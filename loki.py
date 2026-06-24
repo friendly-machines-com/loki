@@ -68,7 +68,7 @@ class terminal:
         print('\033[{};{}r'.format(first_row, last_row - 1), end='')
 		#goto_position(1, 1)
 
-    def disable_clipping_regions(): # note: after that, cursor position is weird.  Set it.
+    def disable_clipping_regions(): # note: after that, cursor position is (1,1) either absolute or relative dependig on origin_mode.
         print('\033[r', end='')
 		#goto_position(1, 1)
 
