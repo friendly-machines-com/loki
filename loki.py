@@ -10,8 +10,7 @@
 # TODO: background tasks and job control, maybe
 # TODO: also support anthropic protocol (in addition to the old openai chat protocol we do support)
 # TODO: make this an actual shell; pipeable and so on like always
-# TODO: OSC 9 - desktop notification
-# TODO: beep
+# TODO: use getopt getopt to support the options "resume <uuid>" and "--resume <uuid>" with either just the uuid or a filename, then uses that as the chat log (LOADING it into MESSAGES) and prints that out like it just happened.
 
 import sys
 import re
@@ -24,6 +23,8 @@ import urllib.parse
 import subprocess
 import signal
 import socket
+import uuid
+import getopt
 from pprint import pprint
 
 url = "https://opencode.ai/zen/go/v1/chat/completions" # "https://api.openai.com/v1/chat/completions"
@@ -200,10 +201,6 @@ def run_menu(items): # TODO: use.
     return 'None of the above'
 
 def run_input_loop():
-  terminal.reset_colors_and_flags()
-  terminal.set_clipping_region(*output_area)
-  terminal.goto_position(1, 1)
-  terminal.save_cursor_position()
   while True:
     input_text = get_input()
 
@@ -338,11 +335,70 @@ def chat_completion(messages: list) -> dict:
     print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]")
     return data
 
-# TODO: handle EOFError
+messages = []
+
+def new_chat_log(filename):
+    global chat_log
+    chat_log = open(filename, 'w')
+
+def save_chat_log():
+    chat_log.seek(0)
+    json.dump(messages, chat_log, indent=4)
+    chat_log.truncate()
+    chat_log.flush()
+    print('Note: Saved chat log to {}'.format(chat_log.name), file=sys.stderr)
+    sys.stderr.flush()
+
+def load_chat_log(filename):
+    global chat_log
+    global messages
+    chat_log = open(filename, 'r')
+    try:
+        messages = json.load(chat_log)
+        for message in messages:
+            for k, v in message.items():
+                pprint((k, v)) # TODO: nicer
+
+            print()
+
+        print('----')
+    finally:
+        chat_log.close()
+
+    chat_log = open(filename, 'w')
+    save_chat_log()
 
 def main():
     global model
-    messages = [{"role": "system", "content": "You are a helpful system agent capable of running bash commands, reading, writing, and patching files."}]
+    global messages
+    options, args = getopt.getopt(sys.argv[1:], 'r:', ['resume='])
+    try:
+        log_filename = None
+        for option_name, option_value in options:
+            print(option_name)
+            time.sleep(2)
+            if option_name == '--resume' or option_name == '-r':
+                log_filename = option_value
+
+        if args[0:1] == ['resume']:
+            log_filename = args[1]
+
+        if log_filename:
+            if not os.path.exists(log_filename):
+                log_filename = 'chat-{}.json'.format(log_filename)
+            load_chat_log(log_filename)
+        else:
+            log_filename = 'chat-{}.json'.format(str(uuid.uuid4()))
+            new_chat_log(log_filename)
+
+    except IndexError: # TODO: remove
+        log_filename = 'chat-{}.json'.format(str(uuid.uuid4()))
+        new_chat_log(log_filename)
+
+    messages = [{
+        "role": "system",
+        "content": "You are a helpful system agent capable of running bash commands, reading, writing, and patching files."
+    }]
     for user_in in run_input_loop():
         if not user_in:
             continue
@@ -447,25 +503,33 @@ def main():
 
 if __name__ == '__main__':
     def clean_up(*args, **kwargs):
+        save_chat_log()
         terminal.disable_bracketed_paste_mode()
         terminal.disable_clipping_regions()
         terminal.disable_origin_mode()
         terminal.reset_colors_and_flags()
         terminal.clear_screen()
+
+    def clean_up_and_exit(*args, **kwargs):
+        clean_up(*args, **kwargs)
         sys.exit(1)
 
-    signal.signal(signal.SIGTERM, clean_up)
+    signal.signal(signal.SIGTERM, clean_up_and_exit)
 
     terminal.enable_bracketed_paste_mode()
     terminal.enable_origin_mode()
     terminal.clear_screen()
 
+    terminal.reset_colors_and_flags()
+    terminal.set_clipping_region(*output_area)
+    terminal.goto_position(1, 1)
+    terminal.save_cursor_position()
+
     try:
         main()
-        terminal.disable_bracketed_paste_mode()
-        terminal.disable_clipping_regions()
-        terminal.disable_origin_mode()
-        terminal.reset_colors_and_flags()
-        terminal.clear_screen()
+        clean_up()
+    except Exception as e:
+        clean_up()
+        raise
     except KeyboardInterrupt:
         clean_up()
