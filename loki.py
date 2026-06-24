@@ -10,6 +10,8 @@
 # TODO: background tasks and job control, maybe
 # TODO: also support anthropic protocol (in addition to the old openai chat protocol we do support)
 # TODO: make this an actual shell; pipeable and so on like always
+# TODO: OSC 9 - desktop notification
+# TODO: beep
 
 import sys
 import re
@@ -62,6 +64,7 @@ class terminal:
         print('\033[{};{}H'.format(row, column), end='')
 
     def set_clipping_region(first_row, last_row): # note: after that, cursor position is (1,1) ABSOLUTE OR RELATIVE DEPENDING ON origin_mode
+        assert last_row - first_row >= 2 # otherwise not supported.
         print('\033[{};{}r'.format(first_row, last_row - 1), end='')
 		#goto_position(1, 1)
 
@@ -129,14 +132,15 @@ def markdown_to_ansi(text: str) -> str:
 
     return "".join(parts)
 
-# TODO: isatty
-
-terminal_size = os.get_terminal_size()
-terminal_lines = terminal_size.lines
+try:
+    terminal_size = os.get_terminal_size()
+    terminal_lines = terminal_size.lines
+except OSError:
+    terminal_lines = 25
 
 output_area = 1, terminal_lines - 4
 input_area = terminal_lines - 4, terminal_lines - 2
-status_area = terminal_lines - 2, terminal_lines
+status_area = terminal_lines - 2, terminal_lines # too big, but that's the minimum supported height of set_clipping_region
 
 '''
     output area
@@ -333,6 +337,8 @@ def chat_completion(messages: list) -> dict:
     elapsed = time.perf_counter() - start
     print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]")
     return data
+
+# TODO: handle EOFError
 
 def main():
     global model
