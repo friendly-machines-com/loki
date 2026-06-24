@@ -61,8 +61,8 @@ class terminal:
     def goto_position(row, column):
         print('\033[{};{}H'.format(row, column), end='')
 
-    def set_clipping_region(first_row, last_row): # note: after that, cursor position is (1,1) relative.
-        print('\033[{};{}r'.format(first_row, last_row), end='')
+    def set_clipping_region(first_row, last_row): # note: after that, cursor position is (1,1) ABSOLUTE OR RELATIVE DEPENDING ON origin_mode
+        print('\033[{};{}r'.format(first_row, last_row - 1), end='')
 		#goto_position(1, 1)
 
     def disable_clipping_regions(): # note: after that, cursor position is weird.  Set it.
@@ -135,8 +135,8 @@ terminal_size = os.get_terminal_size()
 terminal_lines = terminal_size.lines
 
 output_area = 1, terminal_lines - 4
-input_area = terminal_lines - 4, terminal_lines - 1
-status_area = terminal_lines - 1, terminal_lines
+input_area = terminal_lines - 4, terminal_lines - 2
+status_area = terminal_lines - 2, terminal_lines
 
 '''
     output area
