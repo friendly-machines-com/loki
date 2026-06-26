@@ -420,6 +420,8 @@ def _read_spool_tail(path: str, max_chars: int = JOB_TAIL_CHARS) -> str:
 class Job:
     id: str
     command: str
+    argv: list[str] | None
+    shell: bool
     description: str
     background: bool
     spool_dir: str
@@ -460,6 +462,8 @@ class JobManager:
         return {
             "id": job.id,
             "command": job.command,
+            "argv": job.argv,
+            "shell": job.shell,
             "description": job.description,
             "background": job.background,
             "pid": job.pid,
@@ -491,7 +495,15 @@ class JobManager:
             job.finished_at_iso = _now_iso()
             self._write_metadata(job)
 
-    def _spawn(self, command: str, description: str, background: bool, timeout_ms: int | None) -> Job:
+    def _refresh_job(self, job: Job) -> None:
+        if job.status not in ["running", "stopping"]:
+            return
+        exit_code = job.process.poll()
+        if exit_code is not None:
+            self._record_exit(job, exit_code)
+
+    def _spawn(self, command, display_command: str, description: str,
+               background: bool, timeout_ms: int | None, shell: bool) -> Job:
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -501,7 +513,9 @@ class JobManager:
         metadata_path = os.path.join(spool_dir, "job.json")
         job = Job(
             id=job_id,
-            command=command,
+            command=display_command,
+            argv=None if shell else list(command),
+            shell=shell,
             description=description,
             background=background,
             spool_dir=spool_dir,
@@ -515,7 +529,7 @@ class JobManager:
         with open(stdout_path, 'wb') as stdout_file, open(stderr_path, 'wb') as stderr_file:
             proc = subprocess.Popen(
                 command,
-                shell=True,
+                shell=shell,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
@@ -553,31 +567,10 @@ class JobManager:
                     stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
                 self._write_metadata(job)
 
-    async def run_bash(self, command: str, timeout: int = None, description: str = "",
-                       run_in_background: bool = False) -> str:
-        if command is None:
-            return "Error: command is required"
-        if command.strip() == "":
-            return _format_bash_result("", "", 0, no_output_expected=True)
-
-        timeout_ms = int(timeout) if timeout else BASH_DEFAULT_TIMEOUT_MS
-        timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
-        job = self._spawn(command, description, run_in_background, None if run_in_background else timeout_ms)
-
-        if run_in_background:
-            try:
-                asyncio.get_running_loop().create_task(self._monitor_background_job(job))
-            except RuntimeError:
-                pass
-            return "\n".join([
-                f"Started background job {job.id}",
-                f"pid: {job.pid}",
-                f"pgid: {job.pgid}",
-                f"status: {job.status}",
-                f"stdout: {job.stdout_path}",
-                f"stderr: {job.stderr_path}",
-            ])
-
+    async def run_foreground(self, command, display_command: str, timeout_ms: int,
+                             description: str = "", shell: bool = False,
+                             output_chars: int = BASH_MAX_OUTPUT_CHARS):
+        job = self._spawn(command, display_command, description, False, timeout_ms, shell)
         try:
             exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=timeout_ms / 1000)
         except asyncio.TimeoutError:
@@ -597,25 +590,66 @@ class JobManager:
                     pass
                 exit_code = await self._wait_for_job(job)
             self._record_exit(job, exit_code)
-            stdout = _read_spool_tail(job.stdout_path, BASH_MAX_OUTPUT_CHARS)
-            stderr = _read_spool_tail(job.stderr_path, BASH_MAX_OUTPUT_CHARS)
+            return job, "timed_out", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+
+        self._record_exit(job, exit_code)
+        return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+
+    async def run_shell(self, command: str, timeout: int = None, description: str = "",
+                        run_in_background: bool = False) -> str:
+        if command is None:
+            return "Error: command is required"
+        if command.strip() == "":
+            return _format_bash_result("", "", 0, no_output_expected=True)
+
+        timeout_ms = int(timeout) if timeout else BASH_DEFAULT_TIMEOUT_MS
+        timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
+
+        if run_in_background:
+            job = self._spawn(command, command, description, True, None, True)
+            try:
+                asyncio.get_running_loop().create_task(self._monitor_background_job(job))
+            except RuntimeError:
+                pass
+            return "\n".join([
+                f"Started background job {job.id}",
+                f"pid: {job.pid}",
+                f"pgid: {job.pgid}",
+                f"status: {job.status}",
+                f"stdout: {job.stdout_path}",
+                f"stderr: {job.stderr_path}",
+            ])
+
+        job, status, stdout, stderr = await self.run_foreground(
+            command, command, timeout_ms, description=description, shell=True)
+        if status == "timed_out":
             if stderr:
                 stderr += "\n"
             stderr += f"command timed out after {timeout_ms}ms"
             return _format_bash_result(stdout, stderr, job.exit_code, status="timed_out")
 
-        self._record_exit(job, exit_code)
-        stdout = _read_spool_tail(job.stdout_path, BASH_MAX_OUTPUT_CHARS)
-        stderr = _read_spool_tail(job.stderr_path, BASH_MAX_OUTPUT_CHARS)
         return _format_bash_result(stdout, stderr, job.exit_code)
+
+    async def run_exec(self, argv: list[str], timeout_ms: int, description: str = "",
+                       output_chars: int = BASH_MAX_OUTPUT_CHARS):
+        if not argv:
+            raise ValueError("argv must not be empty")
+        return await self.run_foreground(argv, " ".join(argv), timeout_ms,
+                                         description=description, shell=False,
+                                         output_chars=output_chars)
 
     def _get_job(self, job_id: str) -> Job | None:
         with self._lock:
-            return self.jobs.get(str(job_id))
+            job = self.jobs.get(str(job_id))
+        if job is not None:
+            self._refresh_job(job)
+        return job
 
     def list_jobs(self) -> str:
         with self._lock:
             jobs = list(self.jobs.values())
+        for job in jobs:
+            self._refresh_job(job)
         if not jobs:
             return "No jobs."
         lines = ["Jobs:"]
@@ -678,8 +712,8 @@ def run_bash(command: str, timeout: int = None, description: str = "",
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
                          run_in_background: bool = False,
                          dangerously_disable_sandbox: bool = False) -> str:
-    return await job_manager.run_bash(command, timeout=timeout, description=description,
-                                      run_in_background=run_in_background)
+    return await job_manager.run_shell(command, timeout=timeout, description=description,
+                                       run_in_background=run_in_background)
 
 
 def run_jobs() -> str:
@@ -827,6 +861,10 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
 
 
 def run_glob(pattern: str, path: str = None) -> str:
+    return asyncio.run(run_glob_async(pattern, path))
+
+
+async def run_glob_async(pattern: str, path: str = None) -> str:
     if not pattern:
         return "Error: pattern is required"
     rg = _find_rg_binary()
@@ -837,17 +875,16 @@ def run_glob(pattern: str, path: str = None) -> str:
         return f"Error: {root} is not a directory"
     args = [rg, '--files', '--color=never', '--glob', pattern, root]
     start = time.perf_counter()
-    try:
-        res = subprocess.run(args, capture_output=True, text=True, timeout=SEARCH_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
+    job, status, stdout, stderr = await job_manager.run_exec(
+        args, SEARCH_TIMEOUT_S * 1000, description=f"Glob {pattern!r}")
+    if status == "timed_out":
         return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
-    except Exception as e:
-        return f"Error running ripgrep: {e}"
     duration_ms = int((time.perf_counter() - start) * 1000)
-    stderr = res.stderr.strip()
-    if res.returncode not in [0, 1]:
-        return f"Error: ripgrep failed with exit code {res.returncode}" + (f"\n{stderr}" if stderr else "")
-    matches = res.stdout.splitlines()
+    stderr = stderr.strip()
+    if job.exit_code not in [0, 1]:
+        return f"Error: ripgrep failed with exit code {job.exit_code}" + (f"\n{stderr}" if stderr else "")
+    matches = stdout.splitlines()
+    num_files = len(matches)
     truncated = len(matches) > GLOB_MAX_RESULTS
 
     def mtime_or_zero(file_path: str) -> float:
@@ -862,7 +899,7 @@ def run_glob(pattern: str, path: str = None) -> str:
         return f"No files matched pattern {pattern!r} in {root}"
     return "\n".join([
         f"duration_ms: {duration_ms}",
-        f"num_files: {len(res.stdout.splitlines())}",
+        f"num_files: {num_files}",
         f"truncated: {str(truncated).lower()}",
         "[filenames]",
         *matches,
@@ -893,6 +930,11 @@ def _select_limited(lines: list[str], offset: int, head_limit: int) -> tuple[lis
 
 def run_grep(pattern: str, path: str = None, glob: str = None,
              output_mode: str = "files_with_matches", **kwargs) -> str:
+    return asyncio.run(run_grep_async(pattern, path, glob, output_mode, **kwargs))
+
+
+async def run_grep_async(pattern: str, path: str = None, glob: str = None,
+                         output_mode: str = "files_with_matches", **kwargs) -> str:
     if not pattern:
         return "Error: pattern is required"
     if output_mode not in ['content', 'files_with_matches', 'count']:
@@ -955,18 +997,16 @@ def run_grep(pattern: str, path: str = None, glob: str = None,
     args.extend(['--', pattern, root])
 
     start = time.perf_counter()
-    try:
-        res = subprocess.run(args, capture_output=True, text=True, timeout=SEARCH_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
+    job, status, stdout, stderr = await job_manager.run_exec(
+        args, SEARCH_TIMEOUT_S * 1000, description=f"Grep {pattern!r}")
+    if status == "timed_out":
         return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
-    except Exception as e:
-        return f"Error running ripgrep: {e}"
     duration_ms = int((time.perf_counter() - start) * 1000)
-    stderr = res.stderr.strip()
-    if res.returncode not in [0, 1]:
-        return f"Error: ripgrep failed with exit code {res.returncode}" + (f"\n{stderr}" if stderr else "")
+    stderr = stderr.strip()
+    if job.exit_code not in [0, 1]:
+        return f"Error: ripgrep failed with exit code {job.exit_code}" + (f"\n{stderr}" if stderr else "")
 
-    lines = res.stdout.splitlines()
+    lines = stdout.splitlines()
     selected, truncated = _select_limited(lines, offset_n, head_limit)
     if not selected:
         return f"No matches for {pattern!r}"
@@ -1171,6 +1211,21 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None) -> dict:
                                         description=args.get("description", ""),
                                         run_in_background=args.get("run_in_background", False),
                                         dangerously_disable_sandbox=args.get("dangerously_disable_sandbox", False))
+        if fn_name == "Glob":
+            return await run_glob_async(args["pattern"], args.get("path"))
+        if fn_name == "Grep":
+            extra = {k: v for k, v in args.items()
+                     if k not in ["pattern", "path", "glob", "output_mode"]}
+            return await run_grep_async(args["pattern"],
+                                        path=args.get("path"),
+                                        glob=args.get("glob"),
+                                        output_mode=args.get("output_mode", "files_with_matches"),
+                                        **extra)
+        if fn_name == "Agent":
+            return await run_agent_async(args.get("description", ""),
+                                         args["prompt"],
+                                         args.get("run_in_background", False),
+                                         args.get("subagent_type", "Explore"))
         if fn_name == "Jobs":
             return run_jobs()
         if fn_name == "JobStatus":
@@ -1397,6 +1452,11 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
 
 def run_agent(description: str, prompt: str, run_in_background: bool = False,
               subagent_type: str = "Explore") -> str:
+    return asyncio.run(run_agent_async(description, prompt, run_in_background, subagent_type))
+
+
+async def run_agent_async(description: str, prompt: str, run_in_background: bool = False,
+                          subagent_type: str = "Explore") -> str:
     agent_type = subagent_type or "Explore"
     if not prompt:
         return "Error: prompt is required"
@@ -1405,22 +1465,26 @@ def run_agent(description: str, prompt: str, run_in_background: bool = False,
     if run_in_background:
         return ("Background subagents are not supported in this build. "
                 f"Prompt was: {prompt[:200]}")
-    try:
-        proc = subprocess.run(
-            [sys.executable, os.path.abspath(__file__),
-             '--subagent', agent_type, '--prompt', prompt],
-            text=True, capture_output=True, timeout=SUBAGENT_TIMEOUT_S)
-        result = _format_subagent_result(agent_type, description, "completed",
-                                         proc.returncode, proc.stdout, proc.stderr)
-        if proc.returncode != 0:
-            return f"Error: subagent exited with code {proc.returncode}\n{result}"
-        return result
-    except subprocess.TimeoutExpired as e:
+    argv = [
+        sys.executable,
+        os.path.abspath(__file__),
+        '--subagent',
+        agent_type,
+        '--prompt',
+        prompt,
+    ]
+    job, status, stdout, stderr = await job_manager.run_exec(
+        argv, SUBAGENT_TIMEOUT_S * 1000,
+        description=description or "subagent task")
+    if status == "timed_out":
         result = _format_subagent_result(agent_type, description, "timed_out",
-                                         None, e.stdout, e.stderr)
+                                         job.exit_code, stdout, stderr)
         return f"Error: subagent timed out after {SUBAGENT_TIMEOUT_S}s for {description or 'task'}\n{result}"
-    except FileNotFoundError:
-        return "Error: could not launch subagent (interpreter or script missing)"
+    result = _format_subagent_result(agent_type, description, "completed",
+                                     job.exit_code, stdout, stderr)
+    if job.exit_code != 0:
+        return f"Error: subagent exited with code {job.exit_code}\n{result}"
+    return result
 
 
 def run_skill(skill: str, args: str = None) -> str:
