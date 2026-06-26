@@ -14,6 +14,7 @@
 import sys
 import re
 import os
+import asyncio
 import collections
 import json
 import time
@@ -28,6 +29,8 @@ import getopt
 import io
 import tempfile
 import shutil
+import threading
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pprint import pprint
 
@@ -58,6 +61,10 @@ SKILL_MAX_BYTES = 100_000
 LOKI_CONFIG_DIR_NAME = "loki"
 XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 LOKI_CONFIG_DIR = os.path.join(os.path.expanduser(XDG_CONFIG_HOME), LOKI_CONFIG_DIR_NAME)
+XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+LOKI_STATE_DIR = os.path.join(os.path.expanduser(XDG_STATE_HOME), LOKI_CONFIG_DIR_NAME)
+LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
+JOB_TAIL_CHARS = 20_000
 
 WEBFETCH_TIMEOUT_S = 30
 WEBFETCH_MAX_BYTES = 10_485_760  # 10 MiB
@@ -385,34 +392,316 @@ def _stale_file_error(file_path: str, action: str) -> str | None:
     return None
 
 
+def _now_iso() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def _decode_spooled_output(data: bytes) -> str:
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        return data.decode('utf-8', errors='replace')
+
+
+def _read_spool_tail(path: str, max_chars: int = JOB_TAIL_CHARS) -> str:
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            f.seek(max(0, size - max_chars * 4))
+            text = _decode_spooled_output(f.read())
+    except FileNotFoundError:
+        return ""
+    if len(text) > max_chars:
+        return text[-max_chars:]
+    return text
+
+
+@dataclass
+class Job:
+    id: str
+    command: str
+    description: str
+    background: bool
+    spool_dir: str
+    stdout_path: str
+    stderr_path: str
+    metadata_path: str
+    started_at: float
+    started_at_iso: str
+    process: subprocess.Popen | None = field(default=None, repr=False)
+    pid: int | None = None
+    pgid: int | None = None
+    status: str = "starting"
+    exit_code: int | None = None
+    signal: int | None = None
+    finished_at: float | None = None
+    finished_at_iso: str | None = None
+    timeout_ms: int | None = None
+
+
+class JobManager:
+    def __init__(self, base_dir: str):
+        self.base_dir = base_dir
+        self.session_id = str(uuid.uuid4())
+        self.session_dir = os.path.join(base_dir, self.session_id)
+        self.jobs = {}
+        self._counter = 0
+        self._lock = threading.RLock()
+
+    def _next_job_id(self) -> str:
+        with self._lock:
+            self._counter += 1
+            return str(self._counter)
+
+    def _job_dir(self, job_id: str) -> str:
+        return os.path.join(self.session_dir, job_id)
+
+    def _job_metadata(self, job: Job) -> dict:
+        return {
+            "id": job.id,
+            "command": job.command,
+            "description": job.description,
+            "background": job.background,
+            "pid": job.pid,
+            "pgid": job.pgid,
+            "status": job.status,
+            "exit_code": job.exit_code,
+            "signal": job.signal,
+            "started_at": job.started_at_iso,
+            "finished_at": job.finished_at_iso,
+            "timeout_ms": job.timeout_ms,
+            "stdout_path": job.stdout_path,
+            "stderr_path": job.stderr_path,
+        }
+
+    def _write_metadata(self, job: Job) -> None:
+        _atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
+
+    def _record_exit(self, job: Job, exit_code: int) -> None:
+        with self._lock:
+            if job.status in ["timed_out", "stopped"]:
+                pass
+            elif exit_code < 0:
+                job.status = "signaled"
+                job.signal = -exit_code
+            else:
+                job.status = "exited"
+            job.exit_code = exit_code
+            job.finished_at = time.time()
+            job.finished_at_iso = _now_iso()
+            self._write_metadata(job)
+
+    def _spawn(self, command: str, description: str, background: bool, timeout_ms: int | None) -> Job:
+        os.makedirs(self.session_dir, exist_ok=True)
+        job_id = self._next_job_id()
+        spool_dir = self._job_dir(job_id)
+        os.makedirs(spool_dir, exist_ok=True)
+        stdout_path = os.path.join(spool_dir, "stdout")
+        stderr_path = os.path.join(spool_dir, "stderr")
+        metadata_path = os.path.join(spool_dir, "job.json")
+        job = Job(
+            id=job_id,
+            command=command,
+            description=description,
+            background=background,
+            spool_dir=spool_dir,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            metadata_path=metadata_path,
+            started_at=time.time(),
+            started_at_iso=_now_iso(),
+            timeout_ms=timeout_ms,
+        )
+        with open(stdout_path, 'wb') as stdout_file, open(stderr_path, 'wb') as stderr_file:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+        job.process = proc
+        job.pid = proc.pid
+        try:
+            job.pgid = os.getpgid(proc.pid)
+        except OSError:
+            job.pgid = proc.pid
+        job.status = "running"
+        with self._lock:
+            self.jobs[job.id] = job
+            self._write_metadata(job)
+        return job
+
+    async def _wait_for_job(self, job: Job) -> int:
+        while True:
+            exit_code = job.process.poll()
+            if exit_code is not None:
+                return exit_code
+            await asyncio.sleep(0.1)
+
+    async def _monitor_background_job(self, job: Job) -> None:
+        try:
+            exit_code = await self._wait_for_job(job)
+            self._record_exit(job, exit_code)
+        except Exception as e:
+            with self._lock:
+                job.status = "monitor_error"
+                job.finished_at = time.time()
+                job.finished_at_iso = _now_iso()
+                with open(job.stderr_path, 'ab') as stderr_file:
+                    stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
+                self._write_metadata(job)
+
+    async def run_bash(self, command: str, timeout: int = None, description: str = "",
+                       run_in_background: bool = False) -> str:
+        if command is None:
+            return "Error: command is required"
+        if command.strip() == "":
+            return _format_bash_result("", "", 0, no_output_expected=True)
+
+        timeout_ms = int(timeout) if timeout else BASH_DEFAULT_TIMEOUT_MS
+        timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
+        job = self._spawn(command, description, run_in_background, None if run_in_background else timeout_ms)
+
+        if run_in_background:
+            try:
+                asyncio.get_running_loop().create_task(self._monitor_background_job(job))
+            except RuntimeError:
+                pass
+            return "\n".join([
+                f"Started background job {job.id}",
+                f"pid: {job.pid}",
+                f"pgid: {job.pgid}",
+                f"status: {job.status}",
+                f"stdout: {job.stdout_path}",
+                f"stderr: {job.stderr_path}",
+            ])
+
+        try:
+            exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=timeout_ms / 1000)
+        except asyncio.TimeoutError:
+            with self._lock:
+                job.status = "timed_out"
+                self._write_metadata(job)
+            try:
+                os.killpg(job.pgid or job.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=2)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(job.pgid or job.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                exit_code = await self._wait_for_job(job)
+            self._record_exit(job, exit_code)
+            stdout = _read_spool_tail(job.stdout_path, BASH_MAX_OUTPUT_CHARS)
+            stderr = _read_spool_tail(job.stderr_path, BASH_MAX_OUTPUT_CHARS)
+            if stderr:
+                stderr += "\n"
+            stderr += f"command timed out after {timeout_ms}ms"
+            return _format_bash_result(stdout, stderr, job.exit_code, status="timed_out")
+
+        self._record_exit(job, exit_code)
+        stdout = _read_spool_tail(job.stdout_path, BASH_MAX_OUTPUT_CHARS)
+        stderr = _read_spool_tail(job.stderr_path, BASH_MAX_OUTPUT_CHARS)
+        return _format_bash_result(stdout, stderr, job.exit_code)
+
+    def _get_job(self, job_id: str) -> Job | None:
+        with self._lock:
+            return self.jobs.get(str(job_id))
+
+    def list_jobs(self) -> str:
+        with self._lock:
+            jobs = list(self.jobs.values())
+        if not jobs:
+            return "No jobs."
+        lines = ["Jobs:"]
+        for job in jobs:
+            lines.append(
+                f"{job.id}. status={job.status} pid={job.pid} exit={job.exit_code} "
+                f"started={job.started_at_iso} command={job.command!r}"
+            )
+        return "\n".join(lines)
+
+    def job_status(self, job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
+        job = self._get_job(job_id)
+        if job is None:
+            return f"Error: unknown job id {job_id!r}"
+        stdout = _read_spool_tail(job.stdout_path, tail_chars)
+        stderr = _read_spool_tail(job.stderr_path, tail_chars)
+        return "\n".join([
+            f"job_id: {job.id}",
+            f"status: {job.status}",
+            f"pid: {job.pid}",
+            f"pgid: {job.pgid}",
+            f"exit_code: {job.exit_code}",
+            f"signal: {job.signal}",
+            f"started_at: {job.started_at_iso}",
+            f"finished_at: {job.finished_at_iso}",
+            f"stdout_path: {job.stdout_path}",
+            f"stderr_path: {job.stderr_path}",
+            "[stdout_tail]",
+            stdout if stdout else "(empty)",
+            "[stderr_tail]",
+            stderr if stderr else "(empty)",
+        ])
+
+    def stop_job(self, job_id: str, force: bool = False) -> str:
+        job = self._get_job(job_id)
+        if job is None:
+            return f"Error: unknown job id {job_id!r}"
+        if job.status != "running":
+            return f"Job {job.id} is not running (status={job.status})."
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(job.pgid or job.pid, sig)
+        except ProcessLookupError:
+            return f"Job {job.id} is no longer running."
+        with self._lock:
+            job.status = "stopping"
+            self._write_metadata(job)
+        return f"Sent {sig.name} to job {job.id} (pgid={job.pgid})."
+
+
+job_manager = JobManager(LOKI_JOB_STATE_DIR)
+
+
 def run_bash(command: str, timeout: int = None, description: str = "",
               run_in_background: bool = False, dangerously_disable_sandbox: bool = False) -> str:
-    if command is None:
-        return "Error: command is required"
-    if command.strip() == "":
-        return _format_bash_result("", "", 0, no_output_expected=True)
-    if run_in_background:
-        try:
-            with open(os.devnull, 'w') as devnull:
-                subprocess.Popen(command, shell=True, stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
-                                 # Calls setsid() in the child before exec: the child becomes
-                                 # leader of a new session and process group, detached from
-                                 # loki.py's terminal foreground process group. Combined with
-                                 # DEVNULL stdin/stdout/stderr, this is fire-and-forget.
-                                 start_new_session=True)
-            return f"Started in background: {command}"
-        except Exception as e:
-            return f"Error starting background task: {e}"
+    return asyncio.run(run_bash_async(command, timeout, description,
+                                      run_in_background, dangerously_disable_sandbox))
 
-    timeout_ms = int(timeout) if timeout else BASH_DEFAULT_TIMEOUT_MS
-    timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
+
+async def run_bash_async(command: str, timeout: int = None, description: str = "",
+                         run_in_background: bool = False,
+                         dangerously_disable_sandbox: bool = False) -> str:
+    return await job_manager.run_bash(command, timeout=timeout, description=description,
+                                      run_in_background=run_in_background)
+
+
+def run_jobs() -> str:
+    return job_manager.list_jobs()
+
+
+def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
+    if not job_id:
+        return "Error: job_id is required"
     try:
-        completed = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout_ms / 1000)
-        return _format_bash_result(completed.stdout, completed.stderr, completed.returncode)
-    except subprocess.TimeoutExpired:
-        return _format_bash_result("", f"command timed out after {timeout_ms}ms", None, status="timed_out")
-    except Exception as e:
-        return f"Error: {e}"
+        tail_chars = int(tail_chars)
+    except (TypeError, ValueError) as e:
+        return f"Error: invalid tail_chars: {e}"
+    if tail_chars < 0:
+        return "Error: tail_chars must be non-negative"
+    return job_manager.job_status(job_id, tail_chars=tail_chars)
+
+
+def run_job_stop(job_id: str, force: bool = False) -> str:
+    if not job_id:
+        return "Error: job_id is required"
+    return job_manager.stop_job(job_id, force=bool(force))
 
 
 def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
@@ -766,6 +1055,18 @@ def _handle_grep(args: dict) -> str:
                                 "type", "head_limit", "offset", "multiline"]})
 
 
+def _handle_jobs(args: dict) -> str:
+    return run_jobs()
+
+
+def _handle_job_status(args: dict) -> str:
+    return run_job_status(args["job_id"], args.get("tail_chars", JOB_TAIL_CHARS))
+
+
+def _handle_job_stop(args: dict) -> str:
+    return run_job_stop(args["job_id"], args.get("force", False))
+
+
 def _handle_todoread(args: dict) -> str:
     return run_todoread()
 
@@ -833,6 +1134,54 @@ def dispatch_tool(fn_name: str, args: dict, allowed=None) -> dict:
         return _tool_result(False, f"Tool {fn_name} not available in this subagent (allowed: {sorted(allowed)})")
     return with_exception_to_tool_result(f"executing {fn_name}", lambda: spec["handler"](args))
 
+
+async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
+    try:
+        content = await thunk()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except FileNotFoundError as e:
+        return _tool_result(False, f"Error while {context}: file not found: {e}")
+    except PermissionError as e:
+        return _tool_result(False, f"Error while {context}: permission denied: {e}")
+    except TimeoutError as e:
+        return _tool_result(False, f"Error while {context}: timed out: {e}")
+    except OSError as e:
+        return _tool_result(False, f"Error while {context}: OS error: {e}")
+    except ValueError as e:
+        return _tool_result(False, f"Error while {context}: invalid value: {e}")
+    except Exception as e:
+        return _tool_result(False, f"Failed while {context}: {type(e).__name__}: {e}")
+
+    text = str(content)
+    return _tool_result(not _looks_like_tool_error(text), text)
+
+
+async def dispatch_tool_async(fn_name: str, args: dict, allowed=None) -> dict:
+    spec = TOOL_REGISTRY.get(fn_name)
+    if spec is None:
+        return _tool_result(False, f"Unknown function: {fn_name}")
+    if allowed is not None and fn_name not in allowed:
+        return _tool_result(False, f"Tool {fn_name} not available in this subagent (allowed: {sorted(allowed)})")
+
+    async def run_handler():
+        if fn_name == "Bash":
+            return await run_bash_async(args["command"],
+                                        timeout=args.get("timeout"),
+                                        description=args.get("description", ""),
+                                        run_in_background=args.get("run_in_background", False),
+                                        dangerously_disable_sandbox=args.get("dangerously_disable_sandbox", False))
+        if fn_name == "Jobs":
+            return run_jobs()
+        if fn_name == "JobStatus":
+            return run_job_status(args["job_id"], args.get("tail_chars", JOB_TAIL_CHARS))
+        if fn_name == "JobStop":
+            return run_job_stop(args["job_id"], args.get("force", False))
+        return await asyncio.to_thread(spec["handler"], args)
+
+    return await with_exception_to_tool_result_async(f"executing {fn_name}", run_handler)
+
+
 def run_tool_loop(messages: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
                   chat_fn=None, on_event=None) -> str:
     """Run the raw model/tool protocol loop. Mutates `messages` in place."""
@@ -896,6 +1245,69 @@ def run_tool_loop(messages: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
             })
 
 
+async def run_tool_loop_async(messages: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
+                              chat_fn=None, on_event=None) -> str:
+    """Run the raw model/tool protocol loop asynchronously. Mutates `messages` in place."""
+    if chat_fn is None:
+        chat_fn = lambda msgs: asyncio.to_thread(chat_completion, msgs, TOOLS)
+    if on_event is None:
+        on_event = lambda event: None
+
+    loop_count = 0
+    while True:
+        loop_count += 1
+        if loop_count > max_loops:
+            messages.append({"role": "system",
+                             "content": "Max tool loop limit reached. Stop calling tools and respond."})
+            on_event({"type": "max_loops"})
+        try:
+            resp = await chat_fn(messages)
+        except OSError as e:
+            on_event({"type": "network_error", "error": e})
+            return ""
+        if not resp:
+            return ""
+
+        msg = resp["choices"][0]["message"]
+        clean_msg = {"role": msg["role"]}
+        if msg.get("content"):
+            clean_msg["content"] = msg["content"]
+
+        if msg.get("tool_calls"):
+            clean_msg["tool_calls"] = msg["tool_calls"]
+
+        messages.append(clean_msg)
+        if clean_msg.get("content"):
+            on_event({"type": "assistant_message", "content": clean_msg["content"]})
+
+        if not clean_msg.get("tool_calls"):
+            return clean_msg.get("content", "")
+
+        for tc in clean_msg["tool_calls"]:
+            fn_name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except Exception as e:
+                args = {}
+                result = _tool_result(False, f"Failed to parse arguments: {e}")
+            else:
+                validation_error = validate_tool_args(fn_name, args)
+                if validation_error:
+                    result = _tool_result(False, validation_error)
+                    on_event({"type": "tool_rejected", "name": fn_name, "args": args})
+                else:
+                    on_event({"type": "tool_call", "name": fn_name, "args": args})
+                    result = await dispatch_tool_async(fn_name, args, allowed=allowed)
+            if not result["ok"]:
+                on_event({"type": "tool_error", "result": result["content"]})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": fn_name,
+                "content": result["content"],
+            })
+
+
 def _print_tool_args(args) -> None:
     if not isinstance(args, dict):
         pprint(args)
@@ -933,6 +1345,17 @@ def run_terminal_turn(messages: list) -> str:
     return run_tool_loop(
         messages,
         chat_fn=lambda msgs: chat_completion(msgs, tools=TOOLS, show_timing=True, report_errors=True),
+        on_event=_terminal_agent_event,
+    )
+
+
+async def run_terminal_turn_async(messages: list) -> str:
+    async def chat_fn(msgs):
+        return await asyncio.to_thread(chat_completion, msgs, TOOLS, True, True)
+
+    return await run_tool_loop_async(
+        messages,
+        chat_fn=chat_fn,
         on_event=_terminal_agent_event,
     )
 
@@ -1407,7 +1830,7 @@ TOOLS = [
                 "- Working directory persists between calls, but prefer absolute paths -- `cd` in a compound command can trigger a permission prompt. Shell state (env vars, functions) does not persist; the shell is initialized from the user's profile.",
                 "- IMPORTANT: Avoid using this tool to run `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user.",
                 f"- `timeout` is in milliseconds: default {BASH_DEFAULT_TIMEOUT_MS}, max {BASH_MAX_TIMEOUT_MS}.",
-                "- `run_in_background` runs the command detached: it keeps running across turns and re-invokes you when it exits. No `&` needed.",
+                "- `run_in_background` starts a detached job with stdout/stderr spooled to files. Use Jobs/JobStatus/JobStop to inspect or control it. No `&` needed.",
                 "",
                 "# Git",
                 "- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.",
@@ -1438,6 +1861,46 @@ TOOLS = [
                                                     "description": "Set this to true to dangerously override sandbox mode and run commands without sandboxing."}
                 },
                 "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "Jobs",
+            "description": "List shell jobs started by Bash with their status, pid, exit code, and command.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "JobStatus",
+            "description": "Inspect one shell job, including status, exit code, spool paths, and stdout/stderr tails.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job id returned by Bash or Jobs"},
+                    "tail_chars": {"type": "integer", "minimum": 0,
+                                   "description": f"Maximum characters to show from each spool file. Defaults to {JOB_TAIL_CHARS}."}
+                },
+                "required": ["job_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "JobStop",
+            "description": "Stop a running shell job by sending SIGTERM to its process group, or SIGKILL if force is true.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job id returned by Bash or Jobs"},
+                    "force": {"type": "boolean",
+                              "description": "Use SIGKILL instead of SIGTERM. Default false."}
+                },
+                "required": ["job_id"]
             }
         }
     },
@@ -1555,7 +2018,7 @@ TOOLS = [
                 "Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.",
                 "",
                 "Available agent types and the tools they have access to:",
-                "- Explore: Read-only search agent for broad fan-out searches - when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: \"medium\" for moderate exploration, \"very thorough\" for multiple locations and naming conventions. (Tools: Glob, Grep, Read, Bash, WebFetch, WebSearch, TodoWrite)",
+                "- Explore: Read-only search agent for broad fan-out searches - when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: \"medium\" for moderate exploration, \"very thorough\" for multiple locations and naming conventions. (Tools: Glob, Grep, Read, Bash, Jobs, JobStatus, JobStop, WebFetch, WebSearch, TodoWrite)",
                 "",
                 "When using the Agent tool, specify a subagent_type parameter to select which agent type to use. If omitted, the \"Explore\" agent is used.",
                 "",
@@ -1565,7 +2028,7 @@ TOOLS = [
                 "",
                 "- The agent's final message is returned to you as the tool result; it is not shown to the user - relay what matters.",
                 "- A new Agent call starts fresh, so the prompt must be self-contained.",
-                "- `run_in_background: true` runs the agent asynchronously; you'll be notified when it completes.",
+                "- Background subagents are not supported in this build; keep `run_in_background` false.",
                 "- When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently",
             ]),
             "parameters": {
@@ -1670,6 +2133,9 @@ TOOL_HANDLERS = {
     "Write": {"handler": _handle_write},
     "Edit": {"handler": _handle_edit},
     "Bash": {"handler": _handle_bash, "explore": True},
+    "Jobs": {"handler": _handle_jobs, "explore": True},
+    "JobStatus": {"handler": _handle_job_status, "explore": True},
+    "JobStop": {"handler": _handle_job_stop, "explore": True},
     "Glob": {"handler": _handle_glob, "explore": True},
     "Grep": {"handler": _handle_grep, "explore": True},
     "TodoRead": {"handler": _handle_todoread, "explore": True},
@@ -2011,6 +2477,10 @@ def load_chat_log(filename):
     save_chat_log()
 
 def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
+    return asyncio.run(run_subagent_prompt_async(subagent_type, prompt))
+
+
+async def run_subagent_prompt_async(subagent_type: str, prompt: str) -> str:
     if subagent_type != "Explore":
         return f"Error: unknown subagent_type {subagent_type!r} (only 'Explore' is supported)"
     if not prompt:
@@ -2020,17 +2490,25 @@ def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
          "content": "You are a focused Explore subagent. Use Glob/Grep/Read/Bash to investigate, then write a concise final answer."},
         {"role": "user", "content": prompt},
     ]
-    return run_tool_loop(msgs, allowed=EXPLORE_TOOLS)
+    return await run_tool_loop_async(msgs, allowed=EXPLORE_TOOLS)
 
 
 def run_subagent_cli(subagent_type: str, prompt: str = None):
+    asyncio.run(run_subagent_cli_async(subagent_type, prompt))
+
+
+async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
     prompt = prompt if prompt is not None else sys.stdin.read().strip()
-    result = run_subagent_prompt(subagent_type, prompt)
+    result = await run_subagent_prompt_async(subagent_type, prompt)
     if result:
         print(result)
 
 
 def main():
+    asyncio.run(async_main())
+
+
+async def async_main():
     global model
     global messages
 
@@ -2050,7 +2528,7 @@ def main():
             toolset = option_value
 
     if subagent_type or headless:
-        run_subagent_cli(subagent_type or toolset or "Explore", prompt_arg)
+        await run_subagent_cli_async(subagent_type or toolset or "Explore", prompt_arg)
         return
 
     try:
@@ -2077,13 +2555,19 @@ def main():
     messages = [{
         "role": "system",
         "content": ("You are a helpful system agent running in a terminal. You have these tools: "
-                    "Read, Write, Edit, Bash, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
+                    "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
                     "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
                     "Always Read a file before editing or overwriting it. "
                     "Use TodoWrite to plan multi-step work. Keep responses concise.")
     }]
-    for user_in in run_input_loop():
+    while True:
+        user_in = await asyncio.to_thread(get_input)
+        terminal.reset_colors_and_flags()
+        terminal.set_clipping_region(*output_area)
+        terminal.restore_cursor_position()
+
         if not user_in:
+            terminal.save_cursor_position()
             continue
 
         print('User:', user_in)
@@ -2091,13 +2575,14 @@ def main():
             case '/quit':
                 break
             case '/model':
-                model = run_menu(models)
+                model = await asyncio.to_thread(run_menu, models)
+                terminal.save_cursor_position()
                 continue
             case _:
                 if user_in.strip().startswith('!'): # direct command execution
                     cmd = user_in[1:].strip()
                     print(f"{computer}: [Running local command: {cmd}]")
-                    cmd_output = run_bash(cmd)
+                    cmd_output = await run_bash_async(cmd)
                     print(cmd_output) # Show output to you in the terminal
                     # Morph the user input so the AI sees exactly what you did and the result
                     user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
@@ -2107,7 +2592,7 @@ def main():
         messages.append({"role": "user", "content": user_in})
 
         try:
-            run_terminal_turn(messages)
+            await run_terminal_turn_async(messages)
         except KeyboardInterrupt:
             terminal.reset_colors_and_flags()
             # ? EMERGENCY BRAKE
@@ -2122,6 +2607,7 @@ def main():
                 "content": "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."
             })
             continue # Drop immediately back to the User> prompt
+        terminal.save_cursor_position()
 
 if __name__ == '__main__':
     cleanup_done = False
