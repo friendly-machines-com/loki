@@ -130,6 +130,7 @@ model = ""
 
 
 def _pop_env_api_keys(names, environ=os.environ):
+    """Return configured API keys and remove them from the given environment."""
     values = {}
     for name in names:
         value = environ.pop(name, "")
@@ -155,6 +156,13 @@ def _lookup_api_key_with_secret_tool(domain):
 
 
 def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with_secret_tool):
+    """Build runtime provider config from environment and consume API key vars.
+
+    This removes LOKI_API_KEY, OPENAI_API_KEY, and ANTHROPIC_API_KEY from the
+    supplied environment. Loki passes a normalized LOKI_API_KEY to subagents
+    explicitly, so removing provider-specific env vars here prevents child tools
+    and subprocesses from inheriting extra ambient credentials they do not need.
+    """
     config_url = environ.get("LOKI_API_BASE") or environ.get("OPENAI_API_BASE", DEFAULT_API_BASE)
     config_provider_kind = protocols.resolve_protocol(config_url, environ.get("LOKI_PROVIDER", "auto"))
     config_netloc = urllib.parse.urlparse(config_url).netloc
