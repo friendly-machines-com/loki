@@ -126,13 +126,8 @@ class RuntimeConfig:
     model: str
 
 
-url: str
-provider_kind: str
-netloc: str
-api_key: str
-chat_provider: protocols.Provider
-headers: dict
-model = ""
+RUNTIME_CONFIG: RuntimeConfig | None = None
+model: str = ""
 
 
 def _pop_env_api_keys(names, environ=os.environ):
@@ -213,21 +208,11 @@ def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with
     )
 
 
-def apply_runtime_config(config):
-    global url
-    global provider_kind
-    global netloc
-    global api_key
-    global chat_provider
-    global headers
+def apply_runtime_config(config: RuntimeConfig):
+    global RUNTIME_CONFIG
     global model
 
-    url = config.url
-    provider_kind = config.provider_kind
-    netloc = config.netloc
-    api_key = config.api_key
-    chat_provider = config.chat_provider
-    headers = config.headers
+    RUNTIME_CONFIG = config
     model = config.model
 
 class LruCache(object):
@@ -1601,10 +1586,11 @@ def _subagent_env() -> dict:
     env = os.environ.copy()
     # Parent startup consumes provider-specific key variables. Subagents receive
     # only the normalized runtime provider/url/model/key they should use.
-    env['LOKI_PROVIDER'] = chat_provider.kind
-    env['LOKI_API_BASE'] = chat_provider.input_url
-    env['LOKI_MODEL'] = model
-    env['LOKI_API_KEY'] = api_key
+    if RUNTIME_CONFIG:
+        env['LOKI_PROVIDER'] = RUNTIME_CONFIG.chat_provider.kind
+        env['LOKI_API_BASE'] = RUNTIME_CONFIG.chat_provider.input_url
+        env['LOKI_MODEL'] = model
+        env['LOKI_API_KEY'] = RUNTIME_CONFIG.api_key
     return env
 
 
@@ -2395,11 +2381,16 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     start = time.perf_counter()
     body = json.dumps(payload).encode('utf-8') if payload is not None else b''
     method = 'POST' if payload is not None else 'GET'
+
+    headers_to_use = request_headers
+    if headers_to_use is None:
+        headers_to_use = RUNTIME_CONFIG.headers if RUNTIME_CONFIG else {}
+
     response = await http_client.async_http_request(
         method,
         request_url,
         body=body,
-        headers_in=request_headers or headers,
+        headers_in=headers_to_use,
         timeout=WEBFETCH_TIMEOUT_S,
         max_bytes=HTTP_MAX_RESPONSE_BYTES,
     )
@@ -2416,30 +2407,36 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
 
 async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
                                 show_timing: bool = False) -> list:
-    payload = chat_provider.chat_payload(transcript_items, tools, model)
+    if not RUNTIME_CONFIG:
+        return []
+
+    payload = RUNTIME_CONFIG.chat_provider.chat_payload(transcript_items, tools, model)
     data = await async_chat_request(
-        chat_provider.chat_url,
+        RUNTIME_CONFIG.chat_provider.chat_url,
         payload,
-        request_headers=chat_provider.headers,
+        request_headers=RUNTIME_CONFIG.chat_provider.headers,
         report_errors=report_errors,
         show_timing=show_timing,
     )
     if not data:
         return []
     detected = protocols.detect_protocol_from_response(data)
-    if detected and detected != chat_provider.kind:
+    if detected and detected != RUNTIME_CONFIG.chat_provider.kind:
         # A configured adapter should not parse a response that clearly has
         # another protocol's shape; that usually means endpoint/config mismatch.
         raise protocols.ProtocolError(
-            f"configured provider {chat_provider.kind!r} but response looks like {detected!r}")
-    return chat_provider.parse_chat_response(data)
+            f"configured provider {RUNTIME_CONFIG.chat_provider.kind!r} but response looks like {detected!r}")
+    return RUNTIME_CONFIG.chat_provider.parse_chat_response(data)
 
 
 models = []
 
 
 def _status_api_base() -> str:
-    configured_url = getattr(globals().get("chat_provider"), "input_url", None) or globals().get("url", "")
+    configured_url = ""
+    if RUNTIME_CONFIG:
+        configured_url = RUNTIME_CONFIG.chat_provider.input_url if RUNTIME_CONFIG.chat_provider else RUNTIME_CONFIG.url
+
     parsed = urllib.parse.urlparse(configured_url)
     if not parsed.netloc:
         return configured_url
@@ -2472,8 +2469,12 @@ def status_text() -> str:
 async def load_models_async():
     global models
     global model
-    model_urls = getattr(chat_provider, "model_urls", None) or ([chat_provider.models_url]
-                                                                if chat_provider.models_url else [])
+    if not RUNTIME_CONFIG:
+        models = [model] if model else []
+        return
+
+    model_urls = getattr(RUNTIME_CONFIG.chat_provider, "model_urls", None) or ([RUNTIME_CONFIG.chat_provider.models_url]
+                                                                if RUNTIME_CONFIG.chat_provider.models_url else [])
     if not model_urls:
         models = [model] if model else []
         return
@@ -2483,7 +2484,7 @@ async def load_models_async():
             data = await async_chat_request(
                 models_url,
                 None,
-                request_headers=chat_provider.headers,
+                request_headers=RUNTIME_CONFIG.chat_provider.headers,
                 report_errors=True,
             )
         except ApiError as e:
@@ -2492,7 +2493,7 @@ async def load_models_async():
         except OSError as e:
             errors.append(f"API Error for <{models_url}>: {e}")
             continue
-        loaded = chat_provider.parse_model_ids(data)
+        loaded = RUNTIME_CONFIG.chat_provider.parse_model_ids(data)
         if loaded:
             models = loaded
             if model not in models:
@@ -2897,3 +2898,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

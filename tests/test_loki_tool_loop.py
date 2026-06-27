@@ -74,19 +74,14 @@ class RuntimeConfigTests(unittest.TestCase):
             "LOKI_MODEL": "gpt-test",
         }
         config = loki.build_config_from_env(env, lambda domain: "")
-        names = ["url", "provider_kind", "netloc", "api_key", "chat_provider", "headers", "model"]
+        names = ["RUNTIME_CONFIG", "model"]
         sentinel = object()
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
 
         try:
             loki.apply_runtime_config(config)
 
-            self.assertEqual(loki.url, "https://example.test/v1/responses")
-            self.assertEqual(loki.provider_kind, protocols.OPENAI_RESPONSES)
-            self.assertEqual(loki.netloc, "example.test")
-            self.assertEqual(loki.api_key, "test-key")
-            self.assertIs(loki.chat_provider, config.chat_provider)
-            self.assertEqual(loki.headers["Authorization"], "Bearer test-key")
+            self.assertIs(loki.RUNTIME_CONFIG, config)
             self.assertEqual(loki.model, "gpt-test")
         finally:
             for name, value in old_values.items():
@@ -98,13 +93,13 @@ class RuntimeConfigTests(unittest.TestCase):
 
 class StatusTextTests(unittest.TestCase):
     def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
-        names = ["chat_provider", "model", "shell_cwd"]
+        names = ["RUNTIME_CONFIG", "model", "shell_cwd"]
         sentinel = object()
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
 
         try:
             loki.shell_cwd = loki.STARTUP_CWD
-            loki.chat_provider = protocols.Provider(
+            chat_provider = protocols.Provider(
                 kind=protocols.OPENAI_CHAT,
                 input_url="https://user:pass@example.test:8443/base/path/v1/chat/completions?token=secret#fragment",
                 chat_url="https://example.test:8443/base/path/chat/completions",
@@ -112,6 +107,15 @@ class StatusTextTests(unittest.TestCase):
                 model_urls=[],
                 headers={},
                 max_tokens=4096,
+            )
+            loki.RUNTIME_CONFIG = loki.RuntimeConfig(
+                url=chat_provider.input_url,
+                provider_kind=chat_provider.kind,
+                netloc="example.test:8443",
+                api_key="secret",
+                chat_provider=chat_provider,
+                headers={},
+                model="model-x"
             )
             loki.model = "model-x"
 
