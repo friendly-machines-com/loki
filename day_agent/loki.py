@@ -99,16 +99,14 @@ class ApiError(Exception):
     def summary(self) -> str:
         return f"API Error for <{self.request_url}>: HTTP {self.status} {self.reason}"
 
-    def formatted_body(self, max_chars: int = 4000) -> str:
+    def formatted_body(self) -> str:
         if self.body is not None:
             # API error bodies are often JSON dictionaries. Pretty-print them so
-            # terminal errors stay readable instead of becoming one long line.
-            text = pformat(self.body, width=100)
-        else:
-            text = self.body_text
-        if len(text) > max_chars:
-            return text[:max_chars] + f"\n... [body truncated: {len(text)} chars total]"
-        return text
+            # terminal errors stay readable. Use the real terminal width instead
+            # of an arbitrary fixed column so wide terminals are not wrapped early.
+            width = shutil.get_terminal_size(fallback=(80, 24)).columns
+            return pformat(self.body, width=width)
+        return self.body_text
 
     def formatted(self) -> str:
         body = self.formatted_body()

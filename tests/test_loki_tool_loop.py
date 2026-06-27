@@ -134,6 +134,36 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("secret", text)
 
 
+class ApiErrorFormattingTests(unittest.TestCase):
+    def test_formatted_error_preserves_full_json_body(self):
+        message = "x" * 5000
+        error = loki.ApiError(
+            "https://example.test/v1/chat/completions",
+            429,
+            "Too Many Requests",
+            json.dumps({"error": {"message": message}}),
+        )
+
+        text = error.formatted()
+
+        self.assertIn(message, text)
+        self.assertNotIn("body truncated", text)
+
+    def test_formatted_error_preserves_full_raw_body(self):
+        body = "not-json:" + ("y" * 5000)
+        error = loki.ApiError(
+            "https://example.test/v1/chat/completions",
+            500,
+            "Internal Server Error",
+            body,
+        )
+
+        text = error.formatted()
+
+        self.assertIn(body, text)
+        self.assertNotIn("body truncated", text)
+
+
 class ResumeTranscriptRendererTests(unittest.TestCase):
     def test_resume_renderer_replays_visible_conversation_without_metadata_dump(self):
         items = [
