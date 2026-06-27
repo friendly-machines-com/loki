@@ -1585,6 +1585,25 @@ def _format_started_background_job(job: Job, kind: str = "job") -> str:
     ])
 
 
+def _current_entrypoint_argv() -> list[str]:
+    argv0 = sys.argv[0]
+    if argv0 and os.path.basename(argv0) != "__main__.py":
+        script = shutil.which(argv0) if not os.path.dirname(argv0) else argv0
+        return [sys.executable, os.path.abspath(script or argv0)]
+    # python -m day_agent sets sys.argv[0] to day_agent/__main__.py. Running
+    # that file directly would lose package context and break relative imports.
+    return [sys.executable, "-m", "day_agent"]
+
+
+def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
+    return _current_entrypoint_argv() + [
+        '--subagent',
+        agent_type,
+        '--prompt',
+        prompt,
+    ]
+
+
 def run_agent(description: str, prompt: str, run_in_background: bool = False,
               subagent_type: str = "Explore") -> str:
     return asyncio.run(run_agent_async(description, prompt, run_in_background, subagent_type))
@@ -1597,14 +1616,7 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         return "Error: prompt is required"
     if agent_type != "Explore":
         return f"Error: unknown subagent_type {agent_type!r} (only 'Explore' is supported)"
-    argv = [
-        sys.executable,
-        os.path.abspath(__file__),
-        '--subagent',
-        agent_type,
-        '--prompt',
-        prompt,
-    ]
+    argv = _subagent_argv(agent_type, prompt)
     if run_in_background:
         job = await job_manager.run_background_exec(
             argv,

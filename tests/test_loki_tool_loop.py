@@ -94,6 +94,45 @@ class RuntimeConfigTests(unittest.TestCase):
                     loki.__dict__[name] = value
 
 
+class SubagentLaunchTests(unittest.TestCase):
+    def test_subagent_launch_uses_current_script_entrypoint(self):
+        old_argv = sys.argv[:]
+        try:
+            sys.argv = ["./loki.py"]
+
+            argv = loki._subagent_argv("Explore", "inspect this")
+        finally:
+            sys.argv = old_argv
+
+        self.assertEqual(argv, [
+            sys.executable,
+            os.path.abspath("./loki.py"),
+            "--subagent",
+            "Explore",
+            "--prompt",
+            "inspect this",
+        ])
+
+    def test_subagent_launch_preserves_module_entrypoint(self):
+        old_argv = sys.argv[:]
+        try:
+            sys.argv = [os.path.abspath("day_agent/__main__.py")]
+
+            argv = loki._subagent_argv("Explore", "inspect this")
+        finally:
+            sys.argv = old_argv
+
+        self.assertEqual(argv, [
+            sys.executable,
+            "-m",
+            "day_agent",
+            "--subagent",
+            "Explore",
+            "--prompt",
+            "inspect this",
+        ])
+
+
 class ResponsesToolLoopTests(unittest.TestCase):
     def test_function_call_only_response_executes_tool_and_continues(self):
         transcript = [formats.message_item("user", "read README")]
