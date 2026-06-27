@@ -703,8 +703,8 @@ class JobManager:
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
         os.makedirs(spool_dir, exist_ok=True)
-        stdout_path = os.path.join(spool_dir, "stdout")
-        stderr_path = os.path.join(spool_dir, "stderr")
+        stdout_path = os.path.join(spool_dir, "stdout.log")
+        stderr_path = os.path.join(spool_dir, "stderr.log")
         metadata_path = os.path.join(spool_dir, "job.json")
         job = Job(
             id=job_id,
