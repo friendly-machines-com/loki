@@ -13,9 +13,9 @@ os.environ.setdefault("LOKI_API_KEY", "test-key")
 os.environ.setdefault("LOKI_API_BASE", "https://api.openai.com/v1/responses")
 os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 
-from day_agent import formats
-from day_agent import loki
-from day_agent import protocols
+from loki_agent import formats
+from loki_agent import loki
+from loki_agent import protocols
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -355,7 +355,7 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_launch_preserves_module_entrypoint(self):
         old_argv = sys.argv[:]
         try:
-            sys.argv = [os.path.abspath("day_agent/__main__.py")]
+            sys.argv = [os.path.abspath("loki_agent/__main__.py")]
 
             argv = loki._subagent_argv("Explore", "inspect this")
         finally:
@@ -364,7 +364,7 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertEqual(argv, [
             sys.executable,
             "-m",
-            "day_agent",
+            "loki_agent",
             "--subagent",
             "Explore",
             "--prompt",

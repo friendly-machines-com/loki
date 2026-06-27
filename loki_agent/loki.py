@@ -1627,9 +1627,9 @@ def _current_entrypoint_argv() -> list[str]:
         if not os.path.isabs(script):
             script = os.path.join(STARTUP_CWD, script)
         return [sys.executable, os.path.abspath(script)]
-    # python -m day_agent sets sys.argv[0] to day_agent/__main__.py. Running
+    # python -m loki_agent sets sys.argv[0] to loki_agent/__main__.py. Running
     # that file directly would lose package context and break relative imports.
-    return [sys.executable, "-m", "day_agent"]
+    return [sys.executable, "-m", "loki_agent"]
 
 
 def _subagent_argv(agent_type: str, prompt: str) -> list[str]:

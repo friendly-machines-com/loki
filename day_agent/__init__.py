@@ -1,1 +1,0 @@
-"""day-agent package."""

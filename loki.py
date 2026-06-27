@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from day_agent.loki import main
+from loki_agent.loki import main
 
 
 if __name__ == "__main__":

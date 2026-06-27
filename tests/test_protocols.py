@@ -5,8 +5,8 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from day_agent import formats
-from day_agent import protocols
+from loki_agent import formats
+from loki_agent import protocols
 
 
 class OpenAIResponsesProviderTests(unittest.TestCase):
