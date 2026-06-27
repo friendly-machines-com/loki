@@ -125,8 +125,8 @@ class StatusTextTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "CWD: .; API: example.test:8443/base/path; Model: model-x; "
-            "Commands: /quit, /model, /pwd, /cd DIR, !foo",
+            "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
+            "Local: CWD: day-agent; /pwd, /cd DIR, !foo, /quit",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)

@@ -2482,9 +2482,9 @@ def _status_api_base() -> str:
 
 def status_text() -> str:
     return (
-        'CWD: {}; API: {}; Model: {}\n'
-        'Commands: /quit, /model, /pwd, /cd DIR, !foo'
-    ).format(display_path(shell_cwd), _status_api_base(), model)
+        'Remote: API: {}; Model: {}; /model\n'
+        'Local: CWD: {}; /pwd, /cd DIR, !foo, /quit'
+    ).format(_status_api_base(), model, display_path(shell_cwd))
 
 
 async def load_models_async():
