@@ -503,7 +503,7 @@ async def run_menu_async(items):
     while True:
         terminal.restore_cursor_position()
         for i, item in enumerate(items):
-            print(i + 1, '.', item)
+            print(f"{i + 1}. {item}")
         selection = await get_input_async('User choice: ')
         selection = selection.strip()
         if selection.endswith('.'):
