@@ -194,7 +194,7 @@ def _matches_json_type(value, expected_type: str) -> bool:
     raise ToolSchemaError(f"unsupported type {expected_type!r}")
 
 
-def _validate_schema(schema: dict, value, path: str = "$") -> None:
+def _validate_schema(schema: dict, value, path: str = "$"):
     if not isinstance(schema, dict):
         raise ToolSchemaError(f"{path}: schema must be an object")
 
@@ -262,7 +262,7 @@ def _validate_schema(schema: dict, value, path: str = "$") -> None:
             raise ToolValidationError(f"{path} must be <= {schema['maximum']}")
 
 
-def _close_object_schemas(schema: dict) -> None:
+def _close_object_schemas(schema: dict):
     if not isinstance(schema, dict):
         return
     if schema.get("type") == "object" or "properties" in schema:
@@ -273,7 +273,7 @@ def _close_object_schemas(schema: dict) -> None:
         _close_object_schemas(schema["items"])
 
 
-def _check_schema_supported(schema: dict, path: str = "$") -> None:
+def _check_schema_supported(schema: dict, path: str = "$"):
     if not isinstance(schema, dict):
         raise ToolSchemaError(f"{path}: schema must be an object")
     unsupported = sorted(set(schema) - SCHEMA_ALLOWED_KEYS)
@@ -363,7 +363,7 @@ def _format_bash_result(stdout: str, stderr: str, exit_code: int | None,
     return _truncate_text("\n".join(parts), BASH_MAX_OUTPUT_CHARS)
 
 
-def _atomic_write_text(file_path: str, content: str) -> None:
+def _atomic_write_text(file_path: str, content: str):
     directory = os.path.dirname(file_path) or '.'
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
@@ -487,10 +487,10 @@ class JobManager:
             "stderr_path": job.stderr_path,
         }
 
-    def _write_metadata(self, job: Job) -> None:
+    def _write_metadata(self, job: Job):
         _atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
 
-    def _record_exit(self, job: Job, exit_code: int) -> None:
+    def _record_exit(self, job: Job, exit_code: int):
         with self._lock:
             if job.status in ["timed_out", "stopped"]:
                 pass
@@ -504,7 +504,7 @@ class JobManager:
             job.finished_at_iso = _now_iso()
             self._write_metadata(job)
 
-    def _refresh_job(self, job: Job) -> None:
+    def _refresh_job(self, job: Job):
         if job.status not in ["running", "stopping"]:
             return
         exit_code = job.process.returncode
@@ -570,7 +570,7 @@ class JobManager:
     async def _wait_for_job(self, job: Job) -> int:
         return await job.process.wait()
 
-    async def _monitor_background_job(self, job: Job) -> None:
+    async def _monitor_background_job(self, job: Job):
         try:
             exit_code = await self._wait_for_job(job)
             self._record_exit(job, exit_code)
@@ -1299,7 +1299,7 @@ async def run_tool_loop_async(messages: list, allowed=None, max_loops=MAX_LOOP_L
             })
 
 
-def _print_tool_args(args) -> None:
+def _print_tool_args(args):
     if not isinstance(args, dict):
         pprint(args)
         return
@@ -1307,7 +1307,7 @@ def _print_tool_args(args) -> None:
         pprint((k, v))
 
 
-def _terminal_agent_event(event: dict) -> None:
+def _terminal_agent_event(event: dict):
     kind = event.get("type")
     if kind == "max_loops":
         print("\n[!] [Max Loop Limit Reached - Stopping Autonomous Execution]")
@@ -2403,7 +2403,7 @@ models = []
 model = os.environ.get('LOKI_MODEL', 'glm-5.2')
 
 
-async def load_models_async() -> None:
+async def load_models_async():
     global models
     global model
     data = await async_chat_request(url.replace('/v1/chat/completions', '/v1/models'), None,

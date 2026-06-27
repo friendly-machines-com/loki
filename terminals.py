@@ -124,7 +124,7 @@ status_area = terminal_lines - 2, terminal_lines # too big, but that's the minim
 _status_text_provider = lambda: ""
 
 
-def set_status_text_provider(provider) -> None:
+def set_status_text_provider(provider):
     global _status_text_provider
     _status_text_provider = provider
 
@@ -265,12 +265,12 @@ class AsyncKeyReader:
                 pass
         await self.byte_reader.__aexit__(exc_type, exc, tb)
 
-    def _emit_text_byte(self, byte: int) -> None:
+    def _emit_text_byte(self, byte: int):
         text = self.decoder.decode(bytes([byte]), final=False)
         if text:
             self.pending.append(KeyEvent("TEXT", text))
 
-    def _feed_byte(self, byte: int) -> None:
+    def _feed_byte(self, byte: int):
         if self.escape:
             self.escape.append(byte)
             if self.escape == b'\x1b[':
@@ -345,30 +345,30 @@ class InputBuffer:
     def after_cursor(self) -> str:
         return ''.join(self.chars[self.cursor:])
 
-    def insert(self, text: str) -> None:
+    def insert(self, text: str):
         for ch in text:
             self.chars.insert(self.cursor, ch)
             self.cursor += 1
 
-    def backspace(self) -> None:
+    def backspace(self):
         if self.cursor > 0:
             del self.chars[self.cursor - 1]
             self.cursor -= 1
 
-    def delete(self) -> None:
+    def delete(self):
         if self.cursor < len(self.chars):
             del self.chars[self.cursor]
 
-    def left(self) -> None:
+    def left(self):
         self.cursor = max(0, self.cursor - 1)
 
-    def right(self) -> None:
+    def right(self):
         self.cursor = min(len(self.chars), self.cursor + 1)
 
-    def home(self) -> None:
+    def home(self):
         self.cursor = 0
 
-    def end(self) -> None:
+    def end(self):
         self.cursor = len(self.chars)
 
 
@@ -377,7 +377,7 @@ class PromptRenderer:
         self.terminal = terminal
         self.prompt = prompt
 
-    def render(self, buffer: InputBuffer) -> None:
+    def render(self, buffer: InputBuffer):
         refresh_terminal_layout()
         self.terminal.set_clipping_region(*input_area)
         self.terminal.goto_position(1, 1)
