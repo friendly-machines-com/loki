@@ -17,40 +17,47 @@ def item_types(items):
 
 
 class TranscriptFormatTests(unittest.TestCase):
-    def test_v1_nested_tool_call_migrates_to_top_level_and_saves_v2(self):
-        blob = {
-            "schema": "day-agent.transcript.v1",
-            "items": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": "Need the file."},
-                        {
-                            "type": "tool_call",
-                            "id": "call_old",
-                            "name": "Read",
-                            "input": {"file_path": "README.md"},
-                            "raw_arguments": '{"file_path":"README.md"}',
-                        },
-                    ],
-                }
-            ],
-            "session_todos": ["keep"],
-        }
+    def test_current_log_schema_roundtrips_without_migration(self):
+        items = [
+            formats.message_item("assistant", "Need the file."),
+            formats.tool_call_item("call_1", "Read", {"file_path": "README.md"}),
+        ]
+        blob = formats.new_log_blob(items, ["keep"])
 
-        items, todos = formats.load_log_blob(blob)
+        loaded_items, loaded_todos = formats.load_log_blob(blob)
 
-        self.assertEqual(todos, ["keep"])
-        self.assertEqual(item_types(items), ["message", "tool_call"])
-        self.assertEqual(items[0]["content"], [{"type": "text", "text": "Need the file."}])
-        self.assertEqual(items[1]["call_id"], "call_old")
-        self.assertEqual(items[1]["input"], {"file_path": "README.md"})
+        self.assertEqual(blob["schema"], "day-agent.transcript.v2")
+        self.assertEqual(loaded_todos, ["keep"])
+        self.assertEqual(item_types(loaded_items), ["message", "tool_call"])
+        self.assertEqual(loaded_items[1]["call_id"], "call_1")
+        self.assertEqual(loaded_items[1]["input"], {"file_path": "README.md"})
 
-        saved = formats.new_log_blob(items, todos)
-        self.assertEqual(saved["schema"], "day-agent.transcript.v2")
-        self.assertEqual(item_types(saved["items"]), ["message", "tool_call"])
-        self.assertNotIn("tool_call", [block.get("type") for block in saved["items"][0]["content"]])
+    def test_old_log_formats_are_rejected(self):
+        old_blobs = [
+            {
+                "schema": "day-agent.transcript.v1",
+                "items": [{"type": "message", "role": "user", "content": "old"}],
+            },
+            {"messages": [{"role": "user", "content": "old"}]},
+            [{"role": "user", "content": "old"}],
+            {"items": [{"type": "message", "role": "user", "content": "old"}]},
+        ]
+
+        for blob in old_blobs:
+            with self.subTest(blob=blob):
+                with self.assertRaises(formats.TranscriptFormatError):
+                    formats.load_log_blob(blob)
+
+    def test_invalid_current_log_shapes_are_rejected(self):
+        invalid_blobs = [
+            {"schema": "day-agent.transcript.v2", "items": {}},
+            {"schema": "day-agent.transcript.v2", "items": [], "session_todos": {}},
+        ]
+
+        for blob in invalid_blobs:
+            with self.subTest(blob=blob):
+                with self.assertRaises(formats.TranscriptFormatError):
+                    formats.load_log_blob(blob)
 
     def test_openai_chat_tool_calls_roundtrip_through_v2(self):
         messages = [

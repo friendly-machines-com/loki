@@ -2,6 +2,7 @@ import asyncio
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 
 
@@ -161,6 +162,53 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         self.assertNotIn("internal startup instruction", text)
         self.assertNotIn("response_metadata", text)
         self.assertNotIn("provider_raw", text)
+
+
+class ChatLogPathTests(unittest.TestCase):
+    def test_bare_resume_names_resolve_to_local_loki_chat_directory(self):
+        self.assertEqual(
+            loki.resolve_chat_log_path("abc"),
+            os.path.join(".loki", "chats", "chat-abc.json"),
+        )
+        self.assertEqual(
+            loki.resolve_chat_log_path("chat-abc.json"),
+            os.path.join(".loki", "chats", "chat-abc.json"),
+        )
+
+    def test_path_like_resume_arguments_stay_explicit(self):
+        self.assertEqual(loki.resolve_chat_log_path("./chat-abc.json"), "./chat-abc.json")
+        self.assertEqual(loki.resolve_chat_log_path("logs/chat-abc.json"), "logs/chat-abc.json")
+
+    def test_new_chat_log_path_uses_local_loki_chat_directory(self):
+        path = loki.new_chat_log_path()
+
+        self.assertEqual(os.path.dirname(path), os.path.join(".loki", "chats"))
+        self.assertTrue(os.path.basename(path).startswith("chat-"))
+        self.assertTrue(path.endswith(".json"))
+
+    def test_new_chat_log_creates_parent_directory(self):
+        names = ["chat_log", "transcript_items", "session_todos"]
+        sentinel = object()
+        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, ".loki", "chats", "chat-test.json")
+                loki.new_chat_log(path)
+
+                self.assertTrue(os.path.isdir(os.path.dirname(path)))
+                self.assertEqual(loki.chat_log.name, path)
+        finally:
+            if "chat_log" in loki.__dict__:
+                try:
+                    loki.chat_log.close()
+                except OSError:
+                    pass
+            for name, value in old_values.items():
+                if value is sentinel:
+                    loki.__dict__.pop(name, None)
+                else:
+                    loki.__dict__[name] = value
 
 
 class SubagentLaunchTests(unittest.TestCase):

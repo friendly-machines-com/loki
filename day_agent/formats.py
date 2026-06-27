@@ -3,7 +3,6 @@ import json
 
 
 TRANSCRIPT_SCHEMA = "day-agent.transcript.v2"
-LEGACY_TRANSCRIPT_SCHEMAS = {"day-agent.transcript.v1"}
 
 # The persisted format is a transcript item stream, not a provider message
 # list. OpenAI Chat and Anthropic Messages are rendered as projections from
@@ -183,58 +182,6 @@ def item_text(item):
     return blocks_text(item.get("content", []))
 
 
-def _tool_call_from_legacy_block(block):
-    return tool_call_item(
-        block.get("call_id") or block.get("id"),
-        block.get("name"),
-        block.get("input", {}),
-        raw_arguments=block.get("raw_arguments"),
-        provider_ids=block.get("provider_ids"),
-        parse_error=block.get("parse_error"),
-        tool_kind=block.get("tool_kind", "function"),
-        status=block.get("status"),
-        provider_raw=block.get("provider_raw"),
-    )
-
-
-def normalize_items_to_v2(items):
-    # v1 stored assistant tool calls inside message content because it followed
-    # OpenAI Chat's envelope. Split those into top-level tool_call items so old
-    # logs migrate into the v2 stream shape when loaded or saved.
-    normalized = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            normalized.append(provider_item("unknown", item))
-            continue
-
-        item_type = item.get("type")
-        if item_type == "message":
-            message = _copy(item)
-            content = []
-            tool_calls = []
-            for block in message.get("content", []) or []:
-                if isinstance(block, dict) and block.get("type") == "tool_call":
-                    tool_calls.append(_tool_call_from_legacy_block(block))
-                else:
-                    content.append(_copy(block))
-            message["content"] = content
-            normalized.append(message)
-            normalized.extend(tool_calls)
-            continue
-
-        if item_type == "tool_call":
-            call = _copy(item)
-            call_id = call.get("call_id") or call.get("id")
-            call["id"] = call_id
-            call["call_id"] = call_id
-            call.setdefault("tool_kind", "function")
-            normalized.append(call)
-            continue
-
-        normalized.append(_copy(item))
-    return normalized
-
-
 def item_tool_calls(item):
     if item.get("type") == "tool_call":
         return [item]
@@ -273,23 +220,20 @@ def user_prompt_history(items):
 def new_log_blob(items, session_todos):
     return {
         "schema": TRANSCRIPT_SCHEMA,
-        "items": normalize_items_to_v2(items),
+        "items": _copy(items),
         "session_todos": session_todos,
     }
 
 
 def load_log_blob(blob):
-    if isinstance(blob, dict) and blob.get("schema") == TRANSCRIPT_SCHEMA:
-        return normalize_items_to_v2(blob.get("items", [])), _copy(blob.get("session_todos", []))
-    if isinstance(blob, dict) and blob.get("schema") in LEGACY_TRANSCRIPT_SCHEMAS:
-        return normalize_items_to_v2(blob.get("items", [])), _copy(blob.get("session_todos", []))
-    if isinstance(blob, dict) and "items" in blob:
-        return normalize_items_to_v2(blob.get("items", [])), _copy(blob.get("session_todos", []))
-    if isinstance(blob, dict) and "messages" in blob:
-        return openai_chat_messages_to_items(blob["messages"]), _copy(blob.get("session_todos", []))
-    if isinstance(blob, list):
-        return openai_chat_messages_to_items(blob), []
-    raise TranscriptFormatError("unrecognized chat log format")
+    if not isinstance(blob, dict) or blob.get("schema") != TRANSCRIPT_SCHEMA:
+        raise TranscriptFormatError(f"expected chat log schema {TRANSCRIPT_SCHEMA!r}")
+    if not isinstance(blob.get("items"), list):
+        raise TranscriptFormatError("chat log items must be a list")
+    session_todos = blob.get("session_todos", [])
+    if not isinstance(session_todos, list):
+        raise TranscriptFormatError("chat log session_todos must be a list")
+    return _copy(blob["items"]), _copy(session_todos)
 
 
 def openai_content_to_blocks(content):

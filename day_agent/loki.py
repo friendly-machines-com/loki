@@ -63,6 +63,8 @@ LOKI_CONFIG_DIR = os.path.join(os.path.expanduser(XDG_CONFIG_HOME), LOKI_CONFIG_
 XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
 LOKI_STATE_DIR = os.path.join(os.path.expanduser(XDG_STATE_HOME), LOKI_CONFIG_DIR_NAME)
 LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
+LOCAL_LOKI_DIR = ".loki"
+CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
 JOB_TAIL_CHARS = 20_000
 
 WEBFETCH_TIMEOUT_S = 30
@@ -2490,12 +2492,34 @@ def user_prompt_history(items):
     return formats.user_prompt_history(items)
 
 
+def chat_log_filename(chat_id: str) -> str:
+    if chat_id.startswith("chat-") and chat_id.endswith(".json"):
+        return chat_id
+    return "chat-{}.json".format(chat_id)
+
+
+def new_chat_log_path() -> str:
+    return os.path.join(CHAT_LOG_DIR, chat_log_filename(str(uuid.uuid4())))
+
+
+def resolve_chat_log_path(resume_arg: str) -> str:
+    # Bare resume names are chat ids in the local Loki chat directory. An
+    # argument with a directory component is an explicit path supplied by the
+    # caller; there is intentionally no fallback to the old root chat location.
+    if os.path.dirname(resume_arg):
+        return resume_arg
+    return os.path.join(CHAT_LOG_DIR, chat_log_filename(resume_arg))
+
+
 def new_chat_log(filename):
     global chat_log
     global transcript_items
     global session_todos
     transcript_items = initial_transcript_items()
     session_todos = []
+    dirname = os.path.dirname(filename)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     chat_log = open(filename, 'w')
 
 def save_chat_log():
@@ -2657,26 +2681,20 @@ async def async_main(args):
         await run_subagent_cli_async(subagent_type or toolset or "Explore", prompt_arg)
         return
 
-    try:
-        log_filename = None
-        for option_name, option_value in options:
-            if option_name == '--resume' or option_name == '-r':
-                log_filename = option_value
+    log_filename = None
+    for option_name, option_value in options:
+        if option_name == '--resume' or option_name == '-r':
+            log_filename = option_value
 
-        if args[0:1] == ['resume']:
-            log_filename = args[1]
+    if args[0:1] == ['resume']:
+        if len(args) < 2:
+            raise ValueError("resume requires a chat id or path")
+        log_filename = args[1]
 
-        if log_filename:
-            if not os.path.exists(log_filename):
-                log_filename = 'chat-{}.json'.format(log_filename)
-            load_chat_log(log_filename)
-        else:
-            log_filename = 'chat-{}.json'.format(str(uuid.uuid4()))
-            new_chat_log(log_filename)
-
-    except IndexError: # TODO: remove
-        log_filename = 'chat-{}.json'.format(str(uuid.uuid4()))
-        new_chat_log(log_filename)
+    if log_filename:
+        load_chat_log(resolve_chat_log_path(log_filename))
+    else:
+        new_chat_log(new_chat_log_path())
 
     while True:
         try:
