@@ -8,7 +8,7 @@
 # TODO: input with readline support (just print the text you have so far--up to the cursor)
 # TODO: maybe sixel bitmap support; but what for?
 # TODO: background tasks and job control, maybe
-# TODO: also support anthropic protocol (in addition to the old openai chat protocol we do support)
+# TODO: implement OpenAI Responses provider rendering/parsing on top of the neutral transcript
 # TODO: make this an actual shell; pipeable and so on like always; history search etc
 
 import sys
@@ -33,8 +33,12 @@ from pprint import pprint
 
 import terminals
 from terminals import get_input_async, restore_output_area_after_input, run_menu_async, terminal
+import formats
+import protocols
 
-url = os.environ.get("OPENAI_API_BASE", "https://opencode.ai/zen/go/v1/chat/completions") # "https://api.openai.com/v1/chat/completions"
+url = os.environ.get("LOKI_API_BASE") or os.environ.get("OPENAI_API_BASE", "https://opencode.ai/zen/go/v1/chat/completions") # "https://api.openai.com/v1/chat/completions"
+provider_override = os.environ.get("LOKI_PROVIDER", "auto")
+provider_kind = protocols.resolve_protocol(url, provider_override)
 
 computer = socket.gethostname()
 
@@ -79,22 +83,51 @@ HTTP_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 
 netloc = urllib.parse.urlparse(url).netloc
 
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-if OPENAI_API_KEY:
-    api_key = OPENAI_API_KEY
-    del os.environ['OPENAI_API_KEY']
+def _pop_env_api_keys(names):
+    values = {}
+    for name in names:
+        value = os.environ.pop(name, "")
+        if value:
+            values[name] = value
+    return values
+
+
+def _int_env(name, default):
+    value = os.environ.get(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'])
+if provider_kind == protocols.ANTHROPIC_MESSAGES:
+    api_key = (env_api_keys.get('LOKI_API_KEY') or
+               env_api_keys.get('ANTHROPIC_API_KEY') or
+               env_api_keys.get('OPENAI_API_KEY') or "")
 else:
+    api_key = (env_api_keys.get('LOKI_API_KEY') or
+               env_api_keys.get('OPENAI_API_KEY') or
+               env_api_keys.get('ANTHROPIC_API_KEY') or "")
+if not api_key:
     res = subprocess.run(['secret-tool', 'lookup', 'domain', netloc], shell=False, capture_output=True, text=True)
     api_key = res.stdout.strip()
 
 if not api_key:
     raise ValueError('API key missing.  Please run secret-tool store --label="opencode API key" domain {!r}'.format(netloc))
 
-headers = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {api_key}",
-    "User-Agent": "TinyAgent/1.0",
-}
+chat_provider = protocols.make_provider(
+    url,
+    provider=provider_kind,
+    api_key=api_key,
+    models_url=os.environ.get("LOKI_MODELS_URL"),
+    max_tokens=_int_env("LOKI_MAX_TOKENS", 4096),
+    anthropic_version=os.environ.get("ANTHROPIC_VERSION", "2023-06-01"),
+    auth_header=os.environ.get("LOKI_AUTH_HEADER"),
+)
+headers = chat_provider.headers
 
 class LruCache(object):
     def __init__(self, max_size):
@@ -1236,11 +1269,11 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None) -> dict:
     return await with_exception_to_tool_result_async(f"executing {fn_name}", run_handler)
 
 
-async def run_tool_loop_async(messages: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
+async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
                               chat_fn=None, on_event=None) -> str:
-    """Run the raw model/tool protocol loop asynchronously. Mutates `messages` in place."""
+    """Run the model/tool loop over the neutral transcript. Mutates `transcript_items` in place."""
     if chat_fn is None:
-        chat_fn = lambda msgs: async_chat_completion(msgs, tools=TOOLS)
+        chat_fn = lambda items: async_chat_completion(items, tools=TOOLS)
     if on_event is None:
         on_event = lambda event: None
 
@@ -1248,39 +1281,43 @@ async def run_tool_loop_async(messages: list, allowed=None, max_loops=MAX_LOOP_L
     while True:
         loop_count += 1
         if loop_count > max_loops:
-            messages.append({"role": "system",
-                             "content": "Max tool loop limit reached. Stop calling tools and respond."})
+            transcript_items.append(formats.instruction_item(
+                "Max tool loop limit reached. Stop calling tools and respond."))
             on_event({"type": "max_loops"})
         try:
-            resp = await chat_fn(messages)
+            response_items = await chat_fn(transcript_items)
         except OSError as e:
             on_event({"type": "network_error", "error": e})
             return ""
-        if not resp:
+        if not response_items:
             return ""
 
-        msg = resp["choices"][0]["message"]
-        clean_msg = {"role": msg["role"]}
-        if msg.get("content"):
-            clean_msg["content"] = msg["content"]
+        for item in response_items:
+            transcript_items.append(item)
 
-        if msg.get("tool_calls"):
-            clean_msg["tool_calls"] = msg["tool_calls"]
+        assistant_items = [
+            item for item in response_items
+            if item.get("type") == "message" and item.get("role") == "assistant"
+        ]
+        if not assistant_items:
+            return ""
 
-        messages.append(clean_msg)
-        if clean_msg.get("content"):
-            on_event({"type": "assistant_message", "content": clean_msg["content"]})
+        assistant_item = assistant_items[-1]
+        assistant_text = formats.item_text(assistant_item)
+        tool_calls = formats.item_tool_calls(assistant_item)
+        if assistant_text:
+            on_event({"type": "assistant_message", "content": assistant_text})
 
-        if not clean_msg.get("tool_calls"):
-            return clean_msg.get("content", "")
+        if not tool_calls:
+            return assistant_text
 
-        for tc in clean_msg["tool_calls"]:
-            fn_name = tc["function"]["name"]
-            try:
-                args = json.loads(tc["function"]["arguments"])
-            except Exception as e:
-                args = {}
-                result = _tool_result(False, f"Failed to parse arguments: {e}")
+        for tc in tool_calls:
+            fn_name = tc.get("name")
+            args = tc.get("input", {})
+            if tc.get("parse_error"):
+                result = _tool_result(False, f"Failed to parse arguments: {tc['parse_error']}")
+            elif not isinstance(args, dict):
+                result = _tool_result(False, f"Tool arguments must be an object, got {type(args).__name__}")
             else:
                 validation_error = validate_tool_args(fn_name, args)
                 if validation_error:
@@ -1291,12 +1328,12 @@ async def run_tool_loop_async(messages: list, allowed=None, max_loops=MAX_LOOP_L
                     result = await dispatch_tool_async(fn_name, args, allowed=allowed)
             if not result["ok"]:
                 on_event({"type": "tool_error", "result": result["content"]})
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": fn_name,
-                "content": result["content"],
-            })
+            transcript_items.append(formats.tool_result_item(
+                tc.get("id"),
+                result["content"],
+                name=fn_name,
+                is_error=not result["ok"],
+            ))
 
 
 def _print_tool_args(args):
@@ -1332,23 +1369,25 @@ def _terminal_agent_event(event: dict):
         terminal.reset_colors_and_flags()
 
 
-async def run_terminal_turn_async(messages: list) -> str:
-    async def chat_fn(msgs):
-        return await async_chat_completion(msgs, TOOLS, True, True)
+async def run_terminal_turn_async(transcript_items: list) -> str:
+    async def chat_fn(items):
+        return await async_chat_completion(items, TOOLS, True, True)
 
     return await run_tool_loop_async(
-        messages,
+        transcript_items,
         chat_fn=chat_fn,
         on_event=_terminal_agent_event,
     )
 
 
-async def run_toolless_completion_async(messages: list) -> str:
-    resp = await async_chat_completion(messages, tools=[])
-    if not resp:
+async def run_toolless_completion_async(transcript_items: list) -> str:
+    response_items = await async_chat_completion(transcript_items, tools=[])
+    if not response_items:
         return ""
-    msg = resp["choices"][0]["message"]
-    return (msg.get("content") or "").strip()
+    for item in response_items:
+        if item.get("type") == "message" and item.get("role") == "assistant":
+            return formats.item_text(item).strip()
+    return ""
 
 
 def _subprocess_stream_text(value) -> str:
@@ -1380,7 +1419,10 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
 
 def _subagent_env() -> dict:
     env = os.environ.copy()
-    env['OPENAI_API_KEY'] = api_key
+    env['LOKI_PROVIDER'] = chat_provider.kind
+    env['LOKI_API_BASE'] = chat_provider.input_url
+    env['LOKI_MODEL'] = model
+    env['LOKI_API_KEY'] = api_key
     return env
 
 
@@ -1886,13 +1928,14 @@ async def run_webfetch_async(url: str, prompt: str) -> str:
         cache_hit = False
 
     msgs = [
-        {"role": "system",
-         "content": "You are processing content fetched by the WebFetch tool. "
-                    "Answer only from the fetched page content. "
-                    "If the content does not contain the answer, say so plainly. "
-                    "Keep quotes short and do not reproduce large copyrighted passages."},
-        {"role": "user",
-         "content": f"URL: {final_url}\nContent-Type: {content_type}\nPrompt: {prompt}\n\n--- Page content ---\n{content_text}"},
+        formats.instruction_item(
+            "You are processing content fetched by the WebFetch tool. "
+            "Answer only from the fetched page content. "
+            "If the content does not contain the answer, say so plainly. "
+            "Keep quotes short and do not reproduce large copyrighted passages."),
+        formats.message_item(
+            "user",
+            f"URL: {final_url}\nContent-Type: {content_type}\nPrompt: {prompt}\n\n--- Page content ---\n{content_text}"),
     ]
     answer = await run_toolless_completion_async(msgs) or "(no answer returned)"
     header = f"[WebFetch status={status} cache_hit={cache_hit} bytes~={len(content_text)} url={final_url}]"
@@ -2355,8 +2398,8 @@ TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]
 EXPLORE_TOOLS = {name for name, spec in TOOL_REGISTRY.items() if spec["explore"]}
 
-async def async_chat_request(request_url: str, payload, report_errors: bool = False,
-                             show_timing: bool = False) -> dict:
+async def async_chat_request(request_url: str, payload, request_headers: dict = None,
+                             report_errors: bool = False, show_timing: bool = False) -> dict:
     start = time.perf_counter()
     try:
         body = json.dumps(payload).encode('utf-8') if payload is not None else b''
@@ -2365,7 +2408,7 @@ async def async_chat_request(request_url: str, payload, report_errors: bool = Fa
             method,
             request_url,
             body=body,
-            headers_in=headers,
+            headers_in=request_headers or headers,
             timeout=WEBFETCH_TIMEOUT_S,
             max_bytes=HTTP_MAX_RESPONSE_BYTES,
         )
@@ -2387,16 +2430,23 @@ async def async_chat_request(request_url: str, payload, report_errors: bool = Fa
     return data
 
 
-async def async_chat_completion(messages: list, tools=TOOLS, report_errors: bool = False,
-                                show_timing: bool = False) -> dict:
-    payload = {
-        "model": model,
-        "messages": messages,
-    }
-    if tools is not None:
-        payload["tools"] = tools
-    return await async_chat_request(url, payload, report_errors=report_errors,
-                                    show_timing=show_timing)
+async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
+                                show_timing: bool = False) -> list:
+    payload = chat_provider.chat_payload(transcript_items, tools, model)
+    data = await async_chat_request(
+        chat_provider.chat_url,
+        payload,
+        request_headers=chat_provider.headers,
+        report_errors=report_errors,
+        show_timing=show_timing,
+    )
+    if not data:
+        return []
+    detected = protocols.detect_protocol_from_response(data)
+    if detected and detected != chat_provider.kind:
+        raise protocols.ProtocolError(
+            f"configured provider {chat_provider.kind!r} but response looks like {detected!r}")
+    return chat_provider.parse_chat_response(data)
 
 
 models = []
@@ -2406,12 +2456,19 @@ model = os.environ.get('LOKI_MODEL', 'glm-5.2')
 async def load_models_async():
     global models
     global model
-    data = await async_chat_request(url.replace('/v1/chat/completions', '/v1/models'), None,
-                                    report_errors=True)
+    if not chat_provider.models_url:
+        models = [model]
+        return
+    data = await async_chat_request(
+        chat_provider.models_url,
+        None,
+        request_headers=chat_provider.headers,
+        report_errors=True,
+    )
     if not data:
         models = [model]
         return
-    loaded = [item['id'] for item in data.get('data', []) if item.get('object') == 'model']
+    loaded = chat_provider.parse_model_ids(data)
     if not loaded:
         models = [model]
         return
@@ -2425,46 +2482,35 @@ terminals.set_status_text_provider(
     lambda: 'Model: {}; Hint: Use /quit to quit, /model to switch model, !foo to execute shell command foo'.format(model)
 )
 
-messages = []
+transcript_items = []
 session_todos = []
 
 
-def initial_messages():
-    return [{
-        "role": "system",
-        "content": ("You are a helpful system agent running in a terminal. You have these tools: "
-                    "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
-                    "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
-                    "Always Read a file before editing or overwriting it. "
-                    "Use TodoWrite to plan multi-step work. Keep responses concise.")
-    }]
+def initial_transcript_items():
+    return [formats.instruction_item(
+        "You are a helpful system agent running in a terminal. You have these tools: "
+        "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
+        "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
+        "Always Read a file before editing or overwriting it. "
+        "Use TodoWrite to plan multi-step work. Keep responses concise."
+    )]
 
 
-def user_prompt_history(message_list):
-    history = []
-    for message in message_list:
-        if message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            history.append(content)
-    return history
+def user_prompt_history(items):
+    return formats.user_prompt_history(items)
 
 
 def new_chat_log(filename):
     global chat_log
-    global messages
+    global transcript_items
     global session_todos
-    messages = initial_messages()
+    transcript_items = initial_transcript_items()
     session_todos = []
     chat_log = open(filename, 'w')
 
 def save_chat_log():
     chat_log.seek(0)
-    json.dump({
-        "messages": messages,
-        "session_todos": session_todos,
-    }, chat_log, indent=4)
+    json.dump(formats.new_log_blob(transcript_items, session_todos), chat_log, indent=4)
     chat_log.truncate()
     chat_log.flush()
     print('Note: Saved chat log to {}'.format(chat_log.name), file=sys.stderr)
@@ -2472,15 +2518,14 @@ def save_chat_log():
 
 def load_chat_log(filename):
     global chat_log
-    global messages
+    global transcript_items
     global session_todos
     chat_log = open(filename, 'r')
     try:
         blob = json.load(chat_log)
-        messages = blob["messages"]
-        session_todos = blob["session_todos"]
-        for message in messages:
-            for k, v in message.items():
+        transcript_items, session_todos = formats.load_log_blob(blob)
+        for item in transcript_items:
+            for k, v in item.items():
                 pprint((k, v)) # TODO: nicer
 
             print()
@@ -2502,9 +2547,9 @@ async def run_subagent_prompt_async(subagent_type: str, prompt: str) -> str:
     if not prompt:
         return ""
     msgs = [
-        {"role": "system",
-         "content": "You are a focused Explore subagent. Use Glob/Grep/Read/Bash to investigate, then write a concise final answer."},
-        {"role": "user", "content": prompt},
+        formats.instruction_item(
+            "You are a focused Explore subagent. Use Glob/Grep/Read/Bash to investigate, then write a concise final answer."),
+        formats.message_item("user", prompt),
     ]
     return await run_tool_loop_async(msgs, allowed=EXPLORE_TOOLS)
 
@@ -2522,7 +2567,7 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
 
 async def async_main(args):
     global model
-    global messages
+    global transcript_items
 
     options, args = getopt.getopt(args, 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=', 'dangerously-skip-permissions'])
     prompt_arg = None
@@ -2568,7 +2613,7 @@ async def async_main(args):
 
     while True:
         try:
-            user_in = await get_input_async(history=user_prompt_history(messages))
+            user_in = await get_input_async(history=user_prompt_history(transcript_items))
         except EOFError:
             break
         restore_output_area_after_input()
@@ -2596,23 +2641,21 @@ async def async_main(args):
                 else:
                     pass
 
-        messages.append({"role": "user", "content": user_in})
+        transcript_items.append(formats.message_item("user", user_in))
 
         try:
-            await run_terminal_turn_async(messages)
+            await run_terminal_turn_async(transcript_items)
         except KeyboardInterrupt:
             terminal.reset_colors_and_flags()
             # ? EMERGENCY BRAKE
             print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
-            # If we interrupt while a tool call was requested but unanswered, the API will crash on
-            # the next request. We must surgically remove the unanswered tool request from history.
-            if messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls"):
-                messages.pop()
+            # If we interrupt while a tool call was requested but unanswered, remove that
+            # assistant item so every later render has matched tool call/result pairs.
+            if transcript_items and formats.item_has_tool_calls(transcript_items[-1]):
+                transcript_items.pop()
 
-            messages.append({
-                "role": "system",
-                "content": "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."
-            })
+            transcript_items.append(formats.instruction_item(
+                "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."))
             continue # Drop immediately back to the User> prompt
         terminal.save_cursor_position()
 
