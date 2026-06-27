@@ -95,11 +95,13 @@ def normalize_protocol(value):
 
 def detect_protocol_from_url(url):
     path = urllib.parse.urlparse(url).path.rstrip("/")
-    if path.endswith("/v1/chat/completions"):
+    # Infer protocol only from a configured chat endpoint path. A base URL
+    # without a recognized endpoint path needs an explicit provider.
+    if path.endswith("/v1/chat/completions") or path.endswith("/chat/completions"):
         return OPENAI_CHAT
-    if path.endswith("/v1/messages"):
+    if path.endswith("/v1/messages") or path.endswith("/messages"):
         return ANTHROPIC_MESSAGES
-    if path.endswith("/v1/responses"):
+    if path.endswith("/v1/responses") or path.endswith("/responses"):
         return OPENAI_RESPONSES
     return None
 
@@ -145,6 +147,16 @@ def _replace_path(parsed, path):
     ))
 
 
+def _append_path(parsed, suffix):
+    # Treat input_url as a provider base URL and append the concrete protocol
+    # endpoint. This is separate from _replace_path(), which is for known /v1
+    # roots or complete endpoints.
+    base_path = parsed.path.rstrip("/")
+    if not base_path:
+        base_path = ""
+    return _replace_path(parsed, base_path + suffix)
+
+
 def _strip_suffix_path(path, suffix):
     clean = path.rstrip("/")
     if clean.endswith(suffix):
@@ -166,21 +178,46 @@ def endpoint_urls(input_url, protocol, models_url=None):
     parsed = urllib.parse.urlparse(input_url)
     if not parsed.scheme or not parsed.netloc:
         raise ProtocolError(f"unsupported URL {input_url!r}")
-    endpoint_path = {
+    v1_endpoint_path = {
         OPENAI_CHAT: "/chat/completions",
         ANTHROPIC_MESSAGES: "/messages",
         OPENAI_RESPONSES: "/responses",
     }.get(protocol)
-    if endpoint_path is None:
+    base_endpoint_path = {
+        OPENAI_CHAT: "/chat/completions",
+        ANTHROPIC_MESSAGES: "/v1/messages",
+        OPENAI_RESPONSES: "/v1/responses",
+    }.get(protocol)
+    if v1_endpoint_path is None:
         raise ProtocolError(f"unknown protocol {protocol!r}")
 
     root = _v1_root(parsed)
     if root:
-        chat_url = _replace_path(parsed, root + endpoint_path)
+        # A URL ending at /v1, or at a known endpoint under /v1, is normalized
+        # around that /v1 root. This keeps full endpoint and /v1 base inputs
+        # equivalent for standard OpenAI/Anthropic-compatible layouts.
+        chat_url = _replace_path(parsed, root + v1_endpoint_path)
         default_models_url = _replace_path(parsed, root + "/models")
     else:
-        chat_url = input_url
-        default_models_url = None
+        detected = detect_protocol_from_url(input_url)
+        if detected == protocol:
+            # The input already names the concrete chat endpoint. Use it
+            # literally; only derive the model-list URL from the endpoint path.
+            chat_url = input_url
+            clean_path = parsed.path.rstrip("/")
+            for suffix in ["/chat/completions", "/messages", "/responses"]:
+                root_path = _strip_suffix_path(clean_path, suffix)
+                if root_path is not None:
+                    default_models_url = _replace_path(parsed, root_path + "/models")
+                    break
+            else:
+                default_models_url = None
+        else:
+            # With an explicit provider override, a non-endpoint URL is a
+            # provider base. Anthropic-compatible bases append /v1/messages;
+            # OpenAI Chat bases append /chat/completions.
+            chat_url = _append_path(parsed, base_endpoint_path)
+            default_models_url = _append_path(parsed, "/v1/models" if protocol != OPENAI_CHAT else "/models")
     return chat_url, models_url or default_models_url
 
 
