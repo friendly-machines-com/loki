@@ -36,7 +36,8 @@ from terminals import get_input_async, restore_output_area_after_input, run_menu
 import formats
 import protocols
 
-url = os.environ.get("LOKI_API_BASE") or os.environ.get("OPENAI_API_BASE", "https://opencode.ai/zen/go/v1/chat/completions") # "https://api.openai.com/v1/chat/completions"
+DEFAULT_API_BASE = "https://opencode.ai/zen/go/v1/chat/completions"
+url = os.environ.get("LOKI_API_BASE") or os.environ.get("OPENAI_API_BASE", DEFAULT_API_BASE) # "https://api.openai.com/v1/chat/completions"
 provider_override = os.environ.get("LOKI_PROVIDER", "auto")
 provider_kind = protocols.resolve_protocol(url, provider_override)
 
@@ -2500,40 +2501,43 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
 
 
 models = []
-model = os.environ.get('LOKI_MODEL', 'glm-5.2')
+configured_model = os.environ.get('LOKI_MODEL')
+model = configured_model or ('glm-5.2' if url == DEFAULT_API_BASE else '')
 
 
 async def load_models_async():
     global models
     global model
-    if not chat_provider.models_url:
-        models = [model]
+    model_urls = getattr(chat_provider, "model_urls", None) or ([chat_provider.models_url]
+                                                                if chat_provider.models_url else [])
+    if not model_urls:
+        models = [model] if model else []
         return
-    try:
-        data = await async_chat_request(
-            chat_provider.models_url,
-            None,
-            request_headers=chat_provider.headers,
-            report_errors=True,
-        )
-    except ApiError as e:
-        print(e.formatted(), file=sys.stderr)
-        models = [model]
-        return
-    except OSError as e:
-        print(f"API Error for <{chat_provider.models_url}>: {e}", file=sys.stderr)
-        models = [model]
-        return
-    if not data:
-        models = [model]
-        return
-    loaded = chat_provider.parse_model_ids(data)
-    if not loaded:
-        models = [model]
-        return
-    models = loaded
-    if model not in models:
-        model = 'glm-5.2' if 'glm-5.2' in models else models[0]
+    errors = []
+    for models_url in model_urls:
+        try:
+            data = await async_chat_request(
+                models_url,
+                None,
+                request_headers=chat_provider.headers,
+                report_errors=True,
+            )
+        except ApiError as e:
+            errors.append(e.formatted())
+            continue
+        except OSError as e:
+            errors.append(f"API Error for <{models_url}>: {e}")
+            continue
+        loaded = chat_provider.parse_model_ids(data)
+        if loaded:
+            models = loaded
+            if model not in models:
+                model = 'glm-5.2' if 'glm-5.2' in models else models[0]
+            return
+
+    if errors:
+        print("Model list failed:\n" + "\n".join(errors), file=sys.stderr)
+    models = [model] if model else []
 
 #models = ['hy3-preview', 'glm-5.2', 'glm-5.1', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro', 'deepseek-v4-flash', 'mimo-v2.5', 'mimo-v2.5-pro']
 

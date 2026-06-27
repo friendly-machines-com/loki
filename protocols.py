@@ -30,6 +30,7 @@ class Provider:
     input_url: str
     chat_url: str
     models_url: str | None
+    model_urls: list[str]
     headers: dict
     max_tokens: int
 
@@ -221,6 +222,33 @@ def endpoint_urls(input_url, protocol, models_url=None):
     return chat_url, models_url or default_models_url
 
 
+def model_url_candidates(input_url, protocol, primary_models_url=None, explicit_models_url=None):
+    if explicit_models_url:
+        return [explicit_models_url]
+
+    candidates = []
+    if primary_models_url:
+        candidates.append(primary_models_url)
+
+    parsed = urllib.parse.urlparse(input_url)
+    root = _v1_root(parsed)
+    if root:
+        candidate = _replace_path(parsed, root + "/models")
+        if candidate not in candidates:
+            candidates.append(candidate)
+        return candidates
+
+    if parsed.path.rstrip("/") and not detect_protocol_from_url(input_url):
+        # Some compatibility bases include a path prefix for chat while their
+        # model-list endpoint remains at the API root. Try that non-mutating
+        # endpoint after the protocol-derived candidate.
+        candidate = _replace_path(parsed, "/models")
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    return candidates
+
+
 def build_headers(protocol, api_key, anthropic_version="2023-06-01",
                   auth_header=None, user_agent="TinyAgent/1.0"):
     headers = {
@@ -245,6 +273,8 @@ def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
                   auth_header=None):
     protocol = resolve_protocol(input_url, provider)
     chat_url, resolved_models_url = endpoint_urls(input_url, protocol, models_url=models_url)
+    model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
+                                      explicit_models_url=models_url)
     headers = build_headers(protocol, api_key, anthropic_version=anthropic_version,
                             auth_header=auth_header)
     return Provider(
@@ -252,6 +282,7 @@ def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
         input_url=input_url,
         chat_url=chat_url,
         models_url=resolved_models_url,
+        model_urls=model_urls,
         headers=headers,
         max_tokens=max_tokens,
     )
