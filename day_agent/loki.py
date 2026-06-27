@@ -2403,6 +2403,34 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
 models = []
 
 
+def _status_api_base() -> str:
+    configured_url = getattr(globals().get("chat_provider"), "input_url", None) or globals().get("url", "")
+    parsed = urllib.parse.urlparse(configured_url)
+    if not parsed.netloc:
+        return configured_url
+    host = parsed.hostname or parsed.netloc.rsplit("@", 1)[-1]
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    path = parsed.path.rstrip("/")
+    for suffix in [
+        "/v1/chat/completions",
+        "/chat/completions",
+        "/v1/messages",
+        "/messages",
+        "/v1/responses",
+        "/responses",
+        "/v1",
+    ]:
+        if path.endswith(suffix):
+            path = path[:-len(suffix)].rstrip("/")
+            break
+    return host + path
+
+
+def status_text() -> str:
+    return 'API: {}; Model: {}; /quit /model !cmd'.format(_status_api_base(), model)
+
+
 async def load_models_async():
     global models
     global model
@@ -2439,9 +2467,7 @@ async def load_models_async():
 
 #models = ['hy3-preview', 'glm-5.2', 'glm-5.1', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro', 'deepseek-v4-flash', 'mimo-v2.5', 'mimo-v2.5-pro']
 
-terminals.set_status_text_provider(
-    lambda: 'Model: {}; Hint: Use /quit to quit, /model to switch model, !foo to execute shell command foo'.format(model)
-)
+terminals.set_status_text_provider(status_text)
 
 transcript_items = []
 session_todos = []

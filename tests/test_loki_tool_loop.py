@@ -94,6 +94,39 @@ class RuntimeConfigTests(unittest.TestCase):
                     loki.__dict__[name] = value
 
 
+class StatusTextTests(unittest.TestCase):
+    def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
+        names = ["chat_provider", "model"]
+        sentinel = object()
+        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+
+        try:
+            loki.chat_provider = protocols.Provider(
+                kind=protocols.OPENAI_CHAT,
+                input_url="https://user:pass@example.test:8443/base/path/v1/chat/completions?token=secret#fragment",
+                chat_url="https://example.test:8443/base/path/chat/completions",
+                models_url=None,
+                model_urls=[],
+                headers={},
+                max_tokens=4096,
+            )
+            loki.model = "model-x"
+
+            text = loki.status_text()
+        finally:
+            for name, value in old_values.items():
+                if value is sentinel:
+                    loki.__dict__.pop(name, None)
+                else:
+                    loki.__dict__[name] = value
+
+        self.assertEqual(text, "API: example.test:8443/base/path; Model: model-x; /quit /model !cmd")
+        self.assertNotIn("user", text)
+        self.assertNotIn("pass", text)
+        self.assertNotIn("token", text)
+        self.assertNotIn("secret", text)
+
+
 class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_launch_uses_current_script_entrypoint(self):
         old_argv = sys.argv[:]
