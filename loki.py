@@ -2524,7 +2524,7 @@ async def async_main(args):
     global model
     global messages
 
-    options, args = getopt.getopt(args, 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset='])
+    options, args = getopt.getopt(args, 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=', 'dangerously-skip-permissions'])
     prompt_arg = None
     subagent_type = None
     headless = False
