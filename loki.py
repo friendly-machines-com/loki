@@ -2691,6 +2691,8 @@ async def async_main(args):
                 break
             case '/model':
                 model = await run_menu_async(models)
+                print(f"Selected model: {model}", file=sys.stderr)
+                sys.stderr.flush()
                 terminal.save_cursor_position()
                 continue
             case _:

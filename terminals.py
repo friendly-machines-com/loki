@@ -486,6 +486,7 @@ class PromptController:
             if interactive:
                 self.terminal.set_clipping_region(*output_area)
                 self.terminal.goto_position(output_row, output_col)
+                self.terminal.reset_colors_and_flags()
                 self.terminal.flush()
 
 
