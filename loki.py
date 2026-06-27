@@ -376,7 +376,7 @@ def _atomic_write_text(file_path: str, content: str) -> None:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(content)
             f.flush()
-            os.fsync(f.fileno())
+            #os.fsync(f.fileno())
         os.replace(tmp_path, file_path)
     except Exception:
         try:
