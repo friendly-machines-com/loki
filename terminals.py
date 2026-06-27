@@ -7,7 +7,6 @@ import re
 import signal
 import sys
 import termios
-import unicodedata
 from dataclasses import dataclass
 
 
@@ -336,6 +335,9 @@ class InputBuffer:
     def before_cursor(self) -> str:
         return ''.join(self.chars[:self.cursor])
 
+    def after_cursor(self) -> str:
+        return ''.join(self.chars[self.cursor:])
+
     def insert(self, text: str) -> None:
         for ch in text:
             self.chars.insert(self.cursor, ch)
@@ -363,49 +365,6 @@ class InputBuffer:
         self.cursor = len(self.chars)
 
 
-def _cell_width(ch: str) -> int:
-    if unicodedata.combining(ch):
-        return 0
-    if unicodedata.east_asian_width(ch) in ["F", "W"]:
-        return 2
-    return 1
-
-
-def _wrap_for_terminal(text: str, width: int) -> list[str]:
-    width = max(1, width)
-    rows = [""]
-    column = 1
-    for ch in text:
-        if ch == '\n':
-            rows.append("")
-            column = 1
-            continue
-        ch_width = _cell_width(ch)
-        if column > 1 and column + ch_width - 1 > width:
-            rows.append("")
-            column = 1
-        rows[-1] += ch
-        column += ch_width
-    return rows
-
-
-def _screen_position(text: str, width: int) -> tuple[int, int]:
-    width = max(1, width)
-    row = 1
-    column = 1
-    for ch in text:
-        if ch == '\n':
-            row += 1
-            column = 1
-            continue
-        ch_width = _cell_width(ch)
-        if column > 1 and column + ch_width - 1 > width:
-            row += 1
-            column = 1
-        column += ch_width
-    return row, column
-
-
 class PromptRenderer:
     def __init__(self, terminal, prompt: str):
         self.terminal = terminal
@@ -413,18 +372,6 @@ class PromptRenderer:
 
     def render(self, buffer: InputBuffer) -> None:
         refresh_terminal_layout()
-        try:
-            width = os.get_terminal_size().columns
-        except OSError:
-            width = 80
-        width = max(1, width)
-        input_height = max(1, input_area[1] - input_area[0])
-        full_text = self.prompt + buffer.text()
-        cursor_row, cursor_column = _screen_position(self.prompt + buffer.before_cursor(), width)
-        first_row = max(0, cursor_row - input_height)
-        rows = _wrap_for_terminal(full_text, width)
-        visible_rows = rows[first_row:first_row + input_height]
-
         self.terminal.set_clipping_region(*input_area)
         self.terminal.goto_position(1, 1)
         self.terminal.set_background_color(INPUT_COLOR)
@@ -433,8 +380,10 @@ class PromptRenderer:
         self.terminal.set_clipping_region(*input_area)
         self.terminal.goto_position(1, 1)
         self.terminal.set_background_color(INPUT_COLOR)
-        print('\n'.join(visible_rows), end='')
-        self.terminal.goto_position(cursor_row - first_row, cursor_column)
+        print(self.prompt + buffer.before_cursor(), end='')
+        self.terminal.save_cursor_position()
+        print(buffer.after_cursor(), end='')
+        self.terminal.restore_cursor_position()
         self.terminal.flush()
 
 
