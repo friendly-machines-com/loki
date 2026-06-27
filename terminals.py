@@ -513,7 +513,7 @@ async def run_menu_async(items):
             terminal.save_cursor_position()
             try:
                 return items[int(selection) - 1]
-            except:
+            except (ValueError, IndexError):
                 return selection
 
     terminal.save_cursor_position()
