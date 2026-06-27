@@ -2753,7 +2753,6 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
 
 async def async_main(args):
     global model
-    global transcript_items
 
     options, args = getopt.getopt(args, 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=', 'dangerously-skip-permissions'])
     prompt_arg = None
