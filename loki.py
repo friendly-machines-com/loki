@@ -1386,8 +1386,9 @@ def _terminal_agent_event(event: dict):
         print("\n[!] [Max Loop Limit Reached - Stopping Autonomous Execution]")
     elif kind == "api_error":
         terminal.set_background_color(ERROR_COLOR)
-        print(event["error"].formatted())
+        print(event["error"].formatted(), end='')
         terminal.reset_colors_and_flags()
+        print()
     elif kind == "network_error":
         print(f"\n{computer}: NETWORK ERROR: {event['error']}")
     elif kind == "assistant_message":
@@ -1405,8 +1406,9 @@ def _terminal_agent_event(event: dict):
         terminal.reset_colors_and_flags()
     elif kind == "tool_error":
         terminal.set_background_color(ERROR_COLOR)
-        print(event["result"])
+        print(event["result"], end='')
         terminal.reset_colors_and_flags()
+        print()
 
 
 async def run_terminal_turn_async(transcript_items: list) -> str:
