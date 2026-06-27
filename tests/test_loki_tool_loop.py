@@ -120,7 +120,12 @@ class StatusTextTests(unittest.TestCase):
                 else:
                     loki.__dict__[name] = value
 
-        self.assertEqual(text, "API: example.test:8443/base/path; Model: model-x; /quit /model !cmd")
+        self.assertEqual(
+            text,
+            "API: example.test:8443/base/path; Model: model-x; "
+            "Use /quit to quit, /model to switch model, "
+            "!foo to run shell command foo",
+        )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)
         self.assertNotIn("token", text)

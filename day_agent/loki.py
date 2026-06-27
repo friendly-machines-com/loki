@@ -2428,7 +2428,10 @@ def _status_api_base() -> str:
 
 
 def status_text() -> str:
-    return 'API: {}; Model: {}; /quit /model !cmd'.format(_status_api_base(), model)
+    return (
+        'API: {}; Model: {}; Use /quit to quit, /model to switch model, '
+        '!foo to run shell command foo'
+    ).format(_status_api_base(), model)
 
 
 async def load_models_async():
