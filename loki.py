@@ -512,7 +512,8 @@ class JobManager:
             self._record_exit(job, exit_code)
 
     async def _spawn(self, command, display_command: str, description: str,
-                     background: bool, timeout_ms: int | None, shell: bool) -> Job:
+                     background: bool, timeout_ms: int | None, shell: bool,
+                     env: dict | None = None) -> Job:
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -543,6 +544,7 @@ class JobManager:
                     stdout=stdout_file,
                     stderr=stderr_file,
                     start_new_session=True,
+                    env=env,
                 )
             else:
                 proc = await asyncio.create_subprocess_exec(
@@ -551,6 +553,7 @@ class JobManager:
                     stdout=stdout_file,
                     stderr=stderr_file,
                     start_new_session=True,
+                    env=env,
                 )
         job.process = proc
         job.pid = proc.pid
@@ -582,8 +585,9 @@ class JobManager:
 
     async def run_foreground(self, command, display_command: str, timeout_ms: int,
                              description: str = "", shell: bool = False,
-                             output_chars: int = BASH_MAX_OUTPUT_CHARS):
-        job = await self._spawn(command, display_command, description, False, timeout_ms, shell)
+                             output_chars: int = BASH_MAX_OUTPUT_CHARS,
+                             env: dict | None = None):
+        job = await self._spawn(command, display_command, description, False, timeout_ms, shell, env=env)
         try:
             exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=timeout_ms / 1000)
         except asyncio.TimeoutError:
@@ -644,12 +648,13 @@ class JobManager:
         return _format_bash_result(stdout, stderr, job.exit_code)
 
     async def run_exec(self, argv: list[str], timeout_ms: int, description: str = "",
-                       output_chars: int = BASH_MAX_OUTPUT_CHARS):
+                       output_chars: int = BASH_MAX_OUTPUT_CHARS,
+                       env: dict | None = None):
         if not argv:
             raise ValueError("argv must not be empty")
         return await self.run_foreground(argv, " ".join(argv), timeout_ms,
                                          description=description, shell=False,
-                                         output_chars=output_chars)
+                                         output_chars=output_chars, env=env)
 
     def _get_job(self, job_id: str) -> Job | None:
         with self._lock:
@@ -1365,6 +1370,12 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
     return "\n".join(parts)
 
 
+def _subagent_env() -> dict:
+    env = os.environ.copy()
+    env['OPENAI_API_KEY'] = api_key
+    return env
+
+
 def run_agent(description: str, prompt: str, run_in_background: bool = False,
               subagent_type: str = "Explore") -> str:
     return asyncio.run(run_agent_async(description, prompt, run_in_background, subagent_type))
@@ -1390,7 +1401,8 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
     ]
     job, status, stdout, stderr = await job_manager.run_exec(
         argv, SUBAGENT_TIMEOUT_S * 1000,
-        description=description or "subagent task")
+        description=description or "subagent task",
+        env=_subagent_env())
     if status == "timed_out":
         result = _format_subagent_result(agent_type, description, "timed_out",
                                          job.exit_code, stdout, stderr)
