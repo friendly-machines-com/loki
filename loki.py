@@ -29,7 +29,7 @@ import threading
 import ssl
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from pprint import pprint
+from pprint import pprint, pformat
 
 import terminals
 from terminals import get_input_async, restore_output_area_after_input, run_menu_async, terminal
@@ -80,6 +80,38 @@ WEBSEARCH_MAX_RESULTS = 8
 DUCKDUCKGO_HTML_SEARCH_URL = 'https://html.duckduckgo.com/html/'
 HTTP_HEADER_MAX_BYTES = 64 * 1024
 HTTP_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+
+
+class ApiError(Exception):
+    def __init__(self, request_url: str, status: int, reason: str, body_text: str):
+        self.request_url = request_url
+        self.status = status
+        self.reason = reason
+        self.body_text = body_text
+        try:
+            self.body = json.loads(body_text) if body_text else None
+        except json.JSONDecodeError:
+            self.body = None
+        super().__init__(self.summary())
+
+    def summary(self) -> str:
+        return f"API Error for <{self.request_url}>: HTTP {self.status} {self.reason}"
+
+    def formatted_body(self, max_chars: int = 4000) -> str:
+        if self.body is not None:
+            text = pformat(self.body, width=100)
+        else:
+            text = self.body_text
+        if len(text) > max_chars:
+            return text[:max_chars] + f"\n... [body truncated: {len(text)} chars total]"
+        return text
+
+    def formatted(self) -> str:
+        body = self.formatted_body()
+        if not body:
+            return self.summary()
+        return f"{self.summary()}:\n{body}"
+
 
 netloc = urllib.parse.urlparse(url).netloc
 
@@ -1286,6 +1318,9 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             on_event({"type": "max_loops"})
         try:
             response_items = await chat_fn(transcript_items)
+        except ApiError as e:
+            on_event({"type": "api_error", "error": e})
+            return ""
         except OSError as e:
             on_event({"type": "network_error", "error": e})
             return ""
@@ -1348,6 +1383,10 @@ def _terminal_agent_event(event: dict):
     kind = event.get("type")
     if kind == "max_loops":
         print("\n[!] [Max Loop Limit Reached - Stopping Autonomous Execution]")
+    elif kind == "api_error":
+        terminal.set_background_color(ERROR_COLOR)
+        print(event["error"].formatted())
+        terminal.reset_colors_and_flags()
     elif kind == "network_error":
         print(f"\n{computer}: NETWORK ERROR: {event['error']}")
     elif kind == "assistant_message":
@@ -1381,7 +1420,10 @@ async def run_terminal_turn_async(transcript_items: list) -> str:
 
 
 async def run_toolless_completion_async(transcript_items: list) -> str:
-    response_items = await async_chat_completion(transcript_items, tools=[])
+    try:
+        response_items = await async_chat_completion(transcript_items, tools=[])
+    except ApiError as e:
+        return e.formatted()
     if not response_items:
         return ""
     for item in response_items:
@@ -1686,6 +1728,18 @@ def _request_target(parsed) -> str:
     return path
 
 
+def _validate_header_line(name, value):
+    # This file writes HTTP/1.1 requests directly to a socket below. Since no
+    # library validates header fields for us, reject syntax that could break out
+    # of the current header line before formatting "Name: value".
+    name = str(name)
+    value = str(value)
+    if not name or any(ord(ch) <= 32 or ord(ch) >= 127 or ch == ':' for ch in name):
+        raise ValueError(f"invalid HTTP header name: {name!r}")
+    if '\r' in value or '\n' in value:
+        raise ValueError(f"invalid HTTP header value for {name!r}")
+
+
 async def _read_headers(reader: asyncio.StreamReader) -> tuple[str, dict]:
     total = 0
     status_line = await reader.readline()
@@ -1801,6 +1855,10 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
             if body:
                 request_headers['Content-Length'] = str(len(body))
             lines = [f"{method.upper()} {_request_target(parsed)} HTTP/1.1"]
+            # Header names and values may include config/env-derived values
+            # such as auth headers, so validate before serializing them.
+            for name, value in request_headers.items():
+                _validate_header_line(name, value)
             lines.extend(f"{name}: {value}" for name, value in request_headers.items())
             raw_request = ("\r\n".join(lines) + "\r\n\r\n").encode('iso-8859-1') + body
             writer.write(raw_request)
@@ -2401,28 +2459,20 @@ EXPLORE_TOOLS = {name for name, spec in TOOL_REGISTRY.items() if spec["explore"]
 async def async_chat_request(request_url: str, payload, request_headers: dict = None,
                              report_errors: bool = False, show_timing: bool = False) -> dict:
     start = time.perf_counter()
-    try:
-        body = json.dumps(payload).encode('utf-8') if payload is not None else b''
-        method = 'POST' if payload is not None else 'GET'
-        response = await async_http_request(
-            method,
-            request_url,
-            body=body,
-            headers_in=request_headers or headers,
-            timeout=WEBFETCH_TIMEOUT_S,
-            max_bytes=HTTP_MAX_RESPONSE_BYTES,
-        )
-        response_text = _decode_http_text(response.body, response.headers)
-        if response.status >= 400:
-            if report_errors:
-                print(f"API Error for <{request_url}>: HTTP {response.status} {response.reason}: "
-                      f"{response_text[:1000]}", file=sys.stderr)
-            return None
-        data = json.loads(response_text)
-    except OSError as e:
-        if report_errors:
-            print(f"API Error for <{request_url}>: {e}", file=sys.stderr)
-        return None
+    body = json.dumps(payload).encode('utf-8') if payload is not None else b''
+    method = 'POST' if payload is not None else 'GET'
+    response = await async_http_request(
+        method,
+        request_url,
+        body=body,
+        headers_in=request_headers or headers,
+        timeout=WEBFETCH_TIMEOUT_S,
+        max_bytes=HTTP_MAX_RESPONSE_BYTES,
+    )
+    response_text = _decode_http_text(response.body, response.headers)
+    if response.status >= 400:
+        raise ApiError(request_url, response.status, response.reason, response_text)
+    data = json.loads(response_text)
 
     elapsed = time.perf_counter() - start
     if show_timing:
@@ -2459,12 +2509,21 @@ async def load_models_async():
     if not chat_provider.models_url:
         models = [model]
         return
-    data = await async_chat_request(
-        chat_provider.models_url,
-        None,
-        request_headers=chat_provider.headers,
-        report_errors=True,
-    )
+    try:
+        data = await async_chat_request(
+            chat_provider.models_url,
+            None,
+            request_headers=chat_provider.headers,
+            report_errors=True,
+        )
+    except ApiError as e:
+        print(e.formatted(), file=sys.stderr)
+        models = [model]
+        return
+    except OSError as e:
+        print(f"API Error for <{chat_provider.models_url}>: {e}", file=sys.stderr)
+        models = [model]
+        return
     if not data:
         models = [model]
         return
