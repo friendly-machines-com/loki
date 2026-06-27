@@ -2481,7 +2481,7 @@ def _status_api_base() -> str:
 
 def status_text() -> str:
     return (
-        'CWD: {}; API: {}; Model: {}; /quit /model /pwd /cd DIR !foo'
+        'CWD: {}; API: {}; Model: {}; Commands: /quit, /model, /pwd, /cd DIR, !foo'
     ).format(display_path(shell_cwd), _status_api_base(), model)
 
 

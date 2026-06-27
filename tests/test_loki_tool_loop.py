@@ -126,7 +126,7 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             text,
             "CWD: .; API: example.test:8443/base/path; Model: model-x; "
-            "/quit /model /pwd /cd DIR !foo",
+            "Commands: /quit, /model, /pwd, /cd DIR, !foo",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)
@@ -248,11 +248,14 @@ class ShellCwdTests(unittest.TestCase):
                 loki.change_shell_cwd(workdir)
 
                 result = asyncio.run(loki.run_bash_async("pwd"))
+                jobs = list(loki.job_manager.jobs.values())
         finally:
             for name, value in old_values.items():
                 loki.__dict__[name] = value
 
         self.assertIn("[stdout]\n" + workdir, result)
+        self.assertEqual(os.path.basename(jobs[0].stdout_path), "stdout.log")
+        self.assertEqual(os.path.basename(jobs[0].stderr_path), "stderr.log")
 
     def test_save_chat_log_persists_shell_cwd(self):
         names = ["chat_log", "transcript_items", "session_todos", "shell_cwd", "previous_shell_cwd"]
