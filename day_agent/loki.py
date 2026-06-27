@@ -281,18 +281,7 @@ def _path_under(path: str, parent: str) -> bool:
 
 
 def display_path(path: str) -> str:
-    path = os.path.normpath(path)
-    startup_name = os.path.basename(STARTUP_CWD) or STARTUP_CWD
-    if path == STARTUP_CWD:
-        return startup_name
-    if _path_under(path, STARTUP_CWD):
-        return startup_name + "/" + os.path.relpath(path, STARTUP_CWD)
-    home = os.path.expanduser("~")
-    if path == home:
-        return "~"
-    if _path_under(path, home):
-        return "~/" + os.path.relpath(path, home)
-    return path
+    return os.path.normpath(path)
 
 
 def change_shell_cwd(path: str = None) -> str:
