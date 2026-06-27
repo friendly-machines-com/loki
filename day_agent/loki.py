@@ -36,9 +36,6 @@ from . import terminals
 from .terminals import get_input_async, restore_output_area_after_input, run_menu_async, terminal
 
 DEFAULT_API_BASE = "https://opencode.ai/zen/go/v1/chat/completions"
-url = os.environ.get("LOKI_API_BASE") or os.environ.get("OPENAI_API_BASE", DEFAULT_API_BASE) # "https://api.openai.com/v1/chat/completions"
-provider_override = os.environ.get("LOKI_PROVIDER", "auto")
-provider_kind = protocols.resolve_protocol(url, provider_override)
 
 computer = socket.gethostname()
 
@@ -112,19 +109,37 @@ class ApiError(Exception):
         return f"{self.summary()}:\n{body}"
 
 
-netloc = urllib.parse.urlparse(url).netloc
+@dataclass
+class RuntimeConfig:
+    url: str
+    provider_kind: str
+    netloc: str
+    api_key: str
+    chat_provider: protocols.Provider
+    headers: dict
+    model: str
 
-def _pop_env_api_keys(names):
+
+url: str
+provider_kind: str
+netloc: str
+api_key: str
+chat_provider: protocols.Provider
+headers: dict
+model = ""
+
+
+def _pop_env_api_keys(names, environ=os.environ):
     values = {}
     for name in names:
-        value = os.environ.pop(name, "")
+        value = environ.pop(name, "")
         if value:
             values[name] = value
     return values
 
 
-def _int_env(name, default):
-    value = os.environ.get(name)
+def _int_env(name, default, environ=os.environ):
+    value = environ.get(name)
     if not value:
         return default
     try:
@@ -133,32 +148,69 @@ def _int_env(name, default):
         return default
 
 
-env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'])
-if provider_kind == protocols.ANTHROPIC_MESSAGES:
-    api_key = (env_api_keys.get('LOKI_API_KEY') or
-               env_api_keys.get('ANTHROPIC_API_KEY') or
-               env_api_keys.get('OPENAI_API_KEY') or "")
-else:
-    api_key = (env_api_keys.get('LOKI_API_KEY') or
-               env_api_keys.get('OPENAI_API_KEY') or
-               env_api_keys.get('ANTHROPIC_API_KEY') or "")
-if not api_key:
-    res = subprocess.run(['secret-tool', 'lookup', 'domain', netloc], shell=False, capture_output=True, text=True)
-    api_key = res.stdout.strip()
+def _lookup_api_key_with_secret_tool(domain):
+    res = subprocess.run(['secret-tool', 'lookup', 'domain', domain],
+                         shell=False, capture_output=True, text=True)
+    return res.stdout.strip()
 
-if not api_key:
-    raise ValueError('API key missing.  Please run secret-tool store --label="opencode API key" domain {!r}'.format(netloc))
 
-chat_provider = protocols.make_provider(
-    url,
-    provider=provider_kind,
-    api_key=api_key,
-    models_url=os.environ.get("LOKI_MODELS_URL"),
-    max_tokens=_int_env("LOKI_MAX_TOKENS", 4096),
-    anthropic_version=os.environ.get("ANTHROPIC_VERSION", "2023-06-01"),
-    auth_header=os.environ.get("LOKI_AUTH_HEADER"),
-)
-headers = chat_provider.headers
+def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with_secret_tool):
+    config_url = environ.get("LOKI_API_BASE") or environ.get("OPENAI_API_BASE", DEFAULT_API_BASE)
+    config_provider_kind = protocols.resolve_protocol(config_url, environ.get("LOKI_PROVIDER", "auto"))
+    config_netloc = urllib.parse.urlparse(config_url).netloc
+
+    env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'], environ)
+    if config_provider_kind == protocols.ANTHROPIC_MESSAGES:
+        config_api_key = (env_api_keys.get('LOKI_API_KEY') or
+                          env_api_keys.get('ANTHROPIC_API_KEY') or
+                          env_api_keys.get('OPENAI_API_KEY') or "")
+    else:
+        config_api_key = (env_api_keys.get('LOKI_API_KEY') or
+                          env_api_keys.get('OPENAI_API_KEY') or
+                          env_api_keys.get('ANTHROPIC_API_KEY') or "")
+    if not config_api_key:
+        config_api_key = secret_lookup(config_netloc)
+
+    if not config_api_key:
+        raise ValueError('API key missing.  Please run secret-tool store --label="opencode API key" domain {!r}'.format(config_netloc))
+
+    config_chat_provider = protocols.make_provider(
+        config_url,
+        provider=config_provider_kind,
+        api_key=config_api_key,
+        models_url=environ.get("LOKI_MODELS_URL"),
+        max_tokens=_int_env("LOKI_MAX_TOKENS", 4096, environ),
+        anthropic_version=environ.get("ANTHROPIC_VERSION", "2023-06-01"),
+        auth_header=environ.get("LOKI_AUTH_HEADER"),
+    )
+    config_model = environ.get('LOKI_MODEL') or ('glm-5.2' if config_url == DEFAULT_API_BASE else '')
+    return RuntimeConfig(
+        url=config_url,
+        provider_kind=config_provider_kind,
+        netloc=config_netloc,
+        api_key=config_api_key,
+        chat_provider=config_chat_provider,
+        headers=config_chat_provider.headers,
+        model=config_model,
+    )
+
+
+def apply_runtime_config(config):
+    global url
+    global provider_kind
+    global netloc
+    global api_key
+    global chat_provider
+    global headers
+    global model
+
+    url = config.url
+    provider_kind = config.provider_kind
+    netloc = config.netloc
+    api_key = config.api_key
+    chat_provider = config.chat_provider
+    headers = config.headers
+    model = config.model
 
 class LruCache(object):
     def __init__(self, max_size):
@@ -2294,8 +2346,6 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
 
 
 models = []
-configured_model = os.environ.get('LOKI_MODEL')
-model = configured_model or ('glm-5.2' if url == DEFAULT_API_BASE else '')
 
 
 async def load_models_async():
@@ -2518,6 +2568,7 @@ async def async_main(args):
         terminal.save_cursor_position()
 
 def main():
+    apply_runtime_config(build_config_from_env())
     cleanup_done = False
 
     def clean_up_step(thunk):
