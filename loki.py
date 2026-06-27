@@ -656,6 +656,14 @@ class JobManager:
                                          description=description, shell=False,
                                          output_chars=output_chars, env=env)
 
+    async def run_background_exec(self, argv: list[str], description: str = "",
+                                  env: dict | None = None) -> Job:
+        if not argv:
+            raise ValueError("argv must not be empty")
+        job = await self._spawn(argv, " ".join(argv), description, True, None, False, env=env)
+        asyncio.get_running_loop().create_task(self._monitor_background_job(job))
+        return job
+
     def _get_job(self, job_id: str) -> Job | None:
         with self._lock:
             job = self.jobs.get(str(job_id))
@@ -1376,6 +1384,17 @@ def _subagent_env() -> dict:
     return env
 
 
+def _format_started_background_job(job: Job, kind: str = "job") -> str:
+    return "\n".join([
+        f"Started background {kind} {job.id}",
+        f"pid: {job.pid}",
+        f"pgid: {job.pgid}",
+        f"status: {job.status}",
+        f"stdout: {job.stdout_path}",
+        f"stderr: {job.stderr_path}",
+    ])
+
+
 def run_agent(description: str, prompt: str, run_in_background: bool = False,
               subagent_type: str = "Explore") -> str:
     return asyncio.run(run_agent_async(description, prompt, run_in_background, subagent_type))
@@ -1388,9 +1407,6 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         return "Error: prompt is required"
     if agent_type != "Explore":
         return f"Error: unknown subagent_type {agent_type!r} (only 'Explore' is supported)"
-    if run_in_background:
-        return ("Background subagents are not supported in this build. "
-                f"Prompt was: {prompt[:200]}")
     argv = [
         sys.executable,
         os.path.abspath(__file__),
@@ -1399,6 +1415,13 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         '--prompt',
         prompt,
     ]
+    if run_in_background:
+        job = await job_manager.run_background_exec(
+            argv,
+            description=description or "subagent task",
+            env=_subagent_env())
+        return _format_started_background_job(job, "subagent")
+
     job, status, stdout, stderr = await job_manager.run_exec(
         argv, SUBAGENT_TIMEOUT_S * 1000,
         description=description or "subagent task",
@@ -2051,7 +2074,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "Jobs",
-            "description": "List shell jobs started by Bash with their status, pid, exit code, and command.",
+            "description": "List background jobs with their status, pid, exit code, and command.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -2063,7 +2086,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string", "description": "The job id returned by Bash or Jobs"},
+                    "job_id": {"type": "string", "description": "The job id returned by Bash, Agent, or Jobs"},
                     "tail_chars": {"type": "integer", "minimum": 0,
                                    "description": f"Maximum characters to show from each spool file. Defaults to {JOB_TAIL_CHARS}."}
                 },
@@ -2079,7 +2102,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string", "description": "The job id returned by Bash or Jobs"},
+                    "job_id": {"type": "string", "description": "The job id returned by Bash, Agent, or Jobs"},
                     "force": {"type": "boolean",
                               "description": "Use SIGKILL instead of SIGTERM. Default false."}
                 },
@@ -2211,7 +2234,7 @@ TOOLS = [
                 "",
                 "- The agent's final message is returned to you as the tool result; it is not shown to the user - relay what matters.",
                 "- A new Agent call starts fresh, so the prompt must be self-contained.",
-                "- Background subagents are not supported in this build; keep `run_in_background` false.",
+                "- `run_in_background` starts the subagent as a background job with stdout/stderr spooled to files. Use Jobs/JobStatus/JobStop to inspect or control it.",
                 "- When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently",
             ]),
             "parameters": {
@@ -2220,7 +2243,7 @@ TOOLS = [
                     "description": {"type": "string", "description": "A short (3-5 word) description of the task"},
                     "prompt": {"type": "string", "description": "The task for the agent to perform"},
                     "run_in_background": {"type": "boolean",
-                                          "description": "Set to true to run this agent in the background. You will be notified when it completes."},
+                                          "description": "Set to true to run this agent as a background job. Use Jobs/JobStatus/JobStop to inspect or control it."},
                     "subagent_type": {"type": "string", "enum": ["Explore"],
                                       "description": "The type of specialized agent to use for this task"}
                 },
