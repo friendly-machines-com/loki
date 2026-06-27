@@ -2506,6 +2506,89 @@ def save_chat_log():
     print('Note: Saved chat log to {}'.format(chat_log.name), file=sys.stderr)
     sys.stderr.flush()
 
+
+class ResumeTranscriptRenderer:
+    """Render a loaded transcript as the previous terminal conversation."""
+
+    def __init__(self, assistant_label: str = "Assistant"):
+        self.assistant_label = assistant_label
+        self.current_assistant_label = assistant_label
+
+    def _message_label(self, item: dict) -> str:
+        role = item.get("role")
+        if role == "user":
+            return "User"
+        if role == "assistant":
+            return self.current_assistant_label
+        return str(role or "Message").capitalize()
+
+    def _render_message(self, item: dict) -> str:
+        text = formats.item_text(item).strip()
+        if not text:
+            return ""
+        return f"{self._message_label(item)}: {text}"
+
+    def _render_tool_call(self, item: dict) -> str:
+        name = item.get("name") or "<unknown>"
+        args = pformat(item.get("input", {}), width=100)
+        return f"Tool call: {name}\n{args}"
+
+    def _render_tool_result(self, item: dict) -> str:
+        name = item.get("name") or item.get("tool_call_id") or "<unknown>"
+        label = "Tool error" if item.get("is_error") else "Tool result"
+        text = formats.item_text(item).strip()
+        return f"{label}: {name}" + (f"\n{text}" if text else "")
+
+    def _render_reasoning(self, item: dict) -> str:
+        summary = item.get("summary")
+        if not summary:
+            return ""
+        return "Reasoning summary:\n" + pformat(summary, width=100)
+
+    def _render_provider_item(self, item: dict) -> str:
+        provider = item.get("provider") or "unknown"
+        return f"[Provider-specific transcript item: {provider}]\n{pformat(item.get('value'), width=100)}"
+
+    def render_item(self, item: dict) -> str:
+        item_type = item.get("type")
+        if item_type == "response_metadata":
+            if item.get("model"):
+                self.current_assistant_label = item["model"]
+            return ""
+        if item_type == "instruction":
+            return ""
+        if item_type == "message":
+            return self._render_message(item)
+        if item_type == "tool_call":
+            return self._render_tool_call(item)
+        if item_type == "tool_result":
+            return self._render_tool_result(item)
+        if item_type == "reasoning":
+            return self._render_reasoning(item)
+        if item_type == "provider_item":
+            return self._render_provider_item(item)
+        return f"[Transcript item: {item_type or 'unknown'}]\n{pformat(item, width=100)}"
+
+    def render(self, items: list) -> str:
+        blocks = []
+        for item in items:
+            rendered = self.render_item(item)
+            if rendered:
+                blocks.append(rendered)
+        return "\n\n".join(blocks)
+
+
+def render_resume_transcript(items: list) -> str:
+    return ResumeTranscriptRenderer(assistant_label=model or "Assistant").render(items)
+
+
+def print_resume_transcript(items: list):
+    rendered = render_resume_transcript(items)
+    if rendered:
+        print(rendered)
+    print('----')
+
+
 def load_chat_log(filename):
     global chat_log
     global transcript_items
@@ -2514,13 +2597,7 @@ def load_chat_log(filename):
     try:
         blob = json.load(chat_log)
         transcript_items, session_todos = formats.load_log_blob(blob)
-        for item in transcript_items:
-            for k, v in item.items():
-                pprint((k, v)) # TODO: nicer
-
-            print()
-
-        print('----')
+        print_resume_transcript(transcript_items)
     finally:
         chat_log.close()
 

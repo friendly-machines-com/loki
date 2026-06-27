@@ -132,6 +132,37 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("secret", text)
 
 
+class ResumeTranscriptRendererTests(unittest.TestCase):
+    def test_resume_renderer_replays_visible_conversation_without_metadata_dump(self):
+        items = [
+            formats.instruction_item("internal startup instruction"),
+            formats.message_item("user", "hello"),
+            formats.response_metadata_item(
+                "openai",
+                "openai_chat",
+                {"id": "resp_1", "model": "glm-test", "status": "completed"},
+            ),
+            formats.message_item("assistant", "hi there"),
+            formats.tool_call_item("call_1", "Read", {"file_path": "README.md"}),
+            formats.tool_result_item("call_1", "file contents", name="Read"),
+        ]
+
+        text = loki.ResumeTranscriptRenderer(assistant_label="Assistant").render(items)
+
+        self.assertEqual(
+            text,
+            "User: hello\n\n"
+            "glm-test: hi there\n\n"
+            "Tool call: Read\n"
+            "{'file_path': 'README.md'}\n\n"
+            "Tool result: Read\n"
+            "file contents",
+        )
+        self.assertNotIn("internal startup instruction", text)
+        self.assertNotIn("response_metadata", text)
+        self.assertNotIn("provider_raw", text)
+
+
 class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_launch_uses_current_script_entrypoint(self):
         old_argv = sys.argv[:]
