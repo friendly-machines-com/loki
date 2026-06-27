@@ -18,18 +18,20 @@ import asyncio
 import collections
 import json
 import time
-import urllib.request
-import urllib.error
 import urllib.parse
 import subprocess
 import signal
 import socket
 import uuid
 import getopt
-import io
 import tempfile
 import shutil
 import threading
+import termios
+import codecs
+import fcntl
+import unicodedata
+import ssl
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pprint import pprint
@@ -71,11 +73,13 @@ WEBFETCH_MAX_BYTES = 10_485_760  # 10 MiB
 WEBFETCH_MAX_OUTPUT = 100_000   # 100 KB inline result
 WEBFETCH_MAX_PROMPT_CHARS = 200_000
 WEBFETCH_CACHE_TTL = 15 * 60    # 15 minutes
-_webfetch_cache = {}  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
+WEBFETCH_CACHE_MAX_ENTRIES = 128
 WEBSEARCH_TIMEOUT_S = 20
 WEBSEARCH_MAX_RESPONSE_BYTES = 2_000_000
 WEBSEARCH_MAX_RESULTS = 8
 DUCKDUCKGO_HTML_SEARCH_URL = 'https://html.duckduckgo.com/html/'
+HTTP_HEADER_MAX_BYTES = 64 * 1024
+HTTP_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 
 netloc = urllib.parse.urlparse(url).netloc
 
@@ -102,10 +106,10 @@ class LruCache(object):
         self.items = collections.OrderedDict()
 
     def __setitem__(self, key, value):
-        while len(self.items) > self.max_size:
-            del self.items[0]
-
         self.items[key] = value
+        self.items.move_to_end(key)
+        while len(self.items) > self.max_size:
+            self.items.popitem(last=False)
 
     def __hasitem__(self, key):
         return key in self.items
@@ -114,7 +118,10 @@ class LruCache(object):
         return key in self.items
 
     def get(self, key, default=None):
-        return self.items.get(key, default)
+        if key not in self.items:
+            return default
+        self.items.move_to_end(key)
+        return self.items[key]
 
     def __getitem__(self, key):
         self.items.move_to_end(key)
@@ -122,6 +129,7 @@ class LruCache(object):
 
 
 file_state = LruCache(READ_PATHS_LIMIT) # file_path -> last content the agent observed; keys = files Read this session
+_webfetch_cache = LruCache(WEBFETCH_CACHE_MAX_ENTRIES)  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
 
 
 def _resolve_path(path: str) -> str:
@@ -302,10 +310,15 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
         _close_object_schemas(parameters)
         _check_schema_supported(parameters)
         handler = handlers[name]
+        sync_handler = handler.get("handler")
+        async_handler = handler.get("async_handler")
+        if sync_handler is None and async_handler is None:
+            raise ToolSchemaError(f"tool {name} has neither handler nor async_handler")
         registry[name] = {
             "definition": tool,
             "schema": parameters,
-            "handler": handler["handler"],
+            "handler": sync_handler,
+            "async_handler": async_handler,
             "explore": handler.get("explore", False),
         }
 
@@ -430,7 +443,7 @@ class Job:
     metadata_path: str
     started_at: float
     started_at_iso: str
-    process: subprocess.Popen | None = field(default=None, repr=False)
+    process: asyncio.subprocess.Process | None = field(default=None, repr=False)
     pid: int | None = None
     pgid: int | None = None
     status: str = "starting"
@@ -498,12 +511,12 @@ class JobManager:
     def _refresh_job(self, job: Job) -> None:
         if job.status not in ["running", "stopping"]:
             return
-        exit_code = job.process.poll()
+        exit_code = job.process.returncode
         if exit_code is not None:
             self._record_exit(job, exit_code)
 
-    def _spawn(self, command, display_command: str, description: str,
-               background: bool, timeout_ms: int | None, shell: bool) -> Job:
+    async def _spawn(self, command, display_command: str, description: str,
+                     background: bool, timeout_ms: int | None, shell: bool) -> Job:
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -527,14 +540,22 @@ class JobManager:
             timeout_ms=timeout_ms,
         )
         with open(stdout_path, 'wb') as stdout_file, open(stderr_path, 'wb') as stderr_file:
-            proc = subprocess.Popen(
-                command,
-                shell=shell,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                start_new_session=True,
-            )
+            if shell:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
         job.process = proc
         job.pid = proc.pid
         try:
@@ -548,11 +569,7 @@ class JobManager:
         return job
 
     async def _wait_for_job(self, job: Job) -> int:
-        while True:
-            exit_code = job.process.poll()
-            if exit_code is not None:
-                return exit_code
-            await asyncio.sleep(0.1)
+        return await job.process.wait()
 
     async def _monitor_background_job(self, job: Job) -> None:
         try:
@@ -570,7 +587,7 @@ class JobManager:
     async def run_foreground(self, command, display_command: str, timeout_ms: int,
                              description: str = "", shell: bool = False,
                              output_chars: int = BASH_MAX_OUTPUT_CHARS):
-        job = self._spawn(command, display_command, description, False, timeout_ms, shell)
+        job = await self._spawn(command, display_command, description, False, timeout_ms, shell)
         try:
             exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=timeout_ms / 1000)
         except asyncio.TimeoutError:
@@ -606,7 +623,7 @@ class JobManager:
         timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
 
         if run_in_background:
-            job = self._spawn(command, command, description, True, None, True)
+            job = await self._spawn(command, command, description, True, None, True)
             try:
                 asyncio.get_running_loop().create_task(self._monitor_background_job(job))
             except RuntimeError:
@@ -1068,6 +1085,14 @@ def _handle_bash(args: dict) -> str:
                     dangerously_disable_sandbox=args.get("dangerously_disable_sandbox", False))
 
 
+async def _handle_bash_async(args: dict) -> str:
+    return await run_bash_async(args["command"],
+                                timeout=args.get("timeout"),
+                                description=args.get("description", ""),
+                                run_in_background=args.get("run_in_background", False),
+                                dangerously_disable_sandbox=args.get("dangerously_disable_sandbox", False))
+
+
 def _handle_read(args: dict) -> str:
     return run_read(args["file_path"], offset=args.get("offset"), limit=args.get("limit"))
 
@@ -1085,6 +1110,10 @@ def _handle_glob(args: dict) -> str:
     return run_glob(args["pattern"], args.get("path"))
 
 
+async def _handle_glob_async(args: dict) -> str:
+    return await run_glob_async(args["pattern"], args.get("path"))
+
+
 def _handle_grep(args: dict) -> str:
     return run_grep(args["pattern"],
                     path=args.get("path"),
@@ -1093,6 +1122,16 @@ def _handle_grep(args: dict) -> str:
                     **{k: v for k, v in args.items()
                        if k in ["-B", "-A", "-C", "context", "-n", "-i", "-o",
                                 "type", "head_limit", "offset", "multiline"]})
+
+
+async def _handle_grep_async(args: dict) -> str:
+    extra = {k: v for k, v in args.items()
+             if k not in ["pattern", "path", "glob", "output_mode"]}
+    return await run_grep_async(args["pattern"],
+                                path=args.get("path"),
+                                glob=args.get("glob"),
+                                output_mode=args.get("output_mode", "files_with_matches"),
+                                **extra)
 
 
 def _handle_jobs(args: dict) -> str:
@@ -1122,18 +1161,25 @@ def _handle_agent(args: dict) -> str:
                      subagent_type=args.get("subagent_type", "Explore"))
 
 
+async def _handle_agent_async(args: dict) -> str:
+    return await run_agent_async(args.get("description", ""),
+                                 args["prompt"],
+                                 args.get("run_in_background", False),
+                                 args.get("subagent_type", "Explore"))
+
+
 def _handle_skill(args: dict) -> str:
     return run_skill(args["skill"], args.get("args"))
 
 
-def _handle_webfetch(args: dict) -> str:
-    return run_webfetch(args["url"], args["prompt"])
+async def _handle_webfetch_async(args: dict) -> str:
+    return await run_webfetch_async(args["url"], args["prompt"])
 
 
-def _handle_websearch(args: dict) -> str:
-    return run_websearch(args["query"],
-                         allowed_domains=args.get("allowed_domains"),
-                         blocked_domains=args.get("blocked_domains"))
+async def _handle_websearch_async(args: dict) -> str:
+    return await run_websearch_async(args["query"],
+                                     allowed_domains=args.get("allowed_domains"),
+                                     blocked_domains=args.get("blocked_domains"))
 
 
 def _tool_result(ok: bool, content) -> dict:
@@ -1142,37 +1188,6 @@ def _tool_result(ok: bool, content) -> dict:
 
 def _looks_like_tool_error(content: str) -> bool:
     return content.startswith("Error: ") or content.startswith("Failed")
-
-
-def with_exception_to_tool_result(context: str, thunk) -> dict:
-    try:
-        content = thunk()
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except FileNotFoundError as e:
-        return _tool_result(False, f"Error while {context}: file not found: {e}")
-    except PermissionError as e:
-        return _tool_result(False, f"Error while {context}: permission denied: {e}")
-    except TimeoutError as e:
-        return _tool_result(False, f"Error while {context}: timed out: {e}")
-    except OSError as e:
-        return _tool_result(False, f"Error while {context}: OS error: {e}")
-    except ValueError as e:
-        return _tool_result(False, f"Error while {context}: invalid value: {e}")
-    except Exception as e:
-        return _tool_result(False, f"Failed while {context}: {type(e).__name__}: {e}")
-
-    text = str(content)
-    return _tool_result(not _looks_like_tool_error(text), text)
-
-
-def dispatch_tool(fn_name: str, args: dict, allowed=None) -> dict:
-    spec = TOOL_REGISTRY.get(fn_name)
-    if spec is None:
-        return _tool_result(False, f"Unknown function: {fn_name}")
-    if allowed is not None and fn_name not in allowed:
-        return _tool_result(False, f"Tool {fn_name} not available in this subagent (allowed: {sorted(allowed)})")
-    return with_exception_to_tool_result(f"executing {fn_name}", lambda: spec["handler"](args))
 
 
 async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
@@ -1205,106 +1220,18 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None) -> dict:
         return _tool_result(False, f"Tool {fn_name} not available in this subagent (allowed: {sorted(allowed)})")
 
     async def run_handler():
-        if fn_name == "Bash":
-            return await run_bash_async(args["command"],
-                                        timeout=args.get("timeout"),
-                                        description=args.get("description", ""),
-                                        run_in_background=args.get("run_in_background", False),
-                                        dangerously_disable_sandbox=args.get("dangerously_disable_sandbox", False))
-        if fn_name == "Glob":
-            return await run_glob_async(args["pattern"], args.get("path"))
-        if fn_name == "Grep":
-            extra = {k: v for k, v in args.items()
-                     if k not in ["pattern", "path", "glob", "output_mode"]}
-            return await run_grep_async(args["pattern"],
-                                        path=args.get("path"),
-                                        glob=args.get("glob"),
-                                        output_mode=args.get("output_mode", "files_with_matches"),
-                                        **extra)
-        if fn_name == "Agent":
-            return await run_agent_async(args.get("description", ""),
-                                         args["prompt"],
-                                         args.get("run_in_background", False),
-                                         args.get("subagent_type", "Explore"))
-        if fn_name == "Jobs":
-            return run_jobs()
-        if fn_name == "JobStatus":
-            return run_job_status(args["job_id"], args.get("tail_chars", JOB_TAIL_CHARS))
-        if fn_name == "JobStop":
-            return run_job_stop(args["job_id"], args.get("force", False))
-        return await asyncio.to_thread(spec["handler"], args)
+        if spec.get("async_handler") is not None:
+            return await spec["async_handler"](args)
+        return spec["handler"](args)
 
     return await with_exception_to_tool_result_async(f"executing {fn_name}", run_handler)
-
-
-def run_tool_loop(messages: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
-                  chat_fn=None, on_event=None) -> str:
-    """Run the raw model/tool protocol loop. Mutates `messages` in place."""
-    if chat_fn is None:
-        chat_fn = lambda msgs: chat_completion(msgs, tools=TOOLS)
-    if on_event is None:
-        on_event = lambda event: None
-
-    loop_count = 0
-    while True:
-        loop_count += 1
-        if loop_count > max_loops:
-            messages.append({"role": "system",
-                             "content": "Max tool loop limit reached. Stop calling tools and respond."})
-            on_event({"type": "max_loops"})
-        try:
-            resp = chat_fn(messages)
-        except OSError as e:
-            on_event({"type": "network_error", "error": e})
-            return ""
-        if not resp:
-            return ""
-
-        msg = resp["choices"][0]["message"]
-        clean_msg = {"role": msg["role"]}
-        if msg.get("content"):
-            clean_msg["content"] = msg["content"]
-
-        if msg.get("tool_calls"):
-            clean_msg["tool_calls"] = msg["tool_calls"]
-
-        messages.append(clean_msg)
-        if clean_msg.get("content"):
-            on_event({"type": "assistant_message", "content": clean_msg["content"]})
-
-        if not clean_msg.get("tool_calls"):
-            return clean_msg.get("content", "")
-
-        for tc in clean_msg["tool_calls"]:
-            fn_name = tc["function"]["name"]
-            try:
-                args = json.loads(tc["function"]["arguments"])
-            except Exception as e:
-                args = {}
-                result = _tool_result(False, f"Failed to parse arguments: {e}")
-            else:
-                validation_error = validate_tool_args(fn_name, args)
-                if validation_error:
-                    result = _tool_result(False, validation_error)
-                    on_event({"type": "tool_rejected", "name": fn_name, "args": args})
-                else:
-                    on_event({"type": "tool_call", "name": fn_name, "args": args})
-                    result = dispatch_tool(fn_name, args, allowed=allowed)
-            if not result["ok"]:
-                on_event({"type": "tool_error", "result": result["content"]})
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": fn_name,
-                "content": result["content"],
-            })
 
 
 async def run_tool_loop_async(messages: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
                               chat_fn=None, on_event=None) -> str:
     """Run the raw model/tool protocol loop asynchronously. Mutates `messages` in place."""
     if chat_fn is None:
-        chat_fn = lambda msgs: asyncio.to_thread(chat_completion, msgs, TOOLS)
+        chat_fn = lambda msgs: async_chat_completion(msgs, tools=TOOLS)
     if on_event is None:
         on_event = lambda event: None
 
@@ -1396,17 +1323,9 @@ def _terminal_agent_event(event: dict) -> None:
         terminal.reset_colors_and_flags()
 
 
-def run_terminal_turn(messages: list) -> str:
-    return run_tool_loop(
-        messages,
-        chat_fn=lambda msgs: chat_completion(msgs, tools=TOOLS, show_timing=True, report_errors=True),
-        on_event=_terminal_agent_event,
-    )
-
-
 async def run_terminal_turn_async(messages: list) -> str:
     async def chat_fn(msgs):
-        return await asyncio.to_thread(chat_completion, msgs, TOOLS, True, True)
+        return await async_chat_completion(msgs, TOOLS, True, True)
 
     return await run_tool_loop_async(
         messages,
@@ -1415,8 +1334,8 @@ async def run_terminal_turn_async(messages: list) -> str:
     )
 
 
-def run_toolless_completion(messages: list) -> str:
-    resp = chat_completion(messages, tools=[])
+async def run_toolless_completion_async(messages: list) -> str:
+    resp = await async_chat_completion(messages, tools=[])
     if not resp:
         return ""
     msg = resp["choices"][0]["message"]
@@ -1588,6 +1507,12 @@ def _decode_http_text(raw: bytes, headers, default_charset: str = 'utf-8') -> st
         charset = get_content_charset()
         if charset:
             candidates.append(charset)
+    elif isinstance(headers, dict):
+        content_type = headers.get('content-type') or headers.get('Content-Type') or ''
+        for part in content_type.split(';')[1:]:
+            name, sep, value = part.strip().partition('=')
+            if sep and name.lower() == 'charset':
+                candidates.append(value.strip('"'))
     candidates.append(default_charset)
 
     seen = set()
@@ -1601,25 +1526,6 @@ def _decode_http_text(raw: bytes, headers, default_charset: str = 'utf-8') -> st
         except (LookupError, UnicodeDecodeError):
             continue
     return raw.decode(default_charset, errors='replace')
-
-
-def _read_http_text_response(resp, max_bytes: int) -> tuple[str, bool]:
-    raw = resp.read(max_bytes + 1)
-    truncated = len(raw) > max_bytes
-    if truncated:
-        raw = raw[:max_bytes]
-    return _decode_http_text(raw, resp.headers), truncated
-
-
-def _response_status(resp) -> int:
-    status = resp.getcode()
-    if status is None:
-        raise ValueError("HTTP response did not include a status code")
-    return status
-
-
-def _response_content_type(resp) -> str:
-    return resp.headers.get('content-type') or ''
 
 
 def _content_media_type(content_type: str) -> str:
@@ -1677,7 +1583,209 @@ def _parse_duckduckgo_results(html: str) -> list[dict]:
     return parser.results
 
 
-def _fetch_url(url: str) -> dict:
+@dataclass
+class HttpResponse:
+    url: str
+    status: int
+    reason: str
+    headers: dict
+    body: bytes
+    truncated: bool = False
+
+    def header(self, name: str, default: str = "") -> str:
+        return self.headers.get(name.lower(), default)
+
+
+def _host_header(parsed) -> str:
+    default_port = 443 if parsed.scheme == 'https' else 80
+    if parsed.port and parsed.port != default_port:
+        return f"{parsed.hostname}:{parsed.port}"
+    return parsed.hostname or ''
+
+
+def _request_target(parsed) -> str:
+    path = parsed.path or '/'
+    if parsed.params:
+        path += ';' + parsed.params
+    if parsed.query:
+        path += '?' + parsed.query
+    return path
+
+
+async def _read_headers(reader: asyncio.StreamReader) -> tuple[str, dict]:
+    total = 0
+    status_line = await reader.readline()
+    if not status_line:
+        raise OSError("empty HTTP response")
+    total += len(status_line)
+    header_lines = []
+    while True:
+        line = await reader.readline()
+        if not line:
+            break
+        total += len(line)
+        if total > HTTP_HEADER_MAX_BYTES:
+            raise OSError("HTTP headers too large")
+        if line in (b'\r\n', b'\n'):
+            break
+        header_lines.append(line.decode('iso-8859-1').rstrip('\r\n'))
+
+    headers_out = {}
+    for line in header_lines:
+        if ':' not in line:
+            continue
+        name, value = line.split(':', 1)
+        key = name.strip().lower()
+        value = value.strip()
+        if key in headers_out:
+            headers_out[key] += ', ' + value
+        else:
+            headers_out[key] = value
+    return status_line.decode('iso-8859-1').rstrip('\r\n'), headers_out
+
+
+async def _read_until_eof(reader: asyncio.StreamReader, max_bytes: int) -> tuple[bytes, bool]:
+    chunks = []
+    total = 0
+    truncated = False
+    while True:
+        chunk = await reader.read(min(65536, max_bytes + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            truncated = True
+            break
+    body = b''.join(chunks)
+    if len(body) > max_bytes:
+        return body[:max_bytes], True
+    return body, truncated
+
+
+async def _read_content_length(reader: asyncio.StreamReader, length: int,
+                               max_bytes: int) -> tuple[bytes, bool]:
+    to_read = min(length, max_bytes + 1)
+    body = await reader.readexactly(to_read) if to_read else b''
+    truncated = length > max_bytes or len(body) > max_bytes
+    if len(body) > max_bytes:
+        body = body[:max_bytes]
+    return body, truncated
+
+
+async def _read_chunked_body(reader: asyncio.StreamReader, max_bytes: int) -> tuple[bytes, bool]:
+    chunks = []
+    total = 0
+    truncated = False
+    while True:
+        line = await reader.readline()
+        if not line:
+            break
+        size_text = line.split(b';', 1)[0].strip()
+        try:
+            size = int(size_text, 16)
+        except ValueError:
+            raise OSError(f"invalid chunk size {size_text!r}")
+        if size == 0:
+            await reader.readline()
+            break
+        data = await reader.readexactly(size)
+        await reader.readexactly(2)  # CRLF
+        keep = 0
+        if total < max_bytes:
+            keep = min(size, max_bytes - total)
+            chunks.append(data[:keep])
+            total += keep
+        if size > keep:
+            truncated = True
+            break
+    return b''.join(chunks), truncated
+
+
+async def async_http_request(method: str, request_url: str, *, headers_in: dict = None,
+                             body: bytes = b'', timeout: int = 30,
+                             max_bytes: int = HTTP_MAX_RESPONSE_BYTES) -> HttpResponse:
+    async def request_once() -> HttpResponse:
+        parsed = urllib.parse.urlparse(request_url)
+        if parsed.scheme not in ['http', 'https'] or not parsed.hostname:
+            raise ValueError(f"unsupported URL: {request_url}")
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        ssl_context = ssl.create_default_context() if parsed.scheme == 'https' else None
+        reader, writer = await asyncio.open_connection(
+            parsed.hostname,
+            port,
+            ssl=ssl_context,
+            server_hostname=parsed.hostname if ssl_context else None,
+        )
+        try:
+            request_headers = {
+                'Host': _host_header(parsed),
+                'Connection': 'close',
+            }
+            if headers_in:
+                request_headers.update(headers_in)
+            if body:
+                request_headers['Content-Length'] = str(len(body))
+            lines = [f"{method.upper()} {_request_target(parsed)} HTTP/1.1"]
+            lines.extend(f"{name}: {value}" for name, value in request_headers.items())
+            raw_request = ("\r\n".join(lines) + "\r\n\r\n").encode('iso-8859-1') + body
+            writer.write(raw_request)
+            await writer.drain()
+
+            status_line, response_headers = await _read_headers(reader)
+            parts = status_line.split(' ', 2)
+            if len(parts) < 2 or not parts[1].isdigit():
+                raise OSError(f"invalid HTTP status line: {status_line!r}")
+            status = int(parts[1])
+            reason = parts[2] if len(parts) > 2 else ''
+            transfer_encoding = response_headers.get('transfer-encoding', '').lower()
+            if 'chunked' in transfer_encoding:
+                response_body, truncated = await _read_chunked_body(reader, max_bytes)
+            elif response_headers.get('content-length', '').isdigit():
+                response_body, truncated = await _read_content_length(
+                    reader, int(response_headers['content-length']), max_bytes)
+            else:
+                response_body, truncated = await _read_until_eof(reader, max_bytes)
+            return HttpResponse(request_url, status, reason, response_headers, response_body, truncated)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    return await asyncio.wait_for(request_once(), timeout=timeout)
+
+
+def _redirect_location(response: HttpResponse) -> str | None:
+    location = response.header('location')
+    if response.status in range(300, 400) and location:
+        return urllib.parse.urljoin(response.url, location)
+    return None
+
+
+async def async_http_request_follow_same_host(method: str, request_url: str, *,
+                                              headers_in: dict = None, body: bytes = b'',
+                                              timeout: int = 30,
+                                              max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
+                                              max_redirects: int = 5) -> HttpResponse:
+    current_url = request_url
+    original_host = urllib.parse.urlparse(request_url).netloc
+    for _ in range(max_redirects + 1):
+        response = await async_http_request(method, current_url, headers_in=headers_in,
+                                            body=body, timeout=timeout, max_bytes=max_bytes)
+        next_url = _redirect_location(response)
+        if not next_url:
+            return response
+        next_host = urllib.parse.urlparse(next_url).netloc
+        if next_host != original_host:
+            response.url = next_url
+            return response
+        current_url = next_url
+    return response
+
+
+async def _fetch_url_async(url: str) -> dict:
     """GET a URL with redirect tracking, return dict with content/contentType/status/finalUrl/redirects.
     HTTP is upgraded to HTTPS. Cross-host redirects are surfaced, not followed."""
     if url.startswith('http://'):
@@ -1689,40 +1797,35 @@ def _fetch_url(url: str) -> dict:
     if not parsed.scheme or not parsed.netloc:
         return {'error': f'invalid URL: {url}'}
 
-    req = urllib.request.Request(url, headers={
+    request_headers = {
         'User-Agent': 'loki-WebFetch/0.1 (coding-agent)',
         'Accept': 'text/markdown;q=1.0, text/html;q=0.9, text/plain;q=0.8, application/json;q=0.7, */*;q=0.1',
         'Accept-Language': 'en-US,en;q=0.9',
-    })
+    }
     try:
-        with urllib.request.urlopen(req, timeout=WEBFETCH_TIMEOUT_S) as resp:
-            status = _response_status(resp)
-            content_type = _response_content_type(resp)
-            body, truncated = _read_http_text_response(resp, WEBFETCH_MAX_BYTES)
-            final_url = resp.geturl()
-            return {'content': body, 'contentType': content_type, 'status': status,
-                    'finalUrl': final_url, 'truncated': truncated, 'error': None}
-    except urllib.error.HTTPError as e:
-        return {'error': f'HTTP {e.code} {e.reason}', 'status': e.code, 'finalUrl': url}
-    except urllib.error.URLError as e:
-        return {'error': f'URL error: {e.reason}', 'finalUrl': url}
+        response = await async_http_request_follow_same_host(
+            'GET', url, headers_in=request_headers,
+            timeout=WEBFETCH_TIMEOUT_S, max_bytes=WEBFETCH_MAX_BYTES)
+        content_type = response.header('content-type')
+        body = _decode_http_text(response.body, response.headers)
+        return {'content': body, 'contentType': content_type, 'status': response.status,
+                'finalUrl': response.url, 'truncated': response.truncated, 'error': None}
     except Exception as e:
         return {'error': f'fetch failed: {e}', 'finalUrl': url}
 
 
-def run_webfetch(url: str, prompt: str) -> str:
+async def run_webfetch_async(url: str, prompt: str) -> str:
     if not url:
         return "Error: url is required"
     if not prompt:
         return "Error: prompt is required"
-    import time as _time
-    now = _time.time()
-    cached = _webfetch_cache.get(url) # WHAT, IDIOT? DIY LruCache ??? what the FUCK is going on here?
+    now = time.time()
+    cached = _webfetch_cache.get(url)
     if cached and now - cached[0] < WEBFETCH_CACHE_TTL:
         content_text, content_type, final_url, status = cached[1], cached[2], cached[3], cached[4]
         cache_hit = True
     else:
-        response = _fetch_url(url)
+        response = await _fetch_url_async(url)
         if response.get('error'):
             return f"Error: {response['error']}"
         content_type = response['contentType']
@@ -1757,13 +1860,13 @@ def run_webfetch(url: str, prompt: str) -> str:
         {"role": "user",
          "content": f"URL: {final_url}\nContent-Type: {content_type}\nPrompt: {prompt}\n\n--- Page content ---\n{content_text}"},
     ]
-    answer = run_toolless_completion(msgs) or "(no answer returned)"
+    answer = await run_toolless_completion_async(msgs) or "(no answer returned)"
     header = f"[WebFetch status={status} cache_hit={cache_hit} bytes~={len(content_text)} url={final_url}]"
     return f"{header}\n{answer}{cross_host_note}"
 
 
-
-def run_websearch(query: str, allowed_domains: list = None, blocked_domains: list = None) -> str:
+async def run_websearch_async(query: str, allowed_domains: list = None,
+                              blocked_domains: list = None) -> str:
     if not query or len(query) < 2:
         return "Error: query must be at least 2 characters"
     if allowed_domains and blocked_domains:
@@ -1774,15 +1877,20 @@ def run_websearch(query: str, allowed_domains: list = None, blocked_domains: lis
         return "Error: blocked_domains max 20 entries"
 
     form = urllib.parse.urlencode({'q': query, 'b': '', 'kl': 'us-en'})
-    req = urllib.request.Request(
-        DUCKDUCKGO_HTML_SEARCH_URL,
-        data=form.encode('utf-8'),
-        headers={'User-Agent': 'loki-WebSearch/0.1 (coding-agent)',
-                 'Content-Type': 'application/x-www-form-urlencoded'},
-        method='POST')
     try:
-        with urllib.request.urlopen(req, timeout=WEBSEARCH_TIMEOUT_S) as resp:
-            html, _truncated = _read_http_text_response(resp, WEBSEARCH_MAX_RESPONSE_BYTES)
+        response = await async_http_request(
+            'POST',
+            DUCKDUCKGO_HTML_SEARCH_URL,
+            body=form.encode('utf-8'),
+            headers_in={'User-Agent': 'loki-WebSearch/0.1 (coding-agent)',
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'},
+            timeout=WEBSEARCH_TIMEOUT_S,
+            max_bytes=WEBSEARCH_MAX_RESPONSE_BYTES,
+        )
+        if response.status >= 400:
+            return f"Error: web search request failed: HTTP {response.status} {response.reason}"
+        html = _decode_http_text(response.body, response.headers)
     except Exception as e:
         return f"Error: web search request failed: {e}"
 
@@ -2196,33 +2304,47 @@ TOOL_HANDLERS = {
     "Read": {"handler": _handle_read, "explore": True},
     "Write": {"handler": _handle_write},
     "Edit": {"handler": _handle_edit},
-    "Bash": {"handler": _handle_bash, "explore": True},
+    "Bash": {"handler": _handle_bash, "async_handler": _handle_bash_async, "explore": True},
     "Jobs": {"handler": _handle_jobs, "explore": True},
     "JobStatus": {"handler": _handle_job_status, "explore": True},
     "JobStop": {"handler": _handle_job_stop, "explore": True},
-    "Glob": {"handler": _handle_glob, "explore": True},
-    "Grep": {"handler": _handle_grep, "explore": True},
+    "Glob": {"handler": _handle_glob, "async_handler": _handle_glob_async, "explore": True},
+    "Grep": {"handler": _handle_grep, "async_handler": _handle_grep_async, "explore": True},
     "TodoRead": {"handler": _handle_todoread, "explore": True},
     "TodoWrite": {"handler": _handle_todowrite, "explore": True},
-    "Agent": {"handler": _handle_agent},
+    "Agent": {"handler": _handle_agent, "async_handler": _handle_agent_async},
     "Skill": {"handler": _handle_skill},
-    "WebFetch": {"handler": _handle_webfetch, "explore": True},
-    "WebSearch": {"handler": _handle_websearch, "explore": True},
+    "WebFetch": {"async_handler": _handle_webfetch_async, "explore": True},
+    "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
 }
 TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]
 EXPLORE_TOOLS = {name for name, spec in TOOL_REGISTRY.items() if spec["explore"]}
 
-def _chat_request(url: str, payload, report_errors: bool = False,
-                  show_timing: bool = False) -> dict:
-    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8') if payload is not None else None, headers=headers)
+async def async_chat_request(request_url: str, payload, report_errors: bool = False,
+                             show_timing: bool = False) -> dict:
     start = time.perf_counter()
     try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
+        body = json.dumps(payload).encode('utf-8') if payload is not None else b''
+        method = 'POST' if payload is not None else 'GET'
+        response = await async_http_request(
+            method,
+            request_url,
+            body=body,
+            headers_in=headers,
+            timeout=WEBFETCH_TIMEOUT_S,
+            max_bytes=HTTP_MAX_RESPONSE_BYTES,
+        )
+        response_text = _decode_http_text(response.body, response.headers)
+        if response.status >= 400:
+            if report_errors:
+                print(f"API Error for <{request_url}>: HTTP {response.status} {response.reason}: "
+                      f"{response_text[:1000]}", file=sys.stderr)
+            return None
+        data = json.loads(response_text)
     except OSError as e:
         if report_errors:
-            print(f"API Error for <{url}>: {e}", file=sys.stderr)
+            print(f"API Error for <{request_url}>: {e}", file=sys.stderr)
         return None
 
     elapsed = time.perf_counter() - start
@@ -2230,29 +2352,40 @@ def _chat_request(url: str, payload, report_errors: bool = False,
         print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]", file=sys.stderr)
     return data
 
-def chat_completion(messages: list, tools=TOOLS, report_errors: bool = False,
-                    show_timing: bool = False) -> dict:
+
+async def async_chat_completion(messages: list, tools=TOOLS, report_errors: bool = False,
+                                show_timing: bool = False) -> dict:
     payload = {
         "model": model,
         "messages": messages,
     }
     if tools is not None:
         payload["tools"] = tools
-    return _chat_request(url, payload, report_errors=report_errors, show_timing=show_timing)
+    return await async_chat_request(url, payload, report_errors=report_errors,
+                                    show_timing=show_timing)
 
-models = _chat_request(url.replace('/v1/chat/completions', '/v1/models'), None)
-models = [item['id'] for item in models['data'] if item['object'] == 'model']
 
-model = 'glm-5.2' if 'glm-5.2' in models else models[0]
+models = []
+model = os.environ.get('LOKI_MODEL', 'glm-5.2')
+
+
+async def load_models_async() -> None:
+    global models
+    global model
+    data = await async_chat_request(url.replace('/v1/chat/completions', '/v1/models'), None,
+                                    report_errors=True)
+    if not data:
+        models = [model]
+        return
+    loaded = [item['id'] for item in data.get('data', []) if item.get('object') == 'model']
+    if not loaded:
+        models = [model]
+        return
+    models = loaded
+    if model not in models:
+        model = 'glm-5.2' if 'glm-5.2' in models else models[0]
 
 #models = ['hy3-preview', 'glm-5.2', 'glm-5.1', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro', 'deepseek-v4-flash', 'mimo-v2.5', 'mimo-v2.5-pro']
-
-def count_leading_ones_math(byte: int) -> int:
-    # ~byte inverts the bits.
-    # & 0xFF ensures we only care about the 8 least-significant bits.
-    # .bit_length() tells us where the highest '1' is.
-    return 8 - (~byte & 0xFF).bit_length()
-
 
 if not os.isatty(sys.stdout.fileno()):
   class Terminal:
@@ -2314,82 +2447,6 @@ else:
     def disable_bracketed_paste_mode(self):
         print('\033[?2004l', end='')
 
-	# TODO: set raw; set nonecho maybe
-
-    def read_key(self):
-       result = io.BytesIO()
-       ansi_escape = None
-       utf8_count = None
-       while True:
-           c = os.read(0, 1)
-           if c == b'': # EOF
-               return 'EOF'
-
-           if ansi_escape is None:
-               if c == b'\n' and not self.bracketed_paste:
-                   return '\n'
-
-               if c == b'\033':
-                   ansi_escape = io.BytesIO()
-               else:
-                   if c[0] >= 0xc0: # on purpose this will start another utf-8 run (in case there was intermittent connection loss)
-                       utf8_count = count_leading_ones_math(c[0])
-                       # note: assert utf8_count <= 4
-                       # fallthrough
-
-                   result.write(c)
-                   if c[0] < 0x80: # ASCII
-                       break
-                   elif c[0] >= 0x80 and c[0] < 0xc0: # 0b10... ; not 0b11... # not a transmission error
-                       if utf8_count is not None:
-                           utf8_count = utf8_count - 1
-
-                       if utf8_count == 0: # finished utf-8
-                           break
-                   else: # transmission error
-                       pass  # uhh now what? I got a random extra character I don't want.
-           else:
-               ansi_escape.write(c)
-               if c[0] in b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ~':
-                   ansi = ansi_escape.getvalue().decode('utf-8', errors='replace')
-                   ansi_escape = None
-                   if len(ansi) > 0:
-                       match ansi[0]:
-                           case '[':
-                               match ansi[-1]:
-                                 case 'A':
-                                    return 'CURSOR_UP'
-                                 case 'B':
-                                    return 'CURSOR_DOWN'
-                                 case 'C':
-                                    return 'CURSOR_RIGHT'
-                                 case 'D':
-                                    return 'CURSOR_LEFT'
-                                 case '~':
-                                   for v in ansi[1:-1].split():
-                                       try:
-                                           v = int(v)
-                                           match v:
-                                               case 3: # Delete
-                                                   return 'DELETE'
-                                               case 5: # page up
-                                                   return 'PAGE_UP'
-                                               case 6: # page down
-                                                   return 'PAGE_DOWN'
-                                               case 200: # beginning of bracketed paste
-                                                   self.bracketed_paste = True
-                                               case 201: # end of bracketed paste
-                                                   self.bracketed_paste = False
-                                       except ValueError:
-                                           pass
-                               pass
-                           case _:
-                               pass
-
-                   break
-
-       return result.getvalue().decode('utf-8', errors='replace')
-
     def markdown_to_ansi(self, text: str) -> str:
         # We split the text by inline code blocks.
         # Using a capture group `(`.*?`)` ensures the code segments are kept in the resulting list.
@@ -2443,33 +2500,383 @@ def update_status_bar():
     terminal.clear_to_end_of_screen()
     print('Model: {}; Hint: Use /quit to quit, /model to switch model, !foo to execute shell command foo'.format(model), end='')
 
-def get_input(prompt=None):
-    terminal.set_clipping_region(*input_area)
-    terminal.goto_position(1, 1)
-    terminal.set_background_color(INPUT_COLOR)
-    terminal.clear_to_end_of_screen() # also clears status bar
-    update_status_bar()
-    terminal.set_clipping_region(*input_area)
-    terminal.goto_position(1, 1)
-    terminal.set_background_color(INPUT_COLOR)
-    terminal.flush()
-    # TODO: read raw keys
-    text = input(prompt or 'User: ')
-    #terminal.save_cursor_position()
-    terminal.set_clipping_region(*output_area)
-    terminal.restore_cursor_position()
-    return text
 
-# TODO: use.
-def run_menu(items):
+def refresh_terminal_layout():
+    global terminal_lines
+    global output_area
+    global input_area
+    global status_area
+    try:
+        terminal_size = os.get_terminal_size()
+        terminal_lines = terminal_size.lines + 1
+    except OSError:
+        terminal_lines = 25
+    output_area = 1, terminal_lines - 4
+    input_area = terminal_lines - 4, terminal_lines - 2
+    status_area = terminal_lines - 2, terminal_lines
+
+
+@dataclass
+class KeyEvent:
+    kind: str
+    text: str = ""
+
+
+class AsyncByteReader:
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.loop = None
+        self.queue = asyncio.Queue()
+        self.old_flags = None
+
+    def _on_readable(self):
+        try:
+            data = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError as e:
+            self.queue.put_nowait(e)
+            return
+        self.queue.put_nowait(data)
+
+    async def __aenter__(self):
+        self.loop = asyncio.get_running_loop()
+        self.old_flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, self.old_flags | os.O_NONBLOCK)
+        self.loop.add_reader(self.fd, self._on_readable)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.loop is not None:
+            self.loop.remove_reader(self.fd)
+        if self.old_flags is not None:
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, self.old_flags)
+
+    async def read(self):
+        item = await self.queue.get()
+        if isinstance(item, OSError):
+            raise item
+        return item
+
+
+class TerminalMode:
+    def __init__(self, fd: int, enabled: bool):
+        self.fd = fd
+        self.enabled = enabled
+        self.old_attrs = None
+
+    def __enter__(self):
+        if self.enabled:
+            self.old_attrs = termios.tcgetattr(self.fd)
+            new_attrs = termios.tcgetattr(self.fd)
+            new_attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            new_attrs[6][termios.VMIN] = 1
+            new_attrs[6][termios.VTIME] = 0
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, new_attrs)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.old_attrs is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
+
+
+KEY_SEQUENCES = {
+    b'\x1b[A': "CURSOR_UP",
+    b'\x1b[B': "CURSOR_DOWN",
+    b'\x1b[C': "CURSOR_RIGHT",
+    b'\x1b[D': "CURSOR_LEFT",
+    b'\x1b[H': "HOME",
+    b'\x1b[F': "END",
+    b'\x1b[3~': "DELETE",
+    b'\x1b[5~': "PAGE_UP",
+    b'\x1b[6~': "PAGE_DOWN",
+    b'\x1b[200~': "PASTE_START",
+    b'\x1b[201~': "PASTE_END",
+}
+CSI_FINAL_BYTES = set(range(0x40, 0x7f))
+
+
+class AsyncKeyReader:
+    def __init__(self, fd: int, watch_resize: bool = False):
+        self.fd = fd
+        self.watch_resize = watch_resize
+        self.byte_reader = AsyncByteReader(fd)
+        self.pending = collections.deque()
+        self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self.escape = bytearray()
+        self.paste_mode = False
+        self.loop = None
+
+    def _on_resize(self):
+        self.pending.append(KeyEvent("RESIZE"))
+        self.byte_reader.queue.put_nowait(b'')
+
+    async def __aenter__(self):
+        self.loop = asyncio.get_running_loop()
+        await self.byte_reader.__aenter__()
+        if self.watch_resize:
+            try:
+                self.loop.add_signal_handler(signal.SIGWINCH, self._on_resize)
+            except (NotImplementedError, RuntimeError):
+                pass
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.watch_resize and self.loop is not None:
+            try:
+                self.loop.remove_signal_handler(signal.SIGWINCH)
+            except (NotImplementedError, RuntimeError):
+                pass
+        await self.byte_reader.__aexit__(exc_type, exc, tb)
+
+    def _emit_text_byte(self, byte: int) -> None:
+        text = self.decoder.decode(bytes([byte]), final=False)
+        if text:
+            self.pending.append(KeyEvent("TEXT", text))
+
+    def _feed_byte(self, byte: int) -> None:
+        if self.escape:
+            self.escape.append(byte)
+            if self.escape == b'\x1b[':
+                return
+            if self.escape.startswith(b'\x1b[') and byte in CSI_FINAL_BYTES:
+                sequence = bytes(self.escape)
+                kind = KEY_SEQUENCES.get(sequence)
+                self.escape.clear()
+                if kind == "PASTE_START":
+                    self.paste_mode = True
+                    self.pending.append(KeyEvent(kind))
+                elif kind == "PASTE_END":
+                    self.paste_mode = False
+                    self.pending.append(KeyEvent(kind))
+                elif kind:
+                    self.pending.append(KeyEvent(kind))
+                return
+            if len(self.escape) == 2 and not self.escape.startswith(b'\x1b['):
+                self.escape.clear()
+                return
+            if len(self.escape) > 32:
+                self.escape.clear()
+            return
+
+        if byte == 0x1b:
+            self.escape.append(byte)
+        elif byte == 0x03:
+            self.pending.append(KeyEvent("CTRL_C"))
+        elif byte == 0x04:
+            self.pending.append(KeyEvent("CTRL_D"))
+        elif byte in (0x0a, 0x0d):
+            if self.paste_mode:
+                self.pending.append(KeyEvent("TEXT", "\n"))
+            else:
+                self.pending.append(KeyEvent("ENTER"))
+        elif byte in (0x7f, 0x08):
+            self.pending.append(KeyEvent("BACKSPACE"))
+        else:
+            self._emit_text_byte(byte)
+
+    async def read_key(self) -> KeyEvent:
+        while True:
+            if self.pending:
+                return self.pending.popleft()
+            chunk = await self.byte_reader.read()
+            if chunk == b'':
+                if self.pending:
+                    return self.pending.popleft()
+                return KeyEvent("EOF")
+            for byte in chunk:
+                self._feed_byte(byte)
+
+
+class InputBuffer:
+    def __init__(self):
+        self.chars = []
+        self.cursor = 0
+
+    def text(self) -> str:
+        return ''.join(self.chars)
+
+    def before_cursor(self) -> str:
+        return ''.join(self.chars[:self.cursor])
+
+    def insert(self, text: str) -> None:
+        for ch in text:
+            self.chars.insert(self.cursor, ch)
+            self.cursor += 1
+
+    def backspace(self) -> None:
+        if self.cursor > 0:
+            del self.chars[self.cursor - 1]
+            self.cursor -= 1
+
+    def delete(self) -> None:
+        if self.cursor < len(self.chars):
+            del self.chars[self.cursor]
+
+    def left(self) -> None:
+        self.cursor = max(0, self.cursor - 1)
+
+    def right(self) -> None:
+        self.cursor = min(len(self.chars), self.cursor + 1)
+
+    def home(self) -> None:
+        self.cursor = 0
+
+    def end(self) -> None:
+        self.cursor = len(self.chars)
+
+
+def _cell_width(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.east_asian_width(ch) in ["F", "W"]:
+        return 2
+    return 1
+
+
+def _wrap_for_terminal(text: str, width: int) -> list[str]:
+    width = max(1, width)
+    rows = [""]
+    column = 1
+    for ch in text:
+        if ch == '\n':
+            rows.append("")
+            column = 1
+            continue
+        ch_width = _cell_width(ch)
+        if column > 1 and column + ch_width - 1 > width:
+            rows.append("")
+            column = 1
+        rows[-1] += ch
+        column += ch_width
+    return rows
+
+
+def _screen_position(text: str, width: int) -> tuple[int, int]:
+    width = max(1, width)
+    row = 1
+    column = 1
+    for ch in text:
+        if ch == '\n':
+            row += 1
+            column = 1
+            continue
+        ch_width = _cell_width(ch)
+        if column > 1 and column + ch_width - 1 > width:
+            row += 1
+            column = 1
+        column += ch_width
+    return row, column
+
+
+class PromptRenderer:
+    def __init__(self, terminal, prompt: str):
+        self.terminal = terminal
+        self.prompt = prompt
+
+    def render(self, buffer: InputBuffer) -> None:
+        refresh_terminal_layout()
+        try:
+            width = os.get_terminal_size().columns
+        except OSError:
+            width = 80
+        width = max(1, width)
+        input_height = max(1, input_area[1] - input_area[0])
+        full_text = self.prompt + buffer.text()
+        cursor_row, cursor_column = _screen_position(self.prompt + buffer.before_cursor(), width)
+        first_row = max(0, cursor_row - input_height)
+        rows = _wrap_for_terminal(full_text, width)
+        visible_rows = rows[first_row:first_row + input_height]
+
+        self.terminal.set_clipping_region(*input_area)
+        self.terminal.goto_position(1, 1)
+        self.terminal.set_background_color(INPUT_COLOR)
+        self.terminal.clear_to_end_of_screen() # ESC[J clears the status area too.
+        update_status_bar()
+        self.terminal.set_clipping_region(*input_area)
+        self.terminal.goto_position(1, 1)
+        self.terminal.set_background_color(INPUT_COLOR)
+        print('\n'.join(visible_rows), end='')
+        self.terminal.goto_position(cursor_row - first_row, cursor_column)
+        self.terminal.flush()
+
+
+class PromptController:
+    def __init__(self, terminal, prompt: str = 'User: '):
+        self.terminal = terminal
+        self.prompt = prompt
+
+    async def read_text(self) -> str:
+        fd = sys.stdin.fileno()
+        interactive = os.isatty(fd) and os.isatty(sys.stdout.fileno())
+        buffer = InputBuffer()
+        renderer = PromptRenderer(self.terminal, self.prompt)
+        try:
+            with TerminalMode(fd, interactive):
+                if interactive:
+                    renderer.render(buffer)
+                async with AsyncKeyReader(fd, watch_resize=interactive) as reader:
+                    while True:
+                        event = await reader.read_key()
+                        if event.kind == "EOF":
+                            if buffer.text():
+                                return buffer.text()
+                            raise EOFError
+                        if event.kind == "CTRL_C":
+                            raise KeyboardInterrupt
+                        if event.kind == "CTRL_D":
+                            if buffer.text():
+                                return buffer.text()
+                            raise EOFError
+                        if event.kind == "ENTER":
+                            if interactive:
+                                print()
+                                self.terminal.flush()
+                            return buffer.text()
+                        if event.kind == "TEXT":
+                            buffer.insert(event.text)
+                        elif event.kind == "BACKSPACE":
+                            buffer.backspace()
+                        elif event.kind == "DELETE":
+                            buffer.delete()
+                        elif event.kind == "CURSOR_LEFT":
+                            buffer.left()
+                        elif event.kind == "CURSOR_RIGHT":
+                            buffer.right()
+                        elif event.kind == "HOME":
+                            buffer.home()
+                        elif event.kind == "END":
+                            buffer.end()
+                        elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
+                            buffer.home()
+                        elif event.kind in ["CURSOR_DOWN", "PAGE_DOWN"]:
+                            buffer.end()
+                        elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
+                            pass
+                        if interactive:
+                            renderer.render(buffer)
+        finally:
+            if interactive:
+                self.terminal.set_clipping_region(*output_area)
+                self.terminal.restore_cursor_position()
+
+
+async def get_input_async(prompt=None):
+    return await PromptController(terminal, prompt or 'User: ').read_text()
+
+
+def get_input(prompt=None):
+    return asyncio.run(get_input_async(prompt))
+
+
+async def run_menu_async(items):
     # Menus can be large--so show it in the output area.
     terminal.save_cursor_position()
     while True:
         terminal.restore_cursor_position()
         for i, item in enumerate(items):
             print(i + 1, '.', item)
-        #terminal.save_cursor_position()
-        selection = input('User choice: ') # TODO: just use get_input; and do terminal.save_cursor_position() before here.
+        selection = await get_input_async('User choice: ')
         selection = selection.strip()
         if selection.endswith('.'):
             selection = selection.rstrip('.')
@@ -2483,6 +2890,16 @@ def run_menu(items):
 
     terminal.save_cursor_position()
     return 'None of the above'
+
+
+def run_menu(items):
+    return asyncio.run(run_menu_async(items))
+
+
+def restore_output_area_after_input():
+    terminal.reset_colors_and_flags()
+    terminal.set_clipping_region(*output_area)
+    terminal.restore_cursor_position()
 
 def run_input_loop():
   while True:
@@ -2591,6 +3008,8 @@ async def async_main():
         elif option_name == '--toolset':
             toolset = option_value
 
+    await load_models_async()
+
     if subagent_type or headless:
         await run_subagent_cli_async(subagent_type or toolset or "Explore", prompt_arg)
         return
@@ -2625,10 +3044,11 @@ async def async_main():
                     "Use TodoWrite to plan multi-step work. Keep responses concise.")
     }]
     while True:
-        user_in = await asyncio.to_thread(get_input)
-        terminal.reset_colors_and_flags()
-        terminal.set_clipping_region(*output_area)
-        terminal.restore_cursor_position()
+        try:
+            user_in = await get_input_async()
+        except EOFError:
+            break
+        restore_output_area_after_input()
 
         if not user_in:
             terminal.save_cursor_position()
@@ -2639,7 +3059,7 @@ async def async_main():
             case '/quit':
                 break
             case '/model':
-                model = await asyncio.to_thread(run_menu, models)
+                model = await run_menu_async(models)
                 terminal.save_cursor_position()
                 continue
             case _:
