@@ -2428,8 +2428,35 @@ terminals.set_status_text_provider(
 messages = []
 session_todos = []
 
+
+def initial_messages():
+    return [{
+        "role": "system",
+        "content": ("You are a helpful system agent running in a terminal. You have these tools: "
+                    "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
+                    "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
+                    "Always Read a file before editing or overwriting it. "
+                    "Use TodoWrite to plan multi-step work. Keep responses concise.")
+    }]
+
+
+def user_prompt_history(message_list):
+    history = []
+    for message in message_list:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            history.append(content)
+    return history
+
+
 def new_chat_log(filename):
     global chat_log
+    global messages
+    global session_todos
+    messages = initial_messages()
+    session_todos = []
     chat_log = open(filename, 'w')
 
 def save_chat_log():
@@ -2543,17 +2570,9 @@ async def async_main():
         log_filename = 'chat-{}.json'.format(str(uuid.uuid4()))
         new_chat_log(log_filename)
 
-    messages = [{
-        "role": "system",
-        "content": ("You are a helpful system agent running in a terminal. You have these tools: "
-                    "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
-                    "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
-                    "Always Read a file before editing or overwriting it. "
-                    "Use TodoWrite to plan multi-step work. Keep responses concise.")
-    }]
     while True:
         try:
-            user_in = await get_input_async()
+            user_in = await get_input_async(history=user_prompt_history(messages))
         except EOFError:
             break
         restore_output_area_after_input()

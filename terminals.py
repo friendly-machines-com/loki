@@ -395,11 +395,10 @@ class PromptRenderer:
 
 
 class PromptController:
-    history = []
-
-    def __init__(self, terminal, prompt: str = 'User: '):
+    def __init__(self, terminal, prompt: str = 'User: ', history=None):
         self.terminal = terminal
         self.prompt = prompt
+        self.history = list(history or [])
 
     async def read_text(self) -> str:
         fd = sys.stdin.fileno()
@@ -449,10 +448,7 @@ class PromptController:
                             if interactive:
                                 print()
                                 self.terminal.flush()
-                            text = buffer.text()
-                            if text and (not self.history or self.history[-1] != text):
-                                self.history.append(text)
-                            return text
+                            return buffer.text()
                         if event.kind == "TEXT":
                             buffer.insert(event.text)
                         elif event.kind == "BACKSPACE":
@@ -493,12 +489,12 @@ class PromptController:
                 self.terminal.flush()
 
 
-async def get_input_async(prompt=None):
-    return await PromptController(terminal, prompt or 'User: ').read_text()
+async def get_input_async(prompt=None, history=None):
+    return await PromptController(terminal, prompt or 'User: ', history=history).read_text()
 
 
-def get_input(prompt=None):
-    return asyncio.run(get_input_async(prompt))
+def get_input(prompt=None, history=None):
+    return asyncio.run(get_input_async(prompt, history=history))
 
 
 async def run_menu_async(items):
