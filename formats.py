@@ -379,6 +379,117 @@ def _tool_call_arguments(call):
     return json.dumps(call.get("input", {}), separators=(",", ":"))
 
 
+def _json_text(value, max_chars=4000):
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, default=str)
+    except (TypeError, ValueError):
+        text = repr(value)
+    if len(text) > max_chars:
+        return text[:max_chars] + f"\n... [truncated: {len(text)} chars total]"
+    return text
+
+
+def _portable_content_block_text(block, target_protocol):
+    block_type = block.get("type")
+    if block_type == "text":
+        return str(block.get("text", ""))
+    if block_type in ["image", "file", "audio", "refusal"]:
+        provider = block.get("provider") or "unknown"
+        return (
+            f"[Transcript content not native to {target_protocol}: "
+            f"{block_type} block from {provider}]\n"
+            f"{_json_text(block.get('provider_raw') or block.get('value') or block)}"
+        )
+    if block_type == "provider_content":
+        provider = block.get("provider") or "unknown"
+        return (
+            f"[Transcript content not native to {target_protocol}: "
+            f"provider_content from {provider}]\n"
+            f"{_json_text(block.get('value'))}"
+        )
+    return (
+        f"[Transcript content not native to {target_protocol}: {block_type or 'unknown'} block]\n"
+        f"{_json_text(block)}"
+    )
+
+
+def _portable_item_text(item, target_protocol):
+    item_type = item.get("type")
+    if item_type == "response_metadata":
+        fields = {
+            key: item.get(key)
+            for key in [
+                "provider",
+                "protocol",
+                "id",
+                "model",
+                "status",
+                "previous_response_id",
+                "conversation",
+                "error",
+                "incomplete_details",
+            ]
+            if item.get(key) is not None
+        }
+        return (
+            f"[Transcript metadata preserved while rendering to {target_protocol}]\n"
+            f"{_json_text(fields)}"
+        )
+    if item_type == "reasoning":
+        fields = {
+            "status": item.get("status"),
+            "summary": item.get("summary"),
+            "content": item.get("content"),
+            "provider_ids": item.get("provider_ids"),
+            "encrypted_content_present": item.get("encrypted_content") is not None,
+        }
+        return (
+            f"[Previous assistant reasoning item not native to {target_protocol}]\n"
+            f"{_json_text({k: v for k, v in fields.items() if v not in [None, False]})}"
+        )
+    if item_type == "tool_call":
+        fields = {
+            "tool_kind": item.get("tool_kind"),
+            "call_id": item.get("call_id") or item.get("id"),
+            "name": item.get("name"),
+            "input": item.get("input"),
+            "raw_arguments": item.get("raw_arguments"),
+            "status": item.get("status"),
+            "provider_ids": item.get("provider_ids"),
+        }
+        return (
+            f"[Previous assistant tool call not native to {target_protocol}]\n"
+            f"{_json_text({k: v for k, v in fields.items() if v is not None})}"
+        )
+    if item_type == "tool_result":
+        fields = {
+            "tool_kind": item.get("tool_kind"),
+            "tool_call_id": item.get("tool_call_id"),
+            "name": item.get("name"),
+            "is_error": item.get("is_error"),
+            "content": item_text(item),
+            "provider_ids": item.get("provider_ids"),
+        }
+        return (
+            f"[Previous tool result not native to {target_protocol}]\n"
+            f"{_json_text({k: v for k, v in fields.items() if v is not None})}"
+        )
+    if item_type == "provider_item":
+        provider = item.get("provider") or "unknown"
+        return (
+            f"[Provider-specific transcript item from {provider} rendered as text for {target_protocol}]\n"
+            f"{_json_text(item.get('value'))}"
+        )
+    return (
+        f"[Transcript item not native to {target_protocol}: {item_type or 'unknown'}]\n"
+        f"{_json_text(item)}"
+    )
+
+
+def _portable_chat_message(item, target_protocol, role="user"):
+    return {"role": role, "content": _portable_item_text(item, target_protocol)}
+
+
 def _openai_chat_content_from_blocks(blocks):
     provider_parts = []
     text_parts = []
@@ -391,7 +502,7 @@ def _openai_chat_content_from_blocks(blocks):
         elif block_type == "image" and block.get("provider") == "openai_chat":
             provider_parts.append(_copy(block.get("value", {})))
         else:
-            raise TranscriptFormatError(f"cannot render content block {block_type!r} as OpenAI Chat")
+            text_parts.append(_portable_content_block_text(block, "openai_chat"))
     text = "\n".join(part for part in text_parts if part)
     if not provider_parts:
         return text
@@ -413,19 +524,12 @@ def _openai_chat_tool_call(call):
     }
 
 
-def _skip_adapter_neutral_item(item):
-    return item.get("type") in ["response_metadata", "reasoning"]
-
-
 def items_to_openai_chat_messages(items):
     messages = []
     i = 0
     while i < len(items):
         item = items[i]
         item_type = item.get("type")
-        if _skip_adapter_neutral_item(item):
-            i += 1
-            continue
         if item_type == "instruction":
             role = item.get("authority") or "system"
             if role not in ["system", "developer"]:
@@ -435,16 +539,26 @@ def items_to_openai_chat_messages(items):
             continue
         if item_type == "message":
             role = item.get("role")
+            if role not in ["system", "developer", "user", "assistant"]:
+                messages.append(_portable_chat_message(item, "openai_chat"))
+                i += 1
+                continue
             msg = {"role": role}
             content = _openai_chat_content_from_blocks(item.get("content", []))
             tool_calls = []
+            portable_notes = []
             i += 1
             if role == "assistant":
                 while i < len(items) and items[i].get("type") == "tool_call":
                     call = items[i]
                     if is_app_tool_call(call):
                         tool_calls.append(_openai_chat_tool_call(call))
+                    else:
+                        portable_notes.append(_portable_item_text(call, "openai_chat"))
                     i += 1
+            if portable_notes:
+                note_text = "\n\n".join(portable_notes)
+                content = f"{content}\n\n{note_text}" if content else note_text
             if content or role != "assistant" or not tool_calls:
                 msg["content"] = content
             if role == "assistant" and tool_calls:
@@ -457,17 +571,22 @@ def items_to_openai_chat_messages(items):
                     "role": "assistant",
                     "tool_calls": [_openai_chat_tool_call(item)],
                 })
+            else:
+                messages.append(_portable_chat_message(item, "openai_chat", role="assistant"))
             i += 1
             continue
         if item_type == "tool_result":
-            msg = {
-                "role": "tool",
-                "tool_call_id": item.get("tool_call_id"),
-                "content": item_text(item),
-            }
-            if item.get("name"):
-                msg["name"] = item["name"]
-            messages.append(msg)
+            if item.get("tool_kind", "function") == "function":
+                msg = {
+                    "role": "tool",
+                    "tool_call_id": item.get("tool_call_id"),
+                    "content": item_text(item),
+                }
+                if item.get("name"):
+                    msg["name"] = item["name"]
+                messages.append(msg)
+            else:
+                messages.append(_portable_chat_message(item, "openai_chat"))
             i += 1
             continue
         if item_type == "provider_item" and item.get("provider") == "openai_chat":
@@ -475,9 +594,15 @@ def items_to_openai_chat_messages(items):
             i += 1
             continue
         if item_type == "provider_item":
+            messages.append(_portable_chat_message(item, "openai_chat"))
             i += 1
             continue
-        raise TranscriptFormatError(f"cannot render {item_type!r} as OpenAI Chat")
+        if item_type in ["response_metadata", "reasoning"]:
+            messages.append(_portable_chat_message(item, "openai_chat"))
+            i += 1
+            continue
+        messages.append(_portable_chat_message(item, "openai_chat"))
+        i += 1
     return messages
 
 
@@ -514,7 +639,7 @@ def _anthropic_text_blocks(blocks):
         elif block_type == "provider_content" and block.get("provider") == "anthropic":
             out.append(_copy(block.get("value", {})))
         else:
-            raise TranscriptFormatError(f"cannot render content block {block_type!r} as Anthropic text content")
+            out.append({"type": "text", "text": _portable_content_block_text(block, "anthropic_messages")})
     return out
 
 
@@ -527,7 +652,7 @@ def _anthropic_content_from_message(item):
         elif block_type == "provider_content" and block.get("provider") == "anthropic":
             content.append(_copy(block.get("value", {})))
         else:
-            raise TranscriptFormatError(f"cannot render content block {block_type!r} as Anthropic")
+            content.append({"type": "text", "text": _portable_content_block_text(block, "anthropic_messages")})
     return content
 
 
@@ -548,9 +673,6 @@ def items_to_anthropic_parts(items):
     while i < len(items):
         item = items[i]
         item_type = item.get("type")
-        if _skip_adapter_neutral_item(item):
-            i += 1
-            continue
         if item_type == "instruction":
             content_text = item_text(item)
             if not seen_conversation:
@@ -564,7 +686,12 @@ def items_to_anthropic_parts(items):
         if item_type == "message":
             role = item.get("role")
             if role not in ["user", "assistant"]:
-                raise TranscriptFormatError(f"cannot render message role {role!r} as Anthropic")
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": _portable_item_text(item, "anthropic_messages")}],
+                })
+                i += 1
+                continue
             content = _anthropic_content_from_message(item)
             i += 1
             if role == "assistant":
@@ -572,26 +699,42 @@ def items_to_anthropic_parts(items):
                     call = items[i]
                     if is_app_tool_call(call):
                         content.append(_anthropic_tool_use(call))
+                    else:
+                        content.append({
+                            "type": "text",
+                            "text": _portable_item_text(call, "anthropic_messages"),
+                        })
                     i += 1
             messages.append({"role": role, "content": content or ""})
             continue
         if item_type == "tool_call":
             if is_app_tool_call(item):
                 messages.append({"role": "assistant", "content": [_anthropic_tool_use(item)]})
+            else:
+                messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": _portable_item_text(item, "anthropic_messages")}],
+                })
             i += 1
             continue
         if item_type == "tool_result":
             content = []
             while i < len(items) and items[i].get("type") == "tool_result":
                 result = items[i]
-                block = {
-                    "type": "tool_result",
-                    "tool_use_id": result.get("tool_call_id"),
-                    "content": _anthropic_text_blocks(result.get("content", [])) or item_text(result),
-                }
-                if result.get("is_error"):
-                    block["is_error"] = True
-                content.append(block)
+                if result.get("tool_kind", "function") == "function":
+                    block = {
+                        "type": "tool_result",
+                        "tool_use_id": result.get("tool_call_id"),
+                        "content": _anthropic_text_blocks(result.get("content", [])) or item_text(result),
+                    }
+                    if result.get("is_error"):
+                        block["is_error"] = True
+                    content.append(block)
+                else:
+                    content.append({
+                        "type": "text",
+                        "text": _portable_item_text(result, "anthropic_messages"),
+                    })
                 i += 1
             messages.append({"role": "user", "content": content})
             continue
@@ -600,9 +743,24 @@ def items_to_anthropic_parts(items):
             i += 1
             continue
         if item_type == "provider_item":
+            messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text": _portable_item_text(item, "anthropic_messages")}],
+            })
             i += 1
             continue
-        raise TranscriptFormatError(f"cannot render {item_type!r} as Anthropic")
+        if item_type in ["response_metadata", "reasoning"]:
+            messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text": _portable_item_text(item, "anthropic_messages")}],
+            })
+            i += 1
+            continue
+        messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": _portable_item_text(item, "anthropic_messages")}],
+        })
+        i += 1
     return "\n\n".join(system_parts), messages
 
 
@@ -762,8 +920,19 @@ def _responses_content_from_blocks(blocks, role):
         elif block_type == "provider_content" and block.get("provider") == "openai_responses":
             out.append(_copy(block.get("value", {})))
         else:
-            raise TranscriptFormatError(f"cannot render content block {block_type!r} as OpenAI Responses")
+            out.append({
+                "type": text_type,
+                "text": _portable_content_block_text(block, "openai_responses"),
+            })
     return out
+
+
+def _responses_note_item(item, role="user"):
+    return {
+        "type": "message",
+        "role": role,
+        "content": [{"type": "input_text", "text": _portable_item_text(item, "openai_responses")}],
+    }
 
 
 def _responses_tool_call_item(call):
@@ -783,7 +952,7 @@ def _responses_tool_call_item(call):
         }
     if call.get("provider_raw"):
         return _copy(call["provider_raw"])
-    raise TranscriptFormatError(f"cannot render tool kind {call.get('tool_kind')!r} as OpenAI Responses")
+    return _responses_note_item(call, role="assistant")
 
 
 def items_to_openai_responses_parts(items):
@@ -796,8 +965,6 @@ def items_to_openai_responses_parts(items):
     seen_conversation = False
     for item in items:
         item_type = item.get("type")
-        if item_type == "response_metadata":
-            continue
         if item_type == "instruction":
             text = item_text(item)
             if not seen_conversation:
@@ -811,7 +978,12 @@ def items_to_openai_responses_parts(items):
                 })
             continue
         seen_conversation = True
-        if item_type == "message":
+        if item_type == "response_metadata":
+            input_items.append(_responses_note_item(item))
+        elif item_type == "message":
+            if item.get("role") not in ["system", "developer", "user", "assistant"]:
+                input_items.append(_responses_note_item(item))
+                continue
             msg = {
                 "type": "message",
                 "role": item.get("role"),
@@ -829,12 +1001,16 @@ def items_to_openai_responses_parts(items):
                     "call_id": item.get("tool_call_id"),
                     "output": output,
                 })
-            else:
+            elif item.get("tool_kind", "function") == "function":
                 input_items.append({
                     "type": "function_call_output",
                     "call_id": item.get("tool_call_id"),
                     "output": output,
                 })
+            elif item.get("provider_raw"):
+                input_items.append(_copy(item["provider_raw"]))
+            else:
+                input_items.append(_responses_note_item(item))
         elif item_type == "reasoning":
             if item.get("provider_raw"):
                 input_items.append(_copy(item["provider_raw"]))
@@ -846,6 +1022,10 @@ def items_to_openai_responses_parts(items):
                 input_items.append(reasoning)
         elif item_type == "provider_item" and item.get("provider") == "openai_responses":
             input_items.append(_copy(item.get("value", {})))
+        elif item_type == "provider_item":
+            input_items.append(_responses_note_item(item))
+        else:
+            input_items.append(_responses_note_item(item))
     return "\n\n".join(instructions), input_items
 
 

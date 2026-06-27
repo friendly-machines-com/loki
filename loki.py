@@ -1319,6 +1319,9 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             on_event({"type": "max_loops"})
         try:
             response_items = await chat_fn(transcript_items)
+        except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
+            on_event({"type": "transcript_error", "error": e})
+            return ""
         except ApiError as e:
             on_event({"type": "api_error", "error": e})
             return ""
@@ -1391,6 +1394,11 @@ def _terminal_agent_event(event: dict):
         print()
     elif kind == "network_error":
         print(f"\n{computer}: NETWORK ERROR: {event['error']}")
+    elif kind == "transcript_error":
+        terminal.set_background_color(ERROR_COLOR)
+        print(f"Transcript render error: {event['error']}", end='')
+        terminal.reset_colors_and_flags()
+        print()
     elif kind == "assistant_message":
         rendered_content = terminal.markdown_to_ansi(event["content"])
         print(f"\n{model}: {rendered_content if rendered_content is not None else event['content']}")
@@ -1425,6 +1433,8 @@ async def run_terminal_turn_async(transcript_items: list) -> str:
 async def run_toolless_completion_async(transcript_items: list) -> str:
     try:
         response_items = await async_chat_completion(transcript_items, tools=[])
+    except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
+        return f"Transcript render error: {e}"
     except ApiError as e:
         return e.formatted()
     if not response_items:
