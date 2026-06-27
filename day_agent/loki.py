@@ -25,6 +25,7 @@ import getopt
 import tempfile
 import shutil
 import threading
+import shlex
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pprint import pprint, pformat
@@ -63,7 +64,10 @@ LOKI_CONFIG_DIR = os.path.join(os.path.expanduser(XDG_CONFIG_HOME), LOKI_CONFIG_
 XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
 LOKI_STATE_DIR = os.path.join(os.path.expanduser(XDG_STATE_HOME), LOKI_CONFIG_DIR_NAME)
 LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
-LOCAL_LOKI_DIR = ".loki"
+STARTUP_CWD = os.getcwd()
+shell_cwd = STARTUP_CWD
+previous_shell_cwd = STARTUP_CWD
+LOCAL_LOKI_DIR = os.path.join(STARTUP_CWD, ".loki")
 CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
 JOB_TAIL_CHARS = 20_000
 
@@ -260,12 +264,51 @@ file_state = LruCache(READ_PATHS_LIMIT) # file_path -> last content the agent ob
 _webfetch_cache = LruCache(WEBFETCH_CACHE_MAX_ENTRIES)  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
 
 
-def _resolve_path(path: str) -> str:
+def _resolve_path(path: str, base_dir: str = None) -> str:
     if not path:
         return path
+    path = os.path.expanduser(path)
     if os.path.isabs(path):
         return os.path.normpath(path)
-    return os.path.normpath(os.path.join(os.getcwd(), path))
+    return os.path.normpath(os.path.join(base_dir or shell_cwd, path))
+
+
+def _path_under(path: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:
+        return False
+
+
+def display_path(path: str) -> str:
+    path = os.path.normpath(path)
+    if path == STARTUP_CWD:
+        return "."
+    if _path_under(path, STARTUP_CWD):
+        return "./" + os.path.relpath(path, STARTUP_CWD)
+    home = os.path.expanduser("~")
+    if path == home:
+        return "~"
+    if _path_under(path, home):
+        return "~/" + os.path.relpath(path, home)
+    return path
+
+
+def change_shell_cwd(path: str = None) -> str:
+    global shell_cwd
+    global previous_shell_cwd
+    target = (path or "").strip()
+    if not target:
+        target = "~"
+    elif target == "-":
+        target = previous_shell_cwd
+    resolved = _resolve_path(os.path.expanduser(target))
+    if not os.path.isdir(resolved):
+        raise FileNotFoundError(resolved)
+    old_cwd = shell_cwd
+    shell_cwd = resolved
+    previous_shell_cwd = old_cwd
+    return shell_cwd
 
 
 class ToolSchemaError(ValueError):
@@ -655,7 +698,7 @@ class JobManager:
 
     async def _spawn(self, command, display_command: str, description: str,
                      background: bool, timeout_ms: int | None, shell: bool,
-                     env: dict | None = None) -> Job:
+                     env: dict | None = None, cwd: str = None) -> Job:
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -690,6 +733,7 @@ class JobManager:
                     stderr=stderr_file,
                     start_new_session=True,
                     env=env,
+                    cwd=cwd or shell_cwd,
                 )
             else:
                 proc = await asyncio.create_subprocess_exec(
@@ -699,6 +743,7 @@ class JobManager:
                     stderr=stderr_file,
                     start_new_session=True,
                     env=env,
+                    cwd=cwd or shell_cwd,
                 )
         job.process = proc
         job.pid = proc.pid
@@ -733,8 +778,9 @@ class JobManager:
     async def run_foreground(self, command, display_command: str, timeout_ms: int,
                              description: str = "", shell: bool = False,
                              output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                             env: dict | None = None):
-        job = await self._spawn(command, display_command, description, False, timeout_ms, shell, env=env)
+                             env: dict | None = None, cwd: str = None):
+        job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
+                                env=env, cwd=cwd)
         try:
             exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=timeout_ms / 1000)
         except asyncio.TimeoutError:
@@ -772,7 +818,7 @@ class JobManager:
         timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
 
         if run_in_background:
-            job = await self._spawn(command, command, description, True, None, True)
+            job = await self._spawn(command, command, description, True, None, True, cwd=shell_cwd)
             try:
                 asyncio.get_running_loop().create_task(self._monitor_background_job(job))
             except RuntimeError:
@@ -789,7 +835,7 @@ class JobManager:
             ])
 
         job, status, stdout, stderr = await self.run_foreground(
-            command, command, timeout_ms, description=description, shell=True)
+            command, command, timeout_ms, description=description, shell=True, cwd=shell_cwd)
         if status == "timed_out":
             if stderr:
                 stderr += "\n"
@@ -800,18 +846,19 @@ class JobManager:
 
     async def run_exec(self, argv: list[str], timeout_ms: int, description: str = "",
                        output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                       env: dict | None = None):
+                       env: dict | None = None, cwd: str = None):
         if not argv:
             raise ValueError("argv must not be empty")
         return await self.run_foreground(argv, " ".join(argv), timeout_ms,
                                          description=description, shell=False,
-                                         output_chars=output_chars, env=env)
+                                         output_chars=output_chars, env=env, cwd=cwd or shell_cwd)
 
     async def run_background_exec(self, argv: list[str], description: str = "",
-                                  env: dict | None = None) -> Job:
+                                  env: dict | None = None, cwd: str = None) -> Job:
         if not argv:
             raise ValueError("argv must not be empty")
-        job = await self._spawn(argv, " ".join(argv), description, True, None, False, env=env)
+        job = await self._spawn(argv, " ".join(argv), description, True, None, False,
+                                env=env, cwd=cwd or shell_cwd)
         asyncio.get_running_loop().create_task(self._monitor_background_job(job))
         return job
 
@@ -1049,7 +1096,7 @@ async def run_glob_async(pattern: str, path: str = None) -> str:
     rg = _find_rg_binary()
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
-    root = _resolve_path(path) if path else os.getcwd()
+    root = _resolve_path(path) if path else shell_cwd
     if not os.path.isdir(root):
         return f"Error: {root} is not a directory"
     args = [rg, '--files', '--color=never', '--glob', pattern, root]
@@ -1123,7 +1170,7 @@ async def run_grep_async(pattern: str, path: str = None, glob: str = None,
     rg = _find_rg_binary()
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
-    root = _resolve_path(path) if path else os.getcwd()
+    root = _resolve_path(path) if path else shell_cwd
     if not os.path.exists(root):
         return f"Error: {root} does not exist"
 
@@ -1591,7 +1638,10 @@ def _current_entrypoint_argv() -> list[str]:
     argv0 = sys.argv[0]
     if argv0 and os.path.basename(argv0) != "__main__.py":
         script = shutil.which(argv0) if not os.path.dirname(argv0) else argv0
-        return [sys.executable, os.path.abspath(script or argv0)]
+        script = script or argv0
+        if not os.path.isabs(script):
+            script = os.path.join(STARTUP_CWD, script)
+        return [sys.executable, os.path.abspath(script)]
     # python -m day_agent sets sys.argv[0] to day_agent/__main__.py. Running
     # that file directly would lose package context and break relative imports.
     return [sys.executable, "-m", "day_agent"]
@@ -1962,7 +2012,7 @@ TOOLS = [
             "description": "\n".join([
                 "Reads a file from the local filesystem.",
                 "",
-                "- `file_path` may be absolute or relative to the current working directory.",
+                "- `file_path` may be absolute or relative to the current Loki cwd.",
                 "- Reads up to 2000 lines by default.",
                 "- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters",
                 "- Results are returned using cat -n format, with line numbers starting at 1",
@@ -2035,7 +2085,7 @@ TOOLS = [
             "description": "\n".join([
                 "Executes a bash command and returns its output.",
                 "",
-                "- Working directory persists between calls, but prefer absolute paths -- `cd` in a compound command can trigger a permission prompt. Shell state (env vars, functions) does not persist; the shell is initialized from the user's profile.",
+                "- Commands run in the current Loki cwd. Use /cd DIR to change that cwd; cd inside a Bash command only affects that one command.",
                 "- IMPORTANT: Avoid using this tool to run `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user.",
                 f"- `timeout` is in milliseconds: default {BASH_DEFAULT_TIMEOUT_MS}, max {BASH_MAX_TIMEOUT_MS}.",
                 "- `run_in_background` starts a detached job with stdout/stderr spooled to files. Use Jobs/JobStatus/JobStop to inspect or control it. No `&` needed.",
@@ -2054,7 +2104,7 @@ TOOLS = [
                         'Clear, concise description of what this command does in active voice. Never use words like "complex" or "risk" in the description - just describe what it does.',
                         "",
                         "For simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):",
-                        '- ls -> "List files in current directory"',
+                        '- ls -> "List files in current Loki cwd"',
                         '- git status -> "Show working tree status"',
                         '- npm install -> "Install package dependencies"',
                         "",
@@ -2122,7 +2172,7 @@ TOOLS = [
                 "properties": {
                     "pattern": {"type": "string", "description": "The glob pattern to match files against"},
                     "path": {"type": "string",
-                             "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided."}
+                             "description": "The directory to search in. If not specified, the current Loki cwd will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided."}
                 },
                 "required": ["pattern"]
             }
@@ -2146,7 +2196,7 @@ TOOLS = [
                     "pattern": {"type": "string",
                                 "description": "The regular expression pattern to search for in file contents"},
                     "path": {"type": "string",
-                             "description": "File or directory to search in (rg PATH). Defaults to current working directory."},
+                             "description": "File or directory to search in (rg PATH). Defaults to current Loki cwd."},
                     "glob": {"type": "string",
                              "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob"},
                     "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"],
@@ -2431,9 +2481,8 @@ def _status_api_base() -> str:
 
 def status_text() -> str:
     return (
-        'API: {}; Model: {}; Use /quit to quit, /model to switch model, '
-        '!foo to run shell command foo'
-    ).format(_status_api_base(), model)
+        'CWD: {}; API: {}; Model: {}; /quit /model /pwd /cd DIR !foo'
+    ).format(display_path(shell_cwd), _status_api_base(), model)
 
 
 async def load_models_async():
@@ -2482,6 +2531,7 @@ def initial_transcript_items():
     return [formats.instruction_item(
         "You are a helpful system agent running in a terminal. You have these tools: "
         "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
+        f"Current Loki cwd: {shell_cwd}. Relative tool paths and Bash commands run from this directory. "
         "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
         "Always Read a file before editing or overwriting it. "
         "Use TodoWrite to plan multi-step work. Keep responses concise."
@@ -2492,13 +2542,56 @@ def user_prompt_history(items):
     return formats.user_prompt_history(items)
 
 
+def record_shell_cwd_instruction():
+    transcript_items.append(formats.instruction_item(
+        f"Current Loki cwd changed to: {shell_cwd}. "
+        "Relative tool paths and Bash commands now run from this directory."
+    ))
+
+
+def print_shell_cwd():
+    print(f"cwd: {shell_cwd}", file=sys.stderr)
+    sys.stderr.flush()
+
+
+def change_shell_cwd_from_text(arg_text: str) -> bool:
+    try:
+        target = _parse_cd_arg_text(arg_text)
+        change_shell_cwd(target)
+    except (FileNotFoundError, NotADirectoryError) as e:
+        print(f"cd: no such directory: {e}", file=sys.stderr)
+        sys.stderr.flush()
+        return False
+    except ValueError as e:
+        print(f"cd: {e}", file=sys.stderr)
+        sys.stderr.flush()
+        return False
+    record_shell_cwd_instruction()
+    print_shell_cwd()
+    return True
+
+
+def _parse_cd_arg_text(arg_text: str) -> str:
+    if not arg_text.strip():
+        return ""
+    parts = shlex.split(arg_text)
+    if len(parts) != 1:
+        raise ValueError("expected zero or one directory argument")
+    return parts[0]
+
+
 def chat_log_filename(chat_id: str) -> str:
     if chat_id.startswith("chat-") and chat_id.endswith(".json"):
         return chat_id
     return "chat-{}.json".format(chat_id)
 
 
+def ensure_chat_log_dir():
+    os.makedirs(CHAT_LOG_DIR, exist_ok=True)
+
+
 def new_chat_log_path() -> str:
+    ensure_chat_log_dir()
     return os.path.join(CHAT_LOG_DIR, chat_log_filename(str(uuid.uuid4())))
 
 
@@ -2506,8 +2599,11 @@ def resolve_chat_log_path(resume_arg: str) -> str:
     # Bare resume names are chat ids in the local Loki chat directory. An
     # argument with a directory component is an explicit path supplied by the
     # caller; there is intentionally no fallback to the old root chat location.
+    if os.path.isabs(resume_arg):
+        return os.path.normpath(resume_arg)
     if os.path.dirname(resume_arg):
-        return resume_arg
+        return _resolve_path(resume_arg, STARTUP_CWD)
+    ensure_chat_log_dir()
     return os.path.join(CHAT_LOG_DIR, chat_log_filename(resume_arg))
 
 
@@ -2524,7 +2620,9 @@ def new_chat_log(filename):
 
 def save_chat_log():
     chat_log.seek(0)
-    json.dump(formats.new_log_blob(transcript_items, session_todos), chat_log, indent=4)
+    blob = formats.new_log_blob(transcript_items, session_todos)
+    blob["session_state"] = {"shell_cwd": shell_cwd}
+    json.dump(blob, chat_log, indent=4)
     chat_log.truncate()
     chat_log.flush()
     print('Note: Saved chat log to {}'.format(chat_log.name), file=sys.stderr)
@@ -2621,12 +2719,25 @@ def load_chat_log(filename):
     try:
         blob = json.load(chat_log)
         transcript_items, session_todos = formats.load_log_blob(blob)
+        load_session_state(blob.get("session_state", {}))
         print_resume_transcript(transcript_items)
     finally:
         chat_log.close()
 
     chat_log = open(filename, 'w')
     save_chat_log()
+
+
+def load_session_state(state: dict):
+    if not isinstance(state, dict):
+        return
+    loaded_shell_cwd = state.get("shell_cwd")
+    if not isinstance(loaded_shell_cwd, str) or not loaded_shell_cwd:
+        return
+    try:
+        change_shell_cwd(loaded_shell_cwd)
+    except FileNotFoundError:
+        print(f"Warning: saved cwd no longer exists: {loaded_shell_cwd}", file=sys.stderr)
 
 def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
     return asyncio.run(run_subagent_prompt_async(subagent_type, prompt))
@@ -2708,7 +2819,8 @@ async def async_main(args):
             continue
 
         print('User:', user_in)
-        match user_in.strip():
+        command_text = user_in.strip()
+        match command_text:
             case '/quit':
                 break
             case '/model':
@@ -2717,8 +2829,16 @@ async def async_main(args):
                 sys.stderr.flush()
                 terminal.save_cursor_position()
                 continue
+            case '/pwd':
+                print_shell_cwd()
+                terminal.save_cursor_position()
+                continue
+            case _ if command_text == '/cd' or command_text.startswith('/cd '):
+                change_shell_cwd_from_text(command_text[3:].strip())
+                terminal.save_cursor_position()
+                continue
             case _:
-                if user_in.strip().startswith('!'): # direct command execution
+                if command_text.startswith('!'): # direct command execution
                     cmd = user_in[1:].strip()
                     print(f"{computer}: [Running local command: {cmd}]")
                     cmd_output = await run_bash_async(cmd)

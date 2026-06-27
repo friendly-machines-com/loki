@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import pathlib
 import sys
@@ -97,11 +98,12 @@ class RuntimeConfigTests(unittest.TestCase):
 
 class StatusTextTests(unittest.TestCase):
     def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
-        names = ["chat_provider", "model"]
+        names = ["chat_provider", "model", "shell_cwd"]
         sentinel = object()
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
 
         try:
+            loki.shell_cwd = loki.STARTUP_CWD
             loki.chat_provider = protocols.Provider(
                 kind=protocols.OPENAI_CHAT,
                 input_url="https://user:pass@example.test:8443/base/path/v1/chat/completions?token=secret#fragment",
@@ -123,9 +125,8 @@ class StatusTextTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "API: example.test:8443/base/path; Model: model-x; "
-            "Use /quit to quit, /model to switch model, "
-            "!foo to run shell command foo",
+            "CWD: .; API: example.test:8443/base/path; Model: model-x; "
+            "/quit /model /pwd /cd DIR !foo",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)
@@ -168,23 +169,30 @@ class ChatLogPathTests(unittest.TestCase):
     def test_bare_resume_names_resolve_to_local_loki_chat_directory(self):
         self.assertEqual(
             loki.resolve_chat_log_path("abc"),
-            os.path.join(".loki", "chats", "chat-abc.json"),
+            os.path.join(loki.CHAT_LOG_DIR, "chat-abc.json"),
         )
         self.assertEqual(
             loki.resolve_chat_log_path("chat-abc.json"),
-            os.path.join(".loki", "chats", "chat-abc.json"),
+            os.path.join(loki.CHAT_LOG_DIR, "chat-abc.json"),
         )
 
     def test_path_like_resume_arguments_stay_explicit(self):
-        self.assertEqual(loki.resolve_chat_log_path("./chat-abc.json"), "./chat-abc.json")
-        self.assertEqual(loki.resolve_chat_log_path("logs/chat-abc.json"), "logs/chat-abc.json")
+        self.assertEqual(
+            loki.resolve_chat_log_path("./chat-abc.json"),
+            os.path.join(loki.STARTUP_CWD, "chat-abc.json"),
+        )
+        self.assertEqual(
+            loki.resolve_chat_log_path("logs/chat-abc.json"),
+            os.path.join(loki.STARTUP_CWD, "logs", "chat-abc.json"),
+        )
 
     def test_new_chat_log_path_uses_local_loki_chat_directory(self):
         path = loki.new_chat_log_path()
 
-        self.assertEqual(os.path.dirname(path), os.path.join(".loki", "chats"))
+        self.assertEqual(os.path.dirname(path), loki.CHAT_LOG_DIR)
         self.assertTrue(os.path.basename(path).startswith("chat-"))
         self.assertTrue(path.endswith(".json"))
+        self.assertTrue(os.path.isdir(loki.CHAT_LOG_DIR))
 
     def test_new_chat_log_creates_parent_directory(self):
         names = ["chat_log", "transcript_items", "session_todos"]
@@ -209,6 +217,87 @@ class ChatLogPathTests(unittest.TestCase):
                     loki.__dict__.pop(name, None)
                 else:
                     loki.__dict__[name] = value
+
+
+class ShellCwdTests(unittest.TestCase):
+    def test_change_shell_cwd_does_not_change_process_cwd(self):
+        names = ["shell_cwd", "previous_shell_cwd"]
+        old_values = {name: loki.__dict__[name] for name in names}
+        process_cwd = os.getcwd()
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                loki.change_shell_cwd(tmpdir)
+
+                self.assertEqual(loki.shell_cwd, tmpdir)
+                self.assertEqual(os.getcwd(), process_cwd)
+                self.assertEqual(loki._resolve_path("file.txt"), os.path.join(tmpdir, "file.txt"))
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+    def test_bash_runs_in_shell_cwd(self):
+        names = ["shell_cwd", "previous_shell_cwd", "job_manager"]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                workdir = os.path.join(tmpdir, "work")
+                os.mkdir(workdir)
+                loki.job_manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+                loki.change_shell_cwd(workdir)
+
+                result = asyncio.run(loki.run_bash_async("pwd"))
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+        self.assertIn("[stdout]\n" + workdir, result)
+
+    def test_save_chat_log_persists_shell_cwd(self):
+        names = ["chat_log", "transcript_items", "session_todos", "shell_cwd", "previous_shell_cwd"]
+        sentinel = object()
+        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cwd = os.path.join(tmpdir, "work")
+                os.mkdir(cwd)
+                path = os.path.join(tmpdir, "chat-test.json")
+                loki.new_chat_log(path)
+                loki.change_shell_cwd(cwd)
+
+                loki.save_chat_log()
+                loki.chat_log.close()
+
+                with open(path, "r", encoding="utf-8") as f:
+                    blob = json.load(f)
+        finally:
+            if "chat_log" in loki.__dict__:
+                try:
+                    loki.chat_log.close()
+                except OSError:
+                    pass
+            for name, value in old_values.items():
+                if value is sentinel:
+                    loki.__dict__.pop(name, None)
+                else:
+                    loki.__dict__[name] = value
+
+        self.assertEqual(blob["session_state"]["shell_cwd"], cwd)
+
+    def test_load_session_state_restores_shell_cwd(self):
+        names = ["shell_cwd", "previous_shell_cwd"]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                loki.load_session_state({"shell_cwd": tmpdir})
+
+                self.assertEqual(loki.shell_cwd, tmpdir)
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
 
 
 class SubagentLaunchTests(unittest.TestCase):
