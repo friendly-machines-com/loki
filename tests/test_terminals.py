@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-import terminals
+from day_agent import terminals
 
 
 def feed_bytes(reader, data):

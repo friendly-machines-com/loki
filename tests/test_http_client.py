@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-import http_client
+from day_agent import http_client
 
 
 class FakeWriter:

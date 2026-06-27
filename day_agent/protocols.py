@@ -3,7 +3,7 @@ import json
 import urllib.parse
 from dataclasses import dataclass
 
-import formats
+from . import formats
 
 
 OPENAI_CHAT = "openai_chat"
