@@ -916,14 +916,13 @@ job_manager = JobManager(LOKI_JOB_STATE_DIR)
 
 
 def run_bash(command: str, timeout: int = None, description: str = "",
-              run_in_background: bool = False, dangerously_disable_sandbox: bool = False) -> str:
+              run_in_background: bool = False) -> str:
     return asyncio.run(run_bash_async(command, timeout, description,
-                                      run_in_background, dangerously_disable_sandbox))
+                                      run_in_background))
 
 
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
-                         run_in_background: bool = False,
-                         dangerously_disable_sandbox: bool = False) -> str:
+                         run_in_background: bool = False) -> str:
     return await job_manager.run_shell(command, timeout=timeout, description=description,
                                        run_in_background=run_in_background)
 
@@ -1280,16 +1279,14 @@ def _handle_bash(args: dict) -> str:
     return run_bash(args["command"],
                     timeout=args.get("timeout"),
                     description=args.get("description"),
-                    run_in_background=args.get("run_in_background", False),
-                    dangerously_disable_sandbox=args.get("dangerously_disable_sandbox", False))
+                    run_in_background=args.get("run_in_background", False))
 
 
 async def _handle_bash_async(args: dict) -> str:
     return await run_bash_async(args["command"],
                                 timeout=args.get("timeout"),
                                 description=args.get("description", ""),
-                                run_in_background=args.get("run_in_background", False),
-                                dangerously_disable_sandbox=args.get("dangerously_disable_sandbox", False))
+                                run_in_background=args.get("run_in_background", False))
 
 
 def _handle_read(args: dict) -> str:
@@ -2103,8 +2100,6 @@ TOOLS = [
                     ])},
                     "run_in_background": {"type": "boolean",
                                           "description": "Set to true to run this command in the background."},
-                    "dangerously_disable_sandbox": {"type": "boolean",
-                                                    "description": "Set this to true to dangerously override sandbox mode and run commands without sandboxing."}
                 },
                 "required": ["command"]
             }
