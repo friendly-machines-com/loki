@@ -210,7 +210,7 @@ def openai_chat_messages_to_items(messages):
 
 def _tool_call_arguments(block):
     raw_arguments = block.get("raw_arguments")
-    if isinstance(raw_arguments, str) and not block.get("parse_error"):
+    if isinstance(raw_arguments, str):
         return raw_arguments
     return json.dumps(block.get("input", {}), separators=(",", ":"))
 
