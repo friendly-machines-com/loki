@@ -162,6 +162,8 @@ def response_metadata_item(provider, protocol, response=None):
 
 
 def provider_item(provider, value):
+    # Unknown or provider-only records are stored instead of dropped so future
+    # adapters, or the same adapter later, can still see the original payload.
     return {
         "type": "provider_item",
         "provider": provider,
@@ -390,6 +392,9 @@ def _json_text(value, max_chars=4000):
 
 
 def _portable_content_block_text(block, target_protocol):
+    # Cross-protocol resume must preserve evidence of non-native content. If a
+    # target protocol cannot carry a block natively, render an explicit text
+    # note plus compact JSON instead of silently skipping it.
     block_type = block.get("type")
     if block_type == "text":
         return str(block.get("text", ""))
@@ -414,6 +419,8 @@ def _portable_content_block_text(block, target_protocol):
 
 
 def _portable_item_text(item, target_protocol):
+    # This is the loss boundary for projections into less expressive protocols:
+    # non-native items become visible transcript notes, never invisible drops.
     item_type = item.get("type")
     if item_type == "response_metadata":
         fields = {
@@ -549,6 +556,9 @@ def items_to_openai_chat_messages(items):
             portable_notes = []
             i += 1
             if role == "assistant":
+                # OpenAI Chat represents assistant tool calls inside the
+                # assistant message envelope, so adjacent v2 tool_call items
+                # are folded into that one message during projection.
                 while i < len(items) and items[i].get("type") == "tool_call":
                     call = items[i]
                     if is_app_tool_call(call):
@@ -674,6 +684,9 @@ def items_to_anthropic_parts(items):
         item = items[i]
         item_type = item.get("type")
         if item_type == "instruction":
+            # Anthropic has a top-level system field, but only before the
+            # conversation. Later instructions are kept in-band as messages so
+            # they still survive resume/projection.
             content_text = item_text(item)
             if not seen_conversation:
                 if content_text:
@@ -718,6 +731,9 @@ def items_to_anthropic_parts(items):
             i += 1
             continue
         if item_type == "tool_result":
+            # Anthropic carries tool results as user-role content blocks. Group
+            # adjacent v2 tool_result items into one user message to match that
+            # wire shape without changing the persisted transcript order.
             content = []
             while i < len(items) and items[i].get("type") == "tool_result":
                 result = items[i]
@@ -884,6 +900,9 @@ def openai_responses_item_to_items(item):
             provider_raw=item,
         )]
     if item_type and item_type.endswith("_call"):
+        # Responses may add new tool-like output items. Treat them as tool calls
+        # with their native kind so a future Responses projection can replay the
+        # provider payload instead of demoting it to plain text immediately.
         return [tool_call_item(
             item.get("call_id") or item.get("id"),
             item.get("name") or item_type,
@@ -951,6 +970,8 @@ def _responses_tool_call_item(call):
             "input": call.get("raw_arguments", call.get("input", "")),
         }
     if call.get("provider_raw"):
+        # For Responses-native tool kinds beyond function/custom, the original
+        # item is the least lossy representation when sending back to Responses.
         return _copy(call["provider_raw"])
     return _responses_note_item(call, role="assistant")
 

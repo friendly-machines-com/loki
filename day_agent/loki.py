@@ -95,6 +95,8 @@ class ApiError(Exception):
 
     def formatted_body(self, max_chars: int = 4000) -> str:
         if self.body is not None:
+            # API error bodies are often JSON dictionaries. Pretty-print them so
+            # terminal errors stay readable instead of becoming one long line.
             text = pformat(self.body, width=100)
         else:
             text = self.body_text
@@ -168,6 +170,10 @@ def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with
     config_netloc = urllib.parse.urlparse(config_url).netloc
 
     env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'], environ)
+    # LOKI_API_KEY is the explicit override. Otherwise prefer the key whose name
+    # matches the selected wire protocol, with the other provider key as a
+    # compatibility fallback for gateways that expose one protocol under another
+    # provider's credentials.
     if config_provider_kind == protocols.ANTHROPIC_MESSAGES:
         config_api_key = (env_api_keys.get('LOKI_API_KEY') or
                           env_api_keys.get('ANTHROPIC_API_KEY') or
@@ -390,6 +396,8 @@ def _close_object_schemas(schema: dict):
     if not isinstance(schema, dict):
         return
     if schema.get("type") == "object" or "properties" in schema:
+        # Closed object schemas make unexpected model-generated arguments fail
+        # validation before they reach tool handlers.
         schema.setdefault("additionalProperties", False)
         for subschema in schema.get("properties", {}).values():
             _close_object_schemas(subschema)
@@ -473,6 +481,8 @@ def _format_numbered_lines(lines: list[str], first_line_number: int = 1) -> str:
 
 def _format_bash_result(stdout: str, stderr: str, exit_code: int | None,
                         status: str = "completed", no_output_expected: bool = False) -> str:
+    # Keep stdout and stderr separate in normal mode. The model can still ask
+    # for shell-level merging with 2>&1 inside the command when that is desired.
     parts = [f"status: {status}"]
     if exit_code is not None:
         parts.append(f"exit_code: {exit_code}")
@@ -506,6 +516,8 @@ def _atomic_write_text(file_path: str, content: str):
         try:
             os.unlink(tmp_path)
         except FileNotFoundError:
+            # The write failed, but another cleanup path may already have
+            # removed the temp file; preserve the original write exception.
             pass
         raise
 
@@ -540,6 +552,8 @@ def _read_spool_tail(path: str, max_chars: int = JOB_TAIL_CHARS) -> str:
     try:
         size = os.path.getsize(path)
         with open(path, 'rb') as f:
+            # Read extra bytes because UTF-8 may use multiple bytes per
+            # character; trim after decoding so the character cap is stable.
             f.seek(max(0, size - max_chars * 4))
             text = _decode_spooled_output(f.read())
     except FileNotFoundError:
@@ -617,6 +631,8 @@ class JobManager:
     def _record_exit(self, job: Job, exit_code: int):
         with self._lock:
             if job.status in ["timed_out", "stopped"]:
+                # Preserve the user-visible reason even after wait() reports the
+                # eventual process exit code.
                 pass
             elif exit_code < 0:
                 job.status = "signaled"
@@ -661,6 +677,9 @@ class JobManager:
             timeout_ms=timeout_ms,
         )
         with open(stdout_path, 'wb') as stdout_file, open(stderr_path, 'wb') as stderr_file:
+            # Tool output is spooled to separate fd streams. start_new_session
+            # gives each job a process group so timeouts and JobStop can signal
+            # the whole command tree.
             if shell:
                 proc = await asyncio.create_subprocess_shell(
                     command,
@@ -699,6 +718,8 @@ class JobManager:
             exit_code = await self._wait_for_job(job)
             self._record_exit(job, exit_code)
         except Exception as e:
+            # Background monitor failures cannot be returned synchronously, so
+            # record them in the same stderr spool the caller already inspects.
             with self._lock:
                 job.status = "monitor_error"
                 job.finished_at = time.time()
@@ -719,6 +740,8 @@ class JobManager:
                 job.status = "timed_out"
                 self._write_metadata(job)
             try:
+                # Jobs are started in their own process group; signal the group
+                # so shell children are not left behind after a timeout.
                 os.killpg(job.pgid or job.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
@@ -751,6 +774,8 @@ class JobManager:
             try:
                 asyncio.get_running_loop().create_task(self._monitor_background_job(job))
             except RuntimeError:
+                # If no loop can accept the monitor task, the job still exists
+                # with stdout/stderr/metadata paths for manual inspection.
                 pass
             return "\n".join([
                 f"Started background job {job.id}",
@@ -910,6 +935,8 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
 
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
+            # Read one character past the cap so the response can say whether
+            # the file was actually truncated.
             content = f.read(READ_CHAR_CAP + 1)
         truncated_chars = len(content) > READ_CHAR_CAP
         if truncated_chars:
@@ -1043,6 +1070,8 @@ async def run_glob_async(pattern: str, path: str = None) -> str:
         except OSError:
             return 0
 
+    # Put recently changed files first because coding tasks usually care about
+    # active work more than lexicographic directory order.
     matches.sort(key=mtime_or_zero, reverse=True)
     matches = matches[:GLOB_MAX_RESULTS]
     if not matches:
@@ -1444,6 +1473,8 @@ def _print_tool_args(args):
 
 
 def _terminal_agent_event(event: dict):
+    # Error branches reset attributes before emitting their final newline. That
+    # prevents terminal scroll-fill from inheriting the red background.
     kind = event.get("type")
     if kind == "max_loops":
         print("\n[!] [Max Loop Limit Reached - Stopping Autonomous Execution]")
@@ -1534,6 +1565,8 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
 
 def _subagent_env() -> dict:
     env = os.environ.copy()
+    # Parent startup consumes provider-specific key variables. Subagents receive
+    # only the normalized runtime provider/url/model/key they should use.
     env['LOKI_PROVIDER'] = chat_provider.kind
     env['LOKI_API_BASE'] = chat_provider.input_url
     env['LOKI_MODEL'] = model
@@ -2348,6 +2381,8 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         return []
     detected = protocols.detect_protocol_from_response(data)
     if detected and detected != chat_provider.kind:
+        # A configured adapter should not parse a response that clearly has
+        # another protocol's shape; that usually means endpoint/config mismatch.
         raise protocols.ProtocolError(
             f"configured provider {chat_provider.kind!r} but response looks like {detected!r}")
     return chat_provider.parse_chat_response(data)
@@ -2583,6 +2618,8 @@ def main():
         try:
             thunk()
         except Exception as e:
+            # Terminal cleanup is best-effort: one failed restore step should
+            # not prevent later steps from disabling modes or resetting colors.
             print(f"Cleanup error: {type(e).__name__}: {e}", file=sys.stderr)
 
     def clean_up(*args, **kwargs):

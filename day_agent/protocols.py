@@ -160,9 +160,9 @@ def _replace_path(parsed, path):
 
 
 def _append_path(parsed, suffix):
-    # Treat input_url as a provider base URL and append the concrete protocol
-    # endpoint. This is separate from _replace_path(), which is for known /v1
-    # roots or complete endpoints.
+    # Only used after endpoint detection failed and the caller supplied an
+    # explicit protocol. At that point the path is treated as a provider base
+    # prefix, not as a complete chat endpoint.
     base_path = parsed.path.rstrip("/")
     if not base_path:
         base_path = ""
@@ -269,6 +269,8 @@ def build_headers(protocol, api_key, anthropic_version="2023-06-01",
     if not api_key:
         return headers
     if auth_header:
+        # Compatibility gateways sometimes use a nonstandard auth header. When
+        # configured, honor it exactly instead of also adding Bearer/x-api-key.
         headers[auth_header] = api_key
         return headers
     if protocol == ANTHROPIC_MESSAGES:

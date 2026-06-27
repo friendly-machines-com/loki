@@ -18,6 +18,9 @@ RESET = '\033[0m'
 
 
 if not os.isatty(sys.stdout.fileno()):
+  # Noninteractive tests and headless runs still import terminal helpers. The
+  # no-op terminal keeps those paths from emitting escape sequences or touching
+  # terminal state when stdout is not a TTY.
   class Terminal:
       def __getattr__(self, x):
           return lambda *args, **kwargs: None
@@ -254,6 +257,8 @@ class AsyncKeyReader:
             try:
                 self.loop.add_signal_handler(signal.SIGWINCH, self._on_resize)
             except (NotImplementedError, RuntimeError):
+                # Some event loops/platforms do not expose signal handlers; the
+                # prompt remains usable without live resize events.
                 pass
         return self
 
@@ -262,6 +267,8 @@ class AsyncKeyReader:
             try:
                 self.loop.remove_signal_handler(signal.SIGWINCH)
             except (NotImplementedError, RuntimeError):
+                # Match the add path: absence of signal-handler support is not
+                # a terminal-state cleanup failure.
                 pass
         await self.byte_reader.__aexit__(exc_type, exc, tb)
 
@@ -279,8 +286,10 @@ class AsyncKeyReader:
                 sequence = bytes(self.escape)
                 self.escape.clear()
 
-                # Cursor Position Report: ESC [ row ; column R
                 if byte == 0x52: # 0x52 is 'R'
+                    # Only consume the exact two-parameter CPR reply that Loki
+                    # asked for with DSR 6. Other CSI ... R sequences are not
+                    # treated as cursor position guesses.
                     if re.match(br'^\x1b\[\d+;\d+R$', sequence):
                         self.pending.append(KeyEvent("CPR", sequence.decode('ascii')))
                         return
@@ -299,6 +308,8 @@ class AsyncKeyReader:
                 self.escape.clear()
                 return
             if len(self.escape) > 32:
+                # Unsupported escape sequences should not leave the input
+                # parser stuck forever waiting for a final byte.
                 self.escape.clear()
             return
 
@@ -382,7 +393,9 @@ class PromptRenderer:
         self.terminal.set_clipping_region(*input_area)
         self.terminal.goto_position(1, 1)
         self.terminal.set_background_color(INPUT_COLOR)
-        self.terminal.clear_to_end_of_screen() # ESC[J clears the status area too.
+        # ESC[J clears below the cursor, including the status area in this
+        # layout. Redraw status immediately, then re-enter the input area.
+        self.terminal.clear_to_end_of_screen()
         update_status_bar()
         self.terminal.set_clipping_region(*input_area)
         self.terminal.goto_position(1, 1)
@@ -429,6 +442,9 @@ class PromptController:
                             elif event.kind != "EOF":
                                 queued_events.append(event)
 
+                        # Bytes typed before the terminal answers the CPR query
+                        # still belong to the prompt, so replay them after the
+                        # initial cursor-position handshake.
                         reader.pending.extendleft(reversed(queued_events))
                         renderer.render(buffer)
 
@@ -479,11 +495,15 @@ class PromptController:
                                 else:
                                     buffer.insert(self.history[history_index])
                         elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
+                            # Paste markers only affect AsyncKeyReader state;
+                            # resize is handled by the next render pass.
                             pass
                         if interactive:
                             renderer.render(buffer)
         finally:
             if interactive:
+                # The prompt renderer temporarily owns the input/status regions;
+                # put subsequent output back where the original prompt started.
                 self.terminal.set_clipping_region(*output_area)
                 self.terminal.goto_position(output_row, output_col)
                 self.terminal.reset_colors_and_flags()

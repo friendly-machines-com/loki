@@ -4,6 +4,9 @@ import urllib.parse
 from dataclasses import dataclass
 
 
+# This is a small dependency-free HTTP/1.1 client for tool use, not a general
+# browser stack. Keep protocol policy here explicit because callers depend on
+# the exact redirect, truncation, and header-validation behavior.
 HTTP_HEADER_MAX_BYTES = 64 * 1024
 HTTP_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 
@@ -87,6 +90,8 @@ async def _read_until_eof(reader: asyncio.StreamReader, max_bytes: int) -> tuple
     total = 0
     truncated = False
     while True:
+        # Read one byte past the limit so callers can distinguish exactly
+        # max_bytes bytes from a response that was cut short.
         chunk = await reader.read(min(65536, max_bytes + 1 - total))
         if not chunk:
             break
@@ -103,6 +108,8 @@ async def _read_until_eof(reader: asyncio.StreamReader, max_bytes: int) -> tuple
 
 async def _read_content_length(reader: asyncio.StreamReader, length: int,
                                max_bytes: int) -> tuple[bytes, bool]:
+    # When the declared length exceeds the cap, read one byte past the cap so
+    # the returned body follows the same truncation path as the other readers.
     to_read = min(length, max_bytes + 1)
     body = await reader.readexactly(to_read) if to_read else b''
     truncated = length > max_bytes or len(body) > max_bytes
@@ -135,6 +142,8 @@ async def _read_chunked_body(reader: asyncio.StreamReader, max_bytes: int) -> tu
             chunks.append(data[:keep])
             total += keep
         if size > keep:
+            # The connection is closed by async_http_request(); draining the
+            # rest of an over-limit response would defeat the byte cap.
             truncated = True
             break
     return b''.join(chunks), truncated
@@ -199,6 +208,8 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
             try:
                 await writer.wait_closed()
             except Exception:
+                # Response handling already finished or failed; close errors
+                # should not replace the real request result.
                 pass
 
     return await asyncio.wait_for(request_once(), timeout=timeout)
@@ -226,6 +237,8 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
             return response
         next_host = urllib.parse.urlparse(next_url).netloc
         if next_host != original_host:
+            # WebFetch surfaces cross-origin redirects to the model/user rather
+            # than silently fetching a different authority.
             response.redirect_url = next_url
             return response
         current_url = next_url
