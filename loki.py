@@ -1658,7 +1658,7 @@ async def _read_headers(reader: asyncio.StreamReader) -> tuple[str, dict]:
         total += len(line)
         if total > HTTP_HEADER_MAX_BYTES:
             raise OSError("HTTP headers too large")
-        if line in (b'\r\n', b'\n'):
+        if line in [b'\r\n', b'\n']:
             break
         header_lines.append(line.decode('iso-8859-1').rstrip('\r\n'))
 

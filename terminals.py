@@ -308,12 +308,12 @@ class AsyncKeyReader:
             self.pending.append(KeyEvent("CTRL_C"))
         elif byte == 0x04:
             self.pending.append(KeyEvent("CTRL_D"))
-        elif byte in (0x0a, 0x0d):
+        elif byte in [0x0a, 0x0d]:
             if self.paste_mode:
                 self.pending.append(KeyEvent("TEXT", "\n"))
             else:
                 self.pending.append(KeyEvent("ENTER"))
-        elif byte in (0x7f, 0x08):
+        elif byte in [0x7f, 0x08]:
             self.pending.append(KeyEvent("BACKSPACE"))
         else:
             self._emit_text_byte(byte)
