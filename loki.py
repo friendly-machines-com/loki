@@ -2520,15 +2520,11 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
         print(result)
 
 
-def main():
-    asyncio.run(async_main())
-
-
-async def async_main():
+async def async_main(args):
     global model
     global messages
 
-    options, args = getopt.getopt(sys.argv[1:], 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset='])
+    options, args = getopt.getopt(args, 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset='])
     prompt_arg = None
     subagent_type = None
     headless = False
@@ -2619,6 +2615,9 @@ async def async_main():
             })
             continue # Drop immediately back to the User> prompt
         terminal.save_cursor_position()
+
+def main():
+    asyncio.run(async_main(sys.argv[1:]))
 
 if __name__ == '__main__':
     cleanup_done = False
