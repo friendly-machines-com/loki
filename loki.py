@@ -1599,6 +1599,7 @@ class HttpResponse:
     headers: dict
     body: bytes
     truncated: bool = False
+    redirect_url: str | None = None
 
     def header(self, name: str, default: str = "") -> str:
         return self.headers.get(name.lower(), default)
@@ -1787,7 +1788,7 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
             return response
         next_host = urllib.parse.urlparse(next_url).netloc
         if next_host != original_host:
-            response.url = next_url
+            response.redirect_url = next_url
             return response
         current_url = next_url
     return response
@@ -1814,6 +1815,9 @@ async def _fetch_url_async(url: str) -> dict:
         response = await async_http_request_follow_same_host(
             'GET', url, headers_in=request_headers,
             timeout=WEBFETCH_TIMEOUT_S, max_bytes=WEBFETCH_MAX_BYTES)
+        if response.redirect_url:
+            return {'redirectUrl': response.redirect_url, 'status': response.status,
+                    'finalUrl': response.url, 'error': None}
         content_type = response.header('content-type')
         body = _decode_http_text(response.body, response.headers)
         return {'content': body, 'contentType': content_type, 'status': response.status,
@@ -1836,6 +1840,13 @@ async def run_webfetch_async(url: str, prompt: str) -> str:
         response = await _fetch_url_async(url)
         if response.get('error'):
             return f"Error: {response['error']}"
+        if response.get('redirectUrl'):
+            return "\n".join([
+                f"WebFetch redirect: HTTP {response['status']}",
+                f"requested_url: {response['finalUrl']}",
+                f"redirect_url: {response['redirectUrl']}",
+                "Call WebFetch again with redirect_url if you want to fetch that page.",
+            ])
         content_type = response['contentType']
         if _is_html_content_type(content_type):
             content_text = _html_to_text(response['content'])
@@ -1851,14 +1862,6 @@ async def run_webfetch_async(url: str, prompt: str) -> str:
         _webfetch_cache[url] = (now, content_text, content_type, final_url, status)
         cache_hit = False
 
-    # If the final URL's host differs from the requested one, surface it.
-    req_host = urllib.parse.urlparse(url).netloc
-    final_host = urllib.parse.urlparse(final_url).netloc
-    cross_host_note = ""
-    if req_host and final_host and req_host != final_host:
-        cross_host_note = (f"\n\nNote: this was a cross-host redirect ({req_host} -> {final_host}). "
-                           f"Final URL: {final_url}")
-
     msgs = [
         {"role": "system",
          "content": "You are processing content fetched by the WebFetch tool. "
@@ -1870,7 +1873,7 @@ async def run_webfetch_async(url: str, prompt: str) -> str:
     ]
     answer = await run_toolless_completion_async(msgs) or "(no answer returned)"
     header = f"[WebFetch status={status} cache_hit={cache_hit} bytes~={len(content_text)} url={final_url}]"
-    return f"{header}\n{answer}{cross_host_note}"
+    return f"{header}\n{answer}"
 
 
 async def run_websearch_async(query: str, allowed_domains: list = None,
