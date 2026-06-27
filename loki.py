@@ -1340,7 +1340,7 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
 
         assistant_item = assistant_items[-1]
         assistant_text = formats.item_text(assistant_item)
-        tool_calls = formats.item_tool_calls(assistant_item)
+        tool_calls = formats.response_tool_calls(response_items)
         if assistant_text:
             on_event({"type": "assistant_message", "content": assistant_text})
 

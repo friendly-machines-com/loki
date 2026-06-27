@@ -57,7 +57,7 @@ class Provider:
                 payload["tools"] = anthropic_tools
             return payload
         if self.kind == OPENAI_RESPONSES:
-            raise UnsupportedProtocolError("OpenAI Responses is reserved in the transcript format but not implemented")
+            raise UnsupportedProtocolError("OpenAI Responses adapter is not enabled; transcript v2 can represent Responses items")
         raise ProtocolError(f"unknown protocol {self.kind!r}")
 
     def parse_chat_response(self, response):
@@ -66,7 +66,7 @@ class Provider:
         if self.kind == ANTHROPIC_MESSAGES:
             return formats.anthropic_response_to_items(response)
         if self.kind == OPENAI_RESPONSES:
-            raise UnsupportedProtocolError("OpenAI Responses is reserved in the transcript format but not implemented")
+            raise UnsupportedProtocolError("OpenAI Responses adapter is not enabled; transcript v2 can represent Responses items")
         raise ProtocolError(f"unknown protocol {self.kind!r}")
 
     def parse_model_ids(self, response):
