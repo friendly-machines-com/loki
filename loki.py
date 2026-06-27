@@ -8,7 +8,6 @@
 # TODO: input with readline support (just print the text you have so far--up to the cursor)
 # TODO: maybe sixel bitmap support; but what for?
 # TODO: background tasks and job control, maybe
-# TODO: implement OpenAI Responses provider rendering/parsing on top of the neutral transcript
 # TODO: make this an actual shell; pipeable and so on like always; history search etc
 
 import sys
@@ -1334,16 +1333,18 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
         for item in response_items:
             transcript_items.append(item)
 
+        tool_calls = formats.response_tool_calls(response_items)
         assistant_items = [
             item for item in response_items
             if item.get("type") == "message" and item.get("role") == "assistant"
         ]
-        if not assistant_items:
+        if not assistant_items and not tool_calls:
             return ""
 
-        assistant_item = assistant_items[-1]
-        assistant_text = formats.item_text(assistant_item)
-        tool_calls = formats.response_tool_calls(response_items)
+        assistant_text = ""
+        if assistant_items:
+            assistant_item = assistant_items[-1]
+            assistant_text = formats.item_text(assistant_item)
         if assistant_text:
             on_event({"type": "assistant_message", "content": assistant_text})
 
