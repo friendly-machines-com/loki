@@ -277,8 +277,15 @@ class AsyncKeyReader:
                 return
             if self.escape.startswith(b'\x1b[') and byte in CSI_FINAL_BYTES:
                 sequence = bytes(self.escape)
-                kind = KEY_SEQUENCES.get(sequence)
                 self.escape.clear()
+
+                # Cursor Position Report: ESC [ row ; column R
+                if byte == 0x52: # 0x52 is 'R'
+                    if re.match(br'^\x1b\[\d+;\d+R$', sequence):
+                        self.pending.append(KeyEvent("CPR", sequence.decode('ascii')))
+                        return
+
+                kind = KEY_SEQUENCES.get(sequence)
                 if kind == "PASTE_START":
                     self.paste_mode = True
                     self.pending.append(KeyEvent(kind))
@@ -388,6 +395,8 @@ class PromptRenderer:
 
 
 class PromptController:
+    history = []
+
     def __init__(self, terminal, prompt: str = 'User: '):
         self.terminal = terminal
         self.prompt = prompt
@@ -397,11 +406,33 @@ class PromptController:
         interactive = os.isatty(fd) and os.isatty(sys.stdout.fileno())
         buffer = InputBuffer()
         renderer = PromptRenderer(self.terminal, self.prompt)
+
+        output_row, output_col = 1, 1
+        history_index = len(self.history)
+        saved_input = ""
+
         try:
             with TerminalMode(fd, interactive):
-                if interactive:
-                    renderer.render(buffer)
                 async with AsyncKeyReader(fd, watch_resize=interactive) as reader:
+                    if interactive:
+                        sys.stdout.write('\033[6n')
+                        sys.stdout.flush()
+
+                        queued_events = []
+                        while True:
+                            event = await reader.read_key()
+                            if event.kind == "CPR":
+                                m = re.match(r'^\033\[(\d+);(\d+)R$', event.text)
+                                if m:
+                                    output_row = int(m.group(1))
+                                    output_col = int(m.group(2))
+                                break
+                            elif event.kind != "EOF":
+                                queued_events.append(event)
+
+                        reader.pending.extendleft(reversed(queued_events))
+                        renderer.render(buffer)
+
                     while True:
                         event = await reader.read_key()
                         if event.kind == "EOF":
@@ -418,7 +449,10 @@ class PromptController:
                             if interactive:
                                 print()
                                 self.terminal.flush()
-                            return buffer.text()
+                            text = buffer.text()
+                            if text and (not self.history or self.history[-1] != text):
+                                self.history.append(text)
+                            return text
                         if event.kind == "TEXT":
                             buffer.insert(event.text)
                         elif event.kind == "BACKSPACE":
@@ -434,9 +468,20 @@ class PromptController:
                         elif event.kind == "END":
                             buffer.end()
                         elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
-                            buffer.home()
+                            if self.history and history_index > 0:
+                                if history_index == len(self.history):
+                                    saved_input = buffer.text()
+                                history_index -= 1
+                                buffer = InputBuffer()
+                                buffer.insert(self.history[history_index])
                         elif event.kind in ["CURSOR_DOWN", "PAGE_DOWN"]:
-                            buffer.end()
+                            if history_index < len(self.history):
+                                history_index += 1
+                                buffer = InputBuffer()
+                                if history_index == len(self.history):
+                                    buffer.insert(saved_input)
+                                else:
+                                    buffer.insert(self.history[history_index])
                         elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
                             pass
                         if interactive:
@@ -444,7 +489,8 @@ class PromptController:
         finally:
             if interactive:
                 self.terminal.set_clipping_region(*output_area)
-                self.terminal.restore_cursor_position()
+                self.terminal.goto_position(output_row, output_col)
+                self.terminal.flush()
 
 
 async def get_input_async(prompt=None):
@@ -484,22 +530,10 @@ def run_menu(items):
 
 def restore_output_area_after_input():
     terminal.reset_colors_and_flags()
-    terminal.set_clipping_region(*output_area)
-    terminal.restore_cursor_position()
+    terminal.flush()
 
 
 def run_input_loop():
-  while True:
-    input_text = get_input()
-
-    terminal.reset_colors_and_flags()
-    terminal.set_clipping_region(*output_area)
-    terminal.restore_cursor_position()
-
-    yield input_text
-    #print('blahblah')
-    # Update cursor position for next output
-    terminal.save_cursor_position()
-
-    #terminal.disable_origin_mode()
-    #break
+    while True:
+        input_text = get_input()
+        yield input_text
