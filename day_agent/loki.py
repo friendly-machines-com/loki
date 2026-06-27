@@ -133,45 +133,32 @@ def _int_env(name, default):
         return default
 
 
-api_key = ""
-chat_provider = None
-headers = {}
+env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'])
+if provider_kind == protocols.ANTHROPIC_MESSAGES:
+    api_key = (env_api_keys.get('LOKI_API_KEY') or
+               env_api_keys.get('ANTHROPIC_API_KEY') or
+               env_api_keys.get('OPENAI_API_KEY') or "")
+else:
+    api_key = (env_api_keys.get('LOKI_API_KEY') or
+               env_api_keys.get('OPENAI_API_KEY') or
+               env_api_keys.get('ANTHROPIC_API_KEY') or "")
+if not api_key:
+    res = subprocess.run(['secret-tool', 'lookup', 'domain', netloc], shell=False, capture_output=True, text=True)
+    api_key = res.stdout.strip()
 
+if not api_key:
+    raise ValueError('API key missing.  Please run secret-tool store --label="opencode API key" domain {!r}'.format(netloc))
 
-def _ensure_provider_configured():
-    global api_key
-    global chat_provider
-    global headers
-
-    if chat_provider is not None:
-        return
-
-    env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'])
-    if provider_kind == protocols.ANTHROPIC_MESSAGES:
-        api_key = (env_api_keys.get('LOKI_API_KEY') or
-                   env_api_keys.get('ANTHROPIC_API_KEY') or
-                   env_api_keys.get('OPENAI_API_KEY') or "")
-    else:
-        api_key = (env_api_keys.get('LOKI_API_KEY') or
-                   env_api_keys.get('OPENAI_API_KEY') or
-                   env_api_keys.get('ANTHROPIC_API_KEY') or "")
-    if not api_key:
-        res = subprocess.run(['secret-tool', 'lookup', 'domain', netloc], shell=False, capture_output=True, text=True)
-        api_key = res.stdout.strip()
-
-    if not api_key:
-        raise ValueError('API key missing.  Please run secret-tool store --label="opencode API key" domain {!r}'.format(netloc))
-
-    chat_provider = protocols.make_provider(
-        url,
-        provider=provider_kind,
-        api_key=api_key,
-        models_url=os.environ.get("LOKI_MODELS_URL"),
-        max_tokens=_int_env("LOKI_MAX_TOKENS", 4096),
-        anthropic_version=os.environ.get("ANTHROPIC_VERSION", "2023-06-01"),
-        auth_header=os.environ.get("LOKI_AUTH_HEADER"),
-    )
-    headers = chat_provider.headers
+chat_provider = protocols.make_provider(
+    url,
+    provider=provider_kind,
+    api_key=api_key,
+    models_url=os.environ.get("LOKI_MODELS_URL"),
+    max_tokens=_int_env("LOKI_MAX_TOKENS", 4096),
+    anthropic_version=os.environ.get("ANTHROPIC_VERSION", "2023-06-01"),
+    auth_header=os.environ.get("LOKI_AUTH_HEADER"),
+)
+headers = chat_provider.headers
 
 class LruCache(object):
     def __init__(self, max_size):
@@ -2314,7 +2301,6 @@ model = configured_model or ('glm-5.2' if url == DEFAULT_API_BASE else '')
 async def load_models_async():
     global models
     global model
-    _ensure_provider_configured()
     model_urls = getattr(chat_provider, "model_urls", None) or ([chat_provider.models_url]
                                                                 if chat_provider.models_url else [])
     if not model_urls:
@@ -2454,7 +2440,6 @@ async def async_main(args):
         elif option_name == '--toolset':
             toolset = option_value
 
-    _ensure_provider_configured()
     await load_models_async()
 
     if subagent_type or headless:

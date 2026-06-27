@@ -16,44 +16,6 @@ from day_agent import loki
 
 
 class ResponsesToolLoopTests(unittest.TestCase):
-    def test_load_models_initializes_lazy_provider_before_using_it(self):
-        old_chat_provider = loki.chat_provider
-        old_headers = loki.headers
-        old_api_key = loki.api_key
-        old_models = loki.models
-        old_model = loki.model
-        old_async_chat_request = loki.async_chat_request
-        os.environ["LOKI_API_KEY"] = "test-key"
-
-        async def fake_async_chat_request(request_url, payload, request_headers=None,
-                                          report_errors=False, show_timing=False):
-            self.assertIsNotNone(loki.chat_provider)
-            self.assertIn("/models", request_url)
-            self.assertIsNone(payload)
-            self.assertEqual(request_headers["Authorization"], "Bearer test-key")
-            return {"data": [{"id": "model-a"}]}
-
-        try:
-            loki.chat_provider = None
-            loki.headers = {}
-            loki.api_key = ""
-            loki.models = []
-            loki.model = ""
-            loki.async_chat_request = fake_async_chat_request
-
-            asyncio.run(loki.load_models_async())
-
-            self.assertIsNotNone(loki.chat_provider)
-            self.assertEqual(loki.models, ["model-a"])
-            self.assertEqual(loki.model, "model-a")
-        finally:
-            loki.chat_provider = old_chat_provider
-            loki.headers = old_headers
-            loki.api_key = old_api_key
-            loki.models = old_models
-            loki.model = old_model
-            loki.async_chat_request = old_async_chat_request
-
     def test_function_call_only_response_executes_tool_and_continues(self):
         transcript = [formats.message_item("user", "read README")]
         seen_inputs = []
