@@ -13,7 +13,7 @@ from dataclasses import dataclass
 STATUS_COLOR = 4
 INPUT_COLOR = 7
 BOLD = '\033[1m'
-CYAN = '\033[36m'
+CODE_COLOR = 6
 RESET = '\033[0m'
 
 
@@ -85,7 +85,7 @@ else:
             # Check if the current part is a code block
             if part.startswith('`') and part.endswith('`') and len(part) >= 2:
                 inner_text = part[1:-1] # Strip the backticks
-                parts[i] = f"{CYAN}{inner_text}{RESET}"
+                parts[i] = f"\033[3{CODE_COLOR}m{inner_text}{RESET}"
             else: # normal text
                  # .*? is non-greedy so it correctly matches isolated **bold** pairs
                 part = re.sub(r'\*\*(.*?)\*\*', f'{BOLD}\\1{RESET}', part) # bold; TODO: also __foo__ also bold!
