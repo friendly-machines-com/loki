@@ -501,7 +501,7 @@ class PromptController:
                             raise EOFError
                         if event.kind == "ENTER":
                             if interactive:
-                                print()
+                                #print() This would unnecessarily scroll
                                 self.terminal.flush()
                             return buffer.text()
                         if event.kind == "TEXT":
