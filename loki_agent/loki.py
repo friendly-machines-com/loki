@@ -65,6 +65,8 @@ XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.loca
 LOKI_STATE_DIR = os.path.join(os.path.expanduser(XDG_STATE_HOME), LOKI_CONFIG_DIR_NAME)
 LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
 STARTUP_CWD = os.getcwd()
+_UMASK = os.umask(0)          # probe: sets umask to 0 momentarily, returns the previous value
+os.umask(_UMASK)             # restore immediately; no concurrent code runs at startup
 shell_cwd = STARTUP_CWD
 previous_shell_cwd = STARTUP_CWD
 LOCAL_LOKI_DIR = os.path.join(STARTUP_CWD, ".loki")
@@ -252,8 +254,16 @@ def _resolve_path(path: str, base_dir: str = None) -> str:
         return path
     path = os.path.expanduser(path)
     if os.path.isabs(path):
-        return os.path.normpath(path)
-    return os.path.normpath(os.path.join(base_dir or shell_cwd, path))
+        joined = path
+    else:
+        joined = os.path.join(base_dir or shell_cwd, path)
+    # Resolve symlinks so Read/Write/Edit operate on the real target inode
+    # (matches open()'s follow behavior, keeps the temp file on the same
+    # filesystem as the target for atomic os.replace, and keys file_state
+    # consistently across reads and edits). realpath does not raise on
+    # dangling symlinks -- it appends the missing tail lexically -- so creating
+    # a file through a dangling link works.
+    return os.path.realpath(os.path.normpath(joined))
 
 
 def _path_under(path: str, parent: str) -> bool:
@@ -517,6 +527,16 @@ def _format_bash_result(stdout: str, stderr: str, exit_code: int | None,
 
 def _atomic_write_text(file_path: str, content: str):
     directory = os.path.dirname(file_path) or '.'
+    # Capture the desired final mode BEFORE writing so a write/replace failure
+    # can never leave the public path's mode corrupted. For an existing file we
+    # preserve its current mode (rwx bits, including execute); for a new file
+    # we match what plain open(...,'w') would produce, i.e. 0o666 & ~umask.
+    # os.stat follows symlinks (callers resolve them via _resolve_path), so this
+    # reads the real target inode's mode.
+    try:
+        target_mode = os.stat(file_path).st_mode & 0o7777
+    except FileNotFoundError:
+        target_mode = 0o666 & ~_UMASK
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         prefix=f".{os.path.basename(file_path)}.",
@@ -529,6 +549,15 @@ def _atomic_write_text(file_path: str, content: str):
             f.write(content)
             f.flush()
             #os.fsync(f.fileno())
+        # Apply the target mode to the temp inode BEFORE the atomic publish.
+        # This matches what text editors (e.g. vim's buf_write) do: the temp
+        # lives in the user's own destination directory (not a shared /tmp),
+        # so broadening it here is safe -- the content is fully written and the
+        # directory is not adversarially pre-populated. Doing it before replace
+        # means the public path never appears with wrong-to-broad perms: the
+        # rename is atomic, so it jumps straight from (old inode, old mode) to
+        # (new inode, correct mode).
+        os.chmod(tmp_path, target_mode)
         os.replace(tmp_path, file_path)
     except Exception:
         try:
