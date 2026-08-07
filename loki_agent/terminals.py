@@ -231,6 +231,8 @@ KEY_SEQUENCES = {
     b'\x1b[6~': "PAGE_DOWN",
     b'\x1b[200~': "PASTE_START",
     b'\x1b[201~': "PASTE_END",
+    b'\x1b[1;5D': 'CURSOR_WORD_LEFT',
+    b'\x1b[1;5C': 'CURSOR_WORD_RIGHT',
 }
 CSI_FINAL_BYTES = set(range(0x40, 0x7f))
 
@@ -376,6 +378,43 @@ class InputBuffer:
     def right(self):
         self.cursor = min(len(self.chars), self.cursor + 1)
 
+    def word_left(self):
+        if self.cursor >= 0 and self.cursor < len(self.chars):
+            # move off the current word, if any
+            if self.chars[self.cursor].isidentifier():
+                while self.cursor > 0:
+                    self.cursor -= 1
+                    if self.cursor < len(self.chars):
+                        if not self.chars[self.cursor].isidentifier():
+                            break
+
+        # find SOME other word
+        while self.cursor > 0 and (self.cursor < len(self.chars) and not self.chars[self.cursor].isidentifier()) or (self.cursor >= len(self.chars)):
+           self.cursor -= 1
+
+        # move to the beginning of that word
+        if self.cursor >= 0 and self.cursor < len(self.chars) and self.chars[self.cursor].isidentifier():
+            while self.cursor > 0:
+                self.cursor -= 1
+                if self.cursor < len(self.chars):
+                    if not self.chars[self.cursor].isidentifier():
+                        self.cursor = min(len(self.chars), self.cursor + 1)
+                        break
+
+    def word_right(self):
+        if self.cursor >= 0 and self.cursor < len(self.chars):
+            if self.chars[self.cursor].isidentifier():
+                while self.cursor < len(self.chars):
+                    self.cursor += 1
+                    if self.cursor < len(self.chars):
+                        if not self.chars[self.cursor].isidentifier():
+                             break
+
+            while self.cursor < len(self.chars) and not self.chars[self.cursor].isidentifier():
+                self.cursor += 1
+        else:
+            self.cursor = min(len(self.chars), self.cursor + 1)
+
     def home(self):
         self.cursor = 0
 
@@ -475,6 +514,10 @@ class PromptController:
                             buffer.left()
                         elif event.kind == "CURSOR_RIGHT":
                             buffer.right()
+                        elif event.kind == "CURSOR_WORD_LEFT":
+                            buffer.word_left()
+                        elif event.kind == "CURSOR_WORD_RIGHT":
+                            buffer.word_right()
                         elif event.kind == "HOME":
                             buffer.home()
                         elif event.kind == "END":
