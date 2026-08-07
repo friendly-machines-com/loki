@@ -1432,7 +1432,8 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             on_event({"type": "api_error", "error": e})
             return ""
         except OSError as e:
-            on_event({"type": "network_error", "error": e})
+            msg = str(e) or f"{type(e).__name__}() (errno={e.errno!r}, no OS message)"
+            on_event({"type": "network_error", "error": msg})
             return ""
         if not response_items:
             return ""
