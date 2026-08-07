@@ -2833,7 +2833,7 @@ async def async_main(args):
             continue
 
         terminal.set_background_color(terminals.INPUT_COLOR)
-        print('User:', end='')
+        print('User: ', end='')
         print(user_in, end='')
         terminal.reset_colors_and_flags()
         print()
