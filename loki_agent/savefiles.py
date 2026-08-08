@@ -183,7 +183,7 @@ def write_chat_log(file_obj, transcript: list, todos: list,
     json.dump(blob, file_obj, indent=4)
     file_obj.truncate()
     file_obj.flush()
-    print('Note: Saved chat log to {}'.format(file_obj.name), file=sys.stderr)
+    print('Note: Saved chat log in {!r}'.format(file_obj.name), file=sys.stderr)
     sys.stderr.flush()
 
 
