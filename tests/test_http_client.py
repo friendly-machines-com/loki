@@ -1,6 +1,7 @@
 import asyncio
 import pathlib
 import sys
+import time
 import unittest
 
 
@@ -272,6 +273,64 @@ class HttpClientRedirectTests(unittest.TestCase):
         self.assertEqual(calls, ["https://example.test/start"])
         self.assertEqual(response.status, 302)
         self.assertEqual(response.redirect_url, "https://other.test/path")
+
+
+class HttpClientRetryTests(unittest.TestCase):
+    def test_retries_once_on_connection_reset_then_succeeds(self):
+        # First open_connection raises a transient transport error; the second
+        # returns a valid response. The wrapper should retry and succeed.
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        ])
+
+        attempts = {"n": 0}
+        connector_open = connector.open_connection
+
+        async def flaky_open(host, port, ssl=None, server_hostname=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise ConnectionResetError("simulated reset")
+            return await connector_open(host, port, ssl=ssl, server_hostname=server_hostname)
+
+        connector.open_connection = flaky_open
+
+        with PatchedOpenConnection(connector):
+            start = time.monotonic()
+            response = asyncio.run(http_client.async_http_request(
+                "GET",
+                "https://example.test/",
+                timeout=5,
+                max_bytes=100,
+                retry_max_attempts=3,
+                retry_base_delay_s=0.05,
+                retry_max_jitter_s=0.0,
+                retry_backoff_factor=2.0,
+            ))
+            elapsed = time.monotonic() - start
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body, b"hello")
+        self.assertEqual(attempts["n"], 2)
+        # Backoff: at least one base_delay_s sleep before the second attempt.
+        self.assertGreaterEqual(elapsed, 0.05)
+
+    def test_does_not_retry_on_malformed_response(self):
+        # An OSError raised during response parsing (no errno) must not retry.
+        connector = FakeConnector([b"not-http\r\n\r\n"])
+
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(OSError):
+                asyncio.run(http_client.async_http_request(
+                    "GET",
+                    "https://example.test/",
+                    timeout=5,
+                    max_bytes=100,
+                    retry_max_attempts=3,
+                    retry_base_delay_s=0.0,
+                    retry_max_jitter_s=0.0,
+                ))
+
+        self.assertEqual(len(connector.calls), 1)
 
 
 if __name__ == "__main__":

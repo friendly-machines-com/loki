@@ -1,4 +1,5 @@
 import asyncio
+import random
 import ssl
 import urllib.parse
 from dataclasses import dataclass
@@ -9,6 +10,33 @@ from dataclasses import dataclass
 # the exact redirect, truncation, and header-validation behavior.
 HTTP_HEADER_MAX_BYTES = 64 * 1024
 HTTP_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+
+
+# Errno values for which retrying is safe: the failure is transport-level and
+# the server is unlikely to have processed the request. HTTP-parsing OSErrors
+# raised inside this module (empty response, header overflow, bad chunk size,
+# invalid status line) are not in this set, so a malformed response propagates
+# immediately instead of being retried.
+_RETRYABLE_ERRNOS = frozenset({
+    104,   # ECONNRESET
+    110,   # ETIMEDOUT
+    111,   # ECONNREFUSED
+    113,   # EHOSTUNREACH
+    100,   # ENETUNREACH
+    32,    # EPIPE
+    58,    # ESHUTDOWN
+})
+
+
+def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                        ConnectionRefusedError, BrokenPipeError)):
+        return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "errno", None) in _RETRYABLE_ERRNOS
+    return False
 
 
 @dataclass
@@ -171,9 +199,9 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict = None,
     return parsed, raw_request
 
 
-async def async_http_request(method: str, request_url: str, *, headers_in: dict = None,
-                             body: bytes = b'', timeout: int = 30,
-                             max_bytes: int = HTTP_MAX_RESPONSE_BYTES) -> HttpResponse:
+async def _async_http_request_once(method: str, request_url: str, *, headers_in: dict = None,
+                                   body: bytes = b'', timeout: int = 30,
+                                   max_bytes: int = HTTP_MAX_RESPONSE_BYTES) -> HttpResponse:
     async def request_once() -> HttpResponse:
         parsed, raw_request = _build_raw_request(method, request_url, headers_in, body)
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
@@ -215,6 +243,30 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
     return await asyncio.wait_for(request_once(), timeout=timeout)
 
 
+async def async_http_request(method: str, request_url: str, *, headers_in: dict = None,
+                             body: bytes = b'', timeout: int = 30,
+                             max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
+                             retry_max_attempts: int = 1,
+                             retry_base_delay_s: float = 0.5,
+                             retry_max_jitter_s: float = 0.5,
+                             retry_backoff_factor: float = 2.0) -> HttpResponse:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await _async_http_request_once(
+                method, request_url,
+                headers_in=headers_in, body=body,
+                timeout=timeout, max_bytes=max_bytes,
+            )
+        except Exception as exc:
+            if attempt >= retry_max_attempts or not _is_transient(exc):
+                raise
+            delay = retry_base_delay_s * (retry_backoff_factor ** (attempt - 1))
+            delay += random.uniform(0, retry_max_jitter_s)
+            await asyncio.sleep(delay)
+
+
 def _redirect_location(response: HttpResponse) -> str | None:
     location = response.header('location')
     if response.status in range(300, 400) and location:
@@ -226,12 +278,20 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
                                               headers_in: dict = None, body: bytes = b'',
                                               timeout: int = 30,
                                               max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
-                                              max_redirects: int = 5) -> HttpResponse:
+                                              max_redirects: int = 5,
+                                              retry_max_attempts: int = 1,
+                                              retry_base_delay_s: float = 0.5,
+                                              retry_max_jitter_s: float = 0.5,
+                                              retry_backoff_factor: float = 2.0) -> HttpResponse:
     current_url = request_url
     original_host = urllib.parse.urlparse(request_url).netloc
     for _ in range(max_redirects + 1):
         response = await async_http_request(method, current_url, headers_in=headers_in,
-                                            body=body, timeout=timeout, max_bytes=max_bytes)
+                                            body=body, timeout=timeout, max_bytes=max_bytes,
+                                            retry_max_attempts=retry_max_attempts,
+                                            retry_base_delay_s=retry_base_delay_s,
+                                            retry_max_jitter_s=retry_max_jitter_s,
+                                            retry_backoff_factor=retry_backoff_factor)
         next_url = _redirect_location(response)
         if not next_url:
             return response

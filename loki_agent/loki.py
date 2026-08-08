@@ -16,6 +16,7 @@ import asyncio
 import collections
 import json
 import time
+import re
 import urllib.parse
 import subprocess
 import signal
@@ -84,6 +85,22 @@ WEBSEARCH_MAX_RESPONSE_BYTES = 2_000_000
 WEBSEARCH_MAX_RESULTS = 8
 DUCKDUCKGO_HTML_SEARCH_URL = 'https://html.duckduckgo.com/html/'
 HTTP_MAX_RESPONSE_BYTES = http_client.HTTP_MAX_RESPONSE_BYTES
+
+# Retry policy for transient transport failures (timeouts, connection resets).
+# Safe in this codebase because every request opens a fresh TCP connection
+# with Connection: close; the kernel drops late packets from the old socket on
+# the new connection's source port. Edit these to tune or disable.
+HTTP_RETRY_MAX_ATTEMPTS = 3         # for GETs and the read-only search POST
+HTTP_RETRY_MAX_ATTEMPTS_LLM = 3     # for chat-completion POSTs (with idempotency key)
+HTTP_RETRY_BASE_DELAY_S = 0.5
+HTTP_RETRY_MAX_JITTER_S = 0.5
+HTTP_RETRY_BACKOFF_FACTOR = 2.0
+# Idempotency-key header injected on every chat-completion POST so the provider
+# can dedup a retry. Anthropic honors this server-side; OpenAI-compat servers
+# may ignore it and bill for each attempt -- set HTTP_RETRY_MAX_ATTEMPTS_LLM=1
+# if your provider does not honor the header.
+LLM_IDEMPOTENCY_HEADER_ANTHROPIC = "anthropic-idempotency-key"
+LLM_IDEMPOTENCY_HEADER_OPENAI = "Idempotency-Key"
 
 
 class ApiError(Exception):
@@ -1889,7 +1906,11 @@ async def _fetch_url_async(url: str) -> dict:
     try:
         response = await http_client.async_http_request_follow_same_host(
             'GET', url, headers_in=request_headers,
-            timeout=WEBFETCH_TIMEOUT_S, max_bytes=WEBFETCH_MAX_BYTES)
+            timeout=WEBFETCH_TIMEOUT_S, max_bytes=WEBFETCH_MAX_BYTES,
+            retry_max_attempts=HTTP_RETRY_MAX_ATTEMPTS,
+            retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
+            retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
+            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR)
         if response.redirect_url:
             return {'redirectUrl': response.redirect_url, 'status': response.status,
                     'finalUrl': response.url, 'error': None}
@@ -1974,6 +1995,10 @@ async def run_websearch_async(query: str, allowed_domains: list = None,
                         'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'},
             timeout=WEBSEARCH_TIMEOUT_S,
             max_bytes=WEBSEARCH_MAX_RESPONSE_BYTES,
+            retry_max_attempts=HTTP_RETRY_MAX_ATTEMPTS,
+            retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
+            retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
+            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
         )
         if response.status >= 400:
             return f"Error: web search request failed: HTTP {response.status} {response.reason}"
@@ -2415,6 +2440,20 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     headers_to_use = request_headers
     if headers_to_use is None:
         headers_to_use = RUNTIME_CONFIG.headers if RUNTIME_CONFIG else {}
+    # Copy so the per-call idempotency key below does not mutate the cached
+    # provider headers shared across requests.
+    headers_to_use = dict(headers_to_use)
+
+    retry_attempts = HTTP_RETRY_MAX_ATTEMPTS
+    if method == 'POST':
+        # Best-effort server-side dedup; Anthropic honors this header on
+        # /v1/messages. OpenAI-compat servers may ignore it.
+        kind = RUNTIME_CONFIG.provider_kind if RUNTIME_CONFIG else None
+        header = (LLM_IDEMPOTENCY_HEADER_ANTHROPIC
+                  if kind == protocols.ANTHROPIC_MESSAGES
+                  else LLM_IDEMPOTENCY_HEADER_OPENAI)
+        headers_to_use[header] = uuid.uuid4().hex
+        retry_attempts = HTTP_RETRY_MAX_ATTEMPTS_LLM
 
     response = await http_client.async_http_request(
         method,
@@ -2423,6 +2462,10 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
         headers_in=headers_to_use,
         timeout=WEBFETCH_TIMEOUT_S,
         max_bytes=HTTP_MAX_RESPONSE_BYTES,
+        retry_max_attempts=retry_attempts,
+        retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
+        retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
+        retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
     )
     response_text = _decode_http_text(response.body, response.headers)
     if response.status >= 400:
@@ -2813,8 +2856,19 @@ async def async_main(args):
 
     if args[0:1] == ['resume']:
         if len(args) < 2:
-            raise ValueError("resume requires a chat id or path")
-        log_filename = args[1]
+            # Bare "resume" with no id opens the session picker.
+            picked = await run_session_picker_async()
+            if picked is None:
+                log_filename = ''  # picker cancelled -- start a fresh chat
+            else:
+                log_filename = picked
+        else:
+            log_filename = args[1]
+
+    # An empty --resume value (e.g. "--resume=") also opens the picker.
+    if log_filename == '':
+        picked = await run_session_picker_async()
+        log_filename = picked if picked is not None else ''
 
     if log_filename:
         load_chat_log(resolve_chat_log_path(log_filename))
