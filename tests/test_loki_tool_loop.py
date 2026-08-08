@@ -16,6 +16,7 @@ os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 from loki_agent import formats
 from loki_agent import loki
 from loki_agent import protocols
+from loki_agent import savefiles
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -251,6 +252,167 @@ class ChatLogPathTests(unittest.TestCase):
                     loki.__dict__.pop(name, None)
                 else:
                     loki.__dict__[name] = value
+
+
+class SessionPickerTests(unittest.TestCase):
+    """Tests for the `--resume` (no arg) session picker.
+
+    Drives run_session_picker_async by monkeypatching get_input_async to feed a
+    scripted sequence of inputs, with CHAT_LOG_DIR pointed at a tempdir of
+    synthetic chat logs.
+    """
+
+    def _write_chat(self, dirpath, chat_id, text, mtime=None):
+        path = os.path.join(dirpath, f"chat-{chat_id}.json")
+        with open(path, "w") as f:
+            f.write(text)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _make_picker(self, dirpath, inputs):
+        """Build a picker callback that reads from `inputs` (a list of strings).
+
+        Each call to get_input_async returns the next input; EOFError when
+        the list is exhausted (so infinite loops fail the test rather than
+        hang it).
+        """
+        # Point CHAT_LOG_DIR at the tempdir for _chat_log_paths().
+        saved_log_dir = loki.CHAT_LOG_DIR
+        loki.CHAT_LOG_DIR = dirpath
+        # Clear the per-path byte cache so prior tests don't leak in.
+        savefiles._chat_log_bytes_cache.clear()
+        # Scripted input stream.
+        iterator = iter(inputs)
+
+        async def fake_get_input_async(prompt=None, history=None):
+            try:
+                return next(iterator)
+            except StopIteration:
+                raise EOFError
+
+        saved_gia = loki.get_input_async
+        loki.get_input_async = fake_get_input_async
+        saved_terminal = loki.terminal
+
+        class _FakeTerminal:
+            def save_cursor_position(self, *a, **k):
+                pass
+
+            def restore_cursor_position(self, *a, **k):
+                pass
+
+        loki.terminal = _FakeTerminal()
+
+        def restore():
+            loki.CHAT_LOG_DIR = saved_log_dir
+            loki.get_input_async = saved_gia
+            loki.terminal = saved_terminal
+            savefiles._chat_log_bytes_cache.clear()
+
+        return restore
+
+    def test_picker_selects_by_number(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "aaa", '{"text":"alpha chat"}', mtime=1000)
+            self._write_chat(tmpdir, "bbb", '{"text":"beta chat"}', mtime=2000)
+            self._write_chat(tmpdir, "ccc", '{"text":"gamma chat"}', mtime=3000)
+            restore = self._make_picker(tmpdir, ["2"])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            # mtime-sorted oldest->newest: aaa(1000), bbb(2000), ccc(3000).
+            # "2" selects the middle one = bbb.
+            self.assertTrue(result.endswith("chat-bbb.json"))
+
+    def test_picker_filter_matches_all_words_in_any_order(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "aaa", '{"text":"alpha beta"}', mtime=1000)
+            self._write_chat(tmpdir, "bbb", '{"text":"beta gamma"}', mtime=2000)
+            restore = self._make_picker(tmpdir, ["filter beta alpha", "1"])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            # Only the aaa log contains both "beta" and "alpha".
+            self.assertTrue(result.endswith("chat-aaa.json"))
+
+    def test_picker_filter_404_matches_literal_digits(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "aaa", '{"text":"error 404 in nginx"}', mtime=1000)
+            self._write_chat(tmpdir, "bbb", '{"text":"something else"}', mtime=2000)
+            # Bare "404" should NOT match (parsed as int, out of range, ignored).
+            restore = self._make_picker(tmpdir, ["404", "filter 404", "1"])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            self.assertTrue(result.endswith("chat-aaa.json"))
+
+    def test_picker_bare_filter_clears(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "aaa", '{"text":"alpha beta"}', mtime=1000)
+            self._write_chat(tmpdir, "bbb", '{"text":"gamma delta"}', mtime=2000)
+            # Narrow to one match, then clear with bare "filter", then pick 2.
+            restore = self._make_picker(
+                tmpdir, ["filter alpha", "filter", "2"])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            # After clearing, both visible; "2" = bbb (newest last).
+            self.assertTrue(result.endswith("chat-bbb.json"))
+
+    def test_picker_empty_input_cancels(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
+            restore = self._make_picker(tmpdir, [""])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            self.assertIsNone(result)
+
+    def test_picker_mtime_newest_last(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "old", '{"text":"old session"}', mtime=1000)
+            self._write_chat(tmpdir, "mid", '{"text":"mid session"}', mtime=2000)
+            self._write_chat(tmpdir, "new", '{"text":"new session"}', mtime=3000)
+            restore = self._make_picker(tmpdir, ["3"])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            # Oldest->newest: old, mid, new. "3" = newest.
+            self.assertTrue(result.endswith("chat-new.json"))
+
+    def test_picker_preview_handles_partial_json(self):
+        # A truncated/garbled log file must not crash preview extraction.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(
+                tmpdir, "broken", '{"text":"hi there this is truncated', mtime=1000)
+            # No closing quote, no closing brace -- regex should still grab "hi there...".
+            restore = self._make_picker(tmpdir, ["1"])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            self.assertTrue(result.endswith("chat-broken.json"))
+
+    def test_picker_unrecognized_input_keeps_filter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
+            self._write_chat(tmpdir, "bbb", '{"text":"beta"}', mtime=2000)
+            # "alpha" (no prefix) is unrecognized: not "filter ...", not an int,
+            # not empty. Should re-render with the current (empty) filter, then
+            # "1" selects the first row.
+            restore = self._make_picker(tmpdir, ["alpha", "1"])
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+            self.assertTrue(result.endswith("chat-aaa.json"))
 
 
 class ShellCwdTests(unittest.TestCase):

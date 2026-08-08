@@ -34,6 +34,8 @@ from pprint import pprint, pformat
 from . import formats
 from . import http_client
 from . import protocols
+from . import savefiles
+from .savefiles import ResumeTranscriptRenderer
 from . import terminals
 from .terminals import get_input_async, restore_output_area_after_input, run_menu_async, terminal
 
@@ -44,7 +46,7 @@ computer = socket.gethostname()
 ERROR_COLOR = 1
 TOOL_CALL_COLOR = 5
 
-MAX_LOOP_LIMIT = 30
+MAX_LOOP_LIMIT = 50
 READ_CHAR_CAP = 10 * 1024 * 1024
 READ_PATHS_LIMIT = 1000
 READ_DEFAULT_LINES = 2000
@@ -2639,30 +2641,25 @@ def _parse_cd_arg_text(arg_text: str) -> str:
 
 
 def chat_log_filename(chat_id: str) -> str:
-    if chat_id.startswith("chat-") and chat_id.endswith(".json"):
-        return chat_id
-    return "chat-{}.json".format(chat_id)
+    return savefiles.chat_log_filename(chat_id)
 
 
 def ensure_chat_log_dir():
-    os.makedirs(CHAT_LOG_DIR, exist_ok=True)
+    savefiles.ensure_chat_log_dir(CHAT_LOG_DIR)
 
 
 def new_chat_log_path() -> str:
-    ensure_chat_log_dir()
-    return os.path.join(CHAT_LOG_DIR, chat_log_filename(str(uuid.uuid4())))
+    return savefiles.new_chat_log_path(CHAT_LOG_DIR)
 
 
 def resolve_chat_log_path(resume_arg: str) -> str:
-    # Bare resume names are chat ids in the local Loki chat directory. An
-    # argument with a directory component is an explicit path supplied by the
-    # caller; there is intentionally no fallback to the old root chat location.
-    if os.path.isabs(resume_arg):
-        return os.path.normpath(resume_arg)
-    if os.path.dirname(resume_arg):
-        return _resolve_path(resume_arg, STARTUP_CWD)
-    ensure_chat_log_dir()
-    return os.path.join(CHAT_LOG_DIR, chat_log_filename(resume_arg))
+    return savefiles.resolve_chat_log_path(
+        resume_arg, STARTUP_CWD, CHAT_LOG_DIR, _resolve_path)
+
+
+async def run_session_picker_async():
+    return await savefiles.run_session_picker_async(
+        input_fn=get_input_async, terminal=terminal, chat_log_dir=CHAT_LOG_DIR)
 
 
 def new_chat_log(filename):
@@ -2677,111 +2674,29 @@ def new_chat_log(filename):
     chat_log = open(filename, 'w')
 
 def save_chat_log():
-    chat_log.seek(0)
-    blob = formats.new_log_blob(transcript_items, session_todos)
-    blob["session_state"] = {"shell_cwd": shell_cwd}
-    json.dump(blob, chat_log, indent=4)
-    chat_log.truncate()
-    chat_log.flush()
-    print('Note: Saved chat log to {}'.format(chat_log.name), file=sys.stderr)
-    sys.stderr.flush()
-
-
-class ResumeTranscriptRenderer:
-    """Render a loaded transcript as the previous terminal conversation."""
-
-    def __init__(self, assistant_label: str = "Assistant"):
-        self.assistant_label = assistant_label
-        self.current_assistant_label = assistant_label
-
-    def _message_label(self, item: dict) -> str:
-        role = item.get("role")
-        if role == "user":
-            return "User"
-        if role == "assistant":
-            return self.current_assistant_label
-        return str(role or "Message").capitalize()
-
-    def _render_message(self, item: dict) -> str:
-        text = formats.item_text(item).strip()
-        if not text:
-            return ""
-        return f"{self._message_label(item)}: {text}"
-
-    def _render_tool_call(self, item: dict) -> str:
-        name = item.get("name") or "<unknown>"
-        args = pformat(item.get("input", {}), width=100)
-        return f"Tool call: {name}\n{args}"
-
-    def _render_tool_result(self, item: dict) -> str:
-        name = item.get("name") or item.get("tool_call_id") or "<unknown>"
-        label = "Tool error" if item.get("is_error") else "Tool result"
-        text = formats.item_text(item).strip()
-        return f"{label}: {name}" + (f"\n{text}" if text else "")
-
-    def _render_reasoning(self, item: dict) -> str:
-        summary = item.get("summary")
-        if not summary:
-            return ""
-        return "Reasoning summary:\n" + pformat(summary, width=100)
-
-    def _render_provider_item(self, item: dict) -> str:
-        provider = item.get("provider") or "unknown"
-        return f"[Provider-specific transcript item: {provider}]\n{pformat(item.get('value'), width=100)}"
-
-    def render_item(self, item: dict) -> str:
-        item_type = item.get("type")
-        if item_type == "response_metadata":
-            if item.get("model"):
-                self.current_assistant_label = item["model"]
-            return ""
-        if item_type == "instruction":
-            return ""
-        if item_type == "message":
-            return self._render_message(item)
-        if item_type == "tool_call":
-            return self._render_tool_call(item)
-        if item_type == "tool_result":
-            return self._render_tool_result(item)
-        if item_type == "reasoning":
-            return self._render_reasoning(item)
-        if item_type == "provider_item":
-            return self._render_provider_item(item)
-        return f"[Transcript item: {item_type or 'unknown'}]\n{pformat(item, width=100)}"
-
-    def render(self, items: list) -> str:
-        blocks = []
-        for item in items:
-            rendered = self.render_item(item)
-            if rendered:
-                blocks.append(rendered)
-        return "\n\n".join(blocks)
+    savefiles.write_chat_log(
+        chat_log, transcript_items, session_todos,
+        {"shell_cwd": shell_cwd})
 
 
 def render_resume_transcript(items: list) -> str:
-    return ResumeTranscriptRenderer(assistant_label=model or "Assistant").render(items)
+    return savefiles.render_resume_transcript(items, model or "Assistant")
 
 
 def print_resume_transcript(items: list):
-    rendered = render_resume_transcript(items)
-    if rendered:
-        print(rendered)
-    print('----')
+    savefiles.print_resume_transcript(items, model or "Assistant")
 
 
 def load_chat_log(filename):
     global chat_log
     global transcript_items
     global session_todos
-    chat_log = open(filename, 'r')
-    try:
-        blob = json.load(chat_log)
-        transcript_items, session_todos = formats.load_log_blob(blob)
-        load_session_state(blob.get("session_state", {}))
-        print_resume_transcript(transcript_items)
-    finally:
-        chat_log.close()
-
+    with open(filename, 'r') as f:
+        transcript, todos, state = savefiles.read_chat_log(f)
+    transcript_items = transcript
+    session_todos = todos
+    load_session_state(state)
+    print_resume_transcript(transcript_items)
     chat_log = open(filename, 'w')
     save_chat_log()
 
@@ -2828,6 +2743,9 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
 async def async_main(args):
     global model
 
+    # getopt's "resume=" requires a value; normalize a bare `--resume` to
+    # `--resume=` so it opens the picker instead of erroring out.
+    args = ['--resume=' if a == '--resume' else a for a in args]
     options, args = getopt.getopt(args, 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=', 'dangerously-skip-permissions'])
     prompt_arg = None
     subagent_type = None
