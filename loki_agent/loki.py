@@ -2658,8 +2658,15 @@ def resolve_chat_log_path(resume_arg: str) -> str:
 
 
 async def run_session_picker_async():
-    return await savefiles.run_session_picker_async(
+    picked = await savefiles.run_session_picker_async(
         input_fn=get_input_async, terminal=terminal, chat_log_dir=CHAT_LOG_DIR)
+    # Wipe the picker render so the next output (loaded transcript or a fresh
+    # chat) starts from a clean output area instead of below the stale list.
+    # The picker saved the cursor at the top of its render; restore and clear
+    # rolls the screen back to that row and blanks everything below.
+    terminal.goto_position(1, 1)
+    terminal.clear_to_end_of_screen()
+    return picked
 
 
 def new_chat_log(filename):
