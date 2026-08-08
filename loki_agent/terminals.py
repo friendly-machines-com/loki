@@ -17,14 +17,22 @@ CODE_COLOR = 6
 RESET = '\033[0m'
 
 
-if not os.isatty(sys.stdout.fileno()):
+if not os.isatty(sys.stdin.fileno()):
   # Noninteractive tests and headless runs still import terminal helpers. The
   # no-op terminal keeps those paths from emitting escape sequences or touching
-  # terminal state when stdout is not a TTY.
+  # terminal state when stdin is not a TTY.
   class Terminal:
       def __getattr__(self, x):
           return lambda *args, **kwargs: None
 else:
+  # stdin and stdout normally share one open file description (the pty slave),
+  # so AsyncByteReader setting O_NONBLOCK on stdin for async reads would also
+  # make stdout non-blocking -- and print() then raises BlockingIOError (EAGAIN)
+  # when the kernel write buffer fills. Reopen /dev/tty as fd 0: a fresh open
+  # file description whose status flags are independent of stdout's, so reads
+  # can be made non-blocking without affecting writes.
+  sys.stdin.close()
+  new_stdin = os.open('/dev/tty', os.O_RDONLY)
   class Terminal:
     def __init__(self):
         self.bracketed_paste = False
@@ -453,7 +461,7 @@ class PromptController:
         self.history = list(history or [])
 
     async def read_text(self) -> str:
-        fd = sys.stdin.fileno()
+        fd = new_stdin
         interactive = os.isatty(fd) and os.isatty(sys.stdout.fileno())
         buffer = InputBuffer()
         renderer = PromptRenderer(self.terminal, self.prompt)
