@@ -303,6 +303,9 @@ class SessionPickerTests(unittest.TestCase):
             def clear_to_end_of_screen(self, *a, **k):
                 pass
 
+            def goto_position(self, *a, **k):
+                pass
+
         loki.terminal = _FakeTerminal()
 
         def restore():
