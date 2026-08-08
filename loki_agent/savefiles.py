@@ -128,11 +128,9 @@ async def run_session_picker_async(*, input_fn, terminal, chat_log_dir: str):
     # Three gestures: "filter <words>" / bare "filter" sets/clears the filter;
     # a bare int selects that row; empty cancels (returns None -> caller starts
     # a fresh chat).
-    terminal.save_cursor_position()
     query = ""
     while True:
         matches = filtered_chat_log_paths(query, chat_log_dir)
-        terminal.restore_cursor_position()
         print("Resume a chat. \"filter <words>\" searches the logs (words in any order);")
         print("bare \"filter\" clears it; a number selects that row; empty cancels.")
         if matches:
