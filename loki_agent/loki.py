@@ -2779,12 +2779,11 @@ async def async_main(args):
 
     if args[0:1] == ['resume']:
         if len(args) < 2:
-            # Bare "resume" with no id opens the session picker.
+            # Bare "resume" with no id opens the session picker. On cancel
+            # (None), leave log_filename as None so the second block (which
+            # only triggers on '') doesn't reopen the picker.
             picked = await run_session_picker_async()
-            if picked is None:
-                log_filename = ''  # picker cancelled -- start a fresh chat
-            else:
-                log_filename = picked
+            log_filename = picked
         else:
             log_filename = args[1]
 
