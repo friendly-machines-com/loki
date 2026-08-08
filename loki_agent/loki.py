@@ -185,8 +185,23 @@ def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with
     explicitly, so removing provider-specific env vars here prevents child tools
     and subprocesses from inheriting extra ambient credentials they do not need.
     """
-    config_url = environ.get("LOKI_API_BASE") or environ.get("OPENAI_API_BASE", DEFAULT_API_BASE)
-    config_provider_kind = protocols.resolve_protocol(config_url, environ.get("LOKI_PROVIDER", "auto"))
+    # URL precedence: explicit LOKI_API_BASE, then OPENAI_API_BASE, then
+    # ANTHROPIC_BASE_URL (a common Claude Code / Anthropic SDK convention we
+    # honor as a compat alias), then the built-in default. If the URL comes
+    # from ANTHROPIC_BASE_URL with no explicit LOKI_PROVIDER, default the
+    # protocol to anthropic_messages -- the base URL usually isn't a full
+    # endpoint path so auto-detection from URL alone would fail.
+    config_url = (environ.get("LOKI_API_BASE") or
+                  environ.get("OPENAI_API_BASE") or
+                  environ.get("ANTHROPIC_BASE_URL") or
+                  DEFAULT_API_BASE)
+    provider_override = environ.get("LOKI_PROVIDER")
+    if (not provider_override
+            and not environ.get("LOKI_API_BASE")
+            and not environ.get("OPENAI_API_BASE")
+            and environ.get("ANTHROPIC_BASE_URL")):
+        provider_override = "anthropic_messages"
+    config_provider_kind = protocols.resolve_protocol(config_url, provider_override or "auto")
     config_netloc = urllib.parse.urlparse(config_url).netloc
 
     env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'], environ)
