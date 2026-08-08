@@ -280,8 +280,6 @@ class SessionPickerTests(unittest.TestCase):
         # Point CHAT_LOG_DIR at the tempdir for _chat_log_paths().
         saved_log_dir = loki.CHAT_LOG_DIR
         loki.CHAT_LOG_DIR = dirpath
-        # Clear the per-path byte cache so prior tests don't leak in.
-        savefiles._chat_log_bytes_cache.clear()
         # Scripted input stream.
         iterator = iter(inputs)
 
@@ -311,7 +309,6 @@ class SessionPickerTests(unittest.TestCase):
             loki.CHAT_LOG_DIR = saved_log_dir
             loki.get_input_async = saved_gia
             loki.terminal = saved_terminal
-            savefiles._chat_log_bytes_cache.clear()
 
         return restore
 

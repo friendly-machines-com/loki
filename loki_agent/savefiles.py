@@ -18,10 +18,9 @@ from . import formats
 
 
 _PREVIEW_RE = re.compile(
-    rb'"role"\s*:\s*"user".*?"text"\s*:\s*"((?:\\.|[^"\\])*)',
+    r'"role"\s*:\s*"user".*?"text"\s*:\s*"((?:\\.|[^"\\])*)',
     re.DOTALL,
 )
-_chat_log_bytes_cache = {}  # {path: (mtime, bytes)} -- invalidate on mtime change
 
 
 def chat_log_filename(chat_id: str) -> str:
@@ -62,34 +61,25 @@ def chat_log_paths(chat_log_dir: str) -> list[str]:
             if n.startswith("chat-") and n.endswith(".json")]
 
 
-def bytes_for(path: str) -> bytes:
-    # Whole-file cached read; invalidate on mtime change. Used by both the
-    # preview extractor and the substring search below.
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return b""
-    cached = _chat_log_bytes_cache.get(path)
-    if cached and cached[0] == mtime:
-        return cached[1]
+def text_for(path: str) -> str:
+    # Re-read each call; the kernel page cache keeps the bytes in RAM after
+    # the first read, so repeated calls during a picker session are cheap.
     try:
         with open(path, 'rb') as f:
             data = f.read()
     except OSError:
-        data = b""
-    _chat_log_bytes_cache[path] = (mtime, data)
-    return data
+        return ""
+    return data.decode('utf-8', 'replace')
 
 
-def preview(raw_bytes: bytes) -> str:
+def preview(text: str) -> str:
     # Snatch a one-line preview from the first user message. The chat log's
     # first "text" field is always the system instruction ("You are a helpful
     # system agent..."), which is useless for distinguishing chats, so we anchor
     # on "role":"user" and grab the next "text" after it. Not JSON -- regex on
-    # bytes, tolerant of anything weird mid-file.
-    m = _PREVIEW_RE.search(raw_bytes)
-    snippet = (m.group(1) if m else b"")
-    snippet = snippet.decode('utf-8', 'replace')
+    # the decoded text, tolerant of anything weird mid-file.
+    m = _PREVIEW_RE.search(text)
+    snippet = m.group(1) if m else ""
     snippet = re.sub(r'\s+', ' ', snippet).strip()
     if len(snippet) > 80:
         snippet = snippet[:77] + "..."
@@ -103,7 +93,7 @@ def format_picker_row(idx: int, path: str) -> str:
         mtime = 0
     when = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
     chat_id = os.path.basename(path)[len("chat-"):-len(".json")]
-    return f"  {idx}. {when}  {chat_id[:8]}  {preview(bytes_for(path))}"
+    return f"  {idx}. {when}  {chat_id[:8]}  {preview(text_for(path))}"
 
 
 def filtered_chat_log_paths(query: str, chat_log_dir: str) -> list[str]:
@@ -117,7 +107,7 @@ def filtered_chat_log_paths(query: str, chat_log_dir: str) -> list[str]:
     else:
         matches = []
         for path in paths:
-            blob = bytes_for(path).decode('utf-8', 'replace').lower()
+            blob = text_for(path).lower()
             if all(w in blob for w in words):
                 matches.append(path)
     matches.sort(key=os.path.getmtime)
