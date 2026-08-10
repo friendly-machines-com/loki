@@ -77,6 +77,16 @@ else:
     def set_background_color(self, index):
         print('\033[{}m'.format(40 + index), end='')
 
+    def set_reverse_video(self, enabled: bool):
+        # 7 = reverse video (SGR); 0 = reset. Used for the drawn input caret.
+        print('\033[7m' if enabled else '\033[0m', end='')
+
+    def set_autowrap(self, enabled: bool):
+        # DECAWM: with autowrap off, a write at the last column overwrites in
+        # place instead of wrapping/scrolling. Used around a single-cell caret
+        # draw at the input region's bottom-right edge.
+        print('\033[?7{}'.format('h' if enabled else 'l'), end='')
+
     def reset_colors_and_flags(self):
         print('\033[m', end='')
 
@@ -438,7 +448,7 @@ class PromptRenderer:
         self.terminal = terminal
         self.prompt = prompt
 
-    def render(self, buffer: InputBuffer):
+    def render(self, buffer: InputBuffer, output_row: int = 1, output_col: int = 1):
         refresh_terminal_layout()
         self.terminal.set_clipping_region(*input_area)
         self.terminal.goto_position(1, 1)
@@ -451,9 +461,33 @@ class PromptRenderer:
         self.terminal.goto_position(1, 1)
         self.terminal.set_background_color(INPUT_COLOR)
         print(self.prompt + buffer.before_cursor(), end='')
-        self.terminal.save_cursor_position()
-        print(buffer.after_cursor(), end='')
-        self.terminal.restore_cursor_position()
+
+        # Draw the fake (reverse-video) caret at the insertion point, then the
+        # text after it.  The real cursor is parked in the output area at the
+        # end, so stdout/stderr writes land there (contract unchanged).
+        after = buffer.after_cursor()
+        # Autowrap off around the single-cell caret write: a write at the input
+        # region's last column overwrites in place instead of wrapping/scroll-
+        # ing. Safe at every position, and only matters at the edge.
+        self.terminal.set_autowrap(False)
+        self.terminal.set_reverse_video(True)
+        if after:
+            # Caret sits on the first char after the insertion point.
+            print(after[0], end='')
+        else:
+            # End of text (empty buffer, or caret after the last char): draw a
+            # reversed blank cell as the caret.
+            print(' ', end='')
+        self.terminal.set_reverse_video(False)
+        self.terminal.set_autowrap(True)
+        if after:
+            print(after[1:], end='')
+
+        # Park the real cursor in the output area so output writers work
+        # normally; the input area keeps the draft + drawn caret visible.
+        self.terminal.set_clipping_region(*output_area)
+        self.terminal.goto_position(output_row, output_col)
+        self.terminal.reset_colors_and_flags()
         self.terminal.flush()
 
 
@@ -485,30 +519,37 @@ class PromptController:
                 return await self._read_text_from_reader(reader, interactive, buffer, renderer,
                                                          output_row, output_col, history_index, saved_input)
 
+    async def _query_output_cursor(self, reader) -> tuple[int, int]:
+        """CPR handshake: ask the terminal where the cursor is, return (row, col).
+
+        Replays any key events that arrive before the terminal answers the
+        query back into the reader's pending queue so they aren't lost.
+        """
+        sys.stdout.write('\033[6n')
+        sys.stdout.flush()
+        queued_events = []
+        while True:
+            event = await reader.read_key()
+            if event.kind == "CPR":
+                m = re.match(r'^\033\[(\d+);(\d+)R$', event.text)
+                # Events typed while waiting for the CPR reply belong to the
+                # prompt; replay them in order after the handshake.
+                if queued_events:
+                    reader.pending.extendleft(reversed(queued_events))
+                if m:
+                    return int(m.group(1)), int(m.group(2))
+                return 1, 1
+            elif event.kind != "EOF":
+                queued_events.append(event)
+        # Unreachable; kept for clarity that EOF doesn't give a position.
+        return 1, 1
+
     async def _read_text_from_reader(self, reader, interactive, buffer, renderer,
                                      output_row, output_col, history_index, saved_input):
         try:
             if interactive:
-                sys.stdout.write('\033[6n')
-                sys.stdout.flush()
-
-                queued_events = []
-                while True:
-                    event = await reader.read_key()
-                    if event.kind == "CPR":
-                        m = re.match(r'^\033\[(\d+);(\d+)R$', event.text)
-                        if m:
-                            output_row = int(m.group(1))
-                            output_col = int(m.group(2))
-                        break
-                    elif event.kind != "EOF":
-                        queued_events.append(event)
-
-                # Bytes typed before the terminal answers the CPR query
-                # still belong to the prompt, so replay them after the
-                # initial cursor-position handshake.
-                reader.pending.extendleft(reversed(queued_events))
-                renderer.render(buffer)
+                output_row, output_col = await self._query_output_cursor(reader)
+                renderer.render(buffer, output_row, output_col)
 
             while True:
                 event = await reader.read_key()
@@ -565,7 +606,8 @@ class PromptController:
                     # resize is handled by the next render pass.
                     pass
                 if interactive:
-                    renderer.render(buffer)
+                    output_row, output_col = await self._query_output_cursor(reader)
+                    renderer.render(buffer, output_row, output_col)
         finally:
             if interactive:
                 # The prompt renderer temporarily owns the input/status regions;

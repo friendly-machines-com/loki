@@ -32,6 +32,12 @@ class RecordingTerminal:
     def set_background_color(self, index):
         self.calls.append(("set_background_color", index))
 
+    def set_reverse_video(self, enabled):
+        self.calls.append(("set_reverse_video", enabled))
+
+    def set_autowrap(self, enabled):
+        self.calls.append(("set_autowrap", enabled))
+
     def clear_to_end_of_screen(self):
         self.calls.append(("clear_to_end_of_screen",))
 
@@ -304,8 +310,13 @@ class PromptRendererTests(unittest.TestCase):
                 ("set_clipping_region", 10, 13),
                 ("goto_position", 1, 1),
                 ("set_background_color", terminals.INPUT_COLOR),
-                ("save_cursor_position",),
-                ("restore_cursor_position",),
+                ("set_autowrap", False),
+                ("set_reverse_video", True),
+                ("set_reverse_video", False),
+                ("set_autowrap", True),
+                ("set_clipping_region", *terminals.output_area),
+                ("goto_position", 1, 1),
+                ("reset_colors_and_flags",),
                 ("flush",),
             ],
         )
