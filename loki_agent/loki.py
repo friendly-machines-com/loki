@@ -2918,13 +2918,19 @@ async def async_main(args):
                 provider_id = None
                 picked = await modelsdev.run_model_picker_async(
                     input_fn=get_input_async)
-                if picked is None:
-                    # models.dev unavailable or user cancelled: fall back to
-                    # the current provider's own /models list.
+                if picked is modelsdev.UNAVAILABLE:
+                    # models.dev unreachable: fall back to the current
+                    # provider's own /models list.
                     model = await run_menu_async(models)
                     if model:
                         reinstall_provider(model=model)
                         await load_models_async()
+                elif picked is None:
+                    # User cancelled at either menu; keep the current model.
+                    print("Model selection cancelled.", file=sys.stderr)
+                    sys.stderr.flush()
+                    terminal.save_cursor_position()
+                    continue
                 else:
                     provider_id, provider_entry, model_entry = picked
                     model = model_entry.get("id") or model_entry.get("name")

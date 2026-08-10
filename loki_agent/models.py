@@ -296,18 +296,24 @@ def _provider_rows(members):
     return rows
 
 
+# Returned by run_model_picker_async when models.dev could not be fetched.
+# Distinct from None (user cancelled), so the caller can fall back to another
+# model source only for genuine unavailability, never for a user cancel.
+UNAVAILABLE = object()
+
+
 async def run_model_picker_async(input_fn, cache_path=None):
     """Two-level picker: conflated model -> provider.
 
     Returns (provider_id, provider_entry, model_entry) for the chosen
-    provider of the chosen model, or None if the user cancelled or models.dev
-    could not be fetched.
+    provider of the chosen model, None if the user cancelled (at either
+    menu), or UNAVAILABLE if models.dev could not be fetched.
     """
     try:
         _, groups = ensure_index(cache_path=cache_path)
     except Exception as e:
         print(f"models.dev unavailable: {e}", file=sys.stderr)
-        return None
+        return UNAVAILABLE
     # Keep only models served by at least one provider whose wire protocol
     # Loki can speak, so the menu is not flooded with the long tail.
     groups = filter_supported_groups(groups)
