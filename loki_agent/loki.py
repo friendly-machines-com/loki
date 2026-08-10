@@ -1456,14 +1456,15 @@ async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
     return _tool_result(not _looks_like_tool_error(text), text)
 
 
-async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, inhibit_edits=False) -> dict:
+async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_context=None) -> dict:
+    inhibit_edits = (extra_context or {}).get('inhibit_edits', False)
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
         return _tool_result(False, f"Unknown function: {fn_name}")
     if allowed is not None and fn_name not in allowed:
         return _tool_result(False, f"Tool {fn_name} not available in this subagent (allowed: {sorted(allowed)})")
     if inhibit_edits and spec.get('explore') != True:
-        return _tool_result(False, f"Not allowed to {fn_name} instead of answering the user question")
+        return _tool_result(False, f"Not allowed to {fn_name} instead of doing the following: {inhibit_edits}")
 
     async def run_handler():
         if spec.get("async_handler") is not None:
@@ -1471,6 +1472,19 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, inhibit_ed
         return spec["handler"](args)
 
     return await with_exception_to_tool_result_async(f"executing {fn_name}", run_handler)
+
+
+def get_tool_loop_extra_context(transcript_items: list):
+    inhibit_edits = False
+    if len(transcript_items) > 0 and transcript_items[-1].get("type") == "message" and transcript_items[-1].get("role") == "user":
+        content = transcript_items[-1].get('content')
+        content = [x for x in content if x.get('type') == 'text'][-1:]
+        if len(content) > 0:
+            text = content[-1].get("text")
+            if text and text.strip().endswith('?') or text.strip().lower().find('what?') != -1:
+                inhibit_edits = "answering the user's question"
+
+    return {'inhibit_edits': inhibit_edits}
 
 
 async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
@@ -1481,14 +1495,7 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
     if on_event is None:
         on_event = lambda event: None
 
-    inhibit_edits = False
-    if len(transcript_items) > 0 and transcript_items[-1].get("type") == "message" and transcript_items[-1].get("role") == "user":
-        content = transcript_items[-1].get('content')
-        content = [x for x in content if x.get('type') == 'text'][-1:]
-        if len(content) > 0:
-            text = content[-1].get("text")
-            if text and text.strip().endswith('?') or text.strip().lower().find('what?') != -1:
-                inhibit_edits = True
+    tool_loop_extra_context = get_tool_loop_extra_context(transcript_items)
 
     loop_count = 0
     while True:
@@ -1547,7 +1554,7 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                     on_event({"type": "tool_rejected", "name": fn_name, "args": args})
                 else:
                     on_event({"type": "tool_call", "name": fn_name, "args": args})
-                    result = await dispatch_tool_async(fn_name, args, allowed=allowed, inhibit_edits=inhibit_edits)
+                    result = await dispatch_tool_async(fn_name, args, allowed=allowed, extra_context=tool_loop_extra_context)
             if not result["ok"]:
                 on_event({"type": "tool_error", "result": result["content"]})
             transcript_items.append(formats.tool_result_item(
