@@ -677,7 +677,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
                 ]
             return [formats.message_item("assistant", "done")]
 
-        async def fake_dispatch(fn_name, args, allowed=None):
+        async def fake_dispatch(fn_name, args, allowed=None, extra_context=None):
             self.assertEqual(fn_name, "Read")
             self.assertEqual(args, {"file_path": "README.md"})
             return {"ok": True, "content": "file contents"}
