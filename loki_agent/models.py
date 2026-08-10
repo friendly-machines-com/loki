@@ -302,6 +302,26 @@ def _provider_rows(members):
 UNAVAILABLE = object()
 
 
+async def run_flat_model_picker_async(input_fn, model_ids):
+    """Single-level menu over a flat list of model ids (outage fallback).
+
+    Used when models.dev is unreachable: loki.py fetches the current
+    provider's own /models list via the existing load_models_async() and feeds
+    it here, so /model keeps the same menu UI and gestures instead of falling
+    back to a different, older menu. Returns the chosen model id, or None.
+    """
+    ids = [m for m in (model_ids or []) if m]
+    if not ids:
+        print("No models available from the current provider.", file=sys.stderr)
+        return None
+    rows = [(m, m) for m in ids]
+    rows.sort(key=lambda r: r[1].lower())
+    return await _numbered_menu_async(
+        rows,
+        'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
+        input_fn)
+
+
 async def run_model_picker_async(input_fn, cache_path=None):
     """Two-level picker: conflated model -> provider.
 

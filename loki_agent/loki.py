@@ -38,7 +38,7 @@ from . import protocols
 from . import savefiles
 from .savefiles import ResumeTranscriptRenderer
 from . import terminals
-from .terminals import get_input_async, restore_output_area_after_input, run_menu_async, terminal
+from .terminals import get_input_async, restore_output_area_after_input, terminal
 
 DEFAULT_API_BASE = "https://opencode.ai/zen/go/v1/chat/completions"
 
@@ -2919,12 +2919,19 @@ async def async_main(args):
                 picked = await modelsdev.run_model_picker_async(
                     input_fn=get_input_async)
                 if picked is modelsdev.UNAVAILABLE:
-                    # models.dev unreachable: fall back to the current
-                    # provider's own /models list.
-                    model = await run_menu_async(models)
+                    # models.dev unreachable: fetch the current provider's own
+                    # /models list and show it through the same menu UI.
+                    await load_models_async()
+                    model = await modelsdev.run_flat_model_picker_async(
+                        get_input_async, models)
                     if model:
                         reinstall_provider(model=model)
                         await load_models_async()
+                    else:
+                        print("Model selection cancelled.", file=sys.stderr)
+                        sys.stderr.flush()
+                        terminal.save_cursor_position()
+                        continue
                 elif picked is None:
                     # User cancelled at either menu; keep the current model.
                     print("Model selection cancelled.", file=sys.stderr)
