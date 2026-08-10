@@ -178,7 +178,7 @@ def _int_env(name, default, environ=os.environ):
 
 
 def _lookup_api_key_with_secret_tool(domain):
-    res = subprocess.run(['secret-tool', 'lookup', 'domain', domain],
+    res = subprocess.run(['secret-tool', 'lookup', 'service', 'llm', 'domain', domain],
                          shell=False, capture_output=True, text=True)
     return res.stdout.strip()
 

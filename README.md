@@ -15,7 +15,7 @@ Supports Anthropic and OpenAI protocols.
 Run it in a VM or container.
 
 ```
-export LOKI_API_KEY=xxx # or secret-tool store --label='opencode.ai api key' domain opencode.ai
+export LOKI_API_KEY=xxx # or secret-tool store --label='opencode.ai api key' service llm domain opencode.ai
 export LOKI_API_BASE="https://opencode.ai/zen/go/v1/chat/completions"
 ./loki.py
 ```
