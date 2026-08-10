@@ -81,12 +81,6 @@ else:
         # 7 = reverse video (SGR); 0 = reset. Used for the drawn input caret.
         print('\033[7m' if enabled else '\033[0m', end='')
 
-    def set_autowrap(self, enabled: bool):
-        # DECAWM: with autowrap off, a write at the last column overwrites in
-        # place instead of wrapping/scrolling. Used around a single-cell caret
-        # draw at the input region's bottom-right edge.
-        print('\033[?7{}'.format('h' if enabled else 'l'), end='')
-
     def reset_colors_and_flags(self):
         print('\033[m', end='')
 
@@ -477,10 +471,6 @@ class PromptRenderer:
         # text after it.  The real cursor is parked in the output area at the
         # end, so stdout/stderr writes land there (contract unchanged).
         after = buffer.after_cursor()
-        # Autowrap off around the single-cell caret write: a write at the input
-        # region's last column overwrites in place instead of wrapping/scroll-
-        # ing. Safe at every position, and only matters at the edge.
-        self.terminal.set_autowrap(False)
         self.terminal.set_reverse_video(True)
         if after:
             # Caret sits on the first char after the insertion point.
@@ -490,7 +480,6 @@ class PromptRenderer:
             # reversed blank cell as the caret.
             print(' ', end='')
         self.terminal.set_reverse_video(False)
-        self.terminal.set_autowrap(True)
         if after:
             print(after[1:], end='')
 
