@@ -21,6 +21,7 @@ if not os.isatty(sys.stdin.fileno()):
   # Noninteractive tests and headless runs still import terminal helpers. The
   # no-op terminal keeps those paths from emitting escape sequences or touching
   # terminal state when stdin is not a TTY.
+  new_stdin = sys.stdin.fileno()
   class Terminal:
       def __getattr__(self, x):
           return lambda *args, **kwargs: None
