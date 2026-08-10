@@ -329,14 +329,11 @@ async def run_model_picker_async(input_fn, cache_path=None):
 
     Returns (provider_id, provider_entry, model_entry) for the chosen
     provider of the chosen model, or None if the user cancelled (at either
-    menu) or models.dev could not be fetched -- the caller falls back to the
-    current provider's own model list in both cases.
+    menu). If models.dev cannot be fetched, the network exception from
+    fetch_models_dev propagates naturally; the caller catches it and falls
+    back to the current provider's own model list.
     """
-    try:
-        _, groups = ensure_index(cache_path=cache_path)
-    except Exception as e:
-        print(f"models.dev unavailable: {e}", file=sys.stderr)
-        return None
+    _, groups = ensure_index(cache_path=cache_path)
     # Keep only models served by at least one provider whose wire protocol
     # Loki can speak, so the menu is not flooded with the long tail.
     groups = filter_supported_groups(groups)

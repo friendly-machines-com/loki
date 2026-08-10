@@ -2916,12 +2916,18 @@ async def async_main(args):
                 break
             case '/model':
                 provider_id = None
-                picked = await modelsdev.run_model_picker_async(
-                    input_fn=get_input_async)
-                if picked is None:
-                    # User cancelled, or models.dev unreachable: either way,
-                    # show the current provider's own /models list in the same
-                    # menu UI (which cancels cleanly on empty input).
+                try:
+                    picked = await modelsdev.run_model_picker_async(
+                        input_fn=get_input_async)
+                except (OSError, json.JSONDecodeError) as e:
+                    # models.dev unreachable (network errors) or answered with
+                    # non-JSON garbage (JSONDecodeError from parsing the body):
+                    # fall back to the current provider's own /models list,
+                    # shown through the same menu UI (which cancels cleanly on
+                    # empty input). Anything else -- a real bug in the menus --
+                    # propagates as an error, not here.
+                    print(f"models.dev unavailable: {e}", file=sys.stderr)
+                    sys.stderr.flush()
                     await load_models_async()
                     model = await modelsdev.run_flat_model_picker_async(
                         get_input_async, models)
@@ -2933,37 +2939,42 @@ async def async_main(args):
                         sys.stderr.flush()
                         terminal.save_cursor_position()
                         continue
+                if picked is None:
+                    # User cancelled at either menu; keep the current model.
+                    print("Model selection cancelled.", file=sys.stderr)
+                    sys.stderr.flush()
+                    terminal.save_cursor_position()
+                    continue
+                provider_id, provider_entry, model_entry = picked
+                model = model_entry.get("id") or model_entry.get("name")
+                api = provider_entry.get("api")
+                if not api:
+                    print(f"Provider {provider_id!r} has no api base URL; "
+                          f"keeping current provider.", file=sys.stderr)
                 else:
-                    provider_id, provider_entry, model_entry = picked
-                    model = model_entry.get("id") or model_entry.get("name")
-                    api = provider_entry.get("api")
-                    if not api:
-                        print(f"Provider {provider_id!r} has no api base URL; "
-                              f"keeping current provider.", file=sys.stderr)
-                    else:
-                        # Reinstall the Provider for the chosen model + provider
-                        # so its wire protocol, endpoint, and headers take
-                        # effect mid-session, then refresh the model list.
-                        # OpenRouter-style bare /v1 bases and bespoke gateways
-                        # expose OpenAI-compatible endpoints, so default to
-                        # openai_chat when the URL does not name a protocol.
-                        kind = (protocols.detect_protocol_from_url(api)
-                                or protocols.OPENAI_CHAT)
-                        try:
-                            reinstall_provider(
-                                model=model,
-                                url=api,
-                                provider_kind=kind,
-                                api_key=modelsdev.api_key_for(
-                                    provider_entry, RUNTIME_CONFIG.api_key),
-                            )
-                        except (protocols.ProtocolError, ValueError) as e:
-                            print(f"Could not switch to {provider_id!r}: {e}",
-                                  file=sys.stderr)
-                            sys.stderr.flush()
-                            terminal.save_cursor_position()
-                            continue
-                        await load_models_async()
+                    # Reinstall the Provider for the chosen model + provider
+                    # so its wire protocol, endpoint, and headers take
+                    # effect mid-session, then refresh the model list.
+                    # OpenRouter-style bare /v1 bases and bespoke gateways
+                    # expose OpenAI-compatible endpoints, so default to
+                    # openai_chat when the URL does not name a protocol.
+                    kind = (protocols.detect_protocol_from_url(api)
+                            or protocols.OPENAI_CHAT)
+                    try:
+                        reinstall_provider(
+                            model=model,
+                            url=api,
+                            provider_kind=kind,
+                            api_key=modelsdev.api_key_for(
+                                provider_entry, RUNTIME_CONFIG.api_key),
+                        )
+                    except (protocols.ProtocolError, ValueError) as e:
+                        print(f"Could not switch to {provider_id!r}: {e}",
+                              file=sys.stderr)
+                        sys.stderr.flush()
+                        terminal.save_cursor_position()
+                        continue
+                    await load_models_async()
                 via = f" via {provider_id}" if provider_id else ""
                 print(f"Selected model: {model}{via}", file=sys.stderr)
                 sys.stderr.flush()
