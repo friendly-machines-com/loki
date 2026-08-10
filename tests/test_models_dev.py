@@ -178,6 +178,26 @@ class MenuTests(unittest.TestCase):
         result = asyncio.run(models._numbered_menu_async(rows, "Choice: ", _input_script([""])))
         self.assertIsNone(result)
 
+    def test_model_rows_show_provider_snippet(self):
+        rows = models._model_rows(_groups())
+        glm = next(t for t in (r[1] for r in rows) if t.startswith("GLM-5.2"))
+        self.assertIn("[2 providers: zhipuai, openrouter]", glm)
+
+    def test_model_rows_truncate_provider_snippet(self):
+        data = {f"p{i}": {"api": "https://x.test/v1", "models": {
+            "m": {"id": f"m{i}", "name": "Big Model"}}} for i in range(8)}
+        rows = models._model_rows(models.build_groups(data))
+        label = rows[0][1]
+        self.assertIn("[8 providers: p0, p1, p2, p3, p4, ...]", label)
+
+    def test_model_menu_filter_matches_provider_names(self):
+        rows = models._model_rows(_groups())
+        # "filter openrouter" must narrow to GLM-5.2 even though "openrouter"
+        # appears only among its providers, not in the model name.
+        result = asyncio.run(models._numbered_menu_async(
+            rows, "Choice: ", _input_script(["filter openrouter", "1"])))
+        self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
+
 
 class PickerTests(unittest.TestCase):
     def test_run_model_picker_two_level_flow(self):
@@ -261,12 +281,12 @@ class PickerTests(unittest.TestCase):
 
     def test_model_rows_show_minimal_features_in_parentheses(self):
         rows = models._model_rows(_groups())
-        labels = [text for _, text in rows]
+        labels = [row[1] for row in rows]
         glm = next(t for t in labels if t.startswith("GLM-5.2"))
         # Intersection shown; union (adds attachment) differs -> "[and more]".
         self.assertIn("(reasoning, tools, struct, temp)", glm)
         self.assertIn("[and more]", glm)
-        self.assertIn("[2 providers]", glm)
+        self.assertIn("[2 providers: zhipuai, openrouter]", glm)
         # Cost: min/max input and output across the two providers.
         self.assertIn("cost: in $1.4-$2 per 1M tokens, out $4.4-$8 per 1M tokens", glm)
         # Single-provider group: intersection == union, no "[and more]".

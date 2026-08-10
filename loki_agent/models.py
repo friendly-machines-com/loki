@@ -238,23 +238,34 @@ def api_key_for(provider_entry, fallback=""):
 # Picker UI
 # --------------------------------------------------------------------------
 
-def _row_matches(text, query):
+def _row_matches(row, query):
+    """Match a menu row against "filter WORDS" (words in any order).
+
+    A row is (value, display) or (value, display, search_blob); the search
+    blob, when present, extends what the filter can match beyond the visible
+    line -- e.g. the provider ids/names behind a truncated provider snippet.
+    """
+    if len(row) >= 3:
+        blob = row[2]
+    else:
+        blob = row[1]
     words = query.lower().split()
-    blob = text.lower()
+    blob = blob.lower()
     return all(w in blob for w in words)
 
 
 async def _numbered_menu_async(rows, prompt, input_fn):
-    """Numbered menu over rows=[(value, display_text)].
+    """Numbered menu over rows=[(value, display_text)] (optionally a third
+    search_text element for filtering beyond the visible line).
 
     Bare int selects that row; "filter WORDS" narrows (words in any order);
     empty cancels (returns None). Mirrors the session-picker gestures.
     """
     query = ""
     while True:
-        shown = [r for r in rows if _row_matches(r[1], query)] if query else list(rows)
-        for i, (_, text) in enumerate(shown, 1):
-            print(f"{i}. {text}")
+        shown = [r for r in rows if _row_matches(r, query)] if query else list(rows)
+        for i, row in enumerate(shown, 1):
+            print(f"{i}. {row[1]}")
         choice = (await input_fn(prompt) or "").strip()
         if choice == "filter" or choice.startswith("filter "):
             query = choice[len("filter"):].strip()
@@ -272,15 +283,31 @@ async def _numbered_menu_async(rows, prompt, input_fn):
         continue
 
 
+def _provider_snippet(members, max_shown=5):
+    """'fireworks-ai, openrouter, ...' -- up to max_shown provider ids."""
+    ids = [pid for pid, _, _ in members]
+    shown = ", ".join(ids[:max_shown])
+    if len(ids) > max_shown:
+        shown += ", ..."
+    return shown
+
+
 def _model_rows(groups):
     rows = []
     for name, members in groups.items():
         feat = feature_names(minimal_feature_bits(members))
         more = " [and more]" if union_feature_bits(members) != minimal_feature_bits(members) else ""
         cost = cost_range_text(members)
-        label = f"{name} ({feat}){more}{cost} [{len(members)} providers]" if feat \
-            else f"{name}{more}{cost} [{len(members)} providers]"
-        rows.append((members, label))
+        count = len(members)
+        label = f"{name} ({feat}){more}{cost} [{count} providers: {_provider_snippet(members)}]" if feat \
+            else f"{name}{more}{cost} [{count} providers: {_provider_snippet(members)}]"
+        # Search blob: model name plus every provider id/name, so
+        # "filter opencode" (or any provider) finds the model even when the
+        # visible snippet truncates the provider list.
+        search = " ".join([name] +
+                          [pid for pid, _, _ in members] +
+                          [p.get("name") or "" for _, p, _ in members])
+        rows.append((members, label, search))
     rows.sort(key=lambda r: r[1].lower())
     return rows
 
