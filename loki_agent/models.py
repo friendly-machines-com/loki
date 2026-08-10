@@ -287,12 +287,18 @@ async def run_model_picker_async(input_fn, cache_path=None):
     if not model_rows:
         print("models.dev returned no models.", file=sys.stderr)
         return None
-    members = await _numbered_menu_async(model_rows, "Model choice: ", input_fn)
+    members = await _numbered_menu_async(
+        model_rows,
+        'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
+        input_fn)
     if members is None:
         return None
 
     provider_rows = _provider_rows(members)
-    picked = await _numbered_menu_async(provider_rows, "Provider choice: ", input_fn)
+    picked = await _numbered_menu_async(
+        provider_rows,
+        'Provider choice (number selects, "filter WORDS" narrows, empty cancels): ',
+        input_fn)
     if picked is None:
         return None
     return picked
