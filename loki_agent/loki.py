@@ -2768,9 +2768,17 @@ async def run_session_picker_async(session=None):
         if session is not None:
             return session.prompt(prompt, history)
         return get_input_async(prompt, history)
-    picked = await savefiles.run_session_picker_async(
-        input_fn=input_fn,
-        terminal=terminal, chat_log_dir=CHAT_LOG_DIR)
+    # The picker prints rows before prompting; pause the producer for the
+    # whole modal so it can't race the picker for the cursor/output area.
+    if session is not None:
+        await session.pause()
+    try:
+        picked = await savefiles.run_session_picker_async(
+            input_fn=input_fn,
+            terminal=terminal, chat_log_dir=CHAT_LOG_DIR)
+    finally:
+        if session is not None:
+            await session.resume()
     # Wipe the picker render so the next output (loaded transcript or a fresh
     # chat) starts from a clean output area instead of below the stale list.
     terminal.goto_position(1, 1)
@@ -2938,6 +2946,10 @@ async def async_main(args):
                     break
                 case '/model':
                     provider_id = None
+                    # The menu prints rows before prompting; pause the producer
+                    # for the whole modal so it can't race the menu for the
+                    # cursor/output area (one writer at a time).
+                    await session.pause()
                     try:
                         picked = await modelsdev.run_model_picker_async(
                             input_fn=input_fn)
@@ -2961,6 +2973,8 @@ async def async_main(args):
                             sys.stderr.flush()
                             terminal.save_cursor_position()
                             continue
+                    finally:
+                        await session.resume()
                     if picked is None:
                         # User cancelled at either menu; keep the current model.
                         print("Model selection cancelled.", file=sys.stderr)
@@ -3069,6 +3083,7 @@ def main():
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, clean_up_and_exit)
+    signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT,])
 
     terminal.enable_bracketed_paste_mode()
     terminal.enable_origin_mode()

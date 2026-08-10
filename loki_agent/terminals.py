@@ -609,7 +609,12 @@ class PromptController:
                     output_row, output_col = await self._query_output_cursor(reader)
                     renderer.render(buffer, output_row, output_col)
         finally:
-            if interactive:
+            # sys.exc_info()[0] is the active exception (None if returning
+            # normally). On cancellation (producer paused for a modal prompt),
+            # leave the cursor alone: the canceller is taking over the output
+            # area, and restoring a stale position would corrupt it.
+            active_exc = sys.exc_info()[0]
+            if interactive and active_exc is not asyncio.CancelledError:
                 # The prompt renderer temporarily owns the input/status regions;
                 # put subsequent output back where the original prompt started.
                 self.terminal.set_clipping_region(*output_area)
@@ -687,14 +692,27 @@ class InputSession:
     async def prompt(self, prompt_text='User: ', history=None) -> str:
         """One-shot line read against the session reader (modal).
 
-        Pauses the producer first so the prompt is the only key consumer, then
-        resumes it.  Used by the session picker and the /model menus.
+        If the producer is running, pauses it first so the prompt is the only
+        key consumer, then resumes it.  If the caller already paused the
+        producer (session.pause() around a modal that prints before prompting),
+        this just reads without touching the producer.
         """
-        await self._pause()
+        was_paused = self._producer is None
+        if not was_paused:
+            await self._pause()
         try:
             return await get_input_async(prompt_text, history, session=self.reader)
         finally:
-            await self._resume()
+            if not was_paused:
+                await self._resume()
+
+    async def pause(self):
+        """Pause the producer (used around a modal that prints before prompting)."""
+        await self._pause()
+
+    async def resume(self):
+        """Resume the producer after a modal."""
+        await self._resume()
 
     async def _pause(self):
         if self._producer is not None:
