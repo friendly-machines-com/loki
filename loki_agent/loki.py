@@ -2918,9 +2918,10 @@ async def async_main(args):
                 provider_id = None
                 picked = await modelsdev.run_model_picker_async(
                     input_fn=get_input_async)
-                if picked is modelsdev.UNAVAILABLE:
-                    # models.dev unreachable: fetch the current provider's own
-                    # /models list and show it through the same menu UI.
+                if picked is None:
+                    # User cancelled, or models.dev unreachable: either way,
+                    # show the current provider's own /models list in the same
+                    # menu UI (which cancels cleanly on empty input).
                     await load_models_async()
                     model = await modelsdev.run_flat_model_picker_async(
                         get_input_async, models)
@@ -2932,12 +2933,6 @@ async def async_main(args):
                         sys.stderr.flush()
                         terminal.save_cursor_position()
                         continue
-                elif picked is None:
-                    # User cancelled at either menu; keep the current model.
-                    print("Model selection cancelled.", file=sys.stderr)
-                    sys.stderr.flush()
-                    terminal.save_cursor_position()
-                    continue
                 else:
                     provider_id, provider_entry, model_entry = picked
                     model = model_entry.get("id") or model_entry.get("name")
