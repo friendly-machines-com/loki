@@ -136,6 +136,51 @@ def union_feature_bits(members):
     return bits
 
 
+# --------------------------------------------------------------------------
+# Cost helpers (USD per 1M tokens, from each model entry's "cost" object)
+# --------------------------------------------------------------------------
+
+def cost_pair(model_entry):
+    """(input, output) USD per 1M tokens, or None if the entry has no cost."""
+    c = model_entry.get("cost")
+    if not isinstance(c, dict):
+        return None
+    i, o = c.get("input"), c.get("output")
+    if i is None and o is None:
+        return None
+    return (i if isinstance(i, (int, float)) else 0,
+            o if isinstance(o, (int, float)) else 0)
+
+
+def _fmt_usd(value):
+    # Compact dollar rendering: $0.6, $1.4, $30, $0.00015.
+    return f"${value:g}"
+
+
+def cost_range_text(members):
+    """'cost: in $minIn-$maxIn per 1M tokens, out $minOut-$maxOut per 1M
+    tokens' over providers, or ''. Units are USD per 1M tokens (models.dev
+    convention); the unit is repeated on each figure.
+    """
+    pairs = [p for p in (cost_pair(m) for _, _, m in members) if p]
+    if not pairs:
+        return ""
+    ins = [p[0] for p in pairs]
+    outs = [p[1] for p in pairs]
+    return (f" cost: in {_fmt_usd(min(ins))}-{_fmt_usd(max(ins))} per 1M tokens, "
+            f"out {_fmt_usd(min(outs))}-{_fmt_usd(max(outs))} per 1M tokens")
+
+
+def cost_text(model_entry):
+    """'cost: in $in per 1M tokens, out $out per 1M tokens' for one provider,
+    or ''."""
+    pair = cost_pair(model_entry)
+    if pair is None:
+        return ""
+    return (f" cost: in {_fmt_usd(pair[0])} per 1M tokens, "
+            f"out {_fmt_usd(pair[1])} per 1M tokens")
+
+
 def protocol_label(provider_entry):
     """Short wire-protocol-ish label for a provider entry."""
     api = provider_entry.get("api")
@@ -198,8 +243,9 @@ def _model_rows(groups):
     for name, members in groups.items():
         feat = feature_names(minimal_feature_bits(members))
         more = " [and more]" if union_feature_bits(members) != minimal_feature_bits(members) else ""
-        label = f"{name} ({feat}){more} [{len(members)} providers]" if feat \
-            else f"{name}{more} [{len(members)} providers]"
+        cost = cost_range_text(members)
+        label = f"{name} ({feat}){more}{cost} [{len(members)} providers]" if feat \
+            else f"{name}{more}{cost} [{len(members)} providers]"
         rows.append((members, label))
     rows.sort(key=lambda r: r[1].lower())
     return rows
@@ -216,6 +262,9 @@ def _provider_rows(members):
         if feat:
             parts.append(f"({feat})")
         parts.append(f"[{protocol_label(prov)}]")
+        cost = cost_text(m).strip()
+        if cost:
+            parts.append(cost)
         rows.append(((pid, prov, m), " ".join(parts)))
     rows.sort(key=lambda r: r[1].lower())
     return rows
