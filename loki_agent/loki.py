@@ -33,6 +33,7 @@ from pprint import pprint, pformat
 
 from . import formats
 from . import http_client
+from . import models as modelsdev
 from . import protocols
 from . import savefiles
 from .savefiles import ResumeTranscriptRenderer
@@ -145,6 +146,11 @@ class RuntimeConfig:
     chat_provider: protocols.Provider
     headers: dict
     model: str
+    # Retained from startup env so a mid-session Provider reinstall
+    # (e.g. /model choosing a model on a different provider) can reproduce
+    # the exact same Provider settings instead of falling back to defaults.
+    anthropic_version: str = "2023-06-01"
+    auth_header: str | None = None
 
 
 RUNTIME_CONFIG: RuntimeConfig | None = None
@@ -175,6 +181,38 @@ def _lookup_api_key_with_secret_tool(domain):
     res = subprocess.run(['secret-tool', 'lookup', 'domain', domain],
                          shell=False, capture_output=True, text=True)
     return res.stdout.strip()
+
+
+def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=None,
+                        max_tokens=4096, anthropic_version="2023-06-01",
+                        auth_header=None):
+    """Build a RuntimeConfig (and its Provider) from explicit parameters.
+
+    The single place a production Provider is constructed. Startup reads the
+    environment into these parameters; a mid-session /model change calls
+    reinstall_provider() which reuses this to rebuild the Provider from the
+    current config plus per-model overrides.
+    """
+    chat_provider = protocols.make_provider(
+        url,
+        provider=provider_kind,
+        api_key=api_key,
+        models_url=models_url,
+        max_tokens=max_tokens,
+        anthropic_version=anthropic_version,
+        auth_header=auth_header,
+    )
+    return RuntimeConfig(
+        url=url,
+        provider_kind=provider_kind,
+        netloc=urllib.parse.urlparse(url).netloc,
+        api_key=api_key,
+        chat_provider=chat_provider,
+        headers=chat_provider.headers,
+        model=model,
+        anthropic_version=anthropic_version,
+        auth_header=auth_header,
+    )
 
 
 def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with_secret_tool):
@@ -223,24 +261,16 @@ def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with
     if not config_api_key:
         raise ValueError('API key missing.  Please run secret-tool store --label="opencode API key" domain {!r}'.format(config_netloc))
 
-    config_chat_provider = protocols.make_provider(
+    config_model = environ.get('LOKI_MODEL') or ('glm-5.2' if config_url == DEFAULT_API_BASE else '')
+    return make_runtime_config(
         config_url,
-        provider=config_provider_kind,
-        api_key=config_api_key,
+        config_provider_kind,
+        config_api_key,
+        model=config_model,
         models_url=environ.get("LOKI_MODELS_URL"),
         max_tokens=_int_env("LOKI_MAX_TOKENS", 4096, environ),
         anthropic_version=environ.get("ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=environ.get("LOKI_AUTH_HEADER"),
-    )
-    config_model = environ.get('LOKI_MODEL') or ('glm-5.2' if config_url == DEFAULT_API_BASE else '')
-    return RuntimeConfig(
-        url=config_url,
-        provider_kind=config_provider_kind,
-        netloc=config_netloc,
-        api_key=config_api_key,
-        chat_provider=config_chat_provider,
-        headers=config_chat_provider.headers,
-        model=config_model,
     )
 
 
@@ -250,6 +280,40 @@ def apply_runtime_config(config: RuntimeConfig):
 
     RUNTIME_CONFIG = config
     model = config.model
+
+
+def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None,
+                       models_url=None, max_tokens=None, anthropic_version=None,
+                       auth_header=None):
+    """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
+
+    Overrides default to the current runtime config, so a bare call reinstates
+    the Provider from the existing settings
+    """
+    global RUNTIME_CONFIG
+    current = RUNTIME_CONFIG
+    if current is None:
+        raise RuntimeError("cannot reinstall provider before startup config is applied")
+    new_url = url if url is not None else current.url
+    new_kind = provider_kind if provider_kind is not None else current.provider_kind
+    new_api_key = api_key if api_key is not None else current.api_key
+    new_model = model if model is not None else current.model
+    new_anthropic_version = anthropic_version if anthropic_version is not None else current.anthropic_version
+    new_auth_header = auth_header if auth_header is not None else current.auth_header
+    apply_runtime_config(make_runtime_config(
+        new_url,
+        new_kind,
+        new_api_key,
+        model=new_model,
+        # models_url is passed through as-is (None -> derive from new_url);
+        # never carry the previous provider's models URL across a provider
+        # switch.
+        models_url=models_url,
+        max_tokens=max_tokens if max_tokens is not None else current.chat_provider.max_tokens,
+        anthropic_version=new_anthropic_version,
+        auth_header=new_auth_header,
+    ))
+
 
 class LruCache(object):
     def __init__(self, max_size):
@@ -2851,8 +2915,49 @@ async def async_main(args):
             case '/quit':
                 break
             case '/model':
-                model = await run_menu_async(models)
-                print(f"Selected model: {model}", file=sys.stderr)
+                provider_id = None
+                picked = await modelsdev.run_model_picker_async(
+                    input_fn=get_input_async)
+                if picked is None:
+                    # models.dev unavailable or user cancelled: fall back to
+                    # the current provider's own /models list.
+                    model = await run_menu_async(models)
+                    if model:
+                        reinstall_provider(model=model)
+                        await load_models_async()
+                else:
+                    provider_id, provider_entry, model_entry = picked
+                    model = model_entry.get("id") or model_entry.get("name")
+                    api = provider_entry.get("api")
+                    if not api:
+                        print(f"Provider {provider_id!r} has no api base URL; "
+                              f"keeping current provider.", file=sys.stderr)
+                    else:
+                        # Reinstall the Provider for the chosen model + provider
+                        # so its wire protocol, endpoint, and headers take
+                        # effect mid-session, then refresh the model list.
+                        # OpenRouter-style bare /v1 bases and bespoke gateways
+                        # expose OpenAI-compatible endpoints, so default to
+                        # openai_chat when the URL does not name a protocol.
+                        kind = (protocols.detect_protocol_from_url(api)
+                                or protocols.OPENAI_CHAT)
+                        try:
+                            reinstall_provider(
+                                model=model,
+                                url=api,
+                                provider_kind=kind,
+                                api_key=modelsdev.api_key_for(
+                                    provider_entry, RUNTIME_CONFIG.api_key),
+                            )
+                        except (protocols.ProtocolError, ValueError) as e:
+                            print(f"Could not switch to {provider_id!r}: {e}",
+                                  file=sys.stderr)
+                            sys.stderr.flush()
+                            terminal.save_cursor_position()
+                            continue
+                        await load_models_async()
+                via = f" via {provider_id}" if provider_id else ""
+                print(f"Selected model: {model}{via}", file=sys.stderr)
                 sys.stderr.flush()
                 terminal.save_cursor_position()
                 continue

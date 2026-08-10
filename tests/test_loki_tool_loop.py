@@ -19,6 +19,122 @@ from loki_agent import protocols
 from loki_agent import savefiles
 
 
+class ProviderReinstallTests(unittest.TestCase):
+    def test_make_runtime_config_builds_provider_and_headers(self):
+        config = loki.make_runtime_config(
+            "https://api.example.test/v1/messages",
+            protocols.ANTHROPIC_MESSAGES,
+            "secret-key",
+            model="model-a",
+            max_tokens=1234,
+            anthropic_version="2024-01-01",
+            auth_header="X-Custom-Auth",
+        )
+
+        self.assertEqual(config.url, "https://api.example.test/v1/messages")
+        self.assertEqual(config.provider_kind, protocols.ANTHROPIC_MESSAGES)
+        self.assertEqual(config.netloc, "api.example.test")
+        self.assertEqual(config.api_key, "secret-key")
+        self.assertEqual(config.model, "model-a")
+        self.assertEqual(config.chat_provider.max_tokens, 1234)
+        self.assertEqual(config.chat_provider.kind, protocols.ANTHROPIC_MESSAGES)
+        self.assertEqual(config.headers["X-Custom-Auth"], "secret-key")
+        self.assertEqual(config.anthropic_version, "2024-01-01")
+        self.assertEqual(config.auth_header, "X-Custom-Auth")
+
+    def test_reinstall_provider_swaps_provider_preserving_settings(self):
+        env = {
+            "LOKI_API_BASE": "https://example.test/v1/responses",
+            "LOKI_PROVIDER": "openai_responses",
+            "LOKI_API_KEY": "test-key",
+            "LOKI_MODEL": "model-a",
+            "LOKI_MAX_TOKENS": "512",
+        }
+        names = ["RUNTIME_CONFIG", "model"]
+        sentinel = object()
+        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+
+        try:
+            loki.apply_runtime_config(loki.build_config_from_env(env, lambda domain: ""))
+            old_provider = loki.RUNTIME_CONFIG.chat_provider
+
+            loki.reinstall_provider(model="model-b")
+
+            self.assertEqual(loki.model, "model-b")
+            self.assertEqual(loki.RUNTIME_CONFIG.model, "model-b")
+            # A fresh Provider object was built and swapped in.
+            self.assertIsNot(loki.RUNTIME_CONFIG.chat_provider, old_provider)
+            # Everything else carries over from the previous config.
+            self.assertEqual(loki.RUNTIME_CONFIG.chat_provider.kind, protocols.OPENAI_RESPONSES)
+            self.assertEqual(loki.RUNTIME_CONFIG.chat_provider.chat_url, "https://example.test/v1/responses")
+            self.assertEqual(loki.RUNTIME_CONFIG.chat_provider.max_tokens, 512)
+            self.assertEqual(loki.RUNTIME_CONFIG.api_key, "test-key")
+            self.assertEqual(loki.RUNTIME_CONFIG.headers["Authorization"], "Bearer test-key")
+            # The copied headers field was rebuilt too, not left stale.
+            self.assertEqual(loki.RUNTIME_CONFIG.headers,
+                             loki.RUNTIME_CONFIG.chat_provider.headers)
+        finally:
+            for name, value in old_values.items():
+                if value is sentinel:
+                    loki.__dict__.pop(name, None)
+                else:
+                    loki.__dict__[name] = value
+
+    def test_reinstall_provider_switches_protocol_per_model(self):
+        env = {
+            "LOKI_API_BASE": "https://example.test/v1/responses",
+            "LOKI_PROVIDER": "openai_responses",
+            "LOKI_API_KEY": "test-key",
+            "LOKI_MODEL": "model-a",
+        }
+        names = ["RUNTIME_CONFIG", "model"]
+        sentinel = object()
+        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+
+        try:
+            loki.apply_runtime_config(loki.build_config_from_env(env, lambda domain: ""))
+
+            # A future models.dev record maps this model to a different
+            # provider + protocol; reinstall must rebuild Provider/headers.
+            loki.reinstall_provider(
+                model="claude-model",
+                url="https://anthropic.example.test",
+                provider_kind=protocols.ANTHROPIC_MESSAGES,
+                api_key="anthropic-key",
+            )
+
+            self.assertEqual(loki.model, "claude-model")
+            provider = loki.RUNTIME_CONFIG.chat_provider
+            self.assertEqual(provider.kind, protocols.ANTHROPIC_MESSAGES)
+            self.assertEqual(provider.chat_url, "https://anthropic.example.test/v1/messages")
+            self.assertEqual(provider.headers["x-api-key"], "anthropic-key")
+            self.assertEqual(loki.RUNTIME_CONFIG.headers["x-api-key"], "anthropic-key")
+            self.assertEqual(loki.RUNTIME_CONFIG.provider_kind, protocols.ANTHROPIC_MESSAGES)
+            self.assertEqual(loki.RUNTIME_CONFIG.api_key, "anthropic-key")
+        finally:
+            for name, value in old_values.items():
+                if value is sentinel:
+                    loki.__dict__.pop(name, None)
+                else:
+                    loki.__dict__[name] = value
+
+    def test_reinstall_provider_requires_startup_config(self):
+        names = ["RUNTIME_CONFIG"]
+        sentinel = object()
+        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+
+        try:
+            loki.RUNTIME_CONFIG = None
+            with self.assertRaises(RuntimeError):
+                loki.reinstall_provider(model="model-a")
+        finally:
+            for name, value in old_values.items():
+                if value is sentinel:
+                    loki.__dict__.pop(name, None)
+                else:
+                    loki.__dict__[name] = value
+
+
 class RuntimeConfigTests(unittest.TestCase):
     def test_build_config_uses_explicit_env_key_without_secret_lookup(self):
         env = {
@@ -45,6 +161,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.chat_provider.max_tokens, 123)
         self.assertEqual(config.headers["x-api-key"], "loki-key")
         self.assertEqual(config.headers["anthropic-version"], "2024-01-01")
+        self.assertEqual(config.anthropic_version, "2024-01-01")
         self.assertNotIn("LOKI_API_KEY", env)
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("OPENAI_API_KEY", env)
