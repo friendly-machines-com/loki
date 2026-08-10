@@ -207,11 +207,19 @@ def provider_supported(provider_entry):
     return api.rstrip("/").endswith("/v1")
 
 
+def is_deprecated(model_entry):
+    return model_entry.get("status") == "deprecated"
+
+
 def filter_supported_groups(groups):
-    """Drop providers Loki cannot use, then models with no usable provider."""
+    """Drop providers Loki cannot use or that mark the model deprecated, then
+    drop models with no remaining provider. A model served only by deprecated
+    providers disappears entirely; a model with at least one live provider
+    keeps only those providers in its submenu."""
     out = {}
     for name, members in groups.items():
-        kept = [m for m in members if provider_supported(m[1])]
+        kept = [m for m in members
+                if provider_supported(m[1]) and not is_deprecated(m[2])]
         if kept:
             out[name] = kept
     return out
