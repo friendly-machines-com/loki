@@ -198,6 +198,13 @@ class MenuTests(unittest.TestCase):
             rows, "Choice: ", _input_script(["filter openrouter", "1"])))
         self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
 
+    def test_model_menu_filter_matches_provider_display_name(self):
+        rows = models._model_rows(_groups())
+        # "Zhipu AI" is the provider's display name, not its id (zhipuai).
+        result = asyncio.run(models._numbered_menu_async(
+            rows, "Choice: ", _input_script(["filter zhipu ai", "1"])))
+        self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
+
 
 class PickerTests(unittest.TestCase):
     def test_run_model_picker_two_level_flow(self):
