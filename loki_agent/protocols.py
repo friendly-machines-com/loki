@@ -11,6 +11,11 @@ ANTHROPIC_MESSAGES = "anthropic_messages"
 OPENAI_RESPONSES = "openai_responses"
 AUTO = "auto"
 
+# Wire protocols this client can actually speak. Single source of truth:
+# consumers reference this instead of re-listing the constants, so adding a
+# protocol here is all that is needed to teach the rest of the code about it.
+SUPPORTED_PROTOCOLS = [OPENAI_CHAT, ANTHROPIC_MESSAGES, OPENAI_RESPONSES]
+
 
 class ProtocolError(ValueError):
     pass

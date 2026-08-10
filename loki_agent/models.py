@@ -191,6 +191,32 @@ def protocol_label(provider_entry):
     return (provider_entry.get("npm") or "no-api")
 
 
+def provider_supported(provider_entry):
+    """True if Loki can actually use this provider.
+
+    The provider's ``api`` URL must either name one of the supported wire
+    protocols via its endpoint path (.../chat/completions, .../messages,
+    .../responses) or follow the OpenAI-compatible bare ``/v1`` base
+    convention, which reinstall_provider treats as openai_chat. Providers
+    with no api URL, or with a non-/v1 base path, are dropped -- that is what
+    keeps the model menu a manageable size.
+    """
+    api = provider_entry.get("api") or ""
+    if protocols.detect_protocol_from_url(api) in protocols.SUPPORTED_PROTOCOLS:
+        return True
+    return api.rstrip("/").endswith("/v1")
+
+
+def filter_supported_groups(groups):
+    """Drop providers Loki cannot use, then models with no usable provider."""
+    out = {}
+    for name, members in groups.items():
+        kept = [m for m in members if provider_supported(m[1])]
+        if kept:
+            out[name] = kept
+    return out
+
+
 def api_key_for(provider_entry, fallback=""):
     """First API key env var the provider declares, else the fallback key."""
     for var in provider_entry.get("env") or []:
@@ -282,6 +308,9 @@ async def run_model_picker_async(input_fn, cache_path=None):
     except Exception as e:
         print(f"models.dev unavailable: {e}", file=sys.stderr)
         return None
+    # Keep only models served by at least one provider whose wire protocol
+    # Loki can speak, so the menu is not flooded with the long tail.
+    groups = filter_supported_groups(groups)
 
     model_rows = _model_rows(groups)
     if not model_rows:
