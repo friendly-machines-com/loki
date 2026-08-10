@@ -38,7 +38,8 @@ from . import protocols
 from . import savefiles
 from .savefiles import ResumeTranscriptRenderer
 from . import terminals
-from .terminals import get_input_async, restore_output_area_after_input, terminal
+from .terminals import (get_input_async, input_session,
+                        restore_output_area_after_input, terminal)
 
 DEFAULT_API_BASE = "https://opencode.ai/zen/go/v1/chat/completions"
 
@@ -1552,12 +1553,14 @@ def get_tool_loop_extra_context(transcript_items: list):
 
 
 async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
-                              chat_fn=None, on_event=None) -> str:
+                              chat_fn=None, on_event=None, cancel_check=None) -> str:
     """Run the model/tool loop over the neutral transcript. Mutates `transcript_items` in place."""
     if chat_fn is None:
         chat_fn = lambda items: async_chat_completion(items, tools=TOOLS)
     if on_event is None:
         on_event = lambda event: None
+    if cancel_check is None:
+        cancel_check = lambda: False
 
     tool_loop_extra_context = get_tool_loop_extra_context(transcript_items)
 
@@ -1581,6 +1584,9 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             on_event({"type": "network_error", "error": msg})
             return ""
         if not response_items:
+            return ""
+
+        if cancel_check():
             return ""
 
         for item in response_items:
@@ -1627,6 +1633,8 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                 name=fn_name,
                 is_error=not result["ok"],
             ))
+            if cancel_check():
+                return ""
 
 
 def _print_tool_args(args):
@@ -1675,7 +1683,7 @@ def _terminal_agent_event(event: dict):
         print()
 
 
-async def run_terminal_turn_async(transcript_items: list) -> str:
+async def run_terminal_turn_async(transcript_items: list, cancel_check=None) -> str:
     async def chat_fn(items):
         return await async_chat_completion(items, TOOLS, True, True)
 
@@ -1683,6 +1691,7 @@ async def run_terminal_turn_async(transcript_items: list) -> str:
         transcript_items,
         chat_fn=chat_fn,
         on_event=_terminal_agent_event,
+        cancel_check=cancel_check,
     )
 
 
@@ -2754,9 +2763,14 @@ def resolve_chat_log_path(resume_arg: str) -> str:
         resume_arg, STARTUP_CWD, CHAT_LOG_DIR, _resolve_path)
 
 
-async def run_session_picker_async():
+async def run_session_picker_async(session=None):
+    def input_fn(prompt=None, history=None):
+        if session is not None:
+            return session.prompt(prompt, history)
+        return get_input_async(prompt, history)
     picked = await savefiles.run_session_picker_async(
-        input_fn=get_input_async, terminal=terminal, chat_log_dir=CHAT_LOG_DIR)
+        input_fn=input_fn,
+        terminal=terminal, chat_log_dir=CHAT_LOG_DIR)
     # Wipe the picker render so the next output (loaded transcript or a fresh
     # chat) starts from a clean output area instead of below the stale list.
     terminal.goto_position(1, 1)
@@ -2874,148 +2888,156 @@ async def async_main(args):
         if option_name == '--resume' or option_name == '-r':
             log_filename = option_value
 
-    if args[0:1] == ['resume']:
-        if len(args) < 2:
-            # Bare "resume" with no id opens the session picker. On cancel
-            # (None), leave log_filename as None so the second block (which
-            # only triggers on '') doesn't reopen the picker.
-            picked = await run_session_picker_async()
-            log_filename = picked
+    # The input session owns raw mode, the stdin reader, the producer, and the
+    # user_messages queue for the whole session (see terminals.InputSession).
+    # loki.py is just a consumer of the queue and a caller of session.prompt()
+    # for modal prompts (session picker, /model menus).
+    async with input_session() as session:
+        if args[0:1] == ['resume']:
+            if len(args) < 2:
+                # Bare "resume" with no id opens the session picker. On cancel
+                # (None), leave log_filename as None so the second block (which
+                # only triggers on '') doesn't reopen the picker.
+                picked = await run_session_picker_async(session=session)
+                log_filename = picked
+            else:
+                log_filename = args[1]
+
+        # An empty --resume value (e.g. "--resume=") also opens the picker.
+        if log_filename == '':
+            picked = await run_session_picker_async(session=session)
+            log_filename = picked if picked is not None else ''
+
+        if log_filename:
+            load_chat_log(resolve_chat_log_path(log_filename))
         else:
-            log_filename = args[1]
+            new_chat_log(new_chat_log_path())
 
-    # An empty --resume value (e.g. "--resume=") also opens the picker.
-    if log_filename == '':
-        picked = await run_session_picker_async()
-        log_filename = picked if picked is not None else ''
+        def input_fn(prompt=None, history=None):
+            return session.prompt(prompt, history)
 
-    if log_filename:
-        load_chat_log(resolve_chat_log_path(log_filename))
-    else:
-        new_chat_log(new_chat_log_path())
+        while True:
+            user_in = await session.user_messages.get()
+            restore_output_area_after_input()
 
-    while True:
-        try:
-            user_in = await get_input_async(history=user_prompt_history(transcript_items))
-        except EOFError:
-            break
-        restore_output_area_after_input()
-
-        if not user_in:
-            terminal.save_cursor_position()
-            continue
-
-        terminal.set_background_color(terminals.INPUT_COLOR)
-        print('User: ', end='')
-        print(user_in, end='')
-        terminal.reset_colors_and_flags()
-        print()
-        command_text = user_in.strip()
-        match command_text:
-            case '/quit':
+            if user_in is None:  # EOF sentinel from the producer
                 break
-            case '/model':
-                provider_id = None
-                try:
-                    picked = await modelsdev.run_model_picker_async(
-                        input_fn=get_input_async)
-                except (OSError, json.JSONDecodeError) as e:
-                    # models.dev unreachable (network errors) or answered with
-                    # non-JSON garbage (JSONDecodeError from parsing the body):
-                    # fall back to the current provider's own /models list,
-                    # shown through the same menu UI (which cancels cleanly on
-                    # empty input). Anything else -- a real bug in the menus --
-                    # propagates as an error, not here.
-                    print(f"models.dev unavailable: {e}", file=sys.stderr)
-                    sys.stderr.flush()
-                    await load_models_async()
-                    model = await modelsdev.run_flat_model_picker_async(
-                        get_input_async, models)
-                    if model:
-                        reinstall_provider(model=model)
+
+            if not user_in:
+                terminal.save_cursor_position()
+                continue
+
+            terminal.set_background_color(terminals.INPUT_COLOR)
+            print('User: ', end='')
+            print(user_in, end='')
+            terminal.reset_colors_and_flags()
+            print()
+            command_text = user_in.strip()
+            match command_text:
+                case '/quit':
+                    break
+                case '/model':
+                    provider_id = None
+                    try:
+                        picked = await modelsdev.run_model_picker_async(
+                            input_fn=input_fn)
+                    except (OSError, json.JSONDecodeError) as e:
+                        # models.dev unreachable (network errors) or answered with
+                        # non-JSON garbage (JSONDecodeError from parsing the body):
+                        # fall back to the current provider's own /models list,
+                        # shown through the same menu UI (which cancels cleanly on
+                        # empty input). Anything else -- a real bug in the menus --
+                        # propagates as an error, not here.
+                        print(f"models.dev unavailable: {e}", file=sys.stderr)
+                        sys.stderr.flush()
                         await load_models_async()
-                    else:
+                        model = await modelsdev.run_flat_model_picker_async(
+                            input_fn, models)
+                        if model:
+                            reinstall_provider(model=model)
+                            await load_models_async()
+                        else:
+                            print("Model selection cancelled.", file=sys.stderr)
+                            sys.stderr.flush()
+                            terminal.save_cursor_position()
+                            continue
+                    if picked is None:
+                        # User cancelled at either menu; keep the current model.
                         print("Model selection cancelled.", file=sys.stderr)
                         sys.stderr.flush()
                         terminal.save_cursor_position()
                         continue
-                if picked is None:
-                    # User cancelled at either menu; keep the current model.
-                    print("Model selection cancelled.", file=sys.stderr)
+                    provider_id, provider_entry, model_entry = picked
+                    model = model_entry.get("id") or model_entry.get("name")
+                    api = provider_entry.get("api")
+                    if not api:
+                        print(f"Provider {provider_id!r} has no api base URL; "
+                              f"keeping current provider.", file=sys.stderr)
+                    else:
+                        # Reinstall the Provider for the chosen model + provider
+                        # so its wire protocol, endpoint, and headers take
+                        # effect mid-session, then refresh the model list.
+                        # OpenRouter-style bare /v1 bases and bespoke gateways
+                        # expose OpenAI-compatible endpoints, so default to
+                        # openai_chat when the URL does not name a protocol.
+                        kind = (protocols.detect_protocol_from_url(api)
+                                or protocols.OPENAI_CHAT)
+                        try:
+                            reinstall_provider(
+                                model=model,
+                                url=api,
+                                provider_kind=kind,
+                                api_key=modelsdev.api_key_for(
+                                    provider_entry, RUNTIME_CONFIG.api_key),
+                            )
+                        except (protocols.ProtocolError, ValueError) as e:
+                            print(f"Could not switch to {provider_id!r}: {e}",
+                                  file=sys.stderr)
+                            sys.stderr.flush()
+                            terminal.save_cursor_position()
+                            continue
+                        await load_models_async()
+                    via = f" via {provider_id}" if provider_id else ""
+                    print(f"Selected model: {model}{via}", file=sys.stderr)
                     sys.stderr.flush()
                     terminal.save_cursor_position()
                     continue
-                provider_id, provider_entry, model_entry = picked
-                model = model_entry.get("id") or model_entry.get("name")
-                api = provider_entry.get("api")
-                if not api:
-                    print(f"Provider {provider_id!r} has no api base URL; "
-                          f"keeping current provider.", file=sys.stderr)
-                else:
-                    # Reinstall the Provider for the chosen model + provider
-                    # so its wire protocol, endpoint, and headers take
-                    # effect mid-session, then refresh the model list.
-                    # OpenRouter-style bare /v1 bases and bespoke gateways
-                    # expose OpenAI-compatible endpoints, so default to
-                    # openai_chat when the URL does not name a protocol.
-                    kind = (protocols.detect_protocol_from_url(api)
-                            or protocols.OPENAI_CHAT)
-                    try:
-                        reinstall_provider(
-                            model=model,
-                            url=api,
-                            provider_kind=kind,
-                            api_key=modelsdev.api_key_for(
-                                provider_entry, RUNTIME_CONFIG.api_key),
-                        )
-                    except (protocols.ProtocolError, ValueError) as e:
-                        print(f"Could not switch to {provider_id!r}: {e}",
-                              file=sys.stderr)
-                        sys.stderr.flush()
-                        terminal.save_cursor_position()
-                        continue
-                    await load_models_async()
-                via = f" via {provider_id}" if provider_id else ""
-                print(f"Selected model: {model}{via}", file=sys.stderr)
-                sys.stderr.flush()
-                terminal.save_cursor_position()
-                continue
-            case '/pwd':
-                print_shell_cwd()
-                terminal.save_cursor_position()
-                continue
-            case _ if command_text == '/cd' or command_text.startswith('/cd '):
-                change_shell_cwd_from_text(command_text[3:].strip())
-                terminal.save_cursor_position()
-                continue
-            case _:
-                if command_text.startswith('!'): # direct command execution
-                    cmd = user_in[1:].strip()
-                    print(f"{computer}: [Running local command: {cmd}]")
-                    cmd_output = await run_bash_async(cmd)
-                    print(cmd_output) # Show output to you in the terminal
-                    # Morph the user input so the AI sees exactly what you did and the result
-                    user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
-                else:
-                    pass
+                case '/pwd':
+                    print_shell_cwd()
+                    terminal.save_cursor_position()
+                    continue
+                case _ if command_text == '/cd' or command_text.startswith('/cd '):
+                    change_shell_cwd_from_text(command_text[3:].strip())
+                    terminal.save_cursor_position()
+                    continue
+                case _:
+                    if command_text.startswith('!'): # direct command execution
+                        cmd = user_in[1:].strip()
+                        print(f"{computer}: [Running local command: {cmd}]")
+                        cmd_output = await run_bash_async(cmd)
+                        print(cmd_output) # Show output to you in the terminal
+                        # Morph the user input so the AI sees exactly what you did and the result
+                        user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
+                    else:
+                        pass
 
-        transcript_items.append(formats.message_item("user", user_in))
+            transcript_items.append(formats.message_item("user", user_in))
 
-        try:
-            await run_terminal_turn_async(transcript_items)
-        except KeyboardInterrupt:
-            terminal.reset_colors_and_flags()
-            # ? EMERGENCY BRAKE
-            print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
-            # If we interrupt while a tool call was requested but unanswered, remove that
-            # assistant item so every later render has matched tool call/result pairs.
-            if transcript_items and formats.item_has_tool_calls(transcript_items[-1]):
-                transcript_items.pop()
+            try:
+                await run_terminal_turn_async(transcript_items, cancel_check=lambda: session.reader.cancel_requested)
+            except KeyboardInterrupt:
+                terminal.reset_colors_and_flags()
+                # ? EMERGENCY BRAKE
+                print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
+                # If we interrupt while a tool call was requested but unanswered, remove that
+                # assistant item so every later render has matched tool call/result pairs.
+                if transcript_items and formats.item_has_tool_calls(transcript_items[-1]):
+                    transcript_items.pop()
 
-            transcript_items.append(formats.instruction_item(
-                "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."))
-            continue # Drop immediately back to the User> prompt
-        terminal.save_cursor_position()
+                transcript_items.append(formats.instruction_item(
+                    "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."))
+                continue # Drop immediately back to the User> prompt
+            terminal.save_cursor_position()
 
 def main():
     apply_runtime_config(build_config_from_env())

@@ -256,6 +256,7 @@ class AsyncKeyReader:
         self.escape = bytearray()
         self.paste_mode = False
         self.loop = None
+        self.cancel_requested = False
 
     def _on_resize(self):
         self.pending.append(KeyEvent("RESIZE"))
@@ -327,6 +328,7 @@ class AsyncKeyReader:
         if byte == 0x1b:
             self.escape.append(byte)
         elif byte == 0x03:
+            self.cancel_requested = True
             self.pending.append(KeyEvent("CTRL_C"))
         elif byte == 0x04:
             self.pending.append(KeyEvent("CTRL_D"))
@@ -456,10 +458,11 @@ class PromptRenderer:
 
 
 class PromptController:
-    def __init__(self, terminal, prompt: str = 'User: ', history=None):
+    def __init__(self, terminal, prompt: str = 'User: ', history=None, session=None):
         self.terminal = terminal
         self.prompt = prompt
         self.history = list(history or [])
+        self.session = session  # AsyncKeyReader held for the whole session
 
     async def read_text(self) -> str:
         fd = new_stdin
@@ -471,87 +474,98 @@ class PromptController:
         history_index = len(self.history)
         saved_input = ""
 
+        if self.session is not None:
+            # Session owns raw mode + the reader for the whole session; the
+            # prompt just consumes keys from it.
+            return await self._read_text_from_reader(self.session, interactive, buffer, renderer,
+                                                     output_row, output_col, history_index, saved_input)
+        # No session: manage our own raw mode + reader for this one call.
+        with TerminalMode(fd, interactive):
+            async with AsyncKeyReader(fd, watch_resize=interactive) as reader:
+                return await self._read_text_from_reader(reader, interactive, buffer, renderer,
+                                                         output_row, output_col, history_index, saved_input)
+
+    async def _read_text_from_reader(self, reader, interactive, buffer, renderer,
+                                     output_row, output_col, history_index, saved_input):
         try:
-            with TerminalMode(fd, interactive):
-                async with AsyncKeyReader(fd, watch_resize=interactive) as reader:
+            if interactive:
+                sys.stdout.write('\033[6n')
+                sys.stdout.flush()
+
+                queued_events = []
+                while True:
+                    event = await reader.read_key()
+                    if event.kind == "CPR":
+                        m = re.match(r'^\033\[(\d+);(\d+)R$', event.text)
+                        if m:
+                            output_row = int(m.group(1))
+                            output_col = int(m.group(2))
+                        break
+                    elif event.kind != "EOF":
+                        queued_events.append(event)
+
+                # Bytes typed before the terminal answers the CPR query
+                # still belong to the prompt, so replay them after the
+                # initial cursor-position handshake.
+                reader.pending.extendleft(reversed(queued_events))
+                renderer.render(buffer)
+
+            while True:
+                event = await reader.read_key()
+                if event.kind == "EOF":
+                    if buffer.text():
+                        return buffer.text()
+                    raise EOFError
+                if event.kind == "CTRL_C":
+                    raise KeyboardInterrupt
+                if event.kind == "CTRL_D":
+                    if buffer.text():
+                        return buffer.text()
+                    raise EOFError
+                if event.kind == "ENTER":
                     if interactive:
-                        sys.stdout.write('\033[6n')
-                        sys.stdout.flush()
-
-                        queued_events = []
-                        while True:
-                            event = await reader.read_key()
-                            if event.kind == "CPR":
-                                m = re.match(r'^\033\[(\d+);(\d+)R$', event.text)
-                                if m:
-                                    output_row = int(m.group(1))
-                                    output_col = int(m.group(2))
-                                break
-                            elif event.kind != "EOF":
-                                queued_events.append(event)
-
-                        # Bytes typed before the terminal answers the CPR query
-                        # still belong to the prompt, so replay them after the
-                        # initial cursor-position handshake.
-                        reader.pending.extendleft(reversed(queued_events))
-                        renderer.render(buffer)
-
-                    while True:
-                        event = await reader.read_key()
-                        if event.kind == "EOF":
-                            if buffer.text():
-                                return buffer.text()
-                            raise EOFError
-                        if event.kind == "CTRL_C":
-                            raise KeyboardInterrupt
-                        if event.kind == "CTRL_D":
-                            if buffer.text():
-                                return buffer.text()
-                            raise EOFError
-                        if event.kind == "ENTER":
-                            if interactive:
-                                #print() This would unnecessarily scroll
-                                self.terminal.flush()
-                            return buffer.text()
-                        if event.kind == "TEXT":
-                            buffer.insert(event.text)
-                        elif event.kind == "BACKSPACE":
-                            buffer.backspace()
-                        elif event.kind == "DELETE":
-                            buffer.delete()
-                        elif event.kind == "CURSOR_LEFT":
-                            buffer.left()
-                        elif event.kind == "CURSOR_RIGHT":
-                            buffer.right()
-                        elif event.kind == "CURSOR_WORD_LEFT":
-                            buffer.word_left()
-                        elif event.kind == "CURSOR_WORD_RIGHT":
-                            buffer.word_right()
-                        elif event.kind == "HOME":
-                            buffer.home()
-                        elif event.kind == "END":
-                            buffer.end()
-                        elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
-                            if self.history and history_index > 0:
-                                if history_index == len(self.history):
-                                    saved_input = buffer.text()
-                                history_index -= 1
-                                buffer = InputBuffer()
-                                buffer.insert(self.history[history_index])
-                        elif event.kind in ["CURSOR_DOWN", "PAGE_DOWN"]:
-                            if history_index < len(self.history):
-                                history_index += 1
-                                buffer = InputBuffer()
-                                if history_index == len(self.history):
-                                    buffer.insert(saved_input)
-                                else:
-                                    buffer.insert(self.history[history_index])
-                        elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
-                            # Paste markers only affect AsyncKeyReader state;
-                            # resize is handled by the next render pass.
-                            pass
-                        if interactive:
-                            renderer.render(buffer)
+                        #print() This would unnecessarily scroll
+                        self.terminal.flush()
+                    return buffer.text()
+                if event.kind == "TEXT":
+                    buffer.insert(event.text)
+                elif event.kind == "BACKSPACE":
+                    buffer.backspace()
+                elif event.kind == "DELETE":
+                    buffer.delete()
+                elif event.kind == "CURSOR_LEFT":
+                    buffer.left()
+                elif event.kind == "CURSOR_RIGHT":
+                    buffer.right()
+                elif event.kind == "CURSOR_WORD_LEFT":
+                    buffer.word_left()
+                elif event.kind == "CURSOR_WORD_RIGHT":
+                    buffer.word_right()
+                elif event.kind == "HOME":
+                    buffer.home()
+                elif event.kind == "END":
+                    buffer.end()
+                elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
+                    if self.history and history_index > 0:
+                        if history_index == len(self.history):
+                            saved_input = buffer.text()
+                        history_index -= 1
+                        buffer = InputBuffer()
+                        buffer.insert(self.history[history_index])
+                elif event.kind in ["CURSOR_DOWN", "PAGE_DOWN"]:
+                    if history_index < len(self.history):
+                        history_index += 1
+                        buffer = InputBuffer()
+                        if history_index == len(self.history):
+                            buffer.insert(saved_input)
+                        else:
+                            buffer.insert(self.history[history_index])
+                elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
+                    # Paste markers only affect AsyncKeyReader state;
+                    # resize is handled by the next render pass.
+                    pass
+                if interactive:
+                    renderer.render(buffer)
         finally:
             if interactive:
                 # The prompt renderer temporarily owns the input/status regions;
@@ -562,47 +576,102 @@ class PromptController:
                 self.terminal.flush()
 
 
-async def get_input_async(prompt=None, history=None):
-    return await PromptController(terminal, prompt or 'User: ', history=history).read_text()
+async def get_input_async(prompt=None, history=None, session=None):
+    return await PromptController(terminal, prompt or 'User: ', history=history, session=session).read_text()
 
 
-def get_input(prompt=None, history=None):
-    return asyncio.run(get_input_async(prompt, history=history))
+class InputSession:
+    """Session-long input owner: raw mode, one stdin reader, producer, queue.
 
+    Everything that touches the terminal input lives here, so the rest of the
+    program never constructs a reader or flips raw mode itself.  Usage::
 
-async def run_menu_async(items):
-    # Menus can be large--so show it in the output area.
-    terminal.save_cursor_position()
-    while True:
-        terminal.restore_cursor_position()
-        for i, item in enumerate(items):
-            print(f"{i + 1}. {item}")
-        selection = await get_input_async('User choice: ')
-        selection = selection.strip()
-        if selection.endswith('.'):
-            selection = selection.rstrip('.')
+        async with input_session() as session:
+            # session.user_messages: queue of submitted lines (the producer
+            # enqueues; the turn loop drains).
+            # session.prompt(...): one-shot line read against the session
+            # reader (modal; pauses the producer so only one consumer reads
+            # keys at a time).
 
-        if selection:
-            terminal.save_cursor_position()
+    Raw mode and the reader are held from enter to exit, so keys typed while
+    the agent works are drained into the queue instead of being lost to the
+    kernel's line buffer.  Ctrl+C in raw mode is a CTRL_C key event; the
+    reader sets ``cancel_requested`` and the turn loop checks it between
+    awaits (the old SIGINT emergency stop no longer exists).
+    """
+
+    def __init__(self, fd=None):
+        self.fd = fd if fd is not None else new_stdin
+        self.interactive = os.isatty(self.fd) and os.isatty(sys.stdout.fileno())
+        self.reader = AsyncKeyReader(self.fd, watch_resize=self.interactive)
+        self.user_messages = asyncio.Queue()
+        self._producer = None
+        self._mode = None
+
+    async def __aenter__(self):
+        self._mode = TerminalMode(self.fd, self.interactive)
+        self._mode.__enter__()
+        await self.reader.__aenter__()
+        self._producer = asyncio.create_task(self._produce())
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._producer is not None:
+            self._producer.cancel()
             try:
-                return items[int(selection) - 1]
-            except (ValueError, IndexError):
-                return selection
+                await self._producer
+            except (asyncio.CancelledError, EOFError):
+                pass
+            self._producer = None
+        await self.reader.__aexit__(exc_type, exc, tb)
+        if self._mode is not None:
+            self._mode.__exit__(exc_type, exc, tb)
+            self._mode = None
 
-    terminal.save_cursor_position()
-    return 'None of the above'
+    async def _produce(self):
+        while True:
+            try:
+                text = await get_input_async(session=self.reader)
+            except EOFError:
+                self.user_messages.put_nowait(None)  # sentinel: end of session
+                return
+            except KeyboardInterrupt:
+                # Ctrl+C at the prompt cancels the current prompt; keep looping
+                # so the user can keep typing. cancel_requested is set by the
+                # reader.
+                continue
+            self.user_messages.put_nowait(text)
+
+    async def prompt(self, prompt_text='User: ', history=None) -> str:
+        """One-shot line read against the session reader (modal).
+
+        Pauses the producer first so the prompt is the only key consumer, then
+        resumes it.  Used by the session picker and the /model menus.
+        """
+        await self._pause()
+        try:
+            return await get_input_async(prompt_text, history, session=self.reader)
+        finally:
+            await self._resume()
+
+    async def _pause(self):
+        if self._producer is not None:
+            self._producer.cancel()
+            try:
+                await self._producer
+            except (asyncio.CancelledError, EOFError):
+                pass
+            self._producer = None
+
+    async def _resume(self):
+        if self._producer is None:
+            self._producer = asyncio.create_task(self._produce())
 
 
-def run_menu(items):
-    return asyncio.run(run_menu_async(items))
+def input_session(fd=None) -> InputSession:
+    return InputSession(fd)
 
 
 def restore_output_area_after_input():
     terminal.reset_colors_and_flags()
     terminal.flush()
-
-
-def run_input_loop():
-    while True:
-        input_text = get_input()
-        yield input_text

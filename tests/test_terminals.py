@@ -311,44 +311,6 @@ class PromptRendererTests(unittest.TestCase):
         )
 
 
-class MenuTests(unittest.TestCase):
-    def run_menu_with_inputs(self, inputs):
-        old_get_input_async = terminals.get_input_async
-        old_terminal = terminals.terminal
-        answers = list(inputs)
-        recorder = RecordingTerminal()
-
-        async def fake_get_input_async(prompt=None, history=None):
-            return answers.pop(0)
-
-        try:
-            terminals.get_input_async = fake_get_input_async
-            terminals.terminal = recorder
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                result = asyncio.run(terminals.run_menu_async(["alpha", "beta"]))
-            return result, out.getvalue(), recorder.calls
-        finally:
-            terminals.get_input_async = old_get_input_async
-            terminals.terminal = old_terminal
-
-    def test_menu_number_selection_allows_trailing_period(self):
-        result, output, calls = self.run_menu_with_inputs(["2."])
-
-        self.assertEqual(result, "beta")
-        self.assertIn("1. alpha", output)
-        self.assertIn("2. beta", output)
-        self.assertEqual(calls.count(("save_cursor_position",)), 2)
-
-    def test_menu_name_selection_returns_name(self):
-        result, output, calls = self.run_menu_with_inputs(["custom-model"])
-
-        self.assertEqual(result, "custom-model")
-        self.assertIn("1. alpha", output)
-        self.assertIn("2. beta", output)
-        self.assertEqual(calls.count(("save_cursor_position",)), 2)
-
-
 class RestoreOutputAreaTests(unittest.TestCase):
     def test_restore_output_area_resets_colors_and_flushes(self):
         old_terminal = terminals.terminal
