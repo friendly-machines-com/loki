@@ -2647,7 +2647,7 @@ def _status_api_base() -> str:
 def status_text() -> str:
     return (
         'Remote: API: {}; Model: {}; /model\n'
-        'Local: mode={}; CWD: {}; /pwd, /cd DIR, !foo, /quit'
+        'Local: mode={}; CWD: {}; /pwd, /cd DIR, /ps, !foo, /quit'
     ).format(_status_api_base(), model, AGENT_MODE, display_path(shell_cwd))
 
 
@@ -3034,6 +3034,10 @@ async def async_main(args):
                     continue
                 case '/pwd':
                     print_shell_cwd()
+                    terminal.save_cursor_position()
+                    continue
+                case '/ps':
+                    print(run_jobs())
                     terminal.save_cursor_position()
                     continue
                 case _ if command_text == '/cd' or command_text.startswith('/cd '):
