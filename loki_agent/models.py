@@ -194,15 +194,21 @@ def protocol_label(provider_entry):
 def provider_supported(provider_entry):
     """True if Loki can actually use this provider.
 
-    The provider's ``api`` URL must either name one of the supported wire
-    protocols via its endpoint path (.../chat/completions, .../messages,
-    .../responses) or follow the OpenAI-compatible bare ``/v1`` base
-    convention, which reinstall_provider treats as openai_chat. Providers
-    with no api URL, or with a non-/v1 base path, are dropped -- that is what
-    keeps the model menu a manageable size.
+    A provider is usable if any of:
+      1. Its ``api`` URL names one of the supported wire protocols via its
+         endpoint path (.../chat/completions, .../messages, .../responses).
+      2. Its ``npm`` package is one of the three that names a protocol
+         directly (@ai-sdk/openai-compatible -> chat, @ai-sdk/anthropic ->
+         messages, @ai-sdk/openai -> responses).
+      3. Its ``api`` URL follows the OpenAI-compatible bare ``/v1`` base
+         convention, which reinstall_provider treats as openai_chat.
+
+    Providers with no usable signal are dropped.
     """
     api = provider_entry.get("api") or ""
     if protocols.detect_protocol_from_url(api) in protocols.SUPPORTED_PROTOCOLS:
+        return True
+    if protocols.detect_protocol_from_npm(provider_entry.get("npm")) is not None:
         return True
     return api.rstrip("/").endswith("/v1")
 

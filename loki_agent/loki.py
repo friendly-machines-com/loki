@@ -3032,6 +3032,8 @@ async def async_main(args):
                         # expose OpenAI-compatible endpoints, so default to
                         # openai_chat when the URL does not name a protocol.
                         kind = (protocols.detect_protocol_from_url(api)
+                                or protocols.detect_protocol_from_npm(
+                                    provider_entry.get("npm"))
                                 or protocols.OPENAI_CHAT)
                         try:
                             reinstall_provider(

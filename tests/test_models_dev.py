@@ -108,13 +108,50 @@ class ProtocolAndKeyTests(unittest.TestCase):
         self.assertFalse(models.provider_supported({}))
         self.assertFalse(models.provider_supported({"api": None}))
 
+    def test_provider_supported_accepts_known_npm_package(self):
+        # The Z.AI / Zhipu AI / Vivgrid cases: non-v1 URL but a package that
+        # names a protocol directly.
+        self.assertTrue(models.provider_supported({
+            "api": "https://api.z.ai/api/paas/v4",
+            "npm": "@ai-sdk/openai-compatible",
+        }))
+        self.assertTrue(models.provider_supported({
+            "api": "https://open.bigmodel.cn/api/paas/v4",
+            "npm": "@ai-sdk/openai-compatible",
+        }))
+        self.assertTrue(models.provider_supported({
+            "npm": "@ai-sdk/anthropic",
+        }))
+        self.assertTrue(models.provider_supported({
+            "api": "https://api.vivgrid.com/v1",
+            "npm": "@ai-sdk/openai",
+        }))
+
+    def test_provider_supported_rejects_vendor_specific_npm_without_api(self):
+        # Vendor SDKs that don't name a protocol and have no usable URL are
+        # still dropped.
+        self.assertFalse(models.provider_supported({"npm": "@ai-sdk/togetherai"}))
+        self.assertFalse(models.provider_supported({"npm": "@ai-sdk/deepinfra"}))
+        self.assertFalse(models.provider_supported({
+            "npm": "@openrouter/ai-sdk-provider",
+        }))
+
     def test_filter_supported_groups_drops_unsupported_providers_and_models(self):
-        # Synthetic DATA: zhipuai api is /api/paas/v4 (unsupported),
-        # openrouter /api/v1 and anthropic /v1/messages are supported.
-        filtered = models.filter_supported_groups(_groups())
+        # In the synthetic DATA, all three providers are now supported
+        # (zhipuai via npm, openrouter via /v1 fallback, anthropic via URL).
+        # Add a fourth provider that's genuinely unsupported to verify the
+        # filter still drops things.
+        data = dict(DATA, togetherai={
+            "id": "togetherai", "name": "Together AI",
+            "npm": "@ai-sdk/togetherai", "api": None,
+            "models": {"glm-5.2": {"id": "glm-5.2", "name": "GLM-5.2"}},
+        })
+        filtered = models.filter_supported_groups(models.build_groups(data))
         self.assertEqual(set(filtered), {"GLM-5.2", "Claude Sonnet 4.6"})
-        # GLM-5.2 keeps only the supported provider (openrouter).
-        self.assertEqual([pid for pid, _, _ in filtered["GLM-5.2"]], ["openrouter"])
+        # GLM-5.2 keeps the supported providers (zhipuai, openrouter);
+        # togetherai is dropped because its vendor SDK has no api URL.
+        pids = sorted(pid for pid, _, _ in filtered["GLM-5.2"])
+        self.assertEqual(pids, ["openrouter", "zhipuai"])
         self.assertEqual([pid for pid, _, _ in filtered["Claude Sonnet 4.6"]], ["anthropic"])
 
     def test_filter_supported_groups_drops_fully_deprecated_models(self):
@@ -320,3 +357,27 @@ class PickerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NpmProtocolDetectionTests(unittest.TestCase):
+    def test_openai_compatible_npm_maps_to_openai_chat(self):
+        from loki_agent import protocols
+        self.assertEqual(protocols.detect_protocol_from_npm("@ai-sdk/openai-compatible"),
+                         protocols.OPENAI_CHAT)
+
+    def test_anthropic_npm_maps_to_anthropic_messages(self):
+        from loki_agent import protocols
+        self.assertEqual(protocols.detect_protocol_from_npm("@ai-sdk/anthropic"),
+                         protocols.ANTHROPIC_MESSAGES)
+
+    def test_openai_npm_maps_to_openai_responses(self):
+        from loki_agent import protocols
+        self.assertEqual(protocols.detect_protocol_from_npm("@ai-sdk/openai"),
+                         protocols.OPENAI_RESPONSES)
+
+    def test_vendor_specific_npm_returns_none(self):
+        from loki_agent import protocols
+        self.assertIsNone(protocols.detect_protocol_from_npm("@ai-sdk/togetherai"))
+        self.assertIsNone(protocols.detect_protocol_from_npm("@openrouter/ai-sdk-provider"))
+        self.assertIsNone(protocols.detect_protocol_from_npm("no-api"))
+        self.assertIsNone(protocols.detect_protocol_from_npm(None))

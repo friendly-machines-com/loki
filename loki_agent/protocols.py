@@ -130,6 +130,29 @@ def detect_protocol_from_url(url):
     return None
 
 
+# Maps models.dev provider ``npm`` values to the wire protocol they speak.
+# Only packages whose name unambiguously names a protocol belong here.
+# Vendor-specific SDKs (@ai-sdk/togetherai, @ai-sdk/deepinfra,
+# @openrouter/ai-sdk-provider, @aihubmix/ai-sdk-provider, ...) are excluded
+# because they wrap endpoints that may speak any protocol; those still need
+# URL detection or an explicit override.
+NPM_PROTOCOL = {
+    "@ai-sdk/openai-compatible": OPENAI_CHAT,
+    "@ai-sdk/anthropic":         ANTHROPIC_MESSAGES,
+    "@ai-sdk/openai":            OPENAI_RESPONSES,
+}
+
+
+def detect_protocol_from_npm(npm):
+    """Infer wire protocol from a models.dev provider's npm package.
+
+    Returns one of SUPPORTED_PROTOCOLS for the three packages whose names
+    name a protocol directly, or None for vendor-specific SDKs and unknown
+    packages.
+    """
+    return NPM_PROTOCOL.get(npm) if npm else None
+
+
 def detect_protocol_from_response(response):
     if not isinstance(response, dict):
         return None
