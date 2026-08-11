@@ -2948,7 +2948,6 @@ async def async_main(args):
                 break
 
             if not user_in:
-                terminal.save_cursor_position()
                 continue
 
             terminal.set_background_color(terminals.INPUT_COLOR)
@@ -2987,7 +2986,6 @@ async def async_main(args):
                         else:
                             print("Model selection cancelled.", file=sys.stderr)
                             sys.stderr.flush()
-                            terminal.save_cursor_position()
                             continue
                     finally:
                         await session.resume()
@@ -2995,7 +2993,6 @@ async def async_main(args):
                         # User cancelled at either menu; keep the current model.
                         print("Model selection cancelled.", file=sys.stderr)
                         sys.stderr.flush()
-                        terminal.save_cursor_position()
                         continue
                     provider_id, provider_entry, model_entry = picked
                     model = model_entry.get("id") or model_entry.get("name")
@@ -3024,25 +3021,20 @@ async def async_main(args):
                             print(f"Could not switch to {provider_id!r}: {e}",
                                   file=sys.stderr)
                             sys.stderr.flush()
-                            terminal.save_cursor_position()
                             continue
                         await load_models_async()
                     via = f" via {provider_id}" if provider_id else ""
                     print(f"Selected model: {model}{via}", file=sys.stderr)
                     sys.stderr.flush()
-                    terminal.save_cursor_position()
                     continue
                 case '/pwd':
                     print_shell_cwd()
-                    terminal.save_cursor_position()
                     continue
                 case '/ps':
                     print(run_jobs())
-                    terminal.save_cursor_position()
                     continue
                 case _ if command_text == '/cd' or command_text.startswith('/cd '):
                     change_shell_cwd_from_text(command_text[3:].strip())
-                    terminal.save_cursor_position()
                     continue
                 case _:
                     if command_text.startswith('!'): # direct command execution
@@ -3071,7 +3063,6 @@ async def async_main(args):
                 transcript_items.append(formats.instruction_item(
                     "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."))
                 continue # Drop immediately back to the User> prompt
-            terminal.save_cursor_position()
 
 def main():
     apply_runtime_config(build_config_from_env())
@@ -3112,7 +3103,6 @@ def main():
     terminal.reset_colors_and_flags()
     terminal.set_clipping_region(*terminals.output_area)
     terminal.goto_position(1, 1)
-    terminal.save_cursor_position()
 
     try:
         asyncio.run(async_main(sys.argv[1:]))

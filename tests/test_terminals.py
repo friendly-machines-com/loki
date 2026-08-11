@@ -299,6 +299,7 @@ class PromptRendererTests(unittest.TestCase):
         self.assertEqual(
             recorder.calls,
             [
+                ("save_cursor_position",),
                 ("set_clipping_region", 10, 13),
                 ("goto_position", 1, 1),
                 ("set_background_color", terminals.INPUT_COLOR),
@@ -310,7 +311,7 @@ class PromptRendererTests(unittest.TestCase):
                 ("set_reverse_video", True),
                 ("set_reverse_video", False),
                 ("set_clipping_region", *terminals.output_area),
-                ("goto_position", 1, 1),
+                ("restore_cursor_position",),
                 ("reset_colors_and_flags",),
                 ("flush",),
             ],

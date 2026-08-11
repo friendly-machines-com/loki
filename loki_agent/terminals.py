@@ -266,17 +266,6 @@ class AsyncKeyReader:
         # next turn. Same mechanism as cancel_requested (a flag the main loop
         # reads), but it must NOT cancel -- the current turn keeps running.
         self.mode_cycle_requested = False
-        # CPR pairing: True while a \033[6n query is in flight (sent but reply
-        # not yet consumed). The terminal answers queries FIFO, so each query
-        # must have exactly one reply consumed; cancellation must drain the
-        # outstanding reply before another consumer reads stdin.
-        self.cpr_outstanding = False
-
-    def note_cpr_sent(self):
-        self.cpr_outstanding = True
-
-    def note_cpr_consumed(self):
-        self.cpr_outstanding = False
 
     def _on_resize(self):
         self.pending.append(KeyEvent("RESIZE"))
@@ -461,13 +450,24 @@ class PromptRenderer:
         self.terminal = terminal
         self.prompt = prompt
 
-    def render(self, buffer: InputBuffer, output_row: int = 1, output_col: int = 1):
+    def render(self, buffer: InputBuffer):
+        """Draw the input area, atomically.
+
+        The real cursor is owned by output: it always lives in the output area
+        so stdout/stderr writes land there.  To draw the input area we save the
+        cursor position and the output scroll region, draw, then restore both --
+        all synchronously (no awaits), so nothing else can interleave and
+        corrupt the cursor on the single event loop.
+        """
         refresh_terminal_layout()
+        # Save the output cursor position and region before leaving the output
+        # area.  save_cursor_position (DECSC) captures the current position.
+        self.terminal.save_cursor_position()
+
+        # Draw the input area and status area.
         self.terminal.set_clipping_region(*input_area)
         self.terminal.goto_position(1, 1)
         self.terminal.set_background_color(INPUT_COLOR)
-        # ESC[J clears below the cursor, including the status area in this
-        # layout. Redraw status immediately, then re-enter the input area.
         self.terminal.clear_to_end_of_screen()
         update_status_bar()
         self.terminal.set_clipping_region(*input_area)
@@ -476,25 +476,21 @@ class PromptRenderer:
         print(self.prompt + buffer.before_cursor(), end='')
 
         # Draw the fake (reverse-video) caret at the insertion point, then the
-        # text after it.  The real cursor is parked in the output area at the
-        # end, so stdout/stderr writes land there (contract unchanged).
+        # text after it.
         after = buffer.after_cursor()
         self.terminal.set_reverse_video(True)
         if after:
-            # Caret sits on the first char after the insertion point.
             print(after[0], end='')
         else:
-            # End of text (empty buffer, or caret after the last char): draw a
-            # reversed blank cell as the caret.
             print(' ', end='')
         self.terminal.set_reverse_video(False)
         if after:
             print(after[1:], end='')
 
-        # Park the real cursor in the output area so output writers work
-        # normally; the input area keeps the draft + drawn caret visible.
+        # Restore the output scroll region and the cursor position.  The real
+        # cursor is back in the output area where output writers expect it.
         self.terminal.set_clipping_region(*output_area)
-        self.terminal.goto_position(output_row, output_col)
+        self.terminal.restore_cursor_position()
         self.terminal.reset_colors_and_flags()
         self.terminal.flush()
 
@@ -529,54 +525,11 @@ class PromptController:
                 return await self._read_text_from_reader(reader, interactive, buffer, renderer,
                                                          output_row, output_col, history_index, saved_input)
 
-    async def _consume_cpr_reply(self, reader) -> tuple[int, int]:
-        """Consume exactly one CPR reply from the reader, replaying keys.
-
-        The terminal answers CPR queries FIFO, one reply per query.  This reads
-        stdin until the outstanding reply (a CSI ``row;col R`` event) is
-        consumed; any user keystrokes that arrive first are replayed into
-        ``reader.pending`` so they are not lost.  Clears the reader's
-        ``cpr_outstanding`` flag.
-        """
-        queued_events = []
-        while True:
-            event = await reader.read_key()
-            if event.kind == "CPR":
-                m = re.match(r'^\033\[(\d+);(\d+)R$', event.text)
-                reader.note_cpr_consumed()
-                # Events typed while waiting for the CPR reply belong to the
-                # next consumer; replay them in order.
-                if queued_events:
-                    reader.pending.extendleft(reversed(queued_events))
-                if m:
-                    return int(m.group(1)), int(m.group(2))
-                return 1, 1
-            elif event.kind == "EOF":
-                reader.note_cpr_consumed()
-                return 1, 1
-            else:
-                queued_events.append(event)
-        # Unreachable.
-        return 1, 1
-
-    async def _query_output_cursor(self, reader) -> tuple[int, int]:
-        """CPR handshake: ask the terminal where the cursor is, return (row, col).
-
-        Pairs exactly one \033[6n request with exactly one consumed reply, so
-        the async stdin buffer can never leave a stale reply for a later
-        consumer to misattribute.
-        """
-        sys.stdout.write('\033[6n')
-        sys.stdout.flush()
-        reader.note_cpr_sent()
-        return await self._consume_cpr_reply(reader)
-
     async def _read_text_from_reader(self, reader, interactive, buffer, renderer,
                                      output_row, output_col, history_index, saved_input):
         try:
             if interactive:
-                output_row, output_col = await self._query_output_cursor(reader)
-                renderer.render(buffer, output_row, output_col)
+                renderer.render(buffer)
 
             while True:
                 event = await reader.read_key()
@@ -637,27 +590,14 @@ class PromptController:
                     # the buffer.
                     self.on_mode_cycle()
                 if interactive:
-                    output_row, output_col = await self._query_output_cursor(reader)
-                    renderer.render(buffer, output_row, output_col)
+                    renderer.render(buffer)
         finally:
             if interactive:
-                # If a CPR query is outstanding (we were cancelled mid-CPR),
-                # consume its reply so the next consumer doesn't read a stale
-                # one.  This preserves the one-query/one-reply pairing.  Any
-                # keystrokes drained are replayed for the next consumer.
-                if getattr(reader, 'cpr_outstanding', False):
-                    try:
-                        await self._consume_cpr_reply(reader)
-                    except (EOFError, asyncio.CancelledError):
-                        pass
-                # Always park the cursor in the output area, on normal return
-                # AND on cancellation.  output_row/output_col were captured by
-                # CPR before the input-area draw, so they are still the correct
-                # output position.  Skipping on cancel would leave the scroll
-                # region as input_area, so a following modal would print into
-                # the wrong region.
+                # The renderer's atomic save/draw/restore always leaves the
+                # cursor in the output area.  If we were cancelled mid-render
+                # (impossible -- render has no awaits), the region is still the
+                # output area.  Restore it defensively on exit.
                 self.terminal.set_clipping_region(*output_area)
-                self.terminal.goto_position(output_row, output_col)
                 self.terminal.reset_colors_and_flags()
                 self.terminal.flush()
 
