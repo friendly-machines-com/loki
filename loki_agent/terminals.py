@@ -452,48 +452,49 @@ class PromptRenderer:
         self.prompt = prompt
 
     def render(self, buffer: InputBuffer):
-        """Draw the input area, atomically.
+        """Draw the input area and status area, atomically.
 
-        The real cursor is owned by output: it always lives in the output area
-        so stdout/stderr writes land there.  To draw the input area we save the
-        cursor position and the output scroll region, draw, then restore both --
-        all synchronously (no awaits), so nothing else can interleave and
-        corrupt the cursor on the single event loop.
+        DECSC at entry snapshots the output cursor (and SGR, origin mode,
+        ...). The try/finally guarantees that even on a mid-render
+        exception (e.g. set_clipping_region's assert on a too-small
+        resize, or a write I/O error) the scroll region is restored to
+        output_area and the cursor is DECRC'd back to its snapshot. No
+        awaits, so the event loop's no-interleave property makes this
+        atomic w.r.t. output writers on the same loop.
         """
         refresh_terminal_layout()
-        # Save the output cursor position and region before leaving the output
-        # area.  save_cursor_position (DECSC) captures the current position.
         self.terminal.save_cursor_position()
+        try:
+            # Draw the input area and status area.
+            self.terminal.set_clipping_region(*input_area)
+            self.terminal.goto_position(1, 1)
+            self.terminal.set_background_color(INPUT_COLOR)
+            self.terminal.clear_to_end_of_screen()
+            update_status_bar()
+            self.terminal.set_clipping_region(*input_area)
+            self.terminal.goto_position(1, 1)
+            self.terminal.set_background_color(INPUT_COLOR)
+            print(self.prompt + buffer.before_cursor(), end='')
 
-        # Draw the input area and status area.
-        self.terminal.set_clipping_region(*input_area)
-        self.terminal.goto_position(1, 1)
-        self.terminal.set_background_color(INPUT_COLOR)
-        self.terminal.clear_to_end_of_screen()
-        update_status_bar()
-        self.terminal.set_clipping_region(*input_area)
-        self.terminal.goto_position(1, 1)
-        self.terminal.set_background_color(INPUT_COLOR)
-        print(self.prompt + buffer.before_cursor(), end='')
-
-        # Draw the fake (reverse-video) caret at the insertion point, then the
-        # text after it.
-        after = buffer.after_cursor()
-        self.terminal.set_reverse_video(True)
-        if after:
-            print(after[0], end='')
-        else:
-            print(' ', end='')
-        self.terminal.set_reverse_video(False)
-        if after:
-            print(after[1:], end='')
-
-        # Restore the output scroll region and the cursor position.  The real
-        # cursor is back in the output area where output writers expect it.
-        self.terminal.set_clipping_region(*output_area)
-        self.terminal.restore_cursor_position()
-        self.terminal.reset_colors_and_flags()
-        self.terminal.flush()
+            # Draw the fake (reverse-video) caret at the insertion point,
+            # then the text after it.
+            after = buffer.after_cursor()
+            self.terminal.set_reverse_video(True)
+            if after:
+                print(after[0], end='')
+            else:
+                print(' ', end='')
+            self.terminal.set_reverse_video(False)
+            if after:
+                print(after[1:], end='')
+        finally:
+            # Restore the output scroll region and the cursor position.
+            # The real cursor is back in the output area where output
+            # writers expect it -- whether the try block succeeded or not.
+            self.terminal.set_clipping_region(*output_area)
+            self.terminal.restore_cursor_position()
+            self.terminal.reset_colors_and_flags()
+            self.terminal.flush()
 
 
 class PromptController:
@@ -528,79 +529,69 @@ class PromptController:
 
     async def _read_text_from_reader(self, reader, interactive, buffer, renderer,
                                      output_row, output_col, history_index, saved_input):
-        try:
+        if interactive:
+            renderer.render(buffer)
+
+        while True:
+            event = await reader.read_key()
+            if event.kind == "EOF":
+                if buffer.text():
+                    return buffer.text()
+                raise EOFError
+            if event.kind == "CTRL_C":
+                raise KeyboardInterrupt
+            if event.kind == "CTRL_D":
+                if buffer.text():
+                    return buffer.text()
+                raise EOFError
+            if event.kind == "ENTER":
+                if interactive:
+                    #print() This would unnecessarily scroll
+                    self.terminal.flush()
+                return buffer.text()
+            if event.kind == "TEXT":
+                buffer.insert(event.text)
+            elif event.kind == "BACKSPACE":
+                buffer.backspace()
+            elif event.kind == "DELETE":
+                buffer.delete()
+            elif event.kind == "CURSOR_LEFT":
+                buffer.left()
+            elif event.kind == "CURSOR_RIGHT":
+                buffer.right()
+            elif event.kind == "CURSOR_WORD_LEFT":
+                buffer.word_left()
+            elif event.kind == "CURSOR_WORD_RIGHT":
+                buffer.word_right()
+            elif event.kind == "HOME":
+                buffer.home()
+            elif event.kind == "END":
+                buffer.end()
+            elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
+                if self.history and history_index > 0:
+                    if history_index == len(self.history):
+                        saved_input = buffer.text()
+                    history_index -= 1
+                    buffer = InputBuffer()
+                    buffer.insert(self.history[history_index])
+            elif event.kind in ["CURSOR_DOWN", "PAGE_DOWN"]:
+                if history_index < len(self.history):
+                    history_index += 1
+                    buffer = InputBuffer()
+                    if history_index == len(self.history):
+                        buffer.insert(saved_input)
+                    else:
+                        buffer.insert(self.history[history_index])
+            elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
+                # Paste markers only affect AsyncKeyReader state;
+                # resize is handled by the next render pass.
+                pass
+            elif event.kind == "MODE_CYCLE":
+                # Shift-Tab cycles the agent mode; does not cancel or alter
+                # the buffer.
+                self.on_mode_cycle()
             if interactive:
                 renderer.render(buffer)
-
-            while True:
-                event = await reader.read_key()
-                if event.kind == "EOF":
-                    if buffer.text():
-                        return buffer.text()
-                    raise EOFError
-                if event.kind == "CTRL_C":
-                    raise KeyboardInterrupt
-                if event.kind == "CTRL_D":
-                    if buffer.text():
-                        return buffer.text()
-                    raise EOFError
-                if event.kind == "ENTER":
-                    if interactive:
-                        #print() This would unnecessarily scroll
-                        self.terminal.flush()
-                    return buffer.text()
-                if event.kind == "TEXT":
-                    buffer.insert(event.text)
-                elif event.kind == "BACKSPACE":
-                    buffer.backspace()
-                elif event.kind == "DELETE":
-                    buffer.delete()
-                elif event.kind == "CURSOR_LEFT":
-                    buffer.left()
-                elif event.kind == "CURSOR_RIGHT":
-                    buffer.right()
-                elif event.kind == "CURSOR_WORD_LEFT":
-                    buffer.word_left()
-                elif event.kind == "CURSOR_WORD_RIGHT":
-                    buffer.word_right()
-                elif event.kind == "HOME":
-                    buffer.home()
-                elif event.kind == "END":
-                    buffer.end()
-                elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
-                    if self.history and history_index > 0:
-                        if history_index == len(self.history):
-                            saved_input = buffer.text()
-                        history_index -= 1
-                        buffer = InputBuffer()
-                        buffer.insert(self.history[history_index])
-                elif event.kind in ["CURSOR_DOWN", "PAGE_DOWN"]:
-                    if history_index < len(self.history):
-                        history_index += 1
-                        buffer = InputBuffer()
-                        if history_index == len(self.history):
-                            buffer.insert(saved_input)
-                        else:
-                            buffer.insert(self.history[history_index])
-                elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
-                    # Paste markers only affect AsyncKeyReader state;
-                    # resize is handled by the next render pass.
-                    pass
-                elif event.kind == "MODE_CYCLE":
-                    # Shift-Tab cycles the agent mode; does not cancel or alter
-                    # the buffer.
-                    self.on_mode_cycle()
-                if interactive:
-                    renderer.render(buffer)
-        finally:
-            if interactive:
-                # render() already leaves the scroll region as output_area and
-                # the SGR reset; calling set_clipping_region here would emit
-                # DECSTBM, which moves the cursor to the region's home as a
-                # side effect -- clobbering the position the next prompt's
-                # DECSC needs to capture. Don't do that.
-                self.terminal.reset_colors_and_flags()
-                self.terminal.flush()
 
 
 async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle=None):
@@ -672,6 +663,18 @@ class InputSession:
                 # so the user can keep typing. cancel_requested is set by the
                 # reader.
                 continue
+            except Exception as e:
+                # An unexpected exception (e.g. render failing on a tiny
+                # resize, or a write I/O error) would otherwise kill the
+                # producer task silently and leave the main loop blocked on
+                # user_messages.get() forever. Log and treat it as session EOF
+                # so the main loop breaks and main()'s clean_up runs.
+                import traceback
+                print(f"input session error: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                self.user_messages.put_nowait(None)
+                return
             self.user_messages.put_nowait(text)
 
     async def prompt(self, prompt_text='User: ', history=None) -> str:
