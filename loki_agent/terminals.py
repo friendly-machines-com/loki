@@ -57,10 +57,10 @@ else:
         #goto_position(1, 1)
 
     def save_cursor_position(self):
-        print('\033[s', end='')
+        print('\0337', end='')
 
     def restore_cursor_position(self):
-        print('\033[u', end='')
+        print('\0338', end='')
 
     def flush(self):
         sys.stdout.flush()
@@ -78,8 +78,9 @@ else:
         print('\033[{}m'.format(40 + index), end='')
 
     def set_reverse_video(self, enabled: bool):
-        # 7 = reverse video (SGR); 0 = reset. Used for the drawn input caret.
-        print('\033[7m' if enabled else '\033[0m', end='')
+        # 7 = reverse video (SGR); 27 = reverse off. Don't use 0 (full reset)
+        # because that would clobber the input-area background color mid-caret.
+        print('\033[7m' if enabled else '\033[27m', end='')
 
     def reset_colors_and_flags(self):
         print('\033[m', end='')
@@ -593,11 +594,11 @@ class PromptController:
                     renderer.render(buffer)
         finally:
             if interactive:
-                # The renderer's atomic save/draw/restore always leaves the
-                # cursor in the output area.  If we were cancelled mid-render
-                # (impossible -- render has no awaits), the region is still the
-                # output area.  Restore it defensively on exit.
-                self.terminal.set_clipping_region(*output_area)
+                # render() already leaves the scroll region as output_area and
+                # the SGR reset; calling set_clipping_region here would emit
+                # DECSTBM, which moves the cursor to the region's home as a
+                # side effect -- clobbering the position the next prompt's
+                # DECSC needs to capture. Don't do that.
                 self.terminal.reset_colors_and_flags()
                 self.terminal.flush()
 
