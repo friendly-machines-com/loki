@@ -1,0 +1,22 @@
+#!/bin/sh
+# Reject the commit if any staged file contains bytes above 0x7F.
+#
+# Override with `git commit --no-verify` if you have a real reason, then
+# add a sibling test or comment so the same character doesn't sneak back.
+
+set -u
+
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$files" ] && exit 0
+
+# -I skips binaries; non-zero exit means match found.
+if matches=$(grep -InP '[^\x00-\x7F]' $files 2>/dev/null); then
+    cat >&2 <<EOF
+pre-commit: REJECTED -- non-ASCII bytes in staged files:
+
+$matches
+
+Override with: git commit --no-verify
+EOF
+    exit 1
+fi
