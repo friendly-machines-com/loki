@@ -627,7 +627,7 @@ class InputSession:
     awaits (the old SIGINT emergency stop no longer exists).
     """
 
-    def __init__(self, fd=None, on_mode_cycle=None):
+    def __init__(self, fd=None, on_mode_cycle=None, history_provider=None):
         self.fd = fd if fd is not None else new_stdin
         self.interactive = os.isatty(self.fd) and os.isatty(sys.stdout.fileno())
         self.reader = AsyncKeyReader(self.fd, watch_resize=self.interactive)
@@ -635,6 +635,7 @@ class InputSession:
         self._producer = None
         self._mode = None
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
+        self.history_provider = history_provider
 
     async def __aenter__(self):
         self._mode = TerminalMode(self.fd, self.interactive)
@@ -659,7 +660,9 @@ class InputSession:
     async def _produce(self):
         while True:
             try:
-                text = await get_input_async(session=self.reader, on_mode_cycle=self.on_mode_cycle)
+                history = self.history_provider() if self.history_provider else None
+                text = await get_input_async(session=self.reader, history=history,
+                                             on_mode_cycle=self.on_mode_cycle)
             except EOFError:
                 self.user_messages.put_nowait(None)  # sentinel: end of session
                 return
@@ -709,8 +712,8 @@ class InputSession:
             self._producer = asyncio.create_task(self._produce())
 
 
-def input_session(fd=None, on_mode_cycle=None) -> InputSession:
-    return InputSession(fd, on_mode_cycle=on_mode_cycle)
+def input_session(fd=None, on_mode_cycle=None, history_provider=None) -> InputSession:
+    return InputSession(fd, on_mode_cycle=on_mode_cycle, history_provider=history_provider)
 
 
 def restore_output_area_after_input():

@@ -2916,7 +2916,8 @@ async def async_main(args):
     # user_messages queue for the whole session (see terminals.InputSession).
     # loki.py is just a consumer of the queue and a caller of session.prompt()
     # for modal prompts (session picker, /model menus).
-    async with input_session(on_mode_cycle=lambda: cycle_agent_mode()) as session:
+    async with input_session(on_mode_cycle=lambda: cycle_agent_mode(),
+                             history_provider=lambda: user_prompt_history(transcript_items)) as session:
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel
