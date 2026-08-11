@@ -246,6 +246,7 @@ KEY_SEQUENCES = {
     b'\x1b[201~': "PASTE_END",
     b'\x1b[1;5D': 'CURSOR_WORD_LEFT',
     b'\x1b[1;5C': 'CURSOR_WORD_RIGHT',
+    b'\x1b[Z': 'MODE_CYCLE',
 }
 CSI_FINAL_BYTES = set(range(0x40, 0x7f))
 
@@ -261,6 +262,10 @@ class AsyncKeyReader:
         self.paste_mode = False
         self.loop = None
         self.cancel_requested = False
+        # Shift-Tab: requests cycling the agent mode (explore/plan/edit) for the
+        # next turn. Same mechanism as cancel_requested (a flag the main loop
+        # reads), but it must NOT cancel -- the current turn keeps running.
+        self.mode_cycle_requested = False
         # CPR pairing: True while a \033[6n query is in flight (sent but reply
         # not yet consumed). The terminal answers queries FIFO, so each query
         # must have exactly one reply consumed; cancellation must drain the
@@ -327,6 +332,9 @@ class AsyncKeyReader:
                     self.pending.append(KeyEvent(kind))
                 elif kind == "PASTE_END":
                     self.paste_mode = False
+                    self.pending.append(KeyEvent(kind))
+                elif kind == "MODE_CYCLE":
+                    self.mode_cycle_requested = True
                     self.pending.append(KeyEvent(kind))
                 elif kind:
                     self.pending.append(KeyEvent(kind))

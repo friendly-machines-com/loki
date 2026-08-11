@@ -248,7 +248,7 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             text,
             "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
-            f"Local: CWD: {loki.STARTUP_CWD}; /pwd, /cd DIR, !foo, /quit",
+            f"Local: mode={loki.AGENT_MODE}; CWD: {loki.STARTUP_CWD}; /pwd, /cd DIR, !foo, /quit",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)

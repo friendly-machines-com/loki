@@ -1541,6 +1541,10 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_cont
 
 def get_tool_loop_extra_context(transcript_items: list):
     inhibit_edits = False
+    # "explore" mode: read-only. Force the explore-only tool gate so the agent
+    # can't write/edit while investigating.
+    if AGENT_MODE == "explore":
+        inhibit_edits = "explore mode"
     if len(transcript_items) > 0 and transcript_items[-1].get("type") == "message" and transcript_items[-1].get("role") == "user":
         content = transcript_items[-1].get('content')
         content = [x for x in content if x.get('type') == 'text'][-1:]
@@ -2643,8 +2647,8 @@ def _status_api_base() -> str:
 def status_text() -> str:
     return (
         'Remote: API: {}; Model: {}; /model\n'
-        'Local: CWD: {}; /pwd, /cd DIR, !foo, /quit'
-    ).format(_status_api_base(), model, display_path(shell_cwd))
+        'Local: mode: {}; CWD: {}; /pwd, /cd DIR, !foo, /quit'
+    ).format(_status_api_base(), model, AGENT_MODE, display_path(shell_cwd))
 
 
 async def load_models_async():
@@ -2691,6 +2695,18 @@ terminals.set_status_text_provider(status_text)
 
 transcript_items = []
 session_todos = []
+
+# Agent mode, cycled by Shift-Tab: "explore" (read-only), "plan", "edit".
+# Takes effect for the next turn; it does not cancel the current turn.
+MODE_CYCLE_ORDER = ["explore", "plan", "edit"]
+AGENT_MODE = "explore"
+
+
+def cycle_agent_mode() -> str:
+    global AGENT_MODE
+    i = MODE_CYCLE_ORDER.index(AGENT_MODE)
+    AGENT_MODE = MODE_CYCLE_ORDER[(i + 1) % len(MODE_CYCLE_ORDER)]
+    return AGENT_MODE
 
 
 def initial_transcript_items():
@@ -2927,6 +2943,15 @@ async def async_main(args):
         while True:
             user_in = await session.user_messages.get()
             restore_output_area_after_input()
+
+            # Shift-Tab cycles the agent mode (explore/plan/edit). It does not
+            # cancel anything; the flag is set by the reader and consumed here,
+            # so the new mode applies to the next turn.
+            if session.reader.mode_cycle_requested:
+                session.reader.mode_cycle_requested = False
+                cycled = cycle_agent_mode()
+                print(f"\nmode: {cycled}", file=sys.stderr)
+                sys.stderr.flush()
 
             if user_in is None:  # EOF sentinel from the producer
                 break
