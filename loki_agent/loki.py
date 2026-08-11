@@ -243,6 +243,19 @@ def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with
     config_provider_kind = protocols.resolve_protocol(config_url, provider_override or "auto")
     config_netloc = urllib.parse.urlparse(config_url).netloc
 
+    if config_provider_kind == protocols.DUMMY:
+        # No-op provider for testing: no network, no API key, fake URL.
+        config_api_key = "dummy-key"
+        config_model = environ.get("LOKI_MODEL") or "dummy"
+        return make_runtime_config(
+            config_url,
+            config_provider_kind,
+            config_api_key,
+            model=config_model,
+            max_tokens=_int_env("LOKI_MAX_TOKENS", 4096, environ),
+            anthropic_version=environ.get("ANTHROPIC_VERSION", "2023-06-01"),
+        )
+
     env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'], environ)
     # LOKI_API_KEY is the explicit override. Otherwise prefer the key whose name
     # matches the selected wire protocol, with the other provider key as a
@@ -2594,6 +2607,16 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                                 show_timing: bool = False) -> list:
     if not RUNTIME_CONFIG:
         return []
+
+    if RUNTIME_CONFIG.chat_provider.kind == protocols.DUMMY:
+        # No-op LLM for testing: never touches the network.  The reply is a
+        # canned assistant message, so the whole input/turn/render loop runs
+        # deterministically.  LOKI_DUMMY_REPLY overrides the text.
+        reply = os.environ.get("LOKI_DUMMY_REPLY", "ok")
+        return [
+            formats.response_metadata_item("dummy", "dummy", {}),
+            formats.message_item("assistant", reply),
+        ]
 
     payload = RUNTIME_CONFIG.chat_provider.chat_payload(transcript_items, tools, model)
     data = await async_chat_request(

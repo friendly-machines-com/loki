@@ -9,6 +9,7 @@ from . import formats
 OPENAI_CHAT = "openai_chat"
 ANTHROPIC_MESSAGES = "anthropic_messages"
 OPENAI_RESPONSES = "openai_responses"
+DUMMY = "dummy"
 AUTO = "auto"
 
 # Wire protocols this client can actually speak. Single source of truth:
@@ -74,6 +75,10 @@ class Provider:
             if responses_tools:
                 payload["tools"] = responses_tools
             return payload
+        if self.kind == DUMMY:
+            # Never sent over the wire; async_chat_completion short-circuits on
+            # this kind before any HTTP happens.
+            return {}
         raise ProtocolError(f"unknown protocol {self.kind!r}")
 
     def parse_chat_response(self, response):
@@ -83,6 +88,8 @@ class Provider:
             return formats.anthropic_response_to_items(response)
         if self.kind == OPENAI_RESPONSES:
             return formats.openai_responses_response_to_items(response)
+        if self.kind == DUMMY:
+            return formats.openai_chat_response_to_items(response)
         raise ProtocolError(f"unknown protocol {self.kind!r}")
 
     def parse_model_ids(self, response):
@@ -142,7 +149,7 @@ def detect_protocol_from_response(response):
 def resolve_protocol(url, override=AUTO):
     requested = normalize_protocol(override)
     if requested != AUTO:
-        if requested not in [OPENAI_CHAT, ANTHROPIC_MESSAGES, OPENAI_RESPONSES]:
+        if requested not in [OPENAI_CHAT, ANTHROPIC_MESSAGES, OPENAI_RESPONSES, DUMMY]:
             raise ProviderDetectionError(f"unknown provider {override!r}")
         return requested
     detected = detect_protocol_from_url(url)
@@ -150,7 +157,8 @@ def resolve_protocol(url, override=AUTO):
         return detected
     raise ProviderDetectionError(
         "cannot infer chat protocol from URL; set LOKI_PROVIDER=openai_chat, "
-        "LOKI_PROVIDER=anthropic_messages, or LOKI_PROVIDER=openai_responses")
+        "LOKI_PROVIDER=anthropic_messages, LOKI_PROVIDER=openai_responses, "
+        "or LOKI_PROVIDER=dummy")
 
 
 def _replace_path(parsed, path):
@@ -290,6 +298,17 @@ def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
                   max_tokens=4096, anthropic_version="2023-06-01",
                   auth_header=None):
     protocol = resolve_protocol(input_url, provider)
+    if protocol == DUMMY:
+        # No-op provider for testing: no real endpoint or URL structure.
+        return Provider(
+            kind=DUMMY,
+            input_url=input_url,
+            chat_url=input_url,
+            models_url=None,
+            model_urls=[],
+            headers={},
+            max_tokens=max_tokens,
+        )
     chat_url, resolved_models_url = endpoint_urls(input_url, protocol, models_url=models_url)
     model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
                                       explicit_models_url=models_url)
