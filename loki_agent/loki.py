@@ -2647,7 +2647,7 @@ def _status_api_base() -> str:
 def status_text() -> str:
     return (
         'Remote: API: {}; Model: {}; /model\n'
-        'Local: mode: {}; CWD: {}; /pwd, /cd DIR, !foo, /quit'
+        'Local: mode={}; CWD: {}; /pwd, /cd DIR, !foo, /quit'
     ).format(_status_api_base(), model, AGENT_MODE, display_path(shell_cwd))
 
 
@@ -2698,8 +2698,8 @@ session_todos = []
 
 # Agent mode, cycled by Shift-Tab: "explore" (read-only), "plan", "edit".
 # Takes effect for the next turn; it does not cancel the current turn.
-MODE_CYCLE_ORDER = ["explore", "plan", "edit"]
-AGENT_MODE = "explore"
+MODE_CYCLE_ORDER = ["normal", "explore", "plan", "edit"]
+AGENT_MODE = "normal"
 
 
 def cycle_agent_mode() -> str:
@@ -2916,7 +2916,7 @@ async def async_main(args):
     # user_messages queue for the whole session (see terminals.InputSession).
     # loki.py is just a consumer of the queue and a caller of session.prompt()
     # for modal prompts (session picker, /model menus).
-    async with input_session() as session:
+    async with input_session(on_mode_cycle=lambda: cycle_agent_mode()) as session:
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel
@@ -2943,15 +2943,6 @@ async def async_main(args):
         while True:
             user_in = await session.user_messages.get()
             restore_output_area_after_input()
-
-            # Shift-Tab cycles the agent mode (explore/plan/edit). It does not
-            # cancel anything; the flag is set by the reader and consumed here,
-            # so the new mode applies to the next turn.
-            if session.reader.mode_cycle_requested:
-                session.reader.mode_cycle_requested = False
-                cycled = cycle_agent_mode()
-                print(f"\nmode: {cycled}", file=sys.stderr)
-                sys.stderr.flush()
 
             if user_in is None:  # EOF sentinel from the producer
                 break

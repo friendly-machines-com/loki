@@ -500,11 +500,13 @@ class PromptRenderer:
 
 
 class PromptController:
-    def __init__(self, terminal, prompt: str = 'User: ', history=None, session=None):
+    def __init__(self, terminal, prompt: str = 'User: ', history=None, session=None,
+                 on_mode_cycle=None):
         self.terminal = terminal
         self.prompt = prompt
         self.history = list(history or [])
         self.session = session  # AsyncKeyReader held for the whole session
+        self.on_mode_cycle = on_mode_cycle or (lambda: None)
 
     async def read_text(self) -> str:
         fd = new_stdin
@@ -630,6 +632,10 @@ class PromptController:
                     # Paste markers only affect AsyncKeyReader state;
                     # resize is handled by the next render pass.
                     pass
+                elif event.kind == "MODE_CYCLE":
+                    # Shift-Tab cycles the agent mode; does not cancel or alter
+                    # the buffer.
+                    self.on_mode_cycle()
                 if interactive:
                     output_row, output_col = await self._query_output_cursor(reader)
                     renderer.render(buffer, output_row, output_col)
@@ -656,8 +662,9 @@ class PromptController:
                 self.terminal.flush()
 
 
-async def get_input_async(prompt=None, history=None, session=None):
-    return await PromptController(terminal, prompt or 'User: ', history=history, session=session).read_text()
+async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle=None):
+    return await PromptController(terminal, prompt or 'User: ', history=history, session=session,
+                                  on_mode_cycle=on_mode_cycle).read_text()
 
 
 class InputSession:
@@ -680,13 +687,14 @@ class InputSession:
     awaits (the old SIGINT emergency stop no longer exists).
     """
 
-    def __init__(self, fd=None):
+    def __init__(self, fd=None, on_mode_cycle=None):
         self.fd = fd if fd is not None else new_stdin
         self.interactive = os.isatty(self.fd) and os.isatty(sys.stdout.fileno())
         self.reader = AsyncKeyReader(self.fd, watch_resize=self.interactive)
         self.user_messages = asyncio.Queue()
         self._producer = None
         self._mode = None
+        self.on_mode_cycle = on_mode_cycle or (lambda: None)
 
     async def __aenter__(self):
         self._mode = TerminalMode(self.fd, self.interactive)
@@ -711,7 +719,7 @@ class InputSession:
     async def _produce(self):
         while True:
             try:
-                text = await get_input_async(session=self.reader)
+                text = await get_input_async(session=self.reader, on_mode_cycle=self.on_mode_cycle)
             except EOFError:
                 self.user_messages.put_nowait(None)  # sentinel: end of session
                 return
@@ -761,8 +769,8 @@ class InputSession:
             self._producer = asyncio.create_task(self._produce())
 
 
-def input_session(fd=None) -> InputSession:
-    return InputSession(fd)
+def input_session(fd=None, on_mode_cycle=None) -> InputSession:
+    return InputSession(fd, on_mode_cycle=on_mode_cycle)
 
 
 def restore_output_area_after_input():
