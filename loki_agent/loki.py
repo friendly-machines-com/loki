@@ -2701,6 +2701,12 @@ async def load_models_async():
         except OSError as e:
             errors.append(f"API Error for <{models_url}>: {e}")
             continue
+        except json.JSONDecodeError as e:
+            # Some providers (e.g. Z.AI's /paas/v4 base) don't expose a /models
+            # endpoint at all -- the response is an HTML error page or empty.
+            # Treat as "couldn't load" rather than crashing the picker.
+            errors.append(f"Model list at <{models_url}> was not JSON: {e.msg}")
+            continue
         loaded = RUNTIME_CONFIG.chat_provider.parse_model_ids(data)
         if loaded:
             models = loaded
