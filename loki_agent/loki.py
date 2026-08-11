@@ -3054,7 +3054,6 @@ async def async_main(args):
                                   file=sys.stderr)
                             sys.stderr.flush()
                             continue
-                        await load_models_async()
                     via = f" via {provider_id}" if provider_id else ""
                     print(f"Selected model: {model}{via}", file=sys.stderr)
                     sys.stderr.flush()
