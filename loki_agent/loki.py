@@ -2902,6 +2902,10 @@ async def run_session_picker_async(session=None):
     # chat) starts from a clean output area instead of below the stale list.
     terminal.goto_position(1, 1)
     terminal.clear_to_end_of_screen()
+    # Complete the picker cleanup before its caller writes anything through
+    # another stream. Otherwise a later stdout flush can deliver this erase
+    # after intervening stderr output.
+    terminal.flush()
     return picked
 
 
@@ -2967,24 +2971,33 @@ def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:
 
 
 async def confirm_saved_connection_async(
-        descriptor: ConnectionDescriptor, input_fn,
+        descriptor: ConnectionDescriptor, session,
         config: RuntimeConfig | None = None) -> bool:
     provider = descriptor.provider_name or descriptor.provider_id or "custom"
     selected_model = config.model if config is not None else descriptor.model
     endpoint = (config.chat_provider.chat_url
                 if config is not None else descriptor.chat_url)
-    print("Saved connection:", file=sys.stderr)
-    print(f"  Provider: {provider}", file=sys.stderr)
-    print(f"  Model: {selected_model}", file=sys.stderr)
-    print(f"  Chat endpoint: {endpoint}", file=sys.stderr)
     models_endpoint = (config.chat_provider.models_url
                        if config is not None else descriptor.models_url)
-    if models_endpoint:
-        print(f"  Models endpoint: {models_endpoint}", file=sys.stderr)
-    print(f"  Credential: {descriptor.credential_env}", file=sys.stderr)
-    sys.stderr.flush()
-    answer = (await input_fn("Use this saved connection? [y/N]: ") or "")
-    return answer.strip().lower() in ("y", "yes")
+
+    # This is a modal, like the session and /model pickers: it owns the input
+    # producer while it renders all context and reads the answer. Keep the
+    # context on the normal dialog-output stream so it is ordered with the
+    # prompt renderer's stdout flush.
+    await session.pause()
+    try:
+        print("Saved connection:")
+        print(f"  Provider: {provider}")
+        print(f"  Model: {selected_model}")
+        print(f"  Chat endpoint: {endpoint}")
+        if models_endpoint:
+            print(f"  Models endpoint: {models_endpoint}")
+        print(f"  Credential: {descriptor.credential_env}")
+        answer = (await session.prompt(
+            "Use this saved connection? [y/N]: ") or "")
+        return answer.strip().lower() in ("y", "yes")
+    finally:
+        await session.resume()
 
 def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
     return asyncio.run(run_subagent_prompt_async(subagent_type, prompt))
@@ -3094,14 +3107,8 @@ async def async_main(args):
                 else:
                     config = config_from_connection_descriptor(
                         descriptor, CREDENTIALS)
-                    await session.pause()
-                    try:
-                        confirmed = await confirm_saved_connection_async(
-                            descriptor,
-                            lambda prompt: session.prompt(prompt),
-                            config=config)
-                    finally:
-                        await session.resume()
+                    confirmed = await confirm_saved_connection_async(
+                        descriptor, session, config=config)
                     if not confirmed:
                         print("Resume cancelled.", file=sys.stderr)
                         return

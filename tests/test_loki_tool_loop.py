@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -533,6 +535,9 @@ class SessionPickerTests(unittest.TestCase):
         saved_terminal = loki.terminal
 
         class _FakeTerminal:
+            def __init__(self):
+                self.calls = []
+
             def save_cursor_position(self, *a, **k):
                 pass
 
@@ -540,10 +545,13 @@ class SessionPickerTests(unittest.TestCase):
                 pass
 
             def clear_to_end_of_screen(self, *a, **k):
-                pass
+                self.calls.append(("clear_to_end_of_screen",))
 
             def goto_position(self, *a, **k):
-                pass
+                self.calls.append(("goto_position", *a))
+
+            def flush(self, *a, **k):
+                self.calls.append(("flush",))
 
         loki.terminal = _FakeTerminal()
 
@@ -567,6 +575,23 @@ class SessionPickerTests(unittest.TestCase):
             # mtime-sorted oldest->newest: aaa(1000), bbb(2000), ccc(3000).
             # "2" selects the middle one = bbb.
             self.assertTrue(result.endswith("chat-bbb.json"))
+
+    def test_picker_finishes_clear_before_returning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
+            restore = self._make_picker(tmpdir, ["1"])
+            picker_terminal = loki.terminal
+            try:
+                result = asyncio.run(loki.run_session_picker_async())
+            finally:
+                restore()
+
+            self.assertTrue(result.endswith("chat-aaa.json"))
+            self.assertEqual(picker_terminal.calls[-3:], [
+                ("goto_position", 1, 1),
+                ("clear_to_end_of_screen",),
+                ("flush",),
+            ])
 
     def test_picker_filter_matches_all_words_in_any_order(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -800,17 +825,48 @@ class ShellCwdTests(unittest.TestCase):
             credential_env="OPENROUTER_API_KEY",
         )
 
-        async def answer_no(prompt):
-            self.assertIn("[y/N]", prompt)
-            return ""
+        class FakeSession:
+            def __init__(self, answer):
+                self.answer = answer
+                self.calls = []
 
-        async def answer_yes(prompt):
-            return "yes"
+            async def pause(self):
+                self.calls.append("pause")
 
-        self.assertFalse(asyncio.run(
-            loki.confirm_saved_connection_async(descriptor, answer_no)))
-        self.assertTrue(asyncio.run(
-            loki.confirm_saved_connection_async(descriptor, answer_yes)))
+            async def prompt(self, prompt):
+                self.assert_prompt(prompt)
+                self.calls.append("prompt")
+                return self.answer
+
+            async def resume(self):
+                self.calls.append("resume")
+
+            def assert_prompt(self, prompt):
+                if "[y/N]" not in prompt:
+                    raise AssertionError(prompt)
+
+        no_session = FakeSession("")
+        yes_session = FakeSession("yes")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            declined = asyncio.run(
+                loki.confirm_saved_connection_async(descriptor, no_session))
+            accepted = asyncio.run(
+                loki.confirm_saved_connection_async(descriptor, yes_session))
+
+        self.assertFalse(declined)
+        self.assertTrue(accepted)
+        self.assertEqual(no_session.calls, ["pause", "prompt", "resume"])
+        self.assertEqual(yes_session.calls, ["pause", "prompt", "resume"])
+        rendered = output.getvalue()
+        self.assertIn("Saved connection:", rendered)
+        self.assertIn("Provider: OpenRouter", rendered)
+        self.assertIn("Model: z-ai/glm", rendered)
+        self.assertIn(
+            "Chat endpoint: https://openrouter.ai/api/v1/chat/completions",
+            rendered,
+        )
+        self.assertIn("Credential: OPENROUTER_API_KEY", rendered)
 
 
 class SubagentLaunchTests(unittest.TestCase):
