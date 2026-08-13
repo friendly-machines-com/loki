@@ -17,6 +17,7 @@ Run it in a VM or container.
 ```
 export LOKI_API_KEY=xxx
 export LOKI_API_BASE="https://opencode.ai/zen/go/v1/chat/completions"
+export LOKI_MODEL="glm-5.2"
 ./loki.py
 ```
 
@@ -37,11 +38,18 @@ endpoint's wire protocol.
 All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
 `LOKI_PROVIDER`, `LOKI_MODEL`, `LOKI_API_KEY`, `LOKI_MODELS_URL`,
 `LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, and `LOKI_ANTHROPIC_VERSION`.
+Loki never chooses the first model returned by a provider. A new explicit
+connection needs `LOKI_MODEL`, or the model must be selected with `/model`
+before sending a chat request.
 
-Chat logs persist the selected model, protocol, and concrete endpoints, but
-never the credential value. Resuming that connection requires the same
-credential variable to be supplied again and asks for confirmation before
-sending it to the saved endpoints.
+Chat logs are session savefiles. They persist the selected model, protocol,
+concrete endpoints, and other session state, but never credential values.
+Resuming a connection requires the same credential variable to be supplied
+again and asks for confirmation before sending it to the saved endpoints. A
+temporarily unavailable credential does not remove the saved connection.
+`LOKI_*` config initializes new sessions; on resumed sessions it is a runtime
+override and does not replace the saved connection. A successful `/model`
+selection does replace the session's saved connection.
 
 ## Features
 
