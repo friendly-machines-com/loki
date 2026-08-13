@@ -298,7 +298,7 @@ def _row_matches(row, query):
 
     A row is (value, display) or (value, display, search_blob); the search
     blob, when present, extends what the filter can match beyond the visible
-    line -- e.g. the provider ids/names behind a truncated provider snippet.
+    line.
     """
     if len(row) >= 3:
         blob = row[2]
@@ -341,13 +341,9 @@ async def _numbered_menu_async(rows, prompt, input_fn, header=None):
         continue
 
 
-def _provider_snippet(members, max_shown=5):
-    """'fireworks-ai, openrouter, ...' -- up to max_shown provider ids."""
-    ids = [pid for pid, _, _ in members]
-    shown = ", ".join(ids[:max_shown])
-    if len(ids) > max_shown:
-        shown += ", ..."
-    return shown
+def _provider_list(members):
+    """All provider ids for a grouped model, in catalog order."""
+    return ", ".join(pid for pid, _, _ in members)
 
 
 def _model_rows(groups):
@@ -359,11 +355,10 @@ def _model_rows(groups):
         more = " [and more]" if union_feature_bits(members) != minimal_feature_bits(members) else ""
         cost = cost_range_text(members)
         count = len(members)
-        label = f"{name}{status} ({feat}){more}{cost} [{count} providers: {_provider_snippet(members)}]" if feat \
-            else f"{name}{status}{more}{cost} [{count} providers: {_provider_snippet(members)}]"
-        # Search blob: model name plus every provider id/name, so
-        # "filter opencode" (or any provider) finds the model even when the
-        # visible snippet truncates the provider list.
+        label = f"{name}{status} ({feat}){more}{cost} [{count} providers: {_provider_list(members)}]" if feat \
+            else f"{name}{status}{more}{cost} [{count} providers: {_provider_list(members)}]"
+        # Search blob also includes provider display names, which do not
+        # necessarily appear in the visible list of provider ids.
         search = " ".join([name] +
                           [pid for pid, _, _ in members] +
                           [p.get("name") or "" for _, p, _ in members] +

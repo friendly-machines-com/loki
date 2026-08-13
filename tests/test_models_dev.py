@@ -320,12 +320,14 @@ class MenuTests(unittest.TestCase):
         glm = next(t for t in (r[1] for r in rows) if t.startswith("GLM-5.2"))
         self.assertIn("[2 providers: zhipuai, openrouter]", glm)
 
-    def test_model_rows_truncate_provider_snippet(self):
+    def test_model_rows_show_all_providers(self):
         data = {f"p{i}": {"api": "https://x.test/v1", "models": {
             "m": {"id": f"m{i}", "name": "Big Model"}}} for i in range(8)}
         rows = models._model_rows(models.build_groups(data))
         label = rows[0][1]
-        self.assertIn("[8 providers: p0, p1, p2, p3, p4, ...]", label)
+        self.assertIn(
+            "[8 providers: p0, p1, p2, p3, p4, p5, p6, p7]", label)
+        self.assertNotIn("...", label)
 
     def test_model_menu_filter_matches_provider_names(self):
         rows = models._model_rows(_groups())
