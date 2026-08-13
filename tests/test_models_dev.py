@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import pathlib
 import sys
 import unittest
@@ -296,6 +298,23 @@ class MenuTests(unittest.TestCase):
         result = asyncio.run(models._numbered_menu_async(rows, "Choice: ", _input_script([""])))
         self.assertIsNone(result)
 
+    def test_menu_header_separates_every_rendered_block(self):
+        rows = [("a", "Alpha"), ("b", "Beta")]
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = asyncio.run(models._numbered_menu_async(
+                rows,
+                "Choice: ",
+                _input_script(["filter beta", "1"]),
+                header="Usable things:",
+            ))
+
+        self.assertEqual(result, "b")
+        rendered = output.getvalue()
+        self.assertTrue(rendered.startswith("\nUsable things:\n"))
+        self.assertEqual(rendered.count("\nUsable things:\n"), 2)
+
     def test_model_rows_show_provider_snippet(self):
         rows = models._model_rows(_groups())
         glm = next(t for t in (r[1] for r in rows) if t.startswith("GLM-5.2"))
@@ -394,17 +413,26 @@ class PickerTests(unittest.TestCase):
     def test_run_model_picker_two_level_flow(self):
         saved = models._index_cache
         models._index_cache = (DATA, models.build_groups(DATA))
+        output = io.StringIO()
         try:
             # Model menu (sorted): 1. Claude Sonnet 4.6, 2. GLM-5.2.
             # Provider menu (sorted): 1. OpenRouter, 2. Zhipu AI.
-            result = asyncio.run(models.run_model_picker_async(
-                _input_script(["2", "1"]), _credentials()))
+            with contextlib.redirect_stdout(output):
+                result = asyncio.run(models.run_model_picker_async(
+                    _input_script(["2", "1"]), _credentials()))
         finally:
             models._index_cache = saved
 
         provider_id, provider_entry, model_entry = result
         self.assertEqual(provider_id, "openrouter")
         self.assertEqual(model_entry["id"], "z-ai/glm-5.2")
+        rendered = output.getvalue()
+        self.assertTrue(rendered.startswith("\nUsable models:\n"))
+        self.assertIn("\nUsable providers:\n", rendered)
+        self.assertLess(
+            rendered.index("\nUsable models:\n"),
+            rendered.index("\nUsable providers:\n"),
+        )
 
     def test_run_model_picker_cancel_returns_none(self):
         saved = models._index_cache

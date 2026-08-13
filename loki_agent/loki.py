@@ -3042,6 +3042,7 @@ async def confirm_saved_connection_async(
                        if config is not None else descriptor.models_url)
 
     async with session.modal() as modal:
+        print()
         print("Saved connection:")
         print(f"  Provider: {provider}")
         print(f"  Model: {selected_model}")

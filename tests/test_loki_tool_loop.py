@@ -1030,6 +1030,23 @@ class SessionPickerTests(unittest.TestCase):
             # "2" selects the middle one = bbb.
             self.assertTrue(result.endswith("chat-bbb.json"))
 
+    def test_picker_prints_saved_sessions_header(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chat(
+                tmpdir, "aaa", '{"text":"alpha chat"}', mtime=1000)
+            restore, session = self._make_picker(tmpdir, ["1"])
+            output = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(output):
+                    result = asyncio.run(
+                        loki.run_session_picker_async(session))
+            finally:
+                restore()
+
+            self.assertTrue(result.endswith("chat-aaa.json"))
+            self.assertTrue(
+                output.getvalue().startswith("\nSaved sessions:\n"))
+
     def test_picker_finishes_clear_before_returning(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
@@ -1575,6 +1592,7 @@ class ShellCwdTests(unittest.TestCase):
         self.assertEqual(
             yes_session.calls, ["modal", "enter", "prompt", "exit"])
         rendered = output.getvalue()
+        self.assertTrue(rendered.startswith("\nSaved connection:\n"))
         self.assertIn("Saved connection:", rendered)
         self.assertIn("Provider: OpenRouter", rendered)
         self.assertIn("Model: z-ai/glm", rendered)

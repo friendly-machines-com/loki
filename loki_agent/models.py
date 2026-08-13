@@ -25,7 +25,6 @@ cancel.
 
 import json
 import re
-import sys
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
@@ -310,7 +309,7 @@ def _row_matches(row, query):
     return all(w in blob for w in words)
 
 
-async def _numbered_menu_async(rows, prompt, input_fn):
+async def _numbered_menu_async(rows, prompt, input_fn, header=None):
     """Numbered menu over rows=[(value, display_text)] (optionally a third
     search_text element for filtering beyond the visible line).
 
@@ -320,6 +319,9 @@ async def _numbered_menu_async(rows, prompt, input_fn):
     query = ""
     while True:
         shown = [r for r in rows if _row_matches(r, query)] if query else list(rows)
+        if header:
+            print()
+            print(header)
         for i, row in enumerate(shown, 1):
             print(f"{i}. {row[1]}")
         choice = (await input_fn(prompt) or "").strip()
@@ -404,14 +406,17 @@ async def run_flat_model_picker_async(input_fn, model_ids):
     """
     ids = [m for m in (model_ids or []) if m]
     if not ids:
-        print("No models available from the current provider.", file=sys.stderr)
+        print()
+        print("Usable models:")
+        print("No models available from the current provider.")
         return None
     rows = [(m, m) for m in ids]
     rows.sort(key=lambda r: r[1].lower())
     return await _numbered_menu_async(
         rows,
         'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
-        input_fn)
+        input_fn,
+        header="Usable models:")
 
 
 async def run_model_picker_async(input_fn, credentials: CredentialStore,
@@ -431,13 +436,15 @@ async def run_model_picker_async(input_fn, credentials: CredentialStore,
 
     model_rows = _model_rows(groups)
     if not model_rows:
-        print("No models available for configured provider credentials.",
-              file=sys.stderr)
+        print()
+        print("Usable models:")
+        print("No models available for configured provider credentials.")
         return None
     members = await _numbered_menu_async(
         model_rows,
         'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
-        input_fn)
+        input_fn,
+        header="Usable models:")
     if members is None:
         return None
 
@@ -445,7 +452,8 @@ async def run_model_picker_async(input_fn, credentials: CredentialStore,
     picked = await _numbered_menu_async(
         provider_rows,
         'Provider choice (number selects, "filter WORDS" narrows, empty cancels): ',
-        input_fn)
+        input_fn,
+        header="Usable providers:")
     if picked is None:
         return None
     return picked
