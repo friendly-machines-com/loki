@@ -33,7 +33,7 @@ class ConnectionDescriptor:
     chat_url: str
     models_url: str | None
     protocol: str
-    credential_env: str
+    credential_env: str | None
     max_tokens: int = 4096
     anthropic_version: str = "2023-06-01"
     auth_header: str | None = None
@@ -62,11 +62,16 @@ class ConnectionDescriptor:
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise ConnectionDescriptorError(
                 "connection max_tokens must be a positive integer")
-        credential_env = _required_string(
-            value.get("credential_env"), "credential_env")
-        if not is_credential_name(credential_env):
+        if "credential_env" not in value:
             raise ConnectionDescriptorError(
-                "connection credential_env must end in _KEY, _TOKEN, or _PAT")
+                "connection credential_env must be present")
+        credential_env = _optional_string(
+            value.get("credential_env"), "credential_env")
+        if credential_env is not None and not is_credential_name(
+                credential_env):
+            raise ConnectionDescriptorError(
+                "connection credential_env must be null or end in "
+                "_KEY, _TOKEN, or _PAT")
         return cls(
             provider_id=_optional_string(value.get("provider_id"), "provider_id"),
             provider_name=_optional_string(value.get("provider_name"), "provider_name"),

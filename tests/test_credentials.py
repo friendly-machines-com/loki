@@ -99,6 +99,23 @@ class ConnectionDescriptorTests(unittest.TestCase):
         self.assertNotIn("api_url", descriptor.to_dict())
         self.assertIsNone(descriptor.model_status)
 
+    def test_credentialless_connection_round_trips_explicit_null(self):
+        descriptor = ConnectionDescriptor(
+            provider_id=None,
+            provider_name="Explicit LOKI_* connection",
+            model="local-model",
+            chat_url="http://localhost:8000/v1/chat/completions",
+            models_url="http://localhost:8000/v1/models",
+            protocol="openai_chat",
+            credential_env=None,
+        )
+
+        encoded = descriptor.to_dict()
+
+        self.assertIn("credential_env", encoded)
+        self.assertIsNone(encoded["credential_env"])
+        self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
+
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):
             ConnectionDescriptor.from_dict({"model": "x"})
@@ -117,6 +134,12 @@ class ConnectionDescriptorTests(unittest.TestCase):
                 "protocol": "openai_chat",
                 "credential_env": "EXAMPLE_API_KEY",
                 "model_status": False,
+            })
+        with self.assertRaises(ConnectionDescriptorError):
+            ConnectionDescriptor.from_dict({
+                "model": "x",
+                "chat_url": "https://example.test/v1/chat/completions",
+                "protocol": "openai_chat",
             })
 
 

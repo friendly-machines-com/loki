@@ -217,13 +217,20 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("OPENAI_API_KEY", env)
 
-    def test_build_config_rejects_missing_environment_credentials(self):
+    def test_build_config_accepts_explicit_connection_without_authentication(
+            self):
         env = {
             "LOKI_API_BASE": "https://example.test/v1/chat/completions",
             "LOKI_PROVIDER": "openai_chat",
+            "LOKI_MODEL": "local-model",
         }
-        with self.assertRaisesRegex(ValueError, "API credential missing"):
-            loki.build_config_from_env(env)
+        config = loki.build_config_from_env(env)
+
+        self.assertEqual(config.api_key, "")
+        self.assertIsNone(config.credential_env)
+        self.assertEqual(config.model, "local-model")
+        self.assertNotIn("Authorization", config.headers)
+        self.assertNotIn("x-api-key", config.headers)
 
     def test_no_builtin_connection_exists(self):
         for credential_name in (
@@ -249,7 +256,7 @@ class RuntimeConfigTests(unittest.TestCase):
                     loki.build_config_from_env(
                         env, credentials=credentials)
 
-    def test_custom_connection_requires_loki_credential(self):
+    def test_custom_connection_does_not_use_generic_credentials(self):
         for credential_name in (
                 "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_API_KEY"):
             with self.subTest(credential_name=credential_name):
@@ -258,9 +265,12 @@ class RuntimeConfigTests(unittest.TestCase):
                         "https://custom.example.test/v1/chat/completions",
                     credential_name: "must-not-be-sent",
                 }
-                with self.assertRaisesRegex(
-                        ValueError, "set one of: LOKI_API_KEY"):
-                    loki.build_config_from_env(env)
+                config = loki.build_config_from_env(env)
+
+                self.assertEqual(config.api_key, "")
+                self.assertIsNone(config.credential_env)
+                self.assertNotIn("Authorization", config.headers)
+                self.assertNotIn("x-api-key", config.headers)
 
     def test_apply_runtime_config_assigns_runtime_globals(self):
         env = {
@@ -324,6 +334,26 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         self.assertEqual(restored.model, "z-ai/glm")
         self.assertEqual(restored.model_status, "deprecated")
+
+    def test_saved_credentialless_connection_restores_without_authentication(
+            self):
+        descriptor = ConnectionDescriptor(
+            provider_id=None,
+            provider_name="Explicit LOKI_* connection",
+            model="local-model",
+            chat_url="http://localhost:8000/v1/chat/completions",
+            models_url="http://localhost:8000/v1/models",
+            protocol=protocols.OPENAI_CHAT,
+            credential_env=None,
+        )
+
+        config = loki.config_from_connection_descriptor(
+            descriptor, CredentialStore({}))
+
+        self.assertEqual(config.api_key, "")
+        self.assertIsNone(config.credential_env)
+        self.assertNotIn("Authorization", config.headers)
+        self.assertNotIn("x-api-key", config.headers)
 
     def test_modelsdev_selection_builds_fresh_provider_auth(self):
         provider_entry = {
@@ -393,13 +423,11 @@ class ModelLoadingTests(unittest.TestCase):
             CredentialStore({
                 "LOKI_API_BASE": "http://localhost:8000/v1",
                 "LOKI_PROVIDER": protocols.OPENAI_CHAT,
-                "LOKI_API_KEY": "local-key",
             })))
 
         option = loki.explicit_connection_option(CredentialStore({
             "LOKI_API_BASE": "http://localhost:8000/v1",
             "LOKI_PROVIDER": protocols.OPENAI_CHAT,
-            "LOKI_API_KEY": "local-key",
             "LOKI_MODEL": "private-model",
         }))
 
@@ -412,9 +440,8 @@ class ModelLoadingTests(unittest.TestCase):
     def test_interactive_startup_does_not_fetch_provider_models(self):
         loki.CREDENTIALS = CredentialStore({
             "LOKI_API_BASE":
-                "https://provider.example.test/v1/chat/completions",
+                "http://localhost:8000/v1/chat/completions",
             "LOKI_PROVIDER": protocols.OPENAI_CHAT,
-            "LOKI_API_KEY": "test-key",
             "LOKI_MODEL": "chosen-model",
         })
         session = ScriptedInputSession([None])
@@ -436,6 +463,8 @@ class ModelLoadingTests(unittest.TestCase):
         loader.assert_not_awaited()
         self.assertEqual(status, 0)
         self.assertEqual(loki.model, "chosen-model")
+        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
+        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
 
     def test_headless_startup_requires_an_explicit_model(self):
         loki.CREDENTIALS = CredentialStore({
@@ -462,6 +491,25 @@ class ModelLoadingTests(unittest.TestCase):
             "Configuration error: model missing; set LOKI_MODEL.",
             stderr.getvalue(),
         )
+
+    def test_headless_startup_accepts_credentialless_explicit_connection(self):
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE":
+                "http://localhost:8000/v1/chat/completions",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_MODEL": "local-model",
+        })
+        runner = mock.AsyncMock()
+
+        with mock.patch(
+                "loki_agent.loki.run_subagent_cli_async",
+                new=runner):
+            status = asyncio.run(loki.async_main(["--headless"]))
+
+        runner.assert_awaited_once()
+        self.assertEqual(status, 0)
+        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
+        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
 
     def test_headless_configuration_failure_returns_usage_error(self):
         loki.CREDENTIALS = CredentialStore({})
@@ -495,6 +543,46 @@ class ModelLoadingTests(unittest.TestCase):
 
         self.assertEqual(status, 1)
         self.assertIn("Could not resume chat:", stderr.getvalue())
+
+    def test_interactive_resume_accepts_saved_credentialless_connection(self):
+        loki.CREDENTIALS = CredentialStore({})
+        session = ScriptedInputSession([None])
+        descriptor = ConnectionDescriptor(
+            provider_id=None,
+            provider_name="Explicit LOKI_* connection",
+            model="local-model",
+            chat_url="http://localhost:8000/v1/chat/completions",
+            models_url="http://localhost:8000/v1/models",
+            protocol=protocols.OPENAI_CHAT,
+            credential_env=None,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            blob = formats.new_log_blob(
+                loki.initial_transcript_items(), [])
+            blob["session_state"] = {
+                "shell_cwd": loki.shell_cwd,
+                "connection": descriptor.to_dict(),
+            }
+            pathlib.Path(path).write_text(
+                json.dumps(blob), encoding="utf-8")
+            confirm = mock.AsyncMock(return_value=True)
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.confirm_saved_connection_async",
+                        new=confirm), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"):
+                status = asyncio.run(
+                    loki.async_main([f"--resume={path}"]))
+
+        confirm.assert_awaited_once()
+        self.assertEqual(status, 0)
+        self.assertEqual(loki.model, "local-model")
+        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
+        self.assertIsNone(loki.RUNTIME_CONFIG.credential_env)
+        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
 
     def test_chat_request_without_a_model_is_not_sent(self):
         loki.CREDENTIALS = CredentialStore({
@@ -669,7 +757,6 @@ class ModelLoadingTests(unittest.TestCase):
         loki.CREDENTIALS = CredentialStore({
             "LOKI_API_BASE": explicit_url,
             "LOKI_PROVIDER": protocols.OPENAI_CHAT,
-            "LOKI_API_KEY": "local-key",
             "LOKI_MODEL": "private-model",
             "CATALOG_API_KEY": "catalog-key",
         })
@@ -726,7 +813,9 @@ class ModelLoadingTests(unittest.TestCase):
             connection["chat_url"],
             "http://localhost:8000/v1/chat/completions",
         )
-        self.assertEqual(connection["credential_env"], "LOKI_API_KEY")
+        self.assertIsNone(connection["credential_env"])
+        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
+        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
 
     def test_explicit_connection_is_selectable_when_modelsdev_is_offline(self):
         explicit_url = "http://localhost:8000/v1"
@@ -1399,6 +1488,41 @@ class ShellCwdTests(unittest.TestCase):
         )
         self.assertNotIn("do-not-persist-this", text)
 
+    def test_save_chat_log_persists_credentialless_connection(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos",
+            "RUNTIME_CONFIG", "model",
+        ]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                loki.apply_runtime_config(loki.make_runtime_config(
+                    "http://localhost:8000/v1",
+                    protocols.OPENAI_CHAT,
+                    "",
+                    model="local-model",
+                    provider_name="Explicit LOKI_* connection",
+                    credential_env=None,
+                ))
+                loki.new_chat_log(path)
+                loki.save_chat_log()
+                blob = json.loads(
+                    pathlib.Path(path).read_text(encoding="utf-8"))
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+        connection = blob["session_state"]["connection"]
+        self.assertEqual(connection["model"], "local-model")
+        self.assertIsNone(connection["credential_env"])
+        self.assertEqual(
+            connection["chat_url"],
+            "http://localhost:8000/v1/chat/completions",
+        )
+
     def test_loading_and_clean_cleanup_leave_chat_bytes_unchanged(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
@@ -1732,6 +1856,41 @@ class ShellCwdTests(unittest.TestCase):
         )
         self.assertIn("Credential: OPENROUTER_API_KEY", rendered)
 
+    def test_saved_credentialless_connection_confirmation_identifies_no_auth(
+            self):
+        descriptor = ConnectionDescriptor(
+            provider_id=None,
+            provider_name="Explicit LOKI_* connection",
+            model="local-model",
+            chat_url="http://localhost:8000/v1/chat/completions",
+            models_url="http://localhost:8000/v1/models",
+            protocol=protocols.OPENAI_CHAT,
+            credential_env=None,
+        )
+
+        class FakeSession:
+            def modal(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def prompt(self, prompt):
+                return "yes"
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            accepted = asyncio.run(
+                loki.confirm_saved_connection_async(
+                    descriptor, FakeSession()))
+
+        self.assertTrue(accepted)
+        self.assertIn("Authentication: none", output.getvalue())
+        self.assertNotIn("Credential: None", output.getvalue())
+
 
 class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_launch_uses_current_script_entrypoint(self):
@@ -1795,6 +1954,30 @@ class SubagentLaunchTests(unittest.TestCase):
 
         self.assertEqual(child_env["LOKI_API_KEY"], "active-key")
         self.assertNotIn("OPENROUTER_API_KEY", child_env)
+
+    def test_subagent_environment_preserves_credentialless_connection(self):
+        names = ["RUNTIME_CONFIG", "model"]
+        old_values = {name: loki.__dict__[name] for name in names}
+        try:
+            with mock.patch.dict(
+                    os.environ, {"LOKI_API_KEY": "must-not-leak"},
+                    clear=True):
+                loki.apply_runtime_config(loki.make_runtime_config(
+                    "http://localhost:8000/v1",
+                    protocols.OPENAI_CHAT,
+                    "",
+                    model="local-model",
+                    credential_env=None,
+                ))
+                child_env = loki._subagent_env()
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+        self.assertEqual(child_env["LOKI_API_BASE"],
+                         "http://localhost:8000/v1")
+        self.assertEqual(child_env["LOKI_MODEL"], "local-model")
+        self.assertNotIn("LOKI_API_KEY", child_env)
 
 
 class ResponsesToolLoopTests(unittest.TestCase):

@@ -302,6 +302,10 @@ def build_headers(protocol, api_key, anthropic_version="2023-06-01",
         "Content-Type": "application/json",
         "User-Agent": user_agent,
     }
+    if protocol == ANTHROPIC_MESSAGES:
+        # This identifies the Anthropic wire format; it is required protocol
+        # metadata, not an authentication credential.
+        headers["anthropic-version"] = anthropic_version
     if not api_key:
         return headers
     if auth_header:
@@ -311,7 +315,6 @@ def build_headers(protocol, api_key, anthropic_version="2023-06-01",
         return headers
     if protocol == ANTHROPIC_MESSAGES:
         headers["x-api-key"] = api_key
-        headers["anthropic-version"] = anthropic_version
     else:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers

@@ -23,6 +23,16 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         self.assertIn("https://api.openai.com/v1/models", provider.model_urls)
         self.assertEqual(provider.headers["Authorization"], "Bearer test-key")
 
+    def test_provider_with_empty_key_omits_authentication_header(self):
+        provider = protocols.make_provider(
+            "http://localhost:8000/v1",
+            provider=protocols.OPENAI_RESPONSES,
+            api_key="",
+        )
+
+        self.assertNotIn("Authorization", provider.headers)
+        self.assertNotIn("x-api-key", provider.headers)
+
     def test_responses_provider_keeps_explicit_endpoint_literal(self):
         provider = protocols.make_provider(
             "https://example.test/prefix/v1/responses?trace=1",
@@ -129,6 +139,21 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         self.assertEqual(items[1]["call_id"], "call_1")
         self.assertEqual(items[1]["name"], "Read")
         self.assertEqual(items[1]["input"], {"file_path": "README.md"})
+
+
+class AnthropicMessagesProviderTests(unittest.TestCase):
+    def test_credentialless_provider_keeps_protocol_version_header(self):
+        provider = protocols.make_provider(
+            "http://localhost:8000/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES,
+            api_key="",
+            anthropic_version="2024-01-01",
+        )
+
+        self.assertEqual(
+            provider.headers["anthropic-version"], "2024-01-01")
+        self.assertNotIn("x-api-key", provider.headers)
+        self.assertNotIn("Authorization", provider.headers)
 
 
 if __name__ == "__main__":

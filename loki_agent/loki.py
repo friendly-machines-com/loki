@@ -242,14 +242,10 @@ def build_config_from_env(environ=os.environ,
         )
 
     # Never infer credential ownership from the wire protocol. An explicitly
-    # configured endpoint uses only Loki's explicit credential.
-    credential_names = ["LOKI_API_KEY"]
+    # configured endpoint uses LOKI_API_KEY when present and otherwise sends
+    # no authentication header.
     credential_env, config_api_key = credentials.first_available(
-        credential_names)
-    if not config_api_key:
-        raise ValueError(
-            "API credential missing; set one of: "
-            + ", ".join(credential_names))
+        ["LOKI_API_KEY"])
 
     config_model = credentials.get("LOKI_MODEL") or ""
     return make_runtime_config(
@@ -291,10 +287,14 @@ def explicit_connection_option(
 def config_from_connection_descriptor(
         descriptor: ConnectionDescriptor,
         credentials: CredentialStore) -> RuntimeConfig:
-    api_key = credentials.get(descriptor.credential_env)
-    if not api_key:
-        raise ValueError(
-            f"saved connection requires missing {descriptor.credential_env}")
+    if descriptor.credential_env is None:
+        api_key = ""
+    else:
+        api_key = credentials.get(descriptor.credential_env)
+        if not api_key:
+            raise ValueError(
+                "saved connection requires missing "
+                f"{descriptor.credential_env}")
 
     provider_kind = credentials.get("LOKI_PROVIDER") or descriptor.protocol
     configured_model = credentials.get("LOKI_MODEL")
@@ -366,8 +366,6 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
     if not RUNTIME_CONFIG or RUNTIME_CONFIG.provider_kind == protocols.DUMMY:
         return None
     credential_env = RUNTIME_CONFIG.credential_env
-    if not credential_env:
-        return None
     provider = RUNTIME_CONFIG.chat_provider
     return ConnectionDescriptor(
         provider_id=RUNTIME_CONFIG.provider_id,
@@ -1881,7 +1879,10 @@ def _subagent_env() -> dict:
         env['LOKI_PROVIDER'] = RUNTIME_CONFIG.chat_provider.kind
         env['LOKI_API_BASE'] = RUNTIME_CONFIG.chat_provider.input_url
         env['LOKI_MODEL'] = model
-        env['LOKI_API_KEY'] = RUNTIME_CONFIG.api_key
+        if RUNTIME_CONFIG.api_key:
+            env['LOKI_API_KEY'] = RUNTIME_CONFIG.api_key
+        else:
+            env.pop('LOKI_API_KEY', None)
     return env
 
 
@@ -3068,7 +3069,10 @@ async def confirm_saved_connection_async(
         print(f"  Chat endpoint: {endpoint}")
         if models_endpoint:
             print(f"  Models endpoint: {models_endpoint}")
-        print(f"  Credential: {descriptor.credential_env}")
+        if descriptor.credential_env is None:
+            print("  Authentication: none")
+        else:
+            print(f"  Credential: {descriptor.credential_env}")
         answer = (await modal.prompt(
             "Use this saved connection? [y/N]: ") or "")
         return answer.strip().lower() in ("y", "yes")

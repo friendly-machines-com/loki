@@ -32,9 +32,10 @@ entries remain selectable but are labeled in the picker and status bar.
 Loki has no built-in provider connection. Without an explicit
 `LOKI_API_BASE` or a saved session connection, it starts disconnected and
 `/model` can be used to choose among providers represented by captured
-credentials. An explicitly configured endpoint accepts only `LOKI_API_KEY`;
-Loki never substitutes another provider's credential based merely on the
-endpoint's wire protocol.
+credentials. An explicitly configured endpoint uses `LOKI_API_KEY` when it is
+set; when it is absent, Loki sends no authentication header. Loki never
+substitutes another provider's credential based merely on the endpoint's wire
+protocol.
 
 All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
 `LOKI_PROVIDER`, `LOKI_MODEL`, `LOKI_API_KEY`, `LOKI_MODELS_URL`,
@@ -49,9 +50,11 @@ unavailable.
 Chat logs are session savefiles. They persist the selected model, its known
 catalog status, protocol, concrete endpoints, and other session state, but
 never credential values.
-Resuming a connection requires the same credential variable to be supplied
-again and asks for confirmation before sending it to the saved endpoints. A
-temporarily unavailable credential does not remove the saved connection.
+Resuming an authenticated connection requires the same credential variable to
+be supplied again. Credentialless connections resume without inventing a
+credential. Loki asks for confirmation before sending either kind of
+connection to the saved endpoints. A temporarily unavailable credential does
+not remove the saved connection.
 `LOKI_*` config initializes new sessions; on resumed sessions it is a runtime
 override and does not replace the saved connection. A successful `/model`
 selection does replace the session's saved connection.
