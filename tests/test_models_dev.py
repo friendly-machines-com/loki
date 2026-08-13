@@ -165,7 +165,7 @@ class ProtocolAndKeyTests(unittest.TestCase):
         self.assertEqual(pids, ["openrouter", "zhipuai"])
         self.assertEqual([pid for pid, _, _ in filtered["Claude Sonnet 4.6"]], ["anthropic"])
 
-    def test_filter_supported_groups_drops_fully_deprecated_models(self):
+    def test_filter_supported_groups_retains_deprecated_models(self):
         data = {
             "p1": {"api": "https://x.test/v1", "models": {
                 "m1": {"id": "m1", "name": "Old Model", "status": "deprecated"},
@@ -180,11 +180,12 @@ class ProtocolAndKeyTests(unittest.TestCase):
             }},
         }
         groups = models.filter_supported_groups(models.build_groups(data))
-        # Old Model: deprecated on every provider -> dropped entirely.
-        # Alive Model: not deprecated -> kept. Mixed Model: deprecated only on
-        # p2, so it stays but only with the live provider p3.
-        self.assertEqual(set(groups), {"Alive Model", "Mixed Model"})
-        self.assertEqual([pid for pid, _, _ in groups["Mixed Model"]], ["p3"])
+        self.assertEqual(
+            set(groups), {"Old Model", "Alive Model", "Mixed Model"})
+        self.assertEqual(
+            [pid for pid, _, _ in groups["Old Model"]], ["p1", "p2"])
+        self.assertEqual(
+            [pid for pid, _, _ in groups["Mixed Model"]], ["p2", "p3"])
 
     def test_filter_groups_uses_credentials_after_protocol_filtering(self):
         groups = models.filter_supported_groups(
@@ -326,8 +327,70 @@ class MenuTests(unittest.TestCase):
         rows = models._provider_rows(_groups()["GLM-5.2"])
         self.assertTrue(all(" api=https://" in row[1] for row in rows))
 
+    def test_picker_rows_label_deprecation_at_the_right_level(self):
+        groups = {
+            "Old Model": [
+                ("p1", {"name": "Provider One", "api": "https://p1.test/v1"},
+                 {"id": "old-1", "name": "Old Model",
+                  "status": "deprecated"}),
+                ("p2", {"name": "Provider Two", "api": "https://p2.test/v1"},
+                 {"id": "old-2", "name": "Old Model",
+                  "status": "deprecated"}),
+            ],
+            "Mixed Model": [
+                ("p1", {"name": "Provider One", "api": "https://p1.test/v1"},
+                 {"id": "mixed-old", "name": "Mixed Model",
+                  "status": "deprecated"}),
+                ("p2", {"name": "Provider Two", "api": "https://p2.test/v1"},
+                 {"id": "mixed-live", "name": "Mixed Model"}),
+            ],
+        }
+
+        old_label = next(
+            row[1] for row in models._model_rows(groups)
+            if row[1].startswith("Old Model"))
+        mixed_label = next(
+            row[1] for row in models._model_rows(groups)
+            if row[1].startswith("Mixed Model"))
+        provider_labels = [
+            row[1] for row in models._provider_rows(groups["Mixed Model"])]
+
+        self.assertIn("Old Model (deprecated)", old_label)
+        self.assertNotIn("Mixed Model (deprecated)", mixed_label)
+        self.assertIn("(deprecated)", provider_labels[0])
+        self.assertNotIn("(deprecated)", provider_labels[1])
+
 
 class PickerTests(unittest.TestCase):
+    def test_deprecated_model_is_selectable(self):
+        data = {
+            "provider": {
+                "name": "Provider",
+                "env": ["PROVIDER_API_KEY"],
+                "api": "https://provider.test/v1",
+                "models": {
+                    "old": {
+                        "id": "old",
+                        "name": "Old Model",
+                        "status": "deprecated",
+                    },
+                },
+            },
+        }
+        saved = models._index_cache
+        models._index_cache = (data, models.build_groups(data))
+        try:
+            result = asyncio.run(models.run_model_picker_async(
+                _input_script(["1", "1"]),
+                CredentialStore({"PROVIDER_API_KEY": "key"}),
+            ))
+        finally:
+            models._index_cache = saved
+
+        provider_id, _, model_entry = result
+        self.assertEqual(provider_id, "provider")
+        self.assertEqual(model_entry["status"], "deprecated")
+
     def test_run_model_picker_two_level_flow(self):
         saved = models._index_cache
         models._index_cache = (DATA, models.build_groups(DATA))

@@ -155,6 +155,7 @@ class RuntimeConfig:
     provider_id: str | None = None
     provider_name: str | None = None
     credential_env: str | None = None
+    model_status: str | None = None
 
 
 RUNTIME_CONFIG: RuntimeConfig | None = None
@@ -175,7 +176,7 @@ def _int_setting(name, default, credentials: CredentialStore):
 def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=None,
                         max_tokens=4096, anthropic_version="2023-06-01",
                         auth_header=None, provider_id=None, provider_name=None,
-                        credential_env=None):
+                        credential_env=None, model_status=None):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -205,6 +206,7 @@ def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=Non
         provider_id=provider_id,
         provider_name=provider_name,
         credential_env=credential_env,
+        model_status=model_status,
     )
 
 
@@ -276,7 +278,12 @@ def config_from_connection_descriptor(
             f"saved connection requires missing {descriptor.credential_env}")
 
     provider_kind = credentials.get("LOKI_PROVIDER") or descriptor.protocol
-    config_model = credentials.get("LOKI_MODEL") or descriptor.model
+    configured_model = credentials.get("LOKI_MODEL")
+    config_model = configured_model or descriptor.model
+    model_status = (
+        descriptor.model_status
+        if not configured_model or configured_model == descriptor.model
+        else None)
     max_tokens = (
         _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)
         if credentials.get("LOKI_MAX_TOKENS") else descriptor.max_tokens)
@@ -301,6 +308,7 @@ def config_from_connection_descriptor(
         provider_id=descriptor.provider_id,
         provider_name=descriptor.provider_name,
         credential_env=descriptor.credential_env,
+        model_status=model_status,
     )
 
 
@@ -316,6 +324,9 @@ def config_from_modelsdev_selection(
     selected_model = model_entry.get("id") or model_entry.get("name")
     if not selected_model:
         raise ValueError(f"provider {provider_id!r} returned a model without an id")
+    model_status = model_entry.get("status")
+    if not isinstance(model_status, str):
+        model_status = None
     return make_runtime_config(
         access.api_url,
         access.protocol,
@@ -328,6 +339,7 @@ def config_from_modelsdev_selection(
         provider_id=provider_id,
         provider_name=provider_entry.get("name"),
         credential_env=access.credential_env,
+        model_status=model_status,
     )
 
 
@@ -349,6 +361,7 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         max_tokens=provider.max_tokens,
         anthropic_version=RUNTIME_CONFIG.anthropic_version,
         auth_header=RUNTIME_CONFIG.auth_header,
+        model_status=RUNTIME_CONFIG.model_status,
     )
 
 
@@ -360,10 +373,13 @@ def apply_runtime_config(config: RuntimeConfig):
     model = config.model
 
 
+_UNSET = object()
+
+
 def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None,
                        models_url=None, max_tokens=None, anthropic_version=None,
                        auth_header=None, provider_id=None, provider_name=None,
-                       credential_env=None):
+                       credential_env=None, model_status=_UNSET):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -379,6 +395,18 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
     new_model = model if model is not None else current.model
     new_anthropic_version = anthropic_version if anthropic_version is not None else current.anthropic_version
     new_auth_header = auth_header if auth_header is not None else current.auth_header
+    new_provider_id = (
+        provider_id if provider_id is not None else current.provider_id)
+    if model_status is _UNSET:
+        same_catalog_entry = (
+            new_model == current.model
+            and new_url == current.url
+            and new_kind == current.provider_kind
+            and new_provider_id == current.provider_id)
+        new_model_status = (
+            current.model_status if same_catalog_entry else None)
+    else:
+        new_model_status = model_status
     apply_runtime_config(make_runtime_config(
         new_url,
         new_kind,
@@ -391,12 +419,12 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
         max_tokens=max_tokens if max_tokens is not None else current.chat_provider.max_tokens,
         anthropic_version=new_anthropic_version,
         auth_header=new_auth_header,
-        provider_id=(provider_id if provider_id is not None
-                     else current.provider_id),
+        provider_id=new_provider_id,
         provider_name=(provider_name if provider_name is not None
                        else current.provider_name),
         credential_env=(credential_env if credential_env is not None
                         else current.credential_env),
+        model_status=new_model_status,
     ))
 
 
@@ -2742,10 +2770,16 @@ def _status_api_base() -> str:
 
 
 def status_text() -> str:
+    displayed_model = model
+    if (RUNTIME_CONFIG is not None
+            and RUNTIME_CONFIG.model_status == "deprecated"):
+        displayed_model += " (deprecated)"
     return (
         'Remote: API: {}; Model: {}; /model\n'
         'Local: mode={}; CWD: {}; /pwd, /cd DIR, /ps, !foo, /quit'
-    ).format(_status_api_base(), model, AGENT_MODE, display_path(shell_cwd))
+    ).format(
+        _status_api_base(), displayed_model,
+        AGENT_MODE, display_path(shell_cwd))
 
 
 async def load_models_async():

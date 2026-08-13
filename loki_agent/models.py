@@ -272,7 +272,7 @@ def is_deprecated(model_entry):
 
 
 def filter_supported_groups(groups, credentials: CredentialStore | None = None):
-    """Drop unusable/deprecated provider members and then empty model groups.
+    """Drop unusable provider members and then empty model groups.
 
     With a credential store, usable also means that a declared credential and
     every API-template variable are present. The optional protocol-only mode is
@@ -283,7 +283,6 @@ def filter_supported_groups(groups, credentials: CredentialStore | None = None):
     for name, members in groups.items():
         kept = [m for m in members
                 if provider_supported(m[1])
-                and not is_deprecated(m[2])
                 and (credentials is None
                      or provider_access(m[1], credentials) is not None)]
         if kept:
@@ -352,18 +351,21 @@ def _provider_snippet(members, max_shown=5):
 def _model_rows(groups):
     rows = []
     for name, members in groups.items():
+        status = " (deprecated)" if all(
+            is_deprecated(model) for _, _, model in members) else ""
         feat = feature_names(minimal_feature_bits(members))
         more = " [and more]" if union_feature_bits(members) != minimal_feature_bits(members) else ""
         cost = cost_range_text(members)
         count = len(members)
-        label = f"{name} ({feat}){more}{cost} [{count} providers: {_provider_snippet(members)}]" if feat \
-            else f"{name}{more}{cost} [{count} providers: {_provider_snippet(members)}]"
+        label = f"{name}{status} ({feat}){more}{cost} [{count} providers: {_provider_snippet(members)}]" if feat \
+            else f"{name}{status}{more}{cost} [{count} providers: {_provider_snippet(members)}]"
         # Search blob: model name plus every provider id/name, so
         # "filter opencode" (or any provider) finds the model even when the
         # visible snippet truncates the provider list.
         search = " ".join([name] +
                           [pid for pid, _, _ in members] +
-                          [p.get("name") or "" for _, p, _ in members])
+                          [p.get("name") or "" for _, p, _ in members] +
+                          [m.get("status") or "" for _, _, m in members])
         rows.append((members, label, search))
     rows.sort(key=lambda r: r[1].lower())
     return rows
@@ -376,6 +378,8 @@ def _provider_rows(members):
         model_id = m.get("id")
         if model_id:
             parts.append(f"id={model_id}")
+        if is_deprecated(m):
+            parts.append("(deprecated)")
         feat = feature_names(feature_bits(m))
         if feat:
             parts.append(f"({feat})")

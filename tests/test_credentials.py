@@ -67,11 +67,13 @@ class ConnectionDescriptorTests(unittest.TestCase):
             models_url="https://openrouter.ai/api/v1/models",
             protocol="openai_chat",
             credential_env="OPENROUTER_API_KEY",
+            model_status="deprecated",
         )
 
         encoded = descriptor.to_dict()
 
         self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
+        self.assertEqual(encoded["model_status"], "deprecated")
         self.assertNotIn("api_url", encoded)
         self.assertNotIn("secret", repr(encoded))
 
@@ -95,6 +97,7 @@ class ConnectionDescriptorTests(unittest.TestCase):
             "https://openrouter.ai/api/v1/chat/completions",
         )
         self.assertNotIn("api_url", descriptor.to_dict())
+        self.assertIsNone(descriptor.model_status)
 
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):
@@ -106,6 +109,14 @@ class ConnectionDescriptorTests(unittest.TestCase):
                 "protocol": "openai_chat",
                 "credential_env": "EXAMPLE_API_KEY",
                 "max_tokens": 0,
+            })
+        with self.assertRaises(ConnectionDescriptorError):
+            ConnectionDescriptor.from_dict({
+                "model": "x",
+                "chat_url": "https://example.test/v1/chat/completions",
+                "protocol": "openai_chat",
+                "credential_env": "EXAMPLE_API_KEY",
+                "model_status": False,
             })
 
 

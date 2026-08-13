@@ -37,6 +37,7 @@ class ConnectionDescriptor:
     max_tokens: int = 4096
     anthropic_version: str = "2023-06-01"
     auth_header: str | None = None
+    model_status: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -50,6 +51,7 @@ class ConnectionDescriptor:
             "max_tokens": self.max_tokens,
             "anthropic_version": self.anthropic_version,
             "auth_header": self.auth_header,
+            "model_status": self.model_status,
         }
 
     @classmethod
@@ -78,4 +80,6 @@ class ConnectionDescriptor:
                 value.get("anthropic_version", "2023-06-01"),
                 "anthropic_version"),
             auth_header=_optional_string(value.get("auth_header"), "auth_header"),
+            model_status=_optional_string(
+                value.get("model_status"), "model_status"),
         )

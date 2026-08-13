@@ -161,6 +161,31 @@ class ProviderReinstallTests(unittest.TestCase):
                 else:
                     loki.__dict__[name] = value
 
+    def test_reinstall_preserves_status_only_for_the_same_catalog_entry(self):
+        names = ["RUNTIME_CONFIG", "model"]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            loki.apply_runtime_config(loki.make_runtime_config(
+                "https://example.test/v1",
+                protocols.OPENAI_CHAT,
+                "test-key",
+                model="old-model",
+                provider_id="provider",
+                credential_env="PROVIDER_API_KEY",
+                model_status="deprecated",
+            ))
+
+            loki.reinstall_provider(model="old-model")
+            self.assertEqual(
+                loki.RUNTIME_CONFIG.model_status, "deprecated")
+
+            loki.reinstall_provider(model="new-model")
+            self.assertIsNone(loki.RUNTIME_CONFIG.model_status)
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
 
 class RuntimeConfigTests(unittest.TestCase):
     def test_build_config_uses_explicit_env_key(self):
@@ -269,6 +294,7 @@ class RuntimeConfigTests(unittest.TestCase):
             models_url="https://openrouter.ai/api/v1/models",
             protocol=protocols.OPENAI_CHAT,
             credential_env="OPENROUTER_API_KEY",
+            model_status="deprecated",
         )
         with self.assertRaisesRegex(
                 ValueError, "missing OPENROUTER_API_KEY"):
@@ -287,8 +313,16 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.url, descriptor.chat_url)
         self.assertEqual(config.api_key, "right-key")
         self.assertEqual(config.model, "override-model")
+        self.assertIsNone(config.model_status)
         self.assertEqual(config.provider_id, "openrouter")
         self.assertEqual(config.credential_env, "OPENROUTER_API_KEY")
+
+        restored = loki.config_from_connection_descriptor(
+            descriptor,
+            CredentialStore({"OPENROUTER_API_KEY": "right-key"}),
+        )
+        self.assertEqual(restored.model, "z-ai/glm")
+        self.assertEqual(restored.model_status, "deprecated")
 
     def test_modelsdev_selection_builds_fresh_provider_auth(self):
         provider_entry = {
@@ -299,7 +333,8 @@ class RuntimeConfigTests(unittest.TestCase):
         config = loki.config_from_modelsdev_selection(
             "openrouter",
             provider_entry,
-            {"id": "z-ai/glm", "name": "GLM"},
+            {"id": "z-ai/glm", "name": "GLM",
+             "status": "deprecated"},
             CredentialStore({
                 "OPENROUTER_API_KEY": "selected-key",
                 "LOKI_API_KEY": "old-key",
@@ -311,6 +346,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_header, None)
         self.assertEqual(config.provider_id, "openrouter")
         self.assertEqual(config.model, "z-ai/glm")
+        self.assertEqual(config.model_status, "deprecated")
 
 
 class ModelLoadingTests(unittest.TestCase):
@@ -563,6 +599,49 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(
             saved["session_state"]["connection"]["model"], "selected-model")
 
+    def test_modelsdev_selection_persists_deprecated_status(self):
+        loki.CREDENTIALS = CredentialStore({
+            "PROVIDER_API_KEY": "test-key",
+        })
+        session = ScriptedInputSession(["/model", "/quit"])
+        provider_entry = {
+            "name": "Provider",
+            "env": ["PROVIDER_API_KEY"],
+            "api": "https://provider.example.test/v1",
+        }
+        model_entry = {
+            "id": "old-model",
+            "name": "Old Model",
+            "status": "deprecated",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.loki.modelsdev."
+                            "run_model_picker_async",
+                            new=mock.AsyncMock(return_value=(
+                                "provider", provider_entry, model_entry))):
+                status = asyncio.run(loki.async_main([]))
+
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(loki.RUNTIME_CONFIG.model_status, "deprecated")
+        self.assertIn(
+            "Model: old-model (deprecated); /model", loki.status_text())
+        self.assertEqual(
+            saved["session_state"]["connection"]["model_status"],
+            "deprecated",
+        )
+
 
 class ExitStatusTests(unittest.TestCase):
     def test_executable_entry_points_propagate_headless_failure(self):
@@ -676,6 +755,28 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("pass", text)
         self.assertNotIn("token", text)
         self.assertNotIn("secret", text)
+
+    def test_status_text_marks_a_deprecated_selected_model(self):
+        names = ["RUNTIME_CONFIG", "model", "shell_cwd"]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            loki.shell_cwd = loki.STARTUP_CWD
+            loki.apply_runtime_config(loki.make_runtime_config(
+                "https://example.test/v1",
+                protocols.OPENAI_CHAT,
+                "test-key",
+                model="old-model",
+                credential_env="EXAMPLE_API_KEY",
+                model_status="deprecated",
+            ))
+
+            text = loki.status_text()
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+        self.assertIn("Model: old-model (deprecated); /model", text)
 
 
 class TerminalOverlayLifecycleTests(unittest.TestCase):
@@ -1126,6 +1227,7 @@ class ShellCwdTests(unittest.TestCase):
                     provider_id="openrouter",
                     provider_name="OpenRouter",
                     credential_env="OPENROUTER_API_KEY",
+                    model_status="deprecated",
                 )
                 loki.apply_runtime_config(config)
                 loki.new_chat_log(path)
@@ -1142,6 +1244,7 @@ class ShellCwdTests(unittest.TestCase):
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["provider_id"], "openrouter")
         self.assertEqual(connection["credential_env"], "OPENROUTER_API_KEY")
+        self.assertEqual(connection["model_status"], "deprecated")
         self.assertNotIn("api_url", connection)
         self.assertEqual(
             connection["chat_url"],

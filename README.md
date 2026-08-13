@@ -26,7 +26,8 @@ At startup Loki captures the environment and removes variables ending in
 `/model` picker fetches models.dev lazily and shows only providers for which a
 captured credential is available. Provider-specific variables such as
 `OPENROUTER_API_KEY` can therefore be supplied by the VM/container launcher
-without also exposing them to ordinary tool subprocesses.
+without also exposing them to ordinary tool subprocesses. Deprecated catalog
+entries remain selectable but are labeled in the picker and status bar.
 
 Loki has no built-in provider connection. Without an explicit
 `LOKI_API_BASE` or a saved session connection, it starts disconnected and
@@ -42,8 +43,9 @@ Loki never chooses the first model returned by a provider. A new explicit
 connection needs `LOKI_MODEL`, or the model must be selected with `/model`
 before sending a chat request.
 
-Chat logs are session savefiles. They persist the selected model, protocol,
-concrete endpoints, and other session state, but never credential values.
+Chat logs are session savefiles. They persist the selected model, its known
+catalog status, protocol, concrete endpoints, and other session state, but
+never credential values.
 Resuming a connection requires the same credential variable to be supplied
 again and asks for confirmation before sending it to the saved endpoints. A
 temporarily unavailable credential does not remove the saved connection.
