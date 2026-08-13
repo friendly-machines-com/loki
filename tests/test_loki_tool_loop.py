@@ -24,6 +24,27 @@ from loki_agent.credentials import CredentialStore
 from loki_agent import savefiles
 
 
+class ScriptedInputSession:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.user_messages = self
+
+    async def get(self):
+        return self.messages.pop(0)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    def modal(self):
+        return self
+
+    async def prompt(self, prompt=None, history=None):
+        raise AssertionError(f"unexpected real modal prompt: {prompt!r}")
+
+
 class ProviderReinstallTests(unittest.TestCase):
     def test_make_runtime_config_builds_provider_and_headers(self):
         config = loki.make_runtime_config(
@@ -290,6 +311,219 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_header, None)
         self.assertEqual(config.provider_id, "openrouter")
         self.assertEqual(config.model, "z-ai/glm")
+
+
+class ModelLoadingTests(unittest.TestCase):
+    def setUp(self):
+        names = [
+            "RUNTIME_CONFIG", "CREDENTIALS", "model", "models",
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos",
+        ]
+        self.old_values = {name: loki.__dict__[name] for name in names}
+
+    def tearDown(self):
+        for name, value in self.old_values.items():
+            loki.__dict__[name] = value
+
+    def test_provider_model_discovery_does_not_select_a_model(self):
+        loki.apply_runtime_config(loki.make_runtime_config(
+            "https://provider.example.test/v1/chat/completions",
+            protocols.OPENAI_CHAT,
+            "test-key",
+            model="",
+            models_url="https://provider.example.test/v1/models",
+            credential_env="LOKI_API_KEY",
+        ))
+        response = {
+            "data": [
+                {"id": "first-model"},
+                {"id": "second-model"},
+            ],
+        }
+
+        with mock.patch(
+                "loki_agent.loki.async_chat_request",
+                new=mock.AsyncMock(return_value=response)):
+            asyncio.run(loki.load_models_async())
+
+        self.assertEqual(loki.models, ["first-model", "second-model"])
+        self.assertEqual(loki.model, "")
+        self.assertEqual(loki.RUNTIME_CONFIG.model, "")
+
+    def test_interactive_startup_does_not_fetch_provider_models(self):
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE":
+                "https://provider.example.test/v1/chat/completions",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "test-key",
+            "LOKI_MODEL": "chosen-model",
+        })
+        session = ScriptedInputSession([None])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            loader = mock.AsyncMock()
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.loki.load_models_async",
+                            new=loader):
+                asyncio.run(loki.async_main([]))
+
+        loader.assert_not_awaited()
+        self.assertEqual(loki.model, "chosen-model")
+
+    def test_headless_startup_requires_an_explicit_model(self):
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE":
+                "https://provider.example.test/v1/chat/completions",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "test-key",
+        })
+        loader = mock.AsyncMock()
+        runner = mock.AsyncMock()
+        stderr = io.StringIO()
+
+        with mock.patch(
+                "loki_agent.loki.load_models_async",
+                new=loader), mock.patch(
+                    "loki_agent.loki.run_subagent_cli_async",
+                    new=runner), contextlib.redirect_stderr(stderr):
+            asyncio.run(loki.async_main(["--headless"]))
+
+        loader.assert_not_awaited()
+        runner.assert_not_awaited()
+        self.assertIn(
+            "Configuration error: model missing; set LOKI_MODEL.",
+            stderr.getvalue(),
+        )
+
+    def test_chat_request_without_a_model_is_not_sent(self):
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE":
+                "https://provider.example.test/v1/chat/completions",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "test-key",
+        })
+        session = ScriptedInputSession(["do not send this", "/quit"])
+        runner = mock.AsyncMock()
+        stderr = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.loki.run_terminal_turn_async",
+                            new=runner), contextlib.redirect_stderr(stderr):
+                asyncio.run(loki.async_main([]))
+
+        runner.assert_not_awaited()
+        self.assertNotIn(
+            "do not send this",
+            [formats.item_text(item) for item in loki.transcript_items],
+        )
+        self.assertIn(
+            "No model selected; use /model or set LOKI_MODEL.",
+            stderr.getvalue(),
+        )
+
+    def test_provider_fallback_cancel_preserves_selected_model(self):
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE":
+                "https://provider.example.test/v1/chat/completions",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "test-key",
+            "LOKI_MODEL": "current-model",
+        })
+        session = ScriptedInputSession(["/model", "/quit"])
+
+        async def load_provider_models():
+            loki.models = ["current-model", "other-model"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            loader = mock.AsyncMock(side_effect=load_provider_models)
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.loki.load_models_async",
+                            new=loader), mock.patch(
+                                "loki_agent.loki.modelsdev."
+                                "run_model_picker_async",
+                                new=mock.AsyncMock(
+                                    side_effect=OSError("offline"))), \
+                    mock.patch(
+                        "loki_agent.loki.modelsdev."
+                        "run_flat_model_picker_async",
+                        new=mock.AsyncMock(return_value=None)):
+                asyncio.run(loki.async_main([]))
+
+        loader.assert_awaited_once()
+        self.assertEqual(loki.model, "current-model")
+        self.assertEqual(loki.RUNTIME_CONFIG.model, "current-model")
+
+    def test_provider_fallback_selection_preserves_connection(self):
+        models_url = "https://catalog.example.test/custom/models"
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE":
+                "https://provider.example.test/v1/chat/completions",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "test-key",
+            "LOKI_MODELS_URL": models_url,
+        })
+        session = ScriptedInputSession(["/model", "/quit"])
+
+        async def load_provider_models():
+            loki.models = ["first-model", "selected-model"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            loader = mock.AsyncMock(side_effect=load_provider_models)
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.loki.load_models_async",
+                            new=loader), mock.patch(
+                                "loki_agent.loki.modelsdev."
+                                "run_model_picker_async",
+                                new=mock.AsyncMock(
+                                    side_effect=OSError("offline"))), \
+                    mock.patch(
+                        "loki_agent.loki.modelsdev."
+                        "run_flat_model_picker_async",
+                        new=mock.AsyncMock(return_value="selected-model")):
+                asyncio.run(loki.async_main([]))
+
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+
+        loader.assert_awaited_once()
+        self.assertEqual(loki.model, "selected-model")
+        self.assertEqual(loki.RUNTIME_CONFIG.model, "selected-model")
+        self.assertEqual(
+            loki.RUNTIME_CONFIG.chat_provider.models_url, models_url)
+        self.assertEqual(
+            saved["session_state"]["connection"]["models_url"], models_url)
+        self.assertEqual(
+            saved["session_state"]["connection"]["model"], "selected-model")
 
 
 class StatusTextTests(unittest.TestCase):

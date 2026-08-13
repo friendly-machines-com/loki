@@ -248,7 +248,7 @@ def build_config_from_env(environ=os.environ,
             "API credential missing; set one of: "
             + ", ".join(credential_names))
 
-    config_model = credentials.get("LOKI_MODEL")
+    config_model = credentials.get("LOKI_MODEL") or ""
     return make_runtime_config(
         config_url,
         config_provider_kind,
@@ -2751,7 +2751,6 @@ def status_text() -> str:
 
 async def load_models_async():
     global models
-    global model
     if not RUNTIME_CONFIG:
         models = [model] if model else []
         return
@@ -2785,8 +2784,6 @@ async def load_models_async():
         loaded = RUNTIME_CONFIG.chat_provider.parse_model_ids(data)
         if loaded:
             models = loaded
-            if not model:
-                model = 'glm-5.2' if 'glm-5.2' in models else models[0]
             return
 
     if errors:
@@ -3074,7 +3071,10 @@ async def async_main(args):
         except (protocols.ProtocolError, ValueError) as e:
             print(f"Configuration error: {e}", file=sys.stderr)
             return
-        await load_models_async()
+        if not model:
+            print("Configuration error: model missing; set LOKI_MODEL.",
+                  file=sys.stderr)
+            return
         await run_subagent_cli_async(subagent_type or toolset or "Explore", prompt_arg)
         return
 
@@ -3143,7 +3143,10 @@ async def async_main(args):
 
         if config is not None:
             apply_runtime_config(config)
-            await load_models_async()
+            if not model:
+                print("No model selected; use /model or set LOKI_MODEL.",
+                      file=sys.stderr)
+                sys.stderr.flush()
         else:
             print("No provider configured; use /model to select one.",
                   file=sys.stderr)
@@ -3188,16 +3191,21 @@ async def async_main(args):
                                   file=sys.stderr)
                             sys.stderr.flush()
                             await load_models_async()
-                            model = await modelsdev.run_flat_model_picker_async(
-                                modal.prompt, models)
-                            if model:
-                                reinstall_provider(model=model)
-                                await load_models_async()
+                            selected_model = (
+                                await modelsdev.run_flat_model_picker_async(
+                                    modal.prompt, models))
+                            if selected_model:
+                                reinstall_provider(
+                                    model=selected_model,
+                                    models_url=(
+                                        RUNTIME_CONFIG.chat_provider.models_url
+                                        if RUNTIME_CONFIG else None),
+                                )
                                 descriptor = active_connection_descriptor()
                                 if descriptor is not None:
                                     set_session_connection(descriptor)
                                 save_chat_log()
-                                print(f"Selected model: {model}",
+                                print(f"Selected model: {selected_model}",
                                       file=sys.stderr)
                                 sys.stderr.flush()
                                 continue
@@ -3253,6 +3261,11 @@ async def async_main(args):
 
             if RUNTIME_CONFIG is None:
                 print("No provider configured; use /model to select one.",
+                      file=sys.stderr)
+                sys.stderr.flush()
+                continue
+            if not model:
+                print("No model selected; use /model or set LOKI_MODEL.",
                       file=sys.stderr)
                 sys.stderr.flush()
                 continue
