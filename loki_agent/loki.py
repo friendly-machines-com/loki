@@ -214,24 +214,14 @@ def build_config_from_env(environ=os.environ,
     if credentials is None:
         credentials = CredentialStore.capture(environ)
 
-    # URL precedence: explicit LOKI_API_BASE, then OPENAI_API_BASE, then
-    # ANTHROPIC_BASE_URL (a common Claude Code / Anthropic SDK convention we
-    # honor as a compat alias), then the built-in default. If the URL comes
-    # from ANTHROPIC_BASE_URL with no explicit LOKI_PROVIDER, default the
-    # protocol to anthropic_messages -- the base URL usually isn't a full
-    # endpoint path so auto-detection from URL alone would fail.
-    config_url = (credentials.get("LOKI_API_BASE") or
-                  credentials.get("OPENAI_API_BASE") or
-                  credentials.get("ANTHROPIC_BASE_URL"))
+    # Only Loki's namespace configures Loki. Generic SDK variables such as
+    # OPENAI_API_BASE and ANTHROPIC_BASE_URL may belong to unrelated programs
+    # sharing this environment and must not silently select Loki's endpoint.
+    config_url = credentials.get("LOKI_API_BASE")
     if not config_url:
         raise ValueError(
             "API endpoint missing; set LOKI_API_BASE or select one with /model")
     provider_override = credentials.get("LOKI_PROVIDER")
-    if (not provider_override
-            and not credentials.get("LOKI_API_BASE")
-            and not credentials.get("OPENAI_API_BASE")
-            and credentials.get("ANTHROPIC_BASE_URL")):
-        provider_override = "anthropic_messages"
     config_provider_kind = protocols.resolve_protocol(config_url, provider_override or "auto")
 
     if config_provider_kind == protocols.DUMMY:
@@ -274,8 +264,7 @@ def build_config_from_env(environ=os.environ,
 
 
 def explicit_api_base_configured(credentials: CredentialStore) -> bool:
-    return any(credentials.get(name) for name in (
-        "LOKI_API_BASE", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL"))
+    return bool(credentials.get("LOKI_API_BASE"))
 
 
 def config_from_connection_descriptor(
@@ -3119,7 +3108,10 @@ async def async_main(args):
         except (ConnectionDescriptorError, protocols.ProtocolError,
                 ValueError) as e:
             print(f"Configuration error: {e}", file=sys.stderr)
-            return
+            print("Starting without a provider; use /model or correct the "
+                  "LOKI_* configuration.", file=sys.stderr)
+            sys.stderr.flush()
+            config = None
 
         if config is not None:
             apply_runtime_config(config)

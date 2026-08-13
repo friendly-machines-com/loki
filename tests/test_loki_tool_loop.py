@@ -185,6 +185,20 @@ class RuntimeConfigTests(unittest.TestCase):
                         "API endpoint missing"):
                     loki.build_config_from_env(env)
 
+    def test_unrelated_sdk_base_variables_do_not_configure_loki(self):
+        for base_name in ("OPENAI_API_BASE", "ANTHROPIC_BASE_URL"):
+            with self.subTest(base_name=base_name):
+                env = {
+                    base_name: "https://unrelated.example.test/v1",
+                    "ANTHROPIC_API_KEY": "unrelated-key",
+                }
+                credentials = CredentialStore.capture(env)
+                self.assertFalse(
+                    loki.explicit_api_base_configured(credentials))
+                with self.assertRaisesRegex(ValueError, "API endpoint missing"):
+                    loki.build_config_from_env(
+                        env, credentials=credentials)
+
     def test_custom_connection_requires_loki_credential(self):
         for credential_name in (
                 "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_API_KEY"):
