@@ -40,8 +40,8 @@ from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .credentials import CredentialStore
 from .savefiles import ResumeTranscriptRenderer
 from . import terminals
-from .terminals import (get_input_async, input_session,
-                        restore_output_area_after_input, terminal)
+from .terminals import (
+    input_session, restore_output_area_after_input, terminal)
 
 computer = socket.gethostname()
 
@@ -2882,30 +2882,16 @@ def resolve_chat_log_path(resume_arg: str) -> str:
         resume_arg, STARTUP_CWD, CHAT_LOG_DIR, _resolve_path)
 
 
-async def run_session_picker_async(session=None):
-    def input_fn(prompt=None, history=None):
-        if session is not None:
-            return session.prompt(prompt, history)
-        return get_input_async(prompt, history)
-    # The picker prints rows before prompting; pause the producer for the
-    # whole modal so it can't race the picker for the cursor/output area.
-    if session is not None:
-        await session.pause()
-    try:
+async def run_session_picker_async(session):
+    async with session.modal() as modal:
         picked = await savefiles.run_session_picker_async(
-            input_fn=input_fn,
+            input_fn=modal.prompt,
             terminal=terminal, chat_log_dir=CHAT_LOG_DIR)
-    finally:
-        if session is not None:
-            await session.resume()
-    # Wipe the picker render so the next output (loaded transcript or a fresh
-    # chat) starts from a clean output area instead of below the stale list.
-    terminal.goto_position(1, 1)
-    terminal.clear_to_end_of_screen()
-    # Complete the picker cleanup before its caller writes anything through
-    # another stream. Otherwise a later stdout flush can deliver this erase
-    # after intervening stderr output.
-    terminal.flush()
+        # Finish the picker's output cleanup while the modal still owns the
+        # terminal. Only then may the normal input producer resume.
+        terminal.goto_position(1, 1)
+        terminal.clear_to_end_of_screen()
+        terminal.flush()
     return picked
 
 
@@ -2980,12 +2966,7 @@ async def confirm_saved_connection_async(
     models_endpoint = (config.chat_provider.models_url
                        if config is not None else descriptor.models_url)
 
-    # This is a modal, like the session and /model pickers: it owns the input
-    # producer while it renders all context and reads the answer. Keep the
-    # context on the normal dialog-output stream so it is ordered with the
-    # prompt renderer's stdout flush.
-    await session.pause()
-    try:
+    async with session.modal() as modal:
         print("Saved connection:")
         print(f"  Provider: {provider}")
         print(f"  Model: {selected_model}")
@@ -2993,11 +2974,9 @@ async def confirm_saved_connection_async(
         if models_endpoint:
             print(f"  Models endpoint: {models_endpoint}")
         print(f"  Credential: {descriptor.credential_env}")
-        answer = (await session.prompt(
+        answer = (await modal.prompt(
             "Use this saved connection? [y/N]: ") or "")
         return answer.strip().lower() in ("y", "yes")
-    finally:
-        await session.resume()
 
 def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
     return asyncio.run(run_subagent_prompt_async(subagent_type, prompt))
@@ -3066,8 +3045,8 @@ async def async_main(args):
 
     # The input session owns raw mode, the stdin reader, the producer, and the
     # user_messages queue for the whole session (see terminals.InputSession).
-    # loki.py is just a consumer of the queue and a caller of session.prompt()
-    # for modal prompts (session picker, /model menus).
+    # loki.py consumes the normal queue; session.modal() is the one exclusive
+    # path used by the session picker, saved-connection prompt, and /model.
     async with input_session(on_mode_cycle=lambda: cycle_agent_mode(),
                              history_provider=lambda: user_prompt_history(transcript_items)) as session:
         if args[0:1] == ['resume']:
@@ -3133,9 +3112,6 @@ async def async_main(args):
         else:
             new_chat_log(new_chat_log_path())
 
-        def input_fn(prompt=None, history=None):
-            return session.prompt(prompt, history)
-
         while True:
             user_in = await session.user_messages.get()
             restore_output_area_after_input()
@@ -3157,39 +3133,33 @@ async def async_main(args):
                     break
                 case '/model':
                     provider_id = None
-                    # The menu prints rows before prompting; pause the producer
-                    # for the whole modal so it can't race the menu for the
-                    # cursor/output area (one writer at a time).
-                    await session.pause()
-                    try:
-                        picked = await modelsdev.run_model_picker_async(
-                            input_fn=input_fn,
-                            credentials=CREDENTIALS)
-                    except (OSError, json.JSONDecodeError) as e:
-                        # models.dev unreachable (network errors) or answered with
-                        # non-JSON garbage (JSONDecodeError from parsing the body):
-                        # fall back to the current provider's own /models list,
-                        # shown through the same menu UI (which cancels cleanly on
-                        # empty input). Anything else -- a real bug in the menus --
-                        # propagates as an error, not here.
-                        print(f"models.dev unavailable: {e}", file=sys.stderr)
-                        sys.stderr.flush()
-                        await load_models_async()
-                        model = await modelsdev.run_flat_model_picker_async(
-                            input_fn, models)
-                        if model:
-                            reinstall_provider(model=model)
+                    async with session.modal() as modal:
+                        try:
+                            picked = await modelsdev.run_model_picker_async(
+                                input_fn=modal.prompt,
+                                credentials=CREDENTIALS)
+                        except (OSError, json.JSONDecodeError) as e:
+                            # models.dev unreachable (network errors) or answered
+                            # with non-JSON garbage: fall back to the current
+                            # provider's own /models list in the same modal.
+                            print(f"models.dev unavailable: {e}",
+                                  file=sys.stderr)
+                            sys.stderr.flush()
                             await load_models_async()
-                            save_chat_log()
-                            print(f"Selected model: {model}", file=sys.stderr)
+                            model = await modelsdev.run_flat_model_picker_async(
+                                modal.prompt, models)
+                            if model:
+                                reinstall_provider(model=model)
+                                await load_models_async()
+                                save_chat_log()
+                                print(f"Selected model: {model}",
+                                      file=sys.stderr)
+                                sys.stderr.flush()
+                                continue
+                            print("Model selection cancelled.",
+                                  file=sys.stderr)
                             sys.stderr.flush()
                             continue
-                        else:
-                            print("Model selection cancelled.", file=sys.stderr)
-                            sys.stderr.flush()
-                            continue
-                    finally:
-                        await session.resume()
                     if picked is None:
                         # User cancelled at either menu; keep the current model.
                         print("Model selection cancelled.", file=sys.stderr)

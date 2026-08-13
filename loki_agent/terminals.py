@@ -599,6 +599,50 @@ async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle
                                   on_mode_cycle=on_mode_cycle).read_text()
 
 
+class InputModal:
+    """Exclusive modal-input path for one InputSession.
+
+    Entering suspends the normal user-message producer. While active, prompt()
+    is the only supported consumer of the session's reader. Exiting restores
+    the normal producer.
+    """
+
+    def __init__(self, session):
+        self.session = session
+        self.active = False
+        self.reading = False
+
+    async def __aenter__(self):
+        if self.session._modal is not None:
+            raise RuntimeError("an input modal is already active")
+        self.session._modal = self
+        try:
+            await self.session._pause()
+        except BaseException:
+            self.session._modal = None
+            raise
+        self.active = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.active = False
+        if self.session._modal is self:
+            self.session._modal = None
+        await self.session._resume()
+
+    async def prompt(self, prompt_text='User: ', history=None) -> str:
+        if not self.active or self.session._modal is not self:
+            raise RuntimeError("modal prompt used outside its active context")
+        if self.reading:
+            raise RuntimeError("modal already has an active prompt")
+        self.reading = True
+        try:
+            return await get_input_async(
+                prompt_text, history, session=self.session.reader)
+        finally:
+            self.reading = False
+
+
 class InputSession:
     """Session-long input owner: raw mode, one stdin reader, producer, queue.
 
@@ -608,9 +652,8 @@ class InputSession:
         async with input_session() as session:
             # session.user_messages: queue of submitted lines (the producer
             # enqueues; the turn loop drains).
-            # session.prompt(...): one-shot line read against the session
-            # reader (modal; pauses the producer so only one consumer reads
-            # keys at a time).
+            # async with session.modal() as modal: suspends that producer and
+            # gives the modal exclusive access through modal.prompt(...).
 
     Raw mode and the reader are held from enter to exit, so keys typed while
     the agent works are drained into the queue instead of being lost to the
@@ -626,6 +669,7 @@ class InputSession:
         self.user_messages = asyncio.Queue()
         self._producer = None
         self._mode = None
+        self._modal = None
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
         self.history_provider = history_provider
 
@@ -677,30 +721,9 @@ class InputSession:
                 return
             self.user_messages.put_nowait(text)
 
-    async def prompt(self, prompt_text='User: ', history=None) -> str:
-        """One-shot line read against the session reader (modal).
-
-        If the producer is running, pauses it first so the prompt is the only
-        key consumer, then resumes it.  If the caller already paused the
-        producer (session.pause() around a modal that prints before prompting),
-        this just reads without touching the producer.
-        """
-        was_paused = self._producer is None
-        if not was_paused:
-            await self._pause()
-        try:
-            return await get_input_async(prompt_text, history, session=self.reader)
-        finally:
-            if not was_paused:
-                await self._resume()
-
-    async def pause(self):
-        """Pause the producer (used around a modal that prints before prompting)."""
-        await self._pause()
-
-    async def resume(self):
-        """Resume the producer after a modal."""
-        await self._resume()
+    def modal(self) -> InputModal:
+        """Return the sole modal path for temporarily consuming terminal input."""
+        return InputModal(self)
 
     async def _pause(self):
         if self._producer is not None:
