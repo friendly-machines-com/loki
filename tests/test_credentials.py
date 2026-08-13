@@ -63,7 +63,6 @@ class ConnectionDescriptorTests(unittest.TestCase):
             provider_id="openrouter",
             provider_name="OpenRouter",
             model="z-ai/glm",
-            api_url="https://openrouter.ai/api/v1",
             chat_url="https://openrouter.ai/api/v1/chat/completions",
             models_url="https://openrouter.ai/api/v1/models",
             protocol="openai_chat",
@@ -73,7 +72,29 @@ class ConnectionDescriptorTests(unittest.TestCase):
         encoded = descriptor.to_dict()
 
         self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
+        self.assertNotIn("api_url", encoded)
         self.assertNotIn("secret", repr(encoded))
+
+    def test_old_api_url_field_is_accepted_and_not_reserialized(self):
+        legacy = {
+            "provider_id": "openrouter",
+            "provider_name": "OpenRouter",
+            "model": "z-ai/glm",
+            "api_url": "https://openrouter.ai/api/v1",
+            "chat_url":
+                "https://openrouter.ai/api/v1/chat/completions",
+            "models_url": "https://openrouter.ai/api/v1/models",
+            "protocol": "openai_chat",
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+
+        descriptor = ConnectionDescriptor.from_dict(legacy)
+
+        self.assertEqual(
+            descriptor.chat_url,
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+        self.assertNotIn("api_url", descriptor.to_dict())
 
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):
@@ -81,7 +102,6 @@ class ConnectionDescriptorTests(unittest.TestCase):
         with self.assertRaises(ConnectionDescriptorError):
             ConnectionDescriptor.from_dict({
                 "model": "x",
-                "api_url": "https://example.test/v1",
                 "chat_url": "https://example.test/v1/chat/completions",
                 "protocol": "openai_chat",
                 "credential_env": "EXAMPLE_API_KEY",

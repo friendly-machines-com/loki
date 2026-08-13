@@ -342,7 +342,6 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         provider_id=RUNTIME_CONFIG.provider_id,
         provider_name=RUNTIME_CONFIG.provider_name,
         model=model,
-        api_url=RUNTIME_CONFIG.url,
         chat_url=provider.chat_url,
         models_url=provider.models_url,
         protocol=RUNTIME_CONFIG.provider_kind,
@@ -2925,6 +2924,11 @@ def save_chat_log():
         return False
 
     state = dict(session_state)
+    saved_connection = state.get("connection")
+    if isinstance(saved_connection, dict) and "api_url" in saved_connection:
+        saved_connection = dict(saved_connection)
+        saved_connection.pop("api_url")
+        state["connection"] = saved_connection
     state["shell_cwd"] = shell_cwd
     content = savefiles.serialize_chat_log(
         transcript_items, session_todos, state)

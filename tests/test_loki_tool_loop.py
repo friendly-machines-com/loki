@@ -264,7 +264,6 @@ class RuntimeConfigTests(unittest.TestCase):
             provider_id="openrouter",
             provider_name="OpenRouter",
             model="z-ai/glm",
-            api_url="https://openrouter.ai/api/v1",
             chat_url="https://openrouter.ai/api/v1/chat/completions",
             models_url="https://openrouter.ai/api/v1/models",
             protocol=protocols.OPENAI_CHAT,
@@ -1037,6 +1036,7 @@ class ShellCwdTests(unittest.TestCase):
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["provider_id"], "openrouter")
         self.assertEqual(connection["credential_env"], "OPENROUTER_API_KEY")
+        self.assertNotIn("api_url", connection)
         self.assertEqual(
             connection["chat_url"],
             "https://openrouter.ai/api/v1/chat/completions",
@@ -1058,7 +1058,6 @@ class ShellCwdTests(unittest.TestCase):
                     provider_id="openrouter",
                     provider_name="OpenRouter",
                     model="z-ai/glm",
-                    api_url="https://openrouter.ai/api/v1",
                     chat_url="https://openrouter.ai/api/v1/chat/completions",
                     models_url="https://openrouter.ai/api/v1/models",
                     protocol=protocols.OPENAI_CHAT,
@@ -1105,7 +1104,6 @@ class ShellCwdTests(unittest.TestCase):
                     provider_id="openrouter",
                     provider_name="OpenRouter",
                     model="z-ai/glm",
-                    api_url="https://openrouter.ai/api/v1",
                     chat_url="https://openrouter.ai/api/v1/chat/completions",
                     models_url="https://openrouter.ai/api/v1/models",
                     protocol=protocols.OPENAI_CHAT,
@@ -1113,9 +1111,11 @@ class ShellCwdTests(unittest.TestCase):
                 )
                 blob = formats.new_log_blob(
                     loki.initial_transcript_items(), [])
+                legacy_connection = descriptor.to_dict()
+                legacy_connection["api_url"] = "https://openrouter.ai/api/v1"
                 blob["session_state"] = {
                     "shell_cwd": tmpdir,
-                    "connection": descriptor.to_dict(),
+                    "connection": legacy_connection,
                     "future_field": "retained",
                 }
                 pathlib.Path(path).write_text(
@@ -1153,7 +1153,6 @@ class ShellCwdTests(unittest.TestCase):
                     provider_id="saved",
                     provider_name="Saved",
                     model="saved-model",
-                    api_url="https://saved.example/v1",
                     chat_url="https://saved.example/v1/chat/completions",
                     models_url="https://saved.example/v1/models",
                     protocol=protocols.OPENAI_CHAT,
@@ -1267,7 +1266,6 @@ class ShellCwdTests(unittest.TestCase):
                     provider_id="old",
                     provider_name="Old",
                     model="old-model",
-                    api_url="https://old.example/v1",
                     chat_url="https://old.example/v1/chat/completions",
                     models_url="https://old.example/v1/models",
                     protocol=protocols.OPENAI_CHAT,
@@ -1324,7 +1322,6 @@ class ShellCwdTests(unittest.TestCase):
             provider_id="openrouter",
             provider_name="OpenRouter",
             model="z-ai/glm",
-            api_url="https://openrouter.ai/api/v1",
             chat_url="https://openrouter.ai/api/v1/chat/completions",
             models_url="https://openrouter.ai/api/v1/models",
             protocol=protocols.OPENAI_CHAT,

@@ -30,7 +30,6 @@ class ConnectionDescriptor:
     provider_id: str | None
     provider_name: str | None
     model: str
-    api_url: str
     chat_url: str
     models_url: str | None
     protocol: str
@@ -44,7 +43,6 @@ class ConnectionDescriptor:
             "provider_id": self.provider_id,
             "provider_name": self.provider_name,
             "model": self.model,
-            "api_url": self.api_url,
             "chat_url": self.chat_url,
             "models_url": self.models_url,
             "protocol": self.protocol,
@@ -71,7 +69,6 @@ class ConnectionDescriptor:
             provider_id=_optional_string(value.get("provider_id"), "provider_id"),
             provider_name=_optional_string(value.get("provider_name"), "provider_name"),
             model=_required_string(value.get("model"), "model"),
-            api_url=_required_string(value.get("api_url"), "api_url"),
             chat_url=_required_string(value.get("chat_url"), "chat_url"),
             models_url=_optional_string(value.get("models_url"), "models_url"),
             protocol=_required_string(value.get("protocol"), "protocol"),
