@@ -148,7 +148,7 @@ class RuntimeConfigTests(unittest.TestCase):
             "OPENAI_API_KEY": "openai-key",
             "LOKI_MODEL": "deepseek-test",
             "LOKI_MAX_TOKENS": "123",
-            "ANTHROPIC_VERSION": "2024-01-01",
+            "LOKI_ANTHROPIC_VERSION": "2024-01-01",
         }
 
         config = loki.build_config_from_env(env)

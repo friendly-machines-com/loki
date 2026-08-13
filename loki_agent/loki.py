@@ -235,7 +235,7 @@ def build_config_from_env(environ=os.environ,
             model=config_model,
             max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
             anthropic_version=credentials.get(
-                "ANTHROPIC_VERSION", "2023-06-01"),
+                "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         )
 
     # Never infer credential ownership from the wire protocol. An explicitly
@@ -257,7 +257,7 @@ def build_config_from_env(environ=os.environ,
         models_url=credentials.get("LOKI_MODELS_URL") or None,
         max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
         anthropic_version=credentials.get(
-            "ANTHROPIC_VERSION", "2023-06-01"),
+            "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
         credential_env=credential_env,
     )
@@ -281,7 +281,7 @@ def config_from_connection_descriptor(
         _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)
         if credentials.get("LOKI_MAX_TOKENS") else descriptor.max_tokens)
     anthropic_version = (
-        credentials.get("ANTHROPIC_VERSION")
+        credentials.get("LOKI_ANTHROPIC_VERSION")
         or descriptor.anthropic_version)
     auth_header = (
         credentials.get("LOKI_AUTH_HEADER")
@@ -323,7 +323,7 @@ def config_from_modelsdev_selection(
         model=selected_model,
         max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
         anthropic_version=credentials.get(
-            "ANTHROPIC_VERSION", "2023-06-01"),
+            "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
         provider_id=provider_id,
         provider_name=provider_entry.get("name"),

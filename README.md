@@ -34,6 +34,10 @@ credentials. An explicitly configured endpoint accepts only `LOKI_API_KEY`;
 Loki never substitutes another provider's credential based merely on the
 endpoint's wire protocol.
 
+All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
+`LOKI_PROVIDER`, `LOKI_MODEL`, `LOKI_API_KEY`, `LOKI_MODELS_URL`,
+`LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, and `LOKI_ANTHROPIC_VERSION`.
+
 Chat logs persist the selected model, protocol, and concrete endpoints, but
 never the credential value. Resuming that connection requires the same
 credential variable to be supplied again and asks for confirmation before
