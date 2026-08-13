@@ -38,6 +38,7 @@ class ConnectionDescriptor:
     anthropic_version: str = "2023-06-01"
     auth_header: str | None = None
     model_status: str | None = None
+    stream: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -52,6 +53,7 @@ class ConnectionDescriptor:
             "anthropic_version": self.anthropic_version,
             "auth_header": self.auth_header,
             "model_status": self.model_status,
+            "stream": self.stream,
         }
 
     @classmethod
@@ -62,6 +64,10 @@ class ConnectionDescriptor:
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise ConnectionDescriptorError(
                 "connection max_tokens must be a positive integer")
+        stream = value.get("stream", False)
+        if not isinstance(stream, bool):
+            raise ConnectionDescriptorError(
+                "connection stream must be a boolean")
         if "credential_env" not in value:
             raise ConnectionDescriptorError(
                 "connection credential_env must be present")
@@ -87,4 +93,5 @@ class ConnectionDescriptor:
             auth_header=_optional_string(value.get("auth_header"), "auth_header"),
             model_status=_optional_string(
                 value.get("model_status"), "model_status"),
+            stream=stream,
         )

@@ -30,6 +30,10 @@ class UnsupportedProtocolError(ProtocolError):
     pass
 
 
+class StreamProtocolError(ProtocolError):
+    pass
+
+
 @dataclass
 class Provider:
     kind: str
@@ -81,6 +85,23 @@ class Provider:
             return {}
         raise ProtocolError(f"unknown protocol {self.kind!r}")
 
+    def streaming_chat_payload(self, items, tools, model):
+        payload = self.chat_payload(items, tools, model)
+        if self.kind != DUMMY:
+            payload["stream"] = True
+        return payload
+
+    def stream_accumulator(self, on_text_delta=None):
+        callback = on_text_delta or (lambda text: None)
+        if self.kind == OPENAI_CHAT:
+            return OpenAIChatStreamAccumulator(callback)
+        if self.kind == ANTHROPIC_MESSAGES:
+            return AnthropicMessagesStreamAccumulator(callback)
+        if self.kind == OPENAI_RESPONSES:
+            return OpenAIResponsesStreamAccumulator(callback)
+        raise StreamProtocolError(
+            f"streaming is not implemented for protocol {self.kind!r}")
+
     def parse_chat_response(self, response):
         if self.kind == OPENAI_CHAT:
             return formats.openai_chat_response_to_items(response)
@@ -100,6 +121,288 @@ class Provider:
             return []
         return [item["id"] for item in data
                 if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+
+class OpenAIChatStreamAccumulator:
+    def __init__(self, on_text_delta):
+        self.on_text_delta = on_text_delta
+        self.response = {}
+        self.choice = {
+            "index": 0,
+            "message": {"role": "assistant", "content": ""},
+            "finish_reason": None,
+        }
+        self.tool_calls = {}
+        self.complete = False
+
+    def feed(self, event):
+        if event.data == "[DONE]":
+            self.complete = True
+            return
+        try:
+            chunk = json.loads(event.data)
+        except json.JSONDecodeError as e:
+            raise StreamProtocolError(
+                f"OpenAI Chat stream event is not JSON: {e}")
+        if not isinstance(chunk, dict):
+            raise StreamProtocolError(
+                "OpenAI Chat stream event must be an object")
+        if chunk.get("error"):
+            raise StreamProtocolError(_stream_error_text(chunk["error"]))
+        for key in [
+                "id", "object", "created", "model", "system_fingerprint",
+                "service_tier", "usage"]:
+            if key in chunk and chunk[key] is not None:
+                self.response[key] = copy.deepcopy(chunk[key])
+        choices = chunk.get("choices")
+        if not isinstance(choices, list):
+            return
+        for choice in choices:
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                continue
+            if choice.get("finish_reason") is not None:
+                self.choice["finish_reason"] = choice["finish_reason"]
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            role = delta.get("role")
+            if isinstance(role, str):
+                self.choice["message"]["role"] = role
+            content = delta.get("content")
+            if isinstance(content, str):
+                self.choice["message"]["content"] += content
+                if content:
+                    self.on_text_delta(content)
+            self._accumulate_tool_calls(delta.get("tool_calls"))
+
+    def _accumulate_tool_calls(self, calls):
+        if not isinstance(calls, list):
+            return
+        for position, delta in enumerate(calls):
+            if not isinstance(delta, dict):
+                continue
+            index = delta.get("index", position)
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise StreamProtocolError(
+                    "OpenAI Chat tool call index must be an integer")
+            call = self.tool_calls.setdefault(index, {
+                "id": None,
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if delta.get("id") is not None:
+                call["id"] = delta["id"]
+            if delta.get("type") is not None:
+                call["type"] = delta["type"]
+            function = delta.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+                arguments = function.get("arguments")
+                if isinstance(name, str):
+                    call["function"]["name"] += name
+                if isinstance(arguments, str):
+                    call["function"]["arguments"] += arguments
+
+    def finish(self):
+        if not self.complete:
+            raise StreamProtocolError(
+                "OpenAI Chat stream ended before data: [DONE]")
+        message = self.choice["message"]
+        if self.tool_calls:
+            message["tool_calls"] = [
+                self.tool_calls[index] for index in sorted(self.tool_calls)]
+        self.response.setdefault("object", "chat.completion")
+        self.response["choices"] = [self.choice]
+        return self.response
+
+
+class AnthropicMessagesStreamAccumulator:
+    def __init__(self, on_text_delta):
+        self.on_text_delta = on_text_delta
+        self.message = None
+        self.blocks = {}
+        self.tool_json = {}
+        self.complete = False
+
+    def feed(self, event):
+        try:
+            data = json.loads(event.data)
+        except json.JSONDecodeError as e:
+            raise StreamProtocolError(
+                f"Anthropic stream event is not JSON: {e}")
+        if not isinstance(data, dict):
+            raise StreamProtocolError(
+                "Anthropic stream event must be an object")
+        event_type = data.get("type") or event.event
+        if event_type == "error":
+            raise StreamProtocolError(
+                _stream_error_text(data.get("error") or data))
+        if event_type == "message_start":
+            message = data.get("message")
+            if not isinstance(message, dict):
+                raise StreamProtocolError(
+                    "Anthropic message_start is missing message")
+            self.message = copy.deepcopy(message)
+            self.message["content"] = []
+        elif event_type == "content_block_start":
+            index = _stream_index(data, "Anthropic content block")
+            block = data.get("content_block")
+            if not isinstance(block, dict):
+                raise StreamProtocolError(
+                    "Anthropic content_block_start is missing content_block")
+            self.blocks[index] = copy.deepcopy(block)
+            if block.get("type") == "tool_use":
+                self.tool_json[index] = ""
+        elif event_type == "content_block_delta":
+            self._feed_delta(data)
+        elif event_type == "content_block_stop":
+            index = _stream_index(data, "Anthropic content block")
+            self._finish_block(index)
+        elif event_type == "message_delta":
+            if self.message is None:
+                raise StreamProtocolError(
+                    "Anthropic message_delta preceded message_start")
+            delta = data.get("delta")
+            if isinstance(delta, dict):
+                self.message.update(copy.deepcopy(delta))
+            if data.get("usage") is not None:
+                usage = self.message.setdefault("usage", {})
+                if isinstance(usage, dict) and isinstance(
+                        data["usage"], dict):
+                    usage.update(copy.deepcopy(data["usage"]))
+                else:
+                    self.message["usage"] = copy.deepcopy(data["usage"])
+        elif event_type == "message_stop":
+            self.complete = True
+        elif event_type == "ping":
+            return
+        # Unknown event types are allowed by Anthropic's versioning policy.
+
+    def _feed_delta(self, data):
+        index = _stream_index(data, "Anthropic content block")
+        block = self.blocks.get(index)
+        if block is None:
+            raise StreamProtocolError(
+                "Anthropic content delta preceded content block start")
+        delta = data.get("delta")
+        if not isinstance(delta, dict):
+            return
+        delta_type = delta.get("type")
+        if delta_type == "text_delta":
+            text = delta.get("text")
+            if isinstance(text, str):
+                block["text"] = str(block.get("text", "")) + text
+                if text:
+                    self.on_text_delta(text)
+        elif delta_type == "input_json_delta":
+            partial = delta.get("partial_json")
+            if isinstance(partial, str):
+                self.tool_json[index] = self.tool_json.get(index, "") + partial
+        elif delta_type == "thinking_delta":
+            thinking = delta.get("thinking")
+            if isinstance(thinking, str):
+                block["thinking"] = (
+                    str(block.get("thinking", "")) + thinking)
+        elif delta_type == "signature_delta":
+            signature = delta.get("signature")
+            if isinstance(signature, str):
+                block["signature"] = (
+                    str(block.get("signature", "")) + signature)
+        elif delta_type == "citations_delta":
+            citation = delta.get("citation")
+            if citation is not None:
+                block.setdefault("citations", []).append(
+                    copy.deepcopy(citation))
+
+    def _finish_block(self, index):
+        block = self.blocks.get(index)
+        if block is None:
+            raise StreamProtocolError(
+                "Anthropic content block stop preceded start")
+        if block.get("type") == "tool_use":
+            raw = self.tool_json.get(index, "")
+            try:
+                block["input"] = json.loads(raw or "{}")
+            except json.JSONDecodeError as e:
+                raise StreamProtocolError(
+                    f"Anthropic tool input is not valid JSON: {e}")
+
+    def finish(self):
+        if self.message is None:
+            raise StreamProtocolError(
+                "Anthropic stream ended before message_start")
+        if not self.complete:
+            raise StreamProtocolError(
+                "Anthropic stream ended before message_stop")
+        for index in list(self.blocks):
+            if self.blocks[index].get("type") == "tool_use":
+                self._finish_block(index)
+        self.message["content"] = [
+            self.blocks[index] for index in sorted(self.blocks)]
+        self.message["type"] = "message"
+        self.message["role"] = "assistant"
+        return self.message
+
+
+class OpenAIResponsesStreamAccumulator:
+    def __init__(self, on_text_delta):
+        self.on_text_delta = on_text_delta
+        self.completed_response = None
+        self.failed = None
+
+    def feed(self, event):
+        try:
+            data = json.loads(event.data)
+        except json.JSONDecodeError as e:
+            raise StreamProtocolError(
+                f"OpenAI Responses stream event is not JSON: {e}")
+        if not isinstance(data, dict):
+            raise StreamProtocolError(
+                "OpenAI Responses stream event must be an object")
+        event_type = data.get("type") or event.event
+        if event_type == "response.output_text.delta":
+            delta = data.get("delta")
+            if isinstance(delta, str) and delta:
+                self.on_text_delta(delta)
+        elif event_type == "response.completed":
+            response = data.get("response")
+            if not isinstance(response, dict):
+                raise StreamProtocolError(
+                    "response.completed is missing its response")
+            self.completed_response = copy.deepcopy(response)
+        elif event_type in (
+                "response.failed", "response.incomplete", "response.cancelled",
+                "error"):
+            self.failed = copy.deepcopy(data)
+
+    def finish(self):
+        if self.failed is not None:
+            raise StreamProtocolError(_stream_error_text(self.failed))
+        if self.completed_response is None:
+            raise StreamProtocolError(
+                "OpenAI Responses stream ended before response.completed")
+        return self.completed_response
+
+
+def _stream_index(data, context):
+    index = data.get("index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        raise StreamProtocolError(f"{context} index must be a nonnegative integer")
+    return index
+
+
+def _stream_error_text(value):
+    if isinstance(value, dict):
+        nested = value.get("error")
+        if nested is not None and nested is not value:
+            return _stream_error_text(nested)
+        message = value.get("message")
+        error_type = value.get("type") or value.get("code")
+        if message and error_type:
+            return f"{error_type}: {message}"
+        if message:
+            return str(message)
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def normalize_protocol(value):

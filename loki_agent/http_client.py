@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import random
 import ssl
 import urllib.parse
@@ -28,6 +29,33 @@ _RETRYABLE_ERRNOS = frozenset({
 })
 
 
+class HttpRequestCancelled(Exception):
+    pass
+
+
+async def _wait_with_cancel(awaitable, timeout, cancel_check):
+    task = asyncio.create_task(awaitable)
+    deadline = asyncio.get_running_loop().time() + timeout
+    try:
+        while True:
+            if cancel_check():
+                raise HttpRequestCancelled()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            done, _ = await asyncio.wait(
+                {task}, timeout=min(0.05, remaining))
+            if done:
+                return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
 def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, asyncio.TimeoutError):
         return True
@@ -37,6 +65,10 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, OSError):
         return getattr(exc, "errno", None) in _RETRYABLE_ERRNOS
     return False
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    return _is_transient(exc)
 
 
 @dataclass
@@ -51,6 +83,118 @@ class HttpResponse:
 
     def header(self, name: str, default: str = "") -> str:
         return self.headers.get(name.lower(), default)
+
+
+@dataclass
+class HttpStreamResponse:
+    url: str
+    status: int
+    reason: str
+    headers: dict
+    body: object
+
+    def header(self, name: str, default: str = "") -> str:
+        return self.headers.get(name.lower(), default)
+
+
+class HttpBodyStream:
+    """Incrementally expose one HTTP response body without buffering it."""
+
+    def __init__(self, reader, headers, *, timeout, max_bytes,
+                 cancel_check=None):
+        self.reader = reader
+        self.headers = headers
+        self.timeout = timeout
+        self.max_bytes = max_bytes
+        self.bytes_received = 0
+        self._iterated = False
+        self.cancel_check = cancel_check or (lambda: False)
+
+    def __aiter__(self):
+        if self._iterated:
+            raise RuntimeError("HTTP response body can only be consumed once")
+        self._iterated = True
+        return self._iterate()
+
+    async def _read(self, awaitable):
+        return await _wait_with_cancel(
+            awaitable, self.timeout, self.cancel_check)
+
+    async def _read_exact_idle(self, size):
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = await self._read(self.reader.read(remaining))
+            if not chunk:
+                raise OSError("unexpected EOF in HTTP response body")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _count(self, data):
+        self.bytes_received += len(data)
+        if self.bytes_received > self.max_bytes:
+            raise OSError(
+                f"HTTP response body exceeds {self.max_bytes} byte limit")
+        return data
+
+    async def _iterate(self):
+        transfer_encoding = self.headers.get("transfer-encoding", "").lower()
+        content_length = self.headers.get("content-length", "")
+        if "chunked" in transfer_encoding:
+            async for chunk in self._iterate_chunked():
+                yield chunk
+            return
+        if content_length.isdigit():
+            remaining = int(content_length)
+            if remaining > self.max_bytes:
+                raise OSError(
+                    f"HTTP response body exceeds {self.max_bytes} byte limit")
+            while remaining:
+                size = min(65536, remaining)
+                chunk = await self._read(self.reader.read(size))
+                if not chunk:
+                    raise OSError("unexpected EOF in HTTP response body")
+                remaining -= len(chunk)
+                if chunk:
+                    yield self._count(chunk)
+            return
+        while True:
+            remaining_capacity = self.max_bytes - self.bytes_received
+            chunk = await self._read(
+                self.reader.read(min(65536, remaining_capacity + 1)))
+            if not chunk:
+                return
+            yield self._count(chunk)
+
+    async def _iterate_chunked(self):
+        while True:
+            line = await self._read(self.reader.readline())
+            if not line:
+                raise OSError("unexpected EOF in chunked HTTP response")
+            size_text = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_text, 16)
+            except ValueError:
+                raise OSError(f"invalid chunk size {size_text!r}")
+            if size < 0:
+                raise OSError(f"invalid chunk size {size_text!r}")
+            if size == 0:
+                while True:
+                    trailer = await self._read(self.reader.readline())
+                    if trailer in (b"\r\n", b"\n"):
+                        return
+                    if not trailer:
+                        return
+            if self.bytes_received + size > self.max_bytes:
+                raise OSError(
+                    f"HTTP response body exceeds {self.max_bytes} byte limit")
+            data = await self._read_exact_idle(size)
+            terminator = await self._read_exact_idle(2)
+            if terminator != b"\r\n":
+                raise OSError("invalid chunk terminator")
+            if data:
+                yield self._count(data)
 
 
 def _host_header(parsed) -> str:
@@ -241,6 +385,59 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
                 pass
 
     return await asyncio.wait_for(request_once(), timeout=timeout)
+
+
+@contextlib.asynccontextmanager
+async def async_http_stream(method: str, request_url: str, *,
+                            headers_in: dict = None, body: bytes = b"",
+                            timeout: int = 30,
+                            max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
+                            cancel_check=None):
+    """Open an HTTP request and expose its response body as an async iterator.
+
+    ``timeout`` is applied to connection setup, response headers, and each
+    individual body read. It is therefore an idle timeout, not a cap on the
+    total duration of an active stream.
+    """
+    parsed, raw_request = _build_raw_request(
+        method, request_url, headers_in, body)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ssl_context = (
+        ssl.create_default_context() if parsed.scheme == "https" else None)
+    cancel = cancel_check or (lambda: False)
+    writer = None
+    try:
+        reader, writer = await _wait_with_cancel(
+            asyncio.open_connection(
+                parsed.hostname,
+                port,
+                ssl=ssl_context,
+                server_hostname=parsed.hostname if ssl_context else None,
+            ),
+            timeout,
+            cancel,
+        )
+        writer.write(raw_request)
+        await _wait_with_cancel(writer.drain(), timeout, cancel)
+        status_line, response_headers = await _wait_with_cancel(
+            _read_headers(reader), timeout, cancel)
+        parts = status_line.split(" ", 2)
+        if len(parts) < 2 or not parts[1].isdigit():
+            raise OSError(f"invalid HTTP status line: {status_line!r}")
+        status = int(parts[1])
+        reason = parts[2] if len(parts) > 2 else ""
+        response_body = HttpBodyStream(
+            reader, response_headers, timeout=timeout, max_bytes=max_bytes,
+            cancel_check=cancel)
+        yield HttpStreamResponse(
+            request_url, status, reason, response_headers, response_body)
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 async def async_http_request(method: str, request_url: str, *, headers_in: dict = None,

@@ -39,13 +39,22 @@ protocol.
 
 All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
 `LOKI_PROVIDER`, `LOKI_MODEL`, `LOKI_API_KEY`, `LOKI_MODELS_URL`,
-`LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, and `LOKI_ANTHROPIC_VERSION`.
+`LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, `LOKI_ANTHROPIC_VERSION`, and
+`LOKI_STREAM`.
 Loki never chooses the first model returned by a provider. A new explicit
 connection needs `LOKI_MODEL`, or the model must be selected with `/model`
 before sending a chat request. A complete captured `LOKI_*` connection also
 appears in `/model` as `Explicit LOKI_* connection`, so it can be selected
 again after switching to a catalog provider or while models.dev is
 unavailable.
+
+Streaming is disabled by default because compatible servers are not required
+to implement it. Set `LOKI_STREAM=1` to request streaming for the selected
+connection. Loki streams assistant text as it arrives but waits for the final
+response before saving it or executing tool calls. If a server ignores the
+request and returns ordinary JSON, Loki accepts that same response without
+resending the inference request. If the server rejects streaming, set
+`LOKI_STREAM=0`.
 
 Chat logs are session savefiles. They persist the selected model, its known
 catalog status, protocol, concrete endpoints, and other session state, but

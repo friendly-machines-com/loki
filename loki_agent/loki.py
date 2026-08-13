@@ -15,6 +15,7 @@ import os
 import asyncio
 import collections
 import json
+import random
 import time
 import re
 import urllib.parse
@@ -36,6 +37,7 @@ from . import http_client
 from . import models as modelsdev
 from . import protocols
 from . import savefiles
+from . import sse
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .credentials import CredentialStore
 from .savefiles import ResumeTranscriptRenderer
@@ -79,6 +81,7 @@ CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
 JOB_TAIL_CHARS = 20_000
 
 WEBFETCH_TIMEOUT_S = 30
+LLM_STREAM_IDLE_TIMEOUT_S = 300
 WEBFETCH_MAX_BYTES = 10_485_760  # 10 MiB
 WEBFETCH_MAX_OUTPUT = 100_000   # 100 KB inline result
 WEBFETCH_MAX_PROMPT_CHARS = 200_000
@@ -138,6 +141,18 @@ class ApiError(Exception):
         return f"{self.summary()}:\n{body}"
 
 
+class StreamingApiError(ApiError):
+    def formatted(self) -> str:
+        return (
+            super().formatted()
+            + "\nStreaming was requested. If this server does not support "
+              "streaming, set LOKI_STREAM=0.")
+
+
+class StreamCancelled(Exception):
+    pass
+
+
 @dataclass
 class RuntimeConfig:
     url: str
@@ -156,6 +171,7 @@ class RuntimeConfig:
     provider_name: str | None = None
     credential_env: str | None = None
     model_status: str | None = None
+    stream: bool = False
 
 
 RUNTIME_CONFIG: RuntimeConfig | None = None
@@ -173,10 +189,23 @@ def _int_setting(name, default, credentials: CredentialStore):
         return default
 
 
+def _bool_setting(name, default, credentials: CredentialStore):
+    value = credentials.get(name)
+    if not value:
+        return default
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"{name} must be one of: 1, 0, true, false, yes, no, on, off")
+
+
 def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=None,
                         max_tokens=4096, anthropic_version="2023-06-01",
                         auth_header=None, provider_id=None, provider_name=None,
-                        credential_env=None, model_status=None):
+                        credential_env=None, model_status=None, stream=False):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -207,6 +236,7 @@ def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=Non
         provider_name=provider_name,
         credential_env=credential_env,
         model_status=model_status,
+        stream=stream,
     )
 
 
@@ -260,6 +290,7 @@ def build_config_from_env(environ=os.environ,
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
         provider_name="Explicit LOKI_* connection",
         credential_env=credential_env,
+        stream=_bool_setting("LOKI_STREAM", False, credentials),
     )
 
 
@@ -313,6 +344,9 @@ def config_from_connection_descriptor(
         credentials.get("LOKI_AUTH_HEADER")
         if credentials.get("LOKI_AUTH_HEADER")
         else descriptor.auth_header)
+    stream = (
+        _bool_setting("LOKI_STREAM", descriptor.stream, credentials)
+        if credentials.get("LOKI_STREAM") else descriptor.stream)
     return make_runtime_config(
         # Restore the concrete endpoint that was actually used, rather than
         # deriving it again from a catalog base URL.
@@ -328,6 +362,7 @@ def config_from_connection_descriptor(
         provider_name=descriptor.provider_name,
         credential_env=descriptor.credential_env,
         model_status=model_status,
+        stream=stream,
     )
 
 
@@ -359,6 +394,7 @@ def config_from_modelsdev_selection(
         provider_name=provider_entry.get("name"),
         credential_env=access.credential_env,
         model_status=model_status,
+        stream=_bool_setting("LOKI_STREAM", False, credentials),
     )
 
 
@@ -379,6 +415,7 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         anthropic_version=RUNTIME_CONFIG.anthropic_version,
         auth_header=RUNTIME_CONFIG.auth_header,
         model_status=RUNTIME_CONFIG.model_status,
+        stream=RUNTIME_CONFIG.stream,
     )
 
 
@@ -396,7 +433,7 @@ _UNSET = object()
 def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None,
                        models_url=None, max_tokens=None, anthropic_version=None,
                        auth_header=None, provider_id=None, provider_name=None,
-                       credential_env=None, model_status=_UNSET):
+                       credential_env=None, model_status=_UNSET, stream=None):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -442,6 +479,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
         credential_env=(credential_env if credential_env is not None
                         else current.credential_env),
         model_status=new_model_status,
+        stream=stream if stream is not None else current.stream,
     ))
 
 
@@ -1687,7 +1725,8 @@ def get_tool_loop_extra_context(transcript_items: list):
 
 
 async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
-                              chat_fn=None, on_event=None, cancel_check=None) -> str:
+                              chat_fn=None, on_event=None, cancel_check=None,
+                              stream_chat=False, report_timing=False) -> str:
     """Run the model/tool loop over the neutral transcript. Mutates `transcript_items` in place."""
     if chat_fn is None:
         chat_fn = lambda items: async_chat_completion(items, tools=TOOLS)
@@ -1705,15 +1744,53 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             transcript_items.append(formats.instruction_item(
                 "Max tool loop limit reached. Stop calling tools and respond."))
             on_event({"type": "max_loops"})
+        live_text_started = False
+
+        def on_text_delta(text):
+            nonlocal live_text_started
+            if not text:
+                return
+            if not live_text_started:
+                live_text_started = True
+                on_event({"type": "assistant_start"})
+            on_event({"type": "assistant_delta", "content": text})
+
+        def finish_live_text(complete, reason=None):
+            if live_text_started:
+                on_event({
+                    "type": "assistant_end",
+                    "complete": complete,
+                    "reason": reason,
+                })
+
+        request_start = time.perf_counter()
         try:
-            response_items = await chat_fn(transcript_items)
+            if stream_chat:
+                response_items = await chat_fn(
+                    transcript_items, on_text_delta)
+            else:
+                response_items = await chat_fn(transcript_items)
+        except StreamCancelled:
+            finish_live_text(False, "cancelled")
+            on_event({
+                "type": "response_cancelled",
+                "partial": live_text_started,
+            })
+            return ""
+        except protocols.StreamProtocolError as e:
+            finish_live_text(False, "error")
+            on_event({"type": "stream_error", "error": e})
+            return ""
         except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
+            finish_live_text(False, "error")
             on_event({"type": "transcript_error", "error": e})
             return ""
         except ApiError as e:
+            finish_live_text(False, "error")
             on_event({"type": "api_error", "error": e})
             return ""
         except OSError as e:
+            finish_live_text(False, "error")
             msg = str(e) or f"{type(e).__name__}() (errno={e.errno!r}, no OS message)"
             on_event({"type": "network_error", "error": msg})
             return ""
@@ -1721,8 +1798,19 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             return ""
 
         if cancel_check():
+            finish_live_text(False, "cancelled")
+            on_event({
+                "type": "response_cancelled",
+                "partial": live_text_started,
+            })
             return ""
 
+        finish_live_text(True)
+        if report_timing:
+            on_event({
+                "type": "response_timing",
+                "elapsed": time.perf_counter() - request_start,
+            })
         for item in response_items:
             transcript_items.append(item)
 
@@ -1738,7 +1826,7 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
         if assistant_items:
             assistant_item = assistant_items[-1]
             assistant_text = formats.item_text(assistant_item)
-        if assistant_text:
+        if assistant_text and not live_text_started:
             on_event({"type": "assistant_message", "content": assistant_text})
 
         if not tool_calls:
@@ -1800,6 +1888,33 @@ def _terminal_agent_event(event: dict):
     elif kind == "assistant_message":
         rendered_content = terminal.markdown_to_ansi(event["content"])
         print(f"\n{model}: {rendered_content if rendered_content is not None else event['content']}")
+    elif kind == "assistant_start":
+        print(f"\n{model}: ", end='', flush=True)
+    elif kind == "assistant_delta":
+        print(event["content"], end='', flush=True)
+    elif kind == "assistant_end":
+        print()
+        sys.stdout.flush()
+    elif kind == "response_timing":
+        print(
+            f"\n[T]  [LLM Response Time: {event['elapsed']:.3f}s]",
+            file=sys.stderr)
+        sys.stderr.flush()
+    elif kind == "response_cancelled":
+        detail = (
+            "; partial response was not saved" if event.get("partial")
+            else "")
+        print(f"[model response cancelled{detail}]", file=sys.stderr)
+        sys.stderr.flush()
+    elif kind == "stream_error":
+        terminal.set_background_color(ERROR_COLOR)
+        print(
+            f"Streaming response error: {event['error']}\n"
+            "Set LOKI_STREAM=0 to disable streaming for this connection.",
+            end='')
+        terminal.reset_colors_and_flags()
+        print()
+        sys.stdout.flush()
     elif kind == "tool_call":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
         print(f"{computer}: Executing Tool: {event['name']} with args:")
@@ -1818,14 +1933,19 @@ def _terminal_agent_event(event: dict):
 
 
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None) -> str:
-    async def chat_fn(items):
-        return await async_chat_completion(items, TOOLS, True, True)
+    async def chat_fn(items, on_text_delta):
+        return await async_chat_completion(
+            items, TOOLS, True, False,
+            on_text_delta=on_text_delta,
+            cancel_check=cancel_check)
 
     return await run_tool_loop_async(
         transcript_items,
         chat_fn=chat_fn,
         on_event=_terminal_agent_event,
         cancel_check=cancel_check,
+        stream_chat=True,
+        report_timing=True,
     )
 
 
@@ -1883,6 +2003,7 @@ def _subagent_env() -> dict:
             env['LOKI_API_KEY'] = RUNTIME_CONFIG.api_key
         else:
             env.pop('LOKI_API_KEY', None)
+        env['LOKI_STREAM'] = '1' if RUNTIME_CONFIG.stream else '0'
     return env
 
 
@@ -2723,8 +2844,181 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     return data
 
 
+async def _next_stream_chunk(iterator, cancel_check):
+    if cancel_check():
+        raise StreamCancelled()
+    task = asyncio.create_task(anext(iterator))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.05)
+            if done:
+                return task.result()
+            if cancel_check():
+                raise StreamCancelled()
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+
+
+async def _collect_stream_body(iterator, first_chunk, cancel_check):
+    chunks = [first_chunk] if first_chunk else []
+    while True:
+        try:
+            chunk = await _next_stream_chunk(iterator, cancel_check)
+        except StopAsyncIteration:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _stream_body_kind(content_type, first_chunk):
+    prefix = first_chunk.lstrip()
+    if prefix.startswith((b"{", b"[")):
+        return "json"
+    if prefix.startswith((b"data:", b"event:", b":")):
+        return "sse"
+    media_type = content_type.partition(";")[0].strip().lower()
+    if media_type == "text/event-stream":
+        return "sse"
+    if media_type in ("application/json", "application/problem+json"):
+        return "json"
+    return "json"
+
+
+async def _async_chat_stream_request_once(
+        request_url, payload, request_headers, on_text_delta, cancel_check):
+    body = json.dumps(payload).encode("utf-8")
+    async with http_client.async_http_stream(
+            "POST",
+            request_url,
+            body=body,
+            headers_in=request_headers,
+            timeout=LLM_STREAM_IDLE_TIMEOUT_S,
+            max_bytes=HTTP_MAX_RESPONSE_BYTES,
+            cancel_check=cancel_check) as response:
+        iterator = response.body.__aiter__()
+        try:
+            first_chunk = await _next_stream_chunk(iterator, cancel_check)
+        except StopAsyncIteration:
+            first_chunk = b""
+
+        if response.status >= 400:
+            try:
+                response_body = await _collect_stream_body(
+                    iterator, first_chunk, cancel_check)
+            except OSError as e:
+                if first_chunk:
+                    raise protocols.StreamProtocolError(
+                        f"stream interrupted after output began: {e}") from e
+                raise
+            response_text = _decode_http_text(
+                response_body, response.headers)
+            raise StreamingApiError(
+                request_url, response.status, response.reason, response_text)
+
+        if _stream_body_kind(
+                response.header("content-type"), first_chunk) == "json":
+            try:
+                response_body = await _collect_stream_body(
+                    iterator, first_chunk, cancel_check)
+            except OSError as e:
+                if first_chunk:
+                    raise protocols.StreamProtocolError(
+                        f"stream interrupted after output began: {e}") from e
+                raise
+            try:
+                return json.loads(_decode_http_text(
+                    response_body, response.headers))
+            except json.JSONDecodeError as e:
+                raise protocols.StreamProtocolError(
+                    "streaming response was neither valid SSE nor JSON: "
+                    f"{e}") from e
+
+        accumulator = RUNTIME_CONFIG.chat_provider.stream_accumulator(
+            on_text_delta)
+        decoder = sse.SseDecoder()
+        received_body = bool(first_chunk)
+        try:
+            for event in decoder.feed(first_chunk):
+                accumulator.feed(event)
+            while True:
+                try:
+                    chunk = await _next_stream_chunk(
+                        iterator, cancel_check)
+                except StopAsyncIteration:
+                    break
+                received_body = received_body or bool(chunk)
+                for event in decoder.feed(chunk):
+                    accumulator.feed(event)
+            for event in decoder.finish():
+                accumulator.feed(event)
+        except StreamCancelled:
+            raise
+        except protocols.StreamProtocolError:
+            raise
+        except ValueError as e:
+            raise protocols.StreamProtocolError(
+                f"invalid SSE stream: {e}") from e
+        except OSError as e:
+            if received_body:
+                raise protocols.StreamProtocolError(
+                    f"stream interrupted after output began: {e}") from e
+            raise
+        return accumulator.finish()
+
+
+async def async_chat_stream_request(
+        request_url: str, payload, request_headers: dict = None,
+        on_text_delta=None, cancel_check=None,
+        report_errors: bool = False, show_timing: bool = False) -> dict:
+    start = time.perf_counter()
+    callback = on_text_delta or (lambda text: None)
+    cancel = cancel_check or (lambda: False)
+    headers_to_use = dict(
+        request_headers if request_headers is not None
+        else (RUNTIME_CONFIG.headers if RUNTIME_CONFIG else {}))
+    headers_to_use.setdefault("Accept", "text/event-stream")
+    kind = RUNTIME_CONFIG.provider_kind if RUNTIME_CONFIG else None
+    idempotency_header = (
+        LLM_IDEMPOTENCY_HEADER_ANTHROPIC
+        if kind == protocols.ANTHROPIC_MESSAGES
+        else LLM_IDEMPOTENCY_HEADER_OPENAI)
+    headers_to_use[idempotency_header] = uuid.uuid4().hex
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            data = await _async_chat_stream_request_once(
+                request_url, payload, headers_to_use, callback, cancel)
+            break
+        except http_client.HttpRequestCancelled:
+            raise StreamCancelled()
+        except Exception as exc:
+            if (attempt >= HTTP_RETRY_MAX_ATTEMPTS_LLM
+                    or not http_client.is_transient_error(exc)):
+                raise
+            delay = (
+                HTTP_RETRY_BASE_DELAY_S
+                * (HTTP_RETRY_BACKOFF_FACTOR ** (attempt - 1)))
+            if HTTP_RETRY_MAX_JITTER_S:
+                delay += random.uniform(0, HTTP_RETRY_MAX_JITTER_S)
+            await asyncio.sleep(delay)
+
+    elapsed = time.perf_counter() - start
+    if show_timing:
+        print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]",
+              file=sys.stderr)
+    return data
+
+
 async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
-                                show_timing: bool = False) -> list:
+                                show_timing: bool = False,
+                                on_text_delta=None,
+                                cancel_check=None) -> list:
     if not RUNTIME_CONFIG:
         return []
 
@@ -2738,14 +3032,28 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             formats.message_item("assistant", reply),
         ]
 
-    payload = RUNTIME_CONFIG.chat_provider.chat_payload(transcript_items, tools, model)
-    data = await async_chat_request(
-        RUNTIME_CONFIG.chat_provider.chat_url,
-        payload,
-        request_headers=RUNTIME_CONFIG.chat_provider.headers,
-        report_errors=report_errors,
-        show_timing=show_timing,
-    )
+    if RUNTIME_CONFIG.stream:
+        payload = RUNTIME_CONFIG.chat_provider.streaming_chat_payload(
+            transcript_items, tools, model)
+        data = await async_chat_stream_request(
+            RUNTIME_CONFIG.chat_provider.chat_url,
+            payload,
+            request_headers=RUNTIME_CONFIG.chat_provider.headers,
+            on_text_delta=on_text_delta,
+            cancel_check=cancel_check,
+            report_errors=report_errors,
+            show_timing=False,
+        )
+    else:
+        payload = RUNTIME_CONFIG.chat_provider.chat_payload(
+            transcript_items, tools, model)
+        data = await async_chat_request(
+            RUNTIME_CONFIG.chat_provider.chat_url,
+            payload,
+            request_headers=RUNTIME_CONFIG.chat_provider.headers,
+            report_errors=report_errors,
+            show_timing=show_timing,
+        )
     if not data:
         return []
     detected = protocols.detect_protocol_from_response(data)
@@ -3073,6 +3381,7 @@ async def confirm_saved_connection_async(
             print("  Authentication: none")
         else:
             print(f"  Credential: {descriptor.credential_env}")
+        print(f"  Streaming: {'yes' if descriptor.stream else 'no'}")
         answer = (await modal.prompt(
             "Use this saved connection? [y/N]: ") or "")
         return answer.strip().lower() in ("y", "yes")
@@ -3360,6 +3669,9 @@ async def async_main(args) -> int:
             mark_chat_log_dirty()
 
             try:
+                # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
+                # earlier prompt or turn must not poison the next model call.
+                session.reader.cancel_requested = False
                 await run_terminal_turn_async(transcript_items, cancel_check=lambda: session.reader.cancel_requested)
             except KeyboardInterrupt:
                 terminal.reset_colors_and_flags()

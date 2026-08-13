@@ -108,12 +108,14 @@ class ConnectionDescriptorTests(unittest.TestCase):
             models_url="http://localhost:8000/v1/models",
             protocol="openai_chat",
             credential_env=None,
+            stream=True,
         )
 
         encoded = descriptor.to_dict()
 
         self.assertIn("credential_env", encoded)
         self.assertIsNone(encoded["credential_env"])
+        self.assertIs(encoded["stream"], True)
         self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
 
     def test_rejects_invalid_persisted_shapes(self):
@@ -140,6 +142,14 @@ class ConnectionDescriptorTests(unittest.TestCase):
                 "model": "x",
                 "chat_url": "https://example.test/v1/chat/completions",
                 "protocol": "openai_chat",
+            })
+        with self.assertRaises(ConnectionDescriptorError):
+            ConnectionDescriptor.from_dict({
+                "model": "x",
+                "chat_url": "https://example.test/v1/chat/completions",
+                "protocol": "openai_chat",
+                "credential_env": None,
+                "stream": "yes",
             })
 
 

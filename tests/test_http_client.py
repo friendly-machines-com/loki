@@ -333,5 +333,92 @@ class HttpClientRetryTests(unittest.TestCase):
         self.assertEqual(len(connector.calls), 1)
 
 
+class HttpClientStreamingTests(unittest.TestCase):
+    def test_stream_can_be_cancelled_during_connection_setup(self):
+        connector = FakeConnector([])
+
+        async def request():
+            async with http_client.async_http_stream(
+                    "POST", "http://example.test/stream",
+                    body=b"{}", timeout=5, max_bytes=100,
+                    cancel_check=lambda: True):
+                self.fail("cancelled stream entered its response context")
+
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(http_client.HttpRequestCancelled):
+                asyncio.run(request())
+
+    def test_chunked_response_is_exposed_incrementally_and_closed(self):
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"3\r\nabc\r\n"
+            b"4\r\ndefg\r\n"
+            b"0\r\nX-Trailer: ignored\r\n\r\n"
+        ])
+
+        async def request():
+            async with http_client.async_http_stream(
+                    "POST", "http://example.test/stream",
+                    body=b"{}", timeout=5, max_bytes=100) as response:
+                chunks = [chunk async for chunk in response.body]
+                return response, chunks
+
+        with PatchedOpenConnection(connector):
+            response, chunks = asyncio.run(request())
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.header("content-type"), "text/event-stream")
+        self.assertEqual(chunks, [b"abc", b"defg"])
+        self.assertTrue(connector.writers[0].closed)
+        self.assertTrue(connector.writers[0].wait_closed_called)
+
+    def test_stream_content_length_is_read_without_buffering_api(self):
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Length: 7\r\n"
+            b"\r\n"
+            b"abcdefg"
+        ])
+
+        async def request():
+            async with http_client.async_http_stream(
+                    "GET", "http://example.test/data",
+                    timeout=5, max_bytes=100) as response:
+                return b"".join(
+                    [chunk async for chunk in response.body])
+
+        with PatchedOpenConnection(connector):
+            body = asyncio.run(request())
+
+        self.assertEqual(body, b"abcdefg")
+        self.assertTrue(connector.writers[0].closed)
+
+    def test_stream_byte_limit_closes_connection(self):
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"4\r\nabcd\r\n"
+            b"0\r\n\r\n"
+        ])
+
+        async def request():
+            async with http_client.async_http_stream(
+                    "GET", "http://example.test/data",
+                    timeout=5, max_bytes=3) as response:
+                return [chunk async for chunk in response.body]
+
+        with PatchedOpenConnection(connector):
+            with self.assertRaisesRegex(OSError, "byte limit"):
+                asyncio.run(request())
+
+        self.assertTrue(connector.writers[0].closed)
+        self.assertTrue(connector.writers[0].wait_closed_called)
+
+
 if __name__ == "__main__":
     unittest.main()

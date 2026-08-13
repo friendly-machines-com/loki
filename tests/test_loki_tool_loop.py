@@ -231,6 +231,26 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.model, "local-model")
         self.assertNotIn("Authorization", config.headers)
         self.assertNotIn("x-api-key", config.headers)
+        self.assertFalse(config.stream)
+
+    def test_explicit_streaming_is_opt_in_and_validated(self):
+        base = {
+            "LOKI_API_BASE": "http://localhost:8000/v1/chat/completions",
+            "LOKI_PROVIDER": "openai_chat",
+            "LOKI_MODEL": "local-model",
+        }
+
+        enabled = loki.build_config_from_env({
+            **base, "LOKI_STREAM": "1",
+        })
+        disabled = loki.build_config_from_env(base)
+
+        self.assertTrue(enabled.stream)
+        self.assertFalse(disabled.stream)
+        with self.assertRaisesRegex(ValueError, "LOKI_STREAM must be"):
+            loki.build_config_from_env({
+                **base, "LOKI_STREAM": "sometimes",
+            })
 
     def test_no_builtin_connection_exists(self):
         for credential_name in (
@@ -345,6 +365,7 @@ class RuntimeConfigTests(unittest.TestCase):
             models_url="http://localhost:8000/v1/models",
             protocol=protocols.OPENAI_CHAT,
             credential_env=None,
+            stream=True,
         )
 
         config = loki.config_from_connection_descriptor(
@@ -354,6 +375,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIsNone(config.credential_env)
         self.assertNotIn("Authorization", config.headers)
         self.assertNotIn("x-api-key", config.headers)
+        self.assertTrue(config.stream)
 
     def test_modelsdev_selection_builds_fresh_provider_auth(self):
         provider_entry = {
@@ -369,6 +391,7 @@ class RuntimeConfigTests(unittest.TestCase):
             CredentialStore({
                 "OPENROUTER_API_KEY": "selected-key",
                 "LOKI_API_KEY": "old-key",
+                "LOKI_STREAM": "1",
             }),
         )
         self.assertEqual(config.api_key, "selected-key")
@@ -378,6 +401,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.provider_id, "openrouter")
         self.assertEqual(config.model, "z-ai/glm")
         self.assertEqual(config.model_status, "deprecated")
+        self.assertTrue(config.stream)
 
 
 class ModelLoadingTests(unittest.TestCase):
@@ -555,6 +579,7 @@ class ModelLoadingTests(unittest.TestCase):
             models_url="http://localhost:8000/v1/models",
             protocol=protocols.OPENAI_CHAT,
             credential_env=None,
+            stream=True,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -582,6 +607,7 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(loki.model, "local-model")
         self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
         self.assertIsNone(loki.RUNTIME_CONFIG.credential_env)
+        self.assertTrue(loki.RUNTIME_CONFIG.stream)
         self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
 
     def test_chat_request_without_a_model_is_not_sent(self):
@@ -1506,6 +1532,7 @@ class ShellCwdTests(unittest.TestCase):
                     model="local-model",
                     provider_name="Explicit LOKI_* connection",
                     credential_env=None,
+                    stream=True,
                 ))
                 loki.new_chat_log(path)
                 loki.save_chat_log()
@@ -1518,6 +1545,7 @@ class ShellCwdTests(unittest.TestCase):
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["model"], "local-model")
         self.assertIsNone(connection["credential_env"])
+        self.assertTrue(connection["stream"])
         self.assertEqual(
             connection["chat_url"],
             "http://localhost:8000/v1/chat/completions",
@@ -1866,6 +1894,7 @@ class ShellCwdTests(unittest.TestCase):
             models_url="http://localhost:8000/v1/models",
             protocol=protocols.OPENAI_CHAT,
             credential_env=None,
+            stream=True,
         )
 
         class FakeSession:
@@ -1889,6 +1918,7 @@ class ShellCwdTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertIn("Authentication: none", output.getvalue())
+        self.assertIn("Streaming: yes", output.getvalue())
         self.assertNotIn("Credential: None", output.getvalue())
 
 
@@ -1953,6 +1983,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 loki.__dict__[name] = value
 
         self.assertEqual(child_env["LOKI_API_KEY"], "active-key")
+        self.assertEqual(child_env["LOKI_STREAM"], "0")
         self.assertNotIn("OPENROUTER_API_KEY", child_env)
 
     def test_subagent_environment_preserves_credentialless_connection(self):
@@ -1968,6 +1999,7 @@ class SubagentLaunchTests(unittest.TestCase):
                     "",
                     model="local-model",
                     credential_env=None,
+                    stream=True,
                 ))
                 child_env = loki._subagent_env()
         finally:
@@ -1977,7 +2009,343 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertEqual(child_env["LOKI_API_BASE"],
                          "http://localhost:8000/v1")
         self.assertEqual(child_env["LOKI_MODEL"], "local-model")
+        self.assertEqual(child_env["LOKI_STREAM"], "1")
         self.assertNotIn("LOKI_API_KEY", child_env)
+
+
+class StreamingCompletionTests(unittest.TestCase):
+    def setUp(self):
+        self.old_runtime_config = loki.RUNTIME_CONFIG
+        self.old_model = loki.model
+        loki.apply_runtime_config(loki.make_runtime_config(
+            "http://localhost:8000/v1",
+            protocols.OPENAI_CHAT,
+            "",
+            model="local-model",
+            credential_env=None,
+            stream=True,
+        ))
+
+    def tearDown(self):
+        loki.RUNTIME_CONFIG = self.old_runtime_config
+        loki.model = self.old_model
+
+    def test_text_delta_arrives_before_stream_completion(self):
+        async def scenario():
+            first_seen = asyncio.Event()
+            release = asyncio.Event()
+            deltas = []
+            payloads = []
+
+            async def response_body():
+                yield (
+                    b'data: {"id":"chat_1","object":'
+                    b'"chat.completion.chunk","choices":[{"index":0,'
+                    b'"delta":{"role":"assistant","content":"hel"},'
+                    b'"finish_reason":null}]}\n\n')
+                await release.wait()
+                yield (
+                    b'data: {"id":"chat_1","choices":[{"index":0,'
+                    b'"delta":{"content":"lo"},"finish_reason":"stop"}]}'
+                    b'\n\ndata: [DONE]\n\n')
+
+            @contextlib.asynccontextmanager
+            async def fake_http_stream(method, request_url, **kwargs):
+                payloads.append(json.loads(kwargs["body"]))
+                yield loki.http_client.HttpStreamResponse(
+                    request_url,
+                    200,
+                    "OK",
+                    {"content-type": "text/event-stream"},
+                    response_body(),
+                )
+
+            def on_delta(text):
+                deltas.append(text)
+                first_seen.set()
+
+            with mock.patch(
+                    "loki_agent.loki.http_client.async_http_stream",
+                    side_effect=fake_http_stream):
+                task = asyncio.create_task(loki.async_chat_completion(
+                    [formats.message_item("user", "hello")],
+                    tools=[],
+                    on_text_delta=on_delta,
+                ))
+                await asyncio.wait_for(first_seen.wait(), timeout=1)
+                self.assertFalse(task.done())
+                release.set()
+                items = await task
+            return payloads, deltas, items
+
+        payloads, deltas, items = asyncio.run(scenario())
+
+        self.assertEqual(len(payloads), 1)
+        self.assertIs(payloads[0]["stream"], True)
+        self.assertEqual(deltas, ["hel", "lo"])
+        self.assertEqual(
+            [item["type"] for item in items],
+            ["response_metadata", "message"],
+        )
+        self.assertEqual(formats.item_text(items[1]), "hello")
+
+    def test_normal_json_response_to_stream_request_is_not_resent(self):
+        calls = []
+        deltas = []
+        response = {
+            "id": "chat_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "buffered"},
+                "finish_reason": "stop",
+            }],
+        }
+
+        async def response_body():
+            yield json.dumps(response).encode("utf-8")
+
+        @contextlib.asynccontextmanager
+        async def fake_http_stream(method, request_url, **kwargs):
+            calls.append(json.loads(kwargs["body"]))
+            yield loki.http_client.HttpStreamResponse(
+                request_url,
+                200,
+                "OK",
+                {"content-type": "application/json"},
+                response_body(),
+            )
+
+        with mock.patch(
+                "loki_agent.loki.http_client.async_http_stream",
+                side_effect=fake_http_stream):
+            items = asyncio.run(loki.async_chat_completion(
+                [formats.message_item("user", "hello")],
+                tools=[],
+                on_text_delta=deltas.append,
+            ))
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["stream"], True)
+        self.assertEqual(deltas, [])
+        self.assertEqual(formats.item_text(items[1]), "buffered")
+
+    def test_http_rejection_suggests_disabling_streaming(self):
+        async def response_body():
+            yield b'{"error":{"message":"stream unsupported"}}'
+
+        @contextlib.asynccontextmanager
+        async def fake_http_stream(method, request_url, **kwargs):
+            yield loki.http_client.HttpStreamResponse(
+                request_url,
+                400,
+                "Bad Request",
+                {"content-type": "application/json"},
+                response_body(),
+            )
+
+        with mock.patch(
+                "loki_agent.loki.http_client.async_http_stream",
+                side_effect=fake_http_stream):
+            with self.assertRaises(loki.StreamingApiError) as raised:
+                asyncio.run(loki.async_chat_completion(
+                    [formats.message_item("user", "hello")],
+                    tools=[],
+                ))
+
+        self.assertIn("set LOKI_STREAM=0", raised.exception.formatted())
+
+    def test_transport_failure_after_first_event_is_not_retried(self):
+        calls = []
+        deltas = []
+
+        async def response_body():
+            yield (
+                b'data: {"choices":[{"index":0,'
+                b'"delta":{"content":"partial"}}]}\n\n')
+            raise ConnectionResetError("reset")
+
+        @contextlib.asynccontextmanager
+        async def fake_http_stream(method, request_url, **kwargs):
+            calls.append(request_url)
+            yield loki.http_client.HttpStreamResponse(
+                request_url,
+                200,
+                "OK",
+                {"content-type": "text/event-stream"},
+                response_body(),
+            )
+
+        with mock.patch(
+                "loki_agent.loki.http_client.async_http_stream",
+                side_effect=fake_http_stream):
+            with self.assertRaisesRegex(
+                    protocols.StreamProtocolError,
+                    "after output began"):
+                asyncio.run(loki.async_chat_completion(
+                    [formats.message_item("user", "hello")],
+                    tools=[],
+                    on_text_delta=deltas.append,
+                ))
+
+        self.assertEqual(calls, [
+            "http://localhost:8000/v1/chat/completions"])
+        self.assertEqual(deltas, ["partial"])
+
+    def test_cancel_closes_stream_without_final_response(self):
+        cancelled = {"value": False}
+
+        async def response_body():
+            yield (
+                b'data: {"choices":[{"index":0,'
+                b'"delta":{"content":"partial"}}]}\n\n')
+            await asyncio.sleep(60)
+
+        @contextlib.asynccontextmanager
+        async def fake_http_stream(method, request_url, **kwargs):
+            yield loki.http_client.HttpStreamResponse(
+                request_url,
+                200,
+                "OK",
+                {"content-type": "text/event-stream"},
+                response_body(),
+            )
+
+        def on_delta(text):
+            cancelled["value"] = True
+
+        with mock.patch(
+                "loki_agent.loki.http_client.async_http_stream",
+                side_effect=fake_http_stream):
+            with self.assertRaises(loki.StreamCancelled):
+                asyncio.run(loki.async_chat_completion(
+                    [formats.message_item("user", "hello")],
+                    tools=[],
+                    on_text_delta=on_delta,
+                    cancel_check=lambda: cancelled["value"],
+                ))
+
+
+class StreamingToolLoopTests(unittest.TestCase):
+    def test_terminal_stream_writes_one_plain_incremental_line(self):
+        old_model = loki.model
+        output = io.StringIO()
+        try:
+            loki.model = "local-model"
+            with contextlib.redirect_stdout(output), \
+                    contextlib.redirect_stderr(output):
+                loki._terminal_agent_event({"type": "assistant_start"})
+                loki._terminal_agent_event({
+                    "type": "assistant_delta",
+                    "content": "**hel",
+                })
+                loki._terminal_agent_event({
+                    "type": "assistant_delta",
+                    "content": "lo**",
+                })
+                loki._terminal_agent_event({
+                    "type": "assistant_end",
+                    "complete": True,
+                })
+                loki._terminal_agent_event({
+                    "type": "response_timing",
+                    "elapsed": 1.25,
+                })
+        finally:
+            loki.model = old_model
+
+        self.assertEqual(
+            output.getvalue(),
+            "\nlocal-model: **hello**\n"
+            "\n[T]  [LLM Response Time: 1.250s]\n",
+        )
+
+    def test_streamed_text_is_not_printed_again_or_duplicated_in_transcript(
+            self):
+        transcript = [formats.message_item("user", "hello")]
+        events = []
+
+        async def chat_fn(items, on_text_delta):
+            on_text_delta("hel")
+            on_text_delta("lo")
+            return [formats.message_item("assistant", "hello")]
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            transcript,
+            chat_fn=chat_fn,
+            on_event=events.append,
+            stream_chat=True,
+        ))
+
+        self.assertEqual(result, "hello")
+        self.assertEqual(len(transcript), 2)
+        self.assertEqual(formats.item_text(transcript[1]), "hello")
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "assistant_start",
+                "assistant_delta",
+                "assistant_delta",
+                "assistant_end",
+            ],
+        )
+        self.assertFalse(any(
+            event["type"] == "assistant_message" for event in events))
+
+    def test_partial_stream_error_is_not_committed(self):
+        transcript = [formats.message_item("user", "hello")]
+        events = []
+
+        async def chat_fn(items, on_text_delta):
+            on_text_delta("partial")
+            raise protocols.StreamProtocolError("broken stream")
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            transcript,
+            chat_fn=chat_fn,
+            on_event=events.append,
+            stream_chat=True,
+        ))
+
+        self.assertEqual(result, "")
+        self.assertEqual(len(transcript), 1)
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "assistant_start",
+                "assistant_delta",
+                "assistant_end",
+                "stream_error",
+            ],
+        )
+        self.assertFalse(events[2]["complete"])
+
+    def test_partial_cancel_is_not_committed(self):
+        transcript = [formats.message_item("user", "hello")]
+        events = []
+
+        async def chat_fn(items, on_text_delta):
+            on_text_delta("partial")
+            raise loki.StreamCancelled()
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            transcript,
+            chat_fn=chat_fn,
+            on_event=events.append,
+            stream_chat=True,
+        ))
+
+        self.assertEqual(result, "")
+        self.assertEqual(len(transcript), 1)
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "assistant_start",
+                "assistant_delta",
+                "assistant_end",
+                "response_cancelled",
+            ],
+        )
 
 
 class ResponsesToolLoopTests(unittest.TestCase):
