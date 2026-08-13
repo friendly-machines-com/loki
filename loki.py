@@ -4,4 +4,4 @@ from loki_agent.loki import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -3047,7 +3047,7 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
         print(result)
 
 
-async def async_main(args):
+async def async_main(args) -> int:
     global model
 
     # getopt's "resume=" requires a value; normalize a bare `--resume` to
@@ -3074,13 +3074,13 @@ async def async_main(args):
                 credentials=CREDENTIALS))
         except (protocols.ProtocolError, ValueError) as e:
             print(f"Configuration error: {e}", file=sys.stderr)
-            return
+            return 2
         if not model:
             print("Configuration error: model missing; set LOKI_MODEL.",
                   file=sys.stderr)
-            return
+            return 2
         await run_subagent_cli_async(subagent_type or toolset or "Explore", prompt_arg)
-        return
+        return 0
 
     log_filename = None
     for option_name, option_value in options:
@@ -3120,7 +3120,7 @@ async def async_main(args):
             except (OSError, json.JSONDecodeError,
                     formats.TranscriptFormatError) as e:
                 print(f"Could not resume chat: {e}", file=sys.stderr)
-                return
+                return 1
 
         try:
             if explicit_api_base_configured(CREDENTIALS):
@@ -3136,7 +3136,7 @@ async def async_main(args):
                         descriptor, session, config=config)
                     if not confirmed:
                         print("Resume cancelled.", file=sys.stderr)
-                        return
+                        return 0
         except (ConnectionDescriptorError, protocols.ProtocolError,
                 ValueError) as e:
             print(f"Configuration error: {e}", file=sys.stderr)
@@ -3292,6 +3292,8 @@ async def async_main(args):
                     "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."))
                 continue # Drop immediately back to the User> prompt
 
+    return 0
+
 
 def initialize_terminal_overlay(active_terminal):
     active_terminal.enable_bracketed_paste_mode()
@@ -3319,15 +3321,18 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
     run_step(active_terminal.flush)
 
 
-def main():
+def main() -> int:
     global CREDENTIALS
     CREDENTIALS = CredentialStore.capture(os.environ)
     cleanup_done = False
+    cleanup_failed = False
 
     def clean_up_step(thunk):
+        nonlocal cleanup_failed
         try:
             thunk()
         except Exception as e:
+            cleanup_failed = True
             # Terminal cleanup is best-effort: one failed restore step should
             # not prevent later steps from disabling modes or resetting colors.
             print(f"Cleanup error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -3339,7 +3344,8 @@ def main():
         cleanup_done = True
         if chat_log_path is not None:
             clean_up_step(save_chat_log)
-        restore_terminal_overlay(terminal, clean_up_step)
+        clean_up_step(
+            lambda: restore_terminal_overlay(terminal, clean_up_step))
 
     def clean_up_and_exit(*args, **kwargs):
         clean_up(*args, **kwargs)
@@ -3350,11 +3356,15 @@ def main():
 
     initialize_terminal_overlay(terminal)
 
+    exit_status = 1
     try:
-        asyncio.run(async_main(sys.argv[1:]))
+        exit_status = asyncio.run(async_main(sys.argv[1:]))
     finally:
         clean_up()
+    if exit_status == 0 and cleanup_failed:
+        return 1
+    return exit_status
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

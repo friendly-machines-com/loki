@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -372,9 +373,10 @@ class ModelLoadingTests(unittest.TestCase):
                         ), mock.patch(
                             "loki_agent.loki.load_models_async",
                             new=loader):
-                asyncio.run(loki.async_main([]))
+                status = asyncio.run(loki.async_main([]))
 
         loader.assert_not_awaited()
+        self.assertEqual(status, 0)
         self.assertEqual(loki.model, "chosen-model")
 
     def test_headless_startup_requires_an_explicit_model(self):
@@ -393,14 +395,48 @@ class ModelLoadingTests(unittest.TestCase):
                 new=loader), mock.patch(
                     "loki_agent.loki.run_subagent_cli_async",
                     new=runner), contextlib.redirect_stderr(stderr):
-            asyncio.run(loki.async_main(["--headless"]))
+            status = asyncio.run(loki.async_main(["--headless"]))
 
         loader.assert_not_awaited()
         runner.assert_not_awaited()
+        self.assertEqual(status, 2)
         self.assertIn(
             "Configuration error: model missing; set LOKI_MODEL.",
             stderr.getvalue(),
         )
+
+    def test_headless_configuration_failure_returns_usage_error(self):
+        loki.CREDENTIALS = CredentialStore({})
+        runner = mock.AsyncMock()
+        stderr = io.StringIO()
+
+        with mock.patch(
+                "loki_agent.loki.run_subagent_cli_async",
+                new=runner), contextlib.redirect_stderr(stderr):
+            status = asyncio.run(loki.async_main(["--headless"]))
+
+        runner.assert_not_awaited()
+        self.assertEqual(status, 2)
+        self.assertIn(
+            "Configuration error: API endpoint missing",
+            stderr.getvalue(),
+        )
+
+    def test_requested_resume_read_failure_returns_error(self):
+        loki.CREDENTIALS = CredentialStore({})
+        session = ScriptedInputSession([])
+        stderr = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = os.path.join(tmpdir, "missing-chat.json")
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), contextlib.redirect_stderr(stderr):
+                status = asyncio.run(
+                    loki.async_main([f"--resume={missing}"]))
+
+        self.assertEqual(status, 1)
+        self.assertIn("Could not resume chat:", stderr.getvalue())
 
     def test_chat_request_without_a_model_is_not_sent(self):
         loki.CREDENTIALS = CredentialStore({
@@ -424,9 +460,10 @@ class ModelLoadingTests(unittest.TestCase):
                         ), mock.patch(
                             "loki_agent.loki.run_terminal_turn_async",
                             new=runner), contextlib.redirect_stderr(stderr):
-                asyncio.run(loki.async_main([]))
+                status = asyncio.run(loki.async_main([]))
 
         runner.assert_not_awaited()
+        self.assertEqual(status, 0)
         self.assertNotIn(
             "do not send this",
             [formats.item_text(item) for item in loki.transcript_items],
@@ -469,9 +506,10 @@ class ModelLoadingTests(unittest.TestCase):
                         "loki_agent.loki.modelsdev."
                         "run_flat_model_picker_async",
                         new=mock.AsyncMock(return_value=None)):
-                asyncio.run(loki.async_main([]))
+                status = asyncio.run(loki.async_main([]))
 
         loader.assert_awaited_once()
+        self.assertEqual(status, 0)
         self.assertEqual(loki.model, "current-model")
         self.assertEqual(loki.RUNTIME_CONFIG.model, "current-model")
 
@@ -509,12 +547,13 @@ class ModelLoadingTests(unittest.TestCase):
                         "loki_agent.loki.modelsdev."
                         "run_flat_model_picker_async",
                         new=mock.AsyncMock(return_value="selected-model")):
-                asyncio.run(loki.async_main([]))
+                status = asyncio.run(loki.async_main([]))
 
             with open(path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
 
         loader.assert_awaited_once()
+        self.assertEqual(status, 0)
         self.assertEqual(loki.model, "selected-model")
         self.assertEqual(loki.RUNTIME_CONFIG.model, "selected-model")
         self.assertEqual(
@@ -523,6 +562,73 @@ class ModelLoadingTests(unittest.TestCase):
             saved["session_state"]["connection"]["models_url"], models_url)
         self.assertEqual(
             saved["session_state"]["connection"]["model"], "selected-model")
+
+
+class ExitStatusTests(unittest.TestCase):
+    def test_executable_entry_points_propagate_headless_failure(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        env = {
+            "HOME": os.environ.get("HOME", str(root)),
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(root),
+            "TERM": "dumb",
+        }
+        commands = [
+            [sys.executable, str(root / "loki.py"), "--headless"],
+            [sys.executable, "-m", "loki_agent", "--headless"],
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    command,
+                    cwd=root,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    "Configuration error: API endpoint missing",
+                    result.stderr,
+                )
+
+    def test_cleanup_failure_changes_only_successful_status(self):
+        old_credentials = loki.CREDENTIALS
+        stderr = io.StringIO()
+        try:
+            for async_status, expected_status in [(0, 1), (2, 2)]:
+                def finish(coroutine):
+                    coroutine.close()
+                    return async_status
+
+                with self.subTest(async_status=async_status), mock.patch(
+                        "loki_agent.loki.CredentialStore.capture",
+                        return_value=CredentialStore({})), mock.patch(
+                            "loki_agent.loki.signal.signal"), mock.patch(
+                                "loki_agent.loki.signal.pthread_sigmask"
+                            ), mock.patch(
+                                "loki_agent.loki.initialize_terminal_overlay"
+                            ), mock.patch(
+                                "loki_agent.loki.asyncio.run",
+                                side_effect=finish), mock.patch(
+                                    "loki_agent.loki."
+                                    "restore_terminal_overlay",
+                                    side_effect=OSError("restore failed")
+                                ), mock.patch.object(
+                                    loki, "chat_log_path", None
+                                ), contextlib.redirect_stderr(stderr):
+                    status = loki.main()
+
+                self.assertEqual(status, expected_status)
+        finally:
+            loki.CREDENTIALS = old_credentials
+
+        self.assertIn("Cleanup error: OSError: restore failed",
+                      stderr.getvalue())
 
 
 class StatusTextTests(unittest.TestCase):
