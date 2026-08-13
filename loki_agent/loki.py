@@ -3270,10 +3270,16 @@ def initialize_terminal_overlay(active_terminal):
 
 def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
     """Remove Loki's overlay without clearing ordinary terminal contents."""
+    terminals.refresh_terminal_layout()
     run_step(active_terminal.disable_bracketed_paste_mode)
     run_step(active_terminal.disable_clipping_regions)
     run_step(active_terminal.disable_origin_mode)
     run_step(active_terminal.reset_colors_and_flags)
+    # DECSTBM and DECOM reset the cursor to the terminal home position. Move
+    # it to the first row formerly owned by the overlay before erasing, or
+    # ED(0) would still erase the entire visible display from home.
+    run_step(lambda: active_terminal.goto_position(
+        terminals.input_area[0], 1))
     run_step(active_terminal.clear_to_end_of_screen)
     run_step(active_terminal.flush)
 

@@ -357,6 +357,7 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
             ("disable_clipping_regions",),
             ("disable_origin_mode",),
             ("reset_colors_and_flags",),
+            ("goto_position", loki.terminals.input_area[0], 1),
             ("clear_to_end_of_screen",),
             ("flush",),
         ])
