@@ -5,6 +5,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -16,6 +17,8 @@ os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 from loki_agent import formats
 from loki_agent import loki
 from loki_agent import protocols
+from loki_agent.connections import ConnectionDescriptor
+from loki_agent.credentials import CredentialStore
 from loki_agent import savefiles
 
 
@@ -55,7 +58,7 @@ class ProviderReinstallTests(unittest.TestCase):
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
 
         try:
-            loki.apply_runtime_config(loki.build_config_from_env(env, lambda domain: ""))
+            loki.apply_runtime_config(loki.build_config_from_env(env))
             old_provider = loki.RUNTIME_CONFIG.chat_provider
 
             loki.reinstall_provider(model="model-b")
@@ -92,7 +95,7 @@ class ProviderReinstallTests(unittest.TestCase):
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
 
         try:
-            loki.apply_runtime_config(loki.build_config_from_env(env, lambda domain: ""))
+            loki.apply_runtime_config(loki.build_config_from_env(env))
 
             # A future models.dev record maps this model to a different
             # provider + protocol; reinstall must rebuild Provider/headers.
@@ -136,7 +139,7 @@ class ProviderReinstallTests(unittest.TestCase):
 
 
 class RuntimeConfigTests(unittest.TestCase):
-    def test_build_config_uses_explicit_env_key_without_secret_lookup(self):
+    def test_build_config_uses_explicit_env_key(self):
         env = {
             "LOKI_API_BASE": "https://api.deepseek.com/anthropic",
             "LOKI_PROVIDER": "anthropic_messages",
@@ -148,10 +151,7 @@ class RuntimeConfigTests(unittest.TestCase):
             "ANTHROPIC_VERSION": "2024-01-01",
         }
 
-        def secret_lookup(domain):
-            raise AssertionError(f"secret lookup should not be called for {domain}")
-
-        config = loki.build_config_from_env(env, secret_lookup)
+        config = loki.build_config_from_env(env)
 
         self.assertEqual(config.url, "https://api.deepseek.com/anthropic")
         self.assertEqual(config.provider_kind, protocols.ANTHROPIC_MESSAGES)
@@ -162,27 +162,41 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.headers["x-api-key"], "loki-key")
         self.assertEqual(config.headers["anthropic-version"], "2024-01-01")
         self.assertEqual(config.anthropic_version, "2024-01-01")
+        self.assertEqual(config.credential_env, "LOKI_API_KEY")
         self.assertNotIn("LOKI_API_KEY", env)
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("OPENAI_API_KEY", env)
 
-    def test_build_config_uses_secret_lookup_when_env_keys_are_absent(self):
+    def test_build_config_rejects_missing_environment_credentials(self):
         env = {
             "LOKI_API_BASE": "https://example.test/v1/chat/completions",
             "LOKI_PROVIDER": "openai_chat",
         }
-        calls = []
+        with self.assertRaisesRegex(ValueError, "API credential missing"):
+            loki.build_config_from_env(env)
 
-        def secret_lookup(domain):
-            calls.append(domain)
-            return "secret-key"
+    def test_no_builtin_connection_exists(self):
+        for credential_name in (
+                "OPENCODE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            with self.subTest(credential_name=credential_name):
+                env = {credential_name: "provider-key"}
+                with self.assertRaisesRegex(
+                        ValueError,
+                        "API endpoint missing"):
+                    loki.build_config_from_env(env)
 
-        config = loki.build_config_from_env(env, secret_lookup)
-
-        self.assertEqual(calls, ["example.test"])
-        self.assertEqual(config.api_key, "secret-key")
-        self.assertEqual(config.provider_kind, protocols.OPENAI_CHAT)
-        self.assertEqual(config.headers["Authorization"], "Bearer secret-key")
+    def test_custom_connection_requires_loki_credential(self):
+        for credential_name in (
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_API_KEY"):
+            with self.subTest(credential_name=credential_name):
+                env = {
+                    "LOKI_API_BASE":
+                        "https://custom.example.test/v1/chat/completions",
+                    credential_name: "must-not-be-sent",
+                }
+                with self.assertRaisesRegex(
+                        ValueError, "set one of: LOKI_API_KEY"):
+                    loki.build_config_from_env(env)
 
     def test_apply_runtime_config_assigns_runtime_globals(self):
         env = {
@@ -191,7 +205,7 @@ class RuntimeConfigTests(unittest.TestCase):
             "LOKI_API_KEY": "test-key",
             "LOKI_MODEL": "gpt-test",
         }
-        config = loki.build_config_from_env(env, lambda domain: "")
+        config = loki.build_config_from_env(env)
         names = ["RUNTIME_CONFIG", "model"]
         sentinel = object()
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
@@ -207,6 +221,59 @@ class RuntimeConfigTests(unittest.TestCase):
                     loki.__dict__.pop(name, None)
                 else:
                     loki.__dict__[name] = value
+
+    def test_saved_connection_requires_its_exact_credential(self):
+        descriptor = ConnectionDescriptor(
+            provider_id="openrouter",
+            provider_name="OpenRouter",
+            model="z-ai/glm",
+            api_url="https://openrouter.ai/api/v1",
+            chat_url="https://openrouter.ai/api/v1/chat/completions",
+            models_url="https://openrouter.ai/api/v1/models",
+            protocol=protocols.OPENAI_CHAT,
+            credential_env="OPENROUTER_API_KEY",
+        )
+        with self.assertRaisesRegex(
+                ValueError, "missing OPENROUTER_API_KEY"):
+            loki.config_from_connection_descriptor(
+                descriptor,
+                CredentialStore({"LOKI_API_KEY": "wrong-provider-key"}),
+            )
+
+        config = loki.config_from_connection_descriptor(
+            descriptor,
+            CredentialStore({
+                "OPENROUTER_API_KEY": "right-key",
+                "LOKI_MODEL": "override-model",
+            }),
+        )
+        self.assertEqual(config.url, descriptor.chat_url)
+        self.assertEqual(config.api_key, "right-key")
+        self.assertEqual(config.model, "override-model")
+        self.assertEqual(config.provider_id, "openrouter")
+        self.assertEqual(config.credential_env, "OPENROUTER_API_KEY")
+
+    def test_modelsdev_selection_builds_fresh_provider_auth(self):
+        provider_entry = {
+            "name": "OpenRouter",
+            "env": ["OPENROUTER_API_KEY"],
+            "api": "https://openrouter.ai/api/v1",
+        }
+        config = loki.config_from_modelsdev_selection(
+            "openrouter",
+            provider_entry,
+            {"id": "z-ai/glm", "name": "GLM"},
+            CredentialStore({
+                "OPENROUTER_API_KEY": "selected-key",
+                "LOKI_API_KEY": "old-key",
+            }),
+        )
+        self.assertEqual(config.api_key, "selected-key")
+        self.assertEqual(
+            config.headers["Authorization"], "Bearer selected-key")
+        self.assertEqual(config.auth_header, None)
+        self.assertEqual(config.provider_id, "openrouter")
+        self.assertEqual(config.model, "z-ai/glm")
 
 
 class StatusTextTests(unittest.TestCase):
@@ -605,6 +672,54 @@ class ShellCwdTests(unittest.TestCase):
 
         self.assertEqual(blob["session_state"]["shell_cwd"], cwd)
 
+    def test_save_chat_log_persists_connection_without_credential_value(self):
+        names = [
+            "chat_log", "transcript_items", "session_todos",
+            "RUNTIME_CONFIG", "model",
+        ]
+        sentinel = object()
+        old_values = {
+            name: loki.__dict__.get(name, sentinel) for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                config = loki.make_runtime_config(
+                    "https://openrouter.ai/api/v1",
+                    protocols.OPENAI_CHAT,
+                    "do-not-persist-this",
+                    model="z-ai/glm",
+                    provider_id="openrouter",
+                    provider_name="OpenRouter",
+                    credential_env="OPENROUTER_API_KEY",
+                )
+                loki.apply_runtime_config(config)
+                loki.new_chat_log(path)
+                loki.save_chat_log()
+                loki.chat_log.close()
+                text = pathlib.Path(path).read_text(encoding="utf-8")
+                blob = json.loads(text)
+        finally:
+            if "chat_log" in loki.__dict__:
+                try:
+                    loki.chat_log.close()
+                except OSError:
+                    pass
+            for name, value in old_values.items():
+                if value is sentinel:
+                    loki.__dict__.pop(name, None)
+                else:
+                    loki.__dict__[name] = value
+
+        connection = blob["session_state"]["connection"]
+        self.assertEqual(connection["provider_id"], "openrouter")
+        self.assertEqual(connection["credential_env"], "OPENROUTER_API_KEY")
+        self.assertEqual(
+            connection["chat_url"],
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+        self.assertNotIn("do-not-persist-this", text)
+
     def test_load_session_state_restores_shell_cwd(self):
         names = ["shell_cwd", "previous_shell_cwd"]
         old_values = {name: loki.__dict__[name] for name in names}
@@ -617,6 +732,30 @@ class ShellCwdTests(unittest.TestCase):
         finally:
             for name, value in old_values.items():
                 loki.__dict__[name] = value
+
+    def test_saved_connection_confirmation_is_explicit(self):
+        descriptor = ConnectionDescriptor(
+            provider_id="openrouter",
+            provider_name="OpenRouter",
+            model="z-ai/glm",
+            api_url="https://openrouter.ai/api/v1",
+            chat_url="https://openrouter.ai/api/v1/chat/completions",
+            models_url="https://openrouter.ai/api/v1/models",
+            protocol=protocols.OPENAI_CHAT,
+            credential_env="OPENROUTER_API_KEY",
+        )
+
+        async def answer_no(prompt):
+            self.assertIn("[y/N]", prompt)
+            return ""
+
+        async def answer_yes(prompt):
+            return "yes"
+
+        self.assertFalse(asyncio.run(
+            loki.confirm_saved_connection_async(descriptor, answer_no)))
+        self.assertTrue(asyncio.run(
+            loki.confirm_saved_connection_async(descriptor, answer_yes)))
 
 
 class SubagentLaunchTests(unittest.TestCase):
@@ -656,6 +795,31 @@ class SubagentLaunchTests(unittest.TestCase):
             "--prompt",
             "inspect this",
         ])
+
+    def test_subagent_environment_contains_only_active_normalized_key(self):
+        names = ["RUNTIME_CONFIG", "model"]
+        old_values = {name: loki.__dict__[name] for name in names}
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "OPENROUTER_API_KEY": "unrelated-key",
+        }
+        CredentialStore.capture(env)
+        try:
+            with mock.patch.dict(os.environ, env, clear=True):
+                loki.apply_runtime_config(loki.make_runtime_config(
+                    "https://example.test/v1",
+                    protocols.OPENAI_CHAT,
+                    "active-key",
+                    model="active-model",
+                    credential_env="EXAMPLE_API_KEY",
+                ))
+                child_env = loki._subagent_env()
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+        self.assertEqual(child_env["LOKI_API_KEY"], "active-key")
+        self.assertNotIn("OPENROUTER_API_KEY", child_env)
 
 
 class ResponsesToolLoopTests(unittest.TestCase):

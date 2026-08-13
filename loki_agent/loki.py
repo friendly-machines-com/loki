@@ -36,12 +36,12 @@ from . import http_client
 from . import models as modelsdev
 from . import protocols
 from . import savefiles
+from .connections import ConnectionDescriptor, ConnectionDescriptorError
+from .credentials import CredentialStore
 from .savefiles import ResumeTranscriptRenderer
 from . import terminals
 from .terminals import (get_input_async, input_session,
                         restore_output_area_after_input, terminal)
-
-DEFAULT_API_BASE = "https://opencode.ai/zen/go/v1/chat/completions"
 
 computer = socket.gethostname()
 
@@ -152,24 +152,18 @@ class RuntimeConfig:
     # the exact same Provider settings instead of falling back to defaults.
     anthropic_version: str = "2023-06-01"
     auth_header: str | None = None
+    provider_id: str | None = None
+    provider_name: str | None = None
+    credential_env: str | None = None
 
 
 RUNTIME_CONFIG: RuntimeConfig | None = None
+CREDENTIALS: CredentialStore | None = None
 model: str = ""
 
 
-def _pop_env_api_keys(names, environ=os.environ):
-    """Return configured API keys and remove them from the given environment."""
-    values = {}
-    for name in names:
-        value = environ.pop(name, "")
-        if value:
-            values[name] = value
-    return values
-
-
-def _int_env(name, default, environ=os.environ):
-    value = environ.get(name)
+def _int_setting(name, default, credentials: CredentialStore):
+    value = credentials.get(name)
     if not value:
         return default
     try:
@@ -178,15 +172,10 @@ def _int_env(name, default, environ=os.environ):
         return default
 
 
-def _lookup_api_key_with_secret_tool(domain):
-    res = subprocess.run(['secret-tool', 'lookup', 'service', 'llm', 'domain', domain],
-                         shell=False, capture_output=True, text=True)
-    return res.stdout.strip()
-
-
 def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=None,
                         max_tokens=4096, anthropic_version="2023-06-01",
-                        auth_header=None):
+                        auth_header=None, provider_id=None, provider_name=None,
+                        credential_env=None):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -213,78 +202,165 @@ def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=Non
         model=model,
         anthropic_version=anthropic_version,
         auth_header=auth_header,
+        provider_id=provider_id,
+        provider_name=provider_name,
+        credential_env=credential_env,
     )
 
 
-def build_config_from_env(environ=os.environ, secret_lookup=_lookup_api_key_with_secret_tool):
-    """Build runtime provider config from environment and consume API key vars.
+def build_config_from_env(environ=os.environ,
+                          credentials: CredentialStore | None = None):
+    """Build an explicit/default runtime config from captured startup values."""
+    if credentials is None:
+        credentials = CredentialStore.capture(environ)
 
-    This removes LOKI_API_KEY, OPENAI_API_KEY, and ANTHROPIC_API_KEY from the
-    supplied environment. Loki passes a normalized LOKI_API_KEY to subagents
-    explicitly, so removing provider-specific env vars here prevents child tools
-    and subprocesses from inheriting extra ambient credentials they do not need.
-    """
     # URL precedence: explicit LOKI_API_BASE, then OPENAI_API_BASE, then
     # ANTHROPIC_BASE_URL (a common Claude Code / Anthropic SDK convention we
     # honor as a compat alias), then the built-in default. If the URL comes
     # from ANTHROPIC_BASE_URL with no explicit LOKI_PROVIDER, default the
     # protocol to anthropic_messages -- the base URL usually isn't a full
     # endpoint path so auto-detection from URL alone would fail.
-    config_url = (environ.get("LOKI_API_BASE") or
-                  environ.get("OPENAI_API_BASE") or
-                  environ.get("ANTHROPIC_BASE_URL") or
-                  DEFAULT_API_BASE)
-    provider_override = environ.get("LOKI_PROVIDER")
+    config_url = (credentials.get("LOKI_API_BASE") or
+                  credentials.get("OPENAI_API_BASE") or
+                  credentials.get("ANTHROPIC_BASE_URL"))
+    if not config_url:
+        raise ValueError(
+            "API endpoint missing; set LOKI_API_BASE or select one with /model")
+    provider_override = credentials.get("LOKI_PROVIDER")
     if (not provider_override
-            and not environ.get("LOKI_API_BASE")
-            and not environ.get("OPENAI_API_BASE")
-            and environ.get("ANTHROPIC_BASE_URL")):
+            and not credentials.get("LOKI_API_BASE")
+            and not credentials.get("OPENAI_API_BASE")
+            and credentials.get("ANTHROPIC_BASE_URL")):
         provider_override = "anthropic_messages"
     config_provider_kind = protocols.resolve_protocol(config_url, provider_override or "auto")
-    config_netloc = urllib.parse.urlparse(config_url).netloc
 
     if config_provider_kind == protocols.DUMMY:
         # No-op provider for testing: no network, no API key, fake URL.
         config_api_key = "dummy-key"
-        config_model = environ.get("LOKI_MODEL") or "dummy"
+        config_model = credentials.get("LOKI_MODEL") or "dummy"
         return make_runtime_config(
             config_url,
             config_provider_kind,
             config_api_key,
             model=config_model,
-            max_tokens=_int_env("LOKI_MAX_TOKENS", 4096, environ),
-            anthropic_version=environ.get("ANTHROPIC_VERSION", "2023-06-01"),
+            max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
+            anthropic_version=credentials.get(
+                "ANTHROPIC_VERSION", "2023-06-01"),
         )
 
-    env_api_keys = _pop_env_api_keys(['LOKI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'], environ)
-    # LOKI_API_KEY is the explicit override. Otherwise prefer the key whose name
-    # matches the selected wire protocol, with the other provider key as a
-    # compatibility fallback for gateways that expose one protocol under another
-    # provider's credentials.
-    if config_provider_kind == protocols.ANTHROPIC_MESSAGES:
-        config_api_key = (env_api_keys.get('LOKI_API_KEY') or
-                          env_api_keys.get('ANTHROPIC_API_KEY') or
-                          env_api_keys.get('OPENAI_API_KEY') or "")
-    else:
-        config_api_key = (env_api_keys.get('LOKI_API_KEY') or
-                          env_api_keys.get('OPENAI_API_KEY') or
-                          env_api_keys.get('ANTHROPIC_API_KEY') or "")
+    # Never infer credential ownership from the wire protocol. An explicitly
+    # configured endpoint uses only Loki's explicit credential.
+    credential_names = ["LOKI_API_KEY"]
+    credential_env, config_api_key = credentials.first_available(
+        credential_names)
     if not config_api_key:
-        config_api_key = secret_lookup(config_netloc)
+        raise ValueError(
+            "API credential missing; set one of: "
+            + ", ".join(credential_names))
 
-    if not config_api_key:
-        raise ValueError('API key missing.  Please run secret-tool store --label="opencode API key" domain {!r}'.format(config_netloc))
-
-    config_model = environ.get('LOKI_MODEL') or ('glm-5.2' if config_url == DEFAULT_API_BASE else '')
+    config_model = credentials.get("LOKI_MODEL")
     return make_runtime_config(
         config_url,
         config_provider_kind,
         config_api_key,
         model=config_model,
-        models_url=environ.get("LOKI_MODELS_URL"),
-        max_tokens=_int_env("LOKI_MAX_TOKENS", 4096, environ),
-        anthropic_version=environ.get("ANTHROPIC_VERSION", "2023-06-01"),
-        auth_header=environ.get("LOKI_AUTH_HEADER"),
+        models_url=credentials.get("LOKI_MODELS_URL") or None,
+        max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
+        anthropic_version=credentials.get(
+            "ANTHROPIC_VERSION", "2023-06-01"),
+        auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
+        credential_env=credential_env,
+    )
+
+
+def explicit_api_base_configured(credentials: CredentialStore) -> bool:
+    return any(credentials.get(name) for name in (
+        "LOKI_API_BASE", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL"))
+
+
+def config_from_connection_descriptor(
+        descriptor: ConnectionDescriptor,
+        credentials: CredentialStore) -> RuntimeConfig:
+    api_key = credentials.get(descriptor.credential_env)
+    if not api_key:
+        raise ValueError(
+            f"saved connection requires missing {descriptor.credential_env}")
+
+    provider_kind = credentials.get("LOKI_PROVIDER") or descriptor.protocol
+    config_model = credentials.get("LOKI_MODEL") or descriptor.model
+    max_tokens = (
+        _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)
+        if credentials.get("LOKI_MAX_TOKENS") else descriptor.max_tokens)
+    anthropic_version = (
+        credentials.get("ANTHROPIC_VERSION")
+        or descriptor.anthropic_version)
+    auth_header = (
+        credentials.get("LOKI_AUTH_HEADER")
+        if credentials.get("LOKI_AUTH_HEADER")
+        else descriptor.auth_header)
+    return make_runtime_config(
+        # Restore the concrete endpoint that was actually used, rather than
+        # deriving it again from a catalog base URL.
+        descriptor.chat_url,
+        provider_kind,
+        api_key,
+        model=config_model,
+        models_url=descriptor.models_url,
+        max_tokens=max_tokens,
+        anthropic_version=anthropic_version,
+        auth_header=auth_header,
+        provider_id=descriptor.provider_id,
+        provider_name=descriptor.provider_name,
+        credential_env=descriptor.credential_env,
+    )
+
+
+def config_from_modelsdev_selection(
+        provider_id: str,
+        provider_entry: dict,
+        model_entry: dict,
+        credentials: CredentialStore) -> RuntimeConfig:
+    access = modelsdev.provider_access(provider_entry, credentials)
+    if access is None:
+        raise ValueError(
+            f"provider {provider_id!r} is not available from startup credentials")
+    selected_model = model_entry.get("id") or model_entry.get("name")
+    if not selected_model:
+        raise ValueError(f"provider {provider_id!r} returned a model without an id")
+    return make_runtime_config(
+        access.api_url,
+        access.protocol,
+        credentials.get(access.credential_env),
+        model=selected_model,
+        max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
+        anthropic_version=credentials.get(
+            "ANTHROPIC_VERSION", "2023-06-01"),
+        auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
+        provider_id=provider_id,
+        provider_name=provider_entry.get("name"),
+        credential_env=access.credential_env,
+    )
+
+
+def active_connection_descriptor() -> ConnectionDescriptor | None:
+    if not RUNTIME_CONFIG or RUNTIME_CONFIG.provider_kind == protocols.DUMMY:
+        return None
+    credential_env = RUNTIME_CONFIG.credential_env
+    if not credential_env:
+        return None
+    provider = RUNTIME_CONFIG.chat_provider
+    return ConnectionDescriptor(
+        provider_id=RUNTIME_CONFIG.provider_id,
+        provider_name=RUNTIME_CONFIG.provider_name,
+        model=model,
+        api_url=RUNTIME_CONFIG.url,
+        chat_url=provider.chat_url,
+        models_url=provider.models_url,
+        protocol=RUNTIME_CONFIG.provider_kind,
+        credential_env=credential_env,
+        max_tokens=provider.max_tokens,
+        anthropic_version=RUNTIME_CONFIG.anthropic_version,
+        auth_header=RUNTIME_CONFIG.auth_header,
     )
 
 
@@ -298,7 +374,8 @@ def apply_runtime_config(config: RuntimeConfig):
 
 def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None,
                        models_url=None, max_tokens=None, anthropic_version=None,
-                       auth_header=None):
+                       auth_header=None, provider_id=None, provider_name=None,
+                       credential_env=None):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -326,6 +403,12 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
         max_tokens=max_tokens if max_tokens is not None else current.chat_provider.max_tokens,
         anthropic_version=new_anthropic_version,
         auth_header=new_auth_header,
+        provider_id=(provider_id if provider_id is not None
+                     else current.provider_id),
+        provider_name=(provider_name if provider_name is not None
+                       else current.provider_name),
+        credential_env=(credential_env if credential_env is not None
+                        else current.credential_env),
     ))
 
 
@@ -2645,6 +2728,8 @@ def _status_api_base() -> str:
     if RUNTIME_CONFIG:
         configured_url = RUNTIME_CONFIG.chat_provider.input_url if RUNTIME_CONFIG.chat_provider else RUNTIME_CONFIG.url
 
+    if not configured_url:
+        return "not configured"
     parsed = urllib.parse.urlparse(configured_url)
     if not parsed.netloc:
         return configured_url
@@ -2710,7 +2795,7 @@ async def load_models_async():
         loaded = RUNTIME_CONFIG.chat_provider.parse_model_ids(data)
         if loaded:
             models = loaded
-            if model not in models:
+            if not model:
                 model = 'glm-5.2' if 'glm-5.2' in models else models[0]
             return
 
@@ -2843,9 +2928,13 @@ def new_chat_log(filename):
     chat_log = open(filename, 'w')
 
 def save_chat_log():
+    state = {"shell_cwd": shell_cwd}
+    descriptor = active_connection_descriptor()
+    if descriptor is not None:
+        state["connection"] = descriptor.to_dict()
     savefiles.write_chat_log(
         chat_log, transcript_items, session_todos,
-        {"shell_cwd": shell_cwd})
+        state)
 
 
 def render_resume_transcript(items: list) -> str:
@@ -2880,6 +2969,33 @@ def load_session_state(state: dict):
         change_shell_cwd(loaded_shell_cwd)
     except FileNotFoundError:
         print(f"Warning: saved cwd no longer exists: {loaded_shell_cwd}", file=sys.stderr)
+
+
+def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:
+    if not isinstance(state, dict) or "connection" not in state:
+        return None
+    return ConnectionDescriptor.from_dict(state["connection"])
+
+
+async def confirm_saved_connection_async(
+        descriptor: ConnectionDescriptor, input_fn,
+        config: RuntimeConfig | None = None) -> bool:
+    provider = descriptor.provider_name or descriptor.provider_id or "custom"
+    selected_model = config.model if config is not None else descriptor.model
+    endpoint = (config.chat_provider.chat_url
+                if config is not None else descriptor.chat_url)
+    print("Saved connection:", file=sys.stderr)
+    print(f"  Provider: {provider}", file=sys.stderr)
+    print(f"  Model: {selected_model}", file=sys.stderr)
+    print(f"  Chat endpoint: {endpoint}", file=sys.stderr)
+    models_endpoint = (config.chat_provider.models_url
+                       if config is not None else descriptor.models_url)
+    if models_endpoint:
+        print(f"  Models endpoint: {models_endpoint}", file=sys.stderr)
+    print(f"  Credential: {descriptor.credential_env}", file=sys.stderr)
+    sys.stderr.flush()
+    answer = (await input_fn("Use this saved connection? [y/N]: ") or "")
+    return answer.strip().lower() in ("y", "yes")
 
 def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
     return asyncio.run(run_subagent_prompt_async(subagent_type, prompt))
@@ -2930,9 +3046,14 @@ async def async_main(args):
         elif option_name == '--toolset':
             toolset = option_value
 
-    await load_models_async()
-
     if subagent_type or headless:
+        try:
+            apply_runtime_config(build_config_from_env(
+                credentials=CREDENTIALS))
+        except (protocols.ProtocolError, ValueError) as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return
+        await load_models_async()
         await run_subagent_cli_async(subagent_type or toolset or "Explore", prompt_arg)
         return
 
@@ -2962,8 +3083,54 @@ async def async_main(args):
             picked = await run_session_picker_async(session=session)
             log_filename = picked if picked is not None else ''
 
-        if log_filename:
-            load_chat_log(resolve_chat_log_path(log_filename))
+        resolved_log_filename = (
+            resolve_chat_log_path(log_filename) if log_filename else None)
+        saved_state = {}
+        if resolved_log_filename:
+            try:
+                with open(resolved_log_filename, "r", encoding="utf-8") as f:
+                    _, _, saved_state = savefiles.read_chat_log(f)
+            except (OSError, json.JSONDecodeError,
+                    formats.TranscriptFormatError) as e:
+                print(f"Could not resume chat: {e}", file=sys.stderr)
+                return
+
+        try:
+            if explicit_api_base_configured(CREDENTIALS):
+                config = build_config_from_env(credentials=CREDENTIALS)
+            else:
+                descriptor = connection_from_session_state(saved_state)
+                if descriptor is None:
+                    config = None
+                else:
+                    config = config_from_connection_descriptor(
+                        descriptor, CREDENTIALS)
+                    await session.pause()
+                    try:
+                        confirmed = await confirm_saved_connection_async(
+                            descriptor,
+                            lambda prompt: session.prompt(prompt),
+                            config=config)
+                    finally:
+                        await session.resume()
+                    if not confirmed:
+                        print("Resume cancelled.", file=sys.stderr)
+                        return
+        except (ConnectionDescriptorError, protocols.ProtocolError,
+                ValueError) as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return
+
+        if config is not None:
+            apply_runtime_config(config)
+            await load_models_async()
+        else:
+            print("No provider configured; use /model to select one.",
+                  file=sys.stderr)
+            sys.stderr.flush()
+
+        if resolved_log_filename:
+            load_chat_log(resolved_log_filename)
         else:
             new_chat_log(new_chat_log_path())
 
@@ -2997,7 +3164,8 @@ async def async_main(args):
                     await session.pause()
                     try:
                         picked = await modelsdev.run_model_picker_async(
-                            input_fn=input_fn)
+                            input_fn=input_fn,
+                            credentials=CREDENTIALS)
                     except (OSError, json.JSONDecodeError) as e:
                         # models.dev unreachable (network errors) or answered with
                         # non-JSON garbage (JSONDecodeError from parsing the body):
@@ -3013,6 +3181,10 @@ async def async_main(args):
                         if model:
                             reinstall_provider(model=model)
                             await load_models_async()
+                            save_chat_log()
+                            print(f"Selected model: {model}", file=sys.stderr)
+                            sys.stderr.flush()
+                            continue
                         else:
                             print("Model selection cancelled.", file=sys.stderr)
                             sys.stderr.flush()
@@ -3025,35 +3197,19 @@ async def async_main(args):
                         sys.stderr.flush()
                         continue
                     provider_id, provider_entry, model_entry = picked
-                    model = model_entry.get("id") or model_entry.get("name")
-                    api = provider_entry.get("api")
-                    if not api:
-                        print(f"Provider {provider_id!r} has no api base URL; "
-                              f"keeping current provider.", file=sys.stderr)
-                    else:
-                        # Reinstall the Provider for the chosen model + provider
-                        # so its wire protocol, endpoint, and headers take
-                        # effect mid-session, then refresh the model list.
-                        # OpenRouter-style bare /v1 bases and bespoke gateways
-                        # expose OpenAI-compatible endpoints, so default to
-                        # openai_chat when the URL does not name a protocol.
-                        kind = (protocols.detect_protocol_from_url(api)
-                                or protocols.detect_protocol_from_npm(
-                                    provider_entry.get("npm"))
-                                or protocols.OPENAI_CHAT)
-                        try:
-                            reinstall_provider(
-                                model=model,
-                                url=api,
-                                provider_kind=kind,
-                                api_key=modelsdev.api_key_for(
-                                    provider_entry, RUNTIME_CONFIG.api_key),
-                            )
-                        except (protocols.ProtocolError, ValueError) as e:
-                            print(f"Could not switch to {provider_id!r}: {e}",
-                                  file=sys.stderr)
-                            sys.stderr.flush()
-                            continue
+                    try:
+                        apply_runtime_config(config_from_modelsdev_selection(
+                            provider_id,
+                            provider_entry,
+                            model_entry,
+                            CREDENTIALS,
+                        ))
+                    except (protocols.ProtocolError, ValueError) as e:
+                        print(f"Could not switch to {provider_id!r}: {e}",
+                              file=sys.stderr)
+                        sys.stderr.flush()
+                        continue
+                    save_chat_log()
                     via = f" via {provider_id}" if provider_id else ""
                     print(f"Selected model: {model}{via}", file=sys.stderr)
                     sys.stderr.flush()
@@ -3078,6 +3234,12 @@ async def async_main(args):
                     else:
                         pass
 
+            if RUNTIME_CONFIG is None:
+                print("No provider configured; use /model to select one.",
+                      file=sys.stderr)
+                sys.stderr.flush()
+                continue
+
             transcript_items.append(formats.message_item("user", user_in))
 
             try:
@@ -3096,7 +3258,8 @@ async def async_main(args):
                 continue # Drop immediately back to the User> prompt
 
 def main():
-    apply_runtime_config(build_config_from_env())
+    global CREDENTIALS
+    CREDENTIALS = CredentialStore.capture(os.environ)
     cleanup_done = False
 
     def clean_up_step(thunk):
@@ -3143,4 +3306,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

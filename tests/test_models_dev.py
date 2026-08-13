@@ -1,5 +1,4 @@
 import asyncio
-import os
 import pathlib
 import sys
 import unittest
@@ -8,6 +7,7 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from loki_agent import models
+from loki_agent.credentials import CredentialStore
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
 DATA = {
@@ -52,6 +52,16 @@ DATA = {
 
 def _groups():
     return models.build_groups(DATA)
+
+
+def _credentials(**overrides):
+    values = {
+        "ZHIPU_API_KEY": "zhipu-key",
+        "OPENROUTER_API_KEY": "openrouter-key",
+        "ANTHROPIC_API_KEY": "anthropic-key",
+    }
+    values.update(overrides)
+    return CredentialStore(values)
 
 
 def _input_script(inputs):
@@ -120,6 +130,7 @@ class ProtocolAndKeyTests(unittest.TestCase):
             "npm": "@ai-sdk/openai-compatible",
         }))
         self.assertTrue(models.provider_supported({
+            "api": "https://api.anthropic.com/v1/messages",
             "npm": "@ai-sdk/anthropic",
         }))
         self.assertTrue(models.provider_supported({
@@ -175,6 +186,45 @@ class ProtocolAndKeyTests(unittest.TestCase):
         self.assertEqual(set(groups), {"Alive Model", "Mixed Model"})
         self.assertEqual([pid for pid, _, _ in groups["Mixed Model"]], ["p3"])
 
+    def test_filter_groups_uses_credentials_after_protocol_filtering(self):
+        groups = models.filter_supported_groups(
+            _groups(), CredentialStore({"OPENROUTER_API_KEY": "key"}))
+        self.assertEqual(set(groups), {"GLM-5.2"})
+        self.assertEqual(
+            [pid for pid, _, _ in groups["GLM-5.2"]],
+            ["openrouter"],
+        )
+
+    def test_shared_credential_keeps_every_matching_provider(self):
+        data = {
+            pid: {
+                "name": pid,
+                "env": ["SHARED_API_KEY"],
+                "api": f"https://{pid}.example.test/v1",
+                "models": {
+                    "m": {"id": "m", "name": "Shared Model"},
+                },
+            }
+            for pid in ("regional-a", "regional-b")
+        }
+        groups = models.filter_supported_groups(
+            models.build_groups(data),
+            CredentialStore({"SHARED_API_KEY": "key"}),
+        )
+        self.assertEqual(
+            [pid for pid, _, _ in groups["Shared Model"]],
+            ["regional-a", "regional-b"],
+        )
+
+    def test_pat_is_a_catalog_credential_candidate(self):
+        entry = {
+            "env": ["EXAMPLE_ACCOUNT", "EXAMPLE_PAT"],
+            "api": "https://example.test/v1",
+        }
+        access = models.provider_access(
+            entry, CredentialStore({"EXAMPLE_PAT": "pat"}))
+        self.assertEqual(access.credential_env, "EXAMPLE_PAT")
+
     def test_protocol_label_detects_from_api_url(self):
         openai_chat = {"api": "https://x.test/v1/chat/completions", "npm": "@ai-sdk/openai"}
         anthropic = {"api": "https://x.test/v1/messages", "npm": "@ai-sdk/anthropic"}
@@ -191,11 +241,41 @@ class ProtocolAndKeyTests(unittest.TestCase):
         self.assertEqual(models.protocol_label(noapi), "@ai-sdk/mistral")
         self.assertEqual(models.protocol_label(neither), "no-api")
 
-    def test_api_key_for_prefers_provider_env_var_then_fallback(self):
-        entry = DATA["zhipuai"]
-        with mock.patch.dict(os.environ, {"ZHIPU_API_KEY": "zk", "OTHER": "no"}):
-            self.assertEqual(models.api_key_for(entry, "fallback"), "zk")
-        self.assertEqual(models.api_key_for(entry, "fallback"), "fallback")
+    def test_provider_access_resolves_declared_credential(self):
+        access = models.provider_access(
+            DATA["zhipuai"], CredentialStore({"ZHIPU_API_KEY": "zk"}))
+        self.assertEqual(access.credential_env, "ZHIPU_API_KEY")
+        self.assertEqual(access.api_url, "https://open.bigmodel.cn/api/paas/v4")
+        self.assertEqual(access.protocol, "openai_chat")
+
+    def test_provider_access_requires_credentials_and_template_values(self):
+        entry = {
+            "env": ["EXAMPLE_API_KEY", "EXAMPLE_ACCOUNT"],
+            "api": "https://${EXAMPLE_ACCOUNT}.example.test/v1",
+            "npm": "@ai-sdk/openai-compatible",
+        }
+        self.assertIsNone(models.provider_access(
+            entry, CredentialStore({"EXAMPLE_ACCOUNT": "acct"})))
+        self.assertIsNone(models.provider_access(
+            entry, CredentialStore({"EXAMPLE_API_KEY": "key"})))
+        access = models.provider_access(
+            entry,
+            CredentialStore({
+                "EXAMPLE_API_KEY": "key",
+                "EXAMPLE_ACCOUNT": "acct",
+            }),
+        )
+        self.assertEqual(access.api_url, "https://acct.example.test/v1")
+
+        secret_url = dict(
+            entry, api="https://example.test/${EXAMPLE_API_KEY}/v1")
+        self.assertIsNone(models.provider_access(
+            secret_url,
+            CredentialStore({
+                "EXAMPLE_API_KEY": "key",
+                "EXAMPLE_ACCOUNT": "acct",
+            }),
+        ))
 
 
 class MenuTests(unittest.TestCase):
@@ -242,6 +322,10 @@ class MenuTests(unittest.TestCase):
             rows, "Choice: ", _input_script(["filter zhipu ai", "1"])))
         self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
 
+    def test_provider_rows_show_catalog_api_url(self):
+        rows = models._provider_rows(_groups()["GLM-5.2"])
+        self.assertTrue(all(" api=https://" in row[1] for row in rows))
+
 
 class PickerTests(unittest.TestCase):
     def test_run_model_picker_two_level_flow(self):
@@ -251,7 +335,7 @@ class PickerTests(unittest.TestCase):
             # Model menu (sorted): 1. Claude Sonnet 4.6, 2. GLM-5.2.
             # Provider menu (sorted): 1. OpenRouter, 2. Zhipu AI.
             result = asyncio.run(models.run_model_picker_async(
-                _input_script(["2", "1"])))
+                _input_script(["2", "1"]), _credentials()))
         finally:
             models._index_cache = saved
 
@@ -263,7 +347,8 @@ class PickerTests(unittest.TestCase):
         saved = models._index_cache
         models._index_cache = (DATA, models.build_groups(DATA))
         try:
-            result = asyncio.run(models.run_model_picker_async(_input_script([""])))
+            result = asyncio.run(models.run_model_picker_async(
+                _input_script([""]), _credentials()))
         finally:
             models._index_cache = saved
         self.assertIsNone(result)
@@ -273,7 +358,8 @@ class PickerTests(unittest.TestCase):
         saved = models._index_cache
         models._index_cache = (DATA, models.build_groups(DATA))
         try:
-            result = asyncio.run(models.run_model_picker_async(_input_script(["1", ""])))
+            result = asyncio.run(models.run_model_picker_async(
+                _input_script(["1", ""]), _credentials()))
         finally:
             models._index_cache = saved
         self.assertIsNone(result)
@@ -300,7 +386,8 @@ class PickerTests(unittest.TestCase):
         with mock.patch("loki_agent.models.ensure_index",
                         side_effect=OSError("boom")):
             with self.assertRaises(OSError):
-                asyncio.run(models.run_model_picker_async(_input_script([])))
+                asyncio.run(models.run_model_picker_async(
+                    _input_script([]), _credentials()))
 
     def test_picker_prompts_advertise_filter_gesture(self):
         saved = models._index_cache
@@ -312,7 +399,7 @@ class PickerTests(unittest.TestCase):
             raise EOFError
 
         try:
-            asyncio.run(models.run_model_picker_async(capture))
+            asyncio.run(models.run_model_picker_async(capture, _credentials()))
         except EOFError:
             pass
         finally:

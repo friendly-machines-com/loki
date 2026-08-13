@@ -24,12 +24,14 @@ cancel.
 """
 
 import json
-import os
+import re
 import sys
 import urllib.request
 from collections import defaultdict
+from dataclasses import dataclass
 
 from . import protocols
+from .credentials import CredentialStore, is_credential_name
 
 MODELS_DEV_URL = "https://models.dev/api.json"
 USER_AGENT = "loki-models.dev-picker/1.0"
@@ -55,6 +57,14 @@ FEATURE_LABELS = {
 }
 
 _index_cache = None  # (data, groups) once fetched this session
+_API_TEMPLATE_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+@dataclass(frozen=True)
+class ProviderAccess:
+    credential_env: str
+    api_url: str
+    protocol: str
 
 
 # --------------------------------------------------------------------------
@@ -183,18 +193,30 @@ def cost_text(model_entry):
 
 def protocol_label(provider_entry):
     """Short wire-protocol-ish label for a provider entry."""
-    api = provider_entry.get("api")
-    if api:
-        detected = protocols.detect_protocol_from_url(api)
-        if detected:
-            return detected.replace("_", "-")
+    detected = provider_protocol(provider_entry)
+    if detected:
+        return detected.replace("_", "-")
     return (provider_entry.get("npm") or "no-api")
+
+
+def provider_protocol(provider_entry):
+    """Implemented wire protocol for a catalog provider, or None."""
+    api = provider_entry.get("api") or ""
+    detected = protocols.detect_protocol_from_url(api)
+    if detected in protocols.SUPPORTED_PROTOCOLS:
+        return detected
+    detected = protocols.detect_protocol_from_npm(provider_entry.get("npm"))
+    if detected in protocols.SUPPORTED_PROTOCOLS:
+        return detected
+    if api.rstrip("/").endswith("/v1"):
+        return protocols.OPENAI_CHAT
+    return None
 
 
 def provider_supported(provider_entry):
     """True if Loki can actually use this provider.
 
-    A provider is usable if any of:
+    A provider needs a concrete API URL and one of:
       1. Its ``api`` URL names one of the supported wire protocols via its
          endpoint path (.../chat/completions, .../messages, .../responses).
       2. Its ``npm`` package is one of the three that names a protocol
@@ -203,41 +225,70 @@ def provider_supported(provider_entry):
       3. Its ``api`` URL follows the OpenAI-compatible bare ``/v1`` base
          convention, which reinstall_provider treats as openai_chat.
 
-    Providers with no usable signal are dropped.
+    Providers with no API URL or usable protocol signal are dropped.
     """
-    api = provider_entry.get("api") or ""
-    if protocols.detect_protocol_from_url(api) in protocols.SUPPORTED_PROTOCOLS:
-        return True
-    if protocols.detect_protocol_from_npm(provider_entry.get("npm")) is not None:
-        return True
-    return api.rstrip("/").endswith("/v1")
+    return bool(provider_entry.get("api")) and provider_protocol(provider_entry) is not None
+
+
+def provider_access(provider_entry, credentials: CredentialStore):
+    """Resolve a catalog provider against the captured startup environment.
+
+    Returns the credential name, expanded API URL, and implemented protocol.
+    Credential candidates preserve models.dev declaration order. API-template
+    variables may use any startup variable, not only credential-shaped ones.
+    """
+    if not provider_supported(provider_entry):
+        return None
+    credential_names = [
+        name for name in (provider_entry.get("env") or [])
+        if is_credential_name(name)
+    ]
+    credential_env, credential_value = credentials.first_available(
+        credential_names)
+    if not credential_env or not credential_value:
+        return None
+
+    api_template = provider_entry.get("api")
+    template_names = _API_TEMPLATE_VAR_RE.findall(api_template)
+    # Persisted and displayed endpoint URLs are non-secret configuration.
+    # Never expand a credential itself into a URL.
+    if any(is_credential_name(name) for name in template_names):
+        return None
+    missing = [
+        name for name in template_names if not credentials.has(name)]
+    if missing:
+        return None
+    api_url = _API_TEMPLATE_VAR_RE.sub(
+        lambda match: credentials.get(match.group(1)), api_template)
+    return ProviderAccess(
+        credential_env=credential_env,
+        api_url=api_url,
+        protocol=provider_protocol(provider_entry),
+    )
 
 
 def is_deprecated(model_entry):
     return model_entry.get("status") == "deprecated"
 
 
-def filter_supported_groups(groups):
-    """Drop providers Loki cannot use or that mark the model deprecated, then
-    drop models with no remaining provider. A model served only by deprecated
-    providers disappears entirely; a model with at least one live provider
-    keeps only those providers in its submenu."""
+def filter_supported_groups(groups, credentials: CredentialStore | None = None):
+    """Drop unusable/deprecated provider members and then empty model groups.
+
+    With a credential store, usable also means that a declared credential and
+    every API-template variable are present. The optional protocol-only mode is
+    useful to callers that are inspecting catalog support independently of one
+    process environment.
+    """
     out = {}
     for name, members in groups.items():
         kept = [m for m in members
-                if provider_supported(m[1]) and not is_deprecated(m[2])]
+                if provider_supported(m[1])
+                and not is_deprecated(m[2])
+                and (credentials is None
+                     or provider_access(m[1], credentials) is not None)]
         if kept:
             out[name] = kept
     return out
-
-
-def api_key_for(provider_entry, fallback=""):
-    """First API key env var the provider declares, else the fallback key."""
-    for var in provider_entry.get("env") or []:
-        value = os.environ.get(var)
-        if value:
-            return value
-    return fallback
 
 
 # --------------------------------------------------------------------------
@@ -329,6 +380,8 @@ def _provider_rows(members):
         if feat:
             parts.append(f"({feat})")
         parts.append(f"[{protocol_label(prov)}]")
+        if prov.get("api"):
+            parts.append(f"api={prov['api']}")
         cost = cost_text(m).strip()
         if cost:
             parts.append(cost)
@@ -357,7 +410,8 @@ async def run_flat_model_picker_async(input_fn, model_ids):
         input_fn)
 
 
-async def run_model_picker_async(input_fn, cache_path=None):
+async def run_model_picker_async(input_fn, credentials: CredentialStore,
+                                 cache_path=None):
     """Two-level picker: conflated model -> provider.
 
     Returns (provider_id, provider_entry, model_entry) for the chosen
@@ -369,11 +423,12 @@ async def run_model_picker_async(input_fn, cache_path=None):
     _, groups = ensure_index(cache_path=cache_path)
     # Keep only models served by at least one provider whose wire protocol
     # Loki can speak, so the menu is not flooded with the long tail.
-    groups = filter_supported_groups(groups)
+    groups = filter_supported_groups(groups, credentials)
 
     model_rows = _model_rows(groups)
     if not model_rows:
-        print("models.dev returned no models.", file=sys.stderr)
+        print("No models available for configured provider credentials.",
+              file=sys.stderr)
         return None
     members = await _numbered_menu_async(
         model_rows,
