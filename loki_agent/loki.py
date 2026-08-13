@@ -238,6 +238,7 @@ def build_config_from_env(environ=os.environ,
             max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
             anthropic_version=credentials.get(
                 "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
+            provider_name="Explicit LOKI_* connection",
         )
 
     # Never infer credential ownership from the wire protocol. An explicitly
@@ -261,12 +262,30 @@ def build_config_from_env(environ=os.environ,
         anthropic_version=credentials.get(
             "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
+        provider_name="Explicit LOKI_* connection",
         credential_env=credential_env,
     )
 
 
 def explicit_api_base_configured(credentials: CredentialStore) -> bool:
     return bool(credentials.get("LOKI_API_BASE"))
+
+
+def explicit_connection_option(
+        credentials: CredentialStore
+) -> modelsdev.ExplicitConnectionOption | None:
+    """Return a selectable captured LOKI_* connection when it is complete."""
+    try:
+        config = build_config_from_env(credentials=credentials)
+    except (protocols.ProtocolError, ValueError):
+        return None
+    if not config.model:
+        return None
+    return modelsdev.ExplicitConnectionOption(
+        model=config.model,
+        api_url=config.url,
+        protocol=config.provider_kind,
+    )
 
 
 def config_from_connection_descriptor(
@@ -3216,12 +3235,13 @@ async def async_main(args) -> int:
                 case '/quit':
                     break
                 case '/model':
-                    provider_id = None
+                    explicit_option = explicit_connection_option(CREDENTIALS)
                     async with session.modal() as modal:
                         try:
                             picked = await modelsdev.run_model_picker_async(
                                 input_fn=modal.prompt,
-                                credentials=CREDENTIALS)
+                                credentials=CREDENTIALS,
+                                explicit_connection=explicit_option)
                         except (OSError, json.JSONDecodeError) as e:
                             # models.dev unreachable (network errors) or answered
                             # with non-JSON garbage: fall back to the current
@@ -3232,19 +3252,33 @@ async def async_main(args) -> int:
                             await load_models_async()
                             selected_model = (
                                 await modelsdev.run_flat_model_picker_async(
-                                    modal.prompt, models))
+                                    modal.prompt, models,
+                                    explicit_connection=explicit_option))
                             if selected_model:
-                                reinstall_provider(
-                                    model=selected_model,
-                                    models_url=(
-                                        RUNTIME_CONFIG.chat_provider.models_url
-                                        if RUNTIME_CONFIG else None),
-                                )
+                                if isinstance(
+                                        selected_model,
+                                        modelsdev.ExplicitConnectionOption):
+                                    apply_runtime_config(
+                                        build_config_from_env(
+                                            credentials=CREDENTIALS))
+                                    selected_label = selected_model.model
+                                    selected_via = " via explicit LOKI_*"
+                                else:
+                                    reinstall_provider(
+                                        model=selected_model,
+                                        models_url=(
+                                            RUNTIME_CONFIG.chat_provider.models_url
+                                            if RUNTIME_CONFIG else None),
+                                    )
+                                    selected_label = selected_model
+                                    selected_via = ""
                                 descriptor = active_connection_descriptor()
                                 if descriptor is not None:
                                     set_session_connection(descriptor)
                                 save_chat_log()
-                                print(f"Selected model: {selected_model}",
+                                print(
+                                    f"Selected model: {selected_label}"
+                                    f"{selected_via}",
                                       file=sys.stderr)
                                 sys.stderr.flush()
                                 continue
@@ -3257,16 +3291,26 @@ async def async_main(args) -> int:
                         print("Model selection cancelled.", file=sys.stderr)
                         sys.stderr.flush()
                         continue
-                    provider_id, provider_entry, model_entry = picked
                     try:
-                        apply_runtime_config(config_from_modelsdev_selection(
-                            provider_id,
-                            provider_entry,
-                            model_entry,
-                            CREDENTIALS,
-                        ))
+                        if isinstance(
+                                picked,
+                                modelsdev.ExplicitConnectionOption):
+                            apply_runtime_config(build_config_from_env(
+                                credentials=CREDENTIALS))
+                            via = " via explicit LOKI_*"
+                        else:
+                            provider_id, provider_entry, model_entry = picked
+                            apply_runtime_config(
+                                config_from_modelsdev_selection(
+                                    provider_id,
+                                    provider_entry,
+                                    model_entry,
+                                    CREDENTIALS,
+                                ))
+                            via = (
+                                f" via {provider_id}" if provider_id else "")
                     except (protocols.ProtocolError, ValueError) as e:
-                        print(f"Could not switch to {provider_id!r}: {e}",
+                        print(f"Could not switch model: {e}",
                               file=sys.stderr)
                         sys.stderr.flush()
                         continue
@@ -3274,7 +3318,6 @@ async def async_main(args) -> int:
                     if descriptor is not None:
                         set_session_connection(descriptor)
                     save_chat_log()
-                    via = f" via {provider_id}" if provider_id else ""
                     print(f"Selected model: {model}{via}", file=sys.stderr)
                     sys.stderr.flush()
                     continue

@@ -66,6 +66,15 @@ class ProviderAccess:
     protocol: str
 
 
+@dataclass(frozen=True)
+class ExplicitConnectionOption:
+    """A captured LOKI_* connection offered alongside catalog providers."""
+
+    model: str
+    api_url: str
+    protocol: str
+
+
 # --------------------------------------------------------------------------
 # Data loading and indexing
 # --------------------------------------------------------------------------
@@ -343,26 +352,80 @@ async def _numbered_menu_async(rows, prompt, input_fn, header=None):
 
 def _provider_list(members):
     """All provider ids for a grouped model, in catalog order."""
-    return ", ".join(pid for pid, _, _ in members)
+    return ", ".join(
+        "explicit LOKI_*" if isinstance(member, ExplicitConnectionOption)
+        else member[0]
+        for member in members)
+
+
+def _catalog_members(members):
+    return [
+        member for member in members
+        if not isinstance(member, ExplicitConnectionOption)]
+
+
+def _add_explicit_connection(groups, explicit_connection):
+    if explicit_connection is None:
+        return {name: list(members) for name, members in groups.items()}
+
+    result = {name: list(members) for name, members in groups.items()}
+    matching_name = next(
+        (name for name in result
+         if name.casefold() == explicit_connection.model.casefold()),
+        None,
+    )
+    if matching_name is None:
+        matching_name = next(
+            (name for name, members in result.items()
+             if any(
+                 (model_entry.get("id") or "") == explicit_connection.model
+                 for _, _, model_entry in members)),
+            explicit_connection.model,
+        )
+    result.setdefault(matching_name, []).append(explicit_connection)
+    return result
 
 
 def _model_rows(groups):
     rows = []
     for name, members in groups.items():
-        status = " (deprecated)" if all(
-            is_deprecated(model) for _, _, model in members) else ""
-        feat = feature_names(minimal_feature_bits(members))
-        more = " [and more]" if union_feature_bits(members) != minimal_feature_bits(members) else ""
-        cost = cost_range_text(members)
+        catalog_members = _catalog_members(members)
+        explicit_members = [
+            member for member in members
+            if isinstance(member, ExplicitConnectionOption)]
+        has_explicit = bool(explicit_members)
+        status = " (deprecated)" if (
+            catalog_members
+            and not has_explicit
+            and all(is_deprecated(model)
+                    for _, _, model in catalog_members)) else ""
+        feat = (
+            feature_names(minimal_feature_bits(catalog_members))
+            if catalog_members else "")
+        more = " [and more]" if (
+            catalog_members
+            and union_feature_bits(catalog_members)
+            != minimal_feature_bits(catalog_members)) else ""
+        cost = cost_range_text(catalog_members)
         count = len(members)
         label = f"{name}{status} ({feat}){more}{cost} [{count} providers: {_provider_list(members)}]" if feat \
             else f"{name}{status}{more}{cost} [{count} providers: {_provider_list(members)}]"
         # Search blob also includes provider display names, which do not
         # necessarily appear in the visible list of provider ids.
-        search = " ".join([name] +
-                          [pid for pid, _, _ in members] +
-                          [p.get("name") or "" for _, p, _ in members] +
-                          [m.get("status") or "" for _, _, m in members])
+        search = " ".join(
+            [name]
+            + [pid for pid, _, _ in catalog_members]
+            + [p.get("name") or "" for _, p, _ in catalog_members]
+            + [m.get("status") or "" for _, _, m in catalog_members]
+            + [
+                value
+                for explicit in explicit_members
+                for value in (
+                    "explicit LOKI connection",
+                    explicit.api_url,
+                    explicit.protocol,
+                )
+            ])
         rows.append((members, label, search))
     rows.sort(key=lambda r: r[1].lower())
     return rows
@@ -370,7 +433,15 @@ def _model_rows(groups):
 
 def _provider_rows(members):
     rows = []
-    for pid, prov, m in members:
+    for member in members:
+        if isinstance(member, ExplicitConnectionOption):
+            label = (
+                f"Explicit LOKI_* connection id={member.model} "
+                f"[{member.protocol.replace('_', '-')}] "
+                f"api={member.api_url}")
+            rows.append((member, label))
+            continue
+        pid, prov, m = member
         parts = [prov.get("name") or pid]
         model_id = m.get("id")
         if model_id:
@@ -391,7 +462,9 @@ def _provider_rows(members):
     return rows
 
 
-async def run_flat_model_picker_async(input_fn, model_ids):
+async def run_flat_model_picker_async(
+        input_fn, model_ids,
+        explicit_connection: ExplicitConnectionOption | None = None):
     """Single-level menu over a flat list of model ids (outage fallback).
 
     Used when models.dev is unreachable: loki.py fetches the current
@@ -400,12 +473,22 @@ async def run_flat_model_picker_async(input_fn, model_ids):
     back to a different, older menu. Returns the chosen model id, or None.
     """
     ids = [m for m in (model_ids or []) if m]
-    if not ids:
+    if not ids and explicit_connection is None:
         print()
         print("Usable models:")
         print("No models available from the current provider.")
         return None
-    rows = [(m, m) for m in ids]
+    current_suffix = (
+        " [current provider]" if explicit_connection is not None else "")
+    rows = [(m, m + current_suffix) for m in ids]
+    if explicit_connection is not None:
+        rows.append((
+            explicit_connection,
+            f"{explicit_connection.model} "
+            f"[Explicit LOKI_* connection; "
+            f"{explicit_connection.protocol.replace('_', '-')}; "
+            f"api={explicit_connection.api_url}]",
+        ))
     rows.sort(key=lambda r: r[1].lower())
     return await _numbered_menu_async(
         rows,
@@ -415,19 +498,24 @@ async def run_flat_model_picker_async(input_fn, model_ids):
 
 
 async def run_model_picker_async(input_fn, credentials: CredentialStore,
-                                 cache_path=None):
+                                 cache_path=None,
+                                 explicit_connection:
+                                 ExplicitConnectionOption | None = None):
     """Two-level picker: conflated model -> provider.
 
     Returns (provider_id, provider_entry, model_entry) for the chosen
-    provider of the chosen model, or None if the user cancelled (at either
-    menu). If models.dev cannot be fetched, the network exception from
-    fetch_models_dev propagates naturally; the caller catches it and falls
-    back to the current provider's own model list.
+    catalog provider, an ExplicitConnectionOption for the captured LOKI_*
+    connection, or None if the user cancelled (at either menu). If models.dev
+    cannot be fetched, the network exception from fetch_models_dev propagates
+    naturally; the caller catches it and uses the outage picker.
     """
     _, groups = ensure_index(cache_path=cache_path)
     # Keep only models served by at least one provider whose wire protocol
     # Loki can speak, so the menu is not flooded with the long tail.
-    groups = filter_supported_groups(groups, credentials)
+    groups = _add_explicit_connection(
+        filter_supported_groups(groups, credentials),
+        explicit_connection,
+    )
 
     model_rows = _model_rows(groups)
     if not model_rows:

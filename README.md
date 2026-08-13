@@ -41,7 +41,10 @@ All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
 `LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, and `LOKI_ANTHROPIC_VERSION`.
 Loki never chooses the first model returned by a provider. A new explicit
 connection needs `LOKI_MODEL`, or the model must be selected with `/model`
-before sending a chat request.
+before sending a chat request. A complete captured `LOKI_*` connection also
+appears in `/model` as `Explicit LOKI_* connection`, so it can be selected
+again after switching to a catalog provider or while models.dev is
+unavailable.
 
 Chat logs are session savefiles. They persist the selected model, its known
 catalog status, protocol, concrete endpoints, and other session state, but

@@ -329,6 +329,29 @@ class MenuTests(unittest.TestCase):
             "[8 providers: p0, p1, p2, p3, p4, p5, p6, p7]", label)
         self.assertNotIn("...", label)
 
+    def test_explicit_connection_merges_with_catalog_model_id(self):
+        explicit = models.ExplicitConnectionOption(
+            model="glm-5.2",
+            api_url="http://localhost:8000/v1",
+            protocol="openai_chat",
+        )
+        groups = models._add_explicit_connection(_groups(), explicit)
+
+        self.assertIn(explicit, groups["GLM-5.2"])
+        glm_label = next(
+            row[1] for row in models._model_rows(groups)
+            if row[1].startswith("GLM-5.2"))
+        self.assertIn(
+            "[3 providers: zhipuai, openrouter, explicit LOKI_*]",
+            glm_label,
+        )
+        provider_labels = [
+            row[1] for row in models._provider_rows(groups["GLM-5.2"])]
+        self.assertTrue(any(
+            "Explicit LOKI_* connection id=glm-5.2" in label
+            and "api=http://localhost:8000/v1" in label
+            for label in provider_labels))
+
     def test_model_menu_filter_matches_provider_names(self):
         rows = models._model_rows(_groups())
         # "filter openrouter" must narrow to GLM-5.2 even though "openrouter"
@@ -383,6 +406,49 @@ class MenuTests(unittest.TestCase):
 
 
 class PickerTests(unittest.TestCase):
+    def test_explicit_connection_is_selectable_without_catalog_models(self):
+        explicit = models.ExplicitConnectionOption(
+            model="private-model",
+            api_url="http://localhost:8000/v1",
+            protocol="openai_chat",
+        )
+        saved = models._index_cache
+        models._index_cache = ({}, {})
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                result = asyncio.run(models.run_model_picker_async(
+                    _input_script(["1", "1"]),
+                    CredentialStore({}),
+                    explicit_connection=explicit,
+                ))
+        finally:
+            models._index_cache = saved
+
+        self.assertIs(result, explicit)
+        rendered = output.getvalue()
+        self.assertIn("private-model", rendered)
+        self.assertIn("Explicit LOKI_* connection", rendered)
+        self.assertIn("api=http://localhost:8000/v1", rendered)
+
+    def test_outage_picker_can_select_explicit_connection(self):
+        explicit = models.ExplicitConnectionOption(
+            model="private-model",
+            api_url="http://localhost:8000/v1",
+            protocol="openai_chat",
+        )
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = asyncio.run(models.run_flat_model_picker_async(
+                _input_script(["1"]),
+                [],
+                explicit_connection=explicit,
+            ))
+
+        self.assertIs(result, explicit)
+        self.assertIn("Explicit LOKI_* connection", output.getvalue())
+
     def test_deprecated_model_is_selectable(self):
         data = {
             "provider": {

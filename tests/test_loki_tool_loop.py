@@ -19,6 +19,7 @@ os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 
 from loki_agent import formats
 from loki_agent import loki
+from loki_agent import models as modelsdev
 from loki_agent import protocols
 from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialStore
@@ -387,6 +388,27 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(loki.model, "")
         self.assertEqual(loki.RUNTIME_CONFIG.model, "")
 
+    def test_explicit_connection_option_requires_complete_loki_config(self):
+        self.assertIsNone(loki.explicit_connection_option(
+            CredentialStore({
+                "LOKI_API_BASE": "http://localhost:8000/v1",
+                "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+                "LOKI_API_KEY": "local-key",
+            })))
+
+        option = loki.explicit_connection_option(CredentialStore({
+            "LOKI_API_BASE": "http://localhost:8000/v1",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "local-key",
+            "LOKI_MODEL": "private-model",
+        }))
+
+        self.assertEqual(option, modelsdev.ExplicitConnectionOption(
+            model="private-model",
+            api_url="http://localhost:8000/v1",
+            protocol=protocols.OPENAI_CHAT,
+        ))
+
     def test_interactive_startup_does_not_fetch_provider_models(self):
         loki.CREDENTIALS = CredentialStore({
             "LOKI_API_BASE":
@@ -641,6 +663,114 @@ class ModelLoadingTests(unittest.TestCase):
             saved["session_state"]["connection"]["model_status"],
             "deprecated",
         )
+
+    def test_model_can_switch_from_catalog_back_to_explicit_connection(self):
+        explicit_url = "http://localhost:8000/v1"
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE": explicit_url,
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "local-key",
+            "LOKI_MODEL": "private-model",
+            "CATALOG_API_KEY": "catalog-key",
+        })
+        session = ScriptedInputSession(["/model", "/model", "/quit"])
+        catalog_provider = {
+            "name": "Catalog Provider",
+            "env": ["CATALOG_API_KEY"],
+            "api": "https://catalog.example.test/v1",
+        }
+        catalog_model = {
+            "id": "catalog-model",
+            "name": "Catalog Model",
+        }
+        seen_explicit = []
+
+        async def pick_model(*, input_fn, credentials,
+                             explicit_connection=None):
+            seen_explicit.append(explicit_connection)
+            if len(seen_explicit) == 1:
+                return "catalog", catalog_provider, catalog_model
+            return explicit_connection
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.loki.modelsdev."
+                            "run_model_picker_async",
+                            new=mock.AsyncMock(side_effect=pick_model)):
+                status = asyncio.run(loki.async_main([]))
+
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(seen_explicit), 2)
+        self.assertTrue(all(
+            isinstance(option, modelsdev.ExplicitConnectionOption)
+            for option in seen_explicit))
+        self.assertEqual(loki.RUNTIME_CONFIG.url, explicit_url)
+        self.assertEqual(loki.RUNTIME_CONFIG.model, "private-model")
+        self.assertEqual(
+            loki.RUNTIME_CONFIG.provider_name,
+            "Explicit LOKI_* connection",
+        )
+        connection = saved["session_state"]["connection"]
+        self.assertEqual(connection["model"], "private-model")
+        self.assertEqual(
+            connection["chat_url"],
+            "http://localhost:8000/v1/chat/completions",
+        )
+        self.assertEqual(connection["credential_env"], "LOKI_API_KEY")
+
+    def test_explicit_connection_is_selectable_when_modelsdev_is_offline(self):
+        explicit_url = "http://localhost:8000/v1"
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE": explicit_url,
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "local-key",
+            "LOKI_MODEL": "private-model",
+        })
+        session = ScriptedInputSession(["/model", "/quit"])
+        seen_explicit = []
+
+        async def pick_flat(input_fn, model_ids,
+                            explicit_connection=None):
+            seen_explicit.append(explicit_connection)
+            return explicit_connection
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            with mock.patch(
+                    "loki_agent.loki.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.loki.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.loki.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.loki.modelsdev."
+                            "run_model_picker_async",
+                            new=mock.AsyncMock(
+                                side_effect=OSError("offline"))), mock.patch(
+                                    "loki_agent.loki.load_models_async",
+                                    new=mock.AsyncMock()), mock.patch(
+                                        "loki_agent.loki.modelsdev."
+                                        "run_flat_model_picker_async",
+                                        new=mock.AsyncMock(
+                                            side_effect=pick_flat)):
+                status = asyncio.run(loki.async_main([]))
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(seen_explicit), 1)
+        self.assertIsInstance(
+            seen_explicit[0], modelsdev.ExplicitConnectionOption)
+        self.assertEqual(loki.RUNTIME_CONFIG.url, explicit_url)
+        self.assertEqual(loki.RUNTIME_CONFIG.model, "private-model")
 
 
 class ExitStatusTests(unittest.TestCase):
