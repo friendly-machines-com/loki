@@ -3257,6 +3257,27 @@ async def async_main(args):
                     "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."))
                 continue # Drop immediately back to the User> prompt
 
+
+def initialize_terminal_overlay(active_terminal):
+    active_terminal.enable_bracketed_paste_mode()
+    active_terminal.enable_origin_mode()
+    active_terminal.clear_to_end_of_screen()
+    active_terminal.reset_colors_and_flags()
+    active_terminal.set_clipping_region(*terminals.output_area)
+    active_terminal.goto_position(1, 1)
+    active_terminal.flush()
+
+
+def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
+    """Remove Loki's overlay without clearing ordinary terminal contents."""
+    run_step(active_terminal.disable_bracketed_paste_mode)
+    run_step(active_terminal.disable_clipping_regions)
+    run_step(active_terminal.disable_origin_mode)
+    run_step(active_terminal.reset_colors_and_flags)
+    run_step(active_terminal.clear_to_end_of_screen)
+    run_step(active_terminal.flush)
+
+
 def main():
     global CREDENTIALS
     CREDENTIALS = CredentialStore.capture(os.environ)
@@ -3277,11 +3298,7 @@ def main():
         cleanup_done = True
         if 'chat_log' in globals():
             clean_up_step(save_chat_log)
-        clean_up_step(terminal.disable_bracketed_paste_mode)
-        clean_up_step(terminal.disable_clipping_regions)
-        clean_up_step(terminal.disable_origin_mode)
-        clean_up_step(terminal.reset_colors_and_flags)
-        clean_up_step(terminal.clear_screen)
+        restore_terminal_overlay(terminal, clean_up_step)
 
     def clean_up_and_exit(*args, **kwargs):
         clean_up(*args, **kwargs)
@@ -3290,13 +3307,7 @@ def main():
     signal.signal(signal.SIGTERM, clean_up_and_exit)
     signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT,])
 
-    terminal.enable_bracketed_paste_mode()
-    terminal.enable_origin_mode()
-    terminal.clear_screen()
-
-    terminal.reset_colors_and_flags()
-    terminal.set_clipping_region(*terminals.output_area)
-    terminal.goto_position(1, 1)
+    initialize_terminal_overlay(terminal)
 
     try:
         asyncio.run(async_main(sys.argv[1:]))

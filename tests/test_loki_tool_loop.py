@@ -323,6 +323,46 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("secret", text)
 
 
+class TerminalOverlayLifecycleTests(unittest.TestCase):
+    class RecordingTerminal:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            return lambda *args: self.calls.append((name, *args))
+
+    def test_initialize_clears_only_from_cursor_to_end(self):
+        terminal = self.RecordingTerminal()
+
+        loki.initialize_terminal_overlay(terminal)
+
+        self.assertEqual(terminal.calls, [
+            ("enable_bracketed_paste_mode",),
+            ("enable_origin_mode",),
+            ("clear_to_end_of_screen",),
+            ("reset_colors_and_flags",),
+            ("set_clipping_region", *loki.terminals.output_area),
+            ("goto_position", 1, 1),
+            ("flush",),
+        ])
+        self.assertNotIn(("clear_screen",), terminal.calls)
+
+    def test_restore_resets_scroll_region_then_clears_to_end(self):
+        terminal = self.RecordingTerminal()
+
+        loki.restore_terminal_overlay(terminal)
+
+        self.assertEqual(terminal.calls, [
+            ("disable_bracketed_paste_mode",),
+            ("disable_clipping_regions",),
+            ("disable_origin_mode",),
+            ("reset_colors_and_flags",),
+            ("clear_to_end_of_screen",),
+            ("flush",),
+        ])
+        self.assertNotIn(("clear_screen",), terminal.calls)
+
+
 class ApiErrorFormattingTests(unittest.TestCase):
     def test_formatted_error_preserves_full_json_body(self):
         message = "x" * 5000
