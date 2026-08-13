@@ -273,6 +273,75 @@ class PromptControllerTests(unittest.TestCase):
             self.read_with_events([terminals.KeyEvent("CTRL_C")])
 
 
+class InputModalTests(unittest.TestCase):
+    def test_modal_is_the_exclusive_direct_input_path(self):
+        session = terminals.InputSession(fd=0)
+        calls = []
+
+        async def pause():
+            calls.append("pause")
+
+        async def resume():
+            calls.append("resume")
+
+        async def fake_get_input_async(
+                prompt=None, history=None, session=None, on_mode_cycle=None):
+            calls.append(("prompt", prompt, history, session))
+            return "answer"
+
+        session._pause = pause
+        session._resume = resume
+        old_get_input_async = terminals.get_input_async
+        terminals.get_input_async = fake_get_input_async
+
+        async def exercise():
+            modal = session.modal()
+            with self.assertRaisesRegex(RuntimeError, "outside"):
+                await modal.prompt("Question: ")
+            async with modal:
+                self.assertIs(session._modal, modal)
+                with self.assertRaisesRegex(RuntimeError, "already active"):
+                    async with session.modal():
+                        pass
+                return await modal.prompt("Question: ", ["old"])
+
+        try:
+            result = asyncio.run(exercise())
+        finally:
+            terminals.get_input_async = old_get_input_async
+
+        self.assertEqual(result, "answer")
+        self.assertIsNone(session._modal)
+        self.assertEqual(calls, [
+            "pause",
+            ("prompt", "Question: ", ["old"], session.reader),
+            "resume",
+        ])
+
+    def test_modal_restores_normal_input_after_exception(self):
+        session = terminals.InputSession(fd=0)
+        calls = []
+
+        async def pause():
+            calls.append("pause")
+
+        async def resume():
+            calls.append("resume")
+
+        session._pause = pause
+        session._resume = resume
+
+        async def exercise():
+            with self.assertRaisesRegex(ValueError, "boom"):
+                async with session.modal():
+                    raise ValueError("boom")
+
+        asyncio.run(exercise())
+
+        self.assertEqual(calls, ["pause", "resume"])
+        self.assertIsNone(session._modal)
+
+
 class PromptRendererTests(unittest.TestCase):
     def test_render_refreshes_input_area_status_bar_and_cursor_position(self):
         recorder = RecordingTerminal()

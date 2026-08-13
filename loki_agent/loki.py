@@ -1467,6 +1467,7 @@ def run_todowrite(todos: list) -> str:
             return f"Error: invalid priority {priority!r}"
         cleaned.append({'content': content, 'status': status, 'priority': priority})
     session_todos = cleaned
+    mark_chat_log_dirty()
     summary = {'total': len(cleaned), 'pending': sum(1 for t in cleaned if t['status'] == 'pending'),
                'in_progress': in_progress,
                'completed': sum(1 for t in cleaned if t['status'] == 'completed')}
@@ -2798,6 +2799,9 @@ terminals.set_status_text_provider(status_text)
 
 transcript_items = []
 session_todos = []
+chat_log_path: str | None = None
+session_state = {}
+chat_log_dirty = False
 
 # Agent mode, cycled by Shift-Tab: "explore" (read-only), "plan", "edit".
 # Takes effect for the next turn; it does not cancel the current turn.
@@ -2832,6 +2836,7 @@ def record_shell_cwd_instruction():
         f"Current Loki cwd changed to: {shell_cwd}. "
         "Relative tool paths and Bash commands now run from this directory."
     ))
+    mark_chat_log_dirty()
 
 
 def print_shell_cwd():
@@ -2896,7 +2901,9 @@ async def run_session_picker_async(session):
 
 
 def new_chat_log(filename):
-    global chat_log
+    global chat_log_path
+    global session_state
+    global chat_log_dirty
     global transcript_items
     global session_todos
     transcript_items = initial_transcript_items()
@@ -2904,16 +2911,37 @@ def new_chat_log(filename):
     dirname = os.path.dirname(filename)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
-    chat_log = open(filename, 'w')
-
-def save_chat_log():
-    state = {"shell_cwd": shell_cwd}
+    chat_log_path = filename
+    session_state = {"shell_cwd": shell_cwd}
     descriptor = active_connection_descriptor()
     if descriptor is not None:
-        state["connection"] = descriptor.to_dict()
-    savefiles.write_chat_log(
-        chat_log, transcript_items, session_todos,
-        state)
+        # Hybrid persistence rule: an explicit connection belongs to a new
+        # chat, but does not implicitly replace a resumed chat's connection.
+        session_state["connection"] = descriptor.to_dict()
+    chat_log_dirty = True
+
+def save_chat_log():
+    global session_state
+    global chat_log_dirty
+
+    if chat_log_path is None or not chat_log_dirty:
+        return False
+
+    state = dict(session_state)
+    state["shell_cwd"] = shell_cwd
+    content = savefiles.serialize_chat_log(
+        transcript_items, session_todos, state)
+    _atomic_write_text(chat_log_path, content)
+    savefiles.report_chat_log_saved(chat_log_path)
+    session_state = state
+    chat_log_dirty = False
+    return True
+
+
+def mark_chat_log_dirty():
+    global chat_log_dirty
+    if chat_log_path is not None:
+        chat_log_dirty = True
 
 
 def render_resume_transcript(items: list) -> str:
@@ -2924,18 +2952,25 @@ def print_resume_transcript(items: list):
     savefiles.print_resume_transcript(items, model or "Assistant")
 
 
-def load_chat_log(filename):
-    global chat_log
+def load_chat_log(filename, loaded=None):
+    global chat_log_path
+    global session_state
+    global chat_log_dirty
     global transcript_items
     global session_todos
-    with open(filename, 'r') as f:
-        transcript, todos, state = savefiles.read_chat_log(f)
+    if loaded is None:
+        with open(filename, 'r', encoding="utf-8") as f:
+            loaded = savefiles.read_chat_log(f)
+    transcript, todos, state = loaded
     transcript_items = transcript
     session_todos = todos
+    session_state = dict(state)
+    # Atomic replacement must publish over the target inode rather than over a
+    # symlink naming it, matching the old open(..., "w") follow behavior.
+    chat_log_path = os.path.realpath(filename)
+    chat_log_dirty = False
     load_session_state(state)
     print_resume_transcript(transcript_items)
-    chat_log = open(filename, 'w')
-    save_chat_log()
 
 
 def load_session_state(state: dict):
@@ -2954,6 +2989,11 @@ def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:
     if not isinstance(state, dict) or "connection" not in state:
         return None
     return ConnectionDescriptor.from_dict(state["connection"])
+
+
+def set_session_connection(descriptor: ConnectionDescriptor):
+    session_state["connection"] = descriptor.to_dict()
+    mark_chat_log_dirty()
 
 
 async def confirm_saved_connection_async(
@@ -3066,11 +3106,13 @@ async def async_main(args):
 
         resolved_log_filename = (
             resolve_chat_log_path(log_filename) if log_filename else None)
+        loaded_chat = None
         saved_state = {}
         if resolved_log_filename:
             try:
                 with open(resolved_log_filename, "r", encoding="utf-8") as f:
-                    _, _, saved_state = savefiles.read_chat_log(f)
+                    loaded_chat = savefiles.read_chat_log(f)
+                    _, _, saved_state = loaded_chat
             except (OSError, json.JSONDecodeError,
                     formats.TranscriptFormatError) as e:
                 print(f"Could not resume chat: {e}", file=sys.stderr)
@@ -3108,7 +3150,7 @@ async def async_main(args):
             sys.stderr.flush()
 
         if resolved_log_filename:
-            load_chat_log(resolved_log_filename)
+            load_chat_log(resolved_log_filename, loaded_chat)
         else:
             new_chat_log(new_chat_log_path())
 
@@ -3151,6 +3193,9 @@ async def async_main(args):
                             if model:
                                 reinstall_provider(model=model)
                                 await load_models_async()
+                                descriptor = active_connection_descriptor()
+                                if descriptor is not None:
+                                    set_session_connection(descriptor)
                                 save_chat_log()
                                 print(f"Selected model: {model}",
                                       file=sys.stderr)
@@ -3178,6 +3223,9 @@ async def async_main(args):
                               file=sys.stderr)
                         sys.stderr.flush()
                         continue
+                    descriptor = active_connection_descriptor()
+                    if descriptor is not None:
+                        set_session_connection(descriptor)
                     save_chat_log()
                     via = f" via {provider_id}" if provider_id else ""
                     print(f"Selected model: {model}{via}", file=sys.stderr)
@@ -3210,6 +3258,7 @@ async def async_main(args):
                 continue
 
             transcript_items.append(formats.message_item("user", user_in))
+            mark_chat_log_dirty()
 
             try:
                 await run_terminal_turn_async(transcript_items, cancel_check=lambda: session.reader.cancel_requested)
@@ -3271,7 +3320,7 @@ def main():
         if cleanup_done:
             return
         cleanup_done = True
-        if 'chat_log' in globals():
+        if chat_log_path is not None:
             clean_up_step(save_chat_log)
         restore_terminal_overlay(terminal, clean_up_step)
 

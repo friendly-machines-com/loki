@@ -1,8 +1,8 @@
 """On-disk chat-log format, path resolution, listing, and picker UI.
 
 This module is the leaf data layer for session savefiles. It owns no
-live agent state (transcript_items/session_todos/chat_log file handle
-live in loki.py) and has no upward dependency on loki.py -- every
+live agent state (path/transcript/todos/session state live in loki.py)
+and has no upward dependency on loki.py -- every
 function that needs context takes it as a parameter.
 """
 
@@ -163,16 +163,35 @@ def read_chat_log(file_obj) -> tuple[list, list, dict]:
     return transcript, todos, state
 
 
+def chat_log_blob(transcript: list, todos: list,
+                  session_state: dict) -> dict:
+    blob = formats.new_log_blob(transcript, todos)
+    blob["session_state"] = session_state
+    return blob
+
+
+def serialize_chat_log(transcript: list, todos: list,
+                       session_state: dict) -> str:
+    return json.dumps(
+        chat_log_blob(transcript, todos, session_state), indent=4)
+
+
+def report_chat_log_saved(path: str) -> None:
+    print('Note: Saved chat log in {!r}'.format(path), file=sys.stderr)
+    sys.stderr.flush()
+
+
 def write_chat_log(file_obj, transcript: list, todos: list,
                    session_state: dict) -> None:
     file_obj.seek(0)
-    blob = formats.new_log_blob(transcript, todos)
-    blob["session_state"] = session_state
-    json.dump(blob, file_obj, indent=4)
+    json.dump(
+        chat_log_blob(transcript, todos, session_state),
+        file_obj,
+        indent=4,
+    )
     file_obj.truncate()
     file_obj.flush()
-    print('Note: Saved chat log in {!r}'.format(file_obj.name), file=sys.stderr)
-    sys.stderr.flush()
+    report_chat_log_saved(file_obj.name)
 
 
 class ResumeTranscriptRenderer:

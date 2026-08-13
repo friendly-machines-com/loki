@@ -471,7 +471,10 @@ class ChatLogPathTests(unittest.TestCase):
         self.assertTrue(os.path.isdir(loki.CHAT_LOG_DIR))
 
     def test_new_chat_log_creates_parent_directory(self):
-        names = ["chat_log", "transcript_items", "session_todos"]
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos",
+        ]
         sentinel = object()
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
 
@@ -481,13 +484,10 @@ class ChatLogPathTests(unittest.TestCase):
                 loki.new_chat_log(path)
 
                 self.assertTrue(os.path.isdir(os.path.dirname(path)))
-                self.assertEqual(loki.chat_log.name, path)
+                self.assertEqual(loki.chat_log_path, path)
+                self.assertTrue(loki.chat_log_dirty)
+                self.assertFalse(os.path.exists(path))
         finally:
-            if "chat_log" in loki.__dict__:
-                try:
-                    loki.chat_log.close()
-                except OSError:
-                    pass
             for name, value in old_values.items():
                 if value is sentinel:
                     loki.__dict__.pop(name, None)
@@ -512,26 +512,41 @@ class SessionPickerTests(unittest.TestCase):
         return path
 
     def _make_picker(self, dirpath, inputs):
-        """Build a picker callback that reads from `inputs` (a list of strings).
+        """Build a modal session that reads from `inputs` (a list of strings).
 
-        Each call to get_input_async returns the next input; EOFError when
+        Each call to modal.prompt returns the next input; EOFError when
         the list is exhausted (so infinite loops fail the test rather than
         hang it).
         """
         # Point CHAT_LOG_DIR at the tempdir for _chat_log_paths().
         saved_log_dir = loki.CHAT_LOG_DIR
         loki.CHAT_LOG_DIR = dirpath
-        # Scripted input stream.
         iterator = iter(inputs)
 
-        async def fake_get_input_async(prompt=None, history=None):
-            try:
-                return next(iterator)
-            except StopIteration:
-                raise EOFError
+        class _FakeModal:
+            def __init__(self):
+                self.active = False
 
-        saved_gia = loki.get_input_async
-        loki.get_input_async = fake_get_input_async
+            async def __aenter__(self):
+                self.active = True
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.active = False
+
+            async def prompt(self, prompt=None, history=None):
+                if not self.active:
+                    raise AssertionError("prompt outside modal")
+                try:
+                    return next(iterator)
+                except StopIteration:
+                    raise EOFError
+
+        class _FakeSession:
+            def modal(self):
+                return _FakeModal()
+
+        session = _FakeSession()
         saved_terminal = loki.terminal
 
         class _FakeTerminal:
@@ -557,19 +572,18 @@ class SessionPickerTests(unittest.TestCase):
 
         def restore():
             loki.CHAT_LOG_DIR = saved_log_dir
-            loki.get_input_async = saved_gia
             loki.terminal = saved_terminal
 
-        return restore
+        return restore, session
 
     def test_picker_selects_by_number(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha chat"}', mtime=1000)
             self._write_chat(tmpdir, "bbb", '{"text":"beta chat"}', mtime=2000)
             self._write_chat(tmpdir, "ccc", '{"text":"gamma chat"}', mtime=3000)
-            restore = self._make_picker(tmpdir, ["2"])
+            restore, session = self._make_picker(tmpdir, ["2"])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             # mtime-sorted oldest->newest: aaa(1000), bbb(2000), ccc(3000).
@@ -579,10 +593,10 @@ class SessionPickerTests(unittest.TestCase):
     def test_picker_finishes_clear_before_returning(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
-            restore = self._make_picker(tmpdir, ["1"])
+            restore, session = self._make_picker(tmpdir, ["1"])
             picker_terminal = loki.terminal
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
 
@@ -597,9 +611,10 @@ class SessionPickerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha beta"}', mtime=1000)
             self._write_chat(tmpdir, "bbb", '{"text":"beta gamma"}', mtime=2000)
-            restore = self._make_picker(tmpdir, ["filter beta alpha", "1"])
+            restore, session = self._make_picker(
+                tmpdir, ["filter beta alpha", "1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             # Only the aaa log contains both "beta" and "alpha".
@@ -610,9 +625,10 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "aaa", '{"text":"error 404 in nginx"}', mtime=1000)
             self._write_chat(tmpdir, "bbb", '{"text":"something else"}', mtime=2000)
             # Bare "404" should NOT match (parsed as int, out of range, ignored).
-            restore = self._make_picker(tmpdir, ["404", "filter 404", "1"])
+            restore, session = self._make_picker(
+                tmpdir, ["404", "filter 404", "1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             self.assertTrue(result.endswith("chat-aaa.json"))
@@ -622,10 +638,10 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "aaa", '{"text":"alpha beta"}', mtime=1000)
             self._write_chat(tmpdir, "bbb", '{"text":"gamma delta"}', mtime=2000)
             # Narrow to one match, then clear with bare "filter", then pick 2.
-            restore = self._make_picker(
+            (restore, session) = self._make_picker(
                 tmpdir, ["filter alpha", "filter", "2"])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             # After clearing, both visible; "2" = bbb (newest last).
@@ -634,9 +650,9 @@ class SessionPickerTests(unittest.TestCase):
     def test_picker_empty_input_cancels(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
-            restore = self._make_picker(tmpdir, [""])
+            restore, session = self._make_picker(tmpdir, [""])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             self.assertIsNone(result)
@@ -646,9 +662,9 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "old", '{"text":"old session"}', mtime=1000)
             self._write_chat(tmpdir, "mid", '{"text":"mid session"}', mtime=2000)
             self._write_chat(tmpdir, "new", '{"text":"new session"}', mtime=3000)
-            restore = self._make_picker(tmpdir, ["3"])
+            restore, session = self._make_picker(tmpdir, ["3"])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             # Oldest->newest: old, mid, new. "3" = newest.
@@ -660,9 +676,9 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(
                 tmpdir, "broken", '{"text":"hi there this is truncated', mtime=1000)
             # No closing quote, no closing brace -- regex should still grab "hi there...".
-            restore = self._make_picker(tmpdir, ["1"])
+            restore, session = self._make_picker(tmpdir, ["1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             self.assertTrue(result.endswith("chat-broken.json"))
@@ -674,9 +690,9 @@ class SessionPickerTests(unittest.TestCase):
             # "alpha" (no prefix) is unrecognized: not "filter ...", not an int,
             # not empty. Should re-render with the current (empty) filter, then
             # "1" selects the first row.
-            restore = self._make_picker(tmpdir, ["alpha", "1"])
+            restore, session = self._make_picker(tmpdir, ["alpha", "1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async())
+                result = asyncio.run(loki.run_session_picker_async(session))
             finally:
                 restore()
             self.assertTrue(result.endswith("chat-aaa.json"))
@@ -721,7 +737,11 @@ class ShellCwdTests(unittest.TestCase):
         self.assertEqual(os.path.basename(jobs[0].stderr_path), "stderr.log")
 
     def test_save_chat_log_persists_shell_cwd(self):
-        names = ["chat_log", "transcript_items", "session_todos", "shell_cwd", "previous_shell_cwd"]
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos", "shell_cwd",
+            "previous_shell_cwd",
+        ]
         sentinel = object()
         old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
 
@@ -734,16 +754,10 @@ class ShellCwdTests(unittest.TestCase):
                 loki.change_shell_cwd(cwd)
 
                 loki.save_chat_log()
-                loki.chat_log.close()
 
                 with open(path, "r", encoding="utf-8") as f:
                     blob = json.load(f)
         finally:
-            if "chat_log" in loki.__dict__:
-                try:
-                    loki.chat_log.close()
-                except OSError:
-                    pass
             for name, value in old_values.items():
                 if value is sentinel:
                     loki.__dict__.pop(name, None)
@@ -754,7 +768,8 @@ class ShellCwdTests(unittest.TestCase):
 
     def test_save_chat_log_persists_connection_without_credential_value(self):
         names = [
-            "chat_log", "transcript_items", "session_todos",
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos",
             "RUNTIME_CONFIG", "model",
         ]
         sentinel = object()
@@ -776,15 +791,9 @@ class ShellCwdTests(unittest.TestCase):
                 loki.apply_runtime_config(config)
                 loki.new_chat_log(path)
                 loki.save_chat_log()
-                loki.chat_log.close()
                 text = pathlib.Path(path).read_text(encoding="utf-8")
                 blob = json.loads(text)
         finally:
-            if "chat_log" in loki.__dict__:
-                try:
-                    loki.chat_log.close()
-                except OSError:
-                    pass
             for name, value in old_values.items():
                 if value is sentinel:
                     loki.__dict__.pop(name, None)
@@ -799,6 +808,269 @@ class ShellCwdTests(unittest.TestCase):
             "https://openrouter.ai/api/v1/chat/completions",
         )
         self.assertNotIn("do-not-persist-this", text)
+
+    def test_loading_and_clean_cleanup_leave_chat_bytes_unchanged(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos", "RUNTIME_CONFIG",
+            "shell_cwd", "previous_shell_cwd",
+        ]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                descriptor = ConnectionDescriptor(
+                    provider_id="openrouter",
+                    provider_name="OpenRouter",
+                    model="z-ai/glm",
+                    api_url="https://openrouter.ai/api/v1",
+                    chat_url="https://openrouter.ai/api/v1/chat/completions",
+                    models_url="https://openrouter.ai/api/v1/models",
+                    protocol=protocols.OPENAI_CHAT,
+                    credential_env="OPENROUTER_API_KEY",
+                )
+                blob = formats.new_log_blob(
+                    loki.initial_transcript_items(), [])
+                blob["session_state"] = {
+                    "shell_cwd": tmpdir,
+                    "connection": descriptor.to_dict(),
+                    "future_field": {"keep": True},
+                }
+                original = json.dumps(
+                    blob, separators=(",", ":"), sort_keys=True).encode()
+                pathlib.Path(path).write_bytes(original)
+                loki.RUNTIME_CONFIG = None
+
+                loki.load_chat_log(path)
+                saved = loki.save_chat_log()
+
+                self.assertFalse(saved)
+                self.assertFalse(loki.chat_log_dirty)
+                self.assertEqual(pathlib.Path(path).read_bytes(), original)
+                self.assertEqual(
+                    loki.session_state["connection"], descriptor.to_dict())
+                self.assertEqual(
+                    loki.session_state["future_field"], {"keep": True})
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+    def test_later_save_preserves_unavailable_loaded_connection(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos", "RUNTIME_CONFIG",
+            "shell_cwd", "previous_shell_cwd",
+        ]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                descriptor = ConnectionDescriptor(
+                    provider_id="openrouter",
+                    provider_name="OpenRouter",
+                    model="z-ai/glm",
+                    api_url="https://openrouter.ai/api/v1",
+                    chat_url="https://openrouter.ai/api/v1/chat/completions",
+                    models_url="https://openrouter.ai/api/v1/models",
+                    protocol=protocols.OPENAI_CHAT,
+                    credential_env="OPENROUTER_API_KEY",
+                )
+                blob = formats.new_log_blob(
+                    loki.initial_transcript_items(), [])
+                blob["session_state"] = {
+                    "shell_cwd": tmpdir,
+                    "connection": descriptor.to_dict(),
+                    "future_field": "retained",
+                }
+                pathlib.Path(path).write_text(
+                    json.dumps(blob), encoding="utf-8")
+                loki.RUNTIME_CONFIG = None
+
+                loki.load_chat_log(path)
+                loki.mark_chat_log_dirty()
+                self.assertTrue(loki.save_chat_log())
+
+                after = json.loads(
+                    pathlib.Path(path).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    after["session_state"]["connection"],
+                    descriptor.to_dict(),
+                )
+                self.assertEqual(
+                    after["session_state"]["future_field"], "retained")
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+    def test_resumed_chat_does_not_adopt_explicit_runtime_connection(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos", "RUNTIME_CONFIG", "model",
+            "shell_cwd", "previous_shell_cwd",
+        ]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                saved_descriptor = ConnectionDescriptor(
+                    provider_id="saved",
+                    provider_name="Saved",
+                    model="saved-model",
+                    api_url="https://saved.example/v1",
+                    chat_url="https://saved.example/v1/chat/completions",
+                    models_url="https://saved.example/v1/models",
+                    protocol=protocols.OPENAI_CHAT,
+                    credential_env="SAVED_API_KEY",
+                )
+                blob = formats.new_log_blob(
+                    loki.initial_transcript_items(), [])
+                blob["session_state"] = {
+                    "shell_cwd": tmpdir,
+                    "connection": saved_descriptor.to_dict(),
+                }
+                pathlib.Path(path).write_text(
+                    json.dumps(blob), encoding="utf-8")
+                loki.apply_runtime_config(loki.make_runtime_config(
+                    "https://override.example/v1",
+                    protocols.OPENAI_CHAT,
+                    "runtime-only-secret",
+                    model="override-model",
+                    credential_env="LOKI_API_KEY",
+                ))
+
+                loki.load_chat_log(path)
+                loki.mark_chat_log_dirty()
+                loki.save_chat_log()
+
+                after = json.loads(
+                    pathlib.Path(path).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    after["session_state"]["connection"],
+                    saved_descriptor.to_dict(),
+                )
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+    def test_chat_save_atomically_replaces_existing_snapshot(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos",
+        ]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                loki.new_chat_log(path)
+                loki.save_chat_log()
+                first_inode = os.stat(path).st_ino
+
+                loki.transcript_items.append(
+                    formats.message_item("user", "changed"))
+                loki.mark_chat_log_dirty()
+                loki.save_chat_log()
+
+                self.assertNotEqual(os.stat(path).st_ino, first_inode)
+                self.assertEqual(
+                    [name for name in os.listdir(tmpdir)
+                     if name.endswith(".tmp")],
+                    [],
+                )
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+    def test_failed_atomic_publish_preserves_previous_snapshot(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos",
+        ]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                loki.new_chat_log(path)
+                loki.save_chat_log()
+                original = pathlib.Path(path).read_bytes()
+
+                loki.transcript_items.append(
+                    formats.message_item("user", "must not publish"))
+                loki.mark_chat_log_dirty()
+                with mock.patch(
+                        "loki_agent.loki.os.replace",
+                        side_effect=OSError("publish failed")):
+                    with self.assertRaisesRegex(OSError, "publish failed"):
+                        loki.save_chat_log()
+
+                self.assertEqual(pathlib.Path(path).read_bytes(), original)
+                self.assertTrue(loki.chat_log_dirty)
+                self.assertEqual(
+                    [name for name in os.listdir(tmpdir)
+                     if name.endswith(".tmp")],
+                    [],
+                )
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
+
+    def test_successful_model_selection_replaces_resumed_connection(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos", "RUNTIME_CONFIG", "model",
+            "shell_cwd", "previous_shell_cwd",
+        ]
+        old_values = {name: loki.__dict__[name] for name in names}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "chat-test.json")
+                old_descriptor = ConnectionDescriptor(
+                    provider_id="old",
+                    provider_name="Old",
+                    model="old-model",
+                    api_url="https://old.example/v1",
+                    chat_url="https://old.example/v1/chat/completions",
+                    models_url="https://old.example/v1/models",
+                    protocol=protocols.OPENAI_CHAT,
+                    credential_env="OLD_API_KEY",
+                )
+                blob = formats.new_log_blob(
+                    loki.initial_transcript_items(), [])
+                blob["session_state"] = {
+                    "shell_cwd": tmpdir,
+                    "connection": old_descriptor.to_dict(),
+                }
+                pathlib.Path(path).write_text(
+                    json.dumps(blob), encoding="utf-8")
+                loki.load_chat_log(path)
+
+                loki.apply_runtime_config(loki.make_runtime_config(
+                    "https://new.example/v1",
+                    protocols.OPENAI_CHAT,
+                    "new-secret",
+                    model="new-model",
+                    provider_id="new",
+                    provider_name="New",
+                    credential_env="NEW_API_KEY",
+                ))
+                new_descriptor = loki.active_connection_descriptor()
+                loki.set_session_connection(new_descriptor)
+                loki.save_chat_log()
+
+                after = json.loads(
+                    pathlib.Path(path).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    after["session_state"]["connection"],
+                    new_descriptor.to_dict(),
+                )
+        finally:
+            for name, value in old_values.items():
+                loki.__dict__[name] = value
 
     def test_load_session_state_restores_shell_cwd(self):
         names = ["shell_cwd", "previous_shell_cwd"]
@@ -830,20 +1102,22 @@ class ShellCwdTests(unittest.TestCase):
                 self.answer = answer
                 self.calls = []
 
-            async def pause(self):
-                self.calls.append("pause")
+            def modal(self):
+                self.calls.append("modal")
+                return self
+
+            async def __aenter__(self):
+                self.calls.append("enter")
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.calls.append("exit")
 
             async def prompt(self, prompt):
-                self.assert_prompt(prompt)
-                self.calls.append("prompt")
-                return self.answer
-
-            async def resume(self):
-                self.calls.append("resume")
-
-            def assert_prompt(self, prompt):
                 if "[y/N]" not in prompt:
                     raise AssertionError(prompt)
+                self.calls.append("prompt")
+                return self.answer
 
         no_session = FakeSession("")
         yes_session = FakeSession("yes")
@@ -856,8 +1130,10 @@ class ShellCwdTests(unittest.TestCase):
 
         self.assertFalse(declined)
         self.assertTrue(accepted)
-        self.assertEqual(no_session.calls, ["pause", "prompt", "resume"])
-        self.assertEqual(yes_session.calls, ["pause", "prompt", "resume"])
+        self.assertEqual(
+            no_session.calls, ["modal", "enter", "prompt", "exit"])
+        self.assertEqual(
+            yes_session.calls, ["modal", "enter", "prompt", "exit"])
         rendered = output.getvalue()
         self.assertIn("Saved connection:", rendered)
         self.assertIn("Provider: OpenRouter", rendered)
