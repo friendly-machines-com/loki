@@ -463,6 +463,65 @@ class StreamAccumulatorTests(unittest.TestCase):
             buffered["choices"][0]["message"],
         )
 
+    def test_openai_chat_cost_is_preserved_without_unknown_diagnostic(self):
+        buffered = {
+            "id": "chat_cost",
+            "object": "chat.completion",
+            "model": "deepseek-v4-flash",
+            "cost": "0",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Working.",
+                },
+                "finish_reason": "stop",
+            }],
+        }
+        chunks = [
+            {
+                "id": "chat_cost",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4-flash",
+                "cost": "0",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "Work",
+                    },
+                    "finish_reason": None,
+                }],
+            },
+            {
+                "cost": "0",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "ing."},
+                    "finish_reason": "stop",
+                }],
+            },
+        ]
+        accumulator = protocols.OpenAIChatStreamAccumulator(
+            lambda text: None)
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            buffered_turn = formats.openai_chat_response_to_items(
+                buffered)
+            for chunk in chunks:
+                accumulator.feed(self.event(json.dumps(chunk)))
+            accumulator.feed(self.event("[DONE]"))
+            streamed_turn = formats.openai_chat_response_to_items(
+                accumulator.finish())
+
+        expected = buffered_turn.to_event()
+        self.assertEqual(streamed_turn.to_event(), expected)
+        self.assertEqual(
+            expected["protocol_data"][protocols.OPENAI_CHAT]["cost"],
+            "0",
+        )
+        self.assertEqual(diagnostics.getvalue(), "")
+
     def test_openai_chat_tool_only_stream_matches_null_buffered_content(self):
         buffered = {
             "id": "chat_tool_only",

@@ -853,7 +853,8 @@ def openai_chat_response_to_items(response):
         key: value for key, value in response.items()
         if key not in [
             "id", "object", "created", "model", "choices", "usage",
-            "service_tier", "system_fingerprint", "_loki_stream_extensions"]
+            "service_tier", "system_fingerprint", "cost",
+            "_loki_stream_extensions"]
     }
     if unknown_envelope:
         report_unknown(OPENAI_CHAT, "response fields", unknown_envelope)
@@ -868,6 +869,7 @@ def openai_chat_response_to_items(response):
     protocol_data = {}
     _put_optional(protocol_data, "choice_index", first.get("index"))
     _put_optional(protocol_data, "logprobs", first.get("logprobs"))
+    _put_optional(protocol_data, "cost", response.get("cost"))
     return DecodedTurn(
         openai_chat_message_to_items(first["message"]),
         {
