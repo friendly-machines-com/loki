@@ -14,6 +14,7 @@ import sys
 import os
 import asyncio
 import collections
+import copy
 import json
 import random
 import time
@@ -38,6 +39,7 @@ from . import models as modelsdev
 from . import protocols
 from . import savefiles
 from . import sse
+from . import tool_runtime
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .credentials import CredentialStore
 from .savefiles import ResumeTranscriptRenderer
@@ -172,6 +174,7 @@ class RuntimeConfig:
     credential_env: str | None = None
     model_status: str | None = None
     stream: bool = False
+    prompt_cache: bool = False
 
 
 RUNTIME_CONFIG: RuntimeConfig | None = None
@@ -205,7 +208,8 @@ def _bool_setting(name, default, credentials: CredentialStore):
 def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=None,
                         max_tokens=4096, anthropic_version="2023-06-01",
                         auth_header=None, provider_id=None, provider_name=None,
-                        credential_env=None, model_status=None, stream=False):
+                        credential_env=None, model_status=None, stream=False,
+                        prompt_cache=False):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -221,6 +225,9 @@ def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=Non
         max_tokens=max_tokens,
         anthropic_version=anthropic_version,
         auth_header=auth_header,
+        provider_id=provider_id,
+        provider_name=provider_name,
+        prompt_cache=prompt_cache,
     )
     return RuntimeConfig(
         url=url,
@@ -237,6 +244,7 @@ def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=Non
         credential_env=credential_env,
         model_status=model_status,
         stream=stream,
+        prompt_cache=prompt_cache,
     )
 
 
@@ -269,6 +277,7 @@ def build_config_from_env(environ=os.environ,
             anthropic_version=credentials.get(
                 "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
             provider_name="Explicit LOKI_* connection",
+            prompt_cache=False,
         )
 
     # Never infer credential ownership from the wire protocol. An explicitly
@@ -291,6 +300,12 @@ def build_config_from_env(environ=os.environ,
         provider_name="Explicit LOKI_* connection",
         credential_env=credential_env,
         stream=_bool_setting("LOKI_STREAM", False, credentials),
+        prompt_cache=_bool_setting(
+            "LOKI_PROMPT_CACHE",
+            urllib.parse.urlparse(config_url).hostname
+            == "api.anthropic.com",
+            credentials,
+        ),
     )
 
 
@@ -347,6 +362,11 @@ def config_from_connection_descriptor(
     stream = (
         _bool_setting("LOKI_STREAM", descriptor.stream, credentials)
         if credentials.get("LOKI_STREAM") else descriptor.stream)
+    prompt_cache = (
+        _bool_setting(
+            "LOKI_PROMPT_CACHE", descriptor.prompt_cache, credentials)
+        if credentials.get("LOKI_PROMPT_CACHE")
+        else descriptor.prompt_cache)
     return make_runtime_config(
         # Restore the concrete endpoint that was actually used, rather than
         # deriving it again from a catalog base URL.
@@ -363,6 +383,7 @@ def config_from_connection_descriptor(
         credential_env=descriptor.credential_env,
         model_status=model_status,
         stream=stream,
+        prompt_cache=prompt_cache,
     )
 
 
@@ -395,6 +416,11 @@ def config_from_modelsdev_selection(
         credential_env=access.credential_env,
         model_status=model_status,
         stream=_bool_setting("LOKI_STREAM", False, credentials),
+        prompt_cache=_bool_setting(
+            "LOKI_PROMPT_CACHE",
+            provider_id == "anthropic",
+            credentials,
+        ),
     )
 
 
@@ -416,6 +442,7 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         auth_header=RUNTIME_CONFIG.auth_header,
         model_status=RUNTIME_CONFIG.model_status,
         stream=RUNTIME_CONFIG.stream,
+        prompt_cache=RUNTIME_CONFIG.prompt_cache,
     )
 
 
@@ -433,7 +460,8 @@ _UNSET = object()
 def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None,
                        models_url=None, max_tokens=None, anthropic_version=None,
                        auth_header=None, provider_id=None, provider_name=None,
-                       credential_env=None, model_status=_UNSET, stream=None):
+                       credential_env=None, model_status=_UNSET, stream=None,
+                       prompt_cache=None):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -480,6 +508,10 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
                         else current.credential_env),
         model_status=new_model_status,
         stream=stream if stream is not None else current.stream,
+        prompt_cache=(
+            prompt_cache
+            if prompt_cache is not None
+            else current.prompt_cache),
     ))
 
 
@@ -509,6 +541,12 @@ class LruCache(object):
     def __getitem__(self, key):
         self.items.move_to_end(key)
         return self.items[key]
+
+    def clear(self):
+        self.items.clear()
+
+    def pop(self, key, default=None):
+        return self.items.pop(key, default)
 
 
 file_state = LruCache(READ_PATHS_LIMIT) # file_path -> last content the agent observed; keys = files Read this session
@@ -560,20 +598,16 @@ def change_shell_cwd(path: str = None) -> str:
     return shell_cwd
 
 
-class ToolSchemaError(ValueError):
-    pass
+ToolSchemaError = tool_runtime.ToolSchemaError
 
 
 class ToolValidationError(ValueError):
     pass
 
 
-SCHEMA_ANNOTATION_KEYS = {"description", "default", "format"}
-SCHEMA_VALIDATION_KEYS = {
-    "type", "properties", "required", "additionalProperties", "enum", "items",
-    "minLength", "maxLength", "minimum", "maximum", "maxItems",
-}
-SCHEMA_ALLOWED_KEYS = SCHEMA_ANNOTATION_KEYS | SCHEMA_VALIDATION_KEYS
+SCHEMA_ANNOTATION_KEYS = tool_runtime.SCHEMA_ANNOTATION_KEYS
+SCHEMA_VALIDATION_KEYS = tool_runtime.SCHEMA_VALIDATION_KEYS
+SCHEMA_ALLOWED_KEYS = tool_runtime.SCHEMA_ALLOWED_KEYS
 
 
 def _schema_path(path: str, key) -> str:
@@ -583,107 +617,20 @@ def _schema_path(path: str, key) -> str:
 
 
 def _json_type_name(value) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "number"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, list):
-        return "array"
-    if isinstance(value, dict):
-        return "object"
-    return type(value).__name__
+    return tool_runtime.json_type_name(value)
 
 
 def _matches_json_type(value, expected_type: str) -> bool:
-    if expected_type == "null":
-        return value is None
-    if expected_type == "boolean":
-        return isinstance(value, bool)
-    if expected_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected_type == "string":
-        return isinstance(value, str)
-    if expected_type == "array":
-        return isinstance(value, list)
-    if expected_type == "object":
-        return isinstance(value, dict)
-    raise ToolSchemaError(f"unsupported type {expected_type!r}")
+    return tool_runtime.matches_json_type(value, expected_type)
 
 
 def _validate_schema(schema: dict, value, path: str = "$"):
-    if not isinstance(schema, dict):
-        raise ToolSchemaError(f"{path}: schema must be an object")
-
-    unsupported = sorted(set(schema) - SCHEMA_ALLOWED_KEYS)
-    if unsupported:
-        raise ToolSchemaError(f"{path}: unsupported schema keys: {', '.join(unsupported)}")
-
-    if "type" in schema:
-        expected = schema["type"]
-        if isinstance(expected, str):
-            expected_types = [expected]
-        elif isinstance(expected, list) and all(isinstance(t, str) for t in expected):
-            expected_types = expected
-        else:
-            raise ToolSchemaError(f"{path}: type must be a string or list of strings")
-        if not any(_matches_json_type(value, expected_type) for expected_type in expected_types):
-            expected_label = " or ".join(expected_types)
-            raise ToolValidationError(f"{path} must be {expected_label}, got {_json_type_name(value)}")
-
-    if "enum" in schema and value not in schema["enum"]:
-        allowed = ", ".join(repr(item) for item in schema["enum"])
-        raise ToolValidationError(f"{path} must be one of: {allowed}")
-
-    if isinstance(value, dict):
-        properties = schema.get("properties", {})
-        if not isinstance(properties, dict):
-            raise ToolSchemaError(f"{path}: properties must be an object")
-
-        required = schema.get("required", [])
-        if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
-            raise ToolSchemaError(f"{path}: required must be a list of strings")
-        for key in required:
-            if key not in value:
-                raise ToolValidationError(f"{_schema_path(path, key)} is required")
-
-        additional = schema.get("additionalProperties", True)
-        if additional is False:
-            extra = sorted(set(value) - set(properties))
-            if extra:
-                raise ToolValidationError(f"{_schema_path(path, extra[0])} is not allowed")
-        elif additional is not True:
-            raise ToolSchemaError(f"{path}: additionalProperties must be true or false")
-
-        for key, subschema in properties.items():
-            if key in value:
-                _validate_schema(subschema, value[key], _schema_path(path, key))
-
-    if isinstance(value, list):
-        if "maxItems" in schema and len(value) > schema["maxItems"]:
-            raise ToolValidationError(f"{path} must contain at most {schema['maxItems']} items")
-        if "items" in schema:
-            for i, item in enumerate(value):
-                _validate_schema(schema["items"], item, _schema_path(path, i))
-
-    if isinstance(value, str):
-        if "minLength" in schema and len(value) < schema["minLength"]:
-            raise ToolValidationError(f"{path} must be at least {schema['minLength']} characters")
-        if "maxLength" in schema and len(value) > schema["maxLength"]:
-            raise ToolValidationError(f"{path} must be at most {schema['maxLength']} characters")
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if "minimum" in schema and value < schema["minimum"]:
-            raise ToolValidationError(f"{path} must be >= {schema['minimum']}")
-        if "maximum" in schema and value > schema["maximum"]:
-            raise ToolValidationError(f"{path} must be <= {schema['maximum']}")
+    if path != "$":
+        raise ToolSchemaError(
+            "_validate_schema compatibility wrapper only accepts root path")
+    issues = tool_runtime.validate_schema(schema, value)
+    if issues:
+        raise ToolValidationError(issues[0].message)
 
 
 def _close_object_schemas(schema: dict):
@@ -739,6 +686,8 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
         registry[name] = {
             "definition": tool,
             "schema": parameters,
+            "semantics": copy.deepcopy(
+                handler.get("semantics", {})),
             "handler": sync_handler,
             "async_handler": async_handler,
             "explore": handler.get("explore", False),
@@ -1689,15 +1638,28 @@ async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
     return _tool_result(not _looks_like_tool_error(text), text)
 
 
-async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_context=None) -> dict:
+def _tool_access_error(fn_name: str, allowed=None, extra_context=None):
     inhibit_edits = (extra_context or {}).get('inhibit_edits', False)
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
-        return _tool_result(False, f"Unknown function: {fn_name}")
+        return f"Unknown function: {fn_name}"
     if allowed is not None and fn_name not in allowed:
-        return _tool_result(False, f"Tool {fn_name} not available in this subagent (allowed: {sorted(allowed)})")
-    if inhibit_edits and spec.get('explore') != True:
-        return _tool_result(False, f"Not allowed to {fn_name} instead of doing the following: {inhibit_edits}")
+        return (
+            f"Tool {fn_name} not available in this subagent "
+            f"(allowed: {sorted(allowed)})")
+    if inhibit_edits and spec.get('explore') is not True:
+        return (
+            f"Not allowed to {fn_name} instead of doing the following: "
+            f"{inhibit_edits}")
+    return None
+
+
+async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_context=None) -> dict:
+    spec = TOOL_REGISTRY.get(fn_name)
+    access_error = _tool_access_error(
+        fn_name, allowed=allowed, extra_context=extra_context)
+    if access_error:
+        return _tool_result(False, access_error)
 
     async def run_handler():
         if spec.get("async_handler") is not None:
@@ -1705,6 +1667,223 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_cont
         return spec["handler"](args)
 
     return await with_exception_to_tool_result_async(f"executing {fn_name}", run_handler)
+
+
+def _raw_tool_arguments(call):
+    if "input" in call:
+        return copy.deepcopy(call["input"])
+    return call.get("arguments", "{}")
+
+
+def _runtime_provider_label():
+    if RUNTIME_CONFIG is None:
+        return None
+    return (
+        RUNTIME_CONFIG.provider_id
+        or RUNTIME_CONFIG.provider_name
+        or RUNTIME_CONFIG.netloc
+    )
+
+
+def _repair_event(invocation):
+    return {
+        "type": "tool_input_repaired",
+        "name": invocation.tool_name,
+        "call_id": invocation.call_id,
+        "repairs": [
+            {
+                "hook": adjustment.hook,
+                "rule": adjustment.rule,
+                "path": list(adjustment.path),
+                "display_path": tool_runtime.format_path(
+                    adjustment.path),
+            }
+            for adjustment in invocation.adjustments
+        ],
+    }
+
+
+def _execution_metadata(invocation, outcome, defaults):
+    if not (invocation.adjustments
+            or invocation.hook_records
+            or defaults
+            or invocation.denied_by
+            or invocation.changed_paths
+            or invocation.invalidate_all_files):
+        return None
+    result = {
+        "executed": outcome.executed,
+        "status": outcome.status,
+    }
+    if invocation.adjustments:
+        result["adjustments"] = [
+            adjustment.to_dict()
+            for adjustment in invocation.adjustments
+        ]
+    if invocation.hook_records:
+        result["hooks"] = [
+            record.to_dict() for record in invocation.hook_records
+        ]
+    if defaults:
+        result["defaults"] = copy.deepcopy(defaults)
+    if invocation.denied_by:
+        result["denied_by"] = invocation.denied_by
+    if invocation.changed_paths:
+        result["changed_paths"] = list(invocation.changed_paths)
+    if invocation.invalidate_all_files:
+        result["invalidated_all_file_state"] = True
+    return result
+
+
+def _invalidate_hook_file_state(invocation):
+    if invocation.invalidate_all_files:
+        file_state.clear()
+        return
+    for path in invocation.changed_paths:
+        file_state.pop(_resolve_path(path, invocation.cwd), None)
+
+
+def _read_default_notes(invocation):
+    if invocation.tool_name != "Read":
+        return [], []
+    args = invocation.effective_arguments
+    if not isinstance(args, dict):
+        return [], []
+    has_offset = "offset" in args
+    has_limit = "limit" in args
+    if has_offset == has_limit:
+        return [], []
+    if has_offset:
+        return (
+            ["Note: limit was omitted; Read used the default of "
+             f"{READ_DEFAULT_LINES} lines."],
+            [{"field": "limit", "value": READ_DEFAULT_LINES}],
+        )
+    return (
+        ["Note: offset was omitted; Read started at line offset 0."],
+        [{"field": "offset", "value": 0}],
+    )
+
+
+def _prepend_tool_notes(content, notes):
+    useful = [str(note).strip() for note in notes if str(note).strip()]
+    if not useful:
+        return str(content)
+    return "\n\n".join(useful + [str(content)])
+
+
+async def execute_tool_call_async(
+        call, allowed=None, extra_context=None, on_event=None,
+        hook_pipeline=None):
+    if on_event is None:
+        on_event = lambda event: None
+    if hook_pipeline is None:
+        hook_pipeline = TOOL_HOOK_PIPELINE
+    fn_name = formats.tool_call_name(call)
+    spec = TOOL_REGISTRY.get(fn_name)
+    if spec is None:
+        result = _tool_result(False, f"Unknown function: {fn_name}")
+        on_event({
+            "type": "tool_rejected",
+            "name": fn_name,
+            "args": _raw_tool_arguments(call),
+        })
+        return result, None
+
+    parse_error = call.get("parse_error")
+    try:
+        original_args = formats.tool_call_input(call)
+    except formats.TranscriptFormatError as error:
+        original_args = None
+        if parse_error is None:
+            parse_error = str(error)
+    invocation = tool_runtime.ToolInvocation(
+        call_id=formats.tool_call_id(call),
+        tool_name=fn_name,
+        raw_arguments=_raw_tool_arguments(call),
+        original_arguments=copy.deepcopy(original_args),
+        effective_arguments=copy.deepcopy(original_args),
+        schema=spec["schema"],
+        semantics=spec.get("semantics", {}),
+        cwd=shell_cwd,
+        model=model or None,
+        provider=_runtime_provider_label(),
+        parse_error=parse_error,
+    )
+
+    access_error = _tool_access_error(
+        fn_name, allowed=allowed, extra_context=extra_context)
+    if access_error:
+        invocation.denied_reason = access_error
+        invocation.denied_by = "loki.capability-gate"
+        outcome = tool_runtime.ToolOutcome(
+            "rejected", False, False, access_error)
+    else:
+        invocation = await hook_pipeline.prepare(invocation)
+        if invocation.denied_reason:
+            outcome = tool_runtime.ToolOutcome(
+                "rejected",
+                False,
+                False,
+                invocation.denied_reason,
+            )
+        elif invocation.validation_issues:
+            outcome = tool_runtime.ToolOutcome(
+                "invalid",
+                False,
+                False,
+                tool_runtime.invalid_input_message(
+                    fn_name, invocation.validation_issues),
+            )
+        else:
+            if invocation.adjustments:
+                on_event(_repair_event(invocation))
+            on_event({
+                "type": "tool_call",
+                "name": fn_name,
+                "args": copy.deepcopy(
+                    invocation.effective_arguments),
+            })
+            result = await dispatch_tool_async(
+                fn_name,
+                invocation.effective_arguments,
+                allowed=allowed,
+                extra_context=extra_context,
+            )
+            outcome = tool_runtime.ToolOutcome(
+                "success" if result["ok"] else "tool_error",
+                True,
+                result["ok"],
+                result["content"],
+            )
+
+    default_notes, defaults = _read_default_notes(invocation)
+    if outcome.executed:
+        if invocation.adjustments:
+            invocation.notes.insert(
+                0,
+                "Note: Loki repaired or adjusted tool input before "
+                "execution:\n"
+                + "\n".join(
+                    "- " + tool_runtime.adjustment_summary(adjustment)
+                    for adjustment in invocation.adjustments),
+            )
+        invocation.notes.extend(default_notes)
+    invocation, outcome = await hook_pipeline.finish(
+        invocation, outcome)
+    _invalidate_hook_file_state(invocation)
+    outcome.content = _prepend_tool_notes(
+        outcome.content, invocation.notes)
+    if not outcome.executed:
+        on_event({
+            "type": "tool_rejected",
+            "name": fn_name,
+            "args": copy.deepcopy(
+                invocation.effective_arguments),
+        })
+    result = _tool_result(outcome.ok, outcome.content)
+    return result, _execution_metadata(
+        invocation, outcome, defaults)
 
 
 def get_tool_loop_extra_context(transcript_items: list):
@@ -1718,7 +1897,9 @@ def get_tool_loop_extra_context(transcript_items: list):
         content = [x for x in content if x.get('type') == 'text'][-1:]
         if len(content) > 0:
             text = content[-1].get("text")
-            if text and text.strip().endswith('?') or text.strip().lower().find('what?') != -1:
+            if (text and (
+                    text.strip().endswith("?")
+                    or "what?" in text.strip().lower())):
                 inhibit_edits = "answering the user's question"
 
     return {'inhibit_edits': inhibit_edits}
@@ -1726,30 +1907,55 @@ def get_tool_loop_extra_context(transcript_items: list):
 
 async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
                               chat_fn=None, on_event=None, cancel_check=None,
-                              stream_chat=False, report_timing=False) -> str:
-    """Run the model/tool loop over the neutral transcript. Mutates `transcript_items` in place."""
+                              stream_chat=False, report_timing=False,
+                              on_response=None,
+                              hook_pipeline=None) -> str:
+    """Run the model/tool loop over canonical session events.
+
+    Mutates ``transcript_items`` by appending one ``model_response`` for each
+    actual provider response and one event for each local tool result.
+    """
     if chat_fn is None:
-        chat_fn = lambda items: async_chat_completion(items, tools=TOOLS)
+        advertised_tools = (
+            TOOLS if allowed is None else [
+                spec["definition"]
+                for name, spec in TOOL_REGISTRY.items()
+                if name in allowed
+            ])
+        chat_fn = lambda items: async_chat_completion(
+            items, tools=advertised_tools)
     if on_event is None:
         on_event = lambda event: None
     if cancel_check is None:
         cancel_check = lambda: False
+    if on_response is None:
+        on_response = lambda turn, event: None
+    if max_loops < 1:
+        raise ValueError("max_loops must be at least 1")
 
     tool_loop_extra_context = get_tool_loop_extra_context(transcript_items)
+
+    def append_turn(turn):
+        response_event = turn.to_event()
+        transcript_items.append(response_event)
+        on_response(turn, response_event)
+
+    def append_unexecuted_results(tool_calls, reason):
+        for call in tool_calls:
+            transcript_items.append(formats.tool_result_for_call(
+                call, reason, is_error=True))
 
     loop_count = 0
     while True:
         loop_count += 1
-        if loop_count > max_loops:
-            transcript_items.append(formats.instruction_item(
-                "Max tool loop limit reached. Stop calling tools and respond."))
-            on_event({"type": "max_loops"})
         live_text_started = False
+        live_text_parts = []
 
         def on_text_delta(text):
             nonlocal live_text_started
             if not text:
                 return
+            live_text_parts.append(text)
             if not live_text_started:
                 live_text_started = True
                 on_event({"type": "assistant_start"})
@@ -1775,6 +1981,7 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             on_event({
                 "type": "response_cancelled",
                 "partial": live_text_started,
+                "saved": False,
             })
             return ""
         except protocols.StreamProtocolError as e:
@@ -1794,69 +2001,111 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             msg = str(e) or f"{type(e).__name__}() (errno={e.errno!r}, no OS message)"
             on_event({"type": "network_error", "error": msg})
             return ""
-        if not response_items:
-            return ""
-
-        if cancel_check():
-            finish_live_text(False, "cancelled")
-            on_event({
-                "type": "response_cancelled",
-                "partial": live_text_started,
-            })
-            return ""
-
-        finish_live_text(True)
+        turn = formats.coerce_decoded_turn(response_items)
+        finish_live_text(turn.complete, None if turn.complete else "incomplete")
         if report_timing:
             on_event({
                 "type": "response_timing",
                 "elapsed": time.perf_counter() - request_start,
             })
-        for item in response_items:
-            transcript_items.append(item)
+        append_turn(turn)
 
-        tool_calls = formats.response_tool_calls(response_items)
+        tool_calls = formats.response_tool_calls(turn.items)
         assistant_items = [
-            item for item in response_items
+            item for item in turn.items
             if item.get("type") == "message" and item.get("role") == "assistant"
         ]
-        if not assistant_items and not tool_calls:
-            return ""
-
-        assistant_text = ""
-        if assistant_items:
-            assistant_item = assistant_items[-1]
-            assistant_text = formats.item_text(assistant_item)
+        assistant_text = "\n".join(
+            text for text in (
+                formats.item_text(item) for item in assistant_items)
+            if text)
         if assistant_text and not live_text_started:
             on_event({"type": "assistant_message", "content": assistant_text})
+
+        if not turn.complete:
+            if tool_calls:
+                append_unexecuted_results(
+                    tool_calls,
+                    "Tool call not executed because the provider response "
+                    "was incomplete.",
+                )
+            event_type = (
+                "response_failed"
+                if turn.metadata.get("status") == "failed"
+                else "response_incomplete")
+            on_event({
+                "type": event_type,
+                "status": turn.metadata.get("status"),
+                "protocol_data": copy.deepcopy(
+                    turn.metadata.get("protocol_data")),
+            })
+            return assistant_text
+
+        if (turn.metadata.get("stop_reason") == "pause_turn"
+                and not tool_calls):
+            if loop_count >= max_loops:
+                on_event({"type": "max_loops"})
+                return assistant_text
+            # Anthropic server tools require the paused assistant response to
+            # be sent back unchanged in the next request. No synthetic user or
+            # tool-result event belongs between the two provider responses.
+            continue
+
+        if not turn.items:
+            return ""
+        if not assistant_items and not tool_calls:
+            return ""
 
         if not tool_calls:
             return assistant_text
 
-        for tc in tool_calls:
-            fn_name = tc.get("name")
-            args = tc.get("input", {})
-            if tc.get("parse_error"):
-                result = _tool_result(False, f"Failed to parse arguments: {tc['parse_error']}")
-            elif not isinstance(args, dict):
-                result = _tool_result(False, f"Tool arguments must be an object, got {type(args).__name__}")
-            else:
-                validation_error = validate_tool_args(fn_name, args)
-                if validation_error:
-                    result = _tool_result(False, validation_error)
-                    on_event({"type": "tool_rejected", "name": fn_name, "args": args})
-                else:
-                    on_event({"type": "tool_call", "name": fn_name, "args": args})
-                    result = await dispatch_tool_async(fn_name, args, allowed=allowed, extra_context=tool_loop_extra_context)
+        if cancel_check():
+            reason = "Tool call not executed because the user cancelled the turn."
+            append_unexecuted_results(tool_calls, reason)
+            on_event({
+                "type": "response_cancelled",
+                "partial": live_text_started,
+                "saved": True,
+            })
+            return assistant_text
+
+        if loop_count >= max_loops:
+            reason = (
+                f"Tool call not executed because Loki reached its "
+                f"{max_loops}-response autonomous loop limit.")
+            append_unexecuted_results(tool_calls, reason)
+            on_event({"type": "max_loops"})
+            return assistant_text
+
+        for call_index, tc in enumerate(tool_calls):
+            result, execution = await execute_tool_call_async(
+                tc,
+                allowed=allowed,
+                extra_context=tool_loop_extra_context,
+                on_event=on_event,
+                hook_pipeline=hook_pipeline,
+            )
             if not result["ok"]:
                 on_event({"type": "tool_error", "result": result["content"]})
-            transcript_items.append(formats.tool_result_item(
-                tc.get("id"),
+            result_item = formats.tool_result_for_call(
+                tc,
                 result["content"],
-                name=fn_name,
                 is_error=not result["ok"],
-            ))
+                execution=execution,
+            )
+            transcript_items.append(result_item)
             if cancel_check():
-                return ""
+                append_unexecuted_results(
+                    tool_calls[call_index + 1:],
+                    "Tool call not executed because the user cancelled "
+                    "the turn.",
+                )
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": False,
+                    "saved": True,
+                })
+                return assistant_text
 
 
 def _print_tool_args(args):
@@ -1882,9 +2131,21 @@ def _terminal_agent_event(event: dict):
         print(f"\n{computer}: NETWORK ERROR: {event['error']}")
     elif kind == "transcript_error":
         terminal.set_background_color(ERROR_COLOR)
-        print(f"Transcript render error: {event['error']}", end='')
+        error = event["error"]
+        print(f"Transcript render error: {error}", end='')
         terminal.reset_colors_and_flags()
         print()
+        sys.stdout.flush()
+        payload = getattr(error, "payload", None)
+        if payload is not None:
+            print(
+                "Provider payload:\n"
+                + json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True,
+                    default=str),
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
     elif kind == "assistant_message":
         rendered_content = terminal.markdown_to_ansi(event["content"])
         print(f"\n{model}: {rendered_content if rendered_content is not None else event['content']}")
@@ -1896,25 +2157,71 @@ def _terminal_agent_event(event: dict):
         print()
         sys.stdout.flush()
     elif kind == "response_timing":
+        sys.stdout.flush()
         print(
             f"\n[T]  [LLM Response Time: {event['elapsed']:.3f}s]",
             file=sys.stderr)
         sys.stderr.flush()
     elif kind == "response_cancelled":
-        detail = (
-            "; partial response was not saved" if event.get("partial")
-            else "")
+        sys.stdout.flush()
+        detail = ""
+        if event.get("partial"):
+            detail = (
+                "; partial response saved"
+                if event.get("saved")
+                else "; partial transport output was not added to history")
         print(f"[model response cancelled{detail}]", file=sys.stderr)
         sys.stderr.flush()
+    elif kind == "response_incomplete":
+        sys.stdout.flush()
+        detail = event.get("protocol_data")
+        suffix = (
+            "\n" + json.dumps(
+                detail, ensure_ascii=False, sort_keys=True, default=str)
+            if detail else "")
+        print(
+            "[model response incomplete; provider output saved]"
+            + suffix,
+            file=sys.stderr)
+        sys.stderr.flush()
+    elif kind == "response_failed":
+        sys.stdout.flush()
+        detail = event.get("protocol_data")
+        suffix = (
+            "\n" + json.dumps(
+                detail, ensure_ascii=False, sort_keys=True, default=str)
+            if detail else "")
+        print("[model response failed; provider output saved]" + suffix,
+              file=sys.stderr)
+        sys.stderr.flush()
     elif kind == "stream_error":
+        error = event["error"]
         terminal.set_background_color(ERROR_COLOR)
         print(
-            f"Streaming response error: {event['error']}\n"
+            f"Streaming response error: {error}\n"
             "Set LOKI_STREAM=0 to disable streaming for this connection.",
             end='')
         terminal.reset_colors_and_flags()
         print()
         sys.stdout.flush()
+        payload = getattr(error, "payload", None)
+        if payload is not None:
+            print(
+                "Provider payload:\n"
+                + json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True,
+                    default=str),
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+    elif kind == "tool_input_repaired":
+        terminal.set_foreground_color(TOOL_CALL_COLOR)
+        print(f"{computer}: Repaired Tool Input: {event['name']}")
+        for repair in event["repairs"]:
+            print(
+                f"  {repair['display_path']}: "
+                f"{repair['rule'].replace('_', ' ')}")
+        terminal.reset_colors_and_flags()
     elif kind == "tool_call":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
         print(f"{computer}: Executing Tool: {event['name']} with args:")
@@ -1946,6 +2253,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None) -> 
         cancel_check=cancel_check,
         stream_chat=True,
         report_timing=True,
+        on_response=lambda turn, event: _remember_session_toolset(TOOLS),
     )
 
 
@@ -1956,12 +2264,16 @@ async def run_toolless_completion_async(transcript_items: list) -> str:
         return f"Transcript render error: {e}"
     except ApiError as e:
         return e.formatted()
-    if not response_items:
+    turn = formats.coerce_decoded_turn(response_items)
+    if not turn:
         return ""
-    for item in response_items:
-        if item.get("type") == "message" and item.get("role") == "assistant":
-            return formats.item_text(item).strip()
-    return ""
+    return "\n".join(
+        text for text in (
+            formats.item_text(item).strip()
+            for item in turn.items
+            if (item.get("type") == "message"
+                and item.get("role") == "assistant"))
+        if text)
 
 
 def _subprocess_stream_text(value) -> str:
@@ -2004,6 +2316,8 @@ def _subagent_env() -> dict:
         else:
             env.pop('LOKI_API_KEY', None)
         env['LOKI_STREAM'] = '1' if RUNTIME_CONFIG.stream else '0'
+        env['LOKI_PROMPT_CACHE'] = (
+            '1' if RUNTIME_CONFIG.prompt_cache else '0')
     return env
 
 
@@ -2415,7 +2729,13 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {"type": "string", "description": "The absolute or relative path to the file to read"},
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Plain absolute or relative filesystem path "
+                            "passed to file APIs. Do not use Markdown links "
+                            "or URLs."),
+                    },
                     "offset": {"type": "integer", "minimum": 0,
                                "description": "The line number to start reading from. Only provide if the file is too large to read at once"},
                     "limit": {"type": "integer", "minimum": 1,
@@ -2437,8 +2757,13 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {"type": "string",
-                                  "description": "The absolute or relative path to the file to write"},
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Plain absolute or relative filesystem path "
+                            "passed to file APIs. Do not use Markdown links "
+                            "or URLs."),
+                    },
                     "content": {"type": "string", "description": "The content to write to the file"}
                 },
                 "required": ["file_path", "content"]
@@ -2459,7 +2784,13 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {"type": "string", "description": "The absolute or relative path to the file to modify"},
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Plain absolute or relative filesystem path "
+                            "passed to file APIs. Do not use Markdown links "
+                            "or URLs."),
+                    },
                     "old_string": {"type": "string", "description": "The text to replace"},
                     "new_string": {"type": "string",
                                    "description": "The text to replace it with (must be different from old_string)"},
@@ -2561,8 +2892,13 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "The glob pattern to match files against"},
-                    "path": {"type": "string",
-                             "description": "The directory to search in. If not specified, the current Loki cwd will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided."}
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Plain filesystem directory path. Defaults to "
+                            "the current Loki cwd. Omit it for the default; "
+                            "do not pass null, undefined, Markdown, or a URL."),
+                    },
                 },
                 "required": ["pattern"]
             }
@@ -2585,8 +2921,13 @@ TOOLS = [
                 "properties": {
                     "pattern": {"type": "string",
                                 "description": "The regular expression pattern to search for in file contents"},
-                    "path": {"type": "string",
-                             "description": "File or directory to search in (rg PATH). Defaults to current Loki cwd."},
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Plain filesystem file or directory path for "
+                            "rg. Defaults to the current Loki cwd; do not "
+                            "use Markdown links or URLs."),
+                    },
                     "glob": {"type": "string",
                              "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob"},
                     "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"],
@@ -2757,7 +3098,7 @@ TOOLS = [
             "description": "\n".join([
                 "Search the web. Returns result blocks with titles and URLs. US-only.",
                 "",
-                f"- Current date context: {time.strftime('%B %Y')}. Use this when searching for recent information.",
+                "- Use the session's current-date instruction when searching for recent information.",
                 "- `allowed_domains` / `blocked_domains` filter results.",
                 '- After answering from results, end with a "Sources:" list of the URLs you used as markdown links.',
             ]),
@@ -2777,15 +3118,45 @@ TOOLS = [
 ]
 
 TOOL_HANDLERS = {
-    "Read": {"handler": _handle_read, "explore": True},
-    "Write": {"handler": _handle_write},
-    "Edit": {"handler": _handle_edit},
+    "Read": {
+        "handler": _handle_read,
+        "explore": True,
+        "semantics": {
+            ("file_path",): tool_runtime.FILESYSTEM_PATH,
+        },
+    },
+    "Write": {
+        "handler": _handle_write,
+        "semantics": {
+            ("file_path",): tool_runtime.FILESYSTEM_PATH,
+        },
+    },
+    "Edit": {
+        "handler": _handle_edit,
+        "semantics": {
+            ("file_path",): tool_runtime.FILESYSTEM_PATH,
+        },
+    },
     "Bash": {"handler": _handle_bash, "async_handler": _handle_bash_async, "explore": True},
     "Jobs": {"handler": _handle_jobs, "explore": True},
     "JobStatus": {"handler": _handle_job_status, "explore": True},
     "JobStop": {"handler": _handle_job_stop, "explore": True},
-    "Glob": {"handler": _handle_glob, "async_handler": _handle_glob_async, "explore": True},
-    "Grep": {"handler": _handle_grep, "async_handler": _handle_grep_async, "explore": True},
+    "Glob": {
+        "handler": _handle_glob,
+        "async_handler": _handle_glob_async,
+        "explore": True,
+        "semantics": {
+            ("path",): tool_runtime.FILESYSTEM_PATH,
+        },
+    },
+    "Grep": {
+        "handler": _handle_grep,
+        "async_handler": _handle_grep_async,
+        "explore": True,
+        "semantics": {
+            ("path",): tool_runtime.FILESYSTEM_PATH,
+        },
+    },
     "TodoRead": {"handler": _handle_todoread, "explore": True},
     "TodoWrite": {"handler": _handle_todowrite, "explore": True},
     "Agent": {"handler": _handle_agent, "async_handler": _handle_agent_async},
@@ -2796,6 +3167,24 @@ TOOL_HANDLERS = {
 TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]
 EXPLORE_TOOLS = {name for name, spec in TOOL_REGISTRY.items() if spec["explore"]}
+TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
+
+
+def configure_tool_hook_pipeline(environ=os.environ):
+    """Load trusted user-selected command hooks; project hooks are never automatic."""
+    global TOOL_HOOK_PIPELINE
+    configured = environ.get("LOKI_HOOKS")
+    if configured is None:
+        default_path = os.path.join(LOKI_CONFIG_DIR, "hooks.json")
+        configured = default_path if os.path.isfile(default_path) else ""
+    if configured.strip().lower() in ["", "0", "none", "off"]:
+        TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
+        return None
+    path = os.path.expanduser(configured)
+    if not os.path.isabs(path):
+        path = os.path.join(STARTUP_CWD, path)
+    TOOL_HOOK_PIPELINE = tool_runtime.load_hook_pipeline(path)
+    return path
 
 async def async_chat_request(request_url: str, payload, request_headers: dict = None,
                              report_errors: bool = False, show_timing: bool = False) -> dict:
@@ -3018,19 +3407,24 @@ async def async_chat_stream_request(
 async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
                                 show_timing: bool = False,
                                 on_text_delta=None,
-                                cancel_check=None) -> list:
+                                cancel_check=None) -> formats.DecodedTurn:
     if not RUNTIME_CONFIG:
-        return []
+        return formats.DecodedTurn([])
 
     if RUNTIME_CONFIG.chat_provider.kind == protocols.DUMMY:
         # No-op LLM for testing: never touches the network.  The reply is a
         # canned assistant message, so the whole input/turn/render loop runs
         # deterministically.  LOKI_DUMMY_REPLY overrides the text.
         reply = os.environ.get("LOKI_DUMMY_REPLY", "ok")
-        return [
-            formats.response_metadata_item("dummy", "dummy", {}),
-            formats.message_item("assistant", reply),
-        ]
+        return formats.DecodedTurn(
+            [formats.message_item("assistant", reply)],
+            {
+                "protocol": "dummy",
+                "provider_id": "dummy",
+                "model": model,
+                "response": {},
+            },
+        )
 
     if RUNTIME_CONFIG.stream:
         payload = RUNTIME_CONFIG.chat_provider.streaming_chat_payload(
@@ -3054,15 +3448,33 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             report_errors=report_errors,
             show_timing=show_timing,
         )
-    if not data:
-        return []
+    if not isinstance(data, dict):
+        raise protocols.ProtocolError(
+            "chat response must be a JSON object", payload=data)
     detected = protocols.detect_protocol_from_response(data)
     if detected and detected != RUNTIME_CONFIG.chat_provider.kind:
         # A configured adapter should not parse a response that clearly has
         # another protocol's shape; that usually means endpoint/config mismatch.
         raise protocols.ProtocolError(
-            f"configured provider {RUNTIME_CONFIG.chat_provider.kind!r} but response looks like {detected!r}")
-    return RUNTIME_CONFIG.chat_provider.parse_chat_response(data)
+            f"configured provider {RUNTIME_CONFIG.chat_provider.kind!r} "
+            f"but response looks like {detected!r}",
+            payload=data,
+        )
+    try:
+        turn = formats.coerce_decoded_turn(
+            RUNTIME_CONFIG.chat_provider.parse_chat_response(data))
+    except formats.TranscriptFormatError as e:
+        raise protocols.ProtocolError(
+            f"invalid {RUNTIME_CONFIG.chat_provider.kind} response: {e}",
+            payload=data,
+        ) from e
+    turn.metadata["provider_id"] = RUNTIME_CONFIG.provider_id
+    turn.metadata["provider_name"] = RUNTIME_CONFIG.provider_name
+    turn.metadata["endpoint"] = (
+        RUNTIME_CONFIG.chat_provider.chat_url)
+    turn.metadata["model"] = model
+    turn.metadata["protocol"] = RUNTIME_CONFIG.chat_provider.kind
+    return turn
 
 
 models = []
@@ -3160,6 +3572,7 @@ session_todos = []
 chat_log_path: str | None = None
 session_state = {}
 chat_log_dirty = False
+session_toolsets = []
 
 # Agent mode, cycled by Shift-Tab: "explore" (read-only), "plan", "edit".
 # Takes effect for the next turn; it does not cancel the current turn.
@@ -3178,11 +3591,20 @@ def initial_transcript_items():
     return [formats.instruction_item(
         "You are a helpful system agent running in a terminal. You have these tools: "
         "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
+        f"Current date: {time.strftime('%Y-%m-%d')}. "
         f"Current Loki cwd: {shell_cwd}. Relative tool paths and Bash commands run from this directory. "
         "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
         "Always Read a file before editing or overwriting it. "
         "Use TodoWrite to plan multi-step work. Keep responses concise."
     )]
+
+
+def _remember_session_toolset(tools):
+    snapshot = copy.deepcopy(tools or [])
+    for existing in session_toolsets:
+        if existing == snapshot:
+            return
+    session_toolsets.append(snapshot)
 
 
 def user_prompt_history(items):
@@ -3198,6 +3620,7 @@ def record_shell_cwd_instruction():
 
 
 def print_shell_cwd():
+    sys.stdout.flush()
     print(f"cwd: {shell_cwd}", file=sys.stderr)
     sys.stderr.flush()
 
@@ -3207,10 +3630,12 @@ def change_shell_cwd_from_text(arg_text: str) -> bool:
         target = _parse_cd_arg_text(arg_text)
         change_shell_cwd(target)
     except (FileNotFoundError, NotADirectoryError) as e:
+        sys.stdout.flush()
         print(f"cd: no such directory: {e}", file=sys.stderr)
         sys.stderr.flush()
         return False
     except ValueError as e:
+        sys.stdout.flush()
         print(f"cd: {e}", file=sys.stderr)
         sys.stderr.flush()
         return False
@@ -3264,8 +3689,10 @@ def new_chat_log(filename):
     global chat_log_dirty
     global transcript_items
     global session_todos
+    global session_toolsets
     transcript_items = initial_transcript_items()
     session_todos = []
+    session_toolsets = []
     dirname = os.path.dirname(filename)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -3293,7 +3720,11 @@ def save_chat_log():
         state["connection"] = saved_connection
     state["shell_cwd"] = shell_cwd
     content = savefiles.serialize_chat_log(
-        transcript_items, session_todos, state)
+        transcript_items,
+        session_todos,
+        state,
+        toolsets=session_toolsets,
+    )
     _atomic_write_text(chat_log_path, content)
     savefiles.report_chat_log_saved(chat_log_path)
     session_state = state
@@ -3308,11 +3739,13 @@ def mark_chat_log_dirty():
 
 
 def render_resume_transcript(items: list) -> str:
-    return savefiles.render_resume_transcript(items, model or "Assistant")
+    return savefiles.render_resume_transcript(
+        items, model or "Assistant")
 
 
 def print_resume_transcript(items: list):
-    savefiles.print_resume_transcript(items, model or "Assistant")
+    savefiles.print_resume_transcript(
+        items, model or "Assistant")
 
 
 def load_chat_log(filename, loaded=None):
@@ -3321,12 +3754,14 @@ def load_chat_log(filename, loaded=None):
     global chat_log_dirty
     global transcript_items
     global session_todos
+    global session_toolsets
     if loaded is None:
         with open(filename, 'r', encoding="utf-8") as f:
             loaded = savefiles.read_chat_log(f)
-    transcript, todos, state = loaded
+    transcript, todos, state, toolsets = loaded
     transcript_items = transcript
     session_todos = todos
+    session_toolsets = toolsets
     session_state = dict(state)
     # Atomic replacement must publish over the target inode rather than over a
     # symlink naming it, matching the old open(..., "w") follow behavior.
@@ -3382,6 +3817,10 @@ async def confirm_saved_connection_async(
         else:
             print(f"  Credential: {descriptor.credential_env}")
         print(f"  Streaming: {'yes' if descriptor.stream else 'no'}")
+        if descriptor.protocol == protocols.ANTHROPIC_MESSAGES:
+            print(
+                "  Anthropic prompt cache: "
+                f"{'yes' if descriptor.prompt_cache else 'no'}")
         answer = (await modal.prompt(
             "Use this saved connection? [y/N]: ") or "")
         return answer.strip().lower() in ("y", "yes")
@@ -3483,7 +3922,7 @@ async def async_main(args) -> int:
             try:
                 with open(resolved_log_filename, "r", encoding="utf-8") as f:
                     loaded_chat = savefiles.read_chat_log(f)
-                    _, _, saved_state = loaded_chat
+                    _, _, saved_state, _ = loaded_chat
             except (OSError, json.JSONDecodeError,
                     formats.TranscriptFormatError) as e:
                 print(f"Could not resume chat: {e}", file=sys.stderr)
@@ -3655,11 +4094,13 @@ async def async_main(args) -> int:
                         pass
 
             if RUNTIME_CONFIG is None:
+                sys.stdout.flush()
                 print("No provider configured; use /model to select one.",
                       file=sys.stderr)
                 sys.stderr.flush()
                 continue
             if not model:
+                sys.stdout.flush()
                 print("No model selected; use /model or set LOKI_MODEL.",
                       file=sys.stderr)
                 sys.stderr.flush()
@@ -3675,16 +4116,19 @@ async def async_main(args) -> int:
                 await run_terminal_turn_async(transcript_items, cancel_check=lambda: session.reader.cancel_requested)
             except KeyboardInterrupt:
                 terminal.reset_colors_and_flags()
-                # ? EMERGENCY BRAKE
                 print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
-                # If we interrupt while a tool call was requested but unanswered, remove that
-                # assistant item so every later render has matched tool call/result pairs.
-                if transcript_items and formats.item_has_tool_calls(transcript_items[-1]):
-                    transcript_items.pop()
-
-                transcript_items.append(formats.instruction_item(
-                    "CRITICAL: The user forcefully stopped your execution via KeyboardInterrupt (Ctrl+C). You were likely looping, making a mistake, or doing something dangerous. Await new instructions."))
-                continue # Drop immediately back to the User> prompt
+                # Keep the provider response.  Complete every outstanding call
+                # with an explicit local error so the next protocol projection
+                # has no dangling call/result pair.
+                for call in formats.pending_tool_calls(transcript_items):
+                    transcript_items.append(formats.tool_result_for_call(
+                        call,
+                        "Tool call not executed because the user interrupted "
+                        "the turn.",
+                        is_error=True,
+                    ))
+                mark_chat_log_dirty()
+                continue
 
     return 0
 
@@ -3718,6 +4162,12 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
 def main() -> int:
     global CREDENTIALS
     CREDENTIALS = CredentialStore.capture(os.environ)
+    try:
+        configure_tool_hook_pipeline()
+    except tool_runtime.HookConfigurationError as error:
+        print(f"Hook configuration error: {error}", file=sys.stderr)
+        sys.stderr.flush()
+        return 2
     cleanup_done = False
     cleanup_failed = False
 
@@ -3730,6 +4180,7 @@ def main() -> int:
             # Terminal cleanup is best-effort: one failed restore step should
             # not prevent later steps from disabling modes or resetting colors.
             print(f"Cleanup error: {type(e).__name__}: {e}", file=sys.stderr)
+            sys.stderr.flush()
 
     def clean_up(*args, **kwargs):
         nonlocal cleanup_done

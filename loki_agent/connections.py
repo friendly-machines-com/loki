@@ -39,6 +39,7 @@ class ConnectionDescriptor:
     auth_header: str | None = None
     model_status: str | None = None
     stream: bool = False
+    prompt_cache: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -54,6 +55,7 @@ class ConnectionDescriptor:
             "auth_header": self.auth_header,
             "model_status": self.model_status,
             "stream": self.stream,
+            "prompt_cache": self.prompt_cache,
         }
 
     @classmethod
@@ -68,6 +70,10 @@ class ConnectionDescriptor:
         if not isinstance(stream, bool):
             raise ConnectionDescriptorError(
                 "connection stream must be a boolean")
+        prompt_cache = value.get("prompt_cache", False)
+        if not isinstance(prompt_cache, bool):
+            raise ConnectionDescriptorError(
+                "connection prompt_cache must be a boolean")
         if "credential_env" not in value:
             raise ConnectionDescriptorError(
                 "connection credential_env must be present")
@@ -94,4 +100,5 @@ class ConnectionDescriptor:
             model_status=_optional_string(
                 value.get("model_status"), "model_status"),
             stream=stream,
+            prompt_cache=prompt_cache,
         )

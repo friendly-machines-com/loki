@@ -40,7 +40,8 @@ protocol.
 All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
 `LOKI_PROVIDER`, `LOKI_MODEL`, `LOKI_API_KEY`, `LOKI_MODELS_URL`,
 `LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, `LOKI_ANTHROPIC_VERSION`, and
-`LOKI_STREAM`.
+`LOKI_STREAM`. `LOKI_PROMPT_CACHE` controls Anthropic Messages prompt-cache
+metadata.
 Loki never chooses the first model returned by a provider. A new explicit
 connection needs `LOKI_MODEL`, or the model must be selected with `/model`
 before sending a chat request. A complete captured `LOKI_*` connection also
@@ -50,15 +51,34 @@ unavailable.
 
 Streaming is disabled by default because compatible servers are not required
 to implement it. Set `LOKI_STREAM=1` to request streaming for the selected
-connection. Loki streams assistant text as it arrives but waits for the final
-response before saving it or executing tool calls. If a server ignores the
-request and returns ordinary JSON, Loki accepts that same response without
-resending the inference request. If the server rejects streaming, set
-`LOKI_STREAM=0`.
+connection. Loki streams assistant text as it arrives but waits for a
+protocol-confirmed final response before adding it to the session or executing
+tool calls. Interrupted transport output is shown but is not invented as a
+completed assistant response. If a server ignores the request and returns
+ordinary JSON, Loki accepts that same response without resending the inference
+request. If the server rejects streaming, set `LOKI_STREAM=0`.
 
 Chat logs are session savefiles. They persist the selected model, its known
 catalog status, protocol, concrete endpoints, and other session state, but
 never credential values.
+The v4 savefile is an editable ordered event stream. Direct messages, complete
+model responses, and tool results are the only event types. Each model response
+contains its originating protocol and ordered canonical output items; common
+text, media, and function-call meaning is represented once, while native
+continuation data such as Anthropic thinking signatures and OpenAI Responses
+reasoning remains attached to that response. There are no positional call
+ranges or external provenance records.
+
+Every request is a pure projection of the complete current event stream into
+the selected wire protocol. Changing `/model` does not convert or rewrite the
+savefile: portable history is projected to the new protocol, native
+continuation data is replayed only to the same provider endpoint and model,
+and foreign continuation-only data remains stored but is omitted. Unknown
+ordered provider output is printed on stderr, retained for its originating
+connection, and omitted from foreign projections rather than synthesized as
+dialogue. Each distinct tool schema snapshot is stored once and never inserted
+into model-visible history. Older savefile schemas are intentionally not
+migrated.
 Resuming an authenticated connection requires the same credential variable to
 be supplied again. Credentialless connections resume without inventing a
 credential. Loki asks for confirmation before sending either kind of
@@ -67,6 +87,15 @@ not remove the saved connection.
 `LOKI_*` config initializes new sessions; on resumed sessions it is a runtime
 override and does not replace the saved connection. A successful `/model`
 selection does replace the session's saved connection.
+
+During ordinary chat/tool turns, prompt history is append-only and tool
+definitions contain no changing date text. Direct Anthropic API connections
+default to automatic ephemeral prompt caching. Other Anthropic-compatible
+servers receive cache metadata only when `LOKI_PROMPT_CACHE=1`; set
+`LOKI_PROMPT_CACHE=0` to disable it explicitly. OpenAI-compatible servers can
+apply their own automatic prefix cache to the same stable tools, instructions,
+and history. A later operator instruction, such as the context update produced
+by `/cd`, can still invalidate the instruction-and-history portion of a cache.
 
 ## Features
 

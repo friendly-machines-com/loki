@@ -156,38 +156,49 @@ async def run_session_picker_async(*, input_fn, terminal, chat_log_dir: str):
         continue
 
 
-def read_chat_log(file_obj) -> tuple[list, list, dict]:
+def read_chat_log(file_obj) -> tuple[list, list, dict, list]:
     blob = json.load(file_obj)
-    transcript, todos = formats.load_log_blob(blob)
+    events, todos = formats.load_log_blob(blob)
     state = blob.get("session_state", {}) if isinstance(blob, dict) else {}
     if not isinstance(state, dict):
         state = {}
-    return transcript, todos, state
+    return (
+        events,
+        todos,
+        state,
+        formats.log_toolsets(blob),
+    )
 
 
-def chat_log_blob(transcript: list, todos: list,
-                  session_state: dict) -> dict:
-    blob = formats.new_log_blob(transcript, todos)
+def chat_log_blob(events: list, todos: list,
+                  session_state: dict, toolsets=None) -> dict:
+    blob = formats.new_log_blob(
+        events, todos, toolsets=toolsets)
     blob["session_state"] = session_state
     return blob
 
 
-def serialize_chat_log(transcript: list, todos: list,
-                       session_state: dict) -> str:
+def serialize_chat_log(events: list, todos: list,
+                       session_state: dict, toolsets=None) -> str:
     return json.dumps(
-        chat_log_blob(transcript, todos, session_state), indent=4)
+        chat_log_blob(
+            events, todos, session_state, toolsets=toolsets),
+        indent=4,
+    )
 
 
 def report_chat_log_saved(path: str) -> None:
+    sys.stdout.flush()
     print('Note: Saved chat log in {!r}'.format(path), file=sys.stderr)
     sys.stderr.flush()
 
 
-def write_chat_log(file_obj, transcript: list, todos: list,
-                   session_state: dict) -> None:
+def write_chat_log(file_obj, events: list, todos: list,
+                   session_state: dict, toolsets=None) -> None:
     file_obj.seek(0)
     json.dump(
-        chat_log_blob(transcript, todos, session_state),
+        chat_log_blob(
+            events, todos, session_state, toolsets=toolsets),
         file_obj,
         indent=4,
     )
@@ -201,78 +212,164 @@ class ResumeTranscriptRenderer:
 
     def __init__(self, assistant_label: str = "Assistant"):
         self.assistant_label = assistant_label
-        self.current_assistant_label = assistant_label
 
     def _message_label(self, item: dict) -> str:
         role = item.get("role")
         if role == "user":
             return "User"
         if role == "assistant":
-            return self.current_assistant_label
+            return self.assistant_label
         return str(role or "Message").capitalize()
 
-    def _render_message(self, item: dict) -> str:
+    def _render_message(self, item: dict, label=None) -> str:
+        blocks = []
         text = formats.item_text(item).strip()
-        if not text:
-            return ""
-        return f"{self._message_label(item)}: {text}"
+        if text:
+            blocks.append(
+                f"{label or self._message_label(item)}: {text}")
+        for content in item.get("content", []):
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") == "image":
+                blocks.append("[Image content]")
+            elif content.get("type") in ["file", "document"]:
+                blocks.append("[File content]")
+            elif content.get("type") == "audio":
+                blocks.append("[Audio content]")
+        return "\n\n".join(blocks)
 
     def _render_tool_call(self, item: dict) -> str:
-        name = item.get("name") or "<unknown>"
-        args = pformat(item.get("input", {}), width=100)
+        name = formats.tool_call_name(item) or "<unknown>"
+        if item.get("execution", "client") != "client":
+            return (
+                f"Provider tool call: {name}\n"
+                f"{pformat(item, width=100)}")
+        try:
+            input_value = formats.tool_call_input(item)
+        except formats.TranscriptFormatError:
+            input_value = item.get("arguments", item.get("input", {}))
+        args = pformat(input_value, width=100)
         return f"Tool call: {name}\n{args}"
 
     def _render_tool_result(self, item: dict) -> str:
-        name = item.get("name") or item.get("tool_call_id") or "<unknown>"
+        name = item.get("name") or item.get("call_id") or "<unknown>"
         label = "Tool error" if item.get("is_error") else "Tool result"
         text = formats.item_text(item).strip()
         return f"{label}: {name}" + (f"\n{text}" if text else "")
 
     def _render_reasoning(self, item: dict) -> str:
-        summary = item.get("summary")
+        value = item.get("value", item)
+        summary = value.get("summary") if isinstance(value, dict) else None
         if not summary:
             return ""
         return "Reasoning summary:\n" + pformat(summary, width=100)
 
-    def _render_provider_item(self, item: dict) -> str:
-        provider = item.get("provider") or "unknown"
+    def _render_native_item(
+            self, item: dict, response_protocol=None) -> str:
+        provider = (
+            item.get("protocol")
+            or item.get("provider")
+            or response_protocol
+            or "unknown")
         return f"[Provider-specific transcript item: {provider}]\n{pformat(item.get('value'), width=100)}"
 
-    def render_item(self, item: dict) -> str:
+    def _render_provider_tool_result(
+            self, item: dict, response_protocol=None) -> str:
+        provider = response_protocol or "provider"
+        call_id = item.get("call_id") or "<unknown>"
+        return (
+            f"Provider tool result ({provider}): {call_id}\n"
+            f"{pformat(item.get('content'), width=100)}"
+        )
+
+    def _render_provider_operation(
+            self, item: dict, response_protocol=None) -> str:
+        provider = response_protocol or "provider"
+        name = item.get("name") or "<unknown>"
+        parts = [
+            f"Provider operation ({provider}): {name}",
+            pformat(item.get("input"), width=100),
+        ]
+        if item.get("output") is not None:
+            parts.extend([
+                "Provider operation result:",
+                pformat(item.get("output"), width=100),
+            ])
+        return "\n".join(parts)
+
+    def _render_response(self, event: dict) -> str:
+        label = event.get("model") or self.assistant_label
+        blocks = []
+        status = event.get("status", "completed")
+        if status != "completed":
+            detail = event.get("protocol_data")
+            rendered = f"[Model response {status}]"
+            if detail:
+                rendered += "\n" + pformat(detail, width=100)
+            blocks.append(rendered)
+        for item in event.get("items", []):
+            item_type = item.get("type")
+            if item_type == "message":
+                rendered = self._render_message(item, label=label)
+            elif item_type == "function_call":
+                rendered = self._render_tool_call(item)
+            elif item_type == "openai_reasoning":
+                rendered = self._render_reasoning(item)
+            elif item_type in [
+                    "anthropic_thinking",
+                    "anthropic_redacted_thinking"]:
+                rendered = ""
+            elif item_type in [
+                    "native_output", "provider_output"]:
+                rendered = self._render_native_item(
+                    item, response_protocol=event.get("protocol"))
+            elif item_type == "provider_tool_result":
+                rendered = self._render_provider_tool_result(
+                    item, response_protocol=event.get("protocol"))
+            elif item_type == "provider_operation":
+                rendered = self._render_provider_operation(
+                    item, response_protocol=event.get("protocol"))
+            else:
+                rendered = (
+                    f"[Model response item: {item_type or 'unknown'}]\n"
+                    f"{pformat(item, width=100)}")
+            if rendered:
+                blocks.append(rendered)
+        return "\n\n".join(blocks)
+
+    def render_event(self, item: dict) -> str:
         item_type = item.get("type")
-        if item_type == "response_metadata":
-            if item.get("model"):
-                self.current_assistant_label = item["model"]
-            return ""
-        if item_type == "instruction":
+        if item_type == "message" and item.get("role") in [
+                "system", "developer"]:
             return ""
         if item_type == "message":
             return self._render_message(item)
-        if item_type == "tool_call":
-            return self._render_tool_call(item)
+        if item_type == "model_response":
+            return self._render_response(item)
         if item_type == "tool_result":
             return self._render_tool_result(item)
-        if item_type == "reasoning":
-            return self._render_reasoning(item)
-        if item_type == "provider_item":
-            return self._render_provider_item(item)
-        return f"[Transcript item: {item_type or 'unknown'}]\n{pformat(item, width=100)}"
+        return (
+            f"[Session event: {item_type or 'unknown'}]\n"
+            f"{pformat(item, width=100)}")
 
-    def render(self, items: list) -> str:
+    def render(self, events: list) -> str:
         blocks = []
-        for item in items:
-            rendered = self.render_item(item)
+        for event in events:
+            rendered = self.render_event(event)
             if rendered:
                 blocks.append(rendered)
         return "\n\n".join(blocks)
 
 
-def render_resume_transcript(items: list, assistant_label: str) -> str:
-    return ResumeTranscriptRenderer(assistant_label=assistant_label).render(items)
+def render_resume_transcript(
+        events: list, assistant_label: str) -> str:
+    return ResumeTranscriptRenderer(
+        assistant_label=assistant_label).render(events)
 
 
-def print_resume_transcript(items: list, assistant_label: str) -> None:
-    rendered = render_resume_transcript(items, assistant_label)
+def print_resume_transcript(
+        events: list, assistant_label: str) -> None:
+    rendered = render_resume_transcript(events, assistant_label)
     if rendered:
         print(rendered)
     print('----')

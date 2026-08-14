@@ -19,7 +19,9 @@ SUPPORTED_PROTOCOLS = [OPENAI_CHAT, ANTHROPIC_MESSAGES, OPENAI_RESPONSES]
 
 
 class ProtocolError(ValueError):
-    pass
+    def __init__(self, message, payload=None):
+        self.payload = copy.deepcopy(payload)
+        super().__init__(message)
 
 
 class ProviderDetectionError(ProtocolError):
@@ -31,7 +33,8 @@ class UnsupportedProtocolError(ProtocolError):
 
 
 class StreamProtocolError(ProtocolError):
-    pass
+    def __init__(self, message, payload=None):
+        super().__init__(message, payload=payload)
 
 
 @dataclass
@@ -43,23 +46,43 @@ class Provider:
     model_urls: list[str]
     headers: dict
     max_tokens: int
+    provider_id: str | None = None
+    provider_name: str | None = None
+    prompt_cache: bool = False
+
+    def projection_target(self, model):
+        return formats.projection_target(
+            self.kind,
+            provider_id=self.provider_id,
+            provider_name=self.provider_name,
+            endpoint=self.chat_url,
+            model=model,
+        )
 
     def chat_payload(self, items, tools, model):
+        target = self.projection_target(model)
         if self.kind == OPENAI_CHAT:
             payload = {
                 "model": model,
-                "messages": formats.items_to_openai_chat_messages(items),
+                "messages": formats.items_to_openai_chat_messages(
+                    items, target=target),
             }
             if tools is not None:
                 payload["tools"] = tools
             return payload
         if self.kind == ANTHROPIC_MESSAGES:
-            system, messages = formats.items_to_anthropic_parts(items)
+            system, messages = formats.items_to_anthropic_parts(
+                items, target=target)
             payload = {
                 "model": model,
                 "max_tokens": self.max_tokens,
                 "messages": messages,
             }
+            if self.prompt_cache:
+                # Automatic prompt caching advances its breakpoint with the
+                # append-only history. Anthropic hashes the logical prefix as
+                # tools -> system -> messages regardless of JSON key order.
+                payload["cache_control"] = {"type": "ephemeral"}
             if system:
                 payload["system"] = system
             anthropic_tools = formats.openai_tools_to_anthropic_tools(tools)
@@ -67,7 +90,9 @@ class Provider:
                 payload["tools"] = anthropic_tools
             return payload
         if self.kind == OPENAI_RESPONSES:
-            instructions, input_items = formats.items_to_openai_responses_parts(items)
+            instructions, input_items = (
+                formats.items_to_openai_responses_parts(
+                    items, target=target))
             payload = {
                 "model": model,
                 "input": input_items,
@@ -129,11 +154,20 @@ class OpenAIChatStreamAccumulator:
         self.response = {}
         self.choice = {
             "index": 0,
-            "message": {"role": "assistant", "content": ""},
+            "message": {"role": "assistant"},
             "finish_reason": None,
         }
         self.tool_calls = {}
+        self.legacy_function_call = None
+        self.stream_extensions = []
         self.complete = False
+
+    def _preserve_extension(self, context, value):
+        formats.report_unknown(OPENAI_CHAT, context, value)
+        self.stream_extensions.append({
+            "context": context,
+            "value": copy.deepcopy(value),
+        })
 
     def feed(self, event):
         if event.data == "[DONE]":
@@ -148,32 +182,122 @@ class OpenAIChatStreamAccumulator:
             raise StreamProtocolError(
                 "OpenAI Chat stream event must be an object")
         if chunk.get("error"):
-            raise StreamProtocolError(_stream_error_text(chunk["error"]))
+            raise StreamProtocolError(
+                _stream_error_text(chunk["error"]), payload=chunk)
         for key in [
                 "id", "object", "created", "model", "system_fingerprint",
                 "service_tier", "usage"]:
             if key in chunk and chunk[key] is not None:
                 self.response[key] = copy.deepcopy(chunk[key])
+        unknown_envelope = {
+            key: value for key, value in chunk.items()
+            if key not in [
+                "id", "object", "created", "model",
+                "system_fingerprint", "service_tier", "usage",
+                "choices", "error"]
+        }
+        # These are final-response fields repeated on stream chunks, not
+        # semantic deltas. Keep the latest value so the buffered decoder can
+        # diagnose them once from the assembled response.
+        self.response.update(copy.deepcopy(unknown_envelope))
         choices = chunk.get("choices")
         if not isinstance(choices, list):
             return
         for choice in choices:
-            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+            if not isinstance(choice, dict):
+                self._preserve_extension("stream choice", choice)
+                continue
+            if choice.get("index", 0) != 0:
+                self._preserve_extension(
+                    "additional stream choice", choice)
                 continue
             if choice.get("finish_reason") is not None:
                 self.choice["finish_reason"] = choice["finish_reason"]
+            if choice.get("logprobs") is not None:
+                self.choice["logprobs"] = self._merge_delta_value(
+                    self.choice.get("logprobs"),
+                    choice["logprobs"],
+                )
+            unknown_choice = {
+                key: value for key, value in choice.items()
+                if key not in [
+                    "index", "delta", "finish_reason", "logprobs"]
+            }
+            self.choice.update(copy.deepcopy(unknown_choice))
             delta = choice.get("delta")
             if not isinstance(delta, dict):
                 continue
             role = delta.get("role")
             if isinstance(role, str):
                 self.choice["message"]["role"] = role
-            content = delta.get("content")
-            if isinstance(content, str):
-                self.choice["message"]["content"] += content
-                if content:
-                    self.on_text_delta(content)
+            if "content" in delta:
+                content = delta["content"]
+                message = self.choice["message"]
+                if isinstance(content, str):
+                    message["content"] = self._merge_delta_value(
+                        message.get("content"), content)
+                    if content:
+                        self.on_text_delta(content)
+                elif content is None:
+                    message.setdefault("content", None)
+                else:
+                    # Compatibility providers may stream structured content.
+                    # Preserve and assemble it even though only string deltas
+                    # can be rendered incrementally.
+                    self._accumulate_message_delta_field(
+                        "content", content)
+            refusal = delta.get("refusal")
+            if isinstance(refusal, str):
+                self.choice["message"]["refusal"] = (
+                    str(self.choice["message"].get("refusal", ""))
+                    + refusal)
+            for key in ["name", "phase"]:
+                if delta.get(key) is not None:
+                    self.choice["message"][key] = copy.deepcopy(delta[key])
+            self._accumulate_message_delta_field(
+                "audio", delta.get("audio"))
+            for key in formats.OPENAI_CHAT_REASONING_FIELDS:
+                self._accumulate_message_delta_field(
+                    key, delta.get(key))
             self._accumulate_tool_calls(delta.get("tool_calls"))
+            self._accumulate_legacy_function_call(
+                delta.get("function_call"))
+            unknown_delta = {
+                key: value for key, value in delta.items()
+                if key not in [
+                    "role", "content", "refusal", "name", "audio",
+                    "phase", "tool_calls", "function_call",
+                    *formats.OPENAI_CHAT_REASONING_FIELDS]
+            }
+            for key, value in unknown_delta.items():
+                # A streamed message extension can arrive one token at a
+                # time. Assemble it into the authoritative final message so
+                # the ordinary Chat decoder diagnoses it once and preserves
+                # it, instead of printing one diagnostic per token.
+                self._accumulate_message_delta_field(key, value)
+
+    def _accumulate_message_delta_field(self, key, value):
+        if value is None:
+            return
+        message = self.choice["message"]
+        message[key] = self._merge_delta_value(
+            message.get(key), value)
+
+    @classmethod
+    def _merge_delta_value(cls, current, value):
+        if current is None:
+            return copy.deepcopy(value)
+        if isinstance(current, str) and isinstance(value, str):
+            return current + value
+        if isinstance(current, list) and isinstance(value, list):
+            return current + copy.deepcopy(value)
+        if isinstance(current, dict) and isinstance(value, dict):
+            result = copy.deepcopy(current)
+            for key, child in value.items():
+                result[key] = cls._merge_delta_value(
+                    result.get(key), child)
+            return result
+        return copy.deepcopy(value)
 
     def _accumulate_tool_calls(self, calls):
         if not isinstance(calls, list):
@@ -202,6 +326,38 @@ class OpenAIChatStreamAccumulator:
                     call["function"]["name"] += name
                 if isinstance(arguments, str):
                     call["function"]["arguments"] += arguments
+            unknown_call = {
+                key: value for key, value in delta.items()
+                if key not in ["index", "id", "type", "function"]
+            }
+            for key, value in unknown_call.items():
+                call[key] = self._merge_delta_value(
+                    call.get(key), value)
+            if isinstance(function, dict):
+                unknown_function = {
+                    key: value for key, value in function.items()
+                    if key not in ["name", "arguments"]
+                }
+                for key, value in unknown_function.items():
+                    call["function"][key] = self._merge_delta_value(
+                        call["function"].get(key), value)
+
+    def _accumulate_legacy_function_call(self, delta):
+        if not isinstance(delta, dict):
+            return
+        if self.legacy_function_call is None:
+            self.legacy_function_call = {"name": "", "arguments": ""}
+        for key in ["name", "arguments"]:
+            value = delta.get(key)
+            if isinstance(value, str):
+                self.legacy_function_call[key] += value
+        unknown = {
+            key: value for key, value in delta.items()
+            if key not in ["name", "arguments"]
+        }
+        for key, value in unknown.items():
+            self.legacy_function_call[key] = self._merge_delta_value(
+                self.legacy_function_call.get(key), value)
 
     def finish(self):
         if not self.complete:
@@ -211,8 +367,21 @@ class OpenAIChatStreamAccumulator:
         if self.tool_calls:
             message["tool_calls"] = [
                 self.tool_calls[index] for index in sorted(self.tool_calls)]
-        self.response.setdefault("object", "chat.completion")
+        if self.legacy_function_call is not None:
+            message["function_call"] = self.legacy_function_call
+        # Chat Completion assistant messages use a nullable content field.
+        # Tool-only streamed messages normally never send a string delta, so
+        # their completed counterpart has content=null, not an invented empty
+        # string.
+        message.setdefault("content", None)
+        # The first streamed chunk identifies itself as
+        # ``chat.completion.chunk``.  The accumulator returns a completed
+        # response object, not a chunk.
+        self.response["object"] = "chat.completion"
         self.response["choices"] = [self.choice]
+        if self.stream_extensions:
+            self.response["_loki_stream_extensions"] = (
+                self.stream_extensions)
         return self.response
 
 
@@ -222,7 +391,23 @@ class AnthropicMessagesStreamAccumulator:
         self.message = None
         self.blocks = {}
         self.tool_json = {}
+        self.stream_extensions = []
         self.complete = False
+
+    @staticmethod
+    def _uses_streamed_json(block):
+        return block.get("type") in {
+            "tool_use",
+            "server_tool_use",
+            "mcp_tool_use",
+        }
+
+    def _preserve_extension(self, context, value):
+        formats.report_unknown(ANTHROPIC_MESSAGES, context, value)
+        self.stream_extensions.append({
+            "context": context,
+            "value": copy.deepcopy(value),
+        })
 
     def feed(self, event):
         try:
@@ -236,7 +421,9 @@ class AnthropicMessagesStreamAccumulator:
         event_type = data.get("type") or event.event
         if event_type == "error":
             raise StreamProtocolError(
-                _stream_error_text(data.get("error") or data))
+                _stream_error_text(data.get("error") or data),
+                payload=data,
+            )
         if event_type == "message_start":
             message = data.get("message")
             if not isinstance(message, dict):
@@ -251,7 +438,7 @@ class AnthropicMessagesStreamAccumulator:
                 raise StreamProtocolError(
                     "Anthropic content_block_start is missing content_block")
             self.blocks[index] = copy.deepcopy(block)
-            if block.get("type") == "tool_use":
+            if self._uses_streamed_json(block):
                 self.tool_json[index] = ""
         elif event_type == "content_block_delta":
             self._feed_delta(data)
@@ -276,7 +463,11 @@ class AnthropicMessagesStreamAccumulator:
             self.complete = True
         elif event_type == "ping":
             return
-        # Unknown event types are allowed by Anthropic's versioning policy.
+        else:
+            # Forward-compatible event types must not silently disappear.  The
+            # final message remains authoritative model context; the event is
+            # retained out of band for diagnostics.
+            self._preserve_extension("stream event", data)
 
     def _feed_delta(self, data):
         index = _stream_index(data, "Anthropic content block")
@@ -313,14 +504,19 @@ class AnthropicMessagesStreamAccumulator:
             if citation is not None:
                 block.setdefault("citations", []).append(
                     copy.deepcopy(citation))
+        else:
+            self._preserve_extension(
+                "content-block delta", data)
 
     def _finish_block(self, index):
         block = self.blocks.get(index)
         if block is None:
             raise StreamProtocolError(
                 "Anthropic content block stop preceded start")
-        if block.get("type") == "tool_use":
+        if self._uses_streamed_json(block):
             raw = self.tool_json.get(index, "")
+            if not raw and "input" in block:
+                return
             try:
                 block["input"] = json.loads(raw or "{}")
             except json.JSONDecodeError as e:
@@ -335,12 +531,15 @@ class AnthropicMessagesStreamAccumulator:
             raise StreamProtocolError(
                 "Anthropic stream ended before message_stop")
         for index in list(self.blocks):
-            if self.blocks[index].get("type") == "tool_use":
+            if self._uses_streamed_json(self.blocks[index]):
                 self._finish_block(index)
         self.message["content"] = [
             self.blocks[index] for index in sorted(self.blocks)]
         self.message["type"] = "message"
         self.message["role"] = "assistant"
+        if self.stream_extensions:
+            self.message["_loki_stream_extensions"] = (
+                self.stream_extensions)
         return self.message
 
 
@@ -348,7 +547,17 @@ class OpenAIResponsesStreamAccumulator:
     def __init__(self, on_text_delta):
         self.on_text_delta = on_text_delta
         self.completed_response = None
-        self.failed = None
+        self.incomplete_response = None
+        self.failed_response = None
+        self.stream_error = None
+        self.stream_extensions = []
+
+    def _preserve_extension(self, context, value):
+        formats.report_unknown(OPENAI_RESPONSES, context, value)
+        self.stream_extensions.append({
+            "context": context,
+            "value": copy.deepcopy(value),
+        })
 
     def feed(self, event):
         try:
@@ -370,18 +579,71 @@ class OpenAIResponsesStreamAccumulator:
                 raise StreamProtocolError(
                     "response.completed is missing its response")
             self.completed_response = copy.deepcopy(response)
-        elif event_type in (
-                "response.failed", "response.incomplete", "response.cancelled",
-                "error"):
-            self.failed = copy.deepcopy(data)
+        elif event_type == "response.incomplete":
+            response = data.get("response")
+            if not isinstance(response, dict):
+                raise StreamProtocolError(
+                    "response.incomplete is missing its response")
+            self.incomplete_response = copy.deepcopy(response)
+        elif event_type in ("response.failed", "response.cancelled"):
+            response = data.get("response")
+            if isinstance(response, dict):
+                self.failed_response = copy.deepcopy(response)
+            else:
+                self.stream_error = copy.deepcopy(data)
+        elif event_type == "error":
+            self.stream_error = copy.deepcopy(data)
+        elif not _known_responses_stream_event(event_type):
+            self._preserve_extension("stream event", data)
 
     def finish(self):
-        if self.failed is not None:
-            raise StreamProtocolError(_stream_error_text(self.failed))
-        if self.completed_response is None:
+        if self.stream_error is not None:
             raise StreamProtocolError(
-                "OpenAI Responses stream ended before response.completed")
+                _stream_error_text(self.stream_error),
+                payload=self.stream_error)
+        if self.completed_response is None:
+            if self.incomplete_response is not None:
+                response = self.incomplete_response
+                if self.stream_extensions:
+                    response["_loki_stream_extensions"] = (
+                        self.stream_extensions)
+                return response
+            if self.failed_response is not None:
+                response = self.failed_response
+                if self.stream_extensions:
+                    response["_loki_stream_extensions"] = (
+                        self.stream_extensions)
+                return response
+            raise StreamProtocolError(
+                "OpenAI Responses stream ended before response.completed "
+                "or another terminal response event")
+        if self.stream_extensions:
+            self.completed_response["_loki_stream_extensions"] = (
+                self.stream_extensions)
         return self.completed_response
+
+
+def _known_responses_stream_event(event_type):
+    if not isinstance(event_type, str):
+        return False
+    if event_type in [
+            "response.created", "response.in_progress", "response.queued"]:
+        return True
+    return event_type.startswith((
+        "response.output_item.",
+        "response.content_part.",
+        "response.output_text.",
+        "response.refusal.",
+        "response.reasoning_",
+        "response.function_call_arguments.",
+        "response.custom_tool_call_input.",
+        "response.web_search_call.",
+        "response.file_search_call.",
+        "response.image_generation_call.",
+        "response.code_interpreter_call.",
+        "response.mcp_call.",
+        "response.audio.",
+    ))
 
 
 def _stream_index(data, context):
@@ -467,7 +729,8 @@ def detect_protocol_from_response(response):
     if response.get("type") == "message" and response.get("role") == "assistant":
         if isinstance(response.get("content"), list):
             return ANTHROPIC_MESSAGES
-    if response.get("object") == "response" or isinstance(response.get("output"), list):
+    if (response.get("object") == "response"
+            and isinstance(response.get("output"), list)):
         return OPENAI_RESPONSES
     return None
 
@@ -625,7 +888,8 @@ def build_headers(protocol, api_key, anthropic_version="2023-06-01",
 
 def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
                   max_tokens=4096, anthropic_version="2023-06-01",
-                  auth_header=None):
+                  auth_header=None, provider_id=None, provider_name=None,
+                  prompt_cache=False):
     protocol = resolve_protocol(input_url, provider)
     if protocol == DUMMY:
         # No-op provider for testing: no real endpoint or URL structure.
@@ -637,6 +901,9 @@ def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
             model_urls=[],
             headers={},
             max_tokens=max_tokens,
+            provider_id=provider_id,
+            provider_name=provider_name,
+            prompt_cache=False,
         )
     chat_url, resolved_models_url = endpoint_urls(input_url, protocol, models_url=models_url)
     model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
@@ -651,6 +918,9 @@ def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
         model_urls=model_urls,
         headers=headers,
         max_tokens=max_tokens,
+        provider_id=provider_id,
+        provider_name=provider_name,
+        prompt_cache=prompt_cache,
     )
 
 

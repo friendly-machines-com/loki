@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import pathlib
 import sys
@@ -56,8 +58,15 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         items = [
             formats.instruction_item("system marker"),
             formats.message_item("user", "read marker"),
-            formats.message_item("assistant", "need file"),
-            formats.tool_call_item("call_1", "Read", {"file_path": "README.md"}),
+            formats.model_response_event(
+                protocols.OPENAI_CHAT,
+                [
+                    formats.message_item("assistant", "need file"),
+                    formats.tool_call_item(
+                        "call_1", "Read",
+                        {"file_path": "README.md"}),
+                ],
+            ),
             formats.tool_result_item("call_1", "contents marker"),
         ]
         tools = [
@@ -111,7 +120,7 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         self.assertNotIn("tools", payload)
         self.assertEqual(payload["input"][0]["content"][0]["text"], "hi")
 
-    def test_responses_parse_response_returns_v2_items(self):
+    def test_responses_parse_response_separates_items_from_envelope(self):
         provider = protocols.make_provider(
             "https://api.openai.com/v1/responses",
             provider=protocols.OPENAI_RESPONSES,
@@ -134,13 +143,24 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             ],
         }
 
-        items = provider.parse_chat_response(response)
+        turn = provider.parse_chat_response(response)
 
-        self.assertEqual([item.get("type") for item in items], ["response_metadata", "tool_call"])
-        self.assertEqual(items[0]["protocol"], protocols.OPENAI_RESPONSES)
-        self.assertEqual(items[1]["call_id"], "call_1")
-        self.assertEqual(items[1]["name"], "Read")
-        self.assertEqual(items[1]["input"], {"file_path": "README.md"})
+        self.assertEqual(
+            [item.get("type") for item in turn.items],
+            ["function_call"],
+        )
+        self.assertEqual(
+            turn.metadata["protocol"], protocols.OPENAI_RESPONSES)
+        self.assertEqual(turn.items[0]["call_id"], "call_1")
+        self.assertEqual(turn.items[0]["name"], "Read")
+        self.assertEqual(
+            formats.tool_call_input(turn.items[0]),
+            {"file_path": "README.md"},
+        )
+        event = turn.to_event()
+        self.assertEqual(event["protocol"], protocols.OPENAI_RESPONSES)
+        self.assertEqual(event["items"], turn.items)
+        self.assertNotIn("response", turn.metadata)
 
 
 class AnthropicMessagesProviderTests(unittest.TestCase):
@@ -157,10 +177,859 @@ class AnthropicMessagesProviderTests(unittest.TestCase):
         self.assertNotIn("x-api-key", provider.headers)
         self.assertNotIn("Authorization", provider.headers)
 
+    def test_payload_enables_automatic_prompt_caching(self):
+        provider = protocols.make_provider(
+            "https://api.anthropic.com/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES,
+            api_key="test-key",
+            prompt_cache=True,
+        )
+
+        payload = provider.chat_payload(
+            [
+                formats.instruction_item("system"),
+                formats.message_item("user", "hello"),
+            ],
+            [],
+            "claude-test",
+        )
+
+        self.assertEqual(
+            payload["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            payload["system"], [{"type": "text", "text": "system"}])
+
+    def test_payload_omits_prompt_cache_for_compatible_server_by_default(self):
+        provider = protocols.make_provider(
+            "http://localhost:8000/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES,
+            api_key="",
+        )
+
+        payload = provider.chat_payload(
+            [formats.message_item("user", "hello")],
+            [],
+            "local-model",
+        )
+
+        self.assertNotIn("cache_control", payload)
+
 
 class StreamAccumulatorTests(unittest.TestCase):
     def event(self, data, event="message"):
         return sse.SseEvent(event, data)
+
+    def test_openai_chat_semantic_strings_are_split_invariant(self):
+        values = {
+            "content": "Hello world",
+            "reasoning_content": "Think first",
+            "arguments": '{"file_path":"README.md"}',
+        }
+        buffered = {
+            "id": "chat_split",
+            "object": "chat.completion",
+            "model": "chat-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": values["content"],
+                    "reasoning_content": values["reasoning_content"],
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": values["arguments"],
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        expected = formats.openai_chat_response_to_items(
+            buffered).to_event()
+
+        for target, value in values.items():
+            for split in range(len(value) + 1):
+                with self.subTest(target=target, split=split):
+                    parts = {
+                        key: [item]
+                        for key, item in values.items()
+                    }
+                    parts[target] = [value[:split], value[split:]]
+                    accumulator = (
+                        protocols.OpenAIChatStreamAccumulator(
+                            lambda text: None))
+                    for position in range(2):
+                        delta = {}
+                        if position == 0:
+                            delta["role"] = "assistant"
+                        if position < len(parts["content"]):
+                            delta["content"] = (
+                                parts["content"][position])
+                        if position < len(
+                                parts["reasoning_content"]):
+                            delta["reasoning_content"] = (
+                                parts["reasoning_content"][position])
+                        if position < len(parts["arguments"]):
+                            call = {
+                                "index": 0,
+                                "function": {
+                                    "arguments":
+                                        parts["arguments"][position],
+                                },
+                            }
+                            if position == 0:
+                                call.update({
+                                    "id": "call_1",
+                                    "type": "function",
+                                })
+                                call["function"]["name"] = "Read"
+                            delta["tool_calls"] = [call]
+                        accumulator.feed(self.event(json.dumps({
+                            "id": "chat_split",
+                            "object": "chat.completion.chunk",
+                            "model": "chat-model",
+                            "choices": [{
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": (
+                                    "tool_calls"
+                                    if position == 1 else None),
+                            }],
+                        })))
+                    accumulator.feed(self.event("[DONE]"))
+                    streamed = accumulator.finish()
+
+                    self.assertEqual(streamed, buffered)
+                    self.assertEqual(
+                        formats.openai_chat_response_to_items(
+                            streamed).to_event(),
+                        expected,
+                    )
+
+    def test_openai_chat_stream_matches_buffered_canonical_turn(self):
+        buffered = {
+            "id": "chat_equivalent",
+            "object": "chat.completion",
+            "model": "chat-model",
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+            },
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello",
+                    "refusal": "No",
+                    "reasoning_content": "Think first",
+                    "audio": {
+                        "id": "audio_1",
+                        "data": "AB",
+                        "transcript": "spoken",
+                        "expires_at": 123,
+                    },
+                    "phase": "final",
+                    "provider_trace": "trace",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "provider_call": "call-extra",
+                        "function": {
+                            "name": "Read",
+                            "arguments":
+                                '{"file_path":"README.md"}',
+                            "provider_function": "function-extra",
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+                "logprobs": {
+                    "content": [
+                        {"token": "Hel", "logprob": -0.1},
+                        {"token": "lo", "logprob": -0.2},
+                    ],
+                    "refusal": [
+                        {"token": "No", "logprob": -0.3},
+                    ],
+                },
+            }],
+        }
+        chunks = [
+            {
+                "id": "chat_equivalent",
+                "object": "chat.completion.chunk",
+                "model": "chat-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "Hel",
+                        "reasoning_content": "Think ",
+                        "audio": {
+                            "id": "audio_1",
+                            "data": "A",
+                            "transcript": "spo",
+                        },
+                        "phase": "final",
+                        "provider_trace": "tr",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "provider_call": "call-",
+                            "function": {
+                                "name": "Read",
+                                "arguments": '{"file_path":',
+                                "provider_function": "function-",
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                    "logprobs": {
+                        "content": [{
+                            "token": "Hel", "logprob": -0.1,
+                        }],
+                    },
+                }],
+            },
+            {
+                "id": "chat_equivalent",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "lo",
+                        "refusal": "N",
+                        "reasoning_content": "first",
+                        "audio": {
+                            "data": "B",
+                            "transcript": "ken",
+                            "expires_at": 123,
+                        },
+                        "provider_trace": "ace",
+                        "tool_calls": [{
+                            "index": 0,
+                            "provider_call": "extra",
+                            "function": {
+                                "arguments": '"README.md"}',
+                                "provider_function": "extra",
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                    "logprobs": {
+                        "content": [{
+                            "token": "lo", "logprob": -0.2,
+                        }],
+                        "refusal": [{
+                            "token": "No", "logprob": -0.3,
+                        }],
+                    },
+                }],
+            },
+            {
+                "usage": buffered["usage"],
+                "choices": [{
+                    "index": 0,
+                    "delta": {"refusal": "o"},
+                    "finish_reason": "tool_calls",
+                }],
+            },
+        ]
+        accumulator = protocols.OpenAIChatStreamAccumulator(
+            lambda text: None)
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            buffered_turn = formats.openai_chat_response_to_items(
+                buffered)
+            for chunk in chunks:
+                accumulator.feed(self.event(json.dumps(chunk)))
+            accumulator.feed(self.event("[DONE]"))
+            streamed = accumulator.finish()
+            streamed_turn = formats.openai_chat_response_to_items(
+                streamed)
+
+        self.assertEqual(
+            streamed_turn.to_event(), buffered_turn.to_event())
+        self.assertEqual(
+            streamed["choices"][0]["logprobs"],
+            buffered["choices"][0]["logprobs"],
+        )
+        self.assertEqual(
+            streamed["choices"][0]["message"],
+            buffered["choices"][0]["message"],
+        )
+
+    def test_openai_chat_tool_only_stream_matches_null_buffered_content(self):
+        buffered = {
+            "id": "chat_tool_only",
+            "object": "chat.completion",
+            "model": "chat-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments":
+                                '{"file_path":"README.md"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        chunks = [
+            {
+                "id": "chat_tool_only",
+                "object": "chat.completion.chunk",
+                "model": "chat-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": '{"file_path":',
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            },
+            {
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "arguments": '"README.md"}',
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            },
+        ]
+        accumulator = protocols.OpenAIChatStreamAccumulator(
+            lambda text: None)
+        for chunk in chunks:
+            accumulator.feed(self.event(json.dumps(chunk)))
+        accumulator.feed(self.event("[DONE]"))
+        streamed = accumulator.finish()
+
+        self.assertIsNone(
+            streamed["choices"][0]["message"]["content"])
+        self.assertEqual(
+            formats.openai_chat_response_to_items(
+                streamed).to_event(),
+            formats.openai_chat_response_to_items(
+                buffered).to_event(),
+        )
+
+    def test_anthropic_stream_matches_buffered_canonical_turn(self):
+        buffered = {
+            "id": "message_equivalent",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-model",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "Think first",
+                    "signature": "signature",
+                },
+                {
+                    "type": "text",
+                    "text": "Answer",
+                    "citations": [{
+                        "type": "char_location",
+                        "start_char_index": 0,
+                        "end_char_index": 6,
+                    }],
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Read",
+                    "input": {"file_path": "README.md"},
+                },
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "Loki"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [{
+                        "type": "web_search_result",
+                        "title": "Loki",
+                        "url": "https://example.test/loki",
+                        "encrypted_content": "encrypted",
+                    }],
+                },
+                {
+                    "type": "redacted_thinking",
+                    "data": "redacted",
+                },
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": "STOP",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34,
+            },
+        }
+        events = [
+            ("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": "message_equivalent",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-model",
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 1,
+                    },
+                },
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": "",
+                },
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": "Think ",
+                },
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": "first",
+                },
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": "signature",
+                },
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop", "index": 0,
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "Ans"},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "wer"},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "citations_delta",
+                    "citation": buffered["content"][1]["citations"][0],
+                },
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop", "index": 1,
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Read",
+                    "input": {},
+                },
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"file_path":',
+                },
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '"README.md"}',
+                },
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop", "index": 2,
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 3,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {},
+                },
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 3,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"query":"Loki"}',
+                },
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop", "index": 3,
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 4,
+                "content_block": buffered["content"][4],
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop", "index": 4,
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 5,
+                "content_block": buffered["content"][5],
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop", "index": 5,
+            }),
+            ("message_delta", {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "tool_use",
+                    "stop_sequence": "STOP",
+                },
+                "usage": {"output_tokens": 34},
+            }),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        accumulator = protocols.AnthropicMessagesStreamAccumulator(
+            lambda text: None)
+        for event_name, data in events:
+            accumulator.feed(self.event(
+                json.dumps(data), event=event_name))
+        streamed = accumulator.finish()
+
+        buffered_turn = formats.anthropic_response_to_items(buffered)
+        streamed_turn = formats.anthropic_response_to_items(streamed)
+
+        self.assertEqual(streamed, buffered)
+        self.assertEqual(
+            streamed_turn.to_event(), buffered_turn.to_event())
+
+    def test_anthropic_semantic_strings_are_split_invariant(self):
+        cases = [
+            (
+                "text",
+                "Answer text",
+                {"type": "text", "text": "Answer text"},
+                {"type": "text", "text": ""},
+                "text_delta",
+                "text",
+                [],
+            ),
+            (
+                "thinking",
+                "Think first",
+                {
+                    "type": "thinking",
+                    "thinking": "Think first",
+                    "signature": "signature",
+                },
+                {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": "",
+                },
+                "thinking_delta",
+                "thinking",
+                [],
+            ),
+            (
+                "signature",
+                "signature",
+                {
+                    "type": "thinking",
+                    "thinking": "Think first",
+                    "signature": "signature",
+                },
+                {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": "",
+                },
+                "signature_delta",
+                "signature",
+                [("thinking_delta", "thinking", "Think first")],
+            ),
+            (
+                "tool_input",
+                '{"file_path":"README.md"}',
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Read",
+                    "input": {"file_path": "README.md"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Read",
+                    "input": {},
+                },
+                "input_json_delta",
+                "partial_json",
+                [],
+            ),
+        ]
+        for (case_name, value, final_block, start_block,
+             delta_type, delta_key, preceding) in cases:
+            buffered = {
+                "id": "message_split",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-model",
+                "content": [final_block],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 5,
+                },
+            }
+            expected = formats.anthropic_response_to_items(
+                buffered).to_event()
+            for split in range(len(value) + 1):
+                with self.subTest(
+                        case=case_name, split=split):
+                    accumulator = (
+                        protocols.AnthropicMessagesStreamAccumulator(
+                            lambda text: None))
+                    accumulator.feed(self.event(json.dumps({
+                        "type": "message_start",
+                        "message": {
+                            "id": "message_split",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "claude-model",
+                            "content": [],
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                            },
+                        },
+                    }), event="message_start"))
+                    accumulator.feed(self.event(json.dumps({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": start_block,
+                    }), event="content_block_start"))
+                    for kind, key, part in preceding:
+                        accumulator.feed(self.event(json.dumps({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": kind,
+                                key: part,
+                            },
+                        }), event="content_block_delta"))
+                    for part in [value[:split], value[split:]]:
+                        accumulator.feed(self.event(json.dumps({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": delta_type,
+                                delta_key: part,
+                            },
+                        }), event="content_block_delta"))
+                    if case_name == "thinking":
+                        accumulator.feed(self.event(json.dumps({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": "signature",
+                            },
+                        }), event="content_block_delta"))
+                    accumulator.feed(self.event(json.dumps({
+                        "type": "content_block_stop",
+                        "index": 0,
+                    }), event="content_block_stop"))
+                    accumulator.feed(self.event(json.dumps({
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": "end_turn",
+                            "stop_sequence": None,
+                        },
+                        "usage": {"output_tokens": 5},
+                    }), event="message_delta"))
+                    accumulator.feed(self.event(json.dumps({
+                        "type": "message_stop",
+                    }), event="message_stop"))
+                    streamed = accumulator.finish()
+
+                    self.assertEqual(streamed, buffered)
+                    self.assertEqual(
+                        formats.anthropic_response_to_items(
+                            streamed).to_event(),
+                        expected,
+                    )
+
+    def test_responses_terminal_stream_matches_buffered_canonical_turn(self):
+        cases = [
+            (
+                "response.completed",
+                {
+                    "id": "response_completed",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "id": "reasoning_1",
+                            "summary": [],
+                            "encrypted_content": "encrypted",
+                        },
+                        {
+                            "type": "message",
+                            "id": "message_1",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "answer",
+                                "annotations": [],
+                            }],
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "function_1",
+                            "status": "completed",
+                            "call_id": "call_1",
+                            "name": "Read",
+                            "arguments":
+                                '{"file_path":"README.md"}',
+                        },
+                    ],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                },
+            ),
+            (
+                "response.incomplete",
+                {
+                    "id": "response_incomplete",
+                    "object": "response",
+                    "status": "incomplete",
+                    "incomplete_details": {
+                        "reason": "max_output_tokens",
+                    },
+                    "output": [{
+                        "type": "message",
+                        "id": "message_partial",
+                        "status": "incomplete",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "partial",
+                            "annotations": [],
+                        }],
+                    }],
+                },
+            ),
+            (
+                "response.failed",
+                {
+                    "id": "response_failed",
+                    "object": "response",
+                    "status": "failed",
+                    "error": {
+                        "code": "server_error",
+                        "message": "failed",
+                    },
+                    "output": [],
+                },
+            ),
+        ]
+        for terminal_type, buffered in cases:
+            with self.subTest(terminal_type=terminal_type):
+                accumulator = (
+                    protocols.OpenAIResponsesStreamAccumulator(
+                        lambda text: None))
+                accumulator.feed(self.event(json.dumps({
+                    "type": "response.output_text.delta",
+                    "delta": "ignored for final authority",
+                })))
+                accumulator.feed(self.event(json.dumps({
+                    "type": terminal_type,
+                    "response": buffered,
+                })))
+                streamed = accumulator.finish()
+
+                buffered_turn = (
+                    formats.openai_responses_response_to_items(
+                        buffered))
+                streamed_turn = (
+                    formats.openai_responses_response_to_items(
+                        streamed))
+
+                self.assertEqual(streamed, buffered)
+                self.assertEqual(
+                    streamed_turn.to_event(),
+                    buffered_turn.to_event(),
+                )
 
     def test_openai_chat_accumulates_text_and_parallel_tool_calls(self):
         deltas = []
@@ -237,12 +1106,15 @@ class StreamAccumulatorTests(unittest.TestCase):
         items = formats.openai_chat_response_to_items(response)
 
         self.assertEqual(deltas, ["Hel", "lo"])
-        self.assertEqual(formats.item_text(items[1]), "Hello")
+        self.assertEqual(formats.item_text(items[0]), "Hello")
         self.assertEqual(
-            [item["name"] for item in items[2:]], ["Read", "Glob"])
+            [item["name"] for item in items[1:]], ["Read", "Glob"])
         self.assertEqual(
-            items[2]["input"], {"file_path": "README.md"})
-        self.assertEqual(items[3]["input"], {"pattern": "*.py"})
+            formats.tool_call_input(items[1]),
+            {"file_path": "README.md"})
+        self.assertEqual(
+            formats.tool_call_input(items[2]), {"pattern": "*.py"})
+        self.assertEqual(response["object"], "chat.completion")
 
     def test_openai_chat_requires_done_marker(self):
         accumulator = protocols.OpenAIChatStreamAccumulator(lambda text: None)
@@ -252,6 +1124,85 @@ class StreamAccumulatorTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 protocols.StreamProtocolError, "before data: \\[DONE\\]"):
             accumulator.finish()
+
+    def test_openai_chat_assembles_reasoning_content_without_token_diagnostics(
+            self):
+        accumulator = protocols.OpenAIChatStreamAccumulator(
+            lambda text: None)
+        diagnostics = io.StringIO()
+        chunks = [
+            {"choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "reasoning_content": "The",
+                },
+                "finish_reason": None,
+            }]},
+            {"choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": " user"},
+                "finish_reason": None,
+            }]},
+            {"choices": [{
+                "index": 0,
+                "delta": {"content": "Working."},
+                "finish_reason": "stop",
+            }]},
+        ]
+        with contextlib.redirect_stderr(diagnostics):
+            for chunk in chunks:
+                accumulator.feed(self.event(json.dumps(chunk)))
+            accumulator.feed(self.event("[DONE]"))
+            response = accumulator.finish()
+            turn = formats.openai_chat_response_to_items(response)
+
+        self.assertEqual(diagnostics.getvalue(), "")
+        self.assertEqual(
+            response["choices"][0]["message"]["reasoning_content"],
+            "The user",
+        )
+        self.assertEqual(formats.item_text(turn.items[0]), "Working.")
+        self.assertEqual(
+            turn.items[0]["protocol_data"][protocols.OPENAI_CHAT]
+            ["fields"]["reasoning_content"],
+            "The user",
+        )
+
+    def test_openai_chat_aggregates_unknown_string_delta_before_diagnostic(
+            self):
+        accumulator = protocols.OpenAIChatStreamAccumulator(
+            lambda text: None)
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            for value in ["one", " two", " three"]:
+                accumulator.feed(self.event(json.dumps({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"future_delta": value},
+                        "finish_reason": None,
+                    }],
+                })))
+            accumulator.feed(self.event(json.dumps({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "answer"},
+                    "finish_reason": "stop",
+                }],
+            })))
+            accumulator.feed(self.event("[DONE]"))
+            response = accumulator.finish()
+            formats.openai_chat_response_to_items(response)
+
+        self.assertEqual(
+            response["choices"][0]["message"]["future_delta"],
+            "one two three",
+        )
+        self.assertEqual(
+            diagnostics.getvalue().count(
+                "Unknown openai_chat message fields"),
+            1,
+        )
 
     def test_anthropic_accumulates_text_and_tool_json(self):
         deltas = []
@@ -325,12 +1276,106 @@ class StreamAccumulatorTests(unittest.TestCase):
         items = formats.anthropic_response_to_items(response)
 
         self.assertEqual(deltas, ["hello"])
-        self.assertEqual(formats.item_text(items[1]), "hello")
-        self.assertEqual(items[2]["name"], "Read")
+        self.assertEqual(formats.item_text(items[0]), "hello")
+        call = formats.response_tool_calls(items.items)[0]
+        self.assertEqual(call["name"], "Read")
         self.assertEqual(
-            items[2]["input"], {"file_path": "README.md"})
+            formats.tool_call_input(call), {"file_path": "README.md"})
         self.assertEqual(
             response["usage"], {"input_tokens": 4, "output_tokens": 8})
+
+    def test_anthropic_accumulates_streamed_server_tool_json(self):
+        accumulator = protocols.AnthropicMessagesStreamAccumulator(
+            lambda text: None)
+        events = [
+            ("message_start", {
+                "type": "message_start",
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                },
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"query":"current news"}',
+                },
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop",
+                "index": 0,
+            }),
+            ("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "pause_turn"},
+            }),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        for event_name, data in events:
+            accumulator.feed(self.event(
+                json.dumps(data), event=event_name))
+
+        response = accumulator.finish()
+        turn = formats.anthropic_response_to_items(response)
+        call = turn.items[0]
+
+        self.assertEqual(
+            formats.tool_call_input(call), {"query": "current news"})
+        self.assertEqual(call["execution"], "provider")
+
+    def test_anthropic_preserves_server_tool_input_from_block_start(self):
+        accumulator = protocols.AnthropicMessagesStreamAccumulator(
+            lambda text: None)
+        events = [
+            ("message_start", {
+                "type": "message_start",
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "already complete"},
+                },
+            }),
+            ("content_block_stop", {
+                "type": "content_block_stop", "index": 0,
+            }),
+            ("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "pause_turn"},
+            }),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        for event_name, data in events:
+            accumulator.feed(self.event(
+                json.dumps(data), event=event_name))
+
+        response = accumulator.finish()
+
+        self.assertEqual(
+            response["content"][0]["input"],
+            {"query": "already complete"},
+        )
 
     def test_openai_responses_uses_completed_response_as_authority(self):
         deltas = []
@@ -351,7 +1396,82 @@ class StreamAccumulatorTests(unittest.TestCase):
         items = formats.openai_responses_response_to_items(response)
 
         self.assertEqual(deltas, ["hel", "lo"])
-        self.assertEqual(formats.item_text(items[1]), "hello")
+        self.assertEqual(formats.item_text(items[0]), "hello")
+
+    def test_openai_responses_incomplete_stream_returns_partial_turn(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        accumulator.feed(self.event(
+            '{"type":"response.incomplete","response":'
+            '{"id":"resp_1","object":"response","status":"incomplete",'
+            '"incomplete_details":{"reason":"max_output_tokens"},'
+            '"output":[{"id":"msg_1","type":"message",'
+            '"status":"incomplete","role":"assistant","content":'
+            '[{"type":"output_text","text":"partial"}]}]}}'))
+
+        response = accumulator.finish()
+        turn = formats.openai_responses_response_to_items(response)
+
+        self.assertFalse(turn.complete)
+        self.assertEqual(formats.item_text(turn.items[0]), "partial")
+        self.assertEqual(
+            turn.metadata["protocol_data"][protocols.OPENAI_RESPONSES]
+            ["incomplete_details"]["reason"],
+            "max_output_tokens",
+        )
+
+    def test_openai_responses_failed_stream_returns_failed_turn(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        accumulator.feed(self.event(
+            '{"type":"response.failed","response":'
+            '{"id":"resp_1","object":"response","status":"failed",'
+            '"error":{"code":"server_error","message":"failed"},'
+            '"output":[]}}'))
+
+        response = accumulator.finish()
+        turn = formats.openai_responses_response_to_items(response)
+
+        self.assertFalse(turn.complete)
+        self.assertEqual(turn.metadata["status"], "failed")
+        self.assertEqual(
+            turn.metadata["protocol_data"][protocols.OPENAI_RESPONSES]
+            ["error"]["code"],
+            "server_error",
+        )
+
+    def test_openai_responses_error_event_is_a_stream_error(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        accumulator.feed(self.event(
+            '{"type":"error","code":"stream_error",'
+            '"message":"transport failed"}'))
+
+        with self.assertRaises(protocols.StreamProtocolError) as raised:
+            accumulator.finish()
+
+        self.assertEqual(
+            raised.exception.payload["code"], "stream_error")
+
+    def test_unknown_stream_event_is_diagnosed_not_in_conversation(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            accumulator.feed(self.event(
+                '{"type":"future.event","payload":{"marker":true}}'))
+            accumulator.feed(self.event(
+                '{"type":"response.completed","response":'
+                '{"id":"resp_1","object":"response",'
+                '"status":"completed","output":[]}}'))
+            response = accumulator.finish()
+            turn = formats.openai_responses_response_to_items(response)
+
+        self.assertIn('"marker": true', diagnostics.getvalue())
+        self.assertEqual(turn.items, [])
+        self.assertNotIn("response", turn.metadata)
+        self.assertNotIn(
+            "_loki_stream_extensions", json.dumps(turn.to_event()))
 
     def test_streaming_payload_is_opt_in_at_call_site(self):
         provider = protocols.make_provider(

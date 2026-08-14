@@ -68,12 +68,14 @@ class ConnectionDescriptorTests(unittest.TestCase):
             protocol="openai_chat",
             credential_env="OPENROUTER_API_KEY",
             model_status="deprecated",
+            prompt_cache=True,
         )
 
         encoded = descriptor.to_dict()
 
         self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
         self.assertEqual(encoded["model_status"], "deprecated")
+        self.assertIs(encoded["prompt_cache"], True)
         self.assertNotIn("api_url", encoded)
         self.assertNotIn("secret", repr(encoded))
 
@@ -150,6 +152,14 @@ class ConnectionDescriptorTests(unittest.TestCase):
                 "protocol": "openai_chat",
                 "credential_env": None,
                 "stream": "yes",
+            })
+        with self.assertRaises(ConnectionDescriptorError):
+            ConnectionDescriptor.from_dict({
+                "model": "x",
+                "chat_url": "https://example.test/v1/messages",
+                "protocol": "anthropic_messages",
+                "credential_env": None,
+                "prompt_cache": "yes",
             })
 
 
