@@ -734,19 +734,12 @@ class ToolHookPipeline:
                     "error",
                     message,
                 ))
-                if registered.on_error == "deny" and not outcome.executed:
-                    outcome.ok = False
-                    outcome.status = "hook_error"
-                    outcome.content = (
-                        f"Post-tool hook {registered.hook_id!r} failed "
-                        f"before any tool execution: {message}")
-                else:
-                    timing = (
-                        "after the tool had already executed"
-                        if outcome.executed else "after rejection")
-                    invocation.notes.append(
-                        f"Post-tool hook {registered.hook_id!r} failed "
-                        f"{timing}: {message}")
+                timing = (
+                    "after the tool had already executed"
+                    if outcome.executed else "after rejection")
+                invocation.notes.append(
+                    f"Post-tool hook {registered.hook_id!r} failed "
+                    f"{timing}: {message}")
         return invocation, outcome
 
 
@@ -779,6 +772,15 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
                             stdout_limit=1_000_000,
                             stderr_limit=100_000):
     try:
+        stdin_data = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise HookExecutionError(
+            f"hook input is not JSON-compatible: {error}") from error
+    try:
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=cwd,
@@ -790,35 +792,39 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
     except OSError as error:
         raise HookExecutionError(
             f"could not start hook command: {error}") from error
-    stdin_data = json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    process.stdin.write(stdin_data)
-    await process.stdin.drain()
-    process.stdin.close()
     stdout_task = asyncio.create_task(
         _read_stream_limited(process.stdout, stdout_limit))
     stderr_task = asyncio.create_task(
         _read_stream_limited(process.stderr, stderr_limit))
+
+    async def terminate():
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
+        for task in [stdout_task, stderr_task]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            stdout_task, stderr_task, return_exceptions=True)
+
     try:
+        process.stdin.write(stdin_data)
+        await process.stdin.drain()
+        process.stdin.close()
         stdout, stderr, returncode = await asyncio.wait_for(
             asyncio.gather(
                 stdout_task, stderr_task, process.wait()),
             timeout=timeout_ms / 1000,
         )
     except asyncio.TimeoutError as error:
-        process.kill()
-        await process.wait()
-        for task in [stdout_task, stderr_task]:
-            if not task.done():
-                task.cancel()
+        await terminate()
         raise HookExecutionError(
             f"hook timed out after {timeout_ms}ms") from error
-    except Exception:
-        process.kill()
-        await process.wait()
-        for task in [stdout_task, stderr_task]:
-            if not task.done():
-                task.cancel()
+    except BaseException:
+        await terminate()
         raise
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     if returncode != 0:
@@ -852,6 +858,7 @@ class ExternalHook:
     command: tuple
     timeout_ms: int
     workspace_side_effects: bool = False
+    event_name: str = "pre_tool_call"
 
     def matches(self, tool_name):
         return "*" in self.tools or tool_name in self.tools
@@ -873,7 +880,7 @@ class ExternalHook:
         result = await _run_hook_command(
             self.command,
             {
-                "event": "pre_tool_call",
+                "event": self.event_name,
                 "invocation": invocation.to_hook_dict(),
             },
             invocation.cwd,
@@ -992,6 +999,11 @@ def load_hook_pipeline(path):
         for index, value in enumerate(values):
             hook, on_error = _external_hook_from_dict(
                 value, f"{section}[{index}]", default_timeout)
+            hook.event_name = section
+            if section == "post_tool_call" and on_error == "deny":
+                raise HookConfigurationError(
+                    f"{section}[{index}].on_error cannot be 'deny': "
+                    "post-tool failures cannot undo an attempted tool")
             if hook.hook_id in seen_ids:
                 raise HookConfigurationError(
                     f"duplicate hook id {hook.hook_id!r}")

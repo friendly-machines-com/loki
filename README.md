@@ -58,6 +58,84 @@ completed assistant response. If a server ignores the request and returns
 ordinary JSON, Loki accepts that same response without resending the inference
 request. If the server rejects streaming, set `LOKI_STREAM=0`.
 
+Tool input is validated before execution. When validation identifies one of a
+small set of unambiguous representation mistakes, Loki repairs a copy of the
+input, validates the result again, and reports the adjustment to both the user
+and model. The original provider tool call is never rewritten. Supported
+repairs are optional `null` omission, JSON-encoded arrays, an empty-object
+placeholder for an array, a bare string for a string array, and degenerate
+Markdown auto-links in explicitly marked filesystem-path fields. Other invalid
+input is rejected with a path-by-path retry message. A repaired call is
+executed at most once.
+
+Loki also supports trusted external tool hooks. Set `LOKI_HOOKS` to an explicit
+JSON configuration path, or place user-owned configuration at
+`~/.config/loki/hooks.json`. Repository hook files are never loaded
+automatically. Set `LOKI_HOOKS=off` to disable external hooks while retaining
+Loki's built-in input repair.
+
+```json
+{
+    "pre_tool_call": [
+        {
+            "id": "normalize",
+            "tools": ["Write", "Edit"],
+            "command": ["/home/me/bin/loki-normalize"],
+            "timeout_ms": 2000,
+            "on_error": "deny"
+        }
+    ],
+    "pre_tool_gate": [
+        {
+            "id": "policy",
+            "tools": ["Bash"],
+            "command": ["/home/me/bin/loki-policy"]
+        }
+    ],
+    "post_tool_call": [
+        {
+            "id": "format",
+            "tools": ["Write", "Edit"],
+            "command": ["/home/me/bin/loki-format"],
+            "timeout_ms": 10000,
+            "on_error": "continue",
+            "workspace_side_effects": true
+        }
+    ]
+}
+```
+
+Hooks run sequentially in configuration order and receive one JSON object on
+stdin. Pre-hook input has `event: "pre_tool_call"` and an `invocation` object
+containing the call ID, tool name, original and effective arguments, schema,
+current validation issues, cwd, model, provider, and prior adjustments. A
+pre-transformer writes one of:
+
+```json
+{"action": "continue"}
+{"action": "continue", "arguments": {"replacement": "input"}, "note": "why"}
+{"action": "deny", "message": "model-readable reason"}
+```
+
+A `pre_tool_gate` has the same input and decisions but cannot replace
+arguments. It sees the final validated input after all transformers.
+Post-hook input additionally contains the terminal `outcome`, including
+whether the tool executed and its real result. A post-hook may return a
+model-visible note and workspace paths it changed:
+
+```json
+{"note": "formatter ran", "changed_paths": ["src/example.py"]}
+```
+
+Post-hooks cannot replace the real tool result or cause automatic
+re-execution. A pre-hook error denies execution by default. A post-hook error
+preserves the outcome and tells the model that the tool had already executed.
+Commands are argv arrays, not shell strings; stdout is reserved for the single
+JSON response, while stderr remains diagnostic. Hook subprocesses receive a
+minimal environment without Loki API credentials. A hook configured with
+`workspace_side_effects: true` must return `changed_paths`, or Loki
+conservatively invalidates all remembered file state.
+
 Chat logs are session savefiles. They persist the selected model, its known
 catalog status, protocol, concrete endpoints, and other session state, but
 never credential values.

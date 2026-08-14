@@ -512,6 +512,11 @@ def validate_events(events):
                 pending.setdefault(call_id, []).append(index)
         elif event_type == "tool_result":
             call_id = event.get("call_id")
+            execution = event.get("execution")
+            if execution is not None and not isinstance(execution, dict):
+                raise TranscriptFormatError(
+                    f"event {index} tool result execution metadata "
+                    "must be an object")
             matches = pending.get(call_id, [])
             if not matches:
                 raise TranscriptFormatError(

@@ -1690,6 +1690,8 @@ def _repair_event(invocation):
         "type": "tool_input_repaired",
         "name": invocation.tool_name,
         "call_id": invocation.call_id,
+        "model": invocation.model,
+        "provider": invocation.provider,
         "repairs": [
             {
                 "hook": adjustment.hook,
@@ -1716,7 +1718,10 @@ def _execution_metadata(invocation, outcome, defaults):
         "status": outcome.status,
     }
     if invocation.adjustments:
-        result["adjustments"] = [
+        adjustment_key = (
+            "adjustments"
+            if outcome.executed else "attempted_adjustments")
+        result[adjustment_key] = [
             adjustment.to_dict()
             for adjustment in invocation.adjustments
         ]
@@ -1828,6 +1833,22 @@ async def execute_tool_call_async(
                 invocation.denied_reason,
             )
         elif invocation.validation_issues:
+            on_event({
+                "type": "tool_input_invalid",
+                "name": fn_name,
+                "call_id": invocation.call_id,
+                "model": invocation.model,
+                "provider": invocation.provider,
+                "issues": [
+                    {
+                        "code": issue.code,
+                        "path": list(issue.path),
+                        "display_path": tool_runtime.format_path(
+                            issue.path),
+                    }
+                    for issue in invocation.validation_issues
+                ],
+            })
             outcome = tool_runtime.ToolOutcome(
                 "invalid",
                 False,
@@ -1869,6 +1890,8 @@ async def execute_tool_call_async(
                     for adjustment in invocation.adjustments),
             )
         invocation.notes.extend(default_notes)
+    else:
+        defaults = []
     invocation, outcome = await hook_pipeline.finish(
         invocation, outcome)
     _invalidate_hook_file_state(invocation)
