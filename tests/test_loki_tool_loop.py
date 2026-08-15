@@ -1089,6 +1089,7 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
         loki.initialize_terminal_overlay(terminal)
 
         self.assertEqual(terminal.calls, [
+            ("hide_cursor",),
             ("enable_bracketed_paste_mode",),
             ("enable_origin_mode",),
             ("clear_to_end_of_screen",),
@@ -1111,6 +1112,7 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
             ("reset_colors_and_flags",),
             ("goto_position", loki.terminals.input_area[0], 1),
             ("clear_to_end_of_screen",),
+            ("show_cursor",),
             ("flush",),
         ])
         self.assertNotIn(("clear_screen",), terminal.calls)

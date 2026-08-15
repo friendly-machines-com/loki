@@ -85,6 +85,12 @@ else:
     def reset_colors_and_flags(self):
         print('\033[m', end='')
 
+    def hide_cursor(self): # DECTCEM: the input area draws its own reverse-video caret.
+        print('\033[?25l', end='')
+
+    def show_cursor(self):
+        print('\033[?25h', end='')
+
     def enable_bracketed_paste_mode(self): # \e[200~ ... \e[201~
         print('\033[?2004h', end='')
 

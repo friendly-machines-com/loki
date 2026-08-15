@@ -4157,6 +4157,10 @@ async def async_main(args) -> int:
 
 
 def initialize_terminal_overlay(active_terminal):
+    # The input area renders a synthetic reverse-video caret, so the real
+    # cursor is hidden for the whole session; restore_terminal_overlay (which
+    # clean_up runs on every exit path) shows it again.
+    active_terminal.hide_cursor()
     active_terminal.enable_bracketed_paste_mode()
     active_terminal.enable_origin_mode()
     active_terminal.clear_to_end_of_screen()
@@ -4179,6 +4183,8 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
     run_step(lambda: active_terminal.goto_position(
         terminals.input_area[0], 1))
     run_step(active_terminal.clear_to_end_of_screen)
+    # Reveal the real cursor only once it sits at its final resting position.
+    run_step(active_terminal.show_cursor)
     run_step(active_terminal.flush)
 
 
