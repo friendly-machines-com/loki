@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Loki
+GenericName=Coding Agent
+Comment=Really really minimal-dependency coding agent
+Exec=loki
+Icon=utilities-terminal
+Terminal=true
+Categories=Development;Utility;ConsoleOnly;
+Keywords=AI;LLM;agent;coding;assistant;
+StartupNotify=false
