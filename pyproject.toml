@@ -1,0 +1,25 @@
+[build-system]
+requires = ["flit_core >=3.8,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+# Distribution name; flit normalizes it to the "loki_agent" package.
+name = "loki-agent"
+version = "0.1.0"
+description = "Really really minimal-dependency coding agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "COPYING"}
+authors = [{name = "Danny Milosavljevic"}]
+keywords = ["ai", "llm", "agent", "coding"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+dependencies = []
+
+[project.scripts]
+loki = "loki_agent.loki:main"
