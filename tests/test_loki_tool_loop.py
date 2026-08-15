@@ -253,6 +253,15 @@ class RuntimeConfigTests(unittest.TestCase):
                 **base, "LOKI_STREAM": "sometimes",
             })
 
+    def test_dummy_provider_honors_stream_setting(self):
+        config = loki.build_config_from_env({
+            "LOKI_API_BASE": "http://dummy.invalid/v1",
+            "LOKI_PROVIDER": "dummy",
+            "LOKI_STREAM": "1",
+        })
+
+        self.assertTrue(config.stream)
+
     def test_anthropic_prompt_cache_defaults_only_for_anthropic_api(self):
         direct = loki.build_config_from_env({
             "LOKI_API_BASE": "https://api.anthropic.com/v1/messages",

@@ -277,6 +277,7 @@ def build_config_from_env(environ=os.environ,
             anthropic_version=credentials.get(
                 "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
             provider_name="Explicit LOKI_* connection",
+            stream=_bool_setting("LOKI_STREAM", False, credentials),
             prompt_cache=False,
         )
 
@@ -2139,6 +2140,11 @@ def _print_tool_args(args):
         pprint((k, v))
 
 
+def _print_terminal_fragments(fragments):
+    for fragment in fragments:
+        print(fragment, end='', flush=True)
+
+
 def _terminal_agent_event(event: dict):
     # Error branches reset attributes before emitting their final newline. That
     # prevents terminal scroll-fill from inheriting the red background.
@@ -2170,13 +2176,19 @@ def _terminal_agent_event(event: dict):
             )
             sys.stderr.flush()
     elif kind == "assistant_message":
-        rendered_content = terminal.markdown_to_ansi(event["content"])
-        print(f"\n{model}: {rendered_content if rendered_content is not None else event['content']}")
+        rendered_content = terminals.render_markdown(event["content"])
+        print(f"\n{model}: {rendered_content}")
     elif kind == "assistant_start":
+        was_active = terminal.assistant_markdown.active
+        stale = terminal.assistant_markdown.start()
+        if was_active:
+            _print_terminal_fragments(stale)
         print(f"\n{model}: ", end='', flush=True)
     elif kind == "assistant_delta":
-        print(event["content"], end='', flush=True)
+        _print_terminal_fragments(
+            terminal.assistant_markdown.feed(event["content"]))
     elif kind == "assistant_end":
+        _print_terminal_fragments(terminal.assistant_markdown.finish())
         print()
         sys.stdout.flush()
     elif kind == "response_timing":
@@ -3437,8 +3449,37 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     if RUNTIME_CONFIG.chat_provider.kind == protocols.DUMMY:
         # No-op LLM for testing: never touches the network.  The reply is a
         # canned assistant message, so the whole input/turn/render loop runs
-        # deterministically.  LOKI_DUMMY_REPLY overrides the text.
+        # deterministically. LOKI_DUMMY_STREAM_CHUNKS optionally supplies a
+        # JSON array of deltas. A test can make the provider pause after its
+        # first delta by setting LOKI_DUMMY_STREAM_GATE to a path that the test
+        # creates after observing the corresponding terminal output.
         reply = os.environ.get("LOKI_DUMMY_REPLY", "ok")
+        raw_chunks = os.environ.get("LOKI_DUMMY_STREAM_CHUNKS")
+        if RUNTIME_CONFIG.stream and on_text_delta and raw_chunks is not None:
+            try:
+                chunks = json.loads(raw_chunks)
+            except json.JSONDecodeError as error:
+                raise protocols.ProtocolError(
+                    f"LOKI_DUMMY_STREAM_CHUNKS is invalid JSON: {error}"
+                ) from error
+            if (not isinstance(chunks, list)
+                    or any(not isinstance(chunk, str) for chunk in chunks)):
+                raise protocols.ProtocolError(
+                    "LOKI_DUMMY_STREAM_CHUNKS must be a JSON array "
+                    "of strings")
+            gate = os.environ.get("LOKI_DUMMY_STREAM_GATE")
+            for index, chunk in enumerate(chunks):
+                on_text_delta(chunk)
+                if index == 0 and gate:
+                    deadline = time.monotonic() + 10
+                    while not os.path.exists(gate):
+                        if cancel_check and cancel_check():
+                            raise StreamCancelled()
+                        if time.monotonic() >= deadline:
+                            raise protocols.ProtocolError(
+                                "timed out waiting for "
+                                "LOKI_DUMMY_STREAM_GATE")
+                        await asyncio.sleep(0.01)
         return formats.DecodedTurn(
             [formats.message_item("assistant", reply)],
             {

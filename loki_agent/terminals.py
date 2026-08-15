@@ -13,8 +13,10 @@ from dataclasses import dataclass
 STATUS_COLOR = 4
 INPUT_COLOR = 7
 BOLD = '\033[1m'
+ITALIC = '\033[3m'
 CODE_COLOR = 6
 RESET = '\033[0m'
+MARKDOWN_MAX_UNRESOLVED = 4096
 
 
 if not os.isatty(sys.stdin.fileno()):
@@ -98,30 +100,368 @@ else:
         print('\033[?2004l', end='')
 
     def markdown_to_ansi(self, text: str) -> str:
-        # We split the text by inline code blocks.
-        # Using a capture group `(`.*?`)` ensures the code segments are kept in the resulting list.
-        parts = re.split(r'(`.*?`)', text)
-        for i, part in enumerate(parts):
-            # Check if the current part is a code block
-            if part.startswith('`') and part.endswith('`') and len(part) >= 2:
-                inner_text = part[1:-1] # Strip the backticks
-                parts[i] = f"\033[3{CODE_COLOR}m{inner_text}{RESET}"
-            else: # normal text
-                 # .*? is non-greedy so it correctly matches isolated **bold** pairs
-                part = re.sub(r'\*\*(.*?)\*\*', f'{BOLD}\\1{RESET}', part) # bold; TODO: also __foo__ also bold!
-                part = re.sub(r'(?<!\*)\*(.*?)\*(?!\*)', f'\033[3m\\1{RESET}', part) # italics
-                # TODO: maybe underline.
-                # TODO: maybe strikethrough text: ~
-                # TODO: # headline, ## headline, ### headline; also extra line ===== or ----
-                # TODO: handle >blockquote blocks
-                # TODO: ![Tux, the Linux mascot](/assets/images/tux.png)
-                # TODO: \* Without the backslash, this would be a bullet in an unordered list.
-                parts[i] = part
-
-        return "".join(parts)
+        return markdown_line_to_ansi(text)
 
 
 terminal = Terminal()
+
+
+class BoundedMarkdownAnsi:
+    """Incrementally render Loki's small Markdown dialect.
+
+    Design target: a bounded, deterministic scanner that immediately emits
+    coalesced decided prefixes, retains only genuinely unresolved Markdown,
+    applies identical overflow semantics in batch and streaming modes, never
+    leaves ANSI state active across event boundaries, and is tested for
+    visibility before completion.
+
+    Supported inline constructs are single-backtick code, ``*emphasis*``, and
+    ``**bold**``. They never cross a newline and are styled only after their
+    closing delimiter arrives. Backslash escapes and nested inline constructs
+    are intentionally not interpreted. Fenced regions use matching runs of at
+    least three backticks or tildes, with zero to three leading spaces; their
+    contents and marker lines pass through verbatim.
+
+    ``feed`` and ``finish`` eagerly return tuples of terminal-state-neutral
+    fragments. Plain text is emitted immediately. Only a possible fence marker
+    or an unresolved inline span is retained, and neither may exceed
+    ``max_unresolved`` characters. After overflow, the remainder of that line
+    is literal so a later closing delimiter cannot be reinterpreted as a new
+    opener. Batch and streaming rendering use this same fallback rule.
+    """
+
+    def __init__(self, *, style=True,
+                 max_unresolved=MARKDOWN_MAX_UNRESOLVED):
+        if (not isinstance(max_unresolved, int)
+                or isinstance(max_unresolved, bool)
+                or max_unresolved < 1):
+            raise ValueError("max_unresolved must be a positive integer")
+        self.style = bool(style)
+        self.max_unresolved = max_unresolved
+        self._closed = False
+        self._at_line_start = True
+        self._fence_char = None
+        self._fence_length = 0
+        self._bol_pending = []
+        self._inline_mode = "plain"
+        self._inline_pending = []
+        self._bold_star = False
+
+    @property
+    def retained_characters(self):
+        return len(self._bol_pending) + len(self._inline_pending)
+
+    @staticmethod
+    def _emit(output, text):
+        if text:
+            output.append(text)
+
+    @staticmethod
+    def _fragments(output):
+        rendered = "".join(output)
+        return (rendered,) if rendered else ()
+
+    def _reset_inline(self):
+        self._inline_mode = "plain"
+        self._inline_pending.clear()
+        self._bold_star = False
+
+    def _emit_pending_literal(self, output):
+        self._emit(output, "".join(self._inline_pending))
+        self._reset_inline()
+
+    def _emit_completed_span(self, output):
+        raw = "".join(self._inline_pending)
+        mode = self._inline_mode
+        if not self.style:
+            rendered = raw
+        elif mode == "bold":
+            rendered = BOLD + raw[2:-2] + RESET
+        elif mode == "emphasis":
+            rendered = ITALIC + raw[1:-1] + RESET
+        elif mode == "code":
+            rendered = f"\033[3{CODE_COLOR}m" + raw[1:-1] + RESET
+        else:
+            raise AssertionError(f"cannot render inline mode {mode!r}")
+        self._emit(output, rendered)
+        self._reset_inline()
+
+    def _check_inline_bound(self, output):
+        if len(self._inline_pending) > self.max_unresolved:
+            self._emit_pending_literal(output)
+            self._inline_mode = "literal_line"
+
+    def _consume_inline(self, character, output):
+        mode = self._inline_mode
+        if mode == "literal_line":
+            self._emit(output, character)
+            if character == "\n":
+                self._inline_mode = "plain"
+                self._at_line_start = True
+            return
+        if mode == "plain":
+            if character == "\n":
+                self._emit(output, character)
+                self._at_line_start = True
+            elif character == "*":
+                self._inline_mode = "star"
+                self._inline_pending.append(character)
+            elif character == "`":
+                self._inline_mode = "code"
+                self._inline_pending.append(character)
+            else:
+                self._emit(output, character)
+            return
+
+        if mode == "star":
+            if character == "*":
+                self._inline_mode = "bold"
+                self._inline_pending.append(character)
+            elif character == "\n":
+                self._emit_pending_literal(output)
+                self._emit(output, character)
+                self._at_line_start = True
+            else:
+                self._inline_mode = "emphasis"
+                self._inline_pending.append(character)
+                self._check_inline_bound(output)
+            return
+
+        if character == "\n":
+            self._emit_pending_literal(output)
+            self._emit(output, character)
+            self._at_line_start = True
+            return
+
+        self._inline_pending.append(character)
+        if mode == "emphasis":
+            if character == "*":
+                self._emit_completed_span(output)
+            else:
+                self._check_inline_bound(output)
+            return
+        if mode == "code":
+            if character == "`":
+                self._emit_completed_span(output)
+            else:
+                self._check_inline_bound(output)
+            return
+        if mode == "bold":
+            if character == "*":
+                if self._bold_star:
+                    self._emit_completed_span(output)
+                else:
+                    self._bold_star = True
+            else:
+                self._bold_star = False
+            if self._inline_mode == "bold":
+                self._check_inline_bound(output)
+            return
+        raise AssertionError(f"unknown inline mode {mode!r}")
+
+    @staticmethod
+    def _leading_spaces(text):
+        count = 0
+        while count < len(text) and text[count] == " ":
+            count += 1
+        return count
+
+    @classmethod
+    def _opening_candidate(cls, text):
+        spaces = cls._leading_spaces(text)
+        if spaces > 3:
+            return None
+        rest = text[spaces:]
+        if not rest:
+            return ("possible", None, 0)
+        marker = rest[0]
+        if marker not in ["`", "~"]:
+            return None
+        run = 0
+        while run < len(rest) and rest[run] == marker:
+            run += 1
+        suffix = rest[run:]
+        if not suffix:
+            return ("possible", marker, run)
+        if run >= 3:
+            return ("open", marker, run)
+        return None
+
+    @classmethod
+    def _closing_candidate(cls, text, marker, minimum):
+        spaces = cls._leading_spaces(text)
+        if spaces > 3:
+            return (False, False)
+        rest = text[spaces:]
+        if not rest:
+            return (True, False)
+        run = 0
+        while run < len(rest) and rest[run] == marker:
+            run += 1
+        if run == 0:
+            return (False, False)
+        suffix = rest[run:]
+        if not suffix:
+            return (True, run >= minimum)
+        if run >= minimum and all(ch in " \t" for ch in suffix):
+            return (True, True)
+        return (False, False)
+
+    def _consume_opening_line_start(self, character, output):
+        if character == "\n":
+            pending = "".join(self._bol_pending)
+            state = self._opening_candidate(pending)
+            if state is not None and state[1] is not None and state[2] >= 3:
+                self._fence_char = state[1]
+                self._fence_length = state[2]
+                self._emit(output, pending + character)
+            else:
+                self._bol_pending.clear()
+                self._at_line_start = False
+                for pending_character in pending:
+                    self._consume_inline(pending_character, output)
+                self._consume_inline(character, output)
+                return
+            self._bol_pending.clear()
+            self._at_line_start = True
+            return
+
+        self._bol_pending.append(character)
+        pending = "".join(self._bol_pending)
+        state = self._opening_candidate(pending)
+        if state is not None and state[0] == "open":
+            self._fence_char = state[1]
+            self._fence_length = state[2]
+            self._emit(output, pending)
+            self._bol_pending.clear()
+            self._at_line_start = False
+            return
+        if state is None:
+            self._bol_pending.clear()
+            self._at_line_start = False
+            for pending_character in pending:
+                self._consume_inline(pending_character, output)
+            return
+        if len(self._bol_pending) > self.max_unresolved:
+            self._emit(output, pending)
+            self._bol_pending.clear()
+            self._at_line_start = False
+            self._inline_mode = "literal_line"
+
+    def _consume_fenced_line_start(self, character, output):
+        if character == "\n":
+            pending = "".join(self._bol_pending)
+            _possible, closes = self._closing_candidate(
+                pending, self._fence_char, self._fence_length)
+            self._emit(output, pending + character)
+            self._bol_pending.clear()
+            if closes:
+                self._fence_char = None
+                self._fence_length = 0
+            self._at_line_start = True
+            return
+
+        self._bol_pending.append(character)
+        pending = "".join(self._bol_pending)
+        possible, _closes = self._closing_candidate(
+            pending, self._fence_char, self._fence_length)
+        if not possible or len(self._bol_pending) > self.max_unresolved:
+            self._emit(output, pending)
+            self._bol_pending.clear()
+            self._at_line_start = False
+
+    def _consume(self, character, output):
+        if self._at_line_start:
+            if self._fence_char is None:
+                self._consume_opening_line_start(character, output)
+            else:
+                self._consume_fenced_line_start(character, output)
+            return
+        if self._fence_char is not None:
+            self._emit(output, character)
+            if character == "\n":
+                self._at_line_start = True
+            return
+        self._consume_inline(character, output)
+
+    def feed(self, text):
+        if self._closed:
+            raise RuntimeError("cannot feed a finished Markdown renderer")
+        if not isinstance(text, str):
+            raise TypeError("Markdown chunks must be strings")
+        if not self.style:
+            return (text,) if text else ()
+        output = []
+        for character in text:
+            self._consume(character, output)
+        return self._fragments(output)
+
+    def finish(self):
+        if self._closed:
+            return ()
+        output = []
+        if self._bol_pending:
+            self._emit(output, "".join(self._bol_pending))
+            self._bol_pending.clear()
+        if self._inline_pending:
+            self._emit_pending_literal(output)
+        self._closed = True
+        return self._fragments(output)
+
+
+def _terminal_supports_markdown_ansi():
+    return terminal.markdown_to_ansi("") is not None
+
+
+def render_markdown(text, *, style=None,
+                    max_unresolved=MARKDOWN_MAX_UNRESOLVED):
+    """Render complete text through the same bounded scanner used live."""
+    if style is None:
+        style = _terminal_supports_markdown_ansi()
+    renderer = BoundedMarkdownAnsi(
+        style=style, max_unresolved=max_unresolved)
+    return "".join(renderer.feed(text) + renderer.finish())
+
+
+def markdown_line_to_ansi(text: str) -> str:
+    """Compatibility entry point for explicitly ANSI-styled text."""
+    return render_markdown(text, style=True)
+
+
+class AssistantMarkdownPresentation:
+    """Own one terminal assistant turn's Markdown-renderer lifecycle."""
+
+    def __init__(self):
+        self._renderer = None
+
+    @property
+    def active(self):
+        return self._renderer is not None
+
+    def start(self):
+        stale = self.finish()
+        self._renderer = BoundedMarkdownAnsi(
+            style=_terminal_supports_markdown_ansi())
+        return stale
+
+    def feed(self, text):
+        if self._renderer is None:
+            self.start()
+        return self._renderer.feed(text)
+
+    def finish(self):
+        if self._renderer is None:
+            return ()
+        renderer = self._renderer
+        self._renderer = None
+        return renderer.finish()
+
+    def reset(self):
+        self._renderer = None
+
+
+terminal.assistant_markdown = AssistantMarkdownPresentation()
+
 
 try:
     terminal_size = os.get_terminal_size()
