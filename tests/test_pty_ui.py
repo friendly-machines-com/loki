@@ -311,3 +311,63 @@ class PtyCtrlCTests(unittest.TestCase):
             os.close(master)
         self.assertIn(b"CANCEL_SET", out)
         self.assertNotIn(b"CANCEL_NOT_SET", out)
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
+class PtyTurnCancelTests(unittest.TestCase):
+    """A real turn: Ctrl+C must reach the reader's cancel event.
+
+    The reader's cancel_event is what run_foreground races against to
+    interrupt a foreground job; this pins the wiring from tty byte to
+    event with the real InputSession machinery (per-turn clear included).
+    """
+
+    def test_ctrl_c_sets_reader_event_after_read_key(self):
+        pid, master = pty.fork()
+        if pid == 0:
+            try:
+                import sys as _sys
+                import asyncio as _asyncio
+                import time as _time
+                _sys.path.insert(
+                    0, str(pathlib.Path(__file__).resolve().parents[1]))
+                from loki_agent import terminals as _terminals
+
+                async def _main():
+                    mode = _terminals.TerminalMode(0, enabled=True)
+                    mode.__enter__()
+                    reader = _terminals.AsyncKeyReader(0)
+                    key_kind = None
+                    async with reader:
+                        reader.cancel_event.clear()
+                        try:
+                            key = await _asyncio.wait_for(
+                                reader.read_key(), timeout=3.0)
+                            key_kind = key.kind
+                        except _asyncio.TimeoutError:
+                            pass
+                    mode.__exit__(None, None, None)
+                    if (key_kind == "CTRL_C"
+                            and reader.cancel_event.is_set()):
+                        _sys.stdout.buffer.write(b"EVENT_SET\n")
+                    else:
+                        _sys.stdout.buffer.write(b"EVENT_NOT_SET\n")
+                    _sys.stdout.buffer.flush()
+                    _time.sleep(0.2)
+                _asyncio.run(_main())
+            except Exception:
+                pass
+            os._exit(0)
+        try:
+            _set_size(master)
+            _read_with_timeout(master, 1.0)
+            os.write(master, b"\x03")
+            out = _read_with_timeout(master, 4.0)
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            os.close(master)
+        self.assertIn(b"EVENT_SET", out)
+        self.assertNotIn(b"EVENT_NOT_SET", out)

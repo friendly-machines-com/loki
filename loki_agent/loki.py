@@ -1056,37 +1056,59 @@ class JobManager:
     async def run_foreground(self, command, display_command: str, timeout_ms: int,
                              description: str = "", shell: bool = False,
                              output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                             env: dict | None = None, cwd: str = None):
+                             env: dict | None = None, cwd: str = None,
+                             cancel_event: asyncio.Event | None = None):
         job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
                                 env=env, cwd=cwd)
-        try:
-            exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=timeout_ms / 1000)
-        except asyncio.TimeoutError:
-            with self._lock:
-                job.status = "timed_out"
-                self._write_metadata(job)
+        exit_task = asyncio.create_task(self._wait_for_job(job))
+        cancel_task = (asyncio.create_task(cancel_event.wait())
+                       if cancel_event is not None else None)
+        watchers = {exit_task} if cancel_task is None else {
+            exit_task, cancel_task}
+        done, _pending = await asyncio.wait(
+            watchers, timeout=timeout_ms / 1000,
+            return_when=asyncio.FIRST_COMPLETED)
+
+        async def terminate(signum, grace_s: float):
+            # Signal the job's whole process group so shell children are not
+            # left behind.
             try:
-                # Jobs are started in their own process group; signal the group
-                # so shell children are not left behind after a timeout.
-                os.killpg(job.pgid or job.pid, signal.SIGTERM)
+                os.killpg(job.pgid or job.pid, signum)
             except ProcessLookupError:
                 pass
             try:
-                exit_code = await asyncio.wait_for(self._wait_for_job(job), timeout=2)
+                exit_code = await asyncio.wait_for(
+                    asyncio.shield(exit_task), timeout=grace_s)
             except asyncio.TimeoutError:
                 try:
                     os.killpg(job.pgid or job.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                exit_code = await self._wait_for_job(job)
-            self._record_exit(job, exit_code)
-            return job, "timed_out", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+                exit_code = await exit_task
+            return exit_code
 
+        if exit_task in done:
+            self._record_exit(job, exit_task.result())
+            return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+
+        # The job is still running; either the user cancelled or the
+        # timeout fired.  A Ctrl-C cancels like a shell's: SIGINT to the
+        # foreground job's process group (background jobs are separate
+        # sessions and never see it), then SIGKILL after a grace period.
+        # A timeout keeps the SIGTERM-first sequence it always used.
+        interrupted = cancel_task is not None and cancel_task in done
+        with self._lock:
+            job.status = "cancelled" if interrupted else "timed_out"
+            self._write_metadata(job)
+        exit_code = await terminate(
+            signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
         self._record_exit(job, exit_code)
-        return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+        status = "cancelled" if interrupted else "timed_out"
+        return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
     async def run_shell(self, command: str, timeout: int = None, description: str = "",
-                        run_in_background: bool = False) -> str:
+                        run_in_background: bool = False,
+                        cancel_event: asyncio.Event | None = None) -> str:
         if command is None:
             return "Error: command is required"
         if command.strip() == "":
@@ -1113,7 +1135,13 @@ class JobManager:
             ])
 
         job, status, stdout, stderr = await self.run_foreground(
-            command, command, timeout_ms, description=description, shell=True, cwd=current_cwd())
+            command, command, timeout_ms, description=description, shell=True,
+            cwd=current_cwd(), cancel_event=cancel_event)
+        if status == "cancelled":
+            return _tool_result(
+                False,
+                "Tool call interrupted by user (SIGINT to the job's process "
+                "group)" + (f"; partial output:\n{stdout}" if stdout else ""))
         if status == "timed_out":
             if stderr:
                 stderr += "\n"
@@ -1211,9 +1239,11 @@ def run_bash(command: str, timeout: int = None, description: str = "",
 
 
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
-                         run_in_background: bool = False) -> str:
+                         run_in_background: bool = False,
+                         cancel_event: asyncio.Event | None = None) -> str:
     return await current_job_manager().run_shell(command, timeout=timeout, description=description,
-                                       run_in_background=run_in_background)
+                                       run_in_background=run_in_background,
+                                       cancel_event=cancel_event)
 
 
 def run_jobs() -> str:
@@ -1571,11 +1601,13 @@ def _handle_bash(args: dict) -> str:
                     run_in_background=args.get("run_in_background", False))
 
 
-async def _handle_bash_async(args: dict) -> str:
+async def _handle_bash_async(args: dict, extra_context=None) -> str:
     return await run_bash_async(args["command"],
                                 timeout=args.get("timeout"),
                                 description=args.get("description", ""),
-                                run_in_background=args.get("run_in_background", False))
+                                run_in_background=args.get("run_in_background", False),
+                                cancel_event=(extra_context or {}).get("cancel_event")
+                                if isinstance(extra_context, dict) else None)
 
 
 def _handle_read(args: dict) -> str:
@@ -1595,7 +1627,7 @@ def _handle_glob(args: dict) -> str:
     return run_glob(args["pattern"], args.get("path"))
 
 
-async def _handle_glob_async(args: dict) -> str:
+async def _handle_glob_async(args: dict, extra_context=None) -> str:
     return await run_glob_async(args["pattern"], args.get("path"))
 
 
@@ -1609,7 +1641,7 @@ def _handle_grep(args: dict) -> str:
                                 "type", "head_limit", "offset", "multiline"]})
 
 
-async def _handle_grep_async(args: dict) -> str:
+async def _handle_grep_async(args: dict, extra_context=None) -> str:
     extra = {k: v for k, v in args.items()
              if k not in ["pattern", "path", "glob", "output_mode"]}
     return await run_grep_async(args["pattern"],
@@ -1646,7 +1678,7 @@ def _handle_agent(args: dict) -> str:
                      subagent_type=args.get("subagent_type", "Explore"))
 
 
-async def _handle_agent_async(args: dict) -> str:
+async def _handle_agent_async(args: dict, extra_context=None) -> str:
     return await run_agent_async(args.get("description", ""),
                                  args["prompt"],
                                  args.get("run_in_background", False),
@@ -1657,11 +1689,11 @@ def _handle_skill(args: dict) -> str:
     return run_skill(args["skill"], args.get("args"))
 
 
-async def _handle_webfetch_async(args: dict) -> str:
+async def _handle_webfetch_async(args: dict, extra_context=None) -> str:
     return await run_webfetch_async(args["url"], args["prompt"])
 
 
-async def _handle_websearch_async(args: dict) -> str:
+async def _handle_websearch_async(args: dict, extra_context=None) -> str:
     return await run_websearch_async(args["query"],
                                      allowed_domains=args.get("allowed_domains"),
                                      blocked_domains=args.get("blocked_domains"))
@@ -1722,7 +1754,8 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_cont
 
     async def run_handler():
         if spec.get("async_handler") is not None:
-            return await spec["async_handler"](args)
+            return await spec["async_handler"](
+                args, extra_context=extra_context)
         return spec["handler"](args)
 
     return await with_exception_to_tool_result_async(f"executing {fn_name}", run_handler)
@@ -1991,7 +2024,8 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                               chat_fn=None, on_event=None, cancel_check=None,
                               stream_chat=False, report_timing=False,
                               on_response=None,
-                              hook_pipeline=None) -> str:
+                              hook_pipeline=None,
+                              cancel_event: asyncio.Event | None = None) -> str:
     """Run the model/tool loop over canonical session events.
 
     Mutates ``transcript_items`` by appending one ``model_response`` for each
@@ -2016,6 +2050,8 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
         raise ValueError("max_loops must be at least 1")
 
     tool_loop_extra_context = get_tool_loop_extra_context(transcript_items)
+    if cancel_event is not None:
+        tool_loop_extra_context["cancel_event"] = cancel_event
 
     def append_turn(turn):
         response_event = turn.to_event()
@@ -2332,7 +2368,8 @@ def _terminal_agent_event(event: dict):
         print()
 
 
-async def run_terminal_turn_async(transcript_items: list, cancel_check=None) -> str:
+async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
+                                  cancel_event: asyncio.Event | None = None) -> str:
     async def chat_fn(items, on_text_delta):
         return await async_chat_completion(
             items, TOOLS, True, False,
@@ -2346,6 +2383,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None) -> 
         cancel_check=cancel_check,
         stream_chat=True,
         report_timing=True,
+        cancel_event=cancel_event,
         on_response=lambda turn, event: _remember_session_toolset(TOOLS),
     )
 
@@ -4203,7 +4241,11 @@ async def async_main(args) -> int:
                 # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
                 # earlier prompt or turn must not poison the next model call.
                 session.reader.cancel_requested = False
-                await run_terminal_turn_async(current_transcript(), cancel_check=lambda: session.reader.cancel_requested)
+                session.reader.cancel_event.clear()
+                await run_terminal_turn_async(
+                    current_transcript(),
+                    cancel_check=lambda: session.reader.cancel_requested,
+                    cancel_event=session.reader.cancel_event)
             except KeyboardInterrupt:
                 terminal.reset_colors_and_flags()
                 print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")

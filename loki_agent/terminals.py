@@ -616,6 +616,12 @@ class AsyncKeyReader:
         self.paste_mode = False
         self.loop = None
         self.cancel_requested = False
+        # Event-driven counterpart of cancel_requested.  Set in _feed_byte,
+        # which runs inside read_key(), which runs as a task on the same
+        # asyncio loop as everything that waits on this event -- so a plain
+        # .set() is sufficient (no call_soon_threadsafe needed: the setter
+        # is loop context, not a foreign thread).
+        self.cancel_event = asyncio.Event()
         # Shift-Tab: requests cycling the agent mode (explore/plan/edit) for the
         # next turn. Same mechanism as cancel_requested (a flag the main loop
         # reads), but it must NOT cancel -- the current turn keeps running.
@@ -695,6 +701,7 @@ class AsyncKeyReader:
             self.escape.append(byte)
         elif byte == 0x03:
             self.cancel_requested = True
+            self.cancel_event.set()
             self.pending.append(KeyEvent("CTRL_C"))
         elif byte == 0x04:
             self.pending.append(KeyEvent("CTRL_D"))

@@ -189,3 +189,44 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForegroundJobCancelTests(unittest.TestCase):
+    """Ctrl-C must interrupt the foreground job a turn is awaiting."""
+
+    def test_cancel_event_kills_sleep_quickly(self):
+        import time as _time
+        from loki_agent.loki import JobManager
+
+        async def run():
+            manager = JobManager("/tmp/loki-cancel-test-jobs2")
+            cancel = asyncio.Event()
+            start = _time.monotonic()
+
+            async def scenario():
+                return await manager.run_foreground(
+                    ["sleep", "30"], "sleep 30", 60000,
+                    description="cancel test", shell=False, cwd="/tmp",
+                    cancel_event=cancel)
+
+            task = asyncio.get_running_loop().create_task(scenario())
+            await asyncio.sleep(0.7)  # let the job start
+            cancel.set()
+            result = await task
+            return result[1], _time.monotonic() - start  # status, elapsed
+
+        status, elapsed = asyncio.run(run())
+        self.assertEqual(status, "cancelled")
+        self.assertLess(elapsed, 5.0)  # SIGINT kills sleep immediately
+
+    def test_no_cancel_event_uses_timeout_path(self):
+        from loki_agent.loki import JobManager
+
+        async def run():
+            manager = JobManager("/tmp/loki-cancel-test-jobs3")
+            return await manager.run_foreground(
+                ["sleep", "5"], "sleep 5", 300,  # 300ms timeout
+                description="timeout test", shell=False, cwd="/tmp")
+
+        job, status, stdout, stderr = asyncio.run(run())
+        self.assertEqual(status, "timed_out")
