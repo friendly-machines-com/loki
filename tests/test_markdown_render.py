@@ -7,6 +7,7 @@ import os
 import pathlib
 import random
 import sys
+import types
 import unittest
 from unittest import mock
 
@@ -308,13 +309,13 @@ class DifferentialTests(unittest.TestCase):
 
 class TerminalWiringTests(unittest.TestCase):
     def setUp(self):
-        self._old_model = loki.model
-        loki.model = "local-model"
+        self._old_config = loki.current_session().runtime_config
+        loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
         loki.terminal.assistant_markdown.reset()
 
     def tearDown(self):
         loki.terminal.assistant_markdown.reset()
-        loki.model = self._old_model
+        loki.current_session().runtime_config = self._old_config
 
     def replay(self, events, terminal_stub):
         output = io.StringIO()
@@ -443,13 +444,13 @@ class TerminalWiringTests(unittest.TestCase):
 
 class ToolLoopWiringTests(unittest.TestCase):
     def setUp(self):
-        self._old_model = loki.model
-        loki.model = "local-model"
+        self._old_config = loki.current_session().runtime_config
+        loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
         loki.terminal.assistant_markdown.reset()
 
     def tearDown(self):
         loki.terminal.assistant_markdown.reset()
-        loki.model = self._old_model
+        loki.current_session().runtime_config = self._old_config
 
     def test_streamed_events_render_styled_and_not_duplicated(self):
         transcript = [formats.message_item("user", "hello")]

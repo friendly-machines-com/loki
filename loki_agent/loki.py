@@ -43,9 +43,77 @@ from . import tool_runtime
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .credentials import CredentialStore
 from .savefiles import ResumeTranscriptRenderer
+from .sessions import Session, default_session
 from . import terminals
 from .terminals import (
     input_session, restore_output_area_after_input, terminal)
+
+
+# Conversation state lives in a sessions.Session.  current_session() returns
+# the process-wide session used by the terminal and headless front-ends; a
+# front-end hosting several conversations passes its own Session instead.
+
+_DEFAULT_SESSION: Session | None = None
+
+
+def current_session() -> Session:
+    global _DEFAULT_SESSION
+    if _DEFAULT_SESSION is None:
+        _DEFAULT_SESSION = default_session()
+    return _DEFAULT_SESSION
+
+
+def current_cwd() -> str:
+    return current_session().shell_cwd
+
+
+def current_previous_cwd() -> str:
+    return current_session().previous_shell_cwd
+
+
+def current_config():
+    return current_session().runtime_config
+
+
+def current_model() -> str:
+    return current_session().model
+
+
+def current_transcript() -> list:
+    return current_session().transcript_items
+
+
+def current_todos() -> list:
+    return current_session().session_todos
+
+
+def current_toolsets() -> list:
+    return current_session().session_toolsets
+
+
+def current_state() -> dict:
+    return current_session().session_state
+
+
+def current_chat_log_path():
+    return current_session().chat_log_path
+
+
+def current_dirty() -> bool:
+    return current_session().chat_log_dirty
+
+
+def current_agent_mode() -> str:
+    return current_session().agent_mode
+
+
+def current_job_manager():
+    session = current_session()
+    if session.job_manager is None:
+        session.job_manager = JobManager(LOKI_JOB_STATE_DIR)
+    return session.job_manager
+
+# --------------------------------------------------------------------------
 
 computer = socket.gethostname()
 
@@ -76,8 +144,6 @@ LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
 STARTUP_CWD = os.getcwd()
 _UMASK = os.umask(0)          # probe: sets umask to 0 momentarily, returns the previous value
 os.umask(_UMASK)             # restore immediately; no concurrent code runs at startup
-shell_cwd = STARTUP_CWD
-previous_shell_cwd = STARTUP_CWD
 LOCAL_LOKI_DIR = os.path.join(STARTUP_CWD, ".loki")
 CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
 JOB_TAIL_CHARS = 20_000
@@ -177,9 +243,7 @@ class RuntimeConfig:
     prompt_cache: bool = False
 
 
-RUNTIME_CONFIG: RuntimeConfig | None = None
 CREDENTIALS: CredentialStore | None = None
-model: str = ""
 
 
 def _int_setting(name, default, credentials: CredentialStore):
@@ -426,33 +490,31 @@ def config_from_modelsdev_selection(
 
 
 def active_connection_descriptor() -> ConnectionDescriptor | None:
-    if not RUNTIME_CONFIG or RUNTIME_CONFIG.provider_kind == protocols.DUMMY:
+    if not current_config() or current_config().provider_kind == protocols.DUMMY:
         return None
-    credential_env = RUNTIME_CONFIG.credential_env
-    provider = RUNTIME_CONFIG.chat_provider
+    credential_env = current_config().credential_env
+    provider = current_config().chat_provider
     return ConnectionDescriptor(
-        provider_id=RUNTIME_CONFIG.provider_id,
-        provider_name=RUNTIME_CONFIG.provider_name,
-        model=model,
+        provider_id=current_config().provider_id,
+        provider_name=current_config().provider_name,
+        model=current_model(),
         chat_url=provider.chat_url,
         models_url=provider.models_url,
-        protocol=RUNTIME_CONFIG.provider_kind,
+        protocol=current_config().provider_kind,
         credential_env=credential_env,
         max_tokens=provider.max_tokens,
-        anthropic_version=RUNTIME_CONFIG.anthropic_version,
-        auth_header=RUNTIME_CONFIG.auth_header,
-        model_status=RUNTIME_CONFIG.model_status,
-        stream=RUNTIME_CONFIG.stream,
-        prompt_cache=RUNTIME_CONFIG.prompt_cache,
+        anthropic_version=current_config().anthropic_version,
+        auth_header=current_config().auth_header,
+        model_status=current_config().model_status,
+        stream=current_config().stream,
+        prompt_cache=current_config().prompt_cache,
     )
 
 
 def apply_runtime_config(config: RuntimeConfig):
-    global RUNTIME_CONFIG
-    global model
-
-    RUNTIME_CONFIG = config
-    model = config.model
+    # model is derived from runtime_config (Session.model property); nothing
+    # else to publish.
+    current_session().runtime_config = config
 
 
 _UNSET = object()
@@ -468,8 +530,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
     Overrides default to the current runtime config, so a bare call reinstates
     the Provider from the existing settings
     """
-    global RUNTIME_CONFIG
-    current = RUNTIME_CONFIG
+    current = current_config()
     if current is None:
         raise RuntimeError("cannot reinstall provider before startup config is applied")
     new_url = url if url is not None else current.url
@@ -561,7 +622,7 @@ def _resolve_path(path: str, base_dir: str = None) -> str:
     if os.path.isabs(path):
         joined = path
     else:
-        joined = os.path.join(base_dir or shell_cwd, path)
+        joined = os.path.join(base_dir or current_cwd(), path)
     # Resolve symlinks so Read/Write/Edit operate on the real target inode
     # (matches open()'s follow behavior, keeps the temp file on the same
     # filesystem as the target for atomic os.replace, and keys file_state
@@ -583,20 +644,19 @@ def display_path(path: str) -> str:
 
 
 def change_shell_cwd(path: str = None) -> str:
-    global shell_cwd
-    global previous_shell_cwd
+    session = current_session()
     target = (path or "").strip()
     if not target:
         target = "~"
     elif target == "-":
-        target = previous_shell_cwd
+        target = session.previous_shell_cwd
     resolved = _resolve_path(os.path.expanduser(target))
     if not os.path.isdir(resolved):
         raise FileNotFoundError(resolved)
-    old_cwd = shell_cwd
-    shell_cwd = resolved
-    previous_shell_cwd = old_cwd
-    return shell_cwd
+    old_cwd = session.shell_cwd
+    session.shell_cwd = resolved
+    session.previous_shell_cwd = old_cwd
+    return session.shell_cwd
 
 
 ToolSchemaError = tool_runtime.ToolSchemaError
@@ -951,7 +1011,7 @@ class JobManager:
                     stderr=stderr_file,
                     start_new_session=True,
                     env=env,
-                    cwd=cwd or shell_cwd,
+                    cwd=cwd or current_cwd(),
                 )
             else:
                 proc = await asyncio.create_subprocess_exec(
@@ -961,7 +1021,7 @@ class JobManager:
                     stderr=stderr_file,
                     start_new_session=True,
                     env=env,
-                    cwd=cwd or shell_cwd,
+                    cwd=cwd or current_cwd(),
                 )
         job.process = proc
         job.pid = proc.pid
@@ -1036,7 +1096,7 @@ class JobManager:
         timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
 
         if run_in_background:
-            job = await self._spawn(command, command, description, True, None, True, cwd=shell_cwd)
+            job = await self._spawn(command, command, description, True, None, True, cwd=current_cwd())
             try:
                 asyncio.get_running_loop().create_task(self._monitor_background_job(job))
             except RuntimeError:
@@ -1053,7 +1113,7 @@ class JobManager:
             ])
 
         job, status, stdout, stderr = await self.run_foreground(
-            command, command, timeout_ms, description=description, shell=True, cwd=shell_cwd)
+            command, command, timeout_ms, description=description, shell=True, cwd=current_cwd())
         if status == "timed_out":
             if stderr:
                 stderr += "\n"
@@ -1069,14 +1129,14 @@ class JobManager:
             raise ValueError("argv must not be empty")
         return await self.run_foreground(argv, " ".join(argv), timeout_ms,
                                          description=description, shell=False,
-                                         output_chars=output_chars, env=env, cwd=cwd or shell_cwd)
+                                         output_chars=output_chars, env=env, cwd=cwd or current_cwd())
 
     async def run_background_exec(self, argv: list[str], description: str = "",
                                   env: dict | None = None, cwd: str = None) -> Job:
         if not argv:
             raise ValueError("argv must not be empty")
         job = await self._spawn(argv, " ".join(argv), description, True, None, False,
-                                env=env, cwd=cwd or shell_cwd)
+                                env=env, cwd=cwd or current_cwd())
         asyncio.get_running_loop().create_task(self._monitor_background_job(job))
         return job
 
@@ -1142,7 +1202,6 @@ class JobManager:
         return f"Sent {sig.name} to job {job.id} (pgid={job.pgid})."
 
 
-job_manager = JobManager(LOKI_JOB_STATE_DIR)
 
 
 def run_bash(command: str, timeout: int = None, description: str = "",
@@ -1153,12 +1212,12 @@ def run_bash(command: str, timeout: int = None, description: str = "",
 
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
                          run_in_background: bool = False) -> str:
-    return await job_manager.run_shell(command, timeout=timeout, description=description,
+    return await current_job_manager().run_shell(command, timeout=timeout, description=description,
                                        run_in_background=run_in_background)
 
 
 def run_jobs() -> str:
-    return job_manager.list_jobs()
+    return current_job_manager().list_jobs()
 
 
 def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
@@ -1170,13 +1229,13 @@ def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
         return f"Error: invalid tail_chars: {e}"
     if tail_chars < 0:
         return "Error: tail_chars must be non-negative"
-    return job_manager.job_status(job_id, tail_chars=tail_chars)
+    return current_job_manager().job_status(job_id, tail_chars=tail_chars)
 
 
 def run_job_stop(job_id: str, force: bool = False) -> str:
     if not job_id:
         return "Error: job_id is required"
-    return job_manager.stop_job(job_id, force=bool(force))
+    return current_job_manager().stop_job(job_id, force=bool(force))
 
 
 def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
@@ -1313,12 +1372,12 @@ async def run_glob_async(pattern: str, path: str = None) -> str:
     rg = _find_rg_binary()
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
-    root = _resolve_path(path) if path else shell_cwd
+    root = _resolve_path(path) if path else current_cwd()
     if not os.path.isdir(root):
         return f"Error: {root} is not a directory"
     args = [rg, '--files', '--color=never', '--glob', pattern, root]
     start = time.perf_counter()
-    job, status, stdout, stderr = await job_manager.run_exec(
+    job, status, stdout, stderr = await current_job_manager().run_exec(
         args, SEARCH_TIMEOUT_S * 1000, description=f"Glob {pattern!r}")
     if status == "timed_out":
         return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
@@ -1387,7 +1446,7 @@ async def run_grep_async(pattern: str, path: str = None, glob: str = None,
     rg = _find_rg_binary()
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
-    root = _resolve_path(path) if path else shell_cwd
+    root = _resolve_path(path) if path else current_cwd()
     if not os.path.exists(root):
         return f"Error: {root} does not exist"
 
@@ -1442,7 +1501,7 @@ async def run_grep_async(pattern: str, path: str = None, glob: str = None,
     args.extend(['--', pattern, root])
 
     start = time.perf_counter()
-    job, status, stdout, stderr = await job_manager.run_exec(
+    job, status, stdout, stderr = await current_job_manager().run_exec(
         args, SEARCH_TIMEOUT_S * 1000, description=f"Grep {pattern!r}")
     if status == "timed_out":
         return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
@@ -1469,16 +1528,15 @@ async def run_grep_async(pattern: str, path: str = None, glob: str = None,
 
 
 def run_todoread() -> str:
-    if not session_todos:
+    if not current_todos():
         return "No todos for this session."
     out = ["Todos:"]
-    for i, t in enumerate(session_todos, start=1):
+    for i, t in enumerate(current_todos(), start=1):
         out.append(f"  {i}. [{t['status']}] ({t['priority']}) {t['content']}")
     return "\n".join(out)
 
 
 def run_todowrite(todos: list) -> str:
-    global session_todos
     if not isinstance(todos, list):
         return "Error: todos must be an array"
     if len(todos) > TODO_MAX_TODOS:
@@ -1498,7 +1556,7 @@ def run_todowrite(todos: list) -> str:
         if priority not in ['high', 'medium', 'low']:
             return f"Error: invalid priority {priority!r}"
         cleaned.append({'content': content, 'status': status, 'priority': priority})
-    session_todos = cleaned
+    current_session().session_todos = cleaned
     mark_chat_log_dirty()
     summary = {'total': len(cleaned), 'pending': sum(1 for t in cleaned if t['status'] == 'pending'),
                'in_progress': in_progress,
@@ -1677,12 +1735,12 @@ def _raw_tool_arguments(call):
 
 
 def _runtime_provider_label():
-    if RUNTIME_CONFIG is None:
+    if current_config() is None:
         return None
     return (
-        RUNTIME_CONFIG.provider_id
-        or RUNTIME_CONFIG.provider_name
-        or RUNTIME_CONFIG.netloc
+        current_config().provider_id
+        or current_config().provider_name
+        or current_config().netloc
     )
 
 
@@ -1811,8 +1869,8 @@ async def execute_tool_call_async(
         effective_arguments=copy.deepcopy(original_args),
         schema=spec["schema"],
         semantics=spec.get("semantics", {}),
-        cwd=shell_cwd,
-        model=model or None,
+        cwd=current_cwd(),
+        model=current_model() or None,
         provider=_runtime_provider_label(),
         parse_error=parse_error,
     )
@@ -1914,7 +1972,7 @@ def get_tool_loop_extra_context(transcript_items: list):
     inhibit_edits = False
     # "explore" mode: read-only. Force the explore-only tool gate so the agent
     # can't write/edit while investigating.
-    if AGENT_MODE == "explore":
+    if current_agent_mode() == "explore":
         inhibit_edits = "explore mode"
     if len(transcript_items) > 0 and transcript_items[-1].get("type") == "message" and transcript_items[-1].get("role") == "user":
         content = transcript_items[-1].get('content')
@@ -2177,13 +2235,13 @@ def _terminal_agent_event(event: dict):
             sys.stderr.flush()
     elif kind == "assistant_message":
         rendered_content = terminals.render_markdown(event["content"])
-        print(f"\n{model}: {rendered_content}")
+        print(f"\n{current_model()}: {rendered_content}")
     elif kind == "assistant_start":
         was_active = terminal.assistant_markdown.active
         stale = terminal.assistant_markdown.start()
         if was_active:
             _print_terminal_fragments(stale)
-        print(f"\n{model}: ", end='', flush=True)
+        print(f"\n{current_model()}: ", end='', flush=True)
     elif kind == "assistant_delta":
         _print_terminal_fragments(
             terminal.assistant_markdown.feed(event["content"]))
@@ -2342,17 +2400,17 @@ def _subagent_env() -> dict:
     env = os.environ.copy()
     # Parent startup consumes provider-specific key variables. Subagents receive
     # only the normalized runtime provider/url/model/key they should use.
-    if RUNTIME_CONFIG:
-        env['LOKI_PROVIDER'] = RUNTIME_CONFIG.chat_provider.kind
-        env['LOKI_API_BASE'] = RUNTIME_CONFIG.chat_provider.input_url
-        env['LOKI_MODEL'] = model
-        if RUNTIME_CONFIG.api_key:
-            env['LOKI_API_KEY'] = RUNTIME_CONFIG.api_key
+    if current_config():
+        env['LOKI_PROVIDER'] = current_config().chat_provider.kind
+        env['LOKI_API_BASE'] = current_config().chat_provider.input_url
+        env['LOKI_MODEL'] = current_model()
+        if current_config().api_key:
+            env['LOKI_API_KEY'] = current_config().api_key
         else:
             env.pop('LOKI_API_KEY', None)
-        env['LOKI_STREAM'] = '1' if RUNTIME_CONFIG.stream else '0'
+        env['LOKI_STREAM'] = '1' if current_config().stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
-            '1' if RUNTIME_CONFIG.prompt_cache else '0')
+            '1' if current_config().prompt_cache else '0')
     return env
 
 
@@ -2403,13 +2461,13 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         return f"Error: unknown subagent_type {agent_type!r} (only 'Explore' is supported)"
     argv = _subagent_argv(agent_type, prompt)
     if run_in_background:
-        job = await job_manager.run_background_exec(
+        job = await current_job_manager().run_background_exec(
             argv,
             description=description or "subagent task",
             env=_subagent_env())
         return _format_started_background_job(job, "subagent")
 
-    job, status, stdout, stderr = await job_manager.run_exec(
+    job, status, stdout, stderr = await current_job_manager().run_exec(
         argv, SUBAGENT_TIMEOUT_S * 1000,
         description=description or "subagent task",
         env=_subagent_env())
@@ -3229,7 +3287,7 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
 
     headers_to_use = request_headers
     if headers_to_use is None:
-        headers_to_use = RUNTIME_CONFIG.headers if RUNTIME_CONFIG else {}
+        headers_to_use = current_config().headers if current_config() else {}
     # Copy so the per-call idempotency key below does not mutate the cached
     # provider headers shared across requests.
     headers_to_use = dict(headers_to_use)
@@ -3238,7 +3296,7 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     if method == 'POST':
         # Best-effort server-side dedup; Anthropic honors this header on
         # /v1/messages. OpenAI-compat servers may ignore it.
-        kind = RUNTIME_CONFIG.provider_kind if RUNTIME_CONFIG else None
+        kind = current_config().provider_kind if current_config() else None
         header = (LLM_IDEMPOTENCY_HEADER_ANTHROPIC
                   if kind == protocols.ANTHROPIC_MESSAGES
                   else LLM_IDEMPOTENCY_HEADER_OPENAI)
@@ -3361,7 +3419,7 @@ async def _async_chat_stream_request_once(
                     "streaming response was neither valid SSE nor JSON: "
                     f"{e}") from e
 
-        accumulator = RUNTIME_CONFIG.chat_provider.stream_accumulator(
+        accumulator = current_config().chat_provider.stream_accumulator(
             on_text_delta)
         decoder = sse.SseDecoder()
         received_body = bool(first_chunk)
@@ -3403,9 +3461,9 @@ async def async_chat_stream_request(
     cancel = cancel_check or (lambda: False)
     headers_to_use = dict(
         request_headers if request_headers is not None
-        else (RUNTIME_CONFIG.headers if RUNTIME_CONFIG else {}))
+        else (current_config().headers if current_config() else {}))
     headers_to_use.setdefault("Accept", "text/event-stream")
-    kind = RUNTIME_CONFIG.provider_kind if RUNTIME_CONFIG else None
+    kind = current_config().provider_kind if current_config() else None
     idempotency_header = (
         LLM_IDEMPOTENCY_HEADER_ANTHROPIC
         if kind == protocols.ANTHROPIC_MESSAGES
@@ -3443,10 +3501,10 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                                 show_timing: bool = False,
                                 on_text_delta=None,
                                 cancel_check=None) -> formats.DecodedTurn:
-    if not RUNTIME_CONFIG:
+    if not current_config():
         return formats.DecodedTurn([])
 
-    if RUNTIME_CONFIG.chat_provider.kind == protocols.DUMMY:
+    if current_config().chat_provider.kind == protocols.DUMMY:
         # No-op LLM for testing: never touches the network.  The reply is a
         # canned assistant message, so the whole input/turn/render loop runs
         # deterministically. LOKI_DUMMY_STREAM_CHUNKS optionally supplies a
@@ -3455,7 +3513,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         # creates after observing the corresponding terminal output.
         reply = os.environ.get("LOKI_DUMMY_REPLY", "ok")
         raw_chunks = os.environ.get("LOKI_DUMMY_STREAM_CHUNKS")
-        if RUNTIME_CONFIG.stream and on_text_delta and raw_chunks is not None:
+        if current_config().stream and on_text_delta and raw_chunks is not None:
             try:
                 chunks = json.loads(raw_chunks)
             except json.JSONDecodeError as error:
@@ -3485,30 +3543,30 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             {
                 "protocol": "dummy",
                 "provider_id": "dummy",
-                "model": model,
+                "model": current_model(),
                 "response": {},
             },
         )
 
-    if RUNTIME_CONFIG.stream:
-        payload = RUNTIME_CONFIG.chat_provider.streaming_chat_payload(
-            transcript_items, tools, model)
+    if current_config().stream:
+        payload = current_config().chat_provider.streaming_chat_payload(
+            transcript_items, tools, current_model())
         data = await async_chat_stream_request(
-            RUNTIME_CONFIG.chat_provider.chat_url,
+            current_config().chat_provider.chat_url,
             payload,
-            request_headers=RUNTIME_CONFIG.chat_provider.headers,
+            request_headers=current_config().chat_provider.headers,
             on_text_delta=on_text_delta,
             cancel_check=cancel_check,
             report_errors=report_errors,
             show_timing=False,
         )
     else:
-        payload = RUNTIME_CONFIG.chat_provider.chat_payload(
-            transcript_items, tools, model)
+        payload = current_config().chat_provider.chat_payload(
+            transcript_items, tools, current_model())
         data = await async_chat_request(
-            RUNTIME_CONFIG.chat_provider.chat_url,
+            current_config().chat_provider.chat_url,
             payload,
-            request_headers=RUNTIME_CONFIG.chat_provider.headers,
+            request_headers=current_config().chat_provider.headers,
             report_errors=report_errors,
             show_timing=show_timing,
         )
@@ -3516,38 +3574,37 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         raise protocols.ProtocolError(
             "chat response must be a JSON object", payload=data)
     detected = protocols.detect_protocol_from_response(data)
-    if detected and detected != RUNTIME_CONFIG.chat_provider.kind:
+    if detected and detected != current_config().chat_provider.kind:
         # A configured adapter should not parse a response that clearly has
         # another protocol's shape; that usually means endpoint/config mismatch.
         raise protocols.ProtocolError(
-            f"configured provider {RUNTIME_CONFIG.chat_provider.kind!r} "
+            f"configured provider {current_config().chat_provider.kind!r} "
             f"but response looks like {detected!r}",
             payload=data,
         )
     try:
         turn = formats.coerce_decoded_turn(
-            RUNTIME_CONFIG.chat_provider.parse_chat_response(data))
+            current_config().chat_provider.parse_chat_response(data))
     except formats.TranscriptFormatError as e:
         raise protocols.ProtocolError(
-            f"invalid {RUNTIME_CONFIG.chat_provider.kind} response: {e}",
+            f"invalid {current_config().chat_provider.kind} response: {e}",
             payload=data,
         ) from e
-    turn.metadata["provider_id"] = RUNTIME_CONFIG.provider_id
-    turn.metadata["provider_name"] = RUNTIME_CONFIG.provider_name
+    turn.metadata["provider_id"] = current_config().provider_id
+    turn.metadata["provider_name"] = current_config().provider_name
     turn.metadata["endpoint"] = (
-        RUNTIME_CONFIG.chat_provider.chat_url)
-    turn.metadata["model"] = model
-    turn.metadata["protocol"] = RUNTIME_CONFIG.chat_provider.kind
+        current_config().chat_provider.chat_url)
+    turn.metadata["model"] = current_model()
+    turn.metadata["protocol"] = current_config().chat_provider.kind
     return turn
 
 
-models = []
 
 
 def _status_api_base() -> str:
     configured_url = ""
-    if RUNTIME_CONFIG:
-        configured_url = RUNTIME_CONFIG.chat_provider.input_url if RUNTIME_CONFIG.chat_provider else RUNTIME_CONFIG.url
+    if current_config():
+        configured_url = current_config().chat_provider.input_url if current_config().chat_provider else current_config().url
 
     if not configured_url:
         return "not configured"
@@ -3574,36 +3631,34 @@ def _status_api_base() -> str:
 
 
 def status_text() -> str:
-    displayed_model = model
-    if (RUNTIME_CONFIG is not None
-            and RUNTIME_CONFIG.model_status == "deprecated"):
+    displayed_model = current_model()
+    if (current_config() is not None
+            and current_config().model_status == "deprecated"):
         displayed_model += " (deprecated)"
     return (
         'Remote: API: {}; Model: {}; /model\n'
         'Local: mode={}; CWD: {}; /pwd, /cd DIR, /ps, !foo, /quit'
     ).format(
         _status_api_base(), displayed_model,
-        AGENT_MODE, display_path(shell_cwd))
+        current_agent_mode(), display_path(current_cwd()))
 
 
 async def load_models_async():
-    global models
-    if not RUNTIME_CONFIG:
-        models = [model] if model else []
-        return
+    """Fetch the active provider's /models listing; [] when unavailable."""
+    if not current_config():
+        return [current_model()] if current_model() else []
 
-    model_urls = getattr(RUNTIME_CONFIG.chat_provider, "model_urls", None) or ([RUNTIME_CONFIG.chat_provider.models_url]
-                                                                if RUNTIME_CONFIG.chat_provider.models_url else [])
+    model_urls = getattr(current_config().chat_provider, "model_urls", None) or ([current_config().chat_provider.models_url]
+                                                                if current_config().chat_provider.models_url else [])
     if not model_urls:
-        models = [model] if model else []
-        return
+        return [current_model()] if current_model() else []
     errors = []
     for models_url in model_urls:
         try:
             data = await async_chat_request(
                 models_url,
                 None,
-                request_headers=RUNTIME_CONFIG.chat_provider.headers,
+                request_headers=current_config().chat_provider.headers,
                 report_errors=True,
             )
         except ApiError as e:
@@ -3618,37 +3673,28 @@ async def load_models_async():
             # Treat as "couldn't load" rather than crashing the picker.
             errors.append(f"Model list at <{models_url}> was not JSON: {e.msg}")
             continue
-        loaded = RUNTIME_CONFIG.chat_provider.parse_model_ids(data)
+        loaded = current_config().chat_provider.parse_model_ids(data)
         if loaded:
-            models = loaded
-            return
+            return loaded
 
     if errors:
         print("Model list failed:\n" + "\n".join(errors), file=sys.stderr)
-    models = [model] if model else []
+    return [current_model()] if current_model() else []
 
 #models = ['hy3-preview', 'glm-5.2', 'glm-5.1', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro', 'deepseek-v4-flash', 'mimo-v2.5', 'mimo-v2.5-pro']
 
 terminals.set_status_text_provider(status_text)
 
-transcript_items = []
-session_todos = []
-chat_log_path: str | None = None
-session_state = {}
-chat_log_dirty = False
-session_toolsets = []
-
 # Agent mode, cycled by Shift-Tab: "explore" (read-only), "plan", "edit".
 # Takes effect for the next turn; it does not cancel the current turn.
 MODE_CYCLE_ORDER = ["normal", "explore", "plan", "edit"]
-AGENT_MODE = "normal"
 
 
 def cycle_agent_mode() -> str:
-    global AGENT_MODE
-    i = MODE_CYCLE_ORDER.index(AGENT_MODE)
-    AGENT_MODE = MODE_CYCLE_ORDER[(i + 1) % len(MODE_CYCLE_ORDER)]
-    return AGENT_MODE
+    session = current_session()
+    i = MODE_CYCLE_ORDER.index(session.agent_mode)
+    session.agent_mode = MODE_CYCLE_ORDER[(i + 1) % len(MODE_CYCLE_ORDER)]
+    return session.agent_mode
 
 
 def initial_transcript_items():
@@ -3656,7 +3702,7 @@ def initial_transcript_items():
         "You are a helpful system agent running in a terminal. You have these tools: "
         "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
         f"Current date: {time.strftime('%Y-%m-%d')}. "
-        f"Current Loki cwd: {shell_cwd}. Relative tool paths and Bash commands run from this directory. "
+        f"Current Loki cwd: {current_cwd()}. Relative tool paths and Bash commands run from this directory. "
         "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
         "Always Read a file before editing or overwriting it. "
         "Use TodoWrite to plan multi-step work. Keep responses concise."
@@ -3665,10 +3711,10 @@ def initial_transcript_items():
 
 def _remember_session_toolset(tools):
     snapshot = copy.deepcopy(tools or [])
-    for existing in session_toolsets:
+    for existing in current_toolsets():
         if existing == snapshot:
             return
-    session_toolsets.append(snapshot)
+    current_toolsets().append(snapshot)
 
 
 def user_prompt_history(items):
@@ -3676,8 +3722,8 @@ def user_prompt_history(items):
 
 
 def record_shell_cwd_instruction():
-    transcript_items.append(formats.instruction_item(
-        f"Current Loki cwd changed to: {shell_cwd}. "
+    current_transcript().append(formats.instruction_item(
+        f"Current Loki cwd changed to: {current_cwd()}. "
         "Relative tool paths and Bash commands now run from this directory."
     ))
     mark_chat_log_dirty()
@@ -3685,7 +3731,7 @@ def record_shell_cwd_instruction():
 
 def print_shell_cwd():
     sys.stdout.flush()
-    print(f"cwd: {shell_cwd}", file=sys.stderr)
+    print(f"cwd: {current_cwd()}", file=sys.stderr)
     sys.stderr.flush()
 
 
@@ -3748,91 +3794,73 @@ async def run_session_picker_async(session):
 
 
 def new_chat_log(filename):
-    global chat_log_path
-    global session_state
-    global chat_log_dirty
-    global transcript_items
-    global session_todos
-    global session_toolsets
-    transcript_items = initial_transcript_items()
-    session_todos = []
-    session_toolsets = []
+    session = current_session()
+    session.transcript_items = initial_transcript_items()
+    session.session_todos = []
+    session.session_toolsets = []
     dirname = os.path.dirname(filename)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
-    chat_log_path = filename
-    session_state = {"shell_cwd": shell_cwd}
+    session.chat_log_path = filename
+    session.session_state = {"shell_cwd": session.shell_cwd}
     descriptor = active_connection_descriptor()
     if descriptor is not None:
         # Hybrid persistence rule: an explicit connection belongs to a new
         # chat, but does not implicitly replace a resumed chat's connection.
-        session_state["connection"] = descriptor.to_dict()
-    chat_log_dirty = True
+        session.session_state["connection"] = descriptor.to_dict()
+    session.chat_log_dirty = True
 
 def save_chat_log():
-    global session_state
-    global chat_log_dirty
+    session = current_session()
 
-    if chat_log_path is None or not chat_log_dirty:
+    if session.chat_log_path is None or not session.chat_log_dirty:
         return False
 
-    state = dict(session_state)
+    state = dict(session.session_state)
     saved_connection = state.get("connection")
     if isinstance(saved_connection, dict) and "api_url" in saved_connection:
         saved_connection = dict(saved_connection)
         saved_connection.pop("api_url")
         state["connection"] = saved_connection
-    state["shell_cwd"] = shell_cwd
+    state["shell_cwd"] = session.shell_cwd
     content = savefiles.serialize_chat_log(
-        transcript_items,
-        session_todos,
+        session.transcript_items,
+        session.session_todos,
         state,
-        toolsets=session_toolsets,
+        toolsets=session.session_toolsets,
     )
-    _atomic_write_text(chat_log_path, content)
-    savefiles.report_chat_log_saved(chat_log_path)
-    session_state = state
-    chat_log_dirty = False
+    _atomic_write_text(session.chat_log_path, content)
+    savefiles.report_chat_log_saved(session.chat_log_path)
+    session.session_state = state
+    session.chat_log_dirty = False
     return True
 
 
 def mark_chat_log_dirty():
-    global chat_log_dirty
-    if chat_log_path is not None:
-        chat_log_dirty = True
+    session = current_session()
+    if session.chat_log_path is not None:
+        session.chat_log_dirty = True
 
 
 def render_resume_transcript(items: list) -> str:
     return savefiles.render_resume_transcript(
-        items, model or "Assistant")
+        items, current_model() or "Assistant")
 
 
 def print_resume_transcript(items: list):
     savefiles.print_resume_transcript(
-        items, model or "Assistant")
+        items, current_model() or "Assistant")
 
 
 def load_chat_log(filename, loaded=None):
-    global chat_log_path
-    global session_state
-    global chat_log_dirty
-    global transcript_items
-    global session_todos
-    global session_toolsets
     if loaded is None:
         with open(filename, 'r', encoding="utf-8") as f:
             loaded = savefiles.read_chat_log(f)
     transcript, todos, state, toolsets = loaded
-    transcript_items = transcript
-    session_todos = todos
-    session_toolsets = toolsets
-    session_state = dict(state)
-    # Atomic replacement must publish over the target inode rather than over a
-    # symlink naming it, matching the old open(..., "w") follow behavior.
-    chat_log_path = os.path.realpath(filename)
-    chat_log_dirty = False
+    current_session().replace_transcript(
+        transcript, todos, toolsets, state, filename)
     load_session_state(state)
-    print_resume_transcript(transcript_items)
+    print_resume_transcript(current_transcript())
 
 
 def load_session_state(state: dict):
@@ -3854,7 +3882,7 @@ def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:
 
 
 def set_session_connection(descriptor: ConnectionDescriptor):
-    session_state["connection"] = descriptor.to_dict()
+    current_state()["connection"] = descriptor.to_dict()
     mark_chat_log_dirty()
 
 
@@ -3918,8 +3946,6 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
 
 
 async def async_main(args) -> int:
-    global model
-
     # getopt's "resume=" requires a value; normalize a bare `--resume` to
     # `--resume=` so it opens the picker instead of erroring out.
     args = ['--resume=' if a == '--resume' else a for a in args]
@@ -3945,7 +3971,7 @@ async def async_main(args) -> int:
         except (protocols.ProtocolError, ValueError) as e:
             print(f"Configuration error: {e}", file=sys.stderr)
             return 2
-        if not model:
+        if not current_model():
             print("Configuration error: model missing; set LOKI_MODEL.",
                   file=sys.stderr)
             return 2
@@ -3962,7 +3988,7 @@ async def async_main(args) -> int:
     # loki.py consumes the normal queue; session.modal() is the one exclusive
     # path used by the session picker, saved-connection prompt, and /model.
     async with input_session(on_mode_cycle=lambda: cycle_agent_mode(),
-                             history_provider=lambda: user_prompt_history(transcript_items)) as session:
+                             history_provider=lambda: user_prompt_history(current_transcript())) as session:
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel
@@ -4017,7 +4043,7 @@ async def async_main(args) -> int:
 
         if config is not None:
             apply_runtime_config(config)
-            if not model:
+            if not current_model():
                 print("No model selected; use /model or set LOKI_MODEL.",
                       file=sys.stderr)
                 sys.stderr.flush()
@@ -4065,10 +4091,10 @@ async def async_main(args) -> int:
                             print(f"models.dev unavailable: {e}",
                                   file=sys.stderr)
                             sys.stderr.flush()
-                            await load_models_async()
+                            models_list = await load_models_async()
                             selected_model = (
                                 await modelsdev.run_flat_model_picker_async(
-                                    modal.prompt, models,
+                                    modal.prompt, models_list,
                                     explicit_connection=explicit_option))
                             if selected_model:
                                 if isinstance(
@@ -4083,8 +4109,8 @@ async def async_main(args) -> int:
                                     reinstall_provider(
                                         model=selected_model,
                                         models_url=(
-                                            RUNTIME_CONFIG.chat_provider.models_url
-                                            if RUNTIME_CONFIG else None),
+                                            current_config().chat_provider.models_url
+                                            if current_config() else None),
                                     )
                                     selected_label = selected_model
                                     selected_via = ""
@@ -4134,7 +4160,7 @@ async def async_main(args) -> int:
                     if descriptor is not None:
                         set_session_connection(descriptor)
                     save_chat_log()
-                    print(f"Selected model: {model}{via}", file=sys.stderr)
+                    print(f"Selected model: {current_model()}{via}", file=sys.stderr)
                     sys.stderr.flush()
                     continue
                 case '/pwd':
@@ -4157,35 +4183,35 @@ async def async_main(args) -> int:
                     else:
                         pass
 
-            if RUNTIME_CONFIG is None:
+            if current_config() is None:
                 sys.stdout.flush()
                 print("No provider configured; use /model to select one.",
                       file=sys.stderr)
                 sys.stderr.flush()
                 continue
-            if not model:
+            if not current_model():
                 sys.stdout.flush()
                 print("No model selected; use /model or set LOKI_MODEL.",
                       file=sys.stderr)
                 sys.stderr.flush()
                 continue
 
-            transcript_items.append(formats.message_item("user", user_in))
+            current_transcript().append(formats.message_item("user", user_in))
             mark_chat_log_dirty()
 
             try:
                 # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
                 # earlier prompt or turn must not poison the next model call.
                 session.reader.cancel_requested = False
-                await run_terminal_turn_async(transcript_items, cancel_check=lambda: session.reader.cancel_requested)
+                await run_terminal_turn_async(current_transcript(), cancel_check=lambda: session.reader.cancel_requested)
             except KeyboardInterrupt:
                 terminal.reset_colors_and_flags()
                 print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
                 # Keep the provider response.  Complete every outstanding call
                 # with an explicit local error so the next protocol projection
                 # has no dangling call/result pair.
-                for call in formats.pending_tool_calls(transcript_items):
-                    transcript_items.append(formats.tool_result_for_call(
+                for call in formats.pending_tool_calls(current_transcript()):
+                    current_transcript().append(formats.tool_result_for_call(
                         call,
                         "Tool call not executed because the user interrupted "
                         "the turn.",
@@ -4257,7 +4283,7 @@ def main() -> int:
         if cleanup_done:
             return
         cleanup_done = True
-        if chat_log_path is not None:
+        if current_chat_log_path() is not None:
             clean_up_step(save_chat_log)
         clean_up_step(
             lambda: restore_terminal_overlay(terminal, clean_up_step))

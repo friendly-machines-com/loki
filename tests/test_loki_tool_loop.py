@@ -8,6 +8,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -25,6 +26,35 @@ from loki_agent import protocols
 from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialStore
 from loki_agent import savefiles
+
+
+
+_MISSING = object()
+
+
+def save_loki_state(names):
+    """Snapshot session fields (plus CREDENTIALS) by name."""
+    session = loki.current_session()
+    out = {}
+    for name in names:
+        if name == "CREDENTIALS":
+            out[name] = getattr(loki, name, _MISSING)
+        else:
+            out[name] = getattr(session, name, _MISSING)
+    return out
+
+
+def restore_loki_state(saved):
+    session = loki.current_session()
+    for name, value in saved.items():
+        target = loki if name == "CREDENTIALS" else session
+        if value is _MISSING:
+            try:
+                delattr(target, name)
+            except AttributeError:
+                pass
+        else:
+            setattr(target, name, value)
 
 
 class ScriptedInputSession:
@@ -79,35 +109,31 @@ class ProviderReinstallTests(unittest.TestCase):
             "LOKI_MODEL": "model-a",
             "LOKI_MAX_TOKENS": "512",
         }
-        names = ["RUNTIME_CONFIG", "model"]
+        names = ["runtime_config"]
         sentinel = object()
-        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+        old_values = save_loki_state(names)
 
         try:
             loki.apply_runtime_config(loki.build_config_from_env(env))
-            old_provider = loki.RUNTIME_CONFIG.chat_provider
+            old_provider = loki.current_config().chat_provider
 
             loki.reinstall_provider(model="model-b")
 
-            self.assertEqual(loki.model, "model-b")
-            self.assertEqual(loki.RUNTIME_CONFIG.model, "model-b")
+            self.assertEqual(loki.current_model(), "model-b")
+            self.assertEqual(loki.current_config().model, "model-b")
             # A fresh Provider object was built and swapped in.
-            self.assertIsNot(loki.RUNTIME_CONFIG.chat_provider, old_provider)
+            self.assertIsNot(loki.current_config().chat_provider, old_provider)
             # Everything else carries over from the previous config.
-            self.assertEqual(loki.RUNTIME_CONFIG.chat_provider.kind, protocols.OPENAI_RESPONSES)
-            self.assertEqual(loki.RUNTIME_CONFIG.chat_provider.chat_url, "https://example.test/v1/responses")
-            self.assertEqual(loki.RUNTIME_CONFIG.chat_provider.max_tokens, 512)
-            self.assertEqual(loki.RUNTIME_CONFIG.api_key, "test-key")
-            self.assertEqual(loki.RUNTIME_CONFIG.headers["Authorization"], "Bearer test-key")
+            self.assertEqual(loki.current_config().chat_provider.kind, protocols.OPENAI_RESPONSES)
+            self.assertEqual(loki.current_config().chat_provider.chat_url, "https://example.test/v1/responses")
+            self.assertEqual(loki.current_config().chat_provider.max_tokens, 512)
+            self.assertEqual(loki.current_config().api_key, "test-key")
+            self.assertEqual(loki.current_config().headers["Authorization"], "Bearer test-key")
             # The copied headers field was rebuilt too, not left stale.
-            self.assertEqual(loki.RUNTIME_CONFIG.headers,
-                             loki.RUNTIME_CONFIG.chat_provider.headers)
+            self.assertEqual(loki.current_config().headers,
+                             loki.current_config().chat_provider.headers)
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_reinstall_provider_switches_protocol_per_model(self):
         env = {
@@ -116,9 +142,9 @@ class ProviderReinstallTests(unittest.TestCase):
             "LOKI_API_KEY": "test-key",
             "LOKI_MODEL": "model-a",
         }
-        names = ["RUNTIME_CONFIG", "model"]
+        names = ["runtime_config"]
         sentinel = object()
-        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+        old_values = save_loki_state(names)
 
         try:
             loki.apply_runtime_config(loki.build_config_from_env(env))
@@ -132,40 +158,32 @@ class ProviderReinstallTests(unittest.TestCase):
                 api_key="anthropic-key",
             )
 
-            self.assertEqual(loki.model, "claude-model")
-            provider = loki.RUNTIME_CONFIG.chat_provider
+            self.assertEqual(loki.current_model(), "claude-model")
+            provider = loki.current_config().chat_provider
             self.assertEqual(provider.kind, protocols.ANTHROPIC_MESSAGES)
             self.assertEqual(provider.chat_url, "https://anthropic.example.test/v1/messages")
             self.assertEqual(provider.headers["x-api-key"], "anthropic-key")
-            self.assertEqual(loki.RUNTIME_CONFIG.headers["x-api-key"], "anthropic-key")
-            self.assertEqual(loki.RUNTIME_CONFIG.provider_kind, protocols.ANTHROPIC_MESSAGES)
-            self.assertEqual(loki.RUNTIME_CONFIG.api_key, "anthropic-key")
+            self.assertEqual(loki.current_config().headers["x-api-key"], "anthropic-key")
+            self.assertEqual(loki.current_config().provider_kind, protocols.ANTHROPIC_MESSAGES)
+            self.assertEqual(loki.current_config().api_key, "anthropic-key")
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_reinstall_provider_requires_startup_config(self):
-        names = ["RUNTIME_CONFIG"]
+        names = ["runtime_config"]
         sentinel = object()
-        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+        old_values = save_loki_state(names)
 
         try:
-            loki.RUNTIME_CONFIG = None
+            loki.current_session().runtime_config = None
             with self.assertRaises(RuntimeError):
                 loki.reinstall_provider(model="model-a")
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_reinstall_preserves_status_only_for_the_same_catalog_entry(self):
-        names = ["RUNTIME_CONFIG", "model"]
-        old_values = {name: loki.__dict__[name] for name in names}
+        names = ["runtime_config"]
+        old_values = save_loki_state(names)
 
         try:
             loki.apply_runtime_config(loki.make_runtime_config(
@@ -180,13 +198,12 @@ class ProviderReinstallTests(unittest.TestCase):
 
             loki.reinstall_provider(model="old-model")
             self.assertEqual(
-                loki.RUNTIME_CONFIG.model_status, "deprecated")
+                loki.current_config().model_status, "deprecated")
 
             loki.reinstall_provider(model="new-model")
-            self.assertIsNone(loki.RUNTIME_CONFIG.model_status)
+            self.assertIsNone(loki.current_config().model_status)
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -340,21 +357,17 @@ class RuntimeConfigTests(unittest.TestCase):
             "LOKI_MODEL": "gpt-test",
         }
         config = loki.build_config_from_env(env)
-        names = ["RUNTIME_CONFIG", "model"]
+        names = ["runtime_config"]
         sentinel = object()
-        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+        old_values = save_loki_state(names)
 
         try:
             loki.apply_runtime_config(config)
 
-            self.assertIs(loki.RUNTIME_CONFIG, config)
-            self.assertEqual(loki.model, "gpt-test")
+            self.assertIs(loki.current_config(), config)
+            self.assertEqual(loki.current_model(), "gpt-test")
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_saved_connection_requires_its_exact_credential(self):
         descriptor = ConnectionDescriptor(
@@ -467,15 +480,14 @@ class RuntimeConfigTests(unittest.TestCase):
 class ModelLoadingTests(unittest.TestCase):
     def setUp(self):
         names = [
-            "RUNTIME_CONFIG", "CREDENTIALS", "model", "models",
-            "chat_log_path", "session_state", "chat_log_dirty",
+            "runtime_config", "CREDENTIALS", "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos",
         ]
-        self.old_values = {name: loki.__dict__[name] for name in names}
+        self.old_values = save_loki_state(names)
 
     def tearDown(self):
         for name, value in self.old_values.items():
-            loki.__dict__[name] = value
+            loki.current_session().__dict__[name] = value
 
     def test_provider_model_discovery_does_not_select_a_model(self):
         loki.apply_runtime_config(loki.make_runtime_config(
@@ -496,11 +508,11 @@ class ModelLoadingTests(unittest.TestCase):
         with mock.patch(
                 "loki_agent.loki.async_chat_request",
                 new=mock.AsyncMock(return_value=response)):
-            asyncio.run(loki.load_models_async())
+            loaded_models = asyncio.run(loki.load_models_async())
 
-        self.assertEqual(loki.models, ["first-model", "second-model"])
-        self.assertEqual(loki.model, "")
-        self.assertEqual(loki.RUNTIME_CONFIG.model, "")
+        self.assertEqual(loaded_models, ["first-model", "second-model"])
+        self.assertEqual(loki.current_model(), "")
+        self.assertEqual(loki.current_config().model, "")
 
     def test_explicit_connection_option_requires_complete_loki_config(self):
         self.assertIsNone(loki.explicit_connection_option(
@@ -546,9 +558,9 @@ class ModelLoadingTests(unittest.TestCase):
 
         loader.assert_not_awaited()
         self.assertEqual(status, 0)
-        self.assertEqual(loki.model, "chosen-model")
-        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
-        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
+        self.assertEqual(loki.current_model(), "chosen-model")
+        self.assertEqual(loki.current_config().api_key, "")
+        self.assertNotIn("Authorization", loki.current_config().headers)
 
     def test_headless_startup_requires_an_explicit_model(self):
         loki.CREDENTIALS = CredentialStore({
@@ -592,8 +604,8 @@ class ModelLoadingTests(unittest.TestCase):
 
         runner.assert_awaited_once()
         self.assertEqual(status, 0)
-        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
-        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
+        self.assertEqual(loki.current_config().api_key, "")
+        self.assertNotIn("Authorization", loki.current_config().headers)
 
     def test_headless_configuration_failure_returns_usage_error(self):
         loki.CREDENTIALS = CredentialStore({})
@@ -647,7 +659,7 @@ class ModelLoadingTests(unittest.TestCase):
             blob = formats.new_log_blob(
                 loki.initial_transcript_items(), [])
             blob["session_state"] = {
-                "shell_cwd": loki.shell_cwd,
+                "shell_cwd": loki.current_cwd(),
                 "connection": descriptor.to_dict(),
             }
             pathlib.Path(path).write_text(
@@ -664,11 +676,11 @@ class ModelLoadingTests(unittest.TestCase):
 
         confirm.assert_awaited_once()
         self.assertEqual(status, 0)
-        self.assertEqual(loki.model, "local-model")
-        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
-        self.assertIsNone(loki.RUNTIME_CONFIG.credential_env)
-        self.assertTrue(loki.RUNTIME_CONFIG.stream)
-        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
+        self.assertEqual(loki.current_model(), "local-model")
+        self.assertEqual(loki.current_config().api_key, "")
+        self.assertIsNone(loki.current_config().credential_env)
+        self.assertTrue(loki.current_config().stream)
+        self.assertNotIn("Authorization", loki.current_config().headers)
 
     def test_chat_request_without_a_model_is_not_sent(self):
         loki.CREDENTIALS = CredentialStore({
@@ -698,7 +710,7 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertNotIn(
             "do not send this",
-            [formats.item_text(item) for item in loki.transcript_items],
+            [formats.item_text(item) for item in loki.current_transcript()],
         )
         self.assertIn(
             "No model selected; use /model or set LOKI_MODEL.",
@@ -716,7 +728,7 @@ class ModelLoadingTests(unittest.TestCase):
         session = ScriptedInputSession(["/model", "/quit"])
 
         async def load_provider_models():
-            loki.models = ["current-model", "other-model"]
+            loki.current_session().models = ["current-model", "other-model"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
@@ -742,8 +754,8 @@ class ModelLoadingTests(unittest.TestCase):
 
         loader.assert_awaited_once()
         self.assertEqual(status, 0)
-        self.assertEqual(loki.model, "current-model")
-        self.assertEqual(loki.RUNTIME_CONFIG.model, "current-model")
+        self.assertEqual(loki.current_model(), "current-model")
+        self.assertEqual(loki.current_config().model, "current-model")
 
     def test_provider_fallback_selection_preserves_connection(self):
         models_url = "https://catalog.example.test/custom/models"
@@ -757,7 +769,7 @@ class ModelLoadingTests(unittest.TestCase):
         session = ScriptedInputSession(["/model", "/quit"])
 
         async def load_provider_models():
-            loki.models = ["first-model", "selected-model"]
+            loki.current_session().models = ["first-model", "selected-model"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
@@ -786,10 +798,10 @@ class ModelLoadingTests(unittest.TestCase):
 
         loader.assert_awaited_once()
         self.assertEqual(status, 0)
-        self.assertEqual(loki.model, "selected-model")
-        self.assertEqual(loki.RUNTIME_CONFIG.model, "selected-model")
+        self.assertEqual(loki.current_model(), "selected-model")
+        self.assertEqual(loki.current_config().model, "selected-model")
         self.assertEqual(
-            loki.RUNTIME_CONFIG.chat_provider.models_url, models_url)
+            loki.current_config().chat_provider.models_url, models_url)
         self.assertEqual(
             saved["session_state"]["connection"]["models_url"], models_url)
         self.assertEqual(
@@ -830,7 +842,7 @@ class ModelLoadingTests(unittest.TestCase):
                 saved = json.load(f)
 
         self.assertEqual(status, 0)
-        self.assertEqual(loki.RUNTIME_CONFIG.model_status, "deprecated")
+        self.assertEqual(loki.current_config().model_status, "deprecated")
         self.assertIn(
             "Model: old-model (deprecated); /model", loki.status_text())
         self.assertEqual(
@@ -887,10 +899,10 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertTrue(all(
             isinstance(option, modelsdev.ExplicitConnectionOption)
             for option in seen_explicit))
-        self.assertEqual(loki.RUNTIME_CONFIG.url, explicit_url)
-        self.assertEqual(loki.RUNTIME_CONFIG.model, "private-model")
+        self.assertEqual(loki.current_config().url, explicit_url)
+        self.assertEqual(loki.current_config().model, "private-model")
         self.assertEqual(
-            loki.RUNTIME_CONFIG.provider_name,
+            loki.current_config().provider_name,
             "Explicit LOKI_* connection",
         )
         connection = saved["session_state"]["connection"]
@@ -900,8 +912,8 @@ class ModelLoadingTests(unittest.TestCase):
             "http://localhost:8000/v1/chat/completions",
         )
         self.assertIsNone(connection["credential_env"])
-        self.assertEqual(loki.RUNTIME_CONFIG.api_key, "")
-        self.assertNotIn("Authorization", loki.RUNTIME_CONFIG.headers)
+        self.assertEqual(loki.current_config().api_key, "")
+        self.assertNotIn("Authorization", loki.current_config().headers)
 
     def test_explicit_connection_is_selectable_when_modelsdev_is_offline(self):
         explicit_url = "http://localhost:8000/v1"
@@ -944,8 +956,8 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(len(seen_explicit), 1)
         self.assertIsInstance(
             seen_explicit[0], modelsdev.ExplicitConnectionOption)
-        self.assertEqual(loki.RUNTIME_CONFIG.url, explicit_url)
-        self.assertEqual(loki.RUNTIME_CONFIG.model, "private-model")
+        self.assertEqual(loki.current_config().url, explicit_url)
+        self.assertEqual(loki.current_config().model, "private-model")
 
 
 class ExitStatusTests(unittest.TestCase):
@@ -1002,8 +1014,7 @@ class ExitStatusTests(unittest.TestCase):
                                     "loki_agent.loki."
                                     "restore_terminal_overlay",
                                     side_effect=OSError("restore failed")
-                                ), mock.patch.object(
-                                    loki, "chat_log_path", None
+                                ), mock.patch.object(loki.current_session(), "chat_log_path", None
                                 ), contextlib.redirect_stderr(stderr):
                     status = loki.main()
 
@@ -1017,12 +1028,12 @@ class ExitStatusTests(unittest.TestCase):
 
 class StatusTextTests(unittest.TestCase):
     def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
-        names = ["RUNTIME_CONFIG", "model", "shell_cwd"]
+        names = ["runtime_config", "shell_cwd"]
         sentinel = object()
-        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+        old_values = save_loki_state(names)
 
         try:
-            loki.shell_cwd = loki.STARTUP_CWD
+            loki.current_session().shell_cwd = loki.STARTUP_CWD
             chat_provider = protocols.Provider(
                 kind=protocols.OPENAI_CHAT,
                 input_url="https://user:pass@example.test:8443/base/path/v1/chat/completions?token=secret#fragment",
@@ -1032,7 +1043,7 @@ class StatusTextTests(unittest.TestCase):
                 headers={},
                 max_tokens=4096,
             )
-            loki.RUNTIME_CONFIG = loki.RuntimeConfig(
+            loki.current_session().runtime_config = loki.RuntimeConfig(
                 url=chat_provider.input_url,
                 provider_kind=chat_provider.kind,
                 netloc="example.test:8443",
@@ -1041,20 +1052,16 @@ class StatusTextTests(unittest.TestCase):
                 headers={},
                 model="model-x"
             )
-            loki.model = "model-x"
+            # model is derived from runtime_config set above
 
             text = loki.status_text()
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         self.assertEqual(
             text,
             "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
-            f"Local: mode={loki.AGENT_MODE}; CWD: {loki.STARTUP_CWD}; /pwd, /cd DIR, /ps, !foo, /quit",
+            f"Local: mode={loki.current_agent_mode()}; CWD: {loki.STARTUP_CWD}; /pwd, /cd DIR, /ps, !foo, /quit",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)
@@ -1062,11 +1069,11 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("secret", text)
 
     def test_status_text_marks_a_deprecated_selected_model(self):
-        names = ["RUNTIME_CONFIG", "model", "shell_cwd"]
-        old_values = {name: loki.__dict__[name] for name in names}
+        names = ["runtime_config", "shell_cwd"]
+        old_values = save_loki_state(names)
 
         try:
-            loki.shell_cwd = loki.STARTUP_CWD
+            loki.current_session().shell_cwd = loki.STARTUP_CWD
             loki.apply_runtime_config(loki.make_runtime_config(
                 "https://example.test/v1",
                 protocols.OPENAI_CHAT,
@@ -1078,8 +1085,7 @@ class StatusTextTests(unittest.TestCase):
 
             text = loki.status_text()
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         self.assertIn("Model: old-model (deprecated); /model", text)
 
@@ -1284,14 +1290,14 @@ class SessionResponsePersistenceTests(unittest.TestCase):
             "session_toolsets", "shell_cwd", "previous_shell_cwd",
         ]
         old_values = {
-            name: copy.deepcopy(loki.__dict__[name])
+            name: copy.deepcopy(loki.current_session().__dict__[name])
             for name in names
         }
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 path = os.path.join(tmpdir, "chat-test.json")
                 loki.new_chat_log(path)
-                loki.transcript_items.append(
+                loki.current_transcript().append(
                     formats.message_item("user", "hello"))
                 turn = formats.DecodedTurn(
                     [formats.message_item("assistant", "world")],
@@ -1302,17 +1308,17 @@ class SessionResponsePersistenceTests(unittest.TestCase):
                         "usage": {"total_tokens": 3},
                     },
                 )
-                loki.transcript_items.append(turn.to_event())
+                loki.current_transcript().append(turn.to_event())
                 loki._remember_session_toolset(loki.TOOLS)
                 loki.mark_chat_log_dirty()
                 loki.save_chat_log()
 
                 blob = json.loads(pathlib.Path(path).read_text(
                     encoding="utf-8"))
-                loki.session_toolsets = []
+                loki.current_session().session_toolsets = []
                 with contextlib.redirect_stdout(io.StringIO()):
                     loki.load_chat_log(path)
-                loaded_toolsets = copy.deepcopy(loki.session_toolsets)
+                loaded_toolsets = copy.deepcopy(loki.current_toolsets())
 
             self.assertEqual(
                 [item["type"] for item in blob["events"]],
@@ -1332,28 +1338,28 @@ class SessionResponsePersistenceTests(unittest.TestCase):
             self.assertNotIn('"start":', json.dumps(blob))
             self.assertNotIn('"end":', json.dumps(blob))
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
 
 class PrimaryModelSwitchResumeTests(unittest.TestCase):
     _GLOBAL_NAMES = [
-        "RUNTIME_CONFIG", "model", "chat_log_path", "session_state",
+        "runtime_config", "chat_log_path", "session_state",
         "chat_log_dirty", "transcript_items", "session_todos",
         "session_toolsets", "shell_cwd", "previous_shell_cwd",
     ]
 
     @contextlib.contextmanager
     def _isolated_runtime(self):
-        old_values = {
-            name: copy.deepcopy(loki.__dict__[name])
-            for name in self._GLOBAL_NAMES
-        }
+        session = loki.current_session()
+        old_values = {}
+        for name in self._GLOBAL_NAMES:
+            value = getattr(session, name, _MISSING)
+            old_values[name] = _MISSING if value is _MISSING \
+                else copy.deepcopy(value)
         try:
             yield
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     @staticmethod
     def _request_sequence(responses, captured):
@@ -1555,7 +1561,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             )
             loki.apply_runtime_config(provider_a)
             loki.new_chat_log(path)
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item("user", "read the file"))
 
             captured_a = []
@@ -1623,7 +1629,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                         "loki_agent.loki.dispatch_tool_async",
                         new=dispatch):
                 result_a = asyncio.run(loki.run_tool_loop_async(
-                    loki.transcript_items,
+                    loki.current_transcript(),
                     allowed={"Read", "Grep"},
                     max_loops=4,
                 ))
@@ -1665,7 +1671,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             loki.apply_runtime_config(provider_b)
             loki.set_session_connection(
                 loki.active_connection_descriptor())
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item("user", "continue with grep"))
 
             captured_b = []
@@ -1732,7 +1738,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                         "loki_agent.loki.dispatch_tool_async",
                         new=dispatch_b):
                 result_b = asyncio.run(loki.run_tool_loop_async(
-                    loki.transcript_items,
+                    loki.current_transcript(),
                     allowed={"Read", "Grep"},
                     max_loops=4,
                 ))
@@ -1763,11 +1769,11 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 
             loki.mark_chat_log_dirty()
             loki.save_chat_log()
-            loki.transcript_items = []
+            loki.current_session().transcript_items = []
             with contextlib.redirect_stdout(io.StringIO()):
                 loki.load_chat_log(path)
             descriptor = loki.connection_from_session_state(
-                loki.session_state)
+                loki.current_state())
             self.assertEqual(descriptor.provider_id, "provider-b")
             self.assertEqual(
                 descriptor.chat_url,
@@ -1778,7 +1784,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 CredentialStore({"PROVIDER_B_API_KEY": "key-b"}),
             )
             loki.apply_runtime_config(restored_b)
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item("user", "answer after resume"))
             loki.mark_chat_log_dirty()
 
@@ -1843,7 +1849,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                         new=dispatch_resumed):
                 resumed_result = asyncio.run(
                     loki.run_tool_loop_async(
-                        loki.transcript_items,
+                        loki.current_transcript(),
                         allowed={"Read", "Grep"},
                         max_loops=4,
                     ))
@@ -1877,7 +1883,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 "tool result after resume",
                 serialized_resume_continuation,
             )
-            formats.validate_events(loki.transcript_items)
+            formats.validate_events(loki.current_transcript())
 
     def test_incomplete_tool_call_and_media_survive_resume_and_switch(self):
         with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
@@ -1893,7 +1899,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             )
             loki.apply_runtime_config(responses_config)
             loki.new_chat_log(path)
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item("user", [
                     formats.text_block("inspect this image"),
                     {
@@ -1936,7 +1942,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                         "loki_agent.loki.dispatch_tool_async",
                         new=forbidden_dispatch):
                 result = asyncio.run(loki.run_tool_loop_async(
-                    loki.transcript_items,
+                    loki.current_transcript(),
                     allowed={"Read"},
                 ))
 
@@ -1944,17 +1950,17 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             self.assertEqual(result, "")
             self.assertEqual(dispatches, [])
             self.assertEqual(
-                formats.pending_tool_calls(loki.transcript_items), [])
+                formats.pending_tool_calls(loki.current_transcript()), [])
             self.assertEqual(
-                [event["type"] for event in loki.transcript_items[-2:]],
+                [event["type"] for event in loki.current_transcript()[-2:]],
                 ["model_response", "tool_result"],
             )
             self.assertEqual(
-                loki.transcript_items[-2]["status"], "incomplete")
-            self.assertTrue(loki.transcript_items[-1]["is_error"])
+                loki.current_transcript()[-2]["status"], "incomplete")
+            self.assertTrue(loki.current_transcript()[-1]["is_error"])
             self.assertIn(
                 "provider response was incomplete",
-                formats.item_text(loki.transcript_items[-1]),
+                formats.item_text(loki.current_transcript()[-1]),
             )
             self.assertEqual(len(captured_incomplete), 1)
             self.assertEqual(
@@ -1970,13 +1976,13 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             loki.mark_chat_log_dirty()
             loki.save_chat_log()
 
-            loki.transcript_items = []
+            loki.current_session().transcript_items = []
             with contextlib.redirect_stdout(io.StringIO()):
                 loki.load_chat_log(path)
             self.assertEqual(
-                loki.transcript_items[-2]["status"], "incomplete")
+                loki.current_transcript()[-2]["status"], "incomplete")
             self.assertEqual(
-                formats.pending_tool_calls(loki.transcript_items), [])
+                formats.pending_tool_calls(loki.current_transcript()), [])
 
             chat_config = loki.make_runtime_config(
                 "https://chat.example/v1/chat/completions",
@@ -1990,7 +1996,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             loki.apply_runtime_config(chat_config)
             loki.set_session_connection(
                 loki.active_connection_descriptor())
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item(
                     "user", "recover after the incomplete call"))
 
@@ -2011,7 +2017,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     "loki_agent.loki.async_chat_request",
                     new=chat_request):
                 recovered = asyncio.run(loki.run_tool_loop_async(
-                    loki.transcript_items,
+                    loki.current_transcript(),
                     allowed={"Read"},
                 ))
 
@@ -2035,15 +2041,15 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 
             loki.mark_chat_log_dirty()
             loki.save_chat_log()
-            loki.transcript_items = []
+            loki.current_session().transcript_items = []
             with contextlib.redirect_stdout(io.StringIO()):
                 loki.load_chat_log(path)
             descriptor = loki.connection_from_session_state(
-                loki.session_state)
+                loki.current_state())
             self.assertEqual(descriptor.provider_id, "chat-provider")
             self.assertEqual(
-                formats.pending_tool_calls(loki.transcript_items), [])
-            formats.validate_events(loki.transcript_items)
+                formats.pending_tool_calls(loki.current_transcript()), [])
+            formats.validate_events(loki.current_transcript())
 
     def test_anthropic_server_tool_replays_at_origin_and_sanitizes_on_switch(
             self):
@@ -2060,7 +2066,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             )
             loki.apply_runtime_config(provider_a)
             loki.new_chat_log(path)
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item("user", "search for the result"))
 
             server_content = [
@@ -2120,7 +2126,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     "loki_agent.loki.async_chat_request",
                     new=requests_a):
                 answer_a = asyncio.run(loki.run_tool_loop_async(
-                    loki.transcript_items,
+                    loki.current_transcript(),
                     allowed={"Read"},
                     max_loops=4,
                 ))
@@ -2147,7 +2153,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             loki.mark_chat_log_dirty()
             loki.save_chat_log()
 
-            loki.transcript_items = []
+            loki.current_session().transcript_items = []
             with contextlib.redirect_stdout(io.StringIO()):
                 loki.load_chat_log(path)
             provider_b = loki.make_runtime_config(
@@ -2162,7 +2168,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             loki.apply_runtime_config(provider_b)
             loki.set_session_connection(
                 loki.active_connection_descriptor())
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item(
                     "user", "continue on provider B"))
 
@@ -2181,7 +2187,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     "loki_agent.loki.async_chat_request",
                     new=requests_b):
                 answer_b = asyncio.run(loki.run_tool_loop_async(
-                    loki.transcript_items,
+                    loki.current_transcript(),
                     allowed={"Read"},
                 ))
 
@@ -2216,7 +2222,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             ]
             self.assertIn("tool_use", projected_types)
             self.assertIn("tool_result", projected_types)
-            formats.validate_events(loki.transcript_items)
+            formats.validate_events(loki.current_transcript())
 
     def test_chat_exact_replay_runs_through_runtime_and_tool_loop(self):
         with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
@@ -2232,7 +2238,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             )
             loki.apply_runtime_config(config)
             loki.new_chat_log(path)
-            loki.transcript_items.append(
+            loki.current_transcript().append(
                 formats.message_item("user", "read exactly"))
 
             exact_content = [
@@ -2288,7 +2294,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                         "loki_agent.loki.dispatch_tool_async",
                         new=dispatch):
                 answer = asyncio.run(loki.run_tool_loop_async(
-                    loki.transcript_items,
+                    loki.current_transcript(),
                     allowed={"Read"},
                     max_loops=4,
                 ))
@@ -2319,16 +2325,16 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 tool_result["tool_call_id"], "call_exact")
             self.assertEqual(
                 tool_result["content"], "exact tool result")
-            formats.validate_events(loki.transcript_items)
+            formats.validate_events(loki.current_transcript())
 
     def test_projection_smoke_switches_provider_and_protocol(self):
         names = [
-            "RUNTIME_CONFIG", "model", "chat_log_path", "session_state",
+            "runtime_config", "chat_log_path", "session_state",
             "chat_log_dirty", "transcript_items", "session_todos",
             "session_toolsets", "shell_cwd", "previous_shell_cwd",
         ]
         old_values = {
-            name: copy.deepcopy(loki.__dict__[name])
+            name: copy.deepcopy(loki.current_session().__dict__[name])
             for name in names
         }
         try:
@@ -2344,7 +2350,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 )
                 loki.apply_runtime_config(source)
                 loki.new_chat_log(path)
-                loki.transcript_items.append(
+                loki.current_transcript().append(
                     formats.message_item("user", "inspect README"))
                 source_turn = formats.anthropic_response_to_items({
                     "type": "message",
@@ -2373,19 +2379,19 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     "endpoint": source.chat_provider.chat_url,
                     "model": "model-a",
                 })
-                loki.transcript_items.append(source_turn.to_event())
+                loki.current_transcript().append(source_turn.to_event())
                 call = formats.response_tool_calls(source_turn)[0]
-                loki.transcript_items.append(
+                loki.current_transcript().append(
                     formats.tool_result_for_call(
                         call, "README contents"))
                 loki.mark_chat_log_dirty()
                 loki.save_chat_log()
 
-                loki.transcript_items = []
+                loki.current_session().transcript_items = []
                 with contextlib.redirect_stdout(io.StringIO()):
                     loki.load_chat_log(path)
                 self.assertEqual(
-                    loki.transcript_items[2]["endpoint"],
+                    loki.current_transcript()[2]["endpoint"],
                     source.chat_provider.chat_url,
                 )
 
@@ -2443,7 +2449,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                         side_effect=fake_request):
                     target_turn = asyncio.run(
                         loki.async_chat_completion(
-                            loki.transcript_items, tools=[]))
+                            loki.current_transcript(), tools=[]))
 
                 first_switched_payload = json.dumps(captured[0])
                 self.assertIn("I will inspect it.", first_switched_payload)
@@ -2455,19 +2461,19 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     target_turn.metadata["endpoint"],
                     target_b.chat_provider.chat_url,
                 )
-                loki.transcript_items.append(target_turn.to_event())
+                loki.current_transcript().append(target_turn.to_event())
                 target_call = formats.response_tool_calls(target_turn)[0]
-                loki.transcript_items.append(
+                loki.current_transcript().append(
                     formats.tool_result_for_call(
                         target_call, "grep result"))
                 loki.mark_chat_log_dirty()
                 loki.save_chat_log()
 
-                loki.transcript_items = []
+                loki.current_session().transcript_items = []
                 with contextlib.redirect_stdout(io.StringIO()):
                     loki.load_chat_log(path)
                 saved_connection = loki.connection_from_session_state(
-                    loki.session_state)
+                    loki.current_state())
                 self.assertEqual(
                     saved_connection.provider_id, "provider-b")
 
@@ -2480,7 +2486,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     provider_name="Provider C",
                 )
                 responses_payload = target_c.chat_provider.chat_payload(
-                    loki.transcript_items, [], "model-c")
+                    loki.current_transcript(), [], "model-c")
                 rendered_responses = json.dumps(responses_payload)
                 self.assertIn("Provider B answer", rendered_responses)
                 self.assertIn("grep result", rendered_responses)
@@ -2497,7 +2503,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     provider_name="Provider D",
                 )
                 chat_payload = target_d.chat_provider.chat_payload(
-                    loki.transcript_items, [], "model-d")
+                    loki.current_transcript(), [], "model-d")
                 rendered_chat = json.dumps(chat_payload)
                 self.assertIn("I will inspect it.", rendered_chat)
                 self.assertIn("README contents", rendered_chat)
@@ -2506,10 +2512,9 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 self.assertNotIn(
                     "provider-a-signature", rendered_chat)
                 self.assertNotIn("provider-b-only", rendered_chat)
-                formats.validate_events(loki.transcript_items)
+                formats.validate_events(loki.current_transcript())
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
 
 class ChatLogPathTests(unittest.TestCase):
@@ -2547,7 +2552,7 @@ class ChatLogPathTests(unittest.TestCase):
             "transcript_items", "session_todos",
         ]
         sentinel = object()
-        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2555,15 +2560,11 @@ class ChatLogPathTests(unittest.TestCase):
                 loki.new_chat_log(path)
 
                 self.assertTrue(os.path.isdir(os.path.dirname(path)))
-                self.assertEqual(loki.chat_log_path, path)
-                self.assertTrue(loki.chat_log_dirty)
+                self.assertEqual(loki.current_chat_log_path(), path)
+                self.assertTrue(loki.current_dirty())
                 self.assertFalse(os.path.exists(path))
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
 
 class SessionPickerTests(unittest.TestCase):
@@ -2789,36 +2790,34 @@ class SessionPickerTests(unittest.TestCase):
 class ShellCwdTests(unittest.TestCase):
     def test_change_shell_cwd_does_not_change_process_cwd(self):
         names = ["shell_cwd", "previous_shell_cwd"]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
         process_cwd = os.getcwd()
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 loki.change_shell_cwd(tmpdir)
 
-                self.assertEqual(loki.shell_cwd, tmpdir)
+                self.assertEqual(loki.current_cwd(), tmpdir)
                 self.assertEqual(os.getcwd(), process_cwd)
                 self.assertEqual(loki._resolve_path("file.txt"), os.path.join(tmpdir, "file.txt"))
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_bash_runs_in_shell_cwd(self):
         names = ["shell_cwd", "previous_shell_cwd", "job_manager"]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 workdir = os.path.join(tmpdir, "work")
                 os.mkdir(workdir)
-                loki.job_manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+                loki.current_session().job_manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
                 loki.change_shell_cwd(workdir)
 
                 result = asyncio.run(loki.run_bash_async("pwd"))
-                jobs = list(loki.job_manager.jobs.values())
+                jobs = list(loki.current_job_manager().jobs.values())
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         self.assertIn("[stdout]\n" + workdir, result)
         self.assertEqual(os.path.basename(jobs[0].stdout_path), "stdout.log")
@@ -2831,7 +2830,7 @@ class ShellCwdTests(unittest.TestCase):
             "previous_shell_cwd",
         ]
         sentinel = object()
-        old_values = {name: loki.__dict__.get(name, sentinel) for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2846,11 +2845,7 @@ class ShellCwdTests(unittest.TestCase):
                 with open(path, "r", encoding="utf-8") as f:
                     blob = json.load(f)
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         self.assertEqual(blob["session_state"]["shell_cwd"], cwd)
 
@@ -2858,11 +2853,10 @@ class ShellCwdTests(unittest.TestCase):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos",
-            "RUNTIME_CONFIG", "model",
-        ]
+            "runtime_config", ]
         sentinel = object()
         old_values = {
-            name: loki.__dict__.get(name, sentinel) for name in names}
+            name: loki.current_session().__dict__.get(name, sentinel) for name in names}
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2883,11 +2877,7 @@ class ShellCwdTests(unittest.TestCase):
                 text = pathlib.Path(path).read_text(encoding="utf-8")
                 blob = json.loads(text)
         finally:
-            for name, value in old_values.items():
-                if value is sentinel:
-                    loki.__dict__.pop(name, None)
-                else:
-                    loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["provider_id"], "openrouter")
@@ -2904,9 +2894,8 @@ class ShellCwdTests(unittest.TestCase):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos",
-            "RUNTIME_CONFIG", "model",
-        ]
-        old_values = {name: loki.__dict__[name] for name in names}
+            "runtime_config", ]
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2925,8 +2914,7 @@ class ShellCwdTests(unittest.TestCase):
                 blob = json.loads(
                     pathlib.Path(path).read_text(encoding="utf-8"))
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["model"], "local-model")
@@ -2940,10 +2928,10 @@ class ShellCwdTests(unittest.TestCase):
     def test_loading_and_clean_cleanup_leave_chat_bytes_unchanged(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "RUNTIME_CONFIG",
+            "transcript_items", "session_todos", "runtime_config",
             "shell_cwd", "previous_shell_cwd",
         ]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2967,29 +2955,28 @@ class ShellCwdTests(unittest.TestCase):
                 original = json.dumps(
                     blob, separators=(",", ":"), sort_keys=True).encode()
                 pathlib.Path(path).write_bytes(original)
-                loki.RUNTIME_CONFIG = None
+                loki.current_session().runtime_config = None
 
                 loki.load_chat_log(path)
                 saved = loki.save_chat_log()
 
                 self.assertFalse(saved)
-                self.assertFalse(loki.chat_log_dirty)
+                self.assertFalse(loki.current_dirty())
                 self.assertEqual(pathlib.Path(path).read_bytes(), original)
                 self.assertEqual(
-                    loki.session_state["connection"], descriptor.to_dict())
+                    loki.current_state()["connection"], descriptor.to_dict())
                 self.assertEqual(
-                    loki.session_state["future_field"], {"keep": True})
+                    loki.current_state()["future_field"], {"keep": True})
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_later_save_preserves_unavailable_loaded_connection(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "RUNTIME_CONFIG",
+            "transcript_items", "session_todos", "runtime_config",
             "shell_cwd", "previous_shell_cwd",
         ]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3014,7 +3001,7 @@ class ShellCwdTests(unittest.TestCase):
                 }
                 pathlib.Path(path).write_text(
                     json.dumps(blob), encoding="utf-8")
-                loki.RUNTIME_CONFIG = None
+                loki.current_session().runtime_config = None
 
                 loki.load_chat_log(path)
                 loki.mark_chat_log_dirty()
@@ -3029,16 +3016,14 @@ class ShellCwdTests(unittest.TestCase):
                 self.assertEqual(
                     after["session_state"]["future_field"], "retained")
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_resumed_chat_does_not_adopt_explicit_runtime_connection(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "RUNTIME_CONFIG", "model",
-            "shell_cwd", "previous_shell_cwd",
+            "transcript_items", "session_todos", "runtime_config", "shell_cwd", "previous_shell_cwd",
         ]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3079,15 +3064,14 @@ class ShellCwdTests(unittest.TestCase):
                     saved_descriptor.to_dict(),
                 )
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_chat_save_atomically_replaces_existing_snapshot(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos",
         ]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3096,7 +3080,7 @@ class ShellCwdTests(unittest.TestCase):
                 loki.save_chat_log()
                 first_inode = os.stat(path).st_ino
 
-                loki.transcript_items.append(
+                loki.current_transcript().append(
                     formats.message_item("user", "changed"))
                 loki.mark_chat_log_dirty()
                 loki.save_chat_log()
@@ -3108,15 +3092,14 @@ class ShellCwdTests(unittest.TestCase):
                     [],
                 )
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_failed_atomic_publish_preserves_previous_snapshot(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos",
         ]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3125,7 +3108,7 @@ class ShellCwdTests(unittest.TestCase):
                 loki.save_chat_log()
                 original = pathlib.Path(path).read_bytes()
 
-                loki.transcript_items.append(
+                loki.current_transcript().append(
                     formats.message_item("user", "must not publish"))
                 loki.mark_chat_log_dirty()
                 with mock.patch(
@@ -3135,23 +3118,21 @@ class ShellCwdTests(unittest.TestCase):
                         loki.save_chat_log()
 
                 self.assertEqual(pathlib.Path(path).read_bytes(), original)
-                self.assertTrue(loki.chat_log_dirty)
+                self.assertTrue(loki.current_dirty())
                 self.assertEqual(
                     [name for name in os.listdir(tmpdir)
                      if name.endswith(".tmp")],
                     [],
                 )
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_successful_model_selection_replaces_resumed_connection(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "RUNTIME_CONFIG", "model",
-            "shell_cwd", "previous_shell_cwd",
+            "transcript_items", "session_todos", "runtime_config", "shell_cwd", "previous_shell_cwd",
         ]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3195,21 +3176,19 @@ class ShellCwdTests(unittest.TestCase):
                     new_descriptor.to_dict(),
                 )
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_load_session_state_restores_shell_cwd(self):
         names = ["shell_cwd", "previous_shell_cwd"]
-        old_values = {name: loki.__dict__[name] for name in names}
+        old_values = save_loki_state(names)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 loki.load_session_state({"shell_cwd": tmpdir})
 
-                self.assertEqual(loki.shell_cwd, tmpdir)
+                self.assertEqual(loki.current_cwd(), tmpdir)
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
     def test_saved_connection_confirmation_is_explicit(self):
         descriptor = ConnectionDescriptor(
@@ -3347,8 +3326,8 @@ class SubagentLaunchTests(unittest.TestCase):
         ])
 
     def test_subagent_environment_contains_only_active_normalized_key(self):
-        names = ["RUNTIME_CONFIG", "model"]
-        old_values = {name: loki.__dict__[name] for name in names}
+        names = ["runtime_config"]
+        old_values = save_loki_state(names)
         env = {
             "PATH": os.environ.get("PATH", ""),
             "OPENROUTER_API_KEY": "unrelated-key",
@@ -3365,16 +3344,15 @@ class SubagentLaunchTests(unittest.TestCase):
                 ))
                 child_env = loki._subagent_env()
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         self.assertEqual(child_env["LOKI_API_KEY"], "active-key")
         self.assertEqual(child_env["LOKI_STREAM"], "0")
         self.assertNotIn("OPENROUTER_API_KEY", child_env)
 
     def test_subagent_environment_preserves_credentialless_connection(self):
-        names = ["RUNTIME_CONFIG", "model"]
-        old_values = {name: loki.__dict__[name] for name in names}
+        names = ["runtime_config"]
+        old_values = save_loki_state(names)
         try:
             with mock.patch.dict(
                     os.environ, {"LOKI_API_KEY": "must-not-leak"},
@@ -3389,8 +3367,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 ))
                 child_env = loki._subagent_env()
         finally:
-            for name, value in old_values.items():
-                loki.__dict__[name] = value
+            restore_loki_state(old_values)
 
         self.assertEqual(child_env["LOKI_API_BASE"],
                          "http://localhost:8000/v1")
@@ -3401,8 +3378,8 @@ class SubagentLaunchTests(unittest.TestCase):
 
 class StreamingCompletionTests(unittest.TestCase):
     def setUp(self):
-        self.old_runtime_config = loki.RUNTIME_CONFIG
-        self.old_model = loki.model
+        self.old_runtime_config = loki.current_config()
+        self.old_model = loki.current_model()
         loki.apply_runtime_config(loki.make_runtime_config(
             "http://localhost:8000/v1",
             protocols.OPENAI_CHAT,
@@ -3413,8 +3390,8 @@ class StreamingCompletionTests(unittest.TestCase):
         ))
 
     def tearDown(self):
-        loki.RUNTIME_CONFIG = self.old_runtime_config
-        loki.model = self.old_model
+        loki.current_session().runtime_config = self.old_runtime_config
+        # model restored with runtime_config above
 
     def test_text_delta_arrives_before_stream_completion(self):
         async def scenario():
@@ -3526,8 +3503,8 @@ class StreamingCompletionTests(unittest.TestCase):
 
         event = turn.to_event()
         origin_payload = (
-            loki.RUNTIME_CONFIG.chat_provider.chat_payload(
-                [user, event], [], loki.model))
+            loki.current_config().chat_provider.chat_payload(
+                [user, event], [], loki.current_model()))
         foreign = loki.make_runtime_config(
             "http://other-localhost:8000/v1",
             protocols.OPENAI_CHAT,
@@ -3724,10 +3701,10 @@ class StreamingToolLoopTests(unittest.TestCase):
         self.assertIn("model response incomplete", stderr.getvalue())
 
     def test_terminal_stream_writes_one_plain_incremental_line(self):
-        old_model = loki.model
+        old_config = loki.current_session().runtime_config
         output = io.StringIO()
         try:
-            loki.model = "local-model"
+            loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
             with contextlib.redirect_stdout(output), \
                     contextlib.redirect_stderr(output):
                 loki._terminal_agent_event({"type": "assistant_start"})
@@ -3748,7 +3725,7 @@ class StreamingToolLoopTests(unittest.TestCase):
                     "elapsed": 1.25,
                 })
         finally:
-            loki.model = old_model
+            loki.current_session().runtime_config = old_config
 
         self.assertEqual(
             output.getvalue(),
