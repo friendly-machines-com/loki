@@ -1069,25 +1069,41 @@ class JobManager:
             watchers, timeout=timeout_ms / 1000,
             return_when=asyncio.FIRST_COMPLETED)
 
-        async def terminate(signum, grace_s: float):
+        def _signal_job(signum):
             # Signal the job's whole process group so shell children are not
-            # left behind.
+            # left behind.  Guarded by the lock and the running status: a
+            # job already reaped here may have had its pgid recycled by an
+            # unrelated process group, and killpg would hit that instead.
+            with self._lock:
+                if job.status != "running":
+                    return False
             try:
                 os.killpg(job.pgid or job.pid, signum)
+                return True
             except ProcessLookupError:
-                pass
+                return False
+
+        async def terminate(signum, grace_s: float):
+            sent = _signal_job(signum)
+            if not sent:
+                return await exit_task
             try:
                 exit_code = await asyncio.wait_for(
                     asyncio.shield(exit_task), timeout=grace_s)
             except asyncio.TimeoutError:
-                try:
-                    os.killpg(job.pgid or job.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _signal_job(signal.SIGKILL)
                 exit_code = await exit_task
             return exit_code
 
-        if exit_task in done:
+        # Cancel wins a simultaneous finish: if the user cancelled and the
+        # job also exited in the same loop pass, the intent outranks the
+        # race.  A job that exited on its own (no cancel pending) records
+        # completed.
+        interrupted = cancel_task is not None and (
+            cancel_task in done or cancel_task.done())
+        if interrupted and exit_task not in done:
+            pass  # fall through to the kill path below
+        elif exit_task in done:
             self._record_exit(job, exit_task.result())
             return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
@@ -1096,7 +1112,6 @@ class JobManager:
         # foreground job's process group (background jobs are separate
         # sessions and never see it), then SIGKILL after a grace period.
         # A timeout keeps the SIGTERM-first sequence it always used.
-        interrupted = cancel_task is not None and cancel_task in done
         with self._lock:
             job.status = "cancelled" if interrupted else "timed_out"
             self._write_metadata(job)
