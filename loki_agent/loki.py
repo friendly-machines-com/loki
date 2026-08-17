@@ -999,10 +999,13 @@ class JobManager:
             started_at_iso=_now_iso(),
             timeout_ms=timeout_ms,
         )
+
+        # Helper to unblock inherited signal masks in the child process context
+        def unblock_child_signals():
+            import signal
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT, signal.SIGTERM])
+
         with open(stdout_path, 'wb') as stdout_file, open(stderr_path, 'wb') as stderr_file:
-            # Tool output is spooled to separate fd streams. start_new_session
-            # gives each job a process group so timeouts and JobStop can signal
-            # the whole command tree.
             if shell:
                 proc = await asyncio.create_subprocess_shell(
                     command,
@@ -1012,6 +1015,7 @@ class JobManager:
                     start_new_session=True,
                     env=env,
                     cwd=cwd or current_cwd(),
+                    preexec_fn=unblock_child_signals,  # Unblocks the signals
                 )
             else:
                 proc = await asyncio.create_subprocess_exec(
@@ -1022,6 +1026,7 @@ class JobManager:
                     start_new_session=True,
                     env=env,
                     cwd=cwd or current_cwd(),
+                    preexec_fn=unblock_child_signals,  # Unblocks the signals
                 )
         job.process = proc
         job.pid = proc.pid
