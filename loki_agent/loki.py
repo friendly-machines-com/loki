@@ -1063,17 +1063,22 @@ class JobManager:
         exit_task = asyncio.create_task(self._wait_for_job(job))
         cancel_task = (asyncio.create_task(cancel_event.wait())
                        if cancel_event is not None else None)
-        watchers = {exit_task} if cancel_task is None else {
-            exit_task, cancel_task}
-        done, _pending = await asyncio.wait(
-            watchers, timeout=timeout_ms / 1000,
-            return_when=asyncio.FIRST_COMPLETED)
+        watchers = {exit_task} if cancel_task is None else {exit_task, cancel_task}
+        
+        try:
+            done, _pending = await asyncio.wait(
+                watchers, timeout=timeout_ms / 1000,
+                return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Correct leaks: Always cancel and await the cancel_task if it remains pending
+            if cancel_task is not None and not cancel_task.done():
+                cancel_task.cancel()
+                try:
+                    await cancel_task
+                except asyncio.CancelledError:
+                    pass
 
         def _signal_job(signum):
-            # Signal the job's whole process group so shell children are not
-            # left behind.  Guarded by the lock and the running status: a
-            # job already reaped here may have had its pgid recycled by an
-            # unrelated process group, and killpg would hit that instead.
             with self._lock:
                 if job.status != "running":
                     return False
@@ -1095,31 +1100,35 @@ class JobManager:
                 exit_code = await exit_task
             return exit_code
 
-        # Cancel wins a simultaneous finish: if the user cancelled and the
-        # job also exited in the same loop pass, the intent outranks the
-        # race.  A job that exited on its own (no cancel pending) records
-        # completed.
-        interrupted = cancel_task is not None and (
-            cancel_task in done or cancel_task.done())
-        if interrupted and exit_task not in done:
-            pass  # fall through to the kill path below
-        elif exit_task in done:
-            self._record_exit(job, exit_task.result())
-            return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+        # Check if we were explicitly interrupted
+        interrupted = cancel_task is not None and cancel_task in done
+        
+        try:
+            if interrupted and exit_task not in done:
+                pass  # Fall through to the kill path below
+            elif exit_task in done:
+                self._record_exit(job, exit_task.result())
+                return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
-        # The job is still running; either the user cancelled or the
-        # timeout fired.  A Ctrl-C cancels like a shell's: SIGINT to the
-        # foreground job's process group (background jobs are separate
-        # sessions and never see it), then SIGKILL after a grace period.
-        # A timeout keeps the SIGTERM-first sequence it always used.
-        with self._lock:
-            job.status = "cancelled" if interrupted else "timed_out"
-            self._write_metadata(job)
-        exit_code = await terminate(
-            signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
-        self._record_exit(job, exit_code)
-        status = "cancelled" if interrupted else "timed_out"
-        return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+            # The job is still running; either user cancelled or timeout fired.
+            with self._lock:
+                job.status = "cancelled" if interrupted else "timed_out"
+                self._write_metadata(job)
+            
+            exit_code = await terminate(
+                signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
+            self._record_exit(job, exit_code)
+            status = "cancelled" if interrupted else "timed_out"
+            return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+        
+        finally:
+            # Clean up the exit task if we are leaving the function for any reason
+            if not exit_task.done():
+                exit_task.cancel()
+                try:
+                    await exit_task
+                except asyncio.CancelledError:
+                    pass
 
     async def run_shell(self, command: str, timeout: int = None, description: str = "",
                         run_in_background: bool = False,
