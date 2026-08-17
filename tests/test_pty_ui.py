@@ -200,3 +200,114 @@ class PtyUiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
+class PtyCtrlCTests(unittest.TestCase):
+    """Ctrl+C must reach the reader as byte 0x03, not become SIGINT.
+
+    With ISIG left set on the tty, the driver eats Ctrl+C and delivers
+    SIGINT to the foreground process group before the byte reaches
+    AsyncKeyReader, so cancel_requested never becomes True and a running
+    turn cannot be cancelled between tool calls.  These tests pin the
+    ISIG-clearing behavior of TerminalMode end to end.
+    """
+
+    def test_terminal_mode_clears_isig(self):
+        # Direct: enter TerminalMode on a fresh pty and inspect lflag bits.
+        pid, master = pty.fork()
+        if pid == 0:
+            # Child: never returns from this block.
+            try:
+                import sys as _sys
+                _sys.path.insert(
+                    0, str(pathlib.Path(__file__).resolve().parents[1]))
+                import termios as _termios
+                import time as _time
+                from loki_agent import terminals as _terminals
+
+                mode = _terminals.TerminalMode(0, enabled=True)
+                mode.__enter__()
+                attrs = _termios.tcgetattr(0)
+                _sys.stdout.buffer.write(
+                    b"ISIG_SET\n" if attrs[3] & _termios.ISIG
+                    else b"ISIG_CLEAR\n")
+                _sys.stdout.buffer.flush()
+                mode.__exit__(None, None, None)
+                attrs = _termios.tcgetattr(0)
+                _sys.stdout.buffer.write(
+                    b"RESTORED_ISIG_SET\n" if attrs[3] & _termios.ISIG
+                    else b"RESTORED_ISIG_CLEAR\n")
+                _sys.stdout.buffer.flush()
+                _time.sleep(0.5)
+            except Exception:
+                pass
+            os._exit(0)
+        try:
+            out = _read_with_timeout(master, 4.0)
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            os.close(master)
+        self.assertIn(b"ISIG_CLEAR", out)
+        self.assertNotIn(b"ISIG_SET\n", out.replace(b"ISIG_CLEAR", b""))
+        self.assertIn(b"RESTORED_ISIG_SET", out)
+
+    def test_ctrl_c_sets_cancel_flag_in_reader(self):
+        # End to end: with ISIG clear, a 0x03 byte written to the pty is
+        # seen by AsyncKeyReader as CTRL_C and sets cancel_requested.
+        pid, master = pty.fork()
+        if pid == 0:
+            try:
+                import sys as _sys
+                import asyncio as _asyncio
+                import time as _time
+                _sys.path.insert(
+                    0, str(pathlib.Path(__file__).resolve().parents[1]))
+                from loki_agent import terminals as _terminals
+
+                async def _main():
+                    mode = _terminals.TerminalMode(0, enabled=True)
+                    mode.__enter__()
+                    reader = _terminals.AsyncKeyReader(0)
+                    key_kind = None
+                    async with reader:
+                        # Drive the reader the way the real loop does; the
+                        # flag is set inside read_key's parse, not by the
+                        # byte arriving alone.
+                        try:
+                            key = await _asyncio.wait_for(
+                                reader.read_key(), timeout=3.0)
+                            key_kind = key.kind
+                        except _asyncio.TimeoutError:
+                            pass
+                    mode.__exit__(None, None, None)
+                    if reader.cancel_requested and key_kind == "CTRL_C":
+                        _sys.stdout.buffer.write(b"CANCEL_SET\n")
+                    else:
+                        _sys.stdout.buffer.write(
+                            f"CANCEL_NOT_SET key={key_kind}\n".encode())
+                    _sys.stdout.buffer.write(
+                        b"CANCEL_SET\n" if reader.cancel_requested
+                        else b"CANCEL_NOT_SET\n")
+                    _sys.stdout.buffer.flush()
+                    _time.sleep(0.3)
+                _asyncio.run(_main())
+            except Exception:
+                pass
+            os._exit(0)
+        try:
+            _set_size(master)
+            _read_with_timeout(master, 1.0)  # let child reach its wait
+            os.write(master, b"\x03")
+            out = _read_with_timeout(master, 4.0)
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            os.close(master)
+        self.assertIn(b"CANCEL_SET", out)
+        self.assertNotIn(b"CANCEL_NOT_SET", out)

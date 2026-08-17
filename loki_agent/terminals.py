@@ -568,7 +568,14 @@ class TerminalMode:
         if self.enabled:
             self.old_attrs = termios.tcgetattr(self.fd)
             new_attrs = termios.tcgetattr(self.fd)
-            new_attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            # ISIG too: with it set, the tty driver turns Ctrl+C into SIGINT
+            # for the foreground process group before the byte reaches the
+            # reader, so AsyncKeyReader.cancel_requested can never fire and
+            # between-tool-call cancellation never triggers.  Clearing ISIG
+            # makes Ctrl+C the byte (0x03) the reader already handles.
+            # Tool subprocesses are unaffected either way: they run in their
+            # own session (start_new_session) and receive no tty signals.
+            new_attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
             new_attrs[6][termios.VMIN] = 1
             new_attrs[6][termios.VTIME] = 0
             termios.tcsetattr(self.fd, termios.TCSADRAIN, new_attrs)
