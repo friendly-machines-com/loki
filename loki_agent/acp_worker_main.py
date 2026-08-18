@@ -61,7 +61,10 @@ async def amain() -> int:
                 error={"code": acps.PARSE_ERROR,
                        "message": "not a JSON object"}))
             continue
-        await worker.handle(message)
+        # session/prompt runs as a task so the read loop keeps consuming;
+        # otherwise a session/cancel arriving mid-turn would queue behind
+        # the prompt it is meant to interrupt.
+        await worker.handle(message, concurrent=True)
     return 0
 
 

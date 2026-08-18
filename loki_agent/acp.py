@@ -45,8 +45,27 @@ class Front:
     async def handle(self, message: dict):
         method = message.get("method")
         request_id = message.get("id")
-        if method is None or request_id is None:
+        if method is None:
             return
+        if request_id is None and method != "session/cancel":
+            return  # other notifications are not for us
+        if method == "session/prompt":
+            # Long-running: dispatch concurrently so a session/cancel
+            # arriving from the client while the turn runs is still read
+            # and routed instead of queueing behind the prompt.
+            asyncio.get_running_loop().create_task(self._answer(message))
+            return
+        if request_id is None:
+            # cancel-as-notification: route it, answer nothing.
+            params = message.get("params") or {}
+            asyncio.get_running_loop().create_task(
+                self.dispatch(method, params))
+            return
+        await self._answer(message)
+
+    async def _answer(self, message: dict):
+        method = message.get("method")
+        request_id = message.get("id")
         try:
             result = await self.dispatch(method, message.get("params") or {})
         except Exception as error:

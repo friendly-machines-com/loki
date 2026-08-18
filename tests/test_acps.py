@@ -293,3 +293,91 @@ class UpdateStreamingTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     front.kill()
                     front.wait()
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
+class CancelEndToEndTests(unittest.TestCase):
+    """session/cancel mid-turn must yield stopReason "cancelled"."""
+
+    def test_cancel_during_streaming_turn(self):
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gate = os.path.join(tmpdir, "release")
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": ROOT,
+                "HOME": tmpdir,
+                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+                "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy",
+                "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model",
+                "LOKI_DUMMY_REPLY": "chunked answer",
+                "LOKI_STREAM": "1",
+                "LOKI_DUMMY_STREAM_CHUNKS":
+                    '["first ", "second part"]',
+                "LOKI_DUMMY_STREAM_GATE": gate,
+            })
+            front = subprocess.Popen(
+                [sys.executable, "-m", "loki_agent.acp_main"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            try:
+                def send(message):
+                    front.stdin.write(json.dumps(message) + "\n")
+                    front.stdin.flush()
+
+                def recv():
+                    line = front.stdout.readline()
+                    self.assertTrue(line, "front produced no message")
+                    return json.loads(line)
+
+                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": 1}})
+                while recv().get("id") != 1:
+                    pass
+                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                      "params": {"cwd": tmpdir}})
+                while True:
+                    reply = recv()
+                    if reply.get("id") == 2:
+                        break
+                session_id = reply["result"]["sessionId"]
+
+                send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                      "params": {"sessionId": session_id,
+                                 "prompt": [{"type": "text",
+                                             "text": "hello"}]}})
+                # Wait for the first delta to stream: the turn is now
+                # in flight and blocked on the gate.
+                deadline = _time.monotonic() + 5
+                saw_first_chunk = False
+                while _time.monotonic() < deadline:
+                    message = recv()
+                    if (message.get("method") == "session/update"
+                            and message["params"]["update"].get(
+                                "sessionUpdate") == "agent_message_chunk"):
+                        saw_first_chunk = True
+                        break
+                self.assertTrue(saw_first_chunk, "no delta streamed")
+
+                send({"jsonrpc": "2.0", "method": "session/cancel",
+                      "params": {"sessionId": session_id}})
+
+                while True:
+                    reply = recv()
+                    if reply.get("id") == 3:
+                        break
+                self.assertEqual(reply["result"]["stopReason"],
+                                 "cancelled")
+                # The gate was never released: the cancel, not the gate,
+                # ended the turn.
+                self.assertFalse(os.path.exists(gate))
+            finally:
+                front.stdin.close()
+                try:
+                    front.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    front.kill()
+                    front.wait()

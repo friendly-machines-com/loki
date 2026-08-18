@@ -28,11 +28,29 @@ class Worker:
 
     # -- dispatch ---------------------------------------------------------
 
-    async def handle(self, message: dict):
+    async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
         request_id = message.get("id")
         if method is None or request_id is None:
             return  # notification or malformed; nothing to answer
+        if concurrent and method == "session/prompt":
+            if (self._prompt_task is not None
+                    and not self._prompt_task.done()):
+                self.write(acps.response(
+                    request_id,
+                    error={"code": acps.INVALID_PARAMS,
+                           "message":
+                               "a prompt is already running for this "
+                               "session"}))
+                return
+            self._prompt_task = asyncio.get_running_loop().create_task(
+                self._answer(message))
+            return
+        await self._answer(message)
+
+    async def _answer(self, message: dict):
+        method = message.get("method")
+        request_id = message.get("id")
         try:
             result = await self.dispatch(method, message.get("params") or {})
         except Exception as error:  # surface as JSON-RPC error, never crash
@@ -70,8 +88,6 @@ class Worker:
     # -- session/prompt ----------------------------------------------------
 
     async def prompt(self, params: dict) -> dict:
-        if self._prompt_task is not None and not self._prompt_task.done():
-            return {"error": "a prompt is already running for this session"}
         texts = []
         for block in params.get("prompt", []):
             if isinstance(block, dict) and block.get("type") == "text":
@@ -94,9 +110,7 @@ class Worker:
                     self.session_id, event, mapper_state):
                 self.write(acps.notification("session/update", update))
 
-        self._prompt_task = asyncio.get_running_loop().create_task(
-            self._run_turn(on_event))
-        await self._prompt_task
+        await self._run_turn(on_event)
         return {"stopReason": self._stop_reason(events)}
 
     async def _run_turn(self, on_event):
@@ -106,11 +120,21 @@ class Worker:
                       "content": "No model selected; configure LOKI_* "
                                  "environment or pick a model."})
             return
+        cancel_check = self.cancel_event.is_set
+
+        async def chat_fn(items, on_text_delta):
+            return await loki.async_chat_completion(
+                items, loki.TOOLS, True, False,
+                on_text_delta=on_text_delta,
+                cancel_check=cancel_check)
+
         await loki.run_tool_loop_async(
             session.transcript_items,
+            chat_fn=chat_fn,
             on_event=on_event,
-            cancel_check=self.cancel_event.is_set,
+            cancel_check=cancel_check,
             cancel_event=self.cancel_event,
+            stream_chat=True,
             on_response=lambda turn, event: loki.mark_chat_log_dirty(),
         )
         loki.save_chat_log()
