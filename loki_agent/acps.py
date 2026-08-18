@@ -18,11 +18,17 @@ class TransportError(Exception):
 
 
 def make_writer(fd: int):
-    """Line-buffered writer for one JSON-RPC message per line."""
+    """Line-buffered writer for one JSON-RPC message per line.
+
+    Payload and delimiter are separate writes: no concatenation means no
+    second copy of a potentially large message, and the newline doubles
+    as the flush marker.
+    """
     stream = os.fdopen(os.dup(fd), "w", encoding="utf-8", buffering=1)
 
     def write(message: dict) -> None:
-        stream.write(json.dumps(message, ensure_ascii=False) + "\n")
+        stream.write(json.dumps(message, ensure_ascii=False))
+        stream.write("\n")
         stream.flush()
 
     return write

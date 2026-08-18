@@ -136,8 +136,9 @@ class Front:
                               params: dict):
         process = self.workers[session_id]
         request_id = f"front-{method}-{session_id}"
-        line = json.dumps(acps.request(request_id, method, params)) + "\n"
+        line = json.dumps(acps.request(request_id, method, params))
         process.stdin.write(line.encode("utf-8"))
+        process.stdin.write(b"\n")
         await process.stdin.drain()
         # Read lines until the reply with our id arrives; worker
         # notifications (session/update) are forwarded to the client.
