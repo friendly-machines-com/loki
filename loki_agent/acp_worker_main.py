@@ -28,6 +28,13 @@ async def amain() -> int:
 
     loki.CREDENTIALS = loki.CredentialStore.capture(os.environ)
     try:
+        loki.apply_runtime_config(loki.build_config_from_env(
+            credentials=loki.CREDENTIALS))
+    except (loki.protocols.ProtocolError, ValueError) as error:
+        # No provider: the session still works; prompts answer with a
+        # model-selection notice instead of a hollow turn.
+        print(f"ACP worker without provider: {error}", file=sys.stderr)
+    try:
         loki.configure_tool_hook_pipeline()
     except loki.tool_runtime.HookConfigurationError as error:
         print(f"Hook configuration error: {error}", file=sys.stderr)

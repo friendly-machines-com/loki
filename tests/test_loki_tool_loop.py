@@ -3879,7 +3879,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
             seen_inputs[1],
             ["message", "model_response", "tool_result"],
         )
-        self.assertEqual([event.get("type") for event in events], ["tool_call", "assistant_message"])
+        self.assertEqual([event.get("type") for event in events], ["tool_call", "tool_result", "assistant_message"])
 
     def test_autonomous_loop_limit_is_hard_and_closes_pending_call(self):
         transcript = [formats.message_item("user", "keep calling")]
@@ -3929,7 +3929,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
                       formats.item_text(transcript[-1]))
         self.assertEqual(
             [event["type"] for event in events],
-            ["tool_call", "max_loops"],
+            ["tool_call", "tool_result", "max_loops"],
         )
 
     def test_empty_incomplete_response_is_a_real_response_event(self):

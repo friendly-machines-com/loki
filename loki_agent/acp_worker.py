@@ -14,14 +14,15 @@ import json
 import os
 import sys
 
-from . import acps, formats, loki, replays, savefiles
+from . import acps, acp_events, formats, loki, replays, savefiles
 from .sessions import Session
 
 
 class Worker:
-    def __init__(self, session: Session, write):
+    def __init__(self, session: Session, write, session_id: str = "worker"):
         self.session = session
         self.write = write
+        self.session_id = session_id
         self.cancel_event = asyncio.Event()
         self._prompt_task: asyncio.Task | None = None
 
@@ -84,18 +85,27 @@ class Worker:
         transcript.append(formats.message_item("user", user_text))
         self.session.chat_log_dirty = True
         events = []
+        mapper_state: dict = {}
+        self.session_id = params.get("sessionId") or self.session_id
+
+        def on_event(event):
+            events.append(event)
+            for update in acp_events.map_event(
+                    self.session_id, event, mapper_state):
+                self.write(acps.notification("session/update", update))
+
         self._prompt_task = asyncio.get_running_loop().create_task(
-            self._run_turn(events.append))
+            self._run_turn(on_event))
         await self._prompt_task
         return {"stopReason": self._stop_reason(events)}
 
-    async def _run_turn(self, emit):
+    async def _run_turn(self, on_event):
         session = self.session
-        emit_lock_events = emit
-
-        def on_event(event):
-            emit_lock_events(event)
-
+        if not loki.current_model():
+            on_event({"type": "assistant_message",
+                      "content": "No model selected; configure LOKI_* "
+                                 "environment or pick a model."})
+            return
         await loki.run_tool_loop_async(
             session.transcript_items,
             on_event=on_event,

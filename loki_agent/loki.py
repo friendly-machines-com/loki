@@ -2258,6 +2258,13 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                 execution=execution,
             )
             transcript_items.append(result_item)
+            on_event({
+                "type": "tool_result",
+                "name": formats.tool_call_name(tc),
+                "call_id": formats.tool_call_id(tc),
+                "content": result["content"],
+                "is_error": not result["ok"],
+            })
             if cancel_check():
                 append_unexecuted_results(
                     tool_calls[call_index + 1:],

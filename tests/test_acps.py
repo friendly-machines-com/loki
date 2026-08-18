@@ -101,18 +101,22 @@ class FrontWorkerTests(unittest.TestCase):
                     self.assertTrue(line, "front produced no message")
                     return json.loads(line)
 
+                def recv_reply(reply_id):
+                    while True:
+                        message = recv()
+                        if message.get("id") == reply_id:
+                            return message
+
                 send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                       "params": {"protocolVersion": 1}})
-                reply = recv()
-                self.assertEqual(reply["id"], 1)
+                reply = recv_reply(1)
                 self.assertEqual(reply["result"]["protocolVersion"], 1)
                 self.assertEqual(
                     reply["result"]["agentInfo"]["name"], "loki")
 
                 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
                       "params": {"cwd": tmpdir}})
-                reply = recv()
-                self.assertEqual(reply["id"], 2)
+                reply = recv_reply(2)
                 session_id = reply["result"]["sessionId"]
                 self.assertTrue(session_id)
 
@@ -122,9 +126,21 @@ class FrontWorkerTests(unittest.TestCase):
                           "sessionId": session_id,
                           "prompt": [{"type": "text",
                                       "text": "hello acp"}]}})
-                reply = recv()
-                self.assertEqual(reply["id"], 3)
+                updates = []
+                while True:
+                    message = recv()
+                    if message.get("id") == 3:
+                        reply = message
+                        break
+                    updates.append(message)
                 self.assertEqual(reply["result"]["stopReason"], "end_turn")
+                # The turn's assistant text must have streamed as a
+                # session/update before the reply landed.
+                self.assertTrue(any(
+                    m.get("method") == "session/update"
+                    and m["params"]["update"]["sessionUpdate"]
+                    == "agent_message_chunk"
+                    for m in updates))
             finally:
                 front.stdin.close()
                 try:
@@ -163,3 +179,117 @@ class FrontWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EventMapperTests(unittest.TestCase):
+    def test_assistant_delta_streams_chunk(self):
+        from loki_agent import acp_events
+        updates = acp_events.map_event("s", {"type": "assistant_delta",
+                                             "content": "hi"}, {})
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(
+            updates[0]["update"]["sessionUpdate"], "agent_message_chunk")
+        self.assertEqual(updates[0]["update"]["content"]["text"], "hi")
+
+    def test_tool_call_then_result_pair(self):
+        from loki_agent import acp_events
+        state = {}
+        call = acp_events.map_event("s", {"type": "tool_call",
+                                          "name": "Bash",
+                                          "args": {"command": "ls"}}, state)
+        self.assertEqual(call[0]["update"]["sessionUpdate"], "tool_call")
+        self.assertEqual(call[0]["update"]["kind"], "execute")
+        self.assertIn("ls", call[0]["update"]["title"])
+        result = acp_events.map_event("s", {"type": "tool_result",
+                                            "name": "Bash",
+                                            "call_id": "call_1",
+                                            "content": "a\nb",
+                                            "is_error": False}, state)
+        self.assertEqual(result[0]["update"]["sessionUpdate"],
+                         "tool_call_update")
+        self.assertEqual(result[0]["update"]["toolCallId"], "call-1")
+        self.assertNotIn("status", result[0]["update"])
+
+    def test_tool_result_error_is_failed(self):
+        from loki_agent import acp_events
+        updates = acp_events.map_event("s", {"type": "tool_result",
+                                             "content": "boom",
+                                             "is_error": True},
+                                       {"pending_call_id": "call-2"})
+        self.assertEqual(updates[0]["update"]["status"], "failed")
+
+    def test_ignored_events_map_to_nothing(self):
+        from loki_agent import acp_events
+        for kind in ("assistant_end", "response_timing", "max_loops",
+                     "assistant_start"):
+            self.assertEqual(
+                acp_events.map_event("s", {"type": kind}, {}), [])
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
+class UpdateStreamingTests(unittest.TestCase):
+    """A tool-call turn must stream session/update notifications."""
+
+    def test_prompt_emits_updates_and_stop_reason(self):
+        # The dummy provider replies with tool calls when the user text
+        # starts with "tool:" -- reply is JSON naming the call.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": ROOT,
+                "HOME": tmpdir,
+                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+                "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy",
+                "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model",
+                "LOKI_DUMMY_REPLY": "plain answer",
+            })
+            front = subprocess.Popen(
+                [sys.executable, "-m", "loki_agent.acp_main"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            try:
+                def send(message):
+                    front.stdin.write(json.dumps(message) + "\n")
+                    front.stdin.flush()
+
+                def recv():
+                    line = front.stdout.readline()
+                    self.assertTrue(line, "front produced no message")
+                    return json.loads(line)
+
+                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": 1}})
+                recv()
+                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                      "params": {"cwd": tmpdir}})
+                session_id = recv()["result"]["sessionId"]
+                send({"jsonrpc": "2.0", "id": 3,
+                      "method": "session/prompt",
+                      "params": {"sessionId": session_id,
+                                 "prompt": [{"type": "text",
+                                             "text": "hello"}]}})
+                messages = []
+                while True:
+                    reply = recv()
+                    if reply.get("id") == 3:
+                        break
+                    messages.append(reply)
+                # Plain reply: at least the assistant message chunk arrived
+                # as a session/update notification before the reply.
+                self.assertTrue(
+                    any(m.get("method") == "session/update"
+                        and m["params"]["update"]["sessionUpdate"]
+                        == "agent_message_chunk"
+                        for m in messages),
+                    f"no agent_message_chunk in {[m.get('method') for m in messages]}")
+                self.assertEqual(reply["result"]["stopReason"], "end_turn")
+            finally:
+                front.stdin.close()
+                try:
+                    front.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    front.kill()
+                    front.wait()
