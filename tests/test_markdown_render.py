@@ -20,6 +20,7 @@ os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 
 from loki_agent import formats
 from loki_agent import loki
+from loki_agent import terminal_frontend
 from loki_agent import terminals
 
 
@@ -311,10 +312,10 @@ class TerminalWiringTests(unittest.TestCase):
     def setUp(self):
         self._old_config = loki.current_session().runtime_config
         loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
-        loki.terminal.assistant_markdown.reset()
+        terminal_frontend.terminal.assistant_markdown.reset()
 
     def tearDown(self):
-        loki.terminal.assistant_markdown.reset()
+        terminal_frontend.terminal.assistant_markdown.reset()
         loki.current_session().runtime_config = self._old_config
 
     def replay(self, events, terminal_stub):
@@ -323,7 +324,7 @@ class TerminalWiringTests(unittest.TestCase):
                 contextlib.redirect_stdout(output), \
                 contextlib.redirect_stderr(io.StringIO()):
             for event in events:
-                loki._terminal_agent_event(event)
+                terminal_frontend._terminal_agent_event(event)
         return output.getvalue()
 
     @staticmethod
@@ -340,13 +341,13 @@ class TerminalWiringTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(terminals, "terminal", StyledTerminal()), \
                 contextlib.redirect_stdout(output):
-            loki._terminal_agent_event({"type": "assistant_start"})
-            loki._terminal_agent_event({
+            terminal_frontend._terminal_agent_event({"type": "assistant_start"})
+            terminal_frontend._terminal_agent_event({
                 "type": "assistant_delta",
                 "content": "visible without a newline",
             })
             before_end = output.getvalue()
-            loki._terminal_agent_event({
+            terminal_frontend._terminal_agent_event({
                 "type": "assistant_end",
                 "complete": True,
             })
@@ -446,10 +447,10 @@ class ToolLoopWiringTests(unittest.TestCase):
     def setUp(self):
         self._old_config = loki.current_session().runtime_config
         loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
-        loki.terminal.assistant_markdown.reset()
+        terminal_frontend.terminal.assistant_markdown.reset()
 
     def tearDown(self):
-        loki.terminal.assistant_markdown.reset()
+        terminal_frontend.terminal.assistant_markdown.reset()
         loki.current_session().runtime_config = self._old_config
 
     def test_streamed_events_render_styled_and_not_duplicated(self):
@@ -486,7 +487,7 @@ class ToolLoopWiringTests(unittest.TestCase):
                 contextlib.redirect_stdout(output), \
                 contextlib.redirect_stderr(io.StringIO()):
             for event in events:
-                loki._terminal_agent_event(event)
+                terminal_frontend._terminal_agent_event(event)
 
         self.assertEqual(
             output.getvalue(),

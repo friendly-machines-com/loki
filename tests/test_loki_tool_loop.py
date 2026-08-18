@@ -21,6 +21,7 @@ os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 
 from loki_agent import formats
 from loki_agent import loki
+from loki_agent import terminal_frontend
 from loki_agent import models as modelsdev
 from loki_agent import protocols
 from loki_agent.connections import ConnectionDescriptor
@@ -546,15 +547,15 @@ class ModelLoadingTests(unittest.TestCase):
             path = os.path.join(tmpdir, "chat-test.json")
             loader = mock.AsyncMock()
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.new_chat_log_path",
+                        "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
                         ), mock.patch(
-                            "loki_agent.loki.load_models_async",
+                            "loki_agent.terminal_frontend.load_models_async",
                             new=loader):
-                status = asyncio.run(loki.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([]))
 
         loader.assert_not_awaited()
         self.assertEqual(status, 0)
@@ -574,11 +575,11 @@ class ModelLoadingTests(unittest.TestCase):
         stderr = io.StringIO()
 
         with mock.patch(
-                "loki_agent.loki.load_models_async",
+                "loki_agent.terminal_frontend.load_models_async",
                 new=loader), mock.patch(
-                    "loki_agent.loki.run_subagent_cli_async",
+                    "loki_agent.terminal_frontend.run_subagent_cli_async",
                     new=runner), contextlib.redirect_stderr(stderr):
-            status = asyncio.run(loki.async_main(["--headless"]))
+            status = asyncio.run(terminal_frontend.async_main(["--headless"]))
 
         loader.assert_not_awaited()
         runner.assert_not_awaited()
@@ -598,9 +599,9 @@ class ModelLoadingTests(unittest.TestCase):
         runner = mock.AsyncMock()
 
         with mock.patch(
-                "loki_agent.loki.run_subagent_cli_async",
+                "loki_agent.terminal_frontend.run_subagent_cli_async",
                 new=runner):
-            status = asyncio.run(loki.async_main(["--headless"]))
+            status = asyncio.run(terminal_frontend.async_main(["--headless"]))
 
         runner.assert_awaited_once()
         self.assertEqual(status, 0)
@@ -613,9 +614,9 @@ class ModelLoadingTests(unittest.TestCase):
         stderr = io.StringIO()
 
         with mock.patch(
-                "loki_agent.loki.run_subagent_cli_async",
+                "loki_agent.terminal_frontend.run_subagent_cli_async",
                 new=runner), contextlib.redirect_stderr(stderr):
-            status = asyncio.run(loki.async_main(["--headless"]))
+            status = asyncio.run(terminal_frontend.async_main(["--headless"]))
 
         runner.assert_not_awaited()
         self.assertEqual(status, 2)
@@ -632,10 +633,10 @@ class ModelLoadingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             missing = os.path.join(tmpdir, "missing-chat.json")
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), contextlib.redirect_stderr(stderr):
                 status = asyncio.run(
-                    loki.async_main([f"--resume={missing}"]))
+                    terminal_frontend.async_main([f"--resume={missing}"]))
 
         self.assertEqual(status, 1)
         self.assertIn("Could not resume chat:", stderr.getvalue())
@@ -666,13 +667,13 @@ class ModelLoadingTests(unittest.TestCase):
                 json.dumps(blob), encoding="utf-8")
             confirm = mock.AsyncMock(return_value=True)
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.confirm_saved_connection_async",
+                        "loki_agent.terminal_frontend.confirm_saved_connection_async",
                         new=confirm), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"):
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"):
                 status = asyncio.run(
-                    loki.async_main([f"--resume={path}"]))
+                    terminal_frontend.async_main([f"--resume={path}"]))
 
         confirm.assert_awaited_once()
         self.assertEqual(status, 0)
@@ -696,15 +697,15 @@ class ModelLoadingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.new_chat_log_path",
+                        "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
                         ), mock.patch(
-                            "loki_agent.loki.run_terminal_turn_async",
+                            "loki_agent.terminal_frontend.run_terminal_turn_async",
                             new=runner), contextlib.redirect_stderr(stderr):
-                status = asyncio.run(loki.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([]))
 
         runner.assert_not_awaited()
         self.assertEqual(status, 0)
@@ -734,23 +735,23 @@ class ModelLoadingTests(unittest.TestCase):
             path = os.path.join(tmpdir, "chat-test.json")
             loader = mock.AsyncMock(side_effect=load_provider_models)
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.new_chat_log_path",
+                        "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
                         ), mock.patch(
-                            "loki_agent.loki.load_models_async",
+                            "loki_agent.terminal_frontend.load_models_async",
                             new=loader), mock.patch(
-                                "loki_agent.loki.modelsdev."
+                                "loki_agent.terminal_frontend.modelsdev."
                                 "run_model_picker_async",
                                 new=mock.AsyncMock(
                                     side_effect=OSError("offline"))), \
                     mock.patch(
-                        "loki_agent.loki.modelsdev."
+                        "loki_agent.terminal_frontend.modelsdev."
                         "run_flat_model_picker_async",
                         new=mock.AsyncMock(return_value=None)):
-                status = asyncio.run(loki.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([]))
 
         loader.assert_awaited_once()
         self.assertEqual(status, 0)
@@ -775,23 +776,23 @@ class ModelLoadingTests(unittest.TestCase):
             path = os.path.join(tmpdir, "chat-test.json")
             loader = mock.AsyncMock(side_effect=load_provider_models)
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.new_chat_log_path",
+                        "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
                         ), mock.patch(
-                            "loki_agent.loki.load_models_async",
+                            "loki_agent.terminal_frontend.load_models_async",
                             new=loader), mock.patch(
-                                "loki_agent.loki.modelsdev."
+                                "loki_agent.terminal_frontend.modelsdev."
                                 "run_model_picker_async",
                                 new=mock.AsyncMock(
                                     side_effect=OSError("offline"))), \
                     mock.patch(
-                        "loki_agent.loki.modelsdev."
+                        "loki_agent.terminal_frontend.modelsdev."
                         "run_flat_model_picker_async",
                         new=mock.AsyncMock(return_value="selected-model")):
-                status = asyncio.run(loki.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([]))
 
             with open(path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
@@ -826,17 +827,17 @@ class ModelLoadingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.new_chat_log_path",
+                        "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
                         ), mock.patch(
-                            "loki_agent.loki.modelsdev."
+                            "loki_agent.terminal_frontend.modelsdev."
                             "run_model_picker_async",
                             new=mock.AsyncMock(return_value=(
                                 "provider", provider_entry, model_entry))):
-                status = asyncio.run(loki.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([]))
 
             with open(path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
@@ -844,7 +845,7 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(loki.current_config().model_status, "deprecated")
         self.assertIn(
-            "Model: old-model (deprecated); /model", loki.status_text())
+            "Model: old-model (deprecated); /model", terminal_frontend.status_text())
         self.assertEqual(
             saved["session_state"]["connection"]["model_status"],
             "deprecated",
@@ -880,16 +881,16 @@ class ModelLoadingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.new_chat_log_path",
+                        "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
                         ), mock.patch(
-                            "loki_agent.loki.modelsdev."
+                            "loki_agent.terminal_frontend.modelsdev."
                             "run_model_picker_async",
                             new=mock.AsyncMock(side_effect=pick_model)):
-                status = asyncio.run(loki.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([]))
 
             with open(path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
@@ -934,23 +935,23 @@ class ModelLoadingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
             with mock.patch(
-                    "loki_agent.loki.input_session",
+                    "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
-                        "loki_agent.loki.new_chat_log_path",
+                        "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
-                            "loki_agent.loki.restore_output_area_after_input"
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
                         ), mock.patch(
-                            "loki_agent.loki.modelsdev."
+                            "loki_agent.terminal_frontend.modelsdev."
                             "run_model_picker_async",
                             new=mock.AsyncMock(
                                 side_effect=OSError("offline"))), mock.patch(
-                                    "loki_agent.loki.load_models_async",
+                                    "loki_agent.terminal_frontend.load_models_async",
                                     new=mock.AsyncMock()), mock.patch(
-                                        "loki_agent.loki.modelsdev."
+                                        "loki_agent.terminal_frontend.modelsdev."
                                         "run_flat_model_picker_async",
                                         new=mock.AsyncMock(
                                             side_effect=pick_flat)):
-                status = asyncio.run(loki.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([]))
 
         self.assertEqual(status, 0)
         self.assertEqual(len(seen_explicit), 1)
@@ -1002,21 +1003,21 @@ class ExitStatusTests(unittest.TestCase):
                     return async_status
 
                 with self.subTest(async_status=async_status), mock.patch(
-                        "loki_agent.loki.CredentialStore.capture",
+                        "loki_agent.terminal_frontend.CredentialStore.capture",
                         return_value=CredentialStore({})), mock.patch(
-                            "loki_agent.loki.signal.signal"), mock.patch(
-                                "loki_agent.loki.signal.pthread_sigmask"
+                            "loki_agent.terminal_frontend.signal.signal"), mock.patch(
+                                "loki_agent.terminal_frontend.signal.pthread_sigmask"
                             ), mock.patch(
-                                "loki_agent.loki.initialize_terminal_overlay"
+                                "loki_agent.terminal_frontend.initialize_terminal_overlay"
                             ), mock.patch(
-                                "loki_agent.loki.asyncio.run",
+                                "loki_agent.terminal_frontend.asyncio.run",
                                 side_effect=finish), mock.patch(
-                                    "loki_agent.loki."
+                                    "loki_agent.terminal_frontend."
                                     "restore_terminal_overlay",
                                     side_effect=OSError("restore failed")
                                 ), mock.patch.object(loki.current_session(), "chat_log_path", None
                                 ), contextlib.redirect_stderr(stderr):
-                    status = loki.main()
+                    status = terminal_frontend.main()
 
                 self.assertEqual(status, expected_status)
         finally:
@@ -1054,7 +1055,7 @@ class StatusTextTests(unittest.TestCase):
             )
             # model is derived from runtime_config set above
 
-            text = loki.status_text()
+            text = terminal_frontend.status_text()
         finally:
             restore_loki_state(old_values)
 
@@ -1083,7 +1084,7 @@ class StatusTextTests(unittest.TestCase):
                 model_status="deprecated",
             ))
 
-            text = loki.status_text()
+            text = terminal_frontend.status_text()
         finally:
             restore_loki_state(old_values)
 
@@ -1101,7 +1102,7 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
     def test_initialize_clears_only_from_cursor_to_end(self):
         terminal = self.RecordingTerminal()
 
-        loki.initialize_terminal_overlay(terminal)
+        terminal_frontend.initialize_terminal_overlay(terminal)
 
         self.assertEqual(terminal.calls, [
             ("hide_cursor",),
@@ -1109,7 +1110,7 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
             ("enable_origin_mode",),
             ("clear_to_end_of_screen",),
             ("reset_colors_and_flags",),
-            ("set_clipping_region", *loki.terminals.output_area),
+            ("set_clipping_region", *terminal_frontend.terminals.output_area),
             ("goto_position", 1, 1),
             ("flush",),
         ])
@@ -1118,14 +1119,14 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
     def test_restore_resets_scroll_region_then_clears_to_end(self):
         terminal = self.RecordingTerminal()
 
-        loki.restore_terminal_overlay(terminal)
+        terminal_frontend.restore_terminal_overlay(terminal)
 
         self.assertEqual(terminal.calls, [
             ("disable_bracketed_paste_mode",),
             ("disable_clipping_regions",),
             ("disable_origin_mode",),
             ("reset_colors_and_flags",),
-            ("goto_position", loki.terminals.input_area[0], 1),
+            ("goto_position", terminal_frontend.terminals.input_area[0], 1),
             ("clear_to_end_of_screen",),
             ("show_cursor",),
             ("flush",),
@@ -2619,7 +2620,7 @@ class SessionPickerTests(unittest.TestCase):
                 return _FakeModal()
 
         session = _FakeSession()
-        saved_terminal = loki.terminal
+        saved_terminal = terminal_frontend.terminal
 
         class _FakeTerminal:
             def __init__(self):
@@ -2640,11 +2641,11 @@ class SessionPickerTests(unittest.TestCase):
             def flush(self, *a, **k):
                 self.calls.append(("flush",))
 
-        loki.terminal = _FakeTerminal()
+        terminal_frontend.terminal = _FakeTerminal()
 
         def restore():
             loki.CHAT_LOG_DIR = saved_log_dir
-            loki.terminal = saved_terminal
+            terminal_frontend.terminal = saved_terminal
 
         return restore, session
 
@@ -2655,7 +2656,7 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "ccc", '{"text":"gamma chat"}', mtime=3000)
             restore, session = self._make_picker(tmpdir, ["2"])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             # mtime-sorted oldest->newest: aaa(1000), bbb(2000), ccc(3000).
@@ -2671,7 +2672,7 @@ class SessionPickerTests(unittest.TestCase):
             try:
                 with contextlib.redirect_stdout(output):
                     result = asyncio.run(
-                        loki.run_session_picker_async(session))
+                        terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
 
@@ -2683,9 +2684,9 @@ class SessionPickerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
             restore, session = self._make_picker(tmpdir, ["1"])
-            picker_terminal = loki.terminal
+            picker_terminal = terminal_frontend.terminal
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
 
@@ -2703,7 +2704,7 @@ class SessionPickerTests(unittest.TestCase):
             restore, session = self._make_picker(
                 tmpdir, ["filter beta alpha", "1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             # Only the aaa log contains both "beta" and "alpha".
@@ -2717,7 +2718,7 @@ class SessionPickerTests(unittest.TestCase):
             restore, session = self._make_picker(
                 tmpdir, ["404", "filter 404", "1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             self.assertTrue(result.endswith("chat-aaa.json"))
@@ -2730,7 +2731,7 @@ class SessionPickerTests(unittest.TestCase):
             (restore, session) = self._make_picker(
                 tmpdir, ["filter alpha", "filter", "2"])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             # After clearing, both visible; "2" = bbb (newest last).
@@ -2741,7 +2742,7 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
             restore, session = self._make_picker(tmpdir, [""])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             self.assertIsNone(result)
@@ -2753,7 +2754,7 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "new", '{"text":"new session"}', mtime=3000)
             restore, session = self._make_picker(tmpdir, ["3"])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             # Oldest->newest: old, mid, new. "3" = newest.
@@ -2767,7 +2768,7 @@ class SessionPickerTests(unittest.TestCase):
             # No closing quote, no closing brace -- regex should still grab "hi there...".
             restore, session = self._make_picker(tmpdir, ["1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             self.assertTrue(result.endswith("chat-broken.json"))
@@ -2781,7 +2782,7 @@ class SessionPickerTests(unittest.TestCase):
             # "1" selects the first row.
             restore, session = self._make_picker(tmpdir, ["alpha", "1"])
             try:
-                result = asyncio.run(loki.run_session_picker_async(session))
+                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
             finally:
                 restore()
             self.assertTrue(result.endswith("chat-aaa.json"))
@@ -3228,9 +3229,9 @@ class ShellCwdTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             declined = asyncio.run(
-                loki.confirm_saved_connection_async(descriptor, no_session))
+                terminal_frontend.confirm_saved_connection_async(descriptor, no_session))
             accepted = asyncio.run(
-                loki.confirm_saved_connection_async(descriptor, yes_session))
+                terminal_frontend.confirm_saved_connection_async(descriptor, yes_session))
 
         self.assertFalse(declined)
         self.assertTrue(accepted)
@@ -3278,7 +3279,7 @@ class ShellCwdTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             accepted = asyncio.run(
-                loki.confirm_saved_connection_async(
+                terminal_frontend.confirm_saved_connection_async(
                     descriptor, FakeSession()))
 
         self.assertTrue(accepted)
@@ -3693,7 +3694,7 @@ class StreamingToolLoopTests(unittest.TestCase):
 
         with contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(stderr):
-            loki._terminal_agent_event({
+            terminal_frontend._terminal_agent_event({
                 "type": "response_incomplete",
                 "protocol_data": {"reason": "max_output_tokens"},
             })
@@ -3707,20 +3708,20 @@ class StreamingToolLoopTests(unittest.TestCase):
             loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
             with contextlib.redirect_stdout(output), \
                     contextlib.redirect_stderr(output):
-                loki._terminal_agent_event({"type": "assistant_start"})
-                loki._terminal_agent_event({
+                terminal_frontend._terminal_agent_event({"type": "assistant_start"})
+                terminal_frontend._terminal_agent_event({
                     "type": "assistant_delta",
                     "content": "**hel",
                 })
-                loki._terminal_agent_event({
+                terminal_frontend._terminal_agent_event({
                     "type": "assistant_delta",
                     "content": "lo**",
                 })
-                loki._terminal_agent_event({
+                terminal_frontend._terminal_agent_event({
                     "type": "assistant_end",
                     "complete": True,
                 })
-                loki._terminal_agent_event({
+                terminal_frontend._terminal_agent_event({
                     "type": "response_timing",
                     "elapsed": 1.25,
                 })

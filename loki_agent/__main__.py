@@ -1,4 +1,4 @@
-from .loki import main
+from .terminal_frontend import main
 
 
 if __name__ == "__main__":

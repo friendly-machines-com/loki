@@ -140,7 +140,7 @@ class Worker:
             path = os.path.join(
                 loki.CHAT_LOG_DIR, os.path.basename(str(resume)))
             if os.path.isfile(path):
-                loki.load_chat_log(path, quiet=True)
+                loki.load_chat_log(path)
                 if params.get("replay"):
                     self._replay_transcript()
             else:
