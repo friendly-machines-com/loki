@@ -81,6 +81,8 @@ class Front:
             return self.initialize(params)
         if method == "session/new":
             return await self.new_session(params)
+        if method == "session/load":
+            return await self.load_session(params)
         if method == "session/list":
             return self.list_sessions(params)
         if method in SESSION_METHODS:
@@ -120,6 +122,33 @@ class Front:
         if config_options:
             result["configOptions"] = config_options
         return result
+
+    async def load_session(self, params: dict) -> dict | None:
+        """Resume a saved conversation in a fresh worker.
+
+        The worker replays the saved transcript as session/update
+        notifications before answering session/open, mirroring what the
+        terminal shows on --resume.
+        """
+        saved_id = params.get("sessionId")
+        if not saved_id:
+            raise acps.TransportError("session/load requires sessionId")
+        cwd = params.get("cwd") or os.getcwd()
+        self._next_worker_id += 1
+        session_id = f"loki-{os.getpid()}-{self._next_worker_id}"
+        process = await asyncio.create_subprocess_exec(
+            *WORKER_COMMAND,
+            cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=None,
+        )
+        self.workers[session_id] = process
+        await self._worker_request(
+            session_id, "session/open",
+            {"sessionId": session_id, "resume": saved_id,
+             "replay": params.get("replay", True)})
+        return {"sessionId": session_id}
 
     def list_sessions(self, params: dict) -> dict:
         import datetime

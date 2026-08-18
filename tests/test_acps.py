@@ -381,3 +381,129 @@ class CancelEndToEndTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     front.kill()
                     front.wait()
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
+class LoadReplayTests(unittest.TestCase):
+    def _front(self, env, cwd):
+        return subprocess.Popen(
+            [sys.executable, "-m", "loki_agent.acp_main"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, env=env, cwd=cwd)
+
+    def _env(self, tmpdir, reply="loadable answer"):
+        env = dict(os.environ)
+        env.update({
+            "PYTHONPATH": ROOT,
+            "HOME": tmpdir,
+            "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+            "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+            "TERM": "dumb",
+            "LOKI_PROVIDER": "dummy",
+            "LOKI_API_BASE": "http://dummy.invalid/v1",
+            "LOKI_MODEL": "dummy-model",
+            "LOKI_DUMMY_REPLY": reply,
+        })
+        return env
+
+    def test_load_replays_history_and_continues(self):
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env(tmpdir)
+            # Session 1: one prompt, one answer, saved.
+            front = self._front(env, tmpdir)
+            try:
+                def send(fd, m):
+                    fd.stdin.write(json.dumps(m) + "\n")
+                    fd.stdin.flush()
+
+                def recv(fd):
+                    line = fd.stdout.readline()
+                    self.assertTrue(line)
+                    return json.loads(line)
+
+                send(front, {"jsonrpc": "2.0", "id": 1,
+                             "method": "initialize",
+                             "params": {"protocolVersion": 1}})
+                while recv(front).get("id") != 1:
+                    pass
+                send(front, {"jsonrpc": "2.0", "id": 2,
+                             "method": "session/new",
+                             "params": {"cwd": tmpdir}})
+                while True:
+                    m = recv(front)
+                    if m.get("id") == 2:
+                        break
+                first_session = m["result"]["sessionId"]
+                send(front, {"jsonrpc": "2.0", "id": 3,
+                             "method": "session/prompt",
+                             "params": {
+                                 "sessionId": first_session,
+                                 "prompt": [{"type": "text",
+                                             "text": "remember this"}]}})
+                while True:
+                    m = recv(front)
+                    if m.get("id") == 3:
+                        break
+                self.assertEqual(m["result"]["stopReason"], "end_turn")
+            finally:
+                front.stdin.close()
+                front.wait(timeout=5)
+
+            # The saved log must exist with a cwd in its state.
+            logs = [f for f in os.listdir(
+                os.path.join(tmpdir, ".loki", "chats"))]
+            self.assertEqual(len(logs), 1, logs)
+            saved_id = logs[0]
+
+            # Session 2: fresh front process, load the saved conversation.
+            front2 = self._front(env, tmpdir)
+            try:
+                send(front2, {"jsonrpc": "2.0", "id": 1,
+                              "method": "initialize",
+                              "params": {"protocolVersion": 1}})
+                while recv(front2).get("id") != 1:
+                    pass
+                send(front2, {"jsonrpc": "2.0", "id": 2,
+                              "method": "session/load",
+                              "params": {"sessionId": saved_id,
+                                         "cwd": tmpdir}})
+                replayed = []
+                while True:
+                    m = recv(front2)
+                    if m.get("id") == 2:
+                        break
+                    replayed.append(m)
+                new_session = m["result"]["sessionId"]
+                self.assertNotEqual(new_session, first_session)
+                kinds = [
+                    u["params"]["update"]["sessionUpdate"]
+                    for u in replayed
+                    if u.get("method") == "session/update"
+                ]
+                self.assertIn("user_message_chunk", kinds)
+                self.assertIn("agent_message_chunk", kinds)
+                texts = " ".join(
+                    u["params"]["update"]["content"]["text"]
+                    for u in replayed
+                    if u.get("method") == "session/update"
+                    and u["params"]["update"]["sessionUpdate"]
+                    in ("user_message_chunk", "agent_message_chunk"))
+                self.assertIn("remember this", texts)
+                self.assertIn("loadable answer", texts)
+
+                # The loaded session continues: a new prompt works.
+                send(front2, {"jsonrpc": "2.0", "id": 3,
+                              "method": "session/prompt",
+                              "params": {
+                                  "sessionId": new_session,
+                                  "prompt": [{"type": "text",
+                                              "text": "continue"}]}})
+                while True:
+                    m = recv(front2)
+                    if m.get("id") == 3:
+                        break
+                self.assertEqual(m["result"]["stopReason"], "end_turn")
+            finally:
+                front2.stdin.close()
+                front2.wait(timeout=5)

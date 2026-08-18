@@ -78,12 +78,51 @@ class Worker:
             path = os.path.join(
                 loki.CHAT_LOG_DIR, os.path.basename(str(resume)))
             if os.path.isfile(path):
-                loki.load_chat_log(path, _quiet=True)
+                loki.load_chat_log(path, quiet=True)
+                if params.get("replay"):
+                    self._replay_transcript()
+            else:
+                raise acps.TransportError(
+                    f"no saved session named {resume!r}")
         else:
             loki.new_chat_log(os.path.join(
                 loki.CHAT_LOG_DIR,
                 f"chat-{params.get('sessionId', 'acp')}.json"))
         return {}
+
+    def _replay_transcript(self) -> None:
+        """Emit the loaded history as session/update notifications."""
+        blocks = replays.classify_transcript(
+            self.session.transcript_items)
+        for kind, text, key in blocks:
+            if kind == "user":
+                self.write(acps.notification("session/update", {
+                    "sessionId": self.session_id,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                    },
+                }))
+            elif kind == "tool":
+                title, call_id = text, key
+                self.write(acps.notification("session/update", {
+                    "sessionId": self.session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": str(call_id or "replay"),
+                        "title": title.split("\n")[0][:120],
+                        "kind": "other",
+                        "status": "completed",
+                    },
+                }))
+            else:
+                self.write(acps.notification("session/update", {
+                    "sessionId": self.session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": text},
+                    },
+                }))
 
     # -- session/prompt ----------------------------------------------------
 
