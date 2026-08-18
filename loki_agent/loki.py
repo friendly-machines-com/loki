@@ -4079,6 +4079,9 @@ async def async_main(args) -> int:
     # user_messages queue for the whole session (see terminals.InputSession).
     # loki.py consumes the normal queue; session.modal() is the one exclusive
     # path used by the session picker, saved-connection prompt, and /model.
+    # Take over the keyboard here, not at terminals import time: importing
+    # loki must leave stdin alone (headless and ACP processes read it).
+    terminals.open_terminal_stdin()
     async with input_session(on_mode_cycle=lambda: cycle_agent_mode(),
                              history_provider=lambda: user_prompt_history(current_transcript())) as session:
         if args[0:1] == ['resume']:

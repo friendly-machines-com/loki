@@ -19,23 +19,40 @@ RESET = '\033[0m'
 MARKDOWN_MAX_UNRESOLVED = 4096
 
 
-if not os.isatty(sys.stdin.fileno()):
+def open_terminal_stdin() -> int:
+    """Own the keyboard: replace fd 0 with a fresh /dev/tty open.
+
+    stdin and stdout normally share one open file description (the pty
+    slave), so AsyncByteReader setting O_NONBLOCK on stdin for async
+    reads would also make stdout non-blocking -- and print() then raises
+    BlockingIOError (EAGAIN) when the kernel write buffer fills.
+    Reopening /dev/tty as fd 0 gives reads a fresh open file description
+    whose status flags are independent of stdout's.
+
+    The terminal front-end calls this when it starts reading keys.
+    Importing this module never touches fd 0: headless and ACP processes
+    read stdin themselves and must not have it swapped under them.
+    Without a controlling tty this is a no-op returning fd 0.
+    """
+    global new_stdin
+    if not os.isatty(0):
+        new_stdin = 0
+        return new_stdin
+    sys.stdin.close()
+    new_stdin = os.open('/dev/tty', os.O_RDONLY)
+    return new_stdin
+
+
+new_stdin = sys.stdin.fileno()
+
+if not os.isatty(new_stdin):
   # Noninteractive tests and headless runs still import terminal helpers. The
   # no-op terminal keeps those paths from emitting escape sequences or touching
   # terminal state when stdin is not a TTY.
-  new_stdin = sys.stdin.fileno()
   class Terminal:
       def __getattr__(self, x):
           return lambda *args, **kwargs: None
 else:
-  # stdin and stdout normally share one open file description (the pty slave),
-  # so AsyncByteReader setting O_NONBLOCK on stdin for async reads would also
-  # make stdout non-blocking -- and print() then raises BlockingIOError (EAGAIN)
-  # when the kernel write buffer fills. Reopen /dev/tty as fd 0: a fresh open
-  # file description whose status flags are independent of stdout's, so reads
-  # can be made non-blocking without affecting writes.
-  sys.stdin.close()
-  new_stdin = os.open('/dev/tty', os.O_RDONLY)
   class Terminal:
     def __init__(self):
         self.bracketed_paste = False

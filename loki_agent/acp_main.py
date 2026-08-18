@@ -18,17 +18,11 @@ async def amain() -> int:
     saved_stdout = os.dup(1)
     acps.quarantine_stdout()
     write = acps.make_writer(saved_stdout)
-    # terminals.py closes sys.stdin at import when stdin is a tty (the
-    # terminal UI reopens fd 0 as /dev/tty for its async reader).  The
-    # ACP front never uses that UI but inherits the closed object, so
-    # read fd 0 directly: it is the client's pipe, or /dev/tty when a
-    # human is typing test lines into an interactive run.
-    stdin = os.fdopen(0, "r", encoding="utf-8", errors="replace")
 
     async def read():
         loop = asyncio.get_running_loop()
         while True:
-            line = await loop.run_in_executor(None, stdin.readline)
+            line = await loop.run_in_executor(None, sys.stdin.readline)
             if not line:
                 return
             line = line.strip()
