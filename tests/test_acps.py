@@ -671,3 +671,69 @@ class ConfigOptionTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     front.kill()
                     front.wait()
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
+class TtyStdinTests(unittest.TestCase):
+    """The front must work when stdin is a tty, not just a pipe.
+
+    terminals.py closes sys.stdin at import when stdin is a tty (the
+    terminal UI owns fd 0 via /dev/tty); the ACP processes read fd 0
+    directly instead.  This test gives the front a real controlling
+    pty, exactly like an interactive manual run.
+    """
+
+    def test_front_answers_initialize_with_tty_stdin(self):
+        import fcntl
+        import pty
+        import termios
+        import time as _time
+        master, slave = pty.openpty()
+
+        def child_setup():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": ROOT,
+                "HOME": tmpdir,
+                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+                "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy",
+                "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model",
+                "LOKI_DUMMY_REPLY": "x",
+            })
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "loki_agent.acp_main"],
+                stdin=slave, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, env=env, cwd=tmpdir,
+                preexec_fn=child_setup, text=True)
+            os.close(slave)
+            try:
+                os.write(master, (json.dumps({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": 1},
+                }) + "\n").encode())
+                reply = None
+                deadline = _time.monotonic() + 8
+                while _time.monotonic() < deadline:
+                    line = proc.stdout.readline()
+                    if line:
+                        reply = json.loads(line)
+                        break
+                self.assertIsNotNone(reply, "no reply to initialize")
+                self.assertEqual(reply["id"], 1)
+                self.assertEqual(
+                    reply["result"]["agentInfo"]["name"], "loki")
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                os.close(master)

@@ -42,8 +42,10 @@ async def amain() -> int:
 
     import json
     loop = asyncio.get_running_loop()
+    # fd 0 directly, not sys.stdin: see the comment in acp_main.amain.
+    stdin = os.fdopen(0, "r", encoding="utf-8", errors="replace")
     while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline)
+        line = await loop.run_in_executor(None, stdin.readline)
         if not line:
             break
         line = line.strip()
