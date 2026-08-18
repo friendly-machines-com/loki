@@ -593,3 +593,81 @@ class SessionListTests(unittest.TestCase):
             finally:
                 front2.stdin.close()
                 front2.wait(timeout=5)
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
+class ConfigOptionTests(unittest.TestCase):
+    def test_session_new_returns_model_options(self):
+        # The dummy env has no usable catalog credentials, so the option
+        # list carries only the explicit LOKI_* connection -- which is
+        # enough to prove the option plumbing flows and is settable.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": ROOT,
+                "HOME": tmpdir,
+                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+                "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy",
+                "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model",
+                "LOKI_DUMMY_REPLY": "x",
+            })
+            front = subprocess.Popen(
+                [sys.executable, "-m", "loki_agent.acp_main"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            try:
+                def send(m):
+                    front.stdin.write(json.dumps(m) + "\n")
+                    front.stdin.flush()
+
+                def recv():
+                    line = front.stdout.readline()
+                    self.assertTrue(line)
+                    return json.loads(line)
+
+                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": 1}})
+                while recv().get("id") != 1:
+                    pass
+                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                      "params": {"cwd": tmpdir}})
+                while True:
+                    m = recv()
+                    if m.get("id") == 2:
+                        break
+                session_id = m["result"]["sessionId"]
+                options = m["result"]["configOptions"]
+                self.assertEqual(len(options), 1)
+                model_option = options[0]
+                self.assertEqual(model_option["id"], "model")
+                self.assertEqual(model_option["category"], "model")
+                self.assertEqual(model_option["type"], "select")
+                self.assertEqual(model_option["currentValue"],
+                                 "loki-explicit")
+                values = [o["value"] for o in model_option["options"]]
+                self.assertEqual(values, ["loki-explicit"])
+
+                # Setting the value round-trips and echoes full state.
+                send({"jsonrpc": "2.0", "id": 3,
+                      "method": "session/set_config_option",
+                      "params": {"sessionId": session_id,
+                                 "configId": "model",
+                                 "value": "loki-explicit"}})
+                while True:
+                    m = recv()
+                    if m.get("id") == 3:
+                        break
+                self.assertIn("configOptions", m["result"])
+                self.assertEqual(
+                    m["result"]["configOptions"][0]["currentValue"],
+                    "loki-explicit")
+            finally:
+                front.stdin.close()
+                try:
+                    front.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    front.kill()
+                    front.wait()

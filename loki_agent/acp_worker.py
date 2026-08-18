@@ -14,7 +14,7 @@ import json
 import os
 import sys
 
-from . import acps, acp_events, formats, loki, replays, savefiles
+from . import acps, acp_events, formats, loki, models as modelsdev, replays, savefiles
 from .sessions import Session
 
 
@@ -25,6 +25,8 @@ class Worker:
         self.session_id = session_id
         self.cancel_event = asyncio.Event()
         self._prompt_task: asyncio.Task | None = None
+        self._model_options: list = []
+        self._option_leaves: dict = {}
 
     # -- dispatch ---------------------------------------------------------
 
@@ -68,8 +70,68 @@ class Worker:
             return {}
         if method == "session/open":
             return self.open(params)
+        if method == "session/set_config_option":
+            return self.set_config_option(params)
         raise acps.TransportError(
             f"worker does not implement {method}")
+
+    def config_options(self) -> list:
+        """The model select for the client, with currentValue applied."""
+        current = loki.current_model()
+        current_value = None
+        for option in self._model_options:
+            if option["value"] in (
+                    current, f"loki-explicit") and (
+                    option["value"] != "loki-explicit"
+                    or current and loki.current_config()
+                    and loki.current_config().provider_kind
+                    == loki.protocols.DUMMY):
+                current_value = option["value"]
+                break
+        options = []
+        for option in self._model_options:
+            entry = dict(option)
+            options.append(entry)
+        if current_value is None and self._option_leaves:
+            # Fall back to matching the active provider/model pair.
+            config = loki.current_config()
+            if config is not None:
+                wanted = f"{config.provider_id}/{current}"
+                if any(o["value"] == wanted for o in options):
+                    current_value = wanted
+        return [{
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current_value or (
+                options[0]["value"] if options else ""),
+            "options": options,
+        }]
+
+    def set_config_option(self, params: dict) -> dict:
+        config_id = params.get("configId")
+        if config_id != "model":
+            raise acps.TransportError(
+                f"unknown config option {config_id!r}")
+        value = params.get("value")
+        leaf = self._option_leaves.get(value)
+        if leaf is None:
+            raise acps.TransportError(f"unknown model value {value!r}")
+        if leaf == "loki-explicit":
+            loki.apply_runtime_config(loki.build_config_from_env(
+                credentials=loki.CREDENTIALS))
+        else:
+            provider_id, provider_entry, model_entry = leaf
+            loki.apply_runtime_config(
+                loki.config_from_modelsdev_selection(
+                    provider_id, provider_entry, model_entry,
+                    loki.CREDENTIALS))
+        descriptor = loki.active_connection_descriptor()
+        if descriptor is not None:
+            loki.set_session_connection(descriptor)
+        loki.save_chat_log()
+        return {"configOptions": self.config_options()}
 
     def open(self, params: dict) -> dict:
         """Prepare the conversation: fresh log, or resume a saved one."""
@@ -88,7 +150,37 @@ class Worker:
             loki.new_chat_log(os.path.join(
                 loki.CHAT_LOG_DIR,
                 f"chat-{params.get('sessionId', 'acp')}.json"))
-        return {}
+        self._build_model_options()
+        return {"configOptions": self.config_options()}
+
+    def _build_model_options(self) -> None:
+        """Flatten the catalog into model config options, once."""
+        options = modelsdev.flattened_config_options(
+            loki.CREDENTIALS,
+            explicit_connection=loki.explicit_connection_option(
+                loki.CREDENTIALS)
+            if hasattr(loki, "explicit_connection_option") else None)
+        self._model_options = options
+        self._option_leaves = {}
+        # Rebuild the leaf map from the same catalog walk so
+        # set_config_option can apply a value exactly.
+        try:
+            _, groups = modelsdev.ensure_index()
+        except (OSError, ValueError):
+            return
+        groups = modelsdev._add_explicit_connection(
+            modelsdev.filter_supported_groups(groups, loki.CREDENTIALS),
+            loki.explicit_connection_option(loki.CREDENTIALS)
+            if hasattr(loki, "explicit_connection_option") else None)
+        for row in modelsdev._model_rows(groups):
+            for member in row[0]:
+                if isinstance(member,
+                              modelsdev.ExplicitConnectionOption):
+                    self._option_leaves["loki-explicit"] = "loki-explicit"
+                    continue
+                provider_id, provider_entry, model_entry = member
+                model_id = model_entry.get("id") or model_entry.get("name")
+                self._option_leaves[f"{provider_id}/{model_id}"] = member
 
     def _replay_transcript(self) -> None:
         """Emit the loaded history as session/update notifications."""
