@@ -1,0 +1,113 @@
+"""ACP worker: one single-session Loki process behind the front process.
+
+The worker owns one Session -- exactly like the terminal front-end -- and
+speaks JSON-RPC on its stdin/stdout (a socketpair provided by the front
+process).  It handles the per-session methods: session/prompt,
+session/cancel, session/set_config_option; the front process owns the
+session-free methods (initialize, session/new, session/list).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+
+from . import acps, formats, loki, replays, savefiles
+from .sessions import Session
+
+
+class Worker:
+    def __init__(self, session: Session, write):
+        self.session = session
+        self.write = write
+        self.cancel_event = asyncio.Event()
+        self._prompt_task: asyncio.Task | None = None
+
+    # -- dispatch ---------------------------------------------------------
+
+    async def handle(self, message: dict):
+        method = message.get("method")
+        request_id = message.get("id")
+        if method is None or request_id is None:
+            return  # notification or malformed; nothing to answer
+        try:
+            result = await self.dispatch(method, message.get("params") or {})
+        except Exception as error:  # surface as JSON-RPC error, never crash
+            self.write(acps.response(
+                request_id,
+                error={"code": acps.INTERNAL_ERROR, "message": str(error)}))
+            return
+        self.write(acps.response(request_id, result=result))
+
+    async def dispatch(self, method: str, params: dict):
+        if method == "session/prompt":
+            return await self.prompt(params)
+        if method == "session/cancel":
+            self.cancel_event.set()
+            return {}
+        if method == "session/open":
+            return self.open(params)
+        raise acps.TransportError(
+            f"worker does not implement {method}")
+
+    def open(self, params: dict) -> dict:
+        """Prepare the conversation: fresh log, or resume a saved one."""
+        resume = params.get("resume")
+        if resume:
+            path = os.path.join(
+                loki.CHAT_LOG_DIR, os.path.basename(str(resume)))
+            if os.path.isfile(path):
+                loki.load_chat_log(path, _quiet=True)
+        else:
+            loki.new_chat_log(os.path.join(
+                loki.CHAT_LOG_DIR,
+                f"chat-{params.get('sessionId', 'acp')}.json"))
+        return {}
+
+    # -- session/prompt ----------------------------------------------------
+
+    async def prompt(self, params: dict) -> dict:
+        if self._prompt_task is not None and not self._prompt_task.done():
+            return {"error": "a prompt is already running for this session"}
+        texts = []
+        for block in params.get("prompt", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+        user_text = "\n".join(text for text in texts if text)
+        if not user_text:
+            return {"error": "prompt contains no text"}
+
+        self.cancel_event.clear()
+        transcript = self.session.transcript_items
+        transcript.append(formats.message_item("user", user_text))
+        self.session.chat_log_dirty = True
+        events = []
+        self._prompt_task = asyncio.get_running_loop().create_task(
+            self._run_turn(events.append))
+        await self._prompt_task
+        return {"stopReason": self._stop_reason(events)}
+
+    async def _run_turn(self, emit):
+        session = self.session
+        emit_lock_events = emit
+
+        def on_event(event):
+            emit_lock_events(event)
+
+        await loki.run_tool_loop_async(
+            session.transcript_items,
+            on_event=on_event,
+            cancel_check=self.cancel_event.is_set,
+            cancel_event=self.cancel_event,
+            on_response=lambda turn, event: loki.mark_chat_log_dirty(),
+        )
+        loki.save_chat_log()
+
+    @staticmethod
+    def _stop_reason(events: list) -> str:
+        kinds = {event.get("type") for event in events}
+        if "response_cancelled" in kinds:
+            return "cancelled"
+        return "end_turn"

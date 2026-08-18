@@ -3936,7 +3936,7 @@ def print_resume_transcript(items: list):
         items, current_model() or "Assistant")
 
 
-def load_chat_log(filename, loaded=None):
+def load_chat_log(filename, loaded=None, quiet=False):
     if loaded is None:
         with open(filename, 'r', encoding="utf-8") as f:
             loaded = savefiles.read_chat_log(f)
@@ -3944,7 +3944,8 @@ def load_chat_log(filename, loaded=None):
     current_session().replace_transcript(
         transcript, todos, toolsets, state, filename)
     load_session_state(state)
-    print_resume_transcript(current_transcript())
+    if not quiet:
+        print_resume_transcript(current_transcript())
 
 
 def load_session_state(state: dict):
