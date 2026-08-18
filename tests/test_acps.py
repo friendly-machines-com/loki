@@ -507,3 +507,89 @@ class LoadReplayTests(unittest.TestCase):
             finally:
                 front2.stdin.close()
                 front2.wait(timeout=5)
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
+class SessionListTests(unittest.TestCase):
+    def test_list_reports_saved_sessions_with_cwd(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": ROOT,
+                "HOME": tmpdir,
+                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+                "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy",
+                "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model",
+                "LOKI_DUMMY_REPLY": "one",
+            })
+            front = subprocess.Popen(
+                [sys.executable, "-m", "loki_agent.acp_main"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            try:
+                def send(m):
+                    front.stdin.write(json.dumps(m) + "\n")
+                    front.stdin.flush()
+
+                def recv():
+                    line = front.stdout.readline()
+                    self.assertTrue(line)
+                    return json.loads(line)
+
+                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": 1}})
+                while recv().get("id") != 1:
+                    pass
+                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                      "params": {"cwd": tmpdir}})
+                while True:
+                    m = recv()
+                    if m.get("id") == 2:
+                        break
+                session_id = m["result"]["sessionId"]
+                send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                      "params": {"sessionId": session_id,
+                                 "prompt": [{"type": "text",
+                                             "text": "hi"}]}})
+                while True:
+                    m = recv()
+                    if m.get("id") == 3:
+                        break
+            finally:
+                front.stdin.close()
+                front.wait(timeout=5)
+
+            # A second front process sees the saved conversation listed.
+            front2 = subprocess.Popen(
+                [sys.executable, "-m", "loki_agent.acp_main"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            try:
+                front2.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": 1}}) + "\n")
+                front2.stdin.flush()
+                while True:
+                    m = json.loads(front2.stdout.readline())
+                    if m.get("id") == 1:
+                        break
+                front2.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": 2,
+                    "method": "session/list",
+                    "params": {}}) + "\n")
+                front2.stdin.flush()
+                m = json.loads(front2.stdout.readline())
+                self.assertEqual(m["id"], 2)
+                sessions = m["result"]["sessions"]
+                self.assertEqual(len(sessions), 1, sessions)
+                entry = sessions[0]
+                self.assertTrue(entry["sessionId"].endswith(".json"))
+                self.assertEqual(entry["cwd"], tmpdir)
+                self.assertIn("updatedAt", entry)
+            finally:
+                front2.stdin.close()
+                front2.wait(timeout=5)
