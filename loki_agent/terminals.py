@@ -17,6 +17,7 @@ ITALIC = '\033[3m'
 CODE_COLOR = 6
 RESET = '\033[0m'
 MARKDOWN_MAX_UNRESOLVED = 4096
+HEADLINE_COLOR = 2
 
 
 def open_terminal_stdin() -> int:
@@ -139,6 +140,8 @@ class BoundedMarkdownAnsi:
     least three backticks or tildes, with zero to three leading spaces; their
     contents and marker lines pass through verbatim.
 
+    Headlines like ``# Foo`` are also supported.
+
     ``feed`` and ``finish`` eagerly return tuples of terminal-state-neutral
     fragments. Plain text is emitted immediately. Only a possible fence marker
     or an unresolved inline span is retained, and neither may exceed
@@ -198,6 +201,8 @@ class BoundedMarkdownAnsi:
             rendered = ITALIC + raw[1:-1] + RESET
         elif mode == "code":
             rendered = f"\033[3{CODE_COLOR}m" + raw[1:-1] + RESET
+        elif mode == "headline":
+            rendered = f"\033[3{HEADLINE_COLOR}m" + raw + RESET
         else:
             raise AssertionError(f"cannot render inline mode {mode!r}")
         self._emit(output, rendered)
@@ -226,8 +231,21 @@ class BoundedMarkdownAnsi:
             elif character == "`":
                 self._inline_mode = "code"
                 self._inline_pending.append(character)
+            elif self._at_line_start and character == "#":
+                self._inline_mode = "hashtag"
+                self._inline_pending.append(character)
             else:
                 self._emit(output, character)
+            return
+
+        if mode == "hashtag":
+            if character == "#":
+                self._inline_pending.append(character)
+            elif character == " ":
+                self._inline_mode = "headline"
+            else:
+                # not a headline
+                self._inline_mode = "plain"
             return
 
         if mode == "star":
@@ -243,6 +261,11 @@ class BoundedMarkdownAnsi:
                 self._inline_pending.append(character)
                 self._check_inline_bound(output)
             return
+
+        if mode == "headline":
+            if character == "\n":
+                self._emit_completed_span(output)
+                # Fallthrough
 
         if character == "\n":
             self._emit_pending_literal(output)
@@ -274,6 +297,7 @@ class BoundedMarkdownAnsi:
             if self._inline_mode == "bold":
                 self._check_inline_bound(output)
             return
+
         raise AssertionError(f"unknown inline mode {mode!r}")
 
     @staticmethod
