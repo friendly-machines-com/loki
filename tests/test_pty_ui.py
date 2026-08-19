@@ -152,6 +152,13 @@ class PtyUiTests(unittest.TestCase):
         output, _before_release = run_loki_pty_reply(stream=False)
         self._assert_styled_output(output)
 
+    def test_status_bar_shows_api_and_mode(self):
+        # Regression for the frontend split dropping the status text
+        # registration: the bar must carry text, not just background color.
+        output, _before_release = run_loki_pty_reply(stream=False)
+        self.assertIn(b"Remote: API: dummy.invalid", output)
+        self.assertIn(b"Local: mode=normal", output)
+
     def test_streamed_plain_prefix_is_visible_before_completion(self):
         chunks = [
             "visible before completion",
