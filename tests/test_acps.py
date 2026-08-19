@@ -737,3 +737,38 @@ class TtyStdinTests(unittest.TestCase):
                     proc.kill()
                     proc.wait()
                 os.close(master)
+
+
+
+
+
+class WireCwdTests(unittest.TestCase):
+    """session/open's cwd lands in the session's virtual shell_cwd.
+
+    Workers inherit the front process's cwd; the conversation's working
+    directory arrives over the wire, so a tool call with a relative path
+    resolves inside the session directory, not the worker's.
+    """
+
+    def test_open_sets_shell_cwd_and_tools_resolve(self):
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+        from loki_agent import loki
+
+        async def run():
+            session = Session(shell_cwd="/")  # worker cwd, deliberately wrong
+            worker = Worker(session, lambda message: None)
+            await worker.handle({
+                "jsonrpc": "2.0", "id": 1, "method": "session/open",
+                "params": {"sessionId": "w", "cwd": ROOT}}, concurrent=False)
+            result = await loki.dispatch_tool_async(
+                "Bash", {"command": "cat tests/test_acps.py",
+                         "description": "probe"})
+            return session.shell_cwd, result
+
+        shell_cwd, result = asyncio.run(run())
+        self.assertEqual(shell_cwd, ROOT)
+        self.assertTrue(result["ok"])
+        self.assertIn("WireCwdTests", result["content"])
+
+

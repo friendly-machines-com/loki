@@ -135,6 +135,9 @@ class Worker:
 
     def open(self, params: dict) -> dict:
         """Prepare the conversation: fresh log, or resume a saved one."""
+        cwd = params.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            self.session.shell_cwd = cwd
         resume = params.get("resume")
         if resume:
             path = os.path.join(

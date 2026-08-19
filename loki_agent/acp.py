@@ -106,9 +106,12 @@ class Front:
         cwd = params.get("cwd") or os.getcwd()
         self._next_worker_id += 1
         session_id = f"loki-{os.getpid()}-{self._next_worker_id}"
+        # Workers inherit our cwd (import paths and job spools stay
+        # relative to the front process); the conversation's working
+        # directory arrives over the wire in session/open and lives in
+        # the session's virtual shell_cwd, exactly like the terminal.
         process = await asyncio.create_subprocess_exec(
             *WORKER_COMMAND,
-            cwd=cwd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=None,  # inherit: worker logs land in our stderr (ACP log channel)
@@ -116,7 +119,8 @@ class Front:
         self.workers[session_id] = process
         worker_reply = await self._worker_request(
             session_id, "session/open",
-            {"sessionId": session_id, "resume": params.get("resume")})
+            {"sessionId": session_id, "cwd": cwd,
+             "resume": params.get("resume")})
         result = {"sessionId": session_id}
         config_options = (worker_reply or {}).get("configOptions")
         if config_options:
@@ -138,7 +142,6 @@ class Front:
         session_id = f"loki-{os.getpid()}-{self._next_worker_id}"
         process = await asyncio.create_subprocess_exec(
             *WORKER_COMMAND,
-            cwd=cwd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=None,
@@ -146,7 +149,7 @@ class Front:
         self.workers[session_id] = process
         await self._worker_request(
             session_id, "session/open",
-            {"sessionId": session_id, "resume": saved_id,
+            {"sessionId": session_id, "cwd": cwd, "resume": saved_id,
              "replay": params.get("replay", True)})
         return {"sessionId": session_id}
 
