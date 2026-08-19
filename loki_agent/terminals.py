@@ -17,7 +17,22 @@ ITALIC = '\033[3m'
 CODE_COLOR = 6
 RESET = '\033[0m'
 MARKDOWN_MAX_UNRESOLVED = 4096
-HEADLINE_COLOR = 2
+# Markdown headlines carry inline markup (`## The **uv** route`), but ANSI has
+# no style stack: a plain RESET closes everything, and restoring "the rest of
+# the state" would require tracking it. SGR channels are independent, so the
+# headline owns the background channel (42 = green bg) while inline spans
+# inside use foreground/attribute channels, each closed by its
+# parameter-specific cancel (22 bold-off, 23 italic-off, 39 default fg,
+# 49 default bg). That gives one nesting level with zero state tracking.
+# Attribute-inside-attribute (`**b *i* b**`) is intentionally out of scope:
+# it needs both channels' bookkeeping, i.e. the stack we refused.
+HEADLINE_BG = 42
+HEADLINE_BG_OFF = 49
+HEADLINE = f'\033[{HEADLINE_BG}m'
+HEADLINE_OFF = f'\033[{HEADLINE_BG_OFF}m'
+BOLD_OFF = '\033[22m'
+ITALIC_OFF = '\033[23m'
+FOREGROUND_OFF = '\033[39m'
 
 
 def open_terminal_stdin() -> int:
@@ -140,24 +155,35 @@ class BoundedMarkdownAnsi:
     least three backticks or tildes, with zero to three leading spaces; their
     contents and marker lines pass through verbatim.
 
-    Headlines like ``# Foo`` are also supported.
+    Headlines are one to six ``#`` at line start (after up to three leading
+    spaces) followed by a space; the whole line renders on the SGR background
+    channel, and inline spans inside it render on the foreground/attribute
+    channels with parameter-specific resets, so both compose without a style
+    stack. Nesting an attribute inside another attribute (``**b *i* b**``)
+    stays literal as everywhere else; seven or more ``#``, or any ``#`` run
+    not followed by a space, renders literally.
 
     ``feed`` and ``finish`` eagerly return tuples of terminal-state-neutral
-    fragments. Plain text is emitted immediately. Only a possible fence marker
-    or an unresolved inline span is retained, and neither may exceed
-    ``max_unresolved`` characters. After overflow, the remainder of that line
-    is literal so a later closing delimiter cannot be reinterpreted as a new
-    opener. Batch and streaming rendering use this same fallback rule.
+    fragments. Plain text is emitted immediately. Only a possible fence or
+    headline marker line, or an unresolved inline span, is retained, and none
+    may exceed ``max_unresolved`` characters. After overflow, the remainder of
+    that line is literal so a later closing delimiter cannot be reinterpreted
+    as a new opener. Batch and streaming rendering use this same fallback
+    rule.
     """
 
     def __init__(self, *, style=True,
-                 max_unresolved=MARKDOWN_MAX_UNRESOLVED):
+                 max_unresolved=MARKDOWN_MAX_UNRESOLVED, inner=False):
         if (not isinstance(max_unresolved, int)
                 or isinstance(max_unresolved, bool)
                 or max_unresolved < 1):
             raise ValueError("max_unresolved must be a positive integer")
         self.style = bool(style)
         self.max_unresolved = max_unresolved
+        # inner=True is the headline-body pass: it must never detect another
+        # headline (a "#" here is content), which is also what bounds the
+        # recursion in _emit_completed_span to exactly one level.
+        self.inner = bool(inner)
         self._closed = False
         self._at_line_start = True
         self._fence_char = None
@@ -196,13 +222,27 @@ class BoundedMarkdownAnsi:
         if not self.style:
             rendered = raw
         elif mode == "bold":
-            rendered = BOLD + raw[2:-2] + RESET
+            # RESET would also kill an open headline background, so inner
+            # spans close with parameter-specific cancels instead.
+            rendered = BOLD + raw[2:-2] + (BOLD_OFF if self.inner else RESET)
         elif mode == "emphasis":
-            rendered = ITALIC + raw[1:-1] + RESET
+            rendered = (
+                ITALIC + raw[1:-1]
+                + (ITALIC_OFF if self.inner else RESET))
         elif mode == "code":
-            rendered = f"\033[3{CODE_COLOR}m" + raw[1:-1] + RESET
+            rendered = (
+                f"\033[3{CODE_COLOR}m" + raw[1:-1]
+                + (FOREGROUND_OFF if self.inner else RESET))
         elif mode == "headline":
-            rendered = f"\033[3{HEADLINE_COLOR}m" + raw + RESET
+            # The whole line is one span whose body is re-scanned for inline
+            # spans by a nested inner pass. That pass can never produce a
+            # headline (see __init__), so this recurses exactly one level
+            # and stays bounded by max_unresolved.
+            nested = BoundedMarkdownAnsi(
+                style=self.style, max_unresolved=self.max_unresolved,
+                inner=True)
+            body = "".join(nested.feed(raw) + nested.finish())
+            rendered = f"{HEADLINE}{body}{HEADLINE_OFF}"
         else:
             raise AssertionError(f"cannot render inline mode {mode!r}")
         self._emit(output, rendered)
@@ -231,7 +271,10 @@ class BoundedMarkdownAnsi:
             elif character == "`":
                 self._inline_mode = "code"
                 self._inline_pending.append(character)
-            elif self._at_line_start and character == "#":
+            elif self._at_line_start and not self.inner and character == "#":
+                # Line-start only: a "#" mid-line ("a #2 pencil") is text.
+                # Not in the inner pass: there the line already IS a
+                # headline body, so "#" is content, never another marker.
                 self._inline_mode = "hashtag"
                 self._inline_pending.append(character)
             else:
@@ -239,13 +282,25 @@ class BoundedMarkdownAnsi:
             return
 
         if mode == "hashtag":
-            if character == "#":
+            # Up to six "#" (CommonMark h6); a seventh is ordinary text and
+            # falls out through the pending-literal path below.
+            if character == "#" and len(self._inline_pending) < 6:
                 self._inline_pending.append(character)
-            elif character == " ":
+                return
+            if character == " " and len(self._inline_pending) <= 6:
+                # The space is part of the span: the background covers the
+                # marker run as well.
+                self._inline_pending.append(character)
                 self._inline_mode = "headline"
-            else:
-                # not a headline
-                self._inline_mode = "plain"
+                return
+            # Not a headline. The run renders literally and the character
+            # resumes ordinary inline scanning (so "##**b**" still bolds).
+            # Clearing _at_line_start caps this at one headline attempt per
+            # line start: a faux "#######" must not restart detection at
+            # its seventh "#".
+            self._at_line_start = False
+            self._emit_pending_literal(output)
+            self._consume_inline(character, output)
             return
 
         if mode == "star":
@@ -266,6 +321,13 @@ class BoundedMarkdownAnsi:
             if character == "\n":
                 self._emit_completed_span(output)
                 # Fallthrough
+            else:
+                # The retained headline span obeys the same bound as every
+                # other span: past max_unresolved it flushes literally and
+                # the line degrades to text.
+                self._inline_pending.append(character)
+                self._check_inline_bound(output)
+                return
 
         if character == "\n":
             self._emit_pending_literal(output)
@@ -316,6 +378,18 @@ class BoundedMarkdownAnsi:
         if not rest:
             return ("possible", None, 0)
         marker = rest[0]
+        if marker == "#":
+            # Headlines share the BOL buffer with fence candidates: a bare
+            # "#" run stays "possible" (one char of lookahead decides), and
+            # any non-"#" after it settles the question, so the whole line
+            # hands over to the inline scanner, whose hashtag mode owns the
+            # marker-or-literal decision.
+            run = 0
+            while run < len(rest) and rest[run] == "#":
+                run += 1
+            if run == len(rest):
+                return ("possible", None, 0)
+            return None
         if marker not in ["`", "~"]:
             return None
         run = 0
@@ -358,9 +432,11 @@ class BoundedMarkdownAnsi:
                 self._emit(output, pending + character)
             else:
                 self._bol_pending.clear()
-                self._at_line_start = False
+                # Feed before clearing _at_line_start: a flushed leading "#"
+                # must still be recognized as a possible headline marker.
                 for pending_character in pending:
                     self._consume_inline(pending_character, output)
+                self._at_line_start = False
                 self._consume_inline(character, output)
                 return
             self._bol_pending.clear()
@@ -379,9 +455,11 @@ class BoundedMarkdownAnsi:
             return
         if state is None:
             self._bol_pending.clear()
-            self._at_line_start = False
+            # Feed before clearing _at_line_start: a flushed leading "#"
+            # must still be recognized as a possible headline marker.
             for pending_character in pending:
                 self._consume_inline(pending_character, output)
+            self._at_line_start = False
             return
         if len(self._bol_pending) > self.max_unresolved:
             self._emit(output, pending)

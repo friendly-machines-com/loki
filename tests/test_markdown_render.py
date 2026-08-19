@@ -28,6 +28,11 @@ BOLD = "\033[1m"
 ITALIC = "\033[3m"
 CODE = "\033[36m"
 RESET = "\033[0m"
+HEADLINE = "\033[42m"
+HEADLINE_OFF = "\033[49m"
+BOLD_OFF = "\033[22m"
+ITALIC_OFF = "\033[23m"
+FOREGROUND_OFF = "\033[39m"
 
 
 class StyledTerminal:
@@ -61,6 +66,10 @@ DOCUMENT = (
     "~~~text\n"
     "*tilde-fenced content is raw*\n"
     "~~~\n"
+    "# Title with *emphasis* and `code` inside\n"
+    "##NoSpace stays literal\n"
+    "### Deep **bold** headline\n"
+    "####### seven hashes stay literal\n"
     "After fences, **styling resumes**."
 )
 
@@ -244,23 +253,124 @@ class BoundedRendererTests(unittest.TestCase):
                 self.renderer(max_unresolved=value)
 
 
+    def test_headline(self):
+        renderer = self.renderer()
+
+        self.assertEqual(renderer.feed("##"), ())
+        self.assertEqual(renderer.retained_characters, 2)
+        self.assertEqual(renderer.feed(" Foo"), ())
+        self.assertEqual(renderer.retained_characters, 6)
+        self.assertEqual(
+            renderer.feed("\n"),
+            (f"{HEADLINE}## Foo{HEADLINE_OFF}\n",))
+        self.assertEqual(renderer.retained_characters, 0)
+        self.assertEqual(renderer.finish(), ())
+
+    def test_faux_headline_1(self):
+        renderer = self.renderer()
+
+        self.assertEqual(renderer.feed("##"), ())
+        self.assertEqual(renderer.retained_characters, 2)
+        self.assertEqual(renderer.feed("Foo"), ("##Foo",))
+        self.assertEqual(renderer.retained_characters, 0)
+        self.assertEqual(renderer.feed("\n"), ("\n",))
+        self.assertEqual(renderer.retained_characters, 0)
+        self.assertEqual(renderer.finish(), ())
+
+    def test_headline_styles_inner_spans(self):
+        self.assertEqual(
+            terminals.render_markdown(
+                "# Hello *foo* and `bar` and **baz**\n", style=True),
+            f"{HEADLINE}# Hello {ITALIC}foo{ITALIC_OFF} and "
+            f"{CODE}bar{FOREGROUND_OFF} and {BOLD}baz{BOLD_OFF}"
+            f"{HEADLINE_OFF}\n",
+        )
+
+    def test_faux_headline_resumes_inline_scanning(self):
+        self.assertEqual(
+            terminals.render_markdown("##**b** after\n", style=True),
+            f"##{BOLD}b{RESET} after\n",
+        )
+
+    def test_headline_marker_alone_is_literal(self):
+        self.assertEqual(
+            terminals.render_markdown("#\n##\n", style=True), "#\n##\n")
+
+    def test_unclosed_headline_is_literal(self):
+        renderer = self.renderer()
+
+        self.assertEqual(renderer.feed("## never closed"), ())
+        self.assertEqual(renderer.retained_characters, 15)
+        self.assertEqual(renderer.finish(), ("## never closed",))
+        self.assertEqual(renderer.retained_characters, 0)
+
+    def test_headline_overflow_goes_literal(self):
+        renderer = self.renderer(max_unresolved=8)
+
+        self.assertEqual(renderer.feed("## "), ())
+        self.assertEqual(renderer.retained_characters, 3)
+        # The ninth pending character flushes the span literally and the
+        # rest of the line stays literal.
+        self.assertEqual(renderer.feed("0123456789"), ("## 0123456789",))
+        self.assertEqual(renderer.retained_characters, 0)
+        # Overflow literalizes only that line; the next line scans afresh.
+        self.assertEqual(
+            renderer.feed("\nmore `code`\n"),
+            (f"\nmore {CODE}code{RESET}\n",))
+
+
 class DifferentialTests(unittest.TestCase):
     """Chunk divisions cannot change the final rendering."""
 
     @staticmethod
-    def stream_concat(text, cuts, *, max_unresolved=4096):
+    def _ansi_channels_closed(fragment):
+        """Every SGR channel opened in the fragment must close inside it.
+
+        Headlines close inner spans with parameter-specific resets while the
+        background stays on, so counting RESET alone no longer proves the
+        invariant; simulate the channel state instead.
+        """
+        opens = [
+            (BOLD, "bold"), (ITALIC, "italic"), (CODE, "code"),
+            (HEADLINE, "bg"),
+        ]
+        closes = [
+            (BOLD_OFF, "bold"), (ITALIC_OFF, "italic"),
+            (FOREGROUND_OFF, "code"), (HEADLINE_OFF, "bg"),
+        ]
+        state = {}
+        i = 0
+        while i < len(fragment):
+            if fragment.startswith(RESET, i):
+                state.clear()
+                i += len(RESET)
+                continue
+            for escape, channel in opens:
+                if fragment.startswith(escape, i):
+                    state[channel] = state.get(channel, 0) + 1
+                    i += len(escape)
+                    break
+            else:
+                for escape, channel in closes:
+                    if fragment.startswith(escape, i):
+                        state[channel] = state.get(channel, 0) - 1
+                        if state[channel] < 0:
+                            return False
+                        i += len(escape)
+                        break
+                else:
+                    i += 1
+        return all(count == 0 for count in state.values())
+
+    @classmethod
+    def stream_concat(cls, text, cuts, *, max_unresolved=4096):
         renderer = terminals.BoundedMarkdownAnsi(
             style=True, max_unresolved=max_unresolved)
         output = []
         for chunk in split_at(text, cuts):
             fragments = renderer.feed(chunk)
             for fragment in fragments:
-                opens = (
-                    fragment.count(BOLD)
-                    + fragment.count(ITALIC)
-                    + fragment.count(CODE)
-                )
-                if fragment.count(RESET) != opens:
+                if not cls._ansi_channels_closed(fragment):
                     raise AssertionError(
                         f"ANSI state escaped a fragment: {fragment!r}")
             output.extend(fragments)
