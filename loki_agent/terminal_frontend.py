@@ -250,6 +250,9 @@ def status_text() -> str:
         current_agent_mode(), display_path(current_cwd()))
 
 
+terminals.set_status_text_provider(status_text)
+
+
 async def run_session_picker_async(session):
     async with session.modal() as modal:
         picked = await savefiles.run_session_picker_async(
