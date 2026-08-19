@@ -3281,10 +3281,20 @@ async def _collect_stream_body(iterator, first_chunk, cancel_check):
 
 
 def _stream_body_kind(content_type, first_chunk):
+    # Leading whitespace is legal before a JSON document but NOT before an
+    # SSE field (SseDecoder would drop such a line), so strip it only for
+    # the JSON check: "   data:" classifies as JSON and fails loudly, not
+    # as SSE that silently loses its first event.
     prefix = first_chunk.lstrip()
     if prefix.startswith((b"{", b"[")):
         return "json"
-    if prefix.startswith((b"data:", b"event:", b":")):
+    # A UTF-8 BOM may precede the first SSE line; SseDecoder strips one
+    # per line itself (sse.py), so the sniffer must accept it here too.
+    if first_chunk.startswith(b"\xef\xbb\xbf"):
+        if first_chunk[3:].lstrip().startswith(
+                (b"data:", b"event:", b":")):
+            return "sse"
+    if first_chunk.startswith((b"data:", b"event:", b":")):
         return "sse"
     media_type = content_type.partition(";")[0].strip().lower()
     if media_type == "text/event-stream":
@@ -3292,6 +3302,50 @@ def _stream_body_kind(content_type, first_chunk):
     if media_type in ("application/json", "application/problem+json"):
         return "json"
     return "json"
+
+
+_STREAM_MARKERS = (b"data:", b"event:", b":")
+
+
+def _prefix_ambiguous(prefix):
+    """Whether prefix so far could still become an SSE field marker.
+
+    A first TCP read can end mid-marker ("da", "data") or hold only
+    whitespace; such prefixes must not be classified yet, and one more
+    chunk resolves them. Whitespace alone stays ambiguous even though a
+    leading-whitespace stream cannot be SSE, because the whitespace may be
+    the padding of a JSON document whose "{" arrives in the next chunk.
+    """
+    stripped = prefix.lstrip()
+    if not stripped:
+        return True
+    if stripped.startswith(b"\xef\xbb\xbf"):
+        stripped = stripped[3:]
+        if not stripped:
+            return True
+    return any(marker.startswith(stripped) for marker in _STREAM_MARKERS)
+
+
+async def _first_body_chunk(iterator, cancel_check):
+    """Read body bytes until the SSE-vs-JSON sniff can decide.
+
+    Returns the concatenated bytes (b"" on immediate EOF). Extra reads
+    happen only while the bytes so far are still an ambiguous prefix of an
+    SSE marker, so a normal first line (or JSON body) never blocks on this
+    bounded lookahead.
+    """
+    chunks = []
+    total = 0
+    while True:
+        try:
+            chunk = await _next_stream_chunk(iterator, cancel_check)
+        except StopAsyncIteration:
+            return b"".join(chunks)
+        if chunk:
+            chunks.append(chunk)
+            total += len(chunk)
+        if not _prefix_ambiguous(b"".join(chunks)[-64:]):
+            return b"".join(chunks)
 
 
 async def _async_chat_stream_request_once(
@@ -3306,10 +3360,7 @@ async def _async_chat_stream_request_once(
             max_bytes=HTTP_MAX_RESPONSE_BYTES,
             cancel_check=cancel_check) as response:
         iterator = response.body.__aiter__()
-        try:
-            first_chunk = await _next_stream_chunk(iterator, cancel_check)
-        except StopAsyncIteration:
-            first_chunk = b""
+        first_chunk = await _first_body_chunk(iterator, cancel_check)
 
         if response.status >= 400:
             try:

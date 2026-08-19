@@ -3596,6 +3596,118 @@ class StreamingCompletionTests(unittest.TestCase):
 
         self.assertIn("set LOKI_STREAM=0", raised.exception.formatted())
 
+    def _run_stream_turn(self, body_chunks, content_type):
+        deltas = []
+
+        async def response_body():
+            for chunk in body_chunks:
+                yield chunk
+
+        @contextlib.asynccontextmanager
+        async def fake_http_stream(method, request_url, **kwargs):
+            yield loki.http_client.HttpStreamResponse(
+                request_url,
+                200,
+                "OK",
+                {"content-type": content_type},
+                response_body(),
+            )
+
+        with mock.patch(
+                "loki_agent.loki.http_client.async_http_stream",
+                side_effect=fake_http_stream):
+            items = asyncio.run(loki.async_chat_completion(
+                [formats.message_item("user", "hello")],
+                tools=[],
+                on_text_delta=deltas.append,
+            ))
+        return deltas, items
+
+    def test_marker_split_across_chunks_with_lying_content_type(self):
+        # The first TCP read ends mid-"data:" while the content-type claims
+        # JSON; the sniff must wait for more bytes instead of misparsing the
+        # SSE stream as one JSON document.
+        deltas, items = self._run_stream_turn([
+            b'da',
+            b'ta: {"choices":[{"index":0,"delta":'
+            b'{"role":"assistant","content":"hi"},'
+            b'"finish_reason":null}]}\n\n',
+            b'data: [DONE]\n\n',
+        ], "application/json")
+        self.assertEqual(deltas, ["hi"])
+        self.assertEqual(formats.item_text(items[0]), "hi")
+
+    def test_bom_prefixed_stream_is_sniffed_as_sse(self):
+        deltas, items = self._run_stream_turn([
+            b'\xef\xbb\xbfdata: {"choices":[{"index":0,"delta":'
+            b'{"content":"hi"},"finish_reason":"stop"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ], "application/json")
+        self.assertEqual(deltas, ["hi"])
+        self.assertEqual(formats.item_text(items[0]), "hi")
+
+    def test_whitespace_only_prefix_waits_for_deciding_bytes(self):
+        # Whitespace before "{" is legal JSON padding split across reads;
+        # the sniff must not misroute it while ambiguous.
+        response = {"id": "chat_1", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {
+                        "role": "assistant", "content": "buffered"},
+                        "finish_reason": "stop"}]}
+        _, items = self._run_stream_turn([
+            b' ', b'  ', json.dumps(response).encode("utf-8")],
+            "application/json")
+        self.assertEqual(formats.item_text(items[0]), "buffered")
+
+    def test_leading_whitespace_before_data_line_is_not_sse(self):
+        # SSE field names may not be preceded by whitespace; the decoder
+        # would drop that line silently. The sniff must classify as JSON so
+        # the turn fails loudly instead.
+        with self.assertRaises(protocols.StreamProtocolError):
+            self._run_stream_turn([
+                b'   data: {"choices":[{"index":0,"delta":'
+                b'{"content":"hi"},"finish_reason":"stop"}]}\n\n',
+            ], "application/json")
+
+    def test_ambiguous_then_json_still_parses_as_json(self):
+        # The lookahead stops as soon as bytes stop matching an SSE marker
+        # prefix ("eve" stops matching at "e{"...), and a JSON document
+        # split from its opening brace still parses as JSON.
+        response = {"id": "chat_1", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {
+                        "role": "assistant", "content": "buffered"},
+                        "finish_reason": "stop"}]}
+        raw = json.dumps(response).encode("utf-8")
+        _, items = self._run_stream_turn(
+            [b' ', raw[:1], raw[1:]], "application/json")
+        self.assertEqual(formats.item_text(items[0]), "buffered")
+
+    def test_eof_while_ambiguous_yields_short_prefix(self):
+        # Stream ends mid-marker: no hang, no crash; the sniffer falls back
+        # to the content-type and the JSON path reports the parse error.
+        with self.assertRaises(protocols.StreamProtocolError):
+            self._run_stream_turn([b'da'], "application/json")
+
+    def test_stream_body_kind_table(self):
+        cases = [
+            ("text/event-stream", b'data: {}\n\n', "sse"),
+            ("text/event-stream", b'\n\ndata: {}\n\n', "sse"),
+            ("text/event-stream", b': ping\n\ndata: {}', "sse"),
+            ("application/json", b'{"error":"x"}', "json"),
+            ("application/json", b'data: {}', "sse"),
+            ("", b'\xef\xbb\xbfdata: {}', "sse"),
+            ("application/json", b'\xef\xbb\xbfdata: {}', "sse"),
+            # Whitespace before a field name is invalid SSE (the decoder
+            # drops the line); JSON is the loud failure, not silent loss.
+            ("application/json", b'   data: {}\n\n', "json"),
+            ("text/event-stream", b'   data: {}\n\n', "sse"),
+            ("", b'', "json"),
+            ("", b'\n', "json"),
+        ]
+        for content_type, chunk, expected in cases:
+            with self.subTest(chunk=chunk, content_type=content_type):
+                self.assertEqual(
+                    loki._stream_body_kind(content_type, chunk), expected)
+
     def test_transport_failure_after_first_event_is_not_retried(self):
         calls = []
         deltas = []
