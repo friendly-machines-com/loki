@@ -30,10 +30,11 @@ async def amain() -> int:
     try:
         loki.apply_runtime_config(loki.build_config_from_env(
             credentials=loki.CREDENTIALS))
-    except (loki.protocols.ProtocolError, ValueError) as error:
-        # No provider: the session still works; prompts answer with a
-        # model-selection notice instead of a hollow turn.
-        print(f"ACP worker without provider: {error}", file=sys.stderr)
+    except (loki.protocols.ProtocolError, ValueError):
+        # No explicit LOKI_* connection.  The model is chosen over the
+        # wire (session/set_config_option); a prompt without one gets the
+        # same "No model selected" answer the terminal gives.
+        pass
     try:
         loki.configure_tool_hook_pipeline()
     except loki.tool_runtime.HookConfigurationError as error:
