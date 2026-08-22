@@ -66,6 +66,7 @@ async def amain() -> int:
         # otherwise a session/cancel arriving mid-turn would queue behind
         # the prompt it is meant to interrupt.
         await worker.handle(message, concurrent=True)
+    await worker.close()
     return 0
 
 

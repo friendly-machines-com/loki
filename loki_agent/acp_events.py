@@ -26,7 +26,10 @@ TOOL_KINDS = {
 
 
 def _content(text: str) -> list:
-    return [{"type": "text", "text": text}]
+    return [{
+        "type": "content",
+        "content": {"type": "text", "text": text},
+    }]
 
 
 def agent_message_chunk(session_id: str, text: str) -> dict:
@@ -39,7 +42,8 @@ def agent_message_chunk(session_id: str, text: str) -> dict:
     }
 
 
-def tool_call(session_id: str, tool_call_id: str, title: str, kind: str) -> dict:
+def tool_call(session_id: str, tool_call_id: str, title: str, kind: str,
+              status: str = "in_progress") -> dict:
     return {
         "sessionId": session_id,
         "update": {
@@ -47,7 +51,7 @@ def tool_call(session_id: str, tool_call_id: str, title: str, kind: str) -> dict
             "toolCallId": tool_call_id,
             "title": title,
             "kind": kind,
-            "status": "in_progress",
+            "status": status,
         },
     }
 
@@ -68,9 +72,9 @@ def tool_call_update(session_id: str, tool_call_id: str, content,
 def map_event(session_id: str, event: dict, state: dict) -> list:
     """Translate one Loki on_event into zero or more update params.
 
-    ``state`` carries turn-local bookkeeping between calls: the current
-    tool call id (tool_call events carry no id, so ids are assigned in
-    order and results attach to the most recent one).
+    ``state`` carries turn-local bookkeeping. Provider call ids are preserved
+    end to end; inventing positional ids makes concurrent/rejected calls
+    attach updates to the wrong tool.
     """
     kind = event.get("type")
     if kind == "assistant_start":
@@ -83,9 +87,8 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
         return [agent_message_chunk(session_id, event.get("content", ""))]
     if kind == "tool_call":
         name = event.get("name") or "tool"
-        state["tool_counter"] = state.get("tool_counter", 0) + 1
-        call_id = f"call-{state['tool_counter']}"
-        state["pending_call_id"] = call_id
+        call_id = _event_call_id(event, state, begin=True)
+        state.setdefault("announced_calls", set()).add(call_id)
         args = event.get("args") or {}
         title = name
         command = args.get("command") if isinstance(args, dict) else None
@@ -95,7 +98,7 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
             session_id, call_id, title,
             TOOL_KINDS.get(name, "other"))]
     if kind == "tool_result":
-        call_id = state.get("pending_call_id") or "call-1"
+        call_id = _event_call_id(event, state)
         text = event.get("content")
         if not isinstance(text, str):
             text = str(text)
@@ -103,15 +106,23 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
         return [tool_call_update(
             session_id, call_id, _content(text), status=status)]
     if kind == "tool_error":
-        call_id = state.get("pending_call_id") or "call-1"
-        text = event.get("result") or "tool error"
-        return [tool_call_update(
-            session_id, call_id, _content(str(text)), status="failed")]
+        # A tool_result event follows with the same real call id and complete
+        # content. Sending both produces duplicate terminal updates.
+        return []
     if kind == "tool_rejected":
-        call_id = state.get("pending_call_id") or "call-1"
-        return [tool_call_update(
-            session_id, call_id,
-            _content("not executed"), status="failed")]
+        call_id = _event_call_id(event, state, begin=True)
+        announced = state.setdefault("announced_calls", set())
+        if call_id in announced:
+            return []
+        announced.add(call_id)
+        name = event.get("name") or "tool"
+        return [tool_call(
+            session_id,
+            call_id,
+            f"{name}: not executed",
+            TOOL_KINDS.get(name, "other"),
+            status="failed",
+        )]
     if kind == "response_cancelled":
         return [agent_message_chunk(
             session_id, "[turn cancelled by user]")]
@@ -119,3 +130,20 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
     # transcript_error, response_incomplete/failed: no per-event update;
     # the stopReason or an error response carries them.
     return []
+
+
+def _fallback_call_id(state: dict) -> str:
+    state["tool_counter"] = state.get("tool_counter", 0) + 1
+    return f"loki-call-{state['tool_counter']}"
+
+
+def _event_call_id(event: dict, state: dict, *, begin=False) -> str:
+    supplied = event.get("call_id")
+    if supplied is not None:
+        call_id = str(supplied)
+    elif not begin and state.get("last_call_id"):
+        call_id = state["last_call_id"]
+    else:
+        call_id = _fallback_call_id(state)
+    state["last_call_id"] = call_id
+    return call_id

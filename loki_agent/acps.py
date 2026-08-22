@@ -14,7 +14,9 @@ import sys
 
 
 class TransportError(Exception):
-    pass
+    def __init__(self, message: str, *, code: int = -32603):
+        super().__init__(message)
+        self.code = code
 
 
 def make_writer(fd: int):

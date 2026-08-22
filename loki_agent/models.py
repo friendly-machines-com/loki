@@ -497,44 +497,59 @@ async def run_flat_model_picker_async(
         header="Usable models:")
 
 
-def flattened_config_options(credentials, cache_path=None,
-                              explicit_connection=None):
-    """ConfigOption list (category "model"): one entry per usable leaf.
+def flattened_config_option_choices(
+        credentials, cache_path=None, explicit_connection=None, groups=None):
+    """Return ``(ACP option, selectable leaf)`` pairs.
 
-    Each entry is a full connection choice: provider, wire protocol,
-    model id.  Returns [] when the catalog is unavailable or no
-    credentials match -- callers fall back to session/chat selection.
+    ``groups`` lets non-blocking front-ends separate their immediate,
+    offline-safe options from later catalog discovery.  Passing ``None``
+    performs the normal models.dev lookup.  A failed lookup still preserves
+    an explicit LOKI_* connection: local configuration must not depend on an
+    unrelated catalog service being reachable.
     """
-    try:
-        _, groups = ensure_index(cache_path=cache_path)
-    except (OSError, ValueError):
-        return []
+    if groups is None:
+        try:
+            _, groups = ensure_index(cache_path=cache_path)
+        except (OSError, ValueError):
+            groups = {}
     groups = _add_explicit_connection(
         filter_supported_groups(groups, credentials),
         explicit_connection,
     )
-    options = []
+    choices = []
     for row in _model_rows(groups):
         for member in row[0]:
             if isinstance(member, ExplicitConnectionOption):
-                options.append({
+                choices.append(({
                     "value": "loki-explicit",
                     "name": f"{member.model} [LOKI_* connection]",
                     "description": (
                         f"explicit LOKI_* env connection; "
                         f"{member.protocol}; api={member.api_url}"),
-                })
+                }, member))
                 continue
             provider_id, provider_entry, model_entry = member
             model_id = model_entry.get("id") or model_entry.get("name")
             label = provider_entry.get("name") or provider_id
             description = provider_entry.get("api") or ""
-            options.append({
+            choices.append(({
                 "value": f"{provider_id}/{model_id}",
                 "name": f"{model_id} ({label})",
                 "description": description,
-            })
-    return options
+            }, member))
+    return choices
+
+
+def flattened_config_options(credentials, cache_path=None,
+                              explicit_connection=None):
+    """ACP select entries, preserving explicit config while offline."""
+    return [
+        option for option, _leaf in flattened_config_option_choices(
+            credentials,
+            cache_path=cache_path,
+            explicit_connection=explicit_connection,
+        )
+    ]
 
 
 async def run_model_picker_async(input_fn, credentials: CredentialStore,

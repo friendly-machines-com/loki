@@ -627,3 +627,24 @@ class NpmProtocolDetectionTests(unittest.TestCase):
         self.assertIsNone(protocols.detect_protocol_from_npm("@openrouter/ai-sdk-provider"))
         self.assertIsNone(protocols.detect_protocol_from_npm("no-api"))
         self.assertIsNone(protocols.detect_protocol_from_npm(None))
+
+
+class ConfigOptionAvailabilityTests(unittest.TestCase):
+    def test_explicit_connection_survives_catalog_outage(self):
+        from loki_agent import protocols
+
+        explicit = models.ExplicitConnectionOption(
+            model="local-model",
+            api_url="http://localhost:8000/v1",
+            protocol=protocols.OPENAI_CHAT,
+        )
+        with mock.patch.object(
+                models, "ensure_index", side_effect=OSError("offline")):
+            choices = models.flattened_config_option_choices(
+                CredentialStore({}), explicit_connection=explicit)
+
+        self.assertEqual(
+            [option["value"] for option, _leaf in choices],
+            ["loki-explicit"],
+        )
+        self.assertIs(choices[0][1], explicit)

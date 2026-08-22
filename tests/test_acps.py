@@ -20,6 +20,13 @@ from loki_agent import acps  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _close_process_streams(process):
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is not None and not stream.closed:
+            stream.close()
+
+
 class FramingTests(unittest.TestCase):
     def test_response_and_notification_shapes(self):
         self.assertEqual(
@@ -91,6 +98,7 @@ class FrontWorkerTests(unittest.TestCase):
                 [sys.executable, "-m", "loki_agent.acp_main"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, env=env, cwd=tmpdir)
+            self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
                     front.stdin.write(json.dumps(message) + "\n")
@@ -113,6 +121,13 @@ class FrontWorkerTests(unittest.TestCase):
                 self.assertEqual(reply["result"]["protocolVersion"], 1)
                 self.assertEqual(
                     reply["result"]["agentInfo"]["name"], "loki")
+                capabilities = reply["result"]["agentCapabilities"]
+                self.assertEqual(
+                    capabilities["sessionCapabilities"]["close"], {})
+                self.assertEqual(
+                    capabilities["sessionCapabilities"]["list"], {})
+                self.assertFalse(
+                    capabilities["promptCapabilities"]["image"])
 
                 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
                       "params": {"cwd": tmpdir}})
@@ -141,6 +156,17 @@ class FrontWorkerTests(unittest.TestCase):
                     and m["params"]["update"]["sessionUpdate"]
                     == "agent_message_chunk"
                     for m in updates))
+
+                send({"jsonrpc": "2.0", "id": 4,
+                      "method": "session/close",
+                      "params": {"sessionId": session_id}})
+                self.assertEqual(recv_reply(4)["result"], {})
+                send({"jsonrpc": "2.0", "id": 5,
+                      "method": "session/prompt",
+                      "params": {
+                          "sessionId": session_id,
+                          "prompt": [{"type": "text", "text": "closed"}]}})
+                self.assertIn("error", recv_reply(5))
             finally:
                 front.stdin.close()
                 try:
@@ -156,6 +182,7 @@ class FrontWorkerTests(unittest.TestCase):
                 [sys.executable, "-m", "loki_agent.acp_main"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, env=env, cwd=tmpdir)
+            self.addCleanup(_close_process_streams, front)
             try:
                 front.stdin.write(json.dumps({
                     "jsonrpc": "2.0", "id": 9,
@@ -196,6 +223,7 @@ class EventMapperTests(unittest.TestCase):
         state = {}
         call = acp_events.map_event("s", {"type": "tool_call",
                                           "name": "Bash",
+                                          "call_id": "call_1",
                                           "args": {"command": "ls"}}, state)
         self.assertEqual(call[0]["update"]["sessionUpdate"], "tool_call")
         self.assertEqual(call[0]["update"]["kind"], "execute")
@@ -207,8 +235,33 @@ class EventMapperTests(unittest.TestCase):
                                             "is_error": False}, state)
         self.assertEqual(result[0]["update"]["sessionUpdate"],
                          "tool_call_update")
-        self.assertEqual(result[0]["update"]["toolCallId"], "call-1")
+        self.assertEqual(result[0]["update"]["toolCallId"], "call_1")
         self.assertNotIn("status", result[0]["update"])
+        self.assertEqual(
+            result[0]["update"]["content"],
+            [{
+                "type": "content",
+                "content": {"type": "text", "text": "a\nb"},
+            }],
+        )
+
+    def test_rejected_tool_uses_its_real_call_id(self):
+        from loki_agent import acp_events
+        updates = acp_events.map_event(
+            "s",
+            {
+                "type": "tool_rejected",
+                "name": "Write",
+                "call_id": "provider-call-77",
+                "args": {"file_path": "x"},
+            },
+            {},
+        )
+        self.assertEqual(
+            updates[0]["update"]["sessionUpdate"], "tool_call")
+        self.assertEqual(
+            updates[0]["update"]["toolCallId"], "provider-call-77")
+        self.assertEqual(updates[0]["update"]["status"], "failed")
 
     def test_tool_result_error_is_failed(self):
         from loki_agent import acp_events
@@ -250,6 +303,7 @@ class UpdateStreamingTests(unittest.TestCase):
                 [sys.executable, "-m", "loki_agent.acp_main"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
                     front.stdin.write(json.dumps(message) + "\n")
@@ -323,6 +377,7 @@ class CancelEndToEndTests(unittest.TestCase):
                 [sys.executable, "-m", "loki_agent.acp_main"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
                     front.stdin.write(json.dumps(message) + "\n")
@@ -365,12 +420,18 @@ class CancelEndToEndTests(unittest.TestCase):
                 send({"jsonrpc": "2.0", "method": "session/cancel",
                       "params": {"sessionId": session_id}})
 
+                after_cancel = []
                 while True:
                     reply = recv()
                     if reply.get("id") == 3:
                         break
+                    after_cancel.append(reply)
                 self.assertEqual(reply["result"]["stopReason"],
                                  "cancelled")
+                self.assertTrue(all(
+                    message.get("id") is None
+                    for message in after_cancel
+                ), after_cancel)
                 # The gate was never released: the cancel, not the gate,
                 # ended the turn.
                 self.assertFalse(os.path.exists(gate))
@@ -386,10 +447,12 @@ class CancelEndToEndTests(unittest.TestCase):
 @unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class LoadReplayTests(unittest.TestCase):
     def _front(self, env, cwd):
-        return subprocess.Popen(
+        process = subprocess.Popen(
             [sys.executable, "-m", "loki_agent.acp_main"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, env=env, cwd=cwd)
+        self.addCleanup(_close_process_streams, process)
+        return process
 
     def _env(self, tmpdir, reply="loadable answer"):
         env = dict(os.environ)
@@ -407,7 +470,6 @@ class LoadReplayTests(unittest.TestCase):
         return env
 
     def test_load_replays_history_and_continues(self):
-        import time as _time
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._env(tmpdir)
             # Session 1: one prompt, one answer, saved.
@@ -454,7 +516,8 @@ class LoadReplayTests(unittest.TestCase):
             logs = [f for f in os.listdir(
                 os.path.join(tmpdir, ".loki", "chats"))]
             self.assertEqual(len(logs), 1, logs)
-            saved_id = logs[0]
+            saved_filename = logs[0]
+            saved_id = saved_filename[len("chat-"):-len(".json")]
 
             # Session 2: fresh front process, load the saved conversation.
             front2 = self._front(env, tmpdir)
@@ -474,8 +537,10 @@ class LoadReplayTests(unittest.TestCase):
                     if m.get("id") == 2:
                         break
                     replayed.append(m)
-                new_session = m["result"]["sessionId"]
-                self.assertNotEqual(new_session, first_session)
+                self.assertNotIn("sessionId", m["result"])
+                new_session = saved_id
+                self.assertEqual(new_session, first_session)
+                self.assertIn("configOptions", m["result"])
                 kinds = [
                     u["params"]["update"]["sessionUpdate"]
                     for u in replayed
@@ -529,6 +594,7 @@ class SessionListTests(unittest.TestCase):
                 [sys.executable, "-m", "loki_agent.acp_main"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            self.addCleanup(_close_process_streams, front)
             try:
                 def send(m):
                     front.stdin.write(json.dumps(m) + "\n")
@@ -567,6 +633,7 @@ class SessionListTests(unittest.TestCase):
                 [sys.executable, "-m", "loki_agent.acp_main"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            self.addCleanup(_close_process_streams, front2)
             try:
                 front2.stdin.write(json.dumps({
                     "jsonrpc": "2.0", "id": 1,
@@ -587,7 +654,7 @@ class SessionListTests(unittest.TestCase):
                 sessions = m["result"]["sessions"]
                 self.assertEqual(len(sessions), 1, sessions)
                 entry = sessions[0]
-                self.assertTrue(entry["sessionId"].endswith(".json"))
+                self.assertEqual(entry["sessionId"], session_id)
                 self.assertEqual(entry["cwd"], tmpdir)
                 self.assertIn("updatedAt", entry)
             finally:
@@ -618,6 +685,7 @@ class ConfigOptionTests(unittest.TestCase):
                 [sys.executable, "-m", "loki_agent.acp_main"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+            self.addCleanup(_close_process_streams, front)
             try:
                 def send(m):
                     front.stdin.write(json.dumps(m) + "\n")
@@ -712,6 +780,7 @@ class TtyStdinTests(unittest.TestCase):
                 stdin=slave, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, env=env, cwd=tmpdir,
                 preexec_fn=child_setup, text=True)
+            self.addCleanup(_close_process_streams, proc)
             os.close(slave)
             try:
                 os.write(master, (json.dumps({
@@ -772,3 +841,269 @@ class WireCwdTests(unittest.TestCase):
         self.assertIn("WireCwdTests", result["content"])
 
 
+class WorkerSessionContractTests(unittest.TestCase):
+    def test_load_applies_saved_connection_and_client_cwd(self):
+        from unittest import mock
+        from loki_agent import formats, loki, protocols
+        from loki_agent.acp_worker import Worker
+        from loki_agent.connections import ConnectionDescriptor
+        from loki_agent.credentials import CredentialStore
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        old_credentials = loki.CREDENTIALS
+        old_chat_dir = loki.CHAT_LOG_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                saved_cwd = os.path.join(tmpdir, "saved-cwd")
+                client_cwd = os.path.join(tmpdir, "client-cwd")
+                os.mkdir(saved_cwd)
+                os.mkdir(client_cwd)
+                chat_dir = os.path.join(tmpdir, "chats")
+                os.mkdir(chat_dir)
+                descriptor = ConnectionDescriptor(
+                    provider_id="saved-provider",
+                    provider_name="Saved Provider",
+                    model="saved-model",
+                    chat_url=(
+                        "https://saved.example/v1/chat/completions"),
+                    models_url="https://saved.example/v1/models",
+                    protocol=protocols.OPENAI_CHAT,
+                    credential_env="SAVED_API_KEY",
+                    max_tokens=777,
+                )
+                blob = formats.new_log_blob(
+                    loki.initial_transcript_items(), [])
+                blob["session_state"] = {
+                    "shell_cwd": saved_cwd,
+                    "connection": descriptor.to_dict(),
+                }
+                saved_name = "chat-saved.json"
+                with open(
+                        os.path.join(chat_dir, saved_name),
+                        "w", encoding="utf-8") as stream:
+                    json.dump(blob, stream)
+
+                session = Session(shell_cwd="/")
+                loki._DEFAULT_SESSION = session
+                loki.CREDENTIALS = CredentialStore({
+                    "SAVED_API_KEY": "secret",
+                })
+                loki.CHAT_LOG_DIR = chat_dir
+                worker = Worker(session, lambda message: None)
+                with mock.patch.object(
+                        worker, "_start_catalog_discovery"):
+                    result = worker.open({
+                        "sessionId": "live-session",
+                        "cwd": client_cwd,
+                        "resume": saved_name,
+                    })
+
+                self.assertEqual(session.shell_cwd, client_cwd)
+                self.assertEqual(session.model, "saved-model")
+                self.assertEqual(
+                    session.runtime_config.chat_provider.max_tokens, 777)
+                self.assertEqual(
+                    result["configOptions"][0]["currentValue"],
+                    "loki-saved",
+                )
+        finally:
+            loki._DEFAULT_SESSION = old_session
+            loki.CREDENTIALS = old_credentials
+            loki.CHAT_LOG_DIR = old_chat_dir
+
+    def test_new_sessions_get_distinct_persistent_logs_without_catalog_io(self):
+        from unittest import mock
+        from loki_agent import loki, models
+        from loki_agent.acp_worker import Worker
+        from loki_agent.credentials import CredentialStore
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        old_credentials = loki.CREDENTIALS
+        old_chat_dir = loki.CHAT_LOG_DIR
+        paths = []
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                loki.CHAT_LOG_DIR = os.path.join(tmpdir, "chats")
+                loki.CREDENTIALS = CredentialStore({})
+                for number in range(2):
+                    session = Session(shell_cwd=tmpdir)
+                    loki._DEFAULT_SESSION = session
+                    worker = Worker(session, lambda message: None)
+                    with (
+                            mock.patch.object(
+                                worker, "_start_catalog_discovery"),
+                            mock.patch.object(
+                                models, "ensure_index",
+                                side_effect=AssertionError(
+                                    "session/open performed catalog I/O"))):
+                        result = worker.open({
+                            "sessionId": f"live-{number}",
+                            "cwd": tmpdir,
+                        })
+                    paths.append(session.chat_log_path)
+                    option = result["configOptions"][0]
+                    self.assertEqual(
+                        option["currentValue"], "loki-disconnected")
+                    self.assertIn(
+                        option["currentValue"],
+                        [entry["value"] for entry in option["options"]],
+                    )
+                self.assertNotEqual(paths[0], paths[1])
+                self.assertTrue(all(
+                    os.path.dirname(path) == loki.CHAT_LOG_DIR
+                    for path in paths))
+        finally:
+            loki._DEFAULT_SESSION = old_session
+            loki.CREDENTIALS = old_credentials
+            loki.CHAT_LOG_DIR = old_chat_dir
+
+    def test_provider_failure_is_an_acp_request_failure(self):
+        from loki_agent import formats, loki, protocols
+        from loki_agent.acp_worker import TurnFailure, Worker
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                session = Session(shell_cwd=tmpdir)
+                session.transcript_items = [
+                    formats.instruction_item("system"),
+                ]
+                loki._DEFAULT_SESSION = session
+                worker = Worker(session, lambda message: None, "s")
+
+                async def failed_turn(on_event):
+                    on_event({
+                        "type": "provider_error",
+                        "error": protocols.ProtocolError(
+                            "invalid provider JSON"),
+                    })
+
+                worker._run_turn = failed_turn
+                with self.assertRaisesRegex(
+                        TurnFailure, "invalid provider JSON"):
+                    asyncio.run(worker.prompt({
+                        "sessionId": "s",
+                        "prompt": [{"type": "text", "text": "hello"}],
+                    }))
+        finally:
+            loki._DEFAULT_SESSION = old_session
+
+    def test_stop_reasons_cover_protocol_terminal_states(self):
+        from loki_agent.acp_worker import Worker
+
+        self.assertEqual(
+            Worker._stop_reason([{"type": "response_cancelled"}]),
+            "cancelled",
+        )
+        self.assertEqual(
+            Worker._stop_reason([{"type": "max_loops"}]),
+            "max_turn_requests",
+        )
+        self.assertEqual(
+            Worker._stop_reason([{"type": "response_incomplete"}]),
+            "max_tokens",
+        )
+        self.assertEqual(
+            Worker._stop_reason([{"type": "response_refusal"}]),
+            "refusal",
+        )
+
+    def test_cancelled_prompt_returns_cancelled_even_if_operation_raises(self):
+        from loki_agent import loki
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                session = Session(shell_cwd=tmpdir)
+                loki._DEFAULT_SESSION = session
+                worker = Worker(session, lambda message: None, "s")
+
+                async def cancelled_failure(on_event):
+                    worker.cancel_event.set()
+                    raise RuntimeError("underlying close race")
+
+                worker._run_turn = cancelled_failure
+                result = asyncio.run(worker.prompt({
+                    "sessionId": "s",
+                    "prompt": [{"type": "text", "text": "hello"}],
+                }))
+                self.assertEqual(result["stopReason"], "cancelled")
+        finally:
+            loki._DEFAULT_SESSION = old_session
+
+    def test_prompt_supports_baseline_resource_links(self):
+        from loki_agent import formats, loki
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                session = Session(shell_cwd=tmpdir)
+                loki._DEFAULT_SESSION = session
+                worker = Worker(session, lambda message: None, "s")
+
+                async def no_turn(on_event):
+                    return None
+
+                worker._run_turn = no_turn
+                result = asyncio.run(worker.prompt({
+                    "sessionId": "s",
+                    "prompt": [
+                        {"type": "text", "text": "inspect this"},
+                        {
+                            "type": "resource_link",
+                            "name": "source.py",
+                            "uri": "file:///tmp/source.py",
+                            "mimeType": "text/x-python",
+                        },
+                    ],
+                }))
+                text = formats.item_text(
+                    session.transcript_items[-1])
+                self.assertIn("inspect this", text)
+                self.assertIn("file:///tmp/source.py", text)
+                self.assertEqual(result["stopReason"], "end_turn")
+        finally:
+            loki._DEFAULT_SESSION = old_session
+
+    def test_refused_prompt_is_excluded_from_next_turn(self):
+        from loki_agent import formats, loki
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                initial = [formats.instruction_item("system")]
+                session = Session(
+                    shell_cwd=tmpdir,
+                    transcript_items=list(initial),
+                )
+                loki._DEFAULT_SESSION = session
+                worker = Worker(session, lambda message: None, "s")
+
+                async def refused(on_event):
+                    session.transcript_items.append(
+                        formats.DecodedTurn([
+                            formats.message_item(
+                                "assistant",
+                                [{"type": "refusal", "text": "No"}],
+                            ),
+                        ]).to_event())
+                    on_event({"type": "response_refusal"})
+
+                worker._run_turn = refused
+                result = asyncio.run(worker.prompt({
+                    "sessionId": "s",
+                    "prompt": [{"type": "text", "text": "unsafe"}],
+                }))
+                self.assertEqual(result["stopReason"], "refusal")
+                self.assertEqual(session.transcript_items, initial)
+        finally:
+            loki._DEFAULT_SESSION = old_session
