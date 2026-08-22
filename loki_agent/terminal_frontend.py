@@ -70,7 +70,6 @@ from .loki import (
     set_session_connection,
     user_prompt_history,
 )
-from .savefiles import ResumeTranscriptRenderer
 from .terminals import (
     input_session, restore_output_area_after_input, terminal)
 
@@ -437,6 +436,8 @@ async def async_main(args) -> int:
 
         if resolved_log_filename:
             load_chat_log(resolved_log_filename, loaded_chat)
+            savefiles.print_resume_transcript(
+                current_transcript(), current_model() or "Assistant")
         else:
             new_chat_log(new_chat_log_path())
 

@@ -657,8 +657,17 @@ class ModelLoadingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
+            events = loki.initial_transcript_items() + [
+                formats.message_item("user", "visible resumed question"),
+                formats.model_response_event(
+                    protocols.OPENAI_CHAT,
+                    [formats.message_item(
+                        "assistant", "visible resumed answer")],
+                    model="local-model",
+                ),
+            ]
             blob = formats.new_log_blob(
-                loki.initial_transcript_items(), [])
+                events, [])
             blob["session_state"] = {
                 "shell_cwd": loki.current_cwd(),
                 "connection": descriptor.to_dict(),
@@ -666,17 +675,25 @@ class ModelLoadingTests(unittest.TestCase):
             pathlib.Path(path).write_text(
                 json.dumps(blob), encoding="utf-8")
             confirm = mock.AsyncMock(return_value=True)
+            stdout = io.StringIO()
             with mock.patch(
                     "loki_agent.terminal_frontend.input_session",
                     return_value=session), mock.patch(
                         "loki_agent.terminal_frontend.confirm_saved_connection_async",
                         new=confirm), mock.patch(
-                            "loki_agent.terminal_frontend.restore_output_area_after_input"):
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(stdout):
                 status = asyncio.run(
                     terminal_frontend.async_main([f"--resume={path}"]))
 
         confirm.assert_awaited_once()
         self.assertEqual(status, 0)
+        rendered = stdout.getvalue()
+        self.assertIn(
+            "User: visible resumed question", rendered)
+        self.assertIn(
+            "local-model: visible resumed answer", rendered)
+        self.assertTrue(rendered.endswith("----\n"))
         self.assertEqual(loki.current_model(), "local-model")
         self.assertEqual(loki.current_config().api_key, "")
         self.assertIsNone(loki.current_config().credential_env)
