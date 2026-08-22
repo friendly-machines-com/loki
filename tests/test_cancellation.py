@@ -148,9 +148,15 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
         self.assertEqual(executed, [])
         tool_results = [item for item in transcript
                         if item.get("type") == "tool_result"]
-        self.assertEqual(len(tool_results), 1)
-        self.assertIn("cancelled",
-                      formats.item_text(tool_results[0]).lower())
+        # A cancellation already pending before the model request wins before
+        # any provider output is accepted. There is therefore no call to pair
+        # and no synthetic tool result to invent.
+        self.assertEqual(tool_results, [])
+        self.assertEqual(chat.calls, 0)
+        self.assertEqual(
+            [item.get("type") for item in transcript],
+            ["message"],
+        )
 
     def test_no_cancel_means_full_loop(self):
         # Control: identical setup without cancel runs everything and loops
@@ -185,6 +191,77 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
         self.assertEqual(result, "all done")
         self.assertEqual(executed, ["c1"])
         self.assertEqual(chat.calls, 2)
+
+    def test_cancel_that_races_with_nonstream_response_discards_response(self):
+        cancel = _CancelAfter()
+        events = []
+        transcript = [formats.message_item("user", "go")]
+
+        async def response_and_cancel(_items):
+            cancel.cancelled = True
+            return [
+                formats.message_item(
+                    "assistant", "must not be accepted"),
+            ]
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            transcript,
+            chat_fn=response_and_cancel,
+            on_event=events.append,
+            cancel_check=cancel,
+        ))
+
+        self.assertEqual(result, "")
+        self.assertEqual(
+            [item.get("role") for item in transcript], ["user"])
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["response_cancelled"],
+        )
+
+    def test_cancel_dominates_simultaneous_transport_failure(self):
+        cancel = _CancelAfter()
+        events = []
+
+        async def failure_and_cancel(_items):
+            cancel.cancelled = True
+            raise ConnectionResetError("socket closed during cancellation")
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            [formats.message_item("user", "go")],
+            chat_fn=failure_and_cancel,
+            on_event=events.append,
+            cancel_check=cancel,
+        ))
+
+        self.assertEqual(result, "")
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["response_cancelled"],
+        )
+
+    def test_provider_refusal_has_distinct_terminal_event(self):
+        events = []
+
+        async def refusal(_items):
+            return formats.DecodedTurn([
+                formats.message_item(
+                    "assistant",
+                    [{"type": "refusal", "text": "I cannot help."}],
+                ),
+            ])
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            [formats.message_item("user", "request")],
+            chat_fn=refusal,
+            on_event=events.append,
+        ))
+
+        self.assertEqual(result, "I cannot help.")
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["assistant_message", "response_refusal"],
+        )
 
 
 if __name__ == "__main__":

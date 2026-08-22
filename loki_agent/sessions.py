@@ -33,6 +33,7 @@ class Session:
 
     # "normal" / "explore" / "plan" / "edit"
     agent_mode: str = "normal"
+    last_instructed_agent_mode: str | None = None
 
     # JobManager, created on first use.
     job_manager: Any = None
@@ -57,6 +58,7 @@ class Session:
         # Write through the real path, not a symlink naming it.
         self.chat_log_path = os.path.realpath(path) if path else None
         self.chat_log_dirty = False
+        self.last_instructed_agent_mode = None
 
 
 def default_session() -> Session:

@@ -882,27 +882,15 @@ class InputBuffer:
         self.cursor = min(len(self.chars), self.cursor + 1)
 
     def word_left(self):
-        if self.cursor >= 0 and self.cursor < len(self.chars):
-            # move off the current word, if any
-            if self.chars[self.cursor].isidentifier():
-                while self.cursor > 0:
-                    self.cursor -= 1
-                    if self.cursor < len(self.chars):
-                        if not self.chars[self.cursor].isidentifier():
-                            break
-
-        # find SOME other word
-        while self.cursor > 0 and (self.cursor < len(self.chars) and not self.chars[self.cursor].isidentifier()) or (self.cursor >= len(self.chars)):
-           self.cursor -= 1
-
-        # move to the beginning of that word
-        if self.cursor >= 0 and self.cursor < len(self.chars) and self.chars[self.cursor].isidentifier():
-            while self.cursor > 0:
-                self.cursor -= 1
-                if self.cursor < len(self.chars):
-                    if not self.chars[self.cursor].isidentifier():
-                        self.cursor = min(len(self.chars), self.cursor + 1)
-                        break
+        if not self.chars or self.cursor <= 0:
+            self.cursor = 0
+            return
+        position = min(self.cursor, len(self.chars))
+        while position > 0 and not self.chars[position - 1].isidentifier():
+            position -= 1
+        while position > 0 and self.chars[position - 1].isidentifier():
+            position -= 1
+        self.cursor = position
 
     def word_right(self):
         if self.cursor >= 0 and self.cursor < len(self.chars):

@@ -71,6 +71,70 @@ class PatchedOpenConnection:
 
 
 class HttpClientRequestTests(unittest.TestCase):
+    def test_buffered_request_can_be_cancelled_during_connect(self):
+        connector = FakeConnector([])
+        entered = asyncio.Event()
+
+        async def blocked_open(*args, **kwargs):
+            entered.set()
+            await asyncio.Future()
+
+        connector.open_connection = blocked_open
+
+        async def scenario():
+            cancelled = False
+
+            def cancel_check():
+                return cancelled
+
+            async def request():
+                return await http_client.async_http_request(
+                    "POST", "https://example.test/v1/chat/completions",
+                    body=b"{}", timeout=30, cancel_check=cancel_check)
+
+            task = asyncio.create_task(request())
+            await entered.wait()
+            cancelled = True
+            with self.assertRaises(http_client.HttpRequestCancelled):
+                await asyncio.wait_for(task, timeout=1)
+
+        with PatchedOpenConnection(connector):
+            asyncio.run(scenario())
+
+    def test_buffered_request_cancel_interrupts_retry_backoff(self):
+        connector = FakeConnector([])
+        attempts = 0
+
+        async def failed_open(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise ConnectionResetError("offline")
+
+        connector.open_connection = failed_open
+
+        async def scenario():
+            cancelled = False
+
+            def cancel_check():
+                return cancelled
+
+            task = asyncio.create_task(http_client.async_http_request(
+                "POST", "https://example.test/v1/chat/completions",
+                body=b"{}", timeout=30,
+                retry_max_attempts=3,
+                retry_base_delay_s=10,
+                retry_max_jitter_s=0,
+                cancel_check=cancel_check,
+            ))
+            while attempts == 0:
+                await asyncio.sleep(0)
+            cancelled = True
+            with self.assertRaises(http_client.HttpRequestCancelled):
+                await asyncio.wait_for(task, timeout=1)
+
+        with PatchedOpenConnection(connector):
+            asyncio.run(scenario())
+
     def test_https_request_serializes_headers_body_and_tls_connection(self):
         connector = FakeConnector([
             b"HTTP/1.1 201 Created\r\n"

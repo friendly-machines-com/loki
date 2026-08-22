@@ -111,7 +111,6 @@ class ProviderReinstallTests(unittest.TestCase):
             "LOKI_MAX_TOKENS": "512",
         }
         names = ["runtime_config"]
-        sentinel = object()
         old_values = save_loki_state(names)
 
         try:
@@ -144,7 +143,6 @@ class ProviderReinstallTests(unittest.TestCase):
             "LOKI_MODEL": "model-a",
         }
         names = ["runtime_config"]
-        sentinel = object()
         old_values = save_loki_state(names)
 
         try:
@@ -172,7 +170,6 @@ class ProviderReinstallTests(unittest.TestCase):
 
     def test_reinstall_provider_requires_startup_config(self):
         names = ["runtime_config"]
-        sentinel = object()
         old_values = save_loki_state(names)
 
         try:
@@ -359,7 +356,6 @@ class RuntimeConfigTests(unittest.TestCase):
         }
         config = loki.build_config_from_env(env)
         names = ["runtime_config"]
-        sentinel = object()
         old_values = save_loki_state(names)
 
         try:
@@ -1047,7 +1043,6 @@ class ExitStatusTests(unittest.TestCase):
 class StatusTextTests(unittest.TestCase):
     def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
         names = ["runtime_config", "shell_cwd"]
-        sentinel = object()
         old_values = save_loki_state(names)
 
         try:
@@ -2569,7 +2564,6 @@ class ChatLogPathTests(unittest.TestCase):
             "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos",
         ]
-        sentinel = object()
         old_values = save_loki_state(names)
 
         try:
@@ -2847,7 +2841,6 @@ class ShellCwdTests(unittest.TestCase):
             "transcript_items", "session_todos", "shell_cwd",
             "previous_shell_cwd",
         ]
-        sentinel = object()
         old_values = save_loki_state(names)
 
         try:
@@ -3359,6 +3352,10 @@ class SubagentLaunchTests(unittest.TestCase):
                     "active-key",
                     model="active-model",
                     credential_env="EXAMPLE_API_KEY",
+                    models_url="https://example.test/custom-models",
+                    max_tokens=12345,
+                    anthropic_version="2026-01-02",
+                    auth_header="X-Custom-Key",
                 ))
                 child_env = loki._subagent_env()
         finally:
@@ -3366,6 +3363,14 @@ class SubagentLaunchTests(unittest.TestCase):
 
         self.assertEqual(child_env["LOKI_API_KEY"], "active-key")
         self.assertEqual(child_env["LOKI_STREAM"], "0")
+        self.assertEqual(child_env["LOKI_MAX_TOKENS"], "12345")
+        self.assertEqual(
+            child_env["LOKI_ANTHROPIC_VERSION"], "2026-01-02")
+        self.assertEqual(child_env["LOKI_AUTH_HEADER"], "X-Custom-Key")
+        self.assertEqual(
+            child_env["LOKI_MODELS_URL"],
+            "https://example.test/custom-models",
+        )
         self.assertNotIn("OPENROUTER_API_KEY", child_env)
 
     def test_subagent_environment_preserves_credentialless_connection(self):

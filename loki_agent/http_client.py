@@ -39,6 +39,11 @@ async def _wait_with_cancel(awaitable, timeout, cancel_check):
     try:
         while True:
             if cancel_check():
+                if task.done():
+                    try:
+                        task.result()
+                    except BaseException:
+                        pass
                 raise HttpRequestCancelled()
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -46,6 +51,15 @@ async def _wait_with_cancel(awaitable, timeout, cancel_check):
             done, _ = await asyncio.wait(
                 {task}, timeout=min(0.05, remaining))
             if done:
+                # Cancellation is an instruction, not a race for whichever
+                # future happens to be inspected first.  If both completed in
+                # the same event-loop turn, cancellation wins.
+                if cancel_check():
+                    try:
+                        task.result()
+                    except BaseException:
+                        pass
+                    raise HttpRequestCancelled()
                 return task.result()
     finally:
         if not task.done():
@@ -345,7 +359,8 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict = None,
 
 async def _async_http_request_once(method: str, request_url: str, *, headers_in: dict = None,
                                    body: bytes = b'', timeout: int = 30,
-                                   max_bytes: int = HTTP_MAX_RESPONSE_BYTES) -> HttpResponse:
+                                   max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
+                                   cancel_check=None) -> HttpResponse:
     async def request_once() -> HttpResponse:
         parsed, raw_request = _build_raw_request(method, request_url, headers_in, body)
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
@@ -384,7 +399,8 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
                 # should not replace the real request result.
                 pass
 
-    return await asyncio.wait_for(request_once(), timeout=timeout)
+    return await _wait_with_cancel(
+        request_once(), timeout, cancel_check or (lambda: False))
 
 
 @contextlib.asynccontextmanager
@@ -446,22 +462,27 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
                              retry_max_attempts: int = 1,
                              retry_base_delay_s: float = 0.5,
                              retry_max_jitter_s: float = 0.5,
-                             retry_backoff_factor: float = 2.0) -> HttpResponse:
+                             retry_backoff_factor: float = 2.0,
+                             cancel_check=None) -> HttpResponse:
+    cancel = cancel_check or (lambda: False)
     attempt = 0
     while True:
+        if cancel():
+            raise HttpRequestCancelled()
         attempt += 1
         try:
             return await _async_http_request_once(
                 method, request_url,
                 headers_in=headers_in, body=body,
                 timeout=timeout, max_bytes=max_bytes,
+                cancel_check=cancel,
             )
         except Exception as exc:
             if attempt >= retry_max_attempts or not _is_transient(exc):
                 raise
             delay = retry_base_delay_s * (retry_backoff_factor ** (attempt - 1))
             delay += random.uniform(0, retry_max_jitter_s)
-            await asyncio.sleep(delay)
+            await _wait_with_cancel(asyncio.sleep(delay), delay + 0.1, cancel)
 
 
 def _redirect_location(response: HttpResponse) -> str | None:
@@ -479,7 +500,8 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
                                               retry_max_attempts: int = 1,
                                               retry_base_delay_s: float = 0.5,
                                               retry_max_jitter_s: float = 0.5,
-                                              retry_backoff_factor: float = 2.0) -> HttpResponse:
+                                              retry_backoff_factor: float = 2.0,
+                                              cancel_check=None) -> HttpResponse:
     current_url = request_url
     original_host = urllib.parse.urlparse(request_url).netloc
     for _ in range(max_redirects + 1):
@@ -488,7 +510,8 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
                                             retry_max_attempts=retry_max_attempts,
                                             retry_base_delay_s=retry_base_delay_s,
                                             retry_max_jitter_s=retry_max_jitter_s,
-                                            retry_backoff_factor=retry_backoff_factor)
+                                            retry_backoff_factor=retry_backoff_factor,
+                                            cancel_check=cancel_check)
         next_url = _redirect_location(response)
         if not next_url:
             return response

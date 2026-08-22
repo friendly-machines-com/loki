@@ -15,23 +15,22 @@ import os
 import asyncio
 import collections
 import copy
+import hashlib
 import json
 import random
 import time
-import re
 import urllib.parse
 import subprocess
 import signal
 import socket
 import uuid
-import getopt
 import tempfile
 import shutil
 import threading
 import shlex
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from pprint import pprint, pformat
+from pprint import pformat
 
 from . import formats
 from . import http_client
@@ -40,10 +39,12 @@ from . import protocols
 from . import savefiles
 from . import sse
 from . import tool_runtime
-from .connections import ConnectionDescriptor, ConnectionDescriptorError
+from .connections import ConnectionDescriptor
 from .credentials import CredentialStore
-from .savefiles import ResumeTranscriptRenderer
 from .sessions import Session, default_session
+
+# Backwards-compatible public name; the implementation belongs to savefiles.
+ResumeTranscriptRenderer = savefiles.ResumeTranscriptRenderer
 
 
 # Conversation state lives in a sessions.Session.  current_session() returns
@@ -608,7 +609,13 @@ class LruCache(object):
         return self.items.pop(key, default)
 
 
-file_state = LruCache(READ_PATHS_LIMIT) # file_path -> last content the agent observed; keys = files Read this session
+@dataclass(frozen=True)
+class FileObservation:
+    digest: str
+    size: int
+
+
+file_state = LruCache(READ_PATHS_LIMIT)
 _webfetch_cache = LruCache(WEBFETCH_CACHE_MAX_ENTRIES)  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
 
 
@@ -844,17 +851,64 @@ def _atomic_write_text(file_path: str, content: str):
 
 def _stale_file_error(file_path: str, action: str) -> str | None:
     observed = file_state.get(file_path)
+    if file_path not in file_state:
+        return (
+            f"Error: {file_path} has not been read. Read it before "
+            f"{action}.")
     if observed is None:
-        return None
+        # Older callers used None for a binary observation. It conveys no
+        # identity and therefore cannot safely authorize an overwrite.
+        return (
+            f"Error: {file_path} has no verifiable read snapshot. "
+            f"Read it again before {action}.")
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            current = f.read()
+        if isinstance(observed, FileObservation):
+            current = _file_observation(file_path)
+        else:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                current = f.read()
     except Exception as e:
         return f"Error checking current file contents before {action}: {e}"
     if observed != current:
         return (f"Error: {file_path} changed on disk since you last read it. "
                 f"Read it again before {action}.")
     return None
+
+
+def _stat_identity(stat_result) -> tuple:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _file_observation(
+        file_path: str, expected_stat=None) -> FileObservation:
+    digest = hashlib.sha256()
+    size = 0
+    with open(file_path, "rb") as file_obj:
+        before = os.fstat(file_obj.fileno())
+        if (expected_stat is not None
+                and _stat_identity(before) != _stat_identity(expected_stat)):
+            raise OSError("file changed while it was being read")
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(file_obj.fileno())
+        if _stat_identity(after) != _stat_identity(before):
+            raise OSError("file changed while it was being read")
+    return FileObservation(digest.hexdigest(), size)
+
+
+def _content_observation(content: str) -> FileObservation:
+    encoded = content.encode("utf-8")
+    return FileObservation(hashlib.sha256(encoded).hexdigest(), len(encoded))
 
 
 def _now_iso() -> str:
@@ -1073,7 +1127,8 @@ class JobManager:
             # job already reaped here may have had its pgid recycled by an
             # unrelated process group, and killpg would hit that instead.
             with self._lock:
-                if job.status != "running":
+                if (job.status != "running"
+                        or job.process.returncode is not None):
                     return False
             try:
                 os.killpg(job.pgid or job.pid, signum)
@@ -1114,6 +1169,16 @@ class JobManager:
             done, _pending = await asyncio.wait(
                 watchers, timeout=timeout_ms / 1000,
                 return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            # Any unwind of the owning Python task must not orphan the process
+            # it owns. Wait for the process group to die before propagating
+            # the original exception.
+            exit_code = await terminate(signal.SIGINT, 2.0)
+            with self._lock:
+                job.status = "cancelled"
+                self._write_metadata(job)
+            self._record_exit(job, exit_code)
+            raise
         finally:
             # Clean up pending cancel task if it is still running to prevent memory leaks
             if cancel_task is not None and not cancel_task.done():
@@ -1189,18 +1254,24 @@ class JobManager:
             if stderr:
                 stderr += "\n"
             stderr += f"command timed out after {timeout_ms}ms"
-            return _format_bash_result(stdout, stderr, job.exit_code, status="timed_out")
+            return _tool_result(
+                False,
+                _format_bash_result(
+                    stdout, stderr, job.exit_code, status="timed_out"))
 
         return _format_bash_result(stdout, stderr, job.exit_code)
 
     async def run_exec(self, argv: list[str], timeout_ms: int, description: str = "",
                        output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                       env: dict | None = None, cwd: str = None):
+                       env: dict | None = None, cwd: str = None,
+                       cancel_event: asyncio.Event | None = None):
         if not argv:
             raise ValueError("argv must not be empty")
         return await self.run_foreground(argv, " ".join(argv), timeout_ms,
                                          description=description, shell=False,
-                                         output_chars=output_chars, env=env, cwd=cwd or current_cwd())
+                                         output_chars=output_chars, env=env,
+                                         cwd=cwd or current_cwd(),
+                                         cancel_event=cancel_event)
 
     async def run_background_exec(self, argv: list[str], description: str = "",
                                   env: dict | None = None, cwd: str = None) -> Job:
@@ -1260,8 +1331,12 @@ class JobManager:
         job = self._get_job(job_id)
         if job is None:
             return f"Error: unknown job id {job_id!r}"
-        if job.status != "running":
+        if job.status not in ("running", "stopping"):
             return f"Job {job.id} is not running (status={job.status})."
+        if job.status == "stopping" and not force:
+            return (
+                f"Job {job.id} is already stopping. "
+                "Use force=true to send SIGKILL.")
         sig = signal.SIGKILL if force else signal.SIGTERM
         try:
             os.killpg(job.pgid or job.pid, sig)
@@ -1326,7 +1401,11 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
-        file_state[file_path] = None
+        try:
+            file_state[file_path] = _file_observation(
+                file_path, expected_stat=st)
+        except OSError as error:
+            return f"Error reading file: {error}"
         return f"File {file_path} is an image ({st.st_size} bytes). Visual content rendering not supported in this environment; reading the file is acknowledged."
 
     try:
@@ -1338,13 +1417,27 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
         if truncated_chars:
             content = content[:READ_CHAR_CAP]
     except UnicodeDecodeError:
-        file_state[file_path] = None
+        try:
+            file_state[file_path] = _file_observation(
+                file_path, expected_stat=st)
+        except OSError as error:
+            return f"Error reading file: {error}"
         return f"File {file_path} is binary ({st.st_size} bytes); cannot display as text."
     except Exception as e:
         return f"Error reading file: {e}"
 
+    if "\x00" in content:
+        try:
+            file_state[file_path] = _file_observation(
+                file_path, expected_stat=st)
+        except OSError as error:
+            return f"Error reading file: {error}"
+        return (
+            f"File {file_path} is binary ({st.st_size} bytes); "
+            "cannot display as text.")
+
     if not content:
-        file_state[file_path] = ""
+        file_state[file_path] = _content_observation("")
         return f"File {file_path} is empty."
 
     if truncated_chars:
@@ -1365,27 +1458,31 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
     rendered = _format_numbered_lines(sliced, first_line_number=start + 1)
     if start + lim < total_lines:
         rendered += f"\n... ({total_lines - start - lim} more lines not shown)"
-    file_state[file_path] = content
+    try:
+        file_state[file_path] = _file_observation(
+            file_path, expected_stat=st)
+    except OSError as error:
+        return f"Error reading file snapshot: {error}"
     return rendered
 
 
 def run_write(file_path: str, content: str) -> str:
     if not file_path:
         return "Error: file_path is required"
-    if not content:
+    if content is None:
         return "Error: content is required"
     file_path = _resolve_path(file_path)
     existed = os.path.exists(file_path)
     if existed and file_path not in file_state:
         return (f"Error: You must Read {file_path} before overwriting it. "
                 "Read it first, then retry the Write.")
-    if existed:
+    if file_path in file_state:
         stale_error = _stale_file_error(file_path, "overwriting it")
         if stale_error:
             return stale_error
     try:
         _atomic_write_text(file_path, content)
-        file_state[file_path] = content
+        file_state[file_path] = _content_observation(content)
         return f"Successfully wrote to {file_path}"
     except Exception as e:
         return f"Error: {e}"
@@ -1427,7 +1524,7 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
 
     try:
         _atomic_write_text(file_path, new_data)
-        file_state[file_path] = new_data
+        file_state[file_path] = _content_observation(new_data)
         return f"Successfully edited {file_path} ({count} replacement{'s' if count != 1 else ''})."
     except Exception as e:
         return f"Error: {e}"
@@ -1437,7 +1534,9 @@ def run_glob(pattern: str, path: str = None) -> str:
     return asyncio.run(run_glob_async(pattern, path))
 
 
-async def run_glob_async(pattern: str, path: str = None) -> str:
+async def run_glob_async(
+        pattern: str, path: str = None,
+        cancel_event: asyncio.Event | None = None) -> str:
     if not pattern:
         return "Error: pattern is required"
     rg = _find_rg_binary()
@@ -1449,7 +1548,10 @@ async def run_glob_async(pattern: str, path: str = None) -> str:
     args = [rg, '--files', '--color=never', '--glob', pattern, root]
     start = time.perf_counter()
     job, status, stdout, stderr = await current_job_manager().run_exec(
-        args, SEARCH_TIMEOUT_S * 1000, description=f"Glob {pattern!r}")
+        args, SEARCH_TIMEOUT_S * 1000, description=f"Glob {pattern!r}",
+        cancel_event=cancel_event)
+    if status == "cancelled":
+        return "Error: glob search was cancelled by the user"
     if status == "timed_out":
         return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
     duration_ms = int((time.perf_counter() - start) * 1000)
@@ -1509,7 +1611,9 @@ def run_grep(pattern: str, path: str = None, glob: str = None,
 
 
 async def run_grep_async(pattern: str, path: str = None, glob: str = None,
-                         output_mode: str = "files_with_matches", **kwargs) -> str:
+                         output_mode: str = "files_with_matches",
+                         cancel_event: asyncio.Event | None = None,
+                         **kwargs) -> str:
     if not pattern:
         return "Error: pattern is required"
     if output_mode not in ['content', 'files_with_matches', 'count']:
@@ -1573,7 +1677,10 @@ async def run_grep_async(pattern: str, path: str = None, glob: str = None,
 
     start = time.perf_counter()
     job, status, stdout, stderr = await current_job_manager().run_exec(
-        args, SEARCH_TIMEOUT_S * 1000, description=f"Grep {pattern!r}")
+        args, SEARCH_TIMEOUT_S * 1000, description=f"Grep {pattern!r}",
+        cancel_event=cancel_event)
+    if status == "cancelled":
+        return "Error: grep search was cancelled by the user"
     if status == "timed_out":
         return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
     duration_ms = int((time.perf_counter() - start) * 1000)
@@ -1669,7 +1776,9 @@ def _handle_glob(args: dict) -> str:
 
 
 async def _handle_glob_async(args: dict, extra_context=None) -> str:
-    return await run_glob_async(args["pattern"], args.get("path"))
+    return await run_glob_async(
+        args["pattern"], args.get("path"),
+        cancel_event=(extra_context or {}).get("cancel_event"))
 
 
 def _handle_grep(args: dict) -> str:
@@ -1689,6 +1798,8 @@ async def _handle_grep_async(args: dict, extra_context=None) -> str:
                                 path=args.get("path"),
                                 glob=args.get("glob"),
                                 output_mode=args.get("output_mode", "files_with_matches"),
+                                cancel_event=(extra_context or {}).get(
+                                    "cancel_event"),
                                 **extra)
 
 
@@ -1720,10 +1831,12 @@ def _handle_agent(args: dict) -> str:
 
 
 async def _handle_agent_async(args: dict, extra_context=None) -> str:
+    cancel_event = (extra_context or {}).get("cancel_event")
     return await run_agent_async(args.get("description", ""),
                                  args["prompt"],
                                  args.get("run_in_background", False),
-                                 args.get("subagent_type", "Explore"))
+                                 args.get("subagent_type", "Explore"),
+                                 cancel_event=cancel_event)
 
 
 def _handle_skill(args: dict) -> str:
@@ -1731,13 +1844,17 @@ def _handle_skill(args: dict) -> str:
 
 
 async def _handle_webfetch_async(args: dict, extra_context=None) -> str:
-    return await run_webfetch_async(args["url"], args["prompt"])
+    return await run_webfetch_async(
+        args["url"], args["prompt"],
+        cancel_event=(extra_context or {}).get("cancel_event"))
 
 
 async def _handle_websearch_async(args: dict, extra_context=None) -> str:
     return await run_websearch_async(args["query"],
                                      allowed_domains=args.get("allowed_domains"),
-                                     blocked_domains=args.get("blocked_domains"))
+                                     blocked_domains=args.get("blocked_domains"),
+                                     cancel_event=(extra_context or {}).get(
+                                         "cancel_event"))
 
 
 def _tool_result(ok: bool, content) -> dict:
@@ -1766,6 +1883,10 @@ async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
     except Exception as e:
         return _tool_result(False, f"Failed while {context}: {type(e).__name__}: {e}")
 
+    if (isinstance(content, dict)
+            and set(content) == {"ok", "content"}
+            and isinstance(content["ok"], bool)):
+        return _tool_result(content["ok"], content["content"])
     text = str(content)
     return _tool_result(not _looks_like_tool_error(text), text)
 
@@ -1781,8 +1902,8 @@ def _tool_access_error(fn_name: str, allowed=None, extra_context=None):
             f"(allowed: {sorted(allowed)})")
     if inhibit_edits and spec.get('explore') is not True:
         return (
-            f"Not allowed to {fn_name} instead of doing the following: "
-            f"{inhibit_edits}")
+            f"Tool {fn_name} is unavailable while "
+            f"{inhibit_edits} is active.")
     return None
 
 
@@ -1792,6 +1913,11 @@ async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_cont
         fn_name, allowed=allowed, extra_context=extra_context)
     if access_error:
         return _tool_result(False, access_error)
+    cancel_event = (extra_context or {}).get("cancel_event")
+    if cancel_event is not None and cancel_event.is_set():
+        return _tool_result(
+            False, "Tool call not executed because the user cancelled "
+                   "the turn.")
 
     async def run_handler():
         if spec.get("async_handler") is not None:
@@ -1918,12 +2044,14 @@ async def execute_tool_call_async(
     if hook_pipeline is None:
         hook_pipeline = TOOL_HOOK_PIPELINE
     fn_name = formats.tool_call_name(call)
+    call_id = formats.tool_call_id(call)
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
         result = _tool_result(False, f"Unknown function: {fn_name}")
         on_event({
             "type": "tool_rejected",
             "name": fn_name,
+            "call_id": call_id,
             "args": _raw_tool_arguments(call),
         })
         return result, None
@@ -1956,6 +2084,13 @@ async def execute_tool_call_async(
         invocation.denied_by = "loki.capability-gate"
         outcome = tool_runtime.ToolOutcome(
             "rejected", False, False, access_error)
+    elif ((extra_context or {}).get("cancel_event") is not None
+            and (extra_context or {})["cancel_event"].is_set()):
+        invocation.denied_reason = (
+            "Tool call not executed because the user cancelled the turn.")
+        invocation.denied_by = "loki.cancellation"
+        outcome = tool_runtime.ToolOutcome(
+            "rejected", False, False, invocation.denied_reason)
     else:
         invocation = await hook_pipeline.prepare(invocation)
         if invocation.denied_reason:
@@ -1995,6 +2130,7 @@ async def execute_tool_call_async(
             on_event({
                 "type": "tool_call",
                 "name": fn_name,
+                "call_id": invocation.call_id,
                 "args": copy.deepcopy(
                     invocation.effective_arguments),
             })
@@ -2034,6 +2170,7 @@ async def execute_tool_call_async(
         on_event({
             "type": "tool_rejected",
             "name": fn_name,
+            "call_id": invocation.call_id,
             "args": copy.deepcopy(
                 invocation.effective_arguments),
         })
@@ -2044,21 +2181,59 @@ async def execute_tool_call_async(
 
 def get_tool_loop_extra_context(transcript_items: list):
     inhibit_edits = False
-    # "explore" mode: read-only. Force the explore-only tool gate so the agent
-    # can't write/edit while investigating.
-    if current_agent_mode() == "explore":
-        inhibit_edits = "explore mode"
-    if len(transcript_items) > 0 and transcript_items[-1].get("type") == "message" and transcript_items[-1].get("role") == "user":
-        content = transcript_items[-1].get('content')
-        content = [x for x in content if x.get('type') == 'text'][-1:]
-        if len(content) > 0:
-            text = content[-1].get("text")
-            if (text and (
-                    text.strip().endswith("?")
-                    or "what?" in text.strip().lower())):
-                inhibit_edits = "answering the user's question"
+    if current_agent_mode() in ("explore", "plan"):
+        inhibit_edits = f"{current_agent_mode()} mode"
 
     return {'inhibit_edits': inhibit_edits}
+
+
+def record_agent_mode_instruction():
+    session = current_session()
+    mode = session.agent_mode
+    if session.last_instructed_agent_mode == mode:
+        return
+    descriptions = {
+        "normal": (
+            "Normal mode is active. Use available tools as needed to answer "
+            "or implement the user's request."),
+        "explore": (
+            "Explore mode is active for this turn. Investigate and answer, "
+            "but do not modify files, todos, jobs, or other state."),
+        "plan": (
+            "Plan mode is active for this turn. Inspect read-only context and "
+            "produce a plan; do not modify files, todos, jobs, or other "
+            "state."),
+        "edit": (
+            "Edit mode is active. Implement the requested changes and verify "
+            "them with the available tools."),
+    }
+    session.transcript_items.append(formats.instruction_item(
+        descriptions.get(mode, descriptions["normal"])))
+    session.last_instructed_agent_mode = mode
+    mark_chat_log_dirty()
+
+
+def _turn_is_refusal(turn: formats.DecodedTurn) -> bool:
+    stop_reason = str(turn.metadata.get("stop_reason") or "").lower()
+    if stop_reason in ("refusal", "content_filter", "safety"):
+        return True
+    for item in turn.items:
+        if item.get("type") != "message":
+            continue
+        if any(
+                isinstance(block, dict)
+                and block.get("type") == "refusal"
+                for block in item.get("content", [])):
+            return True
+    protocol_data = turn.metadata.get("protocol_data")
+    if isinstance(protocol_data, dict):
+        encoded = json.dumps(protocol_data, default=str).lower()
+        if any(marker in encoded for marker in (
+                '"reason": "content_filter"',
+                '"reason": "refusal"',
+                '"reason": "safety"')):
+            return True
+    return False
 
 
 async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
@@ -2072,6 +2247,7 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
     Mutates ``transcript_items`` by appending one ``model_response`` for each
     actual provider response and one event for each local tool result.
     """
+    completion_cancel_check = cancel_check
     if chat_fn is None:
         advertised_tools = (
             TOOLS if allowed is None else [
@@ -2079,8 +2255,13 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                 for name, spec in TOOL_REGISTRY.items()
                 if name in allowed
             ])
-        chat_fn = lambda items: async_chat_completion(
-            items, tools=advertised_tools)
+        if completion_cancel_check is None:
+            chat_fn = lambda items: async_chat_completion(
+                items, tools=advertised_tools)
+        else:
+            chat_fn = lambda items: async_chat_completion(
+                items, tools=advertised_tools,
+                cancel_check=completion_cancel_check)
     if on_event is None:
         on_event = lambda event: None
     if cancel_check is None:
@@ -2106,6 +2287,13 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
 
     loop_count = 0
     while True:
+        if cancel_check():
+            on_event({
+                "type": "response_cancelled",
+                "partial": False,
+                "saved": False,
+            })
+            return ""
         loop_count += 1
         live_text_started = False
         live_text_parts = []
@@ -2144,21 +2332,73 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             })
             return ""
         except protocols.StreamProtocolError as e:
+            if cancel_check():
+                finish_live_text(False, "cancelled")
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": live_text_started,
+                    "saved": False,
+                })
+                return ""
             finish_live_text(False, "error")
             on_event({"type": "stream_error", "error": e})
             return ""
-        except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
+        except formats.TranscriptFormatError as e:
+            if cancel_check():
+                finish_live_text(False, "cancelled")
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": live_text_started,
+                    "saved": False,
+                })
+                return ""
             finish_live_text(False, "error")
             on_event({"type": "transcript_error", "error": e})
             return ""
+        except protocols.ProtocolError as e:
+            if cancel_check():
+                finish_live_text(False, "cancelled")
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": live_text_started,
+                    "saved": False,
+                })
+                return ""
+            finish_live_text(False, "error")
+            on_event({"type": "provider_error", "error": e})
+            return ""
         except ApiError as e:
+            if cancel_check():
+                finish_live_text(False, "cancelled")
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": live_text_started,
+                    "saved": False,
+                })
+                return ""
             finish_live_text(False, "error")
             on_event({"type": "api_error", "error": e})
             return ""
         except OSError as e:
+            if cancel_check():
+                finish_live_text(False, "cancelled")
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": live_text_started,
+                    "saved": False,
+                })
+                return ""
             finish_live_text(False, "error")
             msg = str(e) or f"{type(e).__name__}() (errno={e.errno!r}, no OS message)"
             on_event({"type": "network_error", "error": msg})
+            return ""
+        if cancel_check():
+            finish_live_text(False, "cancelled")
+            on_event({
+                "type": "response_cancelled",
+                "partial": live_text_started,
+                "saved": False,
+            })
             return ""
         turn = formats.coerce_decoded_turn(response_items)
         finish_live_text(turn.complete, None if turn.complete else "incomplete")
@@ -2180,6 +2420,16 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             if text)
         if assistant_text and not live_text_started:
             on_event({"type": "assistant_message", "content": assistant_text})
+
+        if _turn_is_refusal(turn):
+            if tool_calls:
+                append_unexecuted_results(
+                    tool_calls,
+                    "Tool call not executed because the provider refused "
+                    "the turn.",
+                )
+            on_event({"type": "response_refusal"})
+            return assistant_text
 
         if not turn.complete:
             if tool_calls:
@@ -2245,7 +2495,11 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                 hook_pipeline=hook_pipeline,
             )
             if not result["ok"]:
-                on_event({"type": "tool_error", "result": result["content"]})
+                on_event({
+                    "type": "tool_error",
+                    "call_id": formats.tool_call_id(tc),
+                    "result": result["content"],
+                })
             result_item = formats.tool_result_for_call(
                 tc,
                 result["content"],
@@ -2274,9 +2528,15 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                 return assistant_text
 
 
-async def run_toolless_completion_async(transcript_items: list) -> str:
+async def run_toolless_completion_async(
+        transcript_items: list, cancel_check=None) -> str:
     try:
-        response_items = await async_chat_completion(transcript_items, tools=[])
+        if cancel_check is None:
+            response_items = await async_chat_completion(
+                transcript_items, tools=[])
+        else:
+            response_items = await async_chat_completion(
+                transcript_items, tools=[], cancel_check=cancel_check)
     except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
         return f"Transcript render error: {e}"
     except ApiError as e:
@@ -2335,6 +2595,18 @@ def _subagent_env() -> dict:
         env['LOKI_STREAM'] = '1' if current_config().stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
             '1' if current_config().prompt_cache else '0')
+        provider = current_config().chat_provider
+        env['LOKI_MAX_TOKENS'] = str(provider.max_tokens)
+        env['LOKI_ANTHROPIC_VERSION'] = (
+            current_config().anthropic_version)
+        if current_config().auth_header:
+            env['LOKI_AUTH_HEADER'] = current_config().auth_header
+        else:
+            env.pop('LOKI_AUTH_HEADER', None)
+        if provider.models_url:
+            env['LOKI_MODELS_URL'] = provider.models_url
+        else:
+            env.pop('LOKI_MODELS_URL', None)
     return env
 
 
@@ -2377,7 +2649,8 @@ def run_agent(description: str, prompt: str, run_in_background: bool = False,
 
 
 async def run_agent_async(description: str, prompt: str, run_in_background: bool = False,
-                          subagent_type: str = "Explore") -> str:
+                          subagent_type: str = "Explore",
+                          cancel_event: asyncio.Event | None = None) -> str:
     agent_type = subagent_type or "Explore"
     if not prompt:
         return "Error: prompt is required"
@@ -2394,7 +2667,9 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
     job, status, stdout, stderr = await current_job_manager().run_exec(
         argv, SUBAGENT_TIMEOUT_S * 1000,
         description=description or "subagent task",
-        env=_subagent_env())
+        env=_subagent_env(), cancel_event=cancel_event)
+    if status == "cancelled":
+        return "Error: subagent was cancelled by the user"
     if status == "timed_out":
         result = _format_subagent_result(agent_type, description, "timed_out",
                                          job.exit_code, stdout, stderr)
@@ -2583,7 +2858,7 @@ def _parse_duckduckgo_results(html: str) -> list[dict]:
     return parser.results
 
 
-async def _fetch_url_async(url: str) -> dict:
+async def _fetch_url_async(url: str, cancel_check=None) -> dict:
     """GET a URL with redirect tracking, return dict with content/contentType/status/finalUrl/redirects.
     HTTP is upgraded to HTTPS. Cross-host redirects are surfaced, not followed."""
     if url.startswith('http://'):
@@ -2607,7 +2882,8 @@ async def _fetch_url_async(url: str) -> dict:
             retry_max_attempts=HTTP_RETRY_MAX_ATTEMPTS,
             retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
             retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
-            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR)
+            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
+            cancel_check=cancel_check)
         if response.redirect_url:
             return {'redirectUrl': response.redirect_url, 'status': response.status,
                     'finalUrl': response.url, 'error': None}
@@ -2619,7 +2895,9 @@ async def _fetch_url_async(url: str) -> dict:
         return {'error': f'fetch failed: {e}', 'finalUrl': url}
 
 
-async def run_webfetch_async(url: str, prompt: str) -> str:
+async def run_webfetch_async(
+        url: str, prompt: str,
+        cancel_event: asyncio.Event | None = None) -> str:
     if not url:
         return "Error: url is required"
     if not prompt:
@@ -2630,7 +2908,10 @@ async def run_webfetch_async(url: str, prompt: str) -> str:
         content_text, content_type, final_url, status = cached[1], cached[2], cached[3], cached[4]
         cache_hit = True
     else:
-        response = await _fetch_url_async(url)
+        response = await _fetch_url_async(
+            url,
+            cancel_check=(
+                cancel_event.is_set if cancel_event is not None else None))
         if response.get('error'):
             return f"Error: {response['error']}"
         if response.get('redirectUrl'):
@@ -2665,13 +2946,18 @@ async def run_webfetch_async(url: str, prompt: str) -> str:
             "user",
             f"URL: {final_url}\nContent-Type: {content_type}\nPrompt: {prompt}\n\n--- Page content ---\n{content_text}"),
     ]
-    answer = await run_toolless_completion_async(msgs) or "(no answer returned)"
+    answer = await run_toolless_completion_async(
+        msgs,
+        cancel_check=(
+            cancel_event.is_set if cancel_event is not None else None),
+    ) or "(no answer returned)"
     header = f"[WebFetch status={status} cache_hit={cache_hit} bytes~={len(content_text)} url={final_url}]"
     return f"{header}\n{answer}"
 
 
 async def run_websearch_async(query: str, allowed_domains: list = None,
-                              blocked_domains: list = None) -> str:
+                              blocked_domains: list = None,
+                              cancel_event: asyncio.Event | None = None) -> str:
     if not query or len(query) < 2:
         return "Error: query must be at least 2 characters"
     if allowed_domains and blocked_domains:
@@ -2696,6 +2982,8 @@ async def run_websearch_async(query: str, allowed_domains: list = None,
             retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
             retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
             retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
+            cancel_check=(
+                cancel_event.is_set if cancel_event is not None else None),
         )
         if response.status >= 400:
             return f"Error: web search request failed: HTTP {response.status} {response.reason}"
@@ -3024,7 +3312,7 @@ TOOLS = [
                 "Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.",
                 "",
                 "Available agent types and the tools they have access to:",
-                "- Explore: Read-only search agent for broad fan-out searches - when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: \"medium\" for moderate exploration, \"very thorough\" for multiple locations and naming conventions. (Tools: Glob, Grep, Read, Bash, Jobs, JobStatus, JobStop, WebFetch, WebSearch, TodoWrite)",
+                "- Explore: Read-only search agent for broad fan-out searches - when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: \"medium\" for moderate exploration, \"very thorough\" for multiple locations and naming conventions. (Tools: Glob, Grep, Read, Jobs, JobStatus, WebFetch, WebSearch)",
                 "",
                 "When using the Agent tool, specify a subagent_type parameter to select which agent type to use. If omitted, the \"Explore\" agent is used.",
                 "",
@@ -3154,10 +3442,10 @@ TOOL_HANDLERS = {
             ("file_path",): tool_runtime.FILESYSTEM_PATH,
         },
     },
-    "Bash": {"handler": _handle_bash, "async_handler": _handle_bash_async, "explore": True},
+    "Bash": {"handler": _handle_bash, "async_handler": _handle_bash_async},
     "Jobs": {"handler": _handle_jobs, "explore": True},
     "JobStatus": {"handler": _handle_job_status, "explore": True},
-    "JobStop": {"handler": _handle_job_stop, "explore": True},
+    "JobStop": {"handler": _handle_job_stop},
     "Glob": {
         "handler": _handle_glob,
         "async_handler": _handle_glob_async,
@@ -3175,9 +3463,12 @@ TOOL_HANDLERS = {
         },
     },
     "TodoRead": {"handler": _handle_todoread, "explore": True},
-    "TodoWrite": {"handler": _handle_todowrite, "explore": True},
-    "Agent": {"handler": _handle_agent, "async_handler": _handle_agent_async},
-    "Skill": {"handler": _handle_skill},
+    "TodoWrite": {"handler": _handle_todowrite},
+    "Agent": {
+        "handler": _handle_agent,
+        "async_handler": _handle_agent_async,
+    },
+    "Skill": {"handler": _handle_skill, "explore": True},
     "WebFetch": {"async_handler": _handle_webfetch_async, "explore": True},
     "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
 }
@@ -3204,7 +3495,8 @@ def configure_tool_hook_pipeline(environ=os.environ):
     return path
 
 async def async_chat_request(request_url: str, payload, request_headers: dict = None,
-                             report_errors: bool = False, show_timing: bool = False) -> dict:
+                             report_errors: bool = False, show_timing: bool = False,
+                             cancel_check=None) -> dict:
     start = time.perf_counter()
     body = json.dumps(payload).encode('utf-8') if payload is not None else b''
     method = 'POST' if payload is not None else 'GET'
@@ -3238,11 +3530,19 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
         retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
         retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
         retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
+        cancel_check=cancel_check,
     )
     response_text = _decode_http_text(response.body, response.headers)
     if response.status >= 400:
         raise ApiError(request_url, response.status, response.reason, response_text)
-    data = json.loads(response_text)
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError as error:
+        raise protocols.ProtocolError(
+            f"response from <{request_url}> was not valid JSON: "
+            f"{error.msg}",
+            payload=response_text,
+        ) from error
 
     elapsed = time.perf_counter() - start
     if show_timing:
@@ -3463,7 +3763,11 @@ async def async_chat_stream_request(
                 * (HTTP_RETRY_BACKOFF_FACTOR ** (attempt - 1)))
             if HTTP_RETRY_MAX_JITTER_S:
                 delay += random.uniform(0, HTTP_RETRY_MAX_JITTER_S)
-            await asyncio.sleep(delay)
+            try:
+                await http_client._wait_with_cancel(
+                    asyncio.sleep(delay), delay + 0.1, cancel)
+            except http_client.HttpRequestCancelled:
+                raise StreamCancelled()
 
     elapsed = time.perf_counter() - start
     if show_timing:
@@ -3476,6 +3780,8 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                                 show_timing: bool = False,
                                 on_text_delta=None,
                                 cancel_check=None) -> formats.DecodedTurn:
+    if cancel_check and cancel_check():
+        raise StreamCancelled()
     if not current_config():
         return formats.DecodedTurn([])
 
@@ -3538,13 +3844,22 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     else:
         payload = current_config().chat_provider.chat_payload(
             transcript_items, tools, current_model())
-        data = await async_chat_request(
-            current_config().chat_provider.chat_url,
-            payload,
-            request_headers=current_config().chat_provider.headers,
-            report_errors=report_errors,
-            show_timing=show_timing,
-        )
+        try:
+            request_kwargs = {
+                "request_headers":
+                    current_config().chat_provider.headers,
+                "report_errors": report_errors,
+                "show_timing": show_timing,
+            }
+            if cancel_check is not None:
+                request_kwargs["cancel_check"] = cancel_check
+            data = await async_chat_request(
+                current_config().chat_provider.chat_url,
+                payload,
+                **request_kwargs,
+            )
+        except http_client.HttpRequestCancelled:
+            raise StreamCancelled()
     if not isinstance(data, dict):
         raise protocols.ProtocolError(
             "chat response must be a JSON object", payload=data)
@@ -3627,11 +3942,13 @@ async def load_models_async():
         except OSError as e:
             errors.append(f"API Error for <{models_url}>: {e}")
             continue
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, protocols.ProtocolError) as e:
             # Some providers (e.g. Z.AI's /paas/v4 base) don't expose a /models
             # endpoint at all -- the response is an HTML error page or empty.
             # Treat as "couldn't load" rather than crashing the picker.
-            errors.append(f"Model list at <{models_url}> was not JSON: {e.msg}")
+            message = e.msg if isinstance(e, json.JSONDecodeError) else str(e)
+            errors.append(
+                f"Model list at <{models_url}> was not JSON: {message}")
             continue
         loaded = current_config().chat_provider.parse_model_ids(data)
         if loaded:
@@ -3744,6 +4061,7 @@ def new_chat_log(filename):
     session.transcript_items = initial_transcript_items()
     session.session_todos = []
     session.session_toolsets = []
+    session.last_instructed_agent_mode = None
     dirname = os.path.dirname(filename)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -3827,5 +4145,13 @@ def set_session_connection(descriptor: ConnectionDescriptor):
     mark_chat_log_dirty()
 
 
-if __name__ == '__main__':
+def main() -> int:
+    """Compatibility entry point for wrappers installed before the split."""
+    from .terminal_frontend import main as terminal_main
+    return terminal_main()
+
+
+if __name__ == "__main__":
+    # Keep the historical direct module invocation working without making the
+    # core library own terminal initialization at import time.
     raise SystemExit(main())

@@ -135,6 +135,14 @@ class AsyncKeyReaderTests(unittest.TestCase):
 
 
 class InputBufferTests(unittest.TestCase):
+    def test_word_left_on_empty_buffer_keeps_cursor_valid(self):
+        buffer = terminals.InputBuffer()
+        buffer.word_left()
+        buffer.insert("a")
+        buffer.insert("b")
+        self.assertEqual(buffer.cursor, 2)
+        self.assertEqual(buffer.text(), "ab")
+
     def test_insert_and_cursor_editing(self):
         buffer = terminals.InputBuffer()
 

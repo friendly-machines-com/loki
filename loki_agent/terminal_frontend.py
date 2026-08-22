@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import sys
+from pprint import pprint
 
 from . import formats
 from . import models as modelsdev
@@ -36,7 +37,6 @@ from .loki import (
     apply_runtime_config,
     async_chat_completion,
     build_config_from_env,
-    change_shell_cwd,
     change_shell_cwd_from_text,
     config_from_connection_descriptor,
     config_from_modelsdev_selection,
@@ -48,7 +48,6 @@ from .loki import (
     current_cwd,
     current_model,
     current_session,
-    current_todos,
     current_transcript,
     cycle_agent_mode,
     display_path,
@@ -59,8 +58,8 @@ from .loki import (
     mark_chat_log_dirty,
     new_chat_log,
     new_chat_log_path,
-    pprint,
     print_shell_cwd,
+    record_agent_mode_instruction,
     reinstall_provider,
     resolve_chat_log_path,
     run_bash_async,
@@ -117,6 +116,13 @@ def _terminal_agent_event(event: dict):
                 file=sys.stderr,
             )
             sys.stderr.flush()
+    elif kind == "provider_error":
+        terminal.set_background_color(ERROR_COLOR)
+        error = event["error"]
+        print(f"Provider protocol error: {error}", end='')
+        terminal.reset_colors_and_flags()
+        print()
+        sys.stdout.flush()
     elif kind == "assistant_message":
         rendered_content = terminals.render_markdown(event["content"])
         print(f"\n{current_model()}: {rendered_content}")
@@ -218,21 +224,32 @@ def _terminal_agent_event(event: dict):
 
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None) -> str:
+    read_only = current_agent_mode() in ("explore", "plan")
+    active_tools = (
+        [
+            tool for tool in TOOLS
+            if tool.get("function", {}).get("name") in EXPLORE_TOOLS
+        ]
+        if read_only else TOOLS
+    )
+
     async def chat_fn(items, on_text_delta):
         return await async_chat_completion(
-            items, TOOLS, True, False,
+            items, active_tools, True, False,
             on_text_delta=on_text_delta,
             cancel_check=cancel_check)
 
     return await run_tool_loop_async(
         transcript_items,
+        allowed=EXPLORE_TOOLS if read_only else None,
         chat_fn=chat_fn,
         on_event=_terminal_agent_event,
         cancel_check=cancel_check,
         stream_chat=True,
         report_timing=True,
         cancel_event=cancel_event,
-        on_response=lambda turn, event: _remember_session_toolset(TOOLS),
+        on_response=lambda turn, event: _remember_session_toolset(
+            active_tools),
     )
 
 
@@ -307,9 +324,12 @@ async def run_subagent_prompt_async(subagent_type: str, prompt: str) -> str:
         return ""
     msgs = [
         formats.instruction_item(
-            "You are a focused Explore subagent. Use Glob/Grep/Read/Bash to investigate, then write a concise final answer."),
+            "You are a focused, read-only Explore subagent. Use "
+            "Glob/Grep/Read/WebFetch/WebSearch to investigate, then write a "
+            "concise final answer."),
         formats.message_item("user", prompt),
     ]
+    current_session().agent_mode = "explore"
     return await run_tool_loop_async(msgs, allowed=EXPLORE_TOOLS)
 
 
@@ -580,6 +600,7 @@ async def async_main(args) -> int:
                 sys.stderr.flush()
                 continue
 
+            record_agent_mode_instruction()
             current_transcript().append(formats.message_item("user", user_in))
             mark_chat_log_dirty()
 
