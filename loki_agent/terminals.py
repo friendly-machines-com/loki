@@ -727,6 +727,9 @@ class TerminalMode:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
 
 
+PASTE_START_SEQUENCE = b'\x1b[200~'
+PASTE_END_SEQUENCE = b'\x1b[201~'
+
 KEY_SEQUENCES = {
     b'\x1b[A': "CURSOR_UP",
     b'\x1b[B': "CURSOR_DOWN",
@@ -737,13 +740,14 @@ KEY_SEQUENCES = {
     b'\x1b[3~': "DELETE",
     b'\x1b[5~': "PAGE_UP",
     b'\x1b[6~': "PAGE_DOWN",
-    b'\x1b[200~': "PASTE_START",
-    b'\x1b[201~': "PASTE_END",
+    PASTE_START_SEQUENCE: "PASTE_START",
+    PASTE_END_SEQUENCE: "PASTE_END",
     b'\x1b[1;5D': 'CURSOR_WORD_LEFT',
     b'\x1b[1;5C': 'CURSOR_WORD_RIGHT',
     b'\x1b[Z': 'MODE_CYCLE',
 }
 CSI_FINAL_BYTES = set(range(0x40, 0x7f))
+KEY_READER_WAKE = object()
 
 
 class AsyncKeyReader:
@@ -755,6 +759,8 @@ class AsyncKeyReader:
         self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
         self.escape = bytearray()
         self.paste_mode = False
+        self.paste_bytes = bytearray()
+        self.eof = False
         self.loop = None
         self.cancel_requested = False
         # Event-driven counterpart of cancel_requested.  Set in _feed_byte,
@@ -770,7 +776,7 @@ class AsyncKeyReader:
 
     def _on_resize(self):
         self.pending.append(KeyEvent("RESIZE"))
-        self.byte_reader.queue.put_nowait(b'')
+        self.byte_reader.queue.put_nowait(KEY_READER_WAKE)
 
     async def __aenter__(self):
         self.loop = asyncio.get_running_loop()
@@ -799,7 +805,25 @@ class AsyncKeyReader:
         if text:
             self.pending.append(KeyEvent("TEXT", text))
 
+    def _finish_paste(self):
+        raw = bytes(self.paste_bytes)
+        self.paste_bytes.clear()
+        self.paste_mode = False
+        if raw:
+            # Match the existing input convention: carriage returns pasted
+            # from a CR-oriented clipboard are input newlines.
+            text = raw.decode("utf-8", errors="replace").replace("\r", "\n")
+            self.pending.append(KeyEvent("TEXT", text))
+        self.pending.append(KeyEvent("PASTE_END"))
+
     def _feed_byte(self, byte: int):
+        if self.paste_mode:
+            self.paste_bytes.append(byte)
+            if self.paste_bytes.endswith(PASTE_END_SEQUENCE):
+                del self.paste_bytes[-len(PASTE_END_SEQUENCE):]
+                self._finish_paste()
+            return
+
         if self.escape:
             self.escape.append(byte)
             if self.escape == b'\x1b[':
@@ -819,9 +843,7 @@ class AsyncKeyReader:
                 kind = KEY_SEQUENCES.get(sequence)
                 if kind == "PASTE_START":
                     self.paste_mode = True
-                    self.pending.append(KeyEvent(kind))
-                elif kind == "PASTE_END":
-                    self.paste_mode = False
+                    self.paste_bytes.clear()
                     self.pending.append(KeyEvent(kind))
                 elif kind == "MODE_CYCLE":
                     self.mode_cycle_requested = True
@@ -860,8 +882,15 @@ class AsyncKeyReader:
         while True:
             if self.pending:
                 return self.pending.popleft()
+            if self.eof:
+                return KeyEvent("EOF")
             chunk = await self.byte_reader.read()
+            if chunk is KEY_READER_WAKE:
+                continue
             if chunk == b'':
+                self.eof = True
+                if self.paste_mode:
+                    self._finish_paste()
                 if self.pending:
                     return self.pending.popleft()
                 return KeyEvent("EOF")
@@ -884,9 +913,8 @@ class InputBuffer:
         return ''.join(self.chars[self.cursor:])
 
     def insert(self, text: str):
-        for ch in text:
-            self.chars.insert(self.cursor, ch)
-            self.cursor += 1
+        self.chars[self.cursor:self.cursor] = text
+        self.cursor += len(text)
 
     def backspace(self):
         if self.cursor > 0:
@@ -1021,6 +1049,7 @@ class PromptController:
         if interactive:
             renderer.render(buffer)
 
+        paste_active = False
         while True:
             event = await reader.read_key()
             if event.kind == "EOF":
@@ -1071,15 +1100,19 @@ class PromptController:
                         buffer.insert(saved_input)
                     else:
                         buffer.insert(self.history[history_index])
-            elif event.kind in ["PASTE_START", "PASTE_END", "RESIZE"]:
-                # Paste markers only affect AsyncKeyReader state;
-                # resize is handled by the next render pass.
+            elif event.kind == "PASTE_START":
+                paste_active = True
+            elif event.kind == "PASTE_END":
+                paste_active = False
+            elif event.kind == "RESIZE":
+                # Resize is handled by the next render pass. If one arrives
+                # during a paste, PASTE_END supplies that render.
                 pass
             elif event.kind == "MODE_CYCLE":
                 # Shift-Tab cycles the agent mode; does not cancel or alter
                 # the buffer.
                 self.on_mode_cycle()
-            if interactive:
+            if interactive and not paste_active:
                 renderer.render(buffer)
 
 

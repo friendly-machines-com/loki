@@ -98,7 +98,7 @@ class AsyncKeyReaderTests(unittest.TestCase):
         )
         self.assertEqual(feed_bytes(reader, b"\x1b[12;34;56R"), [])
 
-    def test_bracketed_paste_keeps_newlines_as_text(self):
+    def test_bracketed_paste_is_one_text_event_with_newlines(self):
         reader = terminals.AsyncKeyReader(fd=0)
 
         events = feed_bytes(reader, b"\x1b[200~a\nb\x1b[201~")
@@ -107,13 +107,60 @@ class AsyncKeyReaderTests(unittest.TestCase):
             events,
             [
                 terminals.KeyEvent("PASTE_START"),
-                terminals.KeyEvent("TEXT", "a"),
-                terminals.KeyEvent("TEXT", "\n"),
-                terminals.KeyEvent("TEXT", "b"),
+                terminals.KeyEvent("TEXT", "a\nb"),
                 terminals.KeyEvent("PASTE_END"),
             ],
         )
         self.assertFalse(reader.paste_mode)
+
+    def test_bracketed_paste_coalesces_across_read_chunks(self):
+        class ChunkByteReader:
+            def __init__(self):
+                self.chunks = [
+                    b"\x1b[200~caf\xc3",
+                    b"\xa9\nsecond",
+                    b" line\x1b[201~",
+                ]
+
+            async def read(self):
+                return self.chunks.pop(0)
+
+        async def scenario():
+            reader = terminals.AsyncKeyReader(fd=0)
+            reader.byte_reader = ChunkByteReader()
+            return [await reader.read_key() for _ in range(3)]
+
+        self.assertEqual(
+            asyncio.run(scenario()),
+            [
+                terminals.KeyEvent("PASTE_START"),
+                terminals.KeyEvent("TEXT", "caf\u00e9\nsecond line"),
+                terminals.KeyEvent("PASTE_END"),
+            ],
+        )
+
+    def test_eof_finishes_an_incomplete_bracketed_paste(self):
+        class ChunkByteReader:
+            def __init__(self):
+                self.chunks = [b"\x1b[200~partial", b""]
+
+            async def read(self):
+                return self.chunks.pop(0)
+
+        async def scenario():
+            reader = terminals.AsyncKeyReader(fd=0)
+            reader.byte_reader = ChunkByteReader()
+            return [await reader.read_key() for _ in range(4)]
+
+        self.assertEqual(
+            asyncio.run(scenario()),
+            [
+                terminals.KeyEvent("PASTE_START"),
+                terminals.KeyEvent("TEXT", "partial"),
+                terminals.KeyEvent("PASTE_END"),
+                terminals.KeyEvent("EOF"),
+            ],
+        )
 
     def test_unknown_short_escape_sequence_is_ignored(self):
         reader = terminals.AsyncKeyReader(fd=0)
@@ -132,6 +179,31 @@ class AsyncKeyReaderTests(unittest.TestCase):
         event = asyncio.run(reader.read_key())
 
         self.assertEqual(event, terminals.KeyEvent("EOF"))
+
+    def test_resize_wakeup_is_not_mistaken_for_eof(self):
+        class WakeByteReader:
+            def __init__(self):
+                self.queue = asyncio.Queue()
+
+            async def read(self):
+                return await self.queue.get()
+
+        async def scenario():
+            reader = terminals.AsyncKeyReader(fd=0)
+            reader.byte_reader = WakeByteReader()
+            reader._on_resize()
+            resize = await reader.read_key()
+            reader.byte_reader.queue.put_nowait(b"x")
+            text = await reader.read_key()
+            return resize, text
+
+        self.assertEqual(
+            asyncio.run(scenario()),
+            (
+                terminals.KeyEvent("RESIZE"),
+                terminals.KeyEvent("TEXT", "x"),
+            ),
+        )
 
 
 class UserMessageQueueTests(unittest.TestCase):
@@ -201,6 +273,17 @@ class InputBufferTests(unittest.TestCase):
         buffer.delete()
         self.assertEqual(buffer.text(), "ac")
 
+    def test_bulk_insert_shifts_the_suffix_once_and_updates_cursor(self):
+        buffer = terminals.InputBuffer()
+        buffer.insert("prefix--suffix")
+        buffer.cursor = len("prefix")
+
+        buffer.insert("a large pasted block")
+
+        self.assertEqual(
+            buffer.text(), "prefixa large pasted block--suffix")
+        self.assertEqual(buffer.cursor, len("prefixa large pasted block"))
+
 
 class PromptControllerTests(unittest.TestCase):
     def read_with_events(self, events, history=None):
@@ -266,6 +349,49 @@ class PromptControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(result, "aXbc!")
+
+    def test_bracketed_paste_redraws_once_at_paste_end(self):
+        pasted = "x" * 10000
+
+        class FakeReader:
+            def __init__(self):
+                self.events = iter([
+                    terminals.KeyEvent("PASTE_START"),
+                    terminals.KeyEvent("TEXT", pasted),
+                    terminals.KeyEvent("RESIZE"),
+                    terminals.KeyEvent("PASTE_END"),
+                    terminals.KeyEvent("ENTER"),
+                ])
+
+            async def read_key(self):
+                return next(self.events)
+
+        class RecordingRenderer:
+            def __init__(self):
+                self.rendered = []
+
+            def render(self, buffer):
+                self.rendered.append(buffer.text())
+
+        async def scenario():
+            controller = terminals.PromptController(RecordingTerminal())
+            renderer = RecordingRenderer()
+            result = await controller._read_text_from_reader(
+                FakeReader(),
+                True,
+                terminals.InputBuffer(),
+                renderer,
+                1,
+                1,
+                0,
+                "",
+            )
+            return result, renderer.rendered
+
+        result, rendered = asyncio.run(scenario())
+
+        self.assertEqual(result, pasted)
+        self.assertEqual(rendered, ["", pasted])
 
     def test_read_text_navigates_history_and_restores_saved_input(self):
         result = self.read_with_events(
