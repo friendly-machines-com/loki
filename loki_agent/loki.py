@@ -26,7 +26,6 @@ import socket
 import uuid
 import tempfile
 import shutil
-import threading
 import shlex
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -964,18 +963,24 @@ class Job:
 
 
 class JobManager:
+    """Own subprocess job state on one asyncio event loop.
+
+    Every in-memory state transition in this class is synchronous and contains
+    no ``await``. It therefore completes before another event-loop task can
+    observe or modify the jobs table. Keep await points outside those
+    transitions instead of adding thread locks to event-loop-owned state.
+    """
+
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
         self.session_id = str(uuid.uuid4())
         self.session_dir = os.path.join(base_dir, self.session_id)
         self.jobs = {}
         self._counter = 0
-        self._lock = threading.RLock()
 
     def _next_job_id(self) -> str:
-        with self._lock:
-            self._counter += 1
-            return str(self._counter)
+        self._counter += 1
+        return str(self._counter)
 
     def _job_dir(self, job_id: str) -> str:
         return os.path.join(self.session_dir, job_id)
@@ -1004,24 +1009,23 @@ class JobManager:
         _atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
 
     def _record_exit(self, job: Job, exit_code: int):
-        with self._lock:
-            # Status records why Loki ended the job; exit_code/signal record
-            # how the child process actually terminated.
-            job.signal = -exit_code if exit_code < 0 else None
-            if job.status in ["cancelled", "timed_out", "stopped"]:
-                # Preserve the user-visible reason even after wait() reports the
-                # eventual process exit code.
-                pass
-            elif job.status == "stopping":
-                job.status = "stopped"
-            elif exit_code < 0:
-                job.status = "signaled"
-            else:
-                job.status = "exited"
-            job.exit_code = exit_code
-            job.finished_at = time.time()
-            job.finished_at_iso = _now_iso()
-            self._write_metadata(job)
+        # Status records why Loki ended the job; exit_code/signal record
+        # how the child process actually terminated.
+        job.signal = -exit_code if exit_code < 0 else None
+        if job.status in ["cancelled", "timed_out", "stopped"]:
+            # Preserve the user-visible reason even after wait() reports the
+            # eventual process exit code.
+            pass
+        elif job.status == "stopping":
+            job.status = "stopped"
+        elif exit_code < 0:
+            job.status = "signaled"
+        else:
+            job.status = "exited"
+        job.exit_code = exit_code
+        job.finished_at = time.time()
+        job.finished_at_iso = _now_iso()
+        self._write_metadata(job)
 
     def _refresh_job(self, job: Job):
         if job.status not in ["running", "stopping"]:
@@ -1091,9 +1095,8 @@ class JobManager:
         except OSError:
             job.pgid = proc.pid
         job.status = "running"
-        with self._lock:
-            self.jobs[job.id] = job
-            self._write_metadata(job)
+        self.jobs[job.id] = job
+        self._write_metadata(job)
         return job
 
     async def _wait_for_job(self, job: Job) -> int:
@@ -1106,13 +1109,12 @@ class JobManager:
         except Exception as e:
             # Background monitor failures cannot be returned synchronously, so
             # record them in the same stderr spool the caller already inspects.
-            with self._lock:
-                job.status = "monitor_error"
-                job.finished_at = time.time()
-                job.finished_at_iso = _now_iso()
-                with open(job.stderr_path, 'ab') as stderr_file:
-                    stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
-                self._write_metadata(job)
+            job.status = "monitor_error"
+            job.finished_at = time.time()
+            job.finished_at_iso = _now_iso()
+            with open(job.stderr_path, 'ab') as stderr_file:
+                stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
+            self._write_metadata(job)
 
     async def run_foreground(self, command, display_command: str, timeout_ms: int,
                              description: str = "", shell: bool = False,
@@ -1128,13 +1130,11 @@ class JobManager:
 
         def _signal_job(signum):
             # Signal the job's whole process group so shell children are not
-            # left behind. Guarded by the lock and the running status: a
-            # job already reaped here may have had its pgid recycled by an
-            # unrelated process group, and killpg would hit that instead.
-            with self._lock:
-                if (job.status != "running"
-                        or job.process.returncode is not None):
-                    return False
+            # left behind. The status check and killpg call contain no await,
+            # so another event-loop task cannot reap the job between them.
+            if (job.status != "running"
+                    or job.process.returncode is not None):
+                return False
             try:
                 os.killpg(job.pgid or job.pid, signum)
                 return True
@@ -1159,9 +1159,8 @@ class JobManager:
             # Send the termination signal while status is still "running" so
             # that _signal_job is not locked out by the guard.
             exit_code = await terminate(signal.SIGINT, 2.0)
-            with self._lock:
-                job.status = "cancelled"
-                self._write_metadata(job)
+            job.status = "cancelled"
+            self._write_metadata(job)
             self._record_exit(job, exit_code)
             return job, "cancelled", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
@@ -1179,9 +1178,8 @@ class JobManager:
             # it owns. Wait for the process group to die before propagating
             # the original exception.
             exit_code = await terminate(signal.SIGINT, 2.0)
-            with self._lock:
-                job.status = "cancelled"
-                self._write_metadata(job)
+            job.status = "cancelled"
+            self._write_metadata(job)
             self._record_exit(job, exit_code)
             raise
         finally:
@@ -1211,9 +1209,8 @@ class JobManager:
         exit_code = await terminate(
             signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
         
-        with self._lock:
-            job.status = "cancelled" if interrupted else "timed_out"
-            self._write_metadata(job)
+        job.status = "cancelled" if interrupted else "timed_out"
+        self._write_metadata(job)
             
         self._record_exit(job, exit_code)
         status = "cancelled" if interrupted else "timed_out"
@@ -1288,15 +1285,13 @@ class JobManager:
         return job
 
     def _get_job(self, job_id: str) -> Job | None:
-        with self._lock:
-            job = self.jobs.get(str(job_id))
+        job = self.jobs.get(str(job_id))
         if job is not None:
             self._refresh_job(job)
         return job
 
     def list_jobs(self) -> str:
-        with self._lock:
-            jobs = list(self.jobs.values())
+        jobs = list(self.jobs.values())
         for job in jobs:
             self._refresh_job(job)
         if not jobs:
@@ -1336,27 +1331,24 @@ class JobManager:
         job = self._get_job(job_id)
         if job is None:
             return f"Error: unknown job id {job_id!r}"
-        with self._lock:
-            # Keep signal dispatch and the running -> stopping transition
-            # atomic with respect to the background reaper. Otherwise a fast
-            # exit can be recorded as "signaled" and then overwritten with the
-            # stale transitional state "stopping".
-            if job.status not in ("running", "stopping"):
-                return f"Job {job.id} is not running (status={job.status})."
-            if job.status == "stopping" and not force:
-                return (
-                    f"Job {job.id} is already stopping. "
-                    "Use force=true to send SIGKILL.")
-            if job.process.returncode is not None:
-                self._record_exit(job, job.process.returncode)
-                return f"Job {job.id} is no longer running."
-            sig = signal.SIGKILL if force else signal.SIGTERM
-            try:
-                os.killpg(job.pgid or job.pid, sig)
-            except ProcessLookupError:
-                return f"Job {job.id} is no longer running."
-            job.status = "stopping"
-            self._write_metadata(job)
+        # This whole transition contains no await, so the event-loop reaper
+        # cannot run between signal dispatch and the new state being recorded.
+        if job.status not in ("running", "stopping"):
+            return f"Job {job.id} is not running (status={job.status})."
+        if job.status == "stopping" and not force:
+            return (
+                f"Job {job.id} is already stopping. "
+                "Use force=true to send SIGKILL.")
+        if job.process.returncode is not None:
+            self._record_exit(job, job.process.returncode)
+            return f"Job {job.id} is no longer running."
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(job.pgid or job.pid, sig)
+        except ProcessLookupError:
+            return f"Job {job.id} is no longer running."
+        job.status = "stopping"
+        self._write_metadata(job)
         return f"Sent {sig.name} to job {job.id} (pgid={job.pgid})."
 
 

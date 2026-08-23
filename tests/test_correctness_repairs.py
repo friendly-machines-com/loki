@@ -148,6 +148,14 @@ class FileObservationContractTests(unittest.TestCase):
 
 
 class JobOwnershipContractTests(unittest.TestCase):
+    def test_job_state_uses_event_loop_ownership_without_a_thread_lock(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+
+        self.assertFalse(hasattr(manager, "_lock"))
+        self.assertEqual(manager._next_job_id(), "1")
+        self.assertEqual(manager._next_job_id(), "2")
+
     def test_force_stop_escalates_a_job_already_stopping(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
