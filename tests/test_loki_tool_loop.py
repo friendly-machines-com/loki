@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import copy
 import contextlib
 import io
@@ -62,6 +63,10 @@ class ScriptedInputSession:
     def __init__(self, messages):
         self.messages = list(messages)
         self.user_messages = self
+        self.reader = types.SimpleNamespace(
+            cancel_requested=False,
+            cancel_event=mock.Mock(),
+        )
 
     async def get(self):
         return self.messages.pop(0)
@@ -77,6 +82,214 @@ class ScriptedInputSession:
 
     async def prompt(self, prompt=None, history=None):
         raise AssertionError(f"unexpected real modal prompt: {prompt!r}")
+
+
+class TerminalImageCommandTests(unittest.TestCase):
+    _state_names = [
+        "CREDENTIALS",
+        "runtime_config",
+        "transcript_items",
+        "session_todos",
+        "session_toolsets",
+        "session_state",
+        "chat_log_path",
+        "chat_log_dirty",
+        "shell_cwd",
+        "previous_shell_cwd",
+        "agent_mode",
+        "last_instructed_agent_mode",
+    ]
+
+    def setUp(self):
+        self.saved_state = save_loki_state(self._state_names)
+
+    def tearDown(self):
+        restore_loki_state(self.saved_state)
+
+    def test_loader_snapshots_relative_png_and_detects_real_type(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = b"\x89PNG\r\n\x1a\npayload"
+            path = pathlib.Path(tmpdir, "picture.dat")
+            path.write_bytes(data)
+
+            image = terminal_frontend.load_image_attachment(
+                "picture.dat", base_dir=tmpdir)
+            path.write_bytes(b"changed later")
+
+        self.assertEqual(image.path, os.path.realpath(path))
+        self.assertEqual(image.media_type, "image/png")
+        self.assertEqual(image.byte_size, len(data))
+        self.assertEqual(
+            base64.b64decode(image.encoded_data, validate=True), data)
+        self.assertEqual(image.content_block(), {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": image.encoded_data,
+            },
+        })
+
+    def test_media_type_detection_covers_supported_formats(self):
+        samples = {
+            b"\x89PNG\r\n\x1a\n": "image/png",
+            b"\xff\xd8\xff\xe0": "image/jpeg",
+            b"GIF87a": "image/gif",
+            b"GIF89a": "image/gif",
+            b"RIFF\x04\x00\x00\x00WEBP": "image/webp",
+        }
+        for data, expected in samples.items():
+            with self.subTest(expected=expected, data=data):
+                self.assertEqual(
+                    terminal_frontend._image_media_type(data), expected)
+
+    def test_loader_rejects_missing_non_image_non_file_and_oversize(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            text_path = pathlib.Path(tmpdir, "not-image.png")
+            text_path.write_text("not an image", encoding="utf-8")
+            large_path = pathlib.Path(tmpdir, "large.png")
+            large_path.write_bytes(b"\x89PNG\r\n\x1a\npayload")
+
+            with self.assertRaisesRegex(
+                    terminal_frontend.ImageAttachmentError,
+                    "cannot read"):
+                terminal_frontend.load_image_attachment(
+                    "missing.png", base_dir=tmpdir)
+            with self.assertRaisesRegex(
+                    terminal_frontend.ImageAttachmentError,
+                    "unsupported image data"):
+                terminal_frontend.load_image_attachment(
+                    str(text_path), base_dir=tmpdir)
+            with self.assertRaisesRegex(
+                    terminal_frontend.ImageAttachmentError,
+                    "not a regular file"):
+                terminal_frontend.load_image_attachment(
+                    tmpdir, base_dir=tmpdir)
+            with self.assertRaisesRegex(
+                    terminal_frontend.ImageAttachmentError,
+                    "maximum"):
+                terminal_frontend.load_image_attachment(
+                    str(large_path), base_dir=tmpdir, max_bytes=8)
+
+    def test_command_path_supports_shell_quoting_and_requires_one_path(self):
+        self.assertEqual(
+            terminal_frontend._image_command_path(
+                r'/image "screen shot.png"'),
+            "screen shot.png",
+        )
+        self.assertEqual(
+            terminal_frontend._image_command_path(
+                r"/image screen\ shot.png"),
+            "screen shot.png",
+        )
+        with self.assertRaisesRegex(
+                terminal_frontend.ImageAttachmentError, "usage"):
+            terminal_frontend._image_command_path("/image")
+        with self.assertRaisesRegex(
+                terminal_frontend.ImageAttachmentError, "quot"):
+            terminal_frontend._image_command_path('/image "unterminated')
+
+    def _run_terminal(self, messages, tmpdir):
+        loki.CREDENTIALS = CredentialStore({
+            "LOKI_API_BASE":
+                "https://provider.example.test/v1/chat/completions",
+            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
+            "LOKI_API_KEY": "test-key",
+            "LOKI_MODEL": "vision-model",
+        })
+        loki.current_session().shell_cwd = tmpdir
+        session = ScriptedInputSession(messages)
+        captured = []
+
+        async def capture_turn(items, **kwargs):
+            captured.append(copy.deepcopy(items))
+            return ""
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        path = os.path.join(tmpdir, "chat-test.json")
+        with mock.patch(
+                "loki_agent.terminal_frontend.input_session",
+                return_value=session), mock.patch(
+                    "loki_agent.terminal_frontend.new_chat_log_path",
+                    return_value=path), mock.patch(
+                        "loki_agent.terminal_frontend."
+                        "restore_output_area_after_input"), mock.patch(
+                            "loki_agent.terminal_frontend."
+                            "run_terminal_turn_async",
+                            new=capture_turn), contextlib.redirect_stdout(
+                                stdout), contextlib.redirect_stderr(stderr):
+            status = asyncio.run(terminal_frontend.async_main([]))
+        return status, captured, stdout.getvalue(), stderr.getvalue()
+
+    def test_image_command_attaches_snapshot_to_next_text_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = b"\x89PNG\r\n\x1a\npicture"
+            pathlib.Path(tmpdir, "screen shot.png").write_bytes(data)
+
+            status, captured, _stdout, stderr = self._run_terminal(
+                [
+                    '/image "screen shot.png"',
+                    "What is wrong here?",
+                    "Continue without the image.",
+                    "/quit",
+                ],
+                tmpdir,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(captured), 2)
+        user = captured[0][-1]
+        self.assertEqual(user["type"], "message")
+        self.assertEqual(user["role"], "user")
+        self.assertEqual(user["content"][0], {
+            "type": "text",
+            "text": "What is wrong here?",
+        })
+        self.assertEqual(
+            user["content"][1]["source"]["media_type"], "image/png")
+        self.assertEqual(
+            base64.b64decode(
+                user["content"][1]["source"]["data"], validate=True),
+            data,
+        )
+        self.assertNotIn(
+            '/image "screen shot.png"',
+            [formats.item_text(item) for item in captured[0]],
+        )
+        self.assertEqual(captured[1][-1], {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "Continue without the image.",
+            }],
+        })
+        self.assertIn("Attached image for next prompt:", stderr)
+
+    def test_empty_prompt_submits_all_staged_images_without_text(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pathlib.Path(tmpdir, "one.gif").write_bytes(
+                b"GIF89aone")
+            pathlib.Path(tmpdir, "two.webp").write_bytes(
+                b"RIFF\x04\x00\x00\x00WEBPtwo")
+
+            status, captured, _stdout, _stderr = self._run_terminal(
+                ["/image one.gif", "/image two.webp", "", "/quit"],
+                tmpdir,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(captured), 1)
+        user = captured[0][-1]
+        self.assertEqual(
+            [block["type"] for block in user["content"]],
+            ["image", "image"],
+        )
+        self.assertEqual(
+            [block["source"]["media_type"] for block in user["content"]],
+            ["image/gif", "image/webp"],
+        )
 
 
 class ProviderReinstallTests(unittest.TestCase):
@@ -1074,7 +1287,7 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             text,
             "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
-            f"Local: mode={loki.current_agent_mode()}; CWD: {loki.STARTUP_CWD}; /pwd, /cd DIR, /ps, !foo, /quit",
+            f"Local: mode={loki.current_agent_mode()}; CWD: {loki.STARTUP_CWD}; /pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)

@@ -21,6 +21,14 @@ export LOKI_MODEL="glm-5.2"
 ./loki.py
 ```
 
+Use `/image PATH` to attach a local PNG, JPEG, GIF, or WebP image to
+the next prompt. Relative paths use Loki's current `/pwd`; quote paths
+containing spaces. Several `/image` commands may be used before the prompt,
+and an empty prompt sends the staged images without additional text. Each
+image is limited to 20 MiB and is snapshotted when `/image` is entered, so a
+later change to the file does not change the conversation. The selected
+provider and model must support image input.
+
 At startup Loki captures the environment and removes variables ending in
 `_KEY`, `_TOKEN`, or `_PAT` from the environment inherited by tools. The
 `/model` picker fetches models.dev lazily and shows only providers for which a
