@@ -1,14 +1,16 @@
 import asyncio
 import contextlib
 import io
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from loki_agent import models
+from loki_agent import http_client, models
 from loki_agent.credentials import CredentialStore
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
@@ -77,6 +79,121 @@ def _input_script(inputs):
             raise EOFError
 
     return fake
+
+
+class CatalogFetchTests(unittest.TestCase):
+    def test_fetch_uses_loki_http_transport_with_catalog_bounds(self):
+        response = http_client.HttpResponse(
+            models.MODELS_DEV_URL,
+            200,
+            "OK",
+            {"content-type": "application/json"},
+            json.dumps(DATA).encode("utf-8"),
+        )
+        transport = mock.AsyncMock(return_value=response)
+
+        with mock.patch.object(
+                http_client, "async_http_request", new=transport):
+            result = asyncio.run(models.fetch_models_dev())
+
+        self.assertEqual(result, DATA)
+        self.assertEqual(transport.await_args.args, (
+            "GET", models.MODELS_DEV_URL))
+        self.assertEqual(
+            transport.await_args.kwargs["headers_in"],
+            {
+                "User-Agent": models.USER_AGENT,
+                "Accept": "application/json",
+            },
+        )
+        self.assertEqual(
+            transport.await_args.kwargs["timeout"],
+            models.MODELS_DEV_TIMEOUT_S,
+        )
+        self.assertEqual(
+            transport.await_args.kwargs["max_bytes"],
+            models.MODELS_DEV_MAX_BYTES,
+        )
+        self.assertEqual(
+            transport.await_args.kwargs["retry_max_attempts"],
+            models.MODELS_DEV_RETRY_MAX_ATTEMPTS,
+        )
+
+    def test_fetch_reads_cache_file_without_network_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = pathlib.Path(directory, "models.json")
+            cache_path.write_text(json.dumps(DATA), encoding="utf-8")
+            transport = mock.AsyncMock(
+                side_effect=AssertionError("cache hit performed network I/O"))
+            with mock.patch.object(
+                    http_client, "async_http_request", new=transport):
+                result = asyncio.run(models.fetch_models_dev(
+                    cache_path=str(cache_path)))
+
+        self.assertEqual(result, DATA)
+        transport.assert_not_awaited()
+
+    def test_fetch_leaves_the_event_loop_responsive(self):
+        async def scenario():
+            request_started = asyncio.Event()
+            release_response = asyncio.Event()
+            sibling_ran = asyncio.Event()
+
+            async def transport(*_args, **_kwargs):
+                request_started.set()
+                await release_response.wait()
+                return http_client.HttpResponse(
+                    models.MODELS_DEV_URL,
+                    200,
+                    "OK",
+                    {"content-type": "application/json"},
+                    b"{}",
+                )
+
+            with mock.patch.object(
+                    http_client, "async_http_request", new=transport):
+                fetch = asyncio.create_task(models.fetch_models_dev())
+                await request_started.wait()
+                asyncio.get_running_loop().call_soon(sibling_ran.set)
+                await asyncio.wait_for(sibling_ran.wait(), timeout=0.2)
+                release_response.set()
+                return await fetch
+
+        self.assertEqual(asyncio.run(scenario()), {})
+
+    def test_fetch_rejects_http_errors_and_oversized_catalogs(self):
+        responses = [
+            (
+                http_client.HttpResponse(
+                    models.MODELS_DEV_URL,
+                    503,
+                    "Unavailable",
+                    {},
+                    b"failure",
+                ),
+                "HTTP 503",
+            ),
+            (
+                http_client.HttpResponse(
+                    models.MODELS_DEV_URL,
+                    200,
+                    "OK",
+                    {},
+                    b"{}",
+                    truncated=True,
+                ),
+                "exceeds",
+            ),
+        ]
+
+        for response, message in responses:
+            with self.subTest(message=message), mock.patch.object(
+                    http_client,
+                    "async_http_request",
+                    new=mock.AsyncMock(return_value=response),
+            ):
+                with self.assertRaisesRegex(OSError, message):
+                    asyncio.run(models.fetch_models_dev())
 
 
 class GroupingTests(unittest.TestCase):

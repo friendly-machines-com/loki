@@ -7,7 +7,6 @@ import copy
 import json
 import os
 import sys
-import threading
 
 from . import acps, acp_events, formats, loki, models as modelsdev, replays
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
@@ -33,6 +32,7 @@ class Worker:
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
         self._catalog_started = False
+        self._catalog_task: asyncio.Task | None = None
 
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
@@ -73,6 +73,10 @@ class Worker:
 
     async def close(self):
         self.cancel_event.set()
+        catalog_task = self._catalog_task
+        if catalog_task is not None and not catalog_task.done():
+            catalog_task.cancel()
+            await asyncio.gather(catalog_task, return_exceptions=True)
         task = self._prompt_task
         if task is not None and not task.done():
             try:
@@ -295,34 +299,29 @@ class Worker:
         if self._catalog_started:
             return
         self._catalog_started = True
-        loop = asyncio.get_running_loop()
         explicit = loki.explicit_connection_option(loki.CREDENTIALS)
-
-        def discover():
-            try:
-                _data, groups = modelsdev.ensure_index()
-                choices = modelsdev.flattened_config_option_choices(
-                    loki.CREDENTIALS,
-                    explicit_connection=explicit,
-                    groups=groups,
-                )
-            except Exception as error:
-                print(
-                    f"models.dev discovery failed: {error}",
-                    file=sys.stderr,
-                )
-                return
-            try:
-                loop.call_soon_threadsafe(
-                    self._install_catalog_choices, choices)
-            except RuntimeError:
-                pass
-
-        threading.Thread(
-            target=discover,
+        self._catalog_task = asyncio.create_task(
+            self._discover_catalog(explicit),
             name=f"loki-model-catalog-{self.session_id}",
-            daemon=True,
-        ).start()
+        )
+
+    async def _discover_catalog(self, explicit):
+        try:
+            _data, groups = await modelsdev.ensure_index()
+            choices = modelsdev.flattened_config_option_choices(
+                loki.CREDENTIALS,
+                explicit_connection=explicit,
+                groups=groups,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(
+                f"models.dev discovery failed: {error}",
+                file=sys.stderr,
+            )
+            return
+        self._install_catalog_choices(choices)
 
     def _install_catalog_choices(self, discovered):
         if not discovered:

@@ -23,17 +23,21 @@ and additionally accept "filter WORDS" to narrow a large list and empty to
 cancel.
 """
 
+import asyncio
 import json
 import re
-import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 
+from . import http_client
 from . import protocols
 from .credentials import CredentialStore, is_credential_name
 
 MODELS_DEV_URL = "https://models.dev/api.json"
 USER_AGENT = "loki-models.dev-picker/1.0"
+MODELS_DEV_TIMEOUT_S = 30
+MODELS_DEV_MAX_BYTES = 20 * 1024 * 1024
+MODELS_DEV_RETRY_MAX_ATTEMPTS = 3
 
 # Feature flags shown in the pickers, in a stable order. A provider may set
 # each one differently for the same model; menus show the ones that are on.
@@ -79,23 +83,51 @@ class ExplicitConnectionOption:
 # Data loading and indexing
 # --------------------------------------------------------------------------
 
-def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
-    """Fetch and parse models.dev/api.json (stdlib only; sets a real UA)."""
+def _read_catalog_cache(cache_path):
+    with open(cache_path, "r", encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def _write_catalog_cache(cache_path, data):
+    with open(cache_path, "w", encoding="utf-8") as stream:
+        json.dump(data, stream)
+
+
+def _validate_catalog(data):
+    if not isinstance(data, dict):
+        raise ValueError("models.dev catalog must be a JSON object")
+    return data
+
+
+async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
+    """Fetch and parse models.dev/api.json through Loki's HTTP transport."""
     if cache_path:
         try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return _validate_catalog(
+                await asyncio.to_thread(_read_catalog_cache, cache_path))
         except OSError:
             pass
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-    })
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.load(resp)
+    response = await http_client.async_http_request(
+        "GET",
+        url,
+        headers_in={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
+        timeout=MODELS_DEV_TIMEOUT_S,
+        max_bytes=MODELS_DEV_MAX_BYTES,
+        retry_max_attempts=MODELS_DEV_RETRY_MAX_ATTEMPTS,
+    )
+    if response.status >= 400:
+        raise OSError(
+            f"models.dev returned HTTP {response.status} {response.reason}")
+    if response.truncated:
+        raise OSError(
+            f"models.dev catalog exceeds {MODELS_DEV_MAX_BYTES} bytes")
+    data = _validate_catalog(json.loads(
+        response.body.decode("utf-8-sig")))
     if cache_path:
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        await asyncio.to_thread(_write_catalog_cache, cache_path, data)
     return data
 
 
@@ -116,11 +148,11 @@ def build_groups(data):
     return dict(groups)
 
 
-def ensure_index(cache_path=None):
+async def ensure_index(cache_path=None):
     """Fetch (once per session) and return (data, groups)."""
     global _index_cache
     if _index_cache is None:
-        data = fetch_models_dev(cache_path=cache_path)
+        data = await fetch_models_dev(cache_path=cache_path)
         _index_cache = (data, build_groups(data))
     return _index_cache
 
@@ -498,20 +530,17 @@ async def run_flat_model_picker_async(
 
 
 def flattened_config_option_choices(
-        credentials, cache_path=None, explicit_connection=None, groups=None):
+        credentials, explicit_connection=None, groups=None):
     """Return ``(ACP option, selectable leaf)`` pairs.
 
-    ``groups`` lets non-blocking front-ends separate their immediate,
-    offline-safe options from later catalog discovery.  Passing ``None``
-    performs the normal models.dev lookup.  A failed lookup still preserves
-    an explicit LOKI_* connection: local configuration must not depend on an
-    unrelated catalog service being reachable.
+    ``groups`` lets asynchronous front-ends supply catalog discovery after
+    loading it through ``ensure_index``. Passing ``None`` is deliberately
+    offline-only: synchronous option formatting must never perform network
+    I/O. An explicit LOKI_* connection therefore remains available without
+    depending on the catalog service.
     """
     if groups is None:
-        try:
-            _, groups = ensure_index(cache_path=cache_path)
-        except (OSError, ValueError):
-            groups = {}
+        groups = {}
     groups = _add_explicit_connection(
         filter_supported_groups(groups, credentials),
         explicit_connection,
@@ -540,14 +569,14 @@ def flattened_config_option_choices(
     return choices
 
 
-def flattened_config_options(credentials, cache_path=None,
-                              explicit_connection=None):
+def flattened_config_options(credentials, explicit_connection=None,
+                              groups=None):
     """ACP select entries, preserving explicit config while offline."""
     return [
         option for option, _leaf in flattened_config_option_choices(
             credentials,
-            cache_path=cache_path,
             explicit_connection=explicit_connection,
+            groups=groups,
         )
     ]
 
@@ -564,7 +593,7 @@ async def run_model_picker_async(input_fn, credentials: CredentialStore,
     cannot be fetched, the network exception from fetch_models_dev propagates
     naturally; the caller catches it and uses the outage picker.
     """
-    _, groups = ensure_index(cache_path=cache_path)
+    _, groups = await ensure_index(cache_path=cache_path)
     # Keep only models served by at least one provider whose wire protocol
     # Loki can speak, so the menu is not flooded with the long tail.
     groups = _add_explicit_connection(
