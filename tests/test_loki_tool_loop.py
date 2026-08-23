@@ -28,6 +28,7 @@ from loki_agent import protocols
 from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialStore
 from loki_agent import savefiles
+from loki_agent import terminals
 
 
 
@@ -861,6 +862,13 @@ class ModelLoadingTests(unittest.TestCase):
     def test_interactive_resume_accepts_saved_credentialless_connection(self):
         loki.CREDENTIALS = CredentialStore({})
         session = ScriptedInputSession([None])
+        assistant_markdown = (
+            "## Resume heading\n\n"
+            "**visible resumed answer** and `code`\n\n"
+            "```python\n"
+            "print('raw **inside fence**')\n"
+            "```"
+        )
         descriptor = ConnectionDescriptor(
             provider_id=None,
             provider_name="Explicit LOKI_* connection",
@@ -879,7 +887,7 @@ class ModelLoadingTests(unittest.TestCase):
                 formats.model_response_event(
                     protocols.OPENAI_CHAT,
                     [formats.message_item(
-                        "assistant", "visible resumed answer")],
+                        "assistant", assistant_markdown)],
                     model="local-model",
                 ),
             ]
@@ -898,6 +906,9 @@ class ModelLoadingTests(unittest.TestCase):
                     return_value=session), mock.patch(
                         "loki_agent.terminal_frontend.confirm_saved_connection_async",
                         new=confirm), mock.patch(
+                            "loki_agent.terminals."
+                            "_terminal_supports_markdown_ansi",
+                            return_value=True), mock.patch(
                             "loki_agent.terminal_frontend.restore_output_area_after_input"), \
                     contextlib.redirect_stdout(stdout):
                 status = asyncio.run(
@@ -909,7 +920,17 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertIn(
             "User: visible resumed question", rendered)
         self.assertIn(
-            "local-model: visible resumed answer", rendered)
+            "local-model: "
+            + terminals.render_markdown(assistant_markdown, style=True),
+            rendered,
+        )
+        self.assertIn(
+            "\033[42m## Resume heading\033[49m", rendered)
+        self.assertIn(
+            "\033[1mvisible resumed answer\033[0m", rendered)
+        self.assertIn("\033[36mcode\033[0m", rendered)
+        self.assertNotIn("**visible resumed answer**", rendered)
+        self.assertIn("raw **inside fence**", rendered)
         self.assertTrue(rendered.endswith("----\n"))
         self.assertEqual(loki.current_model(), "local-model")
         self.assertEqual(loki.current_config().api_key, "")
@@ -1447,6 +1468,36 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         )
         self.assertNotIn("internal startup instruction", text)
         self.assertNotIn("response_metadata", text)
+
+    def test_resume_renderer_injects_presentation_for_assistant_text_only(self):
+        seen = []
+
+        def render_assistant(text):
+            seen.append(text)
+            return f"<rendered>{text}</rendered>"
+
+        items = [
+            formats.message_item("user", "**literal user input**"),
+            formats.model_response_event(
+                "openai_chat",
+                [formats.message_item(
+                    "assistant", "**formatted assistant output**")],
+                model="model-a",
+            ),
+        ]
+
+        text = loki.ResumeTranscriptRenderer(
+            assistant_label="Assistant",
+            assistant_text_renderer=render_assistant,
+        ).render(items)
+
+        self.assertEqual(seen, ["**formatted assistant output**"])
+        self.assertIn("User: **literal user input**", text)
+        self.assertIn(
+            "model-a: "
+            "<rendered>**formatted assistant output**</rendered>",
+            text,
+        )
 
     def test_resume_renderer_uses_response_model_labels(self):
         items = [

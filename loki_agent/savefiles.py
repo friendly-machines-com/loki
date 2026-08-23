@@ -210,8 +210,13 @@ def write_chat_log(file_obj, events: list, todos: list,
 class ResumeTranscriptRenderer:
     """Render a loaded transcript as the previous terminal conversation."""
 
-    def __init__(self, assistant_label: str = "Assistant"):
+    def __init__(self, assistant_label: str = "Assistant",
+                 assistant_text_renderer=None):
         self.assistant_label = assistant_label
+        self.assistant_text_renderer = (
+            assistant_text_renderer
+            if assistant_text_renderer is not None
+            else (lambda text: text))
 
     def _message_label(self, item: dict) -> str:
         role = item.get("role")
@@ -223,8 +228,10 @@ class ResumeTranscriptRenderer:
 
     def _render_message(self, item: dict, label=None) -> str:
         blocks = []
-        text = formats.item_text(item).strip()
-        if text:
+        text = formats.item_text(item)
+        if text.strip():
+            if item.get("role") == "assistant":
+                text = self.assistant_text_renderer(text)
             blocks.append(
                 f"{label or self._message_label(item)}: {text}")
         for content in item.get("content", []):
@@ -362,14 +369,22 @@ class ResumeTranscriptRenderer:
 
 
 def render_resume_transcript(
-        events: list, assistant_label: str) -> str:
+        events: list, assistant_label: str,
+        assistant_text_renderer=None) -> str:
     return ResumeTranscriptRenderer(
-        assistant_label=assistant_label).render(events)
+        assistant_label=assistant_label,
+        assistant_text_renderer=assistant_text_renderer,
+    ).render(events)
 
 
 def print_resume_transcript(
-        events: list, assistant_label: str) -> None:
-    rendered = render_resume_transcript(events, assistant_label)
+        events: list, assistant_label: str,
+        assistant_text_renderer=None) -> None:
+    rendered = render_resume_transcript(
+        events,
+        assistant_label,
+        assistant_text_renderer=assistant_text_renderer,
+    )
     if rendered:
         print(rendered)
     print('----')

@@ -605,7 +605,10 @@ async def async_main(args) -> int:
         if resolved_log_filename:
             load_chat_log(resolved_log_filename, loaded_chat)
             savefiles.print_resume_transcript(
-                current_transcript(), current_model() or "Assistant")
+                current_transcript(),
+                current_model() or "Assistant",
+                assistant_text_renderer=terminals.render_markdown,
+            )
         else:
             new_chat_log(new_chat_log_path())
 
