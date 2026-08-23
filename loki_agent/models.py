@@ -23,7 +23,6 @@ and additionally accept "filter WORDS" to narrow a large list and empty to
 cancel.
 """
 
-import asyncio
 import json
 import re
 from collections import defaultdict
@@ -103,8 +102,7 @@ async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
     """Fetch and parse models.dev/api.json through Loki's HTTP transport."""
     if cache_path:
         try:
-            return _validate_catalog(
-                await asyncio.to_thread(_read_catalog_cache, cache_path))
+            return _validate_catalog(_read_catalog_cache(cache_path))
         except OSError:
             pass
     response = await http_client.async_http_request(
@@ -127,7 +125,7 @@ async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
     data = _validate_catalog(json.loads(
         response.body.decode("utf-8-sig")))
     if cache_path:
-        await asyncio.to_thread(_write_catalog_cache, cache_path, data)
+        _write_catalog_cache(cache_path, data)
     return data
 
 

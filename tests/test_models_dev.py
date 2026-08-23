@@ -126,12 +126,40 @@ class CatalogFetchTests(unittest.TestCase):
             transport = mock.AsyncMock(
                 side_effect=AssertionError("cache hit performed network I/O"))
             with mock.patch.object(
-                    http_client, "async_http_request", new=transport):
+                    http_client, "async_http_request", new=transport
+            ), mock.patch.object(
+                    asyncio, "to_thread",
+                    side_effect=AssertionError("cache read used an executor")
+            ):
                 result = asyncio.run(models.fetch_models_dev(
                     cache_path=str(cache_path)))
 
         self.assertEqual(result, DATA)
         transport.assert_not_awaited()
+
+    def test_fetch_writes_cache_file_without_an_executor(self):
+        response = http_client.HttpResponse(
+            models.MODELS_DEV_URL,
+            200,
+            "OK",
+            {"content-type": "application/json"},
+            json.dumps(DATA).encode("utf-8"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = pathlib.Path(directory, "models.json")
+            with mock.patch.object(
+                    http_client, "async_http_request",
+                    new=mock.AsyncMock(return_value=response)
+            ), mock.patch.object(
+                    asyncio, "to_thread",
+                    side_effect=AssertionError("cache write used an executor")
+            ):
+                result = asyncio.run(models.fetch_models_dev(
+                    cache_path=str(cache_path)))
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, DATA)
+        self.assertEqual(cached, DATA)
 
     def test_fetch_leaves_the_event_loop_responsive(self):
         async def scenario():
