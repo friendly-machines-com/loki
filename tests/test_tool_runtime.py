@@ -490,6 +490,30 @@ class ExternalHookTests(unittest.TestCase):
         self.assertEqual(result.denied_by, "external.timeout")
         self.assertIn("timed out", result.denied_reason)
 
+    def test_hook_timeout_includes_blocked_stdin_transfer(self):
+        script = "import time; time.sleep(10)"
+
+        async def scenario(directory):
+            started = asyncio.get_running_loop().time()
+            with self.assertRaisesRegex(
+                    tool_runtime.HookExecutionError,
+                    "hook timed out after 20ms"):
+                await asyncio.wait_for(
+                    tool_runtime._run_hook_command(
+                        [sys.executable, "-c", script],
+                        {"large": "x" * 2_000_000},
+                        directory,
+                        20,
+                    ),
+                    timeout=1,
+                )
+            return asyncio.get_running_loop().time() - started
+
+        with tempfile.TemporaryDirectory() as directory:
+            elapsed = asyncio.run(scenario(directory))
+
+        self.assertLess(elapsed, 0.5)
+
     def test_invalid_hook_config_is_rejected_before_use(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "hooks.json")

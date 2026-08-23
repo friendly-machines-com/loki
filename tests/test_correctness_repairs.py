@@ -71,6 +71,29 @@ class ProviderResponseContractTests(unittest.TestCase):
                 asyncio.run(loki.async_chat_request(
                     response.url, {"model": "x"}, request_headers={}))
 
+    def test_chat_posts_and_model_gets_use_separate_timeouts(self):
+        response = http_client.HttpResponse(
+            "https://example.test/v1/chat/completions",
+            200,
+            "OK",
+            {"content-type": "application/json"},
+            b"{}",
+        )
+
+        for payload, expected_timeout in [
+                ({"model": "x"}, loki.LLM_REQUEST_TIMEOUT_S),
+                (None, loki.WEBFETCH_TIMEOUT_S)]:
+            transport = mock.AsyncMock(return_value=response)
+            with self.subTest(payload=payload), mock.patch.object(
+                    http_client, "async_http_request", new=transport):
+                asyncio.run(loki.async_chat_request(
+                    response.url, payload, request_headers={}))
+
+            self.assertEqual(
+                transport.await_args.kwargs["timeout"],
+                expected_timeout,
+            )
+
     def test_tool_loop_reports_provider_protocol_error_without_appending(self):
         events = []
         transcript = [

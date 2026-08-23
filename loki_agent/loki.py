@@ -147,6 +147,7 @@ CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
 JOB_TAIL_CHARS = 20_000
 
 WEBFETCH_TIMEOUT_S = 30
+LLM_REQUEST_TIMEOUT_S = 300
 LLM_STREAM_IDLE_TIMEOUT_S = 300
 WEBFETCH_MAX_BYTES = 10_485_760  # 10 MiB
 WEBFETCH_MAX_OUTPUT = 100_000   # 100 KB inline result
@@ -3520,6 +3521,7 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     headers_to_use = dict(headers_to_use)
 
     retry_attempts = HTTP_RETRY_MAX_ATTEMPTS
+    request_timeout = WEBFETCH_TIMEOUT_S
     if method == 'POST':
         # Best-effort server-side dedup; Anthropic honors this header on
         # /v1/messages. OpenAI-compat servers may ignore it.
@@ -3529,13 +3531,14 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
                   else LLM_IDEMPOTENCY_HEADER_OPENAI)
         headers_to_use[header] = uuid.uuid4().hex
         retry_attempts = HTTP_RETRY_MAX_ATTEMPTS_LLM
+        request_timeout = LLM_REQUEST_TIMEOUT_S
 
     response = await http_client.async_http_request(
         method,
         request_url,
         body=body,
         headers_in=headers_to_use,
-        timeout=WEBFETCH_TIMEOUT_S,
+        timeout=request_timeout,
         max_bytes=HTTP_MAX_RESPONSE_BYTES,
         retry_max_attempts=retry_attempts,
         retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,

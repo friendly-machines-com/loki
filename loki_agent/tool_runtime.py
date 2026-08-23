@@ -797,6 +797,15 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
     stderr_task = asyncio.create_task(
         _read_stream_limited(process.stderr, stderr_limit))
 
+    async def write_stdin():
+        try:
+            process.stdin.write(stdin_data)
+            await process.stdin.drain()
+        finally:
+            process.stdin.close()
+
+    stdin_task = asyncio.create_task(write_stdin())
+
     async def terminate():
         if process.returncode is None:
             try:
@@ -804,19 +813,16 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
             except ProcessLookupError:
                 pass
         await process.wait()
-        for task in [stdout_task, stderr_task]:
+        for task in [stdin_task, stdout_task, stderr_task]:
             if not task.done():
                 task.cancel()
         await asyncio.gather(
-            stdout_task, stderr_task, return_exceptions=True)
+            stdin_task, stdout_task, stderr_task, return_exceptions=True)
 
     try:
-        process.stdin.write(stdin_data)
-        await process.stdin.drain()
-        process.stdin.close()
-        stdout, stderr, returncode = await asyncio.wait_for(
+        _stdin_result, stdout, stderr, returncode = await asyncio.wait_for(
             asyncio.gather(
-                stdout_task, stderr_task, process.wait()),
+                stdin_task, stdout_task, stderr_task, process.wait()),
             timeout=timeout_ms / 1000,
         )
     except asyncio.TimeoutError as error:
