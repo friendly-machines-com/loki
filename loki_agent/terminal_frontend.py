@@ -86,28 +86,32 @@ class ImageAttachmentError(ValueError):
 
 @dataclass
 class TerminalActivityStatus:
+    turn_running: bool = False
     queued_messages: int = 0
     queued_images: int = 0
 
-    def _set(self, field_name: str, count: int):
-        count = max(0, int(count))
-        if getattr(self, field_name) == count:
+    def _set(self, field_name: str, value):
+        if getattr(self, field_name) == value:
             return
-        setattr(self, field_name, count)
+        setattr(self, field_name, value)
         try:
             terminals.redraw_status_bar()
         except (AssertionError, OSError):
-            # Queue and attachment state are authoritative; a transient tiny
-            # terminal or output error must not undo their state transition.
+            # Activity state is authoritative; a transient tiny terminal or
+            # output error must not undo the state transition.
             pass
 
+    def set_turn_running(self, running: bool):
+        self._set("turn_running", bool(running))
+
     def set_queued_messages(self, count: int):
-        self._set("queued_messages", count)
+        self._set("queued_messages", max(0, int(count)))
 
     def set_queued_images(self, count: int):
-        self._set("queued_images", count)
+        self._set("queued_images", max(0, int(count)))
 
     def reset(self):
+        self.turn_running = False
         self.queued_messages = 0
         self.queued_images = 0
 
@@ -401,10 +405,12 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
         displayed_model += " (deprecated)"
     return (
         'Remote: API: {}; Model: {}; /model\n'
-        'Local: queued_messages={}, queued_images={}; mode={}; CWD: {}; '
+        'Local: turn={}, queued_messages={}, queued_images={}; '
+        'mode={}; CWD: {}; '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         _status_api_base(), displayed_model,
+        "running" if activity.turn_running else "idle",
         activity.queued_messages, activity.queued_images,
         current_agent_mode(), display_path(current_cwd()))
 
@@ -789,6 +795,7 @@ async def async_main(args) -> int:
             _terminal_activity.set_queued_images(0)
             mark_chat_log_dirty()
 
+            _terminal_activity.set_turn_running(True)
             try:
                 # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
                 # earlier prompt or turn must not poison the next model call.
@@ -813,6 +820,8 @@ async def async_main(args) -> int:
                     ))
                 mark_chat_log_dirty()
                 continue
+            finally:
+                _terminal_activity.set_turn_running(False)
 
         pending_images.clear()
         _terminal_activity.set_queued_images(0)

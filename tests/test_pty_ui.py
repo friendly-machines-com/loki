@@ -167,7 +167,8 @@ class PtyUiTests(unittest.TestCase):
         output, _before_release = run_loki_pty_reply(stream=False)
         self.assertIn(b"Remote: API: dummy.invalid", output)
         self.assertIn(
-            b"Local: queued_messages=0, queued_images=0; mode=normal",
+            b"Local: turn=idle, queued_messages=0, "
+            b"queued_images=0; mode=normal",
             output,
         )
 
@@ -193,6 +194,14 @@ class PtyUiTests(unittest.TestCase):
 
         self.assertIn(b"queued_messages=1, queued_images=0", before_release)
         self.assertIn(b"queued_messages=2, queued_images=0", before_release)
+        self.assertIn(
+            b"turn=running, queued_messages=2, queued_images=0",
+            before_release,
+        )
+        self.assertIn(
+            b"turn=idle, queued_messages=0, queued_images=0",
+            output,
+        )
         self.assertIn(b"queued_messages=0, queued_images=0", output)
 
     def test_status_bar_tracks_image_after_queued_command_is_validated(self):

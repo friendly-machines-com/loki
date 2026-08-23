@@ -190,7 +190,7 @@ class TerminalImageCommandTests(unittest.TestCase):
                 terminal_frontend.ImageAttachmentError, "quot"):
             terminal_frontend._image_command_path('/image "unterminated')
 
-    def _run_terminal(self, messages, tmpdir):
+    def _run_terminal(self, messages, tmpdir, turn_runner=None):
         loki.CREDENTIALS = CredentialStore({
             "LOKI_API_BASE":
                 "https://provider.example.test/v1/chat/completions",
@@ -203,6 +203,8 @@ class TerminalImageCommandTests(unittest.TestCase):
         captured = []
 
         async def capture_turn(items, **kwargs):
+            self.assertTrue(
+                terminal_frontend._terminal_activity.turn_running)
             captured.append(copy.deepcopy(items))
             return ""
 
@@ -218,7 +220,8 @@ class TerminalImageCommandTests(unittest.TestCase):
                         "restore_output_area_after_input"), mock.patch(
                             "loki_agent.terminal_frontend."
                             "run_terminal_turn_async",
-                            new=capture_turn), contextlib.redirect_stdout(
+                            new=turn_runner or capture_turn
+                        ), contextlib.redirect_stdout(
                                 stdout), contextlib.redirect_stderr(stderr):
             status = asyncio.run(terminal_frontend.async_main([]))
         return status, captured, stdout.getvalue(), stderr.getvalue()
@@ -299,6 +302,58 @@ class TerminalImageCommandTests(unittest.TestCase):
             [block["source"]["media_type"] for block in user["content"]],
             ["image/gif", "image/webp"],
         )
+
+    def test_turn_status_resets_after_cancellation(self):
+        observed = []
+
+        async def cancel_turn(_items, **_kwargs):
+            observed.append(
+                terminal_frontend._terminal_activity.turn_running)
+            raise KeyboardInterrupt()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status, _captured, _stdout, _stderr = self._run_terminal(
+                ["cancel this turn", "/quit"],
+                tmpdir,
+                turn_runner=cancel_turn,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(observed, [True])
+        self.assertFalse(
+            terminal_frontend._terminal_activity.turn_running)
+
+    def test_slash_commands_do_not_start_a_turn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status, captured, _stdout, _stderr = self._run_terminal(
+                ["/pwd", "/ps", "/quit"],
+                tmpdir,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(captured, [])
+        self.assertFalse(
+            terminal_frontend._terminal_activity.turn_running)
+
+    def test_turn_status_resets_after_unexpected_failure(self):
+        observed = []
+
+        async def fail_turn(_items, **_kwargs):
+            observed.append(
+                terminal_frontend._terminal_activity.turn_running)
+            raise RuntimeError("turn failed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(RuntimeError, "turn failed"):
+                self._run_terminal(
+                    ["fail this turn"],
+                    tmpdir,
+                    turn_runner=fail_turn,
+                )
+
+        self.assertEqual(observed, [True])
+        self.assertFalse(
+            terminal_frontend._terminal_activity.turn_running)
 
 
 class ProviderReinstallTests(unittest.TestCase):
@@ -1292,10 +1347,13 @@ class StatusTextTests(unittest.TestCase):
             activity.set_queued_messages(2)
             activity.set_queued_messages(2)
             activity.set_queued_images(1)
+            activity.set_turn_running(True)
+            activity.set_turn_running(True)
 
+        self.assertTrue(activity.turn_running)
         self.assertEqual(activity.queued_messages, 2)
         self.assertEqual(activity.queued_images, 1)
-        self.assertEqual(redraw.call_count, 2)
+        self.assertEqual(redraw.call_count, 3)
 
     def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
         names = ["runtime_config", "shell_cwd"]
@@ -1325,6 +1383,7 @@ class StatusTextTests(unittest.TestCase):
 
             text = terminal_frontend.status_text(
                 terminal_frontend.TerminalActivityStatus(
+                    turn_running=True,
                     queued_messages=2,
                     queued_images=1,
                 ))
@@ -1334,7 +1393,7 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             text,
             "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
-            "Local: queued_messages=2, queued_images=1; "
+            "Local: turn=running, queued_messages=2, queued_images=1; "
             f"mode={loki.current_agent_mode()}; CWD: {loki.STARTUP_CWD}; "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
