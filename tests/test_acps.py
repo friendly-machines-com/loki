@@ -1289,8 +1289,10 @@ class WorkerSessionContractTests(unittest.TestCase):
         finally:
             loki._DEFAULT_SESSION = old_session
 
-    def test_refused_prompt_is_excluded_from_next_turn(self):
-        from loki_agent import formats, loki
+    def test_refused_prompt_is_retained_persisted_replayed_and_reused(self):
+        import copy
+        from unittest import mock
+        from loki_agent import formats, loki, protocols, savefiles
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
@@ -1298,14 +1300,124 @@ class WorkerSessionContractTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 initial = [formats.instruction_item("system")]
+                chat_path = os.path.join(tmpdir, "chat-refusal.json")
                 session = Session(
                     shell_cwd=tmpdir,
                     transcript_items=list(initial),
+                    chat_log_path=chat_path,
+                )
+                loki._DEFAULT_SESSION = session
+                messages = []
+                worker = Worker(session, messages.append, "s")
+                turns = [
+                    formats.DecodedTurn(
+                        [formats.message_item(
+                            "assistant",
+                            [{"type": "refusal", "text": "No"}],
+                        )],
+                        metadata={
+                            "protocol": protocols.OPENAI_CHAT,
+                            "stop_reason": "refusal",
+                        },
+                    ),
+                    formats.DecodedTurn(
+                        [formats.message_item("assistant", "Continued")],
+                        metadata={
+                            "protocol": protocols.OPENAI_CHAT,
+                            "stop_reason": "end_turn",
+                        },
+                    ),
+                ]
+                requests = []
+
+                async def completion(items, *_args, **_kwargs):
+                    requests.append(copy.deepcopy(items))
+                    return turns.pop(0)
+
+                async def scenario():
+                    with mock.patch.object(
+                            loki, "current_model", return_value="model"
+                    ), mock.patch.object(
+                            loki, "async_chat_completion", new=completion
+                    ):
+                        refused = await worker.prompt({
+                            "sessionId": "s",
+                            "prompt": [
+                                {"type": "text", "text": "unsafe"},
+                            ],
+                        })
+                        with open(
+                                chat_path, encoding="utf-8") as chat_file:
+                            persisted = savefiles.read_chat_log(chat_file)[0]
+                        messages.clear()
+                        worker._replay_transcript()
+                        replayed = list(messages)
+                        messages.clear()
+                        continued = await worker.prompt({
+                            "sessionId": "s",
+                            "prompt": [
+                                {"type": "text", "text": "why?"},
+                            ],
+                        })
+                        return refused, continued, persisted, replayed
+
+                refused, continued, persisted, replayed = asyncio.run(
+                    scenario())
+
+                self.assertEqual(refused["stopReason"], "refusal")
+                self.assertEqual(continued["stopReason"], "end_turn")
+                self.assertEqual(
+                    [event["type"] for event in persisted],
+                    ["message", "message", "model_response"],
+                )
+                self.assertEqual(formats.item_text(persisted[1]), "unsafe")
+                self.assertEqual(formats.item_text(persisted[2]), "No")
+                self.assertEqual(
+                    [formats.item_text(event) for event in requests[1]],
+                    ["system", "unsafe", "No", "why?"],
+                )
+                replay_updates = [
+                    message["params"]["update"]
+                    for message in replayed
+                    if message.get("method") == "session/update"
+                ]
+                replay_text = [
+                    update["content"]["text"]
+                    for update in replay_updates
+                    if update.get("sessionUpdate") in (
+                        "user_message_chunk", "agent_message_chunk")
+                ]
+                self.assertIn("unsafe", replay_text)
+                self.assertIn("No", replay_text)
+        finally:
+            loki._DEFAULT_SESSION = old_session
+
+    def test_refusal_does_not_erase_prior_tool_activity_in_prompt(self):
+        from loki_agent import formats, loki
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                session = Session(
+                    shell_cwd=tmpdir,
+                    transcript_items=[formats.instruction_item("system")],
                 )
                 loki._DEFAULT_SESSION = session
                 worker = Worker(session, lambda message: None, "s")
+                call = {
+                    "type": "function_call",
+                    "name": "Read",
+                    "call_id": "call-1",
+                    "arguments": {"file_path": "source.py"},
+                }
 
-                async def refused(on_event):
+                async def refused_after_tool(on_event):
+                    session.transcript_items.append(
+                        formats.DecodedTurn([call]).to_event())
+                    session.transcript_items.append(
+                        formats.tool_result_for_call(call, "file contents"))
                     session.transcript_items.append(
                         formats.DecodedTurn([
                             formats.message_item(
@@ -1315,12 +1427,23 @@ class WorkerSessionContractTests(unittest.TestCase):
                         ]).to_event())
                     on_event({"type": "response_refusal"})
 
-                worker._run_turn = refused
+                worker._run_turn = refused_after_tool
                 result = asyncio.run(worker.prompt({
                     "sessionId": "s",
-                    "prompt": [{"type": "text", "text": "unsafe"}],
+                    "prompt": [{"type": "text", "text": "inspect"}],
                 }))
+
                 self.assertEqual(result["stopReason"], "refusal")
-                self.assertEqual(session.transcript_items, initial)
+                self.assertEqual(
+                    [event["type"] for event in session.transcript_items],
+                    [
+                        "message",
+                        "message",
+                        "model_response",
+                        "tool_result",
+                        "model_response",
+                    ],
+                )
+                formats.validate_events(session.transcript_items)
         finally:
             loki._DEFAULT_SESSION = old_session

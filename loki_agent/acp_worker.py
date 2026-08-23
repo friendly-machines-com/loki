@@ -475,7 +475,6 @@ class Worker:
 
         self.cancel_event.clear()
         self.session_id = params.get("sessionId") or self.session_id
-        prompt_start = len(self.session.transcript_items)
         self.session.transcript_items.append(
             formats.message_item("user", user_text))
         loki.mark_chat_log_dirty()
@@ -505,10 +504,6 @@ class Worker:
         if failure:
             raise TurnFailure(failure)
         stop_reason = self._stop_reason(events)
-        if stop_reason == "refusal":
-            del self.session.transcript_items[prompt_start:]
-            loki.mark_chat_log_dirty()
-            loki.save_chat_log()
         return {"stopReason": stop_reason}
 
     async def _run_turn(self, on_event):
