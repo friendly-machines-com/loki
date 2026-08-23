@@ -53,6 +53,47 @@ class FramingTests(unittest.TestCase):
             list(acps.read_messages(io.StringIO("not json\n")))
 
 
+class AsyncFdLineReaderTests(unittest.TestCase):
+    def test_reads_buffered_lines_and_eof_without_changing_fd_flags(self):
+        read_fd, write_fd = os.pipe()
+        blocking_before = os.get_blocking(read_fd)
+        try:
+            os.write(write_fd, b"first\nsecond\npartial")
+            os.close(write_fd)
+            write_fd = None
+
+            async def scenario():
+                reader = acps.AsyncFdLineReader(read_fd, chunk_size=7)
+                return [line async for line in reader]
+
+            lines = asyncio.run(scenario())
+            self.assertEqual(lines, [b"first\n", b"second\n", b"partial"])
+            self.assertEqual(os.get_blocking(read_fd), blocking_before)
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
+
+    def test_cancelled_read_unregisters_cleanly(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            async def scenario():
+                reader = acps.AsyncFdLineReader(read_fd)
+                pending = asyncio.create_task(reader.readline())
+                await asyncio.sleep(0)
+                pending.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending
+                os.write(write_fd, b"after cancellation\n")
+                return await asyncio.wait_for(reader.readline(), timeout=1)
+
+            self.assertEqual(
+                asyncio.run(scenario()), b"after cancellation\n")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+
 class QuarantineTests(unittest.TestCase):
     def test_stdout_is_reserved_for_protocol(self):
         code = (
@@ -72,6 +113,80 @@ class QuarantineTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0]),
                          {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
+class NativeAsyncStdinTests(unittest.TestCase):
+    @staticmethod
+    def _command(module):
+        code = (
+            "import asyncio, runpy\n"
+            "def forbidden(*args, **kwargs):\n"
+            "    raise AssertionError('ACP stdin used an executor')\n"
+            "asyncio.BaseEventLoop.run_in_executor = forbidden\n"
+            f"runpy.run_module({module!r}, run_name='__main__')\n"
+        )
+        return [sys.executable, "-c", code]
+
+    def _assert_entrypoint_works_without_executor(self, module, message):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": ROOT,
+                "HOME": tmpdir,
+                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+                "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy",
+                "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model",
+            })
+            process = subprocess.Popen(
+                self._command(module),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=tmpdir,
+            )
+            self.addCleanup(_close_process_streams, process)
+            try:
+                stdout, stderr = process.communicate(
+                    json.dumps(message) + "\n", timeout=5)
+                line = stdout.splitlines()[0] if stdout.splitlines() else ""
+                self.assertTrue(
+                    line,
+                    stderr or f"{module} produced no response",
+                )
+                reply = json.loads(line)
+                self.assertEqual(reply["id"], message["id"])
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                self.fail(f"{module} did not exit after stdin EOF")
+
+    def test_front_stdin_does_not_use_an_executor(self):
+        self._assert_entrypoint_works_without_executor(
+            "loki_agent.acp_main",
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": 1},
+            },
+        )
+
+    def test_worker_stdin_does_not_use_an_executor(self):
+        self._assert_entrypoint_works_without_executor(
+            "loki_agent.acp_worker_main",
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "unknown",
+                "params": {},
+            },
+        )
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")

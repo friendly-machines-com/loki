@@ -42,17 +42,13 @@ async def amain() -> int:
         return 2
 
     import json
-    loop = asyncio.get_running_loop()
-    while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line:
-            break
-        line = line.strip()
+    async for raw_line in acps.AsyncFdLineReader(0):
+        line = raw_line.strip()
         if not line:
             continue
         try:
             message = json.loads(line)
-        except json.JSONDecodeError as error:
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
             write(acps.response(
                 None, error={"code": acps.PARSE_ERROR, "message": str(error)}))
             continue

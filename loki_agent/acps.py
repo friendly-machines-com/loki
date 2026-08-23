@@ -1,13 +1,14 @@
 """ACP transport: JSON-RPC over stdio, one message per line.
 
 The front process speaks this on its real stdin/stdout; worker processes
-speak it on socketpairs.  fd 1 carries protocol messages only, so the
+use subprocess pipes.  fd 1 carries protocol messages only, so the
 front process quarantines it (see quarantine_stdout) and every other
 writer in the process inherits a devnull instead.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -17,6 +18,102 @@ class TransportError(Exception):
     def __init__(self, message: str, *, code: int = -32603):
         super().__init__(message)
         self.code = code
+
+
+class AsyncFdLineReader:
+    """Read lines from a Unix fd through event-loop readiness notifications.
+
+    ``connect_read_pipe`` changes the underlying open file description to
+    nonblocking mode. That is undesirable for stdin because a terminal may
+    share its open file description with stdout. ``add_reader`` lets the loop
+    wait for readability without changing fd flags; the callback performs one
+    bounded read only after the kernel reports that it cannot block.
+
+    Only one ``readline`` call may be active. Leaving the fd unregistered
+    between calls preserves kernel backpressure while the consumer processes
+    the previous ACP message.
+    """
+
+    def __init__(self, fd: int, chunk_size: int = 64 * 1024):
+        self.fd = fd
+        self.chunk_size = chunk_size
+        self._buffer = bytearray()
+        self._eof = False
+        self._reading = False
+
+    def _take_line(self) -> bytes | None:
+        newline = self._buffer.find(b"\n")
+        if newline >= 0:
+            end = newline + 1
+            line = bytes(self._buffer[:end])
+            del self._buffer[:end]
+            return line
+        if self._eof:
+            line = bytes(self._buffer)
+            self._buffer.clear()
+            return line
+        return None
+
+    async def readline(self) -> bytes:
+        if self._reading:
+            raise RuntimeError("concurrent reads from one ACP fd")
+        self._reading = True
+        try:
+            line = self._take_line()
+            if line is not None:
+                return line
+
+            loop = asyncio.get_running_loop()
+            ready = loop.create_future()
+
+            def finish(error=None):
+                loop.remove_reader(self.fd)
+                if ready.done():
+                    return
+                if error is None:
+                    ready.set_result(None)
+                else:
+                    ready.set_exception(error)
+
+            def on_readable():
+                if ready.done():
+                    loop.remove_reader(self.fd)
+                    return
+                try:
+                    chunk = os.read(self.fd, self.chunk_size)
+                except BlockingIOError:
+                    return
+                except OSError as error:
+                    finish(error)
+                    return
+                if not chunk:
+                    self._eof = True
+                    finish()
+                    return
+                self._buffer.extend(chunk)
+                if b"\n" in chunk:
+                    finish()
+
+            loop.add_reader(self.fd, on_readable)
+            try:
+                await ready
+            finally:
+                loop.remove_reader(self.fd)
+            line = self._take_line()
+            if line is None:
+                raise RuntimeError("ACP fd became unreadable without a line")
+            return line
+        finally:
+            self._reading = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        line = await self.readline()
+        if not line:
+            raise StopAsyncIteration
+        return line
 
 
 def make_writer(fd: int):
