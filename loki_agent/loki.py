@@ -1004,13 +1004,17 @@ class JobManager:
 
     def _record_exit(self, job: Job, exit_code: int):
         with self._lock:
-            if job.status in ["timed_out", "stopped"]:
+            # Status records why Loki ended the job; exit_code/signal record
+            # how the child process actually terminated.
+            job.signal = -exit_code if exit_code < 0 else None
+            if job.status in ["cancelled", "timed_out", "stopped"]:
                 # Preserve the user-visible reason even after wait() reports the
                 # eventual process exit code.
                 pass
+            elif job.status == "stopping":
+                job.status = "stopped"
             elif exit_code < 0:
                 job.status = "signaled"
-                job.signal = -exit_code
             else:
                 job.status = "exited"
             job.exit_code = exit_code
@@ -1331,18 +1335,25 @@ class JobManager:
         job = self._get_job(job_id)
         if job is None:
             return f"Error: unknown job id {job_id!r}"
-        if job.status not in ("running", "stopping"):
-            return f"Job {job.id} is not running (status={job.status})."
-        if job.status == "stopping" and not force:
-            return (
-                f"Job {job.id} is already stopping. "
-                "Use force=true to send SIGKILL.")
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        try:
-            os.killpg(job.pgid or job.pid, sig)
-        except ProcessLookupError:
-            return f"Job {job.id} is no longer running."
         with self._lock:
+            # Keep signal dispatch and the running -> stopping transition
+            # atomic with respect to the background reaper. Otherwise a fast
+            # exit can be recorded as "signaled" and then overwritten with the
+            # stale transitional state "stopping".
+            if job.status not in ("running", "stopping"):
+                return f"Job {job.id} is not running (status={job.status})."
+            if job.status == "stopping" and not force:
+                return (
+                    f"Job {job.id} is already stopping. "
+                    "Use force=true to send SIGKILL.")
+            if job.process.returncode is not None:
+                self._record_exit(job, job.process.returncode)
+                return f"Job {job.id} is no longer running."
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            try:
+                os.killpg(job.pgid or job.pid, sig)
+            except ProcessLookupError:
+                return f"Job {job.id} is no longer running."
             job.status = "stopping"
             self._write_metadata(job)
         return f"Sent {sig.name} to job {job.id} (pgid={job.pgid})."

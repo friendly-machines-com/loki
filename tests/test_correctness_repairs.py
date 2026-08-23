@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import pathlib
 import signal
@@ -146,17 +147,30 @@ class JobOwnershipContractTests(unittest.TestCase):
                 self.assertIsNone(job.process.returncode)
                 second = manager.stop_job(job.id, force=True)
                 await asyncio.wait_for(job.process.wait(), timeout=3)
-                return first, second, job.process.returncode
+                deadline = asyncio.get_running_loop().time() + 3
+                while job.status == "stopping":
+                    if asyncio.get_running_loop().time() >= deadline:
+                        self.fail("background reaper did not finalize job")
+                    await asyncio.sleep(0.01)
+                with open(
+                        job.metadata_path, encoding="utf-8") as metadata_file:
+                    metadata = json.load(metadata_file)
+                return first, second, job, metadata
             finally:
                 if job.process.returncode is None:
                     os.killpg(job.pgid, signal.SIGKILL)
                     await job.process.wait()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            first, second, return_code = asyncio.run(scenario(tmpdir))
+            first, second, job, metadata = asyncio.run(scenario(tmpdir))
         self.assertIn("SIGTERM", first)
         self.assertIn("SIGKILL", second)
-        self.assertEqual(return_code, -signal.SIGKILL)
+        self.assertEqual(job.status, "stopped")
+        self.assertEqual(job.exit_code, -signal.SIGKILL)
+        self.assertEqual(job.signal, signal.SIGKILL)
+        self.assertEqual(metadata["status"], "stopped")
+        self.assertEqual(metadata["exit_code"], -signal.SIGKILL)
+        self.assertEqual(metadata["signal"], signal.SIGKILL)
 
     def test_cancelling_owner_task_reaps_foreground_process(self):
         async def scenario(tmpdir):
@@ -169,11 +183,16 @@ class JobOwnershipContractTests(unittest.TestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            return job.process.returncode
+            with open(job.metadata_path, encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+            return job, metadata
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            return_code = asyncio.run(scenario(tmpdir))
-        self.assertIsNotNone(return_code)
+            job, metadata = asyncio.run(scenario(tmpdir))
+        self.assertEqual(job.status, "cancelled")
+        self.assertIsNotNone(job.process.returncode)
+        self.assertEqual(metadata["status"], "cancelled")
+        self.assertEqual(metadata["exit_code"], job.process.returncode)
 
     def test_bash_timeout_is_a_failed_tool_result(self):
         async def scenario(tmpdir):

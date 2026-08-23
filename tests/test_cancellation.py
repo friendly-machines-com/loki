@@ -13,6 +13,8 @@ which ACP's stopReason: "cancelled" depends on:
 """
 
 import asyncio
+import json
+import signal
 import unittest
 from unittest import mock
 
@@ -289,11 +291,24 @@ class ForegroundJobCancelTests(unittest.TestCase):
             task = asyncio.get_running_loop().create_task(scenario())
             await asyncio.sleep(0.7)  # let the job start
             cancel.set()
-            result = await task
-            return result[1], _time.monotonic() - start  # status, elapsed
+            job, status, _stdout, _stderr = await task
+            with open(job.metadata_path, encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+            return (
+                job,
+                status,
+                metadata,
+                _time.monotonic() - start,
+            )
 
-        status, elapsed = asyncio.run(run())
+        job, status, metadata, elapsed = asyncio.run(run())
         self.assertEqual(status, "cancelled")
+        self.assertEqual(job.status, "cancelled")
+        self.assertEqual(job.exit_code, -signal.SIGINT)
+        self.assertEqual(job.signal, signal.SIGINT)
+        self.assertEqual(metadata["status"], "cancelled")
+        self.assertEqual(metadata["exit_code"], -signal.SIGINT)
+        self.assertEqual(metadata["signal"], signal.SIGINT)
         self.assertLess(elapsed, 5.0)  # SIGINT kills sleep immediately
 
     def test_no_cancel_event_uses_timeout_path(self):
