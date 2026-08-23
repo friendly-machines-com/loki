@@ -134,6 +134,37 @@ class AsyncKeyReaderTests(unittest.TestCase):
         self.assertEqual(event, terminals.KeyEvent("EOF"))
 
 
+class UserMessageQueueTests(unittest.TestCase):
+    def test_reports_non_sentinel_messages_on_enqueue_and_dequeue(self):
+        counts = []
+        queue = terminals.UserMessageQueue(counts.append)
+
+        queue.put_nowait("first")
+        queue.put_nowait("")
+        queue.put_nowait(None)
+
+        self.assertEqual(queue.message_count, 2)
+        self.assertEqual(counts, [1, 2])
+        self.assertEqual(queue.get_nowait(), "first")
+        self.assertEqual(queue.get_nowait(), "")
+        self.assertIsNone(queue.get_nowait())
+        self.assertEqual(queue.message_count, 0)
+        self.assertEqual(counts, [1, 2, 1, 0])
+
+    def test_discard_resets_count_and_removes_pending_items(self):
+        counts = []
+        queue = terminals.UserMessageQueue(counts.append)
+        queue.put_nowait("first")
+        queue.put_nowait("second")
+        queue.put_nowait(None)
+
+        queue.discard_pending_messages()
+
+        self.assertTrue(queue.empty())
+        self.assertEqual(queue.message_count, 0)
+        self.assertEqual(counts, [1, 2, 0])
+
+
 class InputBufferTests(unittest.TestCase):
     def test_word_left_on_empty_buffer_keeps_cursor_valid(self):
         buffer = terminals.InputBuffer()

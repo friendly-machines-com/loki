@@ -619,6 +619,28 @@ def update_status_bar():
     print(_status_text_provider(), end='')
 
 
+def redraw_status_bar():
+    """Refresh only the status area while preserving the output cursor."""
+    try:
+        interactive = (
+            os.isatty(new_stdin)
+            and os.isatty(sys.stdout.fileno()))
+    except (AttributeError, OSError, ValueError):
+        interactive = False
+    if not interactive:
+        return
+
+    refresh_terminal_layout()
+    terminal.save_cursor_position()
+    try:
+        update_status_bar()
+    finally:
+        terminal.set_clipping_region(*output_area)
+        terminal.restore_cursor_position()
+        terminal.reset_colors_and_flags()
+        terminal.flush()
+
+
 def refresh_terminal_layout():
     global terminal_lines
     global output_area
@@ -1110,6 +1132,58 @@ class InputModal:
             self.reading = False
 
 
+class UserMessageQueue(asyncio.Queue):
+    """Queue that reports submitted, non-sentinel messages explicitly."""
+
+    def __init__(self, on_size_change=None):
+        super().__init__()
+        self._message_count = 0
+        self._on_size_change = on_size_change or (lambda count: None)
+
+    @property
+    def message_count(self) -> int:
+        return self._message_count
+
+    def _notify_size_change(self):
+        try:
+            self._on_size_change(self._message_count)
+        except Exception as error:
+            # A status-display callback must never lose an input that has
+            # already entered or left the queue.
+            try:
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "user-message queue status callback failed",
+                    "exception": error,
+                })
+            except RuntimeError:
+                pass
+
+    def put_nowait(self, item):
+        super().put_nowait(item)
+        if item is not None:
+            self._message_count += 1
+            self._notify_size_change()
+
+    def get_nowait(self):
+        item = super().get_nowait()
+        if item is not None:
+            assert self._message_count > 0
+            self._message_count -= 1
+            self._notify_size_change()
+        return item
+
+    def discard_pending_messages(self):
+        old_count = self._message_count
+        while True:
+            try:
+                super().get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._message_count = 0
+        if old_count:
+            self._notify_size_change()
+
+
 class InputSession:
     """Session-long input owner: raw mode, one stdin reader, producer, queue.
 
@@ -1129,11 +1203,12 @@ class InputSession:
     awaits (the old SIGINT emergency stop no longer exists).
     """
 
-    def __init__(self, fd=None, on_mode_cycle=None, history_provider=None):
+    def __init__(self, fd=None, on_mode_cycle=None, history_provider=None,
+                 on_queue_size_change=None):
         self.fd = fd if fd is not None else new_stdin
         self.interactive = os.isatty(self.fd) and os.isatty(sys.stdout.fileno())
         self.reader = AsyncKeyReader(self.fd, watch_resize=self.interactive)
-        self.user_messages = asyncio.Queue()
+        self.user_messages = UserMessageQueue(on_queue_size_change)
         self._producer = None
         self._mode = None
         self._modal = None
@@ -1155,6 +1230,7 @@ class InputSession:
             except (asyncio.CancelledError, EOFError):
                 pass
             self._producer = None
+        self.user_messages.discard_pending_messages()
         await self.reader.__aexit__(exc_type, exc, tb)
         if self._mode is not None:
             self._mode.__exit__(exc_type, exc, tb)
@@ -1206,8 +1282,14 @@ class InputSession:
             self._producer = asyncio.create_task(self._produce())
 
 
-def input_session(fd=None, on_mode_cycle=None, history_provider=None) -> InputSession:
-    return InputSession(fd, on_mode_cycle=on_mode_cycle, history_provider=history_provider)
+def input_session(fd=None, on_mode_cycle=None, history_provider=None,
+                  on_queue_size_change=None) -> InputSession:
+    return InputSession(
+        fd,
+        on_mode_cycle=on_mode_cycle,
+        history_provider=history_provider,
+        on_queue_size_change=on_queue_size_change,
+    )
 
 
 def restore_output_area_after_input():

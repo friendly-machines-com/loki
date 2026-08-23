@@ -227,15 +227,21 @@ class TerminalImageCommandTests(unittest.TestCase):
             data = b"\x89PNG\r\n\x1a\npicture"
             pathlib.Path(tmpdir, "screen shot.png").write_bytes(data)
 
-            status, captured, _stdout, stderr = self._run_terminal(
-                [
-                    '/image "screen shot.png"',
-                    "What is wrong here?",
-                    "Continue without the image.",
-                    "/quit",
-                ],
-                tmpdir,
-            )
+            status_updates = []
+            with mock.patch(
+                    "loki_agent.terminal_frontend.terminals."
+                    "redraw_status_bar",
+                    side_effect=lambda: status_updates.append(
+                        terminal_frontend.status_text())):
+                status, captured, _stdout, stderr = self._run_terminal(
+                    [
+                        '/image "screen shot.png"',
+                        "What is wrong here?",
+                        "Continue without the image.",
+                        "/quit",
+                    ],
+                    tmpdir,
+                )
 
         self.assertEqual(status, 0)
         self.assertEqual(len(captured), 2)
@@ -266,6 +272,8 @@ class TerminalImageCommandTests(unittest.TestCase):
             }],
         })
         self.assertIn("Attached image for next prompt:", stderr)
+        self.assertIn("queued_images=1", status_updates[0])
+        self.assertIn("queued_images=0", status_updates[1])
 
     def test_empty_prompt_submits_all_staged_images_without_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1254,6 +1262,20 @@ class ExitStatusTests(unittest.TestCase):
 
 
 class StatusTextTests(unittest.TestCase):
+    def test_activity_status_redraws_only_for_changed_counts(self):
+        activity = terminal_frontend.TerminalActivityStatus()
+
+        with mock.patch(
+                "loki_agent.terminal_frontend.terminals.redraw_status_bar"
+        ) as redraw:
+            activity.set_queued_messages(2)
+            activity.set_queued_messages(2)
+            activity.set_queued_images(1)
+
+        self.assertEqual(activity.queued_messages, 2)
+        self.assertEqual(activity.queued_images, 1)
+        self.assertEqual(redraw.call_count, 2)
+
     def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
         names = ["runtime_config", "shell_cwd"]
         old_values = save_loki_state(names)
@@ -1280,14 +1302,20 @@ class StatusTextTests(unittest.TestCase):
             )
             # model is derived from runtime_config set above
 
-            text = terminal_frontend.status_text()
+            text = terminal_frontend.status_text(
+                terminal_frontend.TerminalActivityStatus(
+                    queued_messages=2,
+                    queued_images=1,
+                ))
         finally:
             restore_loki_state(old_values)
 
         self.assertEqual(
             text,
             "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
-            f"Local: mode={loki.current_agent_mode()}; CWD: {loki.STARTUP_CWD}; /pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
+            "Local: queued_messages=2, queued_images=1; "
+            f"mode={loki.current_agent_mode()}; CWD: {loki.STARTUP_CWD}; "
+            "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)

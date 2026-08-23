@@ -84,6 +84,37 @@ class ImageAttachmentError(ValueError):
     pass
 
 
+@dataclass
+class TerminalActivityStatus:
+    queued_messages: int = 0
+    queued_images: int = 0
+
+    def _set(self, field_name: str, count: int):
+        count = max(0, int(count))
+        if getattr(self, field_name) == count:
+            return
+        setattr(self, field_name, count)
+        try:
+            terminals.redraw_status_bar()
+        except (AssertionError, OSError):
+            # Queue and attachment state are authoritative; a transient tiny
+            # terminal or output error must not undo their state transition.
+            pass
+
+    def set_queued_messages(self, count: int):
+        self._set("queued_messages", count)
+
+    def set_queued_images(self, count: int):
+        self._set("queued_images", count)
+
+    def reset(self):
+        self.queued_messages = 0
+        self.queued_images = 0
+
+
+_terminal_activity = TerminalActivityStatus()
+
+
 @dataclass(frozen=True)
 class StagedImage:
     path: str
@@ -362,17 +393,19 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     )
 
 
-def status_text() -> str:
+def status_text(activity: TerminalActivityStatus | None = None) -> str:
+    activity = activity or _terminal_activity
     displayed_model = current_model()
     if (current_config() is not None
             and current_config().model_status == "deprecated"):
         displayed_model += " (deprecated)"
     return (
         'Remote: API: {}; Model: {}; /model\n'
-        'Local: mode={}; CWD: {}; /pwd, /cd DIR, /ps, /image PATH, '
-        '!foo, /quit'
+        'Local: queued_messages={}, queued_images={}; mode={}; CWD: {}; '
+        '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         _status_api_base(), displayed_model,
+        activity.queued_messages, activity.queued_images,
         current_agent_mode(), display_path(current_cwd()))
 
 
@@ -498,9 +531,14 @@ async def async_main(args) -> int:
     # path used by the session picker, saved-connection prompt, and /model.
     # Take over the keyboard here, not at terminals import time: importing
     # loki must leave stdin alone (headless and ACP processes read it).
+    _terminal_activity.reset()
     terminals.open_terminal_stdin()
-    async with input_session(on_mode_cycle=lambda: cycle_agent_mode(),
-                             history_provider=lambda: user_prompt_history(current_transcript())) as session:
+    async with input_session(
+            on_mode_cycle=lambda: cycle_agent_mode(),
+            history_provider=lambda: user_prompt_history(
+                current_transcript()),
+            on_queue_size_change=(
+                _terminal_activity.set_queued_messages)) as session:
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel
@@ -701,6 +739,8 @@ async def async_main(args) -> int:
                         sys.stderr.flush()
                         continue
                     pending_images.append(image)
+                    _terminal_activity.set_queued_images(
+                        len(pending_images))
                     sys.stdout.flush()
                     print(
                         "Attached image for next prompt: "
@@ -743,6 +783,7 @@ async def async_main(args) -> int:
             current_transcript().append(
                 formats.message_item("user", user_content))
             pending_images.clear()
+            _terminal_activity.set_queued_images(0)
             mark_chat_log_dirty()
 
             try:
@@ -769,6 +810,9 @@ async def async_main(args) -> int:
                     ))
                 mark_chat_log_dirty()
                 continue
+
+        pending_images.clear()
+        _terminal_activity.set_queued_images(0)
 
     return 0
 

@@ -62,7 +62,8 @@ def _read_with_timeout(master, total=4.0):
     return buf
 
 
-def run_loki_pty_reply(stream: bool, stream_chunks=None):
+def run_loki_pty_reply(stream: bool, stream_chunks=None,
+                       queued_inputs=None, create_image=False):
     """Run one real TUI turn; optionally pause after its first delta.
 
     Returns ``(all_output, before_stream_release)``. The second value is only
@@ -70,6 +71,9 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None):
     the provider is still blocked before producing its remaining deltas.
     """
     tmpdir = tempfile.mkdtemp(prefix="loki-pty-test-")
+    if create_image:
+        pathlib.Path(tmpdir, "image.png").write_bytes(
+            b"\x89PNG\r\n\x1a\npayload")
     gate = os.path.join(tmpdir, "release-stream") if stream_chunks else None
     pid, master = pty.fork()
     if pid == 0:  # child: real tty on stdin/stdout, hermetic dirs
@@ -109,6 +113,11 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None):
         collected += reply_output
         if gate:
             before_stream_release = reply_output
+            for queued_input in queued_inputs or []:
+                os.write(master, queued_input.encode() + b"\r")
+                queued_output = _read_with_timeout(master, 2.0)
+                collected += queued_output
+                before_stream_release += queued_output
             pathlib.Path(gate).touch()
             collected += _read_with_timeout(master, 4.0)
 
@@ -157,7 +166,10 @@ class PtyUiTests(unittest.TestCase):
         # registration: the bar must carry text, not just background color.
         output, _before_release = run_loki_pty_reply(stream=False)
         self.assertIn(b"Remote: API: dummy.invalid", output)
-        self.assertIn(b"Local: mode=normal", output)
+        self.assertIn(
+            b"Local: queued_messages=0, queued_images=0; mode=normal",
+            output,
+        )
 
     def test_streamed_plain_prefix_is_visible_before_completion(self):
         chunks = [
@@ -171,6 +183,28 @@ class PtyUiTests(unittest.TestCase):
         self.assertNotIn(b"boldword", before_release)
         self.assertNotIn(b"LLM Response Time", before_release)
         self._assert_styled_output(output)
+
+    def test_status_bar_tracks_messages_queued_behind_active_turn(self):
+        output, before_release = run_loki_pty_reply(
+            stream=True,
+            stream_chunks=["blocked prefix", " completed"],
+            queued_inputs=["second", "third"],
+        )
+
+        self.assertIn(b"queued_messages=1, queued_images=0", before_release)
+        self.assertIn(b"queued_messages=2, queued_images=0", before_release)
+        self.assertIn(b"queued_messages=0, queued_images=0", output)
+
+    def test_status_bar_tracks_image_after_queued_command_is_validated(self):
+        output, before_release = run_loki_pty_reply(
+            stream=True,
+            stream_chunks=["blocked prefix", " completed"],
+            queued_inputs=["/image image.png"],
+            create_image=True,
+        )
+
+        self.assertIn(b"queued_messages=1, queued_images=0", before_release)
+        self.assertIn(b"queued_messages=0, queued_images=1", output)
 
     @unittest.skipIf(pyte is None, "pyte not installed")
     def test_pyte_screen_attributes(self):
