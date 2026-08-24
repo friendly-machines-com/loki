@@ -72,7 +72,7 @@ class AsyncKeyReaderTests(unittest.TestCase):
                 terminals.KeyEvent("ENTER"),
                 terminals.KeyEvent("ENTER"),
                 terminals.KeyEvent("BACKSPACE"),
-                terminals.KeyEvent("BACKSPACE"),
+                terminals.KeyEvent("BACKSPACE_WORD"),
             ],
         )
 
@@ -284,6 +284,31 @@ class InputBufferTests(unittest.TestCase):
             buffer.text(), "prefixa large pasted block--suffix")
         self.assertEqual(buffer.cursor, len("prefixa large pasted block"))
 
+    def test_backspace_word_deletes_exactly_to_ctrl_left_boundary(self):
+        cases = [
+            ("alpha beta", len("alpha beta")),
+            ("alpha beta tail", len("alpha beta ")),
+            ("alpha   ", len("alpha   ")),
+            ("", 0),
+        ]
+        for text, cursor in cases:
+            with self.subTest(text=text, cursor=cursor):
+                movement = terminals.InputBuffer()
+                movement.insert(text)
+                movement.cursor = cursor
+                movement.word_left()
+
+                deletion = terminals.InputBuffer()
+                deletion.insert(text)
+                deletion.cursor = cursor
+                deletion.backspace_word()
+
+                self.assertEqual(deletion.cursor, movement.cursor)
+                self.assertEqual(
+                    deletion.text(),
+                    text[:movement.cursor] + text[cursor:],
+                )
+
 
 class PromptControllerTests(unittest.TestCase):
     def read_with_events(self, events, history=None):
@@ -349,6 +374,18 @@ class PromptControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(result, "aXbc!")
+
+    def test_read_text_applies_ctrl_backspace_after_ctrl_left(self):
+        result = self.read_with_events(
+            [
+                terminals.KeyEvent("TEXT", "alpha beta tail"),
+                terminals.KeyEvent("CURSOR_WORD_LEFT"),
+                terminals.KeyEvent("BACKSPACE_WORD"),
+                terminals.KeyEvent("ENTER"),
+            ]
+        )
+
+        self.assertEqual(result, "alpha tail")
 
     def test_bracketed_paste_redraws_once_at_paste_end(self):
         pasted = "x" * 10000

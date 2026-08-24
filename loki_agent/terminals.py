@@ -873,8 +873,11 @@ class AsyncKeyReader:
                 self.pending.append(KeyEvent("TEXT", "\n"))
             else:
                 self.pending.append(KeyEvent("ENTER"))
-        elif byte in [0x7f, 0x08]:
+        elif byte == 0x7f:
             self.pending.append(KeyEvent("BACKSPACE"))
+        elif byte == 0x08:
+            # Foot sends DEL for Backspace and BS for Ctrl-Backspace.
+            self.pending.append(KeyEvent("BACKSPACE_WORD"))
         else:
             self._emit_text_byte(byte)
 
@@ -920,6 +923,11 @@ class InputBuffer:
         if self.cursor > 0:
             del self.chars[self.cursor - 1]
             self.cursor -= 1
+
+    def backspace_word(self):
+        end = self.cursor
+        self.word_left()
+        del self.chars[self.cursor:end]
 
     def delete(self):
         if self.cursor < len(self.chars):
@@ -1071,6 +1079,8 @@ class PromptController:
                 buffer.insert(event.text)
             elif event.kind == "BACKSPACE":
                 buffer.backspace()
+            elif event.kind == "BACKSPACE_WORD":
+                buffer.backspace_word()
             elif event.kind == "DELETE":
                 buffer.delete()
             elif event.kind == "CURSOR_LEFT":
