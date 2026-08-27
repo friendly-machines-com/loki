@@ -568,7 +568,7 @@ def flattened_config_option_choices(
 
 
 def flattened_config_options(credentials, explicit_connection=None,
-                              groups=None):
+                             groups=None):
     """ACP select entries, preserving explicit config while offline."""
     return [
         option for option, _leaf in flattened_config_option_choices(

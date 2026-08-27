@@ -110,6 +110,7 @@ def current_job_manager():
         session.job_manager = JobManager(LOKI_JOB_STATE_DIR)
     return session.job_manager
 
+
 # --------------------------------------------------------------------------
 
 computer = socket.gethostname()
@@ -828,7 +829,7 @@ def _atomic_write_text(file_path: str, content: str):
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(content)
             f.flush()
-            #os.fsync(f.fileno())
+            # os.fsync(f.fileno())
         # Apply the target mode to the temp inode BEFORE the atomic publish.
         # This matches what text editors (e.g. vim's buf_write) do: the temp
         # lives in the user's own destination directory (not a shared /tmp),
@@ -1123,7 +1124,7 @@ class JobManager:
                              cancel_event: asyncio.Event | None = None):
         job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
                                 env=env, cwd=cwd)
-        
+
         # Define the exit_task and nested signal helpers first so they are
         # available throughout the entire function.
         exit_task = asyncio.create_task(self._wait_for_job(job))
@@ -1168,7 +1169,7 @@ class JobManager:
                        if cancel_event is not None else None)
         watchers = {exit_task} if cancel_task is None else {
             exit_task, cancel_task}
-        
+
         try:
             done, _pending = await asyncio.wait(
                 watchers, timeout=timeout_ms / 1000,
@@ -1208,10 +1209,10 @@ class JobManager:
         # then update state after the signal has successfully dispatched.
         exit_code = await terminate(
             signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
-        
+
         job.status = "cancelled" if interrupted else "timed_out"
         self._write_metadata(job)
-            
+
         self._record_exit(job, exit_code)
         status = "cancelled" if interrupted else "timed_out"
         return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
@@ -1353,7 +1354,7 @@ class JobManager:
 
 
 def run_bash(command: str, timeout: int = None, description: str = "",
-              run_in_background: bool = False) -> str:
+             run_in_background: bool = False) -> str:
     return asyncio.run(run_bash_async(command, timeout, description,
                                       run_in_background))
 
@@ -1361,9 +1362,10 @@ def run_bash(command: str, timeout: int = None, description: str = "",
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
                          run_in_background: bool = False,
                          cancel_event: asyncio.Event | None = None) -> str:
-    return await current_job_manager().run_shell(command, timeout=timeout, description=description,
-                                       run_in_background=run_in_background,
-                                       cancel_event=cancel_event)
+    return await current_job_manager().run_shell(
+        command, timeout=timeout, description=description,
+        run_in_background=run_in_background,
+        cancel_event=cancel_event)
 
 
 def run_jobs() -> str:
@@ -2704,9 +2706,11 @@ def run_skill(skill: str, args: str = None) -> str:
     body = content
     if args:
         body = f"Args: {args}\n\n{body}"
-    footer = ("\n\n[Skill content truncated]" if truncated else "") + \
-             f"\n\nBase directory for this skill: {base_dir}\n" \
-             "Relative paths in this skill are relative to this base directory.\n</skill_content>"
+    footer = (
+        ("\n\n[Skill content truncated]" if truncated else "")
+        + f"\n\nBase directory for this skill: {base_dir}\n"
+        + "Relative paths in this skill are relative to this base directory.\n</skill_content>"
+    )
     return header + body + footer
 
 
@@ -3498,6 +3502,7 @@ def configure_tool_hook_pipeline(environ=os.environ):
     TOOL_HOOK_PIPELINE = tool_runtime.load_hook_pipeline(path)
     return path
 
+
 async def async_chat_request(request_url: str, payload, request_headers: dict = None,
                              report_errors: bool = False, show_timing: bool = False,
                              cancel_check=None) -> dict:
@@ -3929,8 +3934,10 @@ async def load_models_async():
     if not current_config():
         return [current_model()] if current_model() else []
 
-    model_urls = getattr(current_config().chat_provider, "model_urls", None) or ([current_config().chat_provider.models_url]
-                                                                if current_config().chat_provider.models_url else [])
+    model_urls = getattr(
+        current_config().chat_provider, "model_urls", None) or (
+            [current_config().chat_provider.models_url]
+            if current_config().chat_provider.models_url else [])
     if not model_urls:
         return [current_model()] if current_model() else []
     errors = []
@@ -3964,7 +3971,7 @@ async def load_models_async():
         print("Model list failed:\n" + "\n".join(errors), file=sys.stderr)
     return [current_model()] if current_model() else []
 
-#models = ['hy3-preview', 'glm-5.2', 'glm-5.1', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro', 'deepseek-v4-flash', 'mimo-v2.5', 'mimo-v2.5-pro']
+# models = ['hy3-preview', 'glm-5.2', 'glm-5.1', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro', 'deepseek-v4-flash', 'mimo-v2.5', 'mimo-v2.5-pro']
 
 
 # Agent mode, cycled by Shift-Tab: "explore" (read-only), "plan", "edit".
@@ -4094,6 +4101,7 @@ def new_chat_log(filename):
         # chat, but does not implicitly replace a resumed chat's connection.
         session.session_state["connection"] = descriptor.to_dict()
     session.chat_log_dirty = True
+
 
 def save_chat_log():
     session = current_session()

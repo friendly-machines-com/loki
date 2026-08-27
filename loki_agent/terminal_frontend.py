@@ -464,6 +464,7 @@ async def confirm_saved_connection_async(
             "Use this saved connection? [y/N]: ") or "")
         return answer.strip().lower() in ("y", "yes")
 
+
 def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
     return asyncio.run(run_subagent_prompt_async(subagent_type, prompt))
 
@@ -689,7 +690,7 @@ async def async_main(args) -> int:
                                 print(
                                     f"Selected model: {selected_label}"
                                     f"{selected_via}",
-                                      file=sys.stderr)
+                                    file=sys.stderr)
                                 sys.stderr.flush()
                                 continue
                             print("Model selection cancelled.",
@@ -772,7 +773,7 @@ async def async_main(args) -> int:
                     sys.stderr.flush()
                     continue
                 case _:
-                    if command_text.startswith('!'): # direct command execution
+                    if command_text.startswith('!'):  # direct command execution
                         cmd = user_in[1:].strip()
                         print(
                             f"{computer}: [Running local command: ",
@@ -780,7 +781,7 @@ async def async_main(args) -> int:
                         terminals.write_user_text(cmd)
                         print("]")
                         cmd_output = await run_bash_async(cmd)
-                        print(cmd_output) # Show output to you in the terminal
+                        print(cmd_output)  # Show output to you in the terminal
                         # Morph the user input so the AI sees exactly what you did and the result
                         user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
                     else:

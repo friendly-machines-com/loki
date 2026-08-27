@@ -63,78 +63,78 @@ def open_terminal_stdin() -> int:
 new_stdin = sys.stdin.fileno()
 
 if not os.isatty(new_stdin):
-  # Noninteractive tests and headless runs still import terminal helpers. The
-  # no-op terminal keeps those paths from emitting escape sequences or touching
-  # terminal state when stdin is not a TTY.
-  class Terminal:
-      def __getattr__(self, x):
-          return lambda *args, **kwargs: None
+    # Noninteractive tests and headless runs still import terminal helpers. The
+    # no-op terminal keeps those paths from emitting escape sequences or touching
+    # terminal state when stdin is not a TTY.
+    class Terminal:
+        def __getattr__(self, x):
+            return lambda *args, **kwargs: None
 else:
-  class Terminal:
-    def __init__(self):
-        self.bracketed_paste = False
+    class Terminal:
+        def __init__(self):
+            self.bracketed_paste = False
 
-    def clear_screen(self):
-        print('\033[2J', end='')
+        def clear_screen(self):
+            print('\033[2J', end='')
 
-    def clear_to_end_of_screen(self): # always, not relative.
-        print('\033[J', end='')
+        def clear_to_end_of_screen(self):  # always, not relative.
+            print('\033[J', end='')
 
-    def goto_position(self, row, column):
-        print('\033[{};{}H'.format(row, column), end='')
+        def goto_position(self, row, column):
+            print('\033[{};{}H'.format(row, column), end='')
 
-    def set_clipping_region(self, first_row, last_row): # note: after that, cursor position is (1,1) ABSOLUTE OR RELATIVE DEPENDING ON origin_mode
-        assert last_row - first_row >= 2 # otherwise not supported.
-        print('\033[{};{}r'.format(first_row, last_row - 1), end='')
-        #goto_position(1, 1)
+        def set_clipping_region(self, first_row, last_row):  # note: after that, cursor position is (1,1) ABSOLUTE OR RELATIVE DEPENDING ON origin_mode
+            assert last_row - first_row >= 2  # otherwise not supported.
+            print('\033[{};{}r'.format(first_row, last_row - 1), end='')
+            # goto_position(1, 1)
 
-    def disable_clipping_regions(self): # note: after that, cursor position is (1,1) either absolute or relative dependig on origin_mode.
-        print('\033[r', end='')
-        #goto_position(1, 1)
+        def disable_clipping_regions(self):  # note: after that, cursor position is (1,1) either absolute or relative dependig on origin_mode.
+            print('\033[r', end='')
+            # goto_position(1, 1)
 
-    def save_cursor_position(self):
-        print('\0337', end='')
+        def save_cursor_position(self):
+            print('\0337', end='')
 
-    def restore_cursor_position(self):
-        print('\0338', end='')
+        def restore_cursor_position(self):
+            print('\0338', end='')
 
-    def flush(self):
-        sys.stdout.flush()
+        def flush(self):
+            sys.stdout.flush()
 
-    def enable_origin_mode(self): # relative coordinates
-        print('\033[?6h', end='')
+        def enable_origin_mode(self):  # relative coordinates
+            print('\033[?6h', end='')
 
-    def disable_origin_mode(self):
-        print('\033[?6l', end='')
+        def disable_origin_mode(self):
+            print('\033[?6l', end='')
 
-    def set_foreground_color(self, index):
-        print('\033[{}m'.format(30 + index), end='')
+        def set_foreground_color(self, index):
+            print('\033[{}m'.format(30 + index), end='')
 
-    def set_background_color(self, index):
-        print('\033[{}m'.format(40 + index), end='')
+        def set_background_color(self, index):
+            print('\033[{}m'.format(40 + index), end='')
 
-    def set_reverse_video(self, enabled: bool):
-        # 7 = reverse video (SGR); 27 = reverse off. Don't use 0 (full reset)
-        # because that would clobber the input-area background color mid-caret.
-        print('\033[7m' if enabled else '\033[27m', end='')
+        def set_reverse_video(self, enabled: bool):
+            # 7 = reverse video (SGR); 27 = reverse off. Don't use 0 (full reset)
+            # because that would clobber the input-area background color mid-caret.
+            print('\033[7m' if enabled else '\033[27m', end='')
 
-    def reset_colors_and_flags(self):
-        print('\033[m', end='')
+        def reset_colors_and_flags(self):
+            print('\033[m', end='')
 
-    def hide_cursor(self): # DECTCEM: the input area draws its own reverse-video caret.
-        print('\033[?25l', end='')
+        def hide_cursor(self):  # DECTCEM: the input area draws its own reverse-video caret.
+            print('\033[?25l', end='')
 
-    def show_cursor(self):
-        print('\033[?25h', end='')
+        def show_cursor(self):
+            print('\033[?25h', end='')
 
-    def enable_bracketed_paste_mode(self): # \e[200~ ... \e[201~
-        print('\033[?2004h', end='')
+        def enable_bracketed_paste_mode(self):  # \e[200~ ... \e[201~
+            print('\033[?2004h', end='')
 
-    def disable_bracketed_paste_mode(self):
-        print('\033[?2004l', end='')
+        def disable_bracketed_paste_mode(self):
+            print('\033[?2004l', end='')
 
-    def markdown_to_ansi(self, text: str) -> str:
-        return markdown_line_to_ansi(text)
+        def markdown_to_ansi(self, text: str) -> str:
+            return markdown_line_to_ansi(text)
 
 
 terminal = Terminal()
@@ -589,10 +589,10 @@ try:
 except OSError:
     terminal_lines = 25
 
-terminal_lines = terminal_lines + 1 # last line in 1-based indices is missing otherwise.
+terminal_lines = terminal_lines + 1  # last line in 1-based indices is missing otherwise.
 output_area = 1, terminal_lines - 4
 input_area = terminal_lines - 4, terminal_lines - 2
-status_area = terminal_lines - 2, terminal_lines # too big, but that's the minimum supported height of set_clipping_region
+status_area = terminal_lines - 2, terminal_lines  # too big, but that's the minimum supported height of set_clipping_region
 
 '''
     output area
@@ -1693,7 +1693,7 @@ class InputBuffer:
                     self.cursor += 1
                     if self.cursor < len(self.chars):
                         if not self.chars[self.cursor].isidentifier():
-                             break
+                            break
 
             while self.cursor < len(self.chars) and not self.chars[self.cursor].isidentifier():
                 self.cursor += 1
@@ -1856,7 +1856,7 @@ class PromptController:
                 raise EOFError
             if event.kind == "ENTER":
                 if interactive:
-                    #print() This would unnecessarily scroll
+                    # print() This would unnecessarily scroll
                     self.terminal.flush()
                 return buffer.text()
             if event.kind == "TEXT":
