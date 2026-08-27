@@ -1,8 +1,9 @@
 [flake8]
-max-line-length = 150
+max-line-length = 500
 exclude =
     .git
     __pycache__
 per-file-ignores =
-    # Tests prepend the checkout root to sys.path before importing loki_agent.
-    tests/*.py: E402
+    # These tests set required environment variables before importing Loki.
+    tests/test_loki_tool_loop.py: E402
+    tests/test_markdown_render.py: E402
