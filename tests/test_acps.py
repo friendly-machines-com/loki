@@ -13,9 +13,7 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from loki_agent import acps  # noqa: E402
+from loki_agent import acps
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -98,14 +96,13 @@ class QuarantineTests(unittest.TestCase):
     def test_stdout_is_reserved_for_protocol(self):
         code = (
             "import sys, os, json\n"
-            "sys.path.insert(0, %r)\n"
             "from loki_agent import acps\n"
             "saved = os.dup(1)\n"
             "acps.quarantine_stdout()\n"
             "write = acps.make_writer(saved)\n"
             "write(acps.response(1, result={'ok': True}))\n"
             "print('stray output')\n"
-        ) % ROOT
+        )
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, cwd=ROOT)

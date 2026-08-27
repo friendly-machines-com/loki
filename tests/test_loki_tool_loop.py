@@ -14,8 +14,6 @@ import unittest
 from unittest import mock
 
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
 os.environ.setdefault("LOKI_API_KEY", "test-key")
 os.environ.setdefault("LOKI_API_BASE", "https://api.openai.com/v1/responses")
 os.environ.setdefault("LOKI_PROVIDER", "openai_responses")

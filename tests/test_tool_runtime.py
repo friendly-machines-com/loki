@@ -10,8 +10,6 @@ import unittest
 from unittest import mock
 
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
 from loki_agent import formats
 from loki_agent import tool_runtime
 from loki_agent import loki

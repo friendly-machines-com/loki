@@ -3,12 +3,9 @@ import contextlib
 import io
 import json
 import pathlib
-import sys
 import tempfile
 import unittest
 from unittest import mock
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from loki_agent import http_client, models
 from loki_agent.credentials import CredentialStore

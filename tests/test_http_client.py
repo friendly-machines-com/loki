@@ -1,11 +1,6 @@
 import asyncio
-import pathlib
-import sys
 import time
 import unittest
-
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from loki_agent import http_client
 

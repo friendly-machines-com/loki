@@ -22,8 +22,6 @@ import time
 import unittest
 
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
 try:
     import pyte
 except ImportError:
@@ -288,8 +286,6 @@ class PtyCtrlCTests(unittest.TestCase):
             # Child: never returns from this block.
             try:
                 import sys as _sys
-                _sys.path.insert(
-                    0, str(pathlib.Path(__file__).resolve().parents[1]))
                 import termios as _termios
                 import time as _time
                 from loki_agent import terminals as _terminals
@@ -332,8 +328,6 @@ class PtyCtrlCTests(unittest.TestCase):
                 import sys as _sys
                 import asyncio as _asyncio
                 import time as _time
-                _sys.path.insert(
-                    0, str(pathlib.Path(__file__).resolve().parents[1]))
                 from loki_agent import terminals as _terminals
 
                 async def _main():
@@ -397,8 +391,6 @@ class PtyTurnCancelTests(unittest.TestCase):
                 import sys as _sys
                 import asyncio as _asyncio
                 import time as _time
-                _sys.path.insert(
-                    0, str(pathlib.Path(__file__).resolve().parents[1]))
                 from loki_agent import terminals as _terminals
 
                 async def _main():
