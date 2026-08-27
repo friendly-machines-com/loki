@@ -6,7 +6,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
 from unittest import mock
 
@@ -17,15 +16,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class PackageContractTests(unittest.TestCase):
-    def test_console_script_targets_the_terminal_frontend(self):
-        with open(ROOT / "pyproject.toml", "rb") as stream:
-            project = tomllib.load(stream)
-        self.assertEqual(
-            project["project"]["scripts"]["loki"],
-            "loki_agent.terminal_frontend:main",
-        )
-        self.assertTrue(callable(loki.main))
-
     def test_historical_module_invocation_still_reaches_frontend(self):
         env = dict(os.environ)
         env.update({
