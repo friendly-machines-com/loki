@@ -4,6 +4,7 @@ import io
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -52,6 +53,19 @@ class RecordingTerminal:
 
 
 class AsyncKeyReaderTests(unittest.TestCase):
+    def tty_attrs(self, erase=b"\x7f", word_erase=b"\x17"):
+        cc = [b"\0"] * (
+            max(
+                terminals.termios.VERASE,
+                terminals.termios.VWERASE,
+                terminals.termios.VMIN,
+                terminals.termios.VTIME,
+            ) + 1
+        )
+        cc[terminals.termios.VERASE] = erase
+        cc[terminals.termios.VWERASE] = word_erase
+        return [0, 0, 0, 0, 0, 0, cc]
+
     def test_decodes_text_ascii_and_utf8(self):
         reader = terminals.AsyncKeyReader(fd=0)
 
@@ -60,9 +74,15 @@ class AsyncKeyReaderTests(unittest.TestCase):
         self.assertEqual(feed_bytes(reader, bytes([0xa9])), [terminals.KeyEvent("TEXT", "\u00e9")])
 
     def test_decodes_control_keys(self):
-        reader = terminals.AsyncKeyReader(fd=0)
+        erase_bytes = (
+            terminals.FALLBACK_BACKSPACE_BYTES,
+            terminals.FALLBACK_BACKSPACE_WORD_BYTES,
+        )
+        with mock.patch.object(
+                terminals, "terminal_erase_bytes", return_value=erase_bytes):
+            reader = terminals.AsyncKeyReader(fd=0)
 
-        events = feed_bytes(reader, b"\x03\x04\r\n\x7f\x08")
+        events = feed_bytes(reader, b"\x03\x04\r\n\x7f\x08\x17")
 
         self.assertEqual(
             events,
@@ -71,6 +91,90 @@ class AsyncKeyReaderTests(unittest.TestCase):
                 terminals.KeyEvent("CTRL_D"),
                 terminals.KeyEvent("ENTER"),
                 terminals.KeyEvent("ENTER"),
+                terminals.KeyEvent("BACKSPACE"),
+                terminals.KeyEvent("BACKSPACE"),
+                terminals.KeyEvent("BACKSPACE_WORD"),
+            ],
+        )
+
+    def test_uses_configured_character_and_word_erase_bytes(self):
+        cases = [
+            (b"\x08", b"\x17"),
+            (b"\x7f", b"\x17"),
+            (b"\x15", b"\x16"),
+            (0x7f, 0x17),
+        ]
+        for erase, word_erase in cases:
+            with self.subTest(erase=erase, word_erase=word_erase):
+                attrs = self.tty_attrs(erase, word_erase)
+                with (
+                    mock.patch.object(
+                        terminals.termios, "tcgetattr", return_value=attrs),
+                    mock.patch.object(
+                        terminals.os, "fpathconf", return_value=0xff),
+                ):
+                    reader = terminals.AsyncKeyReader(fd=123)
+
+                erase_byte = (
+                    erase if isinstance(erase, int) else erase[0])
+                word_erase_byte = (
+                    word_erase
+                    if isinstance(word_erase, int)
+                    else word_erase[0]
+                )
+                self.assertEqual(
+                    feed_bytes(
+                        reader, bytes((erase_byte, word_erase_byte))),
+                    [
+                        terminals.KeyEvent("BACKSPACE"),
+                        terminals.KeyEvent("BACKSPACE_WORD"),
+                    ],
+                )
+
+    def test_character_erase_wins_if_both_values_are_equal(self):
+        attrs = self.tty_attrs(b"\x15", b"\x15")
+        with (
+            mock.patch.object(
+                terminals.termios, "tcgetattr", return_value=attrs),
+            mock.patch.object(
+                terminals.os, "fpathconf", return_value=0xff),
+        ):
+            reader = terminals.AsyncKeyReader(fd=123)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x15"),
+            [terminals.KeyEvent("BACKSPACE")],
+        )
+
+    def test_invalid_or_disabled_values_use_independent_fallbacks(self):
+        attrs = self.tty_attrs(b"invalid", b"\x15")
+        with (
+            mock.patch.object(
+                terminals.termios, "tcgetattr", return_value=attrs),
+            mock.patch.object(
+                terminals.os, "fpathconf", return_value=0x15),
+        ):
+            reader = terminals.AsyncKeyReader(fd=123)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x08\x7f\x17"),
+            [
+                terminals.KeyEvent("BACKSPACE"),
+                terminals.KeyEvent("BACKSPACE"),
+                terminals.KeyEvent("BACKSPACE_WORD"),
+            ],
+        )
+
+    def test_termios_error_uses_erase_fallbacks(self):
+        error = terminals.termios.error(25, "not a tty")
+        with mock.patch.object(
+                terminals.termios, "tcgetattr", side_effect=error):
+            reader = terminals.AsyncKeyReader(fd=123)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x08\x7f\x17"),
+            [
+                terminals.KeyEvent("BACKSPACE"),
                 terminals.KeyEvent("BACKSPACE"),
                 terminals.KeyEvent("BACKSPACE_WORD"),
             ],

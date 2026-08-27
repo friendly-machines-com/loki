@@ -729,6 +729,71 @@ class TerminalMode:
 
 PASTE_START_SEQUENCE = b'\x1b[200~'
 PASTE_END_SEQUENCE = b'\x1b[201~'
+FALLBACK_BACKSPACE_BYTES = frozenset((0x08, 0x7f))
+FALLBACK_BACKSPACE_WORD_BYTES = frozenset((0x17,))
+
+
+def _control_character_byte(value):
+    if isinstance(value, int):
+        byte = value
+    elif isinstance(value, (bytes, bytearray)) and len(value) == 1:
+        byte = value[0]
+    elif isinstance(value, str) and len(value) == 1:
+        byte = ord(value)
+    else:
+        return None
+    if not 0 <= byte <= 0xff:
+        return None
+    return byte
+
+
+def terminal_erase_bytes(fd: int):
+    """Return configured character-erase and word-erase input bytes."""
+    try:
+        [
+            iflag,
+            oflag,
+            cflag,
+            lflag,
+            ispeed,
+            ospeed,
+            cc,
+        ] = termios.tcgetattr(fd)
+    except (termios.error, OSError, TypeError, ValueError):
+        return FALLBACK_BACKSPACE_BYTES, FALLBACK_BACKSPACE_WORD_BYTES
+
+    # POSIX lets each tty choose the byte that disables a control character.
+    try:
+        disabled_byte = os.fpathconf(fd, 'PC_VDISABLE')
+    except (OSError, TypeError, ValueError):
+        disabled = {0x00, 0xff}
+    else:
+        if isinstance(disabled_byte, int) and 0 <= disabled_byte <= 0xff:
+            disabled = {disabled_byte}
+        else:
+            disabled = {0x00, 0xff}
+
+    def configured(index, fallback):
+        try:
+            byte = _control_character_byte(cc[index])
+        except (IndexError, TypeError):
+            byte = None
+        if byte is None or byte in disabled:
+            return fallback
+        return frozenset((byte,))
+
+    try:
+        backspace_bytes = configured(
+            termios.VERASE, FALLBACK_BACKSPACE_BYTES)
+    except AttributeError:
+        backspace_bytes = FALLBACK_BACKSPACE_BYTES
+    try:
+        backspace_word_bytes = configured(
+            termios.VWERASE, FALLBACK_BACKSPACE_WORD_BYTES)
+    except AttributeError:
+        backspace_word_bytes = FALLBACK_BACKSPACE_WORD_BYTES
+    return backspace_bytes, backspace_word_bytes
+
 
 KEY_SEQUENCES = {
     b'\x1b[A': "CURSOR_UP",
@@ -754,6 +819,10 @@ class AsyncKeyReader:
     def __init__(self, fd: int, watch_resize: bool = False):
         self.fd = fd
         self.watch_resize = watch_resize
+        (
+            self.backspace_bytes,
+            self.backspace_word_bytes,
+        ) = terminal_erase_bytes(fd)
         self.byte_reader = AsyncByteReader(fd)
         self.pending = collections.deque()
         self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
@@ -873,10 +942,9 @@ class AsyncKeyReader:
                 self.pending.append(KeyEvent("TEXT", "\n"))
             else:
                 self.pending.append(KeyEvent("ENTER"))
-        elif byte == 0x7f:
+        elif byte in self.backspace_bytes:
             self.pending.append(KeyEvent("BACKSPACE"))
-        elif byte == 0x08:
-            # Foot sends DEL for Backspace and BS for Ctrl-Backspace.
+        elif byte in self.backspace_word_bytes:
             self.pending.append(KeyEvent("BACKSPACE_WORD"))
         else:
             self._emit_text_byte(byte)
