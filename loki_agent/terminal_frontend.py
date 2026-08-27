@@ -409,10 +409,12 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
         'mode={}; CWD: {}; '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
-        _status_api_base(), displayed_model,
+        terminals.user_text_for_terminal(_status_api_base()),
+        terminals.user_text_for_terminal(displayed_model),
         "running" if activity.turn_running else "idle",
         activity.queued_messages, activity.queued_images,
-        current_agent_mode(), display_path(current_cwd()))
+        terminals.user_text_for_terminal(current_agent_mode()),
+        terminals.user_text_for_terminal(display_path(current_cwd())))
 
 
 terminals.set_status_text_provider(status_text)
@@ -614,6 +616,9 @@ async def async_main(args) -> int:
                 current_transcript(),
                 current_model() or "Assistant",
                 assistant_text_renderer=terminals.render_markdown,
+                user_text_renderer=lambda text: (
+                    terminals.user_text_for_terminal(
+                        text, multiline=True)),
             )
         else:
             new_chat_log(new_chat_log_path())
@@ -632,7 +637,7 @@ async def async_main(args) -> int:
 
             terminal.set_background_color(terminals.INPUT_COLOR)
             print('User: ', end='')
-            print(user_in, end='')
+            terminals.write_user_text(user_in, multiline=True)
             terminal.reset_colors_and_flags()
             print()
             command_text = user_in.strip()
@@ -727,13 +732,16 @@ async def async_main(args) -> int:
                     sys.stderr.flush()
                     continue
                 case '/pwd':
-                    print_shell_cwd()
+                    print_shell_cwd(
+                        text_writer=terminals.write_user_text)
                     continue
                 case '/ps':
                     print(run_jobs())
                     continue
                 case _ if command_text == '/cd' or command_text.startswith('/cd '):
-                    change_shell_cwd_from_text(command_text[3:].strip())
+                    change_shell_cwd_from_text(
+                        command_text[3:].strip(),
+                        text_writer=terminals.write_user_text)
                     continue
                 case _ if (command_text == '/image'
                            or (len(command_text) > len('/image')
@@ -744,25 +752,33 @@ async def async_main(args) -> int:
                         image = load_image_attachment(image_path)
                     except ImageAttachmentError as error:
                         sys.stdout.flush()
-                        print(f"image: {error}", file=sys.stderr)
+                        print("image: ", end="", file=sys.stderr)
+                        terminals.write_user_text(
+                            str(error), file=sys.stderr)
+                        print(file=sys.stderr)
                         sys.stderr.flush()
                         continue
                     pending_images.append(image)
                     _terminal_activity.set_queued_images(
                         len(pending_images))
                     sys.stdout.flush()
+                    print("Attached image for next prompt: ",
+                          end="", file=sys.stderr)
+                    terminals.write_user_text(
+                        display_path(image.path), file=sys.stderr)
                     print(
-                        "Attached image for next prompt: "
-                        f"{display_path(image.path)} "
-                        f"({image.media_type}, {image.byte_size} bytes)",
-                        file=sys.stderr,
-                    )
+                        f" ({image.media_type}, {image.byte_size} bytes)",
+                        file=sys.stderr)
                     sys.stderr.flush()
                     continue
                 case _:
                     if command_text.startswith('!'): # direct command execution
                         cmd = user_in[1:].strip()
-                        print(f"{computer}: [Running local command: {cmd}]")
+                        print(
+                            f"{computer}: [Running local command: ",
+                            end="")
+                        terminals.write_user_text(cmd)
+                        print("]")
                         cmd_output = await run_bash_async(cmd)
                         print(cmd_output) # Show output to you in the terminal
                         # Morph the user input so the AI sees exactly what you did and the result

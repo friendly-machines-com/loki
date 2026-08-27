@@ -226,6 +226,25 @@ class TerminalImageCommandTests(unittest.TestCase):
             status = asyncio.run(terminal_frontend.async_main([]))
         return status, captured, stdout.getvalue(), stderr.getvalue()
 
+    def test_user_echo_is_safe_but_model_receives_original_text(self):
+        logical = (
+            "first\x1b]0;owned\x07\t\n"
+            "second\r\x00\u009b")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status, captured, stdout, _stderr = self._run_terminal(
+                [logical, "/quit"], tmpdir)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            formats.item_text(captured[0][-1]), logical)
+        self.assertIn(
+            "User: first^[]0;owned^G^I\n"
+            "second^M^@\\x9b\n",
+            stdout,
+        )
+        self.assertNotIn("\x1b]0;owned\x07", stdout)
+
     def test_image_command_attaches_snapshot_to_next_text_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data = b"\x89PNG\r\n\x1a\npicture"
@@ -917,6 +936,8 @@ class ModelLoadingTests(unittest.TestCase):
     def test_interactive_resume_accepts_saved_credentialless_connection(self):
         loki.CREDENTIALS = CredentialStore({})
         session = ScriptedInputSession([None])
+        resumed_question = (
+            "visible\x1b]0;owned\x07 resumed question\nnext\tline")
         assistant_markdown = (
             "## Resume heading\n\n"
             "**visible resumed answer** and `code`\n\n"
@@ -938,7 +959,7 @@ class ModelLoadingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
             events = loki.initial_transcript_items() + [
-                formats.message_item("user", "visible resumed question"),
+                formats.message_item("user", resumed_question),
                 formats.model_response_event(
                     protocols.OPENAI_CHAT,
                     [formats.message_item(
@@ -973,7 +994,11 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(status, 0)
         rendered = stdout.getvalue()
         self.assertIn(
-            "User: visible resumed question", rendered)
+            "User: visible^[]0;owned^G resumed question\n"
+            "next^Iline",
+            rendered,
+        )
+        self.assertNotIn("\x1b]0;owned\x07", rendered)
         self.assertIn(
             "local-model: "
             + terminals.render_markdown(assistant_markdown, style=True),
@@ -1401,6 +1426,23 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("pass", text)
         self.assertNotIn("token", text)
         self.assertNotIn("secret", text)
+
+    def test_status_text_escapes_controls_in_dynamic_fields(self):
+        names = ["runtime_config", "shell_cwd"]
+        old_values = save_loki_state(names)
+
+        try:
+            loki.current_session().runtime_config = None
+            loki.current_session().shell_cwd = (
+                "/tmp/unsafe\x1b[2J\nnext")
+            text = terminal_frontend.status_text()
+        finally:
+            restore_loki_state(old_values)
+
+        self.assertIn(
+            "CWD: /tmp/unsafe^[[2J^Jnext;", text)
+        self.assertNotIn("\x1b", text)
+        self.assertEqual(text.count("\n"), 1)
 
     def test_status_text_marks_a_deprecated_selected_model(self):
         names = ["runtime_config", "shell_cwd"]

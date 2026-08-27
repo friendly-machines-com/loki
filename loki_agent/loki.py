@@ -4011,28 +4011,43 @@ def record_shell_cwd_instruction():
     mark_chat_log_dirty()
 
 
-def print_shell_cwd():
+def _print_display_line(prefix, text, *, text_writer=None, file=None):
+    print(prefix, end="", file=file)
+    if text_writer is None:
+        print(text, end="", file=file)
+    else:
+        text_writer(text, file=file)
+    print(file=file)
+
+
+def print_shell_cwd(text_writer=None):
     sys.stdout.flush()
-    print(f"cwd: {current_cwd()}", file=sys.stderr)
+    _print_display_line(
+        "cwd: ", current_cwd(),
+        text_writer=text_writer, file=sys.stderr)
     sys.stderr.flush()
 
 
-def change_shell_cwd_from_text(arg_text: str) -> bool:
+def change_shell_cwd_from_text(arg_text: str, text_writer=None) -> bool:
     try:
         target = _parse_cd_arg_text(arg_text)
         change_shell_cwd(target)
     except (FileNotFoundError, NotADirectoryError) as e:
         sys.stdout.flush()
-        print(f"cd: no such directory: {e}", file=sys.stderr)
+        _print_display_line(
+            "cd: no such directory: ", str(e),
+            text_writer=text_writer, file=sys.stderr)
         sys.stderr.flush()
         return False
     except ValueError as e:
         sys.stdout.flush()
-        print(f"cd: {e}", file=sys.stderr)
+        _print_display_line(
+            "cd: ", str(e),
+            text_writer=text_writer, file=sys.stderr)
         sys.stderr.flush()
         return False
     record_shell_cwd_instruction()
-    print_shell_cwd()
+    print_shell_cwd(text_writer=text_writer)
     return True
 
 

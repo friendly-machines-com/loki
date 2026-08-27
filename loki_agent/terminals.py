@@ -1707,6 +1707,40 @@ class InputBuffer:
         self.cursor = len(self.chars)
 
 
+def user_text_for_terminal(text: str, *, multiline: bool = False) -> str:
+    """Return display text that cannot introduce terminal control functions.
+
+    LF is retained only for an explicitly multiline presentation. Every other
+    C0 control and DEL uses familiar caret notation; C1 controls use a visible
+    hexadecimal escape. The caller's logical text is never modified.
+    """
+    displayed = []
+    for character in text:
+        code = ord(character)
+        if character == "\n" and multiline:
+            displayed.append("\n")
+        elif code < 0x20:
+            displayed.append("^" + chr(code + 0x40))
+        elif code == 0x7f:
+            displayed.append("^?")
+        elif 0x80 <= code <= 0x9f:
+            displayed.append(f"\\x{code:02x}")
+        else:
+            displayed.append(character)
+    return "".join(displayed)
+
+
+def write_user_text(
+        text: str, *, multiline: bool = False, file=None) -> None:
+    """Write safe logical input, generating allowlisted line breaks itself."""
+    displayed = user_text_for_terminal(text, multiline=multiline)
+    lines = displayed.split("\n")
+    for index, line in enumerate(lines):
+        print(line, end="", file=file)
+        if index + 1 < len(lines):
+            print(file=file)
+
+
 class PromptRenderer:
     def __init__(self, terminal, prompt: str):
         self.terminal = terminal
@@ -1735,19 +1769,27 @@ class PromptRenderer:
             self.terminal.set_clipping_region(*input_area)
             self.terminal.goto_position(1, 1)
             self.terminal.set_background_color(INPUT_COLOR)
-            print(self.prompt + buffer.before_cursor(), end='')
+            print(self.prompt, end='')
+            write_user_text(buffer.before_cursor(), multiline=True)
 
             # Draw the fake (reverse-video) caret at the insertion point,
             # then the text after it.
             after = buffer.after_cursor()
             self.terminal.set_reverse_video(True)
             if after:
-                print(after[0], end='')
+                if after[0] == "\n":
+                    # The newline is layout, not caret content. Show the
+                    # logical insertion point before generating that layout.
+                    print(' ', end='')
+                else:
+                    write_user_text(after[0])
             else:
                 print(' ', end='')
             self.terminal.set_reverse_video(False)
             if after:
-                print(after[1:], end='')
+                if after[0] == "\n":
+                    print()
+                write_user_text(after[1:], multiline=True)
         finally:
             # Restore the output scroll region and the cursor position.
             # The real cursor is back in the output area where output

@@ -1118,7 +1118,11 @@ class PromptControllerTests(unittest.TestCase):
         self.assertEqual(result, "alpha tail")
 
     def test_bracketed_paste_redraws_once_at_paste_end(self):
-        pasted = "x" * 10000
+        pasted = (
+            "x" * 5000
+            + "\x1b[2J\x00\t\n"
+            + "x" * 4993
+        )
 
         class FakeReader:
             def __init__(self):
@@ -1274,6 +1278,48 @@ class InputModalTests(unittest.TestCase):
         self.assertIsNone(session._modal)
 
 
+class UserTextDisplayTests(unittest.TestCase):
+    def test_escapes_terminal_controls_and_allowlists_multiline_lf(self):
+        logical = (
+            "\x00A\t\nB\r\x1b\x7f\u0085")
+
+        self.assertEqual(
+            terminals.user_text_for_terminal(logical),
+            "^@A^I^JB^M^[^?\\x85",
+        )
+        self.assertEqual(
+            terminals.user_text_for_terminal(
+                logical, multiline=True),
+            "^@A^I\nB^M^[^?\\x85",
+        )
+
+    def test_no_control_code_survives_single_line_display(self):
+        logical = "".join(chr(code) for code in range(0xa0))
+
+        displayed = terminals.user_text_for_terminal(logical)
+
+        self.assertFalse(any(
+            ord(character) < 0x20
+            or 0x7f <= ord(character) <= 0x9f
+            for character in displayed
+        ))
+
+    def test_writer_generates_only_explicit_multiline_layout(self):
+        logical = "first\x1b[2J\t\nsecond\r\x00"
+        out = io.StringIO()
+
+        terminals.write_user_text(
+            logical, multiline=True, file=out)
+
+        displayed = out.getvalue()
+        self.assertEqual(
+            displayed, "first^[[2J^I\nsecond^M^@")
+        self.assertNotIn("\x1b", displayed)
+        self.assertNotIn("\t", displayed)
+        self.assertNotIn("\r", displayed)
+        self.assertNotIn("\x00", displayed)
+
+
 class PromptRendererTests(unittest.TestCase):
     def test_render_refreshes_input_area_status_bar_and_cursor_position(self):
         recorder = RecordingTerminal()
@@ -1317,6 +1363,35 @@ class PromptRendererTests(unittest.TestCase):
                 ("flush",),
             ],
         )
+
+    def test_render_escapes_controls_without_changing_logical_buffer(self):
+        recorder = RecordingTerminal()
+        logical = "first\x1b[2J\t\nsecond\r\x00\u009b"
+        buffer = terminals.InputBuffer()
+        buffer.insert(logical)
+
+        old_refresh = terminals.refresh_terminal_layout
+        old_update_status_bar = terminals.update_status_bar
+        old_input_area = terminals.input_area
+        try:
+            terminals.refresh_terminal_layout = lambda: None
+            terminals.update_status_bar = lambda: None
+            terminals.input_area = (10, 13)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                terminals.PromptRenderer(
+                    recorder, "User: ").render(buffer)
+        finally:
+            terminals.refresh_terminal_layout = old_refresh
+            terminals.update_status_bar = old_update_status_bar
+            terminals.input_area = old_input_area
+
+        self.assertEqual(buffer.text(), logical)
+        self.assertEqual(
+            out.getvalue(),
+            "User: first^[[2J^I\nsecond^M^@\\x9b ",
+        )
+        self.assertNotIn("\x1b", out.getvalue())
 
 
 class RestoreOutputAreaTests(unittest.TestCase):

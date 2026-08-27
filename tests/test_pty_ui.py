@@ -63,7 +63,8 @@ def _read_with_timeout(master, total=4.0):
 
 
 def run_loki_pty_reply(stream: bool, stream_chunks=None,
-                       queued_inputs=None, create_image=False):
+                       queued_inputs=None, create_image=False,
+                       initial_input=b"hi"):
     """Run one real TUI turn; optionally pause after its first delta.
 
     Returns ``(all_output, before_stream_release)``. The second value is only
@@ -108,7 +109,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
         _set_size(master)
         collected += _read_with_timeout(master, 6.0)  # startup banner
 
-        os.write(master, b"hi\r")
+        os.write(master, initial_input + b"\r")
         reply_output = _read_with_timeout(master, 4.0)
         collected += reply_output
         if gate:
@@ -160,6 +161,23 @@ class PtyUiTests(unittest.TestCase):
     def test_batch_reply_is_styled_on_tty(self):
         output, _before_release = run_loki_pty_reply(stream=False)
         self._assert_styled_output(output)
+
+    def test_pasted_terminal_controls_are_displayed_not_executed(self):
+        attack = b"\x1b]777;LOKI_INPUT_ATTACK\x07"
+        pasted = (
+            b"\x1b[200~"
+            b"first" + attack + b"\t\nnext"
+            b"\x1b[201~"
+        )
+
+        output, _before_release = run_loki_pty_reply(
+            stream=False, initial_input=pasted)
+
+        self.assertNotIn(attack, output)
+        self.assertIn(
+            b"first^[]777;LOKI_INPUT_ATTACK^G^I\r\nnext",
+            output,
+        )
 
     def test_status_bar_shows_api_and_mode(self):
         # Regression for the frontend split dropping the status text
