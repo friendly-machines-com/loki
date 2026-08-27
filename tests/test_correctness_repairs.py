@@ -3,45 +3,12 @@ import json
 import os
 import pathlib
 import signal
-import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from loki_agent import formats, http_client, loki, protocols, terminal_frontend
-
-
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-
-
-class PackageContractTests(unittest.TestCase):
-    def test_historical_module_invocation_still_reaches_frontend(self):
-        env = dict(os.environ)
-        env.update({
-            "PYTHONPATH": str(ROOT),
-            "LOKI_PROVIDER": "dummy",
-            "LOKI_API_BASE": "http://dummy.invalid/v1",
-            "LOKI_MODEL": "dummy-model",
-            "LOKI_DUMMY_REPLY": "module-entry-ok",
-        })
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "loki_agent.loki",
-                "--headless",
-                "--prompt",
-                "probe",
-            ],
-            cwd=ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "module-entry-ok")
 
 
 class ProviderResponseContractTests(unittest.TestCase):

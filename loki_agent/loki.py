@@ -4172,15 +4172,3 @@ def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:
 def set_session_connection(descriptor: ConnectionDescriptor):
     current_state()["connection"] = descriptor.to_dict()
     mark_chat_log_dirty()
-
-
-def main() -> int:
-    """Compatibility entry point for wrappers installed before the split."""
-    from .terminal_frontend import main as terminal_main
-    return terminal_main()
-
-
-if __name__ == "__main__":
-    # Keep the historical direct module invocation working without making the
-    # core library own terminal initialization at import time.
-    raise SystemExit(main())
