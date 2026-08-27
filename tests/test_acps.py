@@ -106,7 +106,8 @@ class QuarantineTests(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, cwd=ROOT)
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        lines = [
+            line for line in proc.stdout.splitlines() if line.strip()]
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0]),
                          {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
@@ -918,9 +919,6 @@ class TtyStdinTests(unittest.TestCase):
                     proc.kill()
                     proc.wait()
                 os.close(master)
-
-
-
 
 
 class WireCwdTests(unittest.TestCase):

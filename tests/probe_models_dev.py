@@ -126,7 +126,7 @@ def summarize_grouping(data, label, keyfn):
             print(f"\n  group {key!r} ({len(members)} providers):")
             for pid, m in members:
                 prov = data[pid]
-                print(f"    {pid:28s} npm={prov.get('npm','?'):32s} "
+                print(f"    {pid:28s} npm={prov.get('npm', '?'):32s} "
                       f"feat=[{feature_row(m)}] id={m.get('id')!r} name={m.get('name')!r}")
     return groups, missing
 

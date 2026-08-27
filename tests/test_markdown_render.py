@@ -248,7 +248,6 @@ class BoundedRendererTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.renderer(max_unresolved=value)
 
-
     def test_headline(self):
         renderer = self.renderer()
 

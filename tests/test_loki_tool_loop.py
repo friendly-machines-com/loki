@@ -29,7 +29,6 @@ from loki_agent import savefiles
 from loki_agent import terminals
 
 
-
 _MISSING = object()
 
 
@@ -1348,7 +1347,10 @@ class ExitStatusTests(unittest.TestCase):
                                     "loki_agent.terminal_frontend."
                                     "restore_terminal_overlay",
                                     side_effect=OSError("restore failed")
-                                ), mock.patch.object(loki.current_session(), "chat_log_path", None
+                                ), mock.patch.object(
+                                    loki.current_session(),
+                                    "chat_log_path",
+                                    None,
                                 ), contextlib.redirect_stderr(stderr):
                     status = terminal_frontend.main()
 
