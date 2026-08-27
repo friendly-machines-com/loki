@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import http_client, models
+from loki_agent import http_client, models, protocols
 from loki_agent.credentials import CredentialStore
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
@@ -219,6 +219,164 @@ class CatalogFetchTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(OSError, message):
                     asyncio.run(models.fetch_models_dev())
+
+
+class CatalogNormalizationTests(unittest.TestCase):
+    @staticmethod
+    def openai_provider(**overrides):
+        provider = {
+            "id": "openai",
+            "name": "OpenAI",
+            "npm": "@ai-sdk/openai",
+            "env": ["OPENAI_API_KEY"],
+            "models": {
+                "gpt-test": {
+                    "id": "gpt-test",
+                    "name": "GPT Test",
+                    "tool_call": True,
+                },
+            },
+        }
+        provider.update(overrides)
+        return provider
+
+    def test_canonical_openai_entry_gets_marked_platform_endpoint(self):
+        raw = {"openai": self.openai_provider()}
+
+        normalized = models.normalize_catalog(raw)
+
+        self.assertNotIn("api", raw["openai"])
+        self.assertEqual(
+            normalized["openai"]["api"],
+            "https://api.openai.com/v1",
+        )
+        self.assertEqual(
+            models.provider_display_name("openai", normalized["openai"]),
+            "OpenAI Platform API [endpoint supplied by Loki]",
+        )
+        self.assertIn(
+            "endpoint supplied by Loki",
+            models.provider_description(normalized["openai"]),
+        )
+
+    def test_openai_repair_requires_complete_exact_signature(self):
+        variants = {
+            "provider id": {"id": "not-openai"},
+            "native package": {"npm": "@ai-sdk/openai-compatible"},
+            "credential declaration": {
+                "env": ["OPENAI_API_KEY", "OPENAI_ORG_ID"],
+            },
+        }
+        for label, overrides in variants.items():
+            with self.subTest(label):
+                raw = {"openai": self.openai_provider(**overrides)}
+                normalized = models.normalize_catalog(raw)
+                self.assertNotIn("api", normalized["openai"])
+                self.assertFalse(
+                    models.provider_supported(normalized["openai"]))
+
+    def test_openai_repair_requires_canonical_provider_map_key(self):
+        raw = {"openai-compatible": self.openai_provider()}
+
+        normalized = models.normalize_catalog(raw)
+
+        self.assertIs(normalized, raw)
+        self.assertNotIn("api", normalized["openai-compatible"])
+
+    def test_noncanonical_openai_endpoint_is_preserved_but_rejected(self):
+        raw = {
+            "openai": self.openai_provider(
+                api="https://credentials.example/v1"),
+        }
+
+        normalized = models.normalize_catalog(raw)
+
+        self.assertEqual(
+            normalized["openai"]["api"],
+            "https://credentials.example/v1",
+        )
+        self.assertFalse(models.provider_supported(normalized["openai"]))
+
+    def test_catalog_supplied_canonical_openai_endpoint_is_not_repaired(self):
+        raw = {
+            "openai": self.openai_provider(
+                api="https://api.openai.com/v1"),
+        }
+
+        normalized = models.normalize_catalog(raw)
+
+        self.assertTrue(models.provider_supported(normalized["openai"]))
+        self.assertEqual(
+            models.provider_display_name("openai", normalized["openai"]),
+            "OpenAI",
+        )
+
+    def test_openai_access_uses_responses_and_canonical_endpoints(self):
+        normalized = models.normalize_catalog({
+            "openai": self.openai_provider(),
+        })
+        access = models.provider_access(
+            normalized["openai"],
+            CredentialStore({"OPENAI_API_KEY": "secret"}),
+        )
+
+        self.assertIsNotNone(access)
+        self.assertEqual(access.credential_env, "OPENAI_API_KEY")
+        self.assertEqual(access.protocol, protocols.OPENAI_RESPONSES)
+        provider = protocols.make_provider(
+            access.api_url,
+            provider=access.protocol,
+            api_key="secret",
+        )
+        self.assertEqual(
+            provider.chat_url,
+            "https://api.openai.com/v1/responses",
+        )
+        self.assertEqual(
+            provider.models_url,
+            "https://api.openai.com/v1/models",
+        )
+
+    def test_acp_choice_marks_loki_supplied_openai_endpoint(self):
+        normalized = models.normalize_catalog({
+            "openai": self.openai_provider(),
+        })
+        groups = models.build_groups(normalized)
+
+        choices = models.flattened_config_option_choices(
+            CredentialStore({"OPENAI_API_KEY": "secret"}),
+            groups=groups,
+        )
+
+        self.assertEqual(len(choices), 1)
+        option, _leaf = choices[0]
+        self.assertEqual(
+            option["name"],
+            "gpt-test (OpenAI Platform API [endpoint supplied by Loki])",
+        )
+        self.assertIn("endpoint supplied by Loki", option["description"])
+
+    def test_ensure_index_normalizes_without_mutating_fetched_catalog(self):
+        raw = {"openai": self.openai_provider()}
+        saved = models._index_cache
+        models._index_cache = None
+        try:
+            with mock.patch.object(
+                    models, "fetch_models_dev",
+                    new=mock.AsyncMock(return_value=raw)):
+                data, groups = asyncio.run(models.ensure_index())
+        finally:
+            models._index_cache = saved
+
+        self.assertNotIn("api", raw["openai"])
+        self.assertEqual(
+            data["openai"]["api"],
+            "https://api.openai.com/v1",
+        )
+        self.assertEqual(
+            [provider_id for provider_id, _, _ in groups["GPT Test"]],
+            ["openai"],
+        )
 
 
 class GroupingTests(unittest.TestCase):

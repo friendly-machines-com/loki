@@ -476,7 +476,8 @@ def config_from_modelsdev_selection(
             "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
         provider_id=provider_id,
-        provider_name=provider_entry.get("name"),
+        provider_name=modelsdev.provider_display_name(
+            provider_id, provider_entry),
         credential_env=access.credential_env,
         model_status=model_status,
         stream=_bool_setting("LOKI_STREAM", False, credentials),

@@ -38,6 +38,14 @@ MODELS_DEV_TIMEOUT_S = 30
 MODELS_DEV_MAX_BYTES = 20 * 1024 * 1024
 MODELS_DEV_RETRY_MAX_ATTEMPTS = 3
 
+# models.dev omits endpoints that its native JavaScript SDK packages know
+# internally.  Keep the downloaded catalog and cache faithful to models.dev,
+# then apply narrowly matched, explicitly annotated repairs in memory.
+OPENAI_PLATFORM_API_BASE = "https://api.openai.com/v1"
+_LOKI_API_SOURCE_KEY = "_loki_api_source"
+_LOKI_API_REJECTION_KEY = "_loki_api_rejection"
+_OPENAI_PLATFORM_API_SOURCE = "built-in OpenAI Platform default"
+
 # Feature flags shown in the pickers, in a stable order. A provider may set
 # each one differently for the same model; menus show the ones that are on.
 FEATURE_KEYS = (
@@ -98,6 +106,63 @@ def _validate_catalog(data):
     return data
 
 
+def _openai_platform_signature(provider_entry):
+    """Whether this is exactly the native OpenAI provider models.dev emits."""
+    return (
+        provider_entry.get("id") == "openai"
+        and provider_entry.get("npm") == "@ai-sdk/openai"
+        and provider_entry.get("env") == ["OPENAI_API_KEY"]
+    )
+
+
+def _canonical_openai_platform_api(api):
+    if not isinstance(api, str):
+        return False
+    return api.rstrip("/") in {
+        OPENAI_PLATFORM_API_BASE,
+        OPENAI_PLATFORM_API_BASE + "/responses",
+    }
+
+
+def normalize_catalog(data):
+    """Return a catalog with fail-closed, explicitly marked Loki repairs.
+
+    The provider-map key, provider id, native SDK package, and credential
+    declaration must all identify OpenAI exactly.  The SDK package alone is
+    not unique in models.dev.  A changed signature or noncanonical endpoint
+    is rejected rather than risking disclosure of ``OPENAI_API_KEY`` to a
+    different service.
+
+    This function never mutates the raw downloaded or cached catalog.
+    """
+    provider_entry = data.get("openai")
+    if provider_entry is None:
+        return data
+    if not isinstance(provider_entry, dict):
+        return data
+
+    normalized = dict(data)
+    normalized_provider = dict(provider_entry)
+    normalized["openai"] = normalized_provider
+
+    if not _openai_platform_signature(provider_entry):
+        normalized_provider[_LOKI_API_REJECTION_KEY] = (
+            "canonical OpenAI provider signature changed")
+        return normalized
+
+    api = provider_entry.get("api")
+    if not api:
+        normalized_provider["api"] = OPENAI_PLATFORM_API_BASE
+        normalized_provider[_LOKI_API_SOURCE_KEY] = (
+            _OPENAI_PLATFORM_API_SOURCE)
+        return normalized
+
+    if not _canonical_openai_platform_api(api):
+        normalized_provider[_LOKI_API_REJECTION_KEY] = (
+            "canonical OpenAI provider declared a non-OpenAI endpoint")
+    return normalized
+
+
 async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
     """Fetch and parse models.dev/api.json through Loki's HTTP transport."""
     if cache_path:
@@ -150,7 +215,8 @@ async def ensure_index(cache_path=None):
     """Fetch (once per session) and return (data, groups)."""
     global _index_cache
     if _index_cache is None:
-        data = await fetch_models_dev(cache_path=cache_path)
+        data = normalize_catalog(
+            await fetch_models_dev(cache_path=cache_path))
         _index_cache = (data, build_groups(data))
     return _index_cache
 
@@ -265,7 +331,29 @@ def provider_supported(provider_entry):
 
     Providers with no API URL or usable protocol signal are dropped.
     """
+    if provider_entry.get(_LOKI_API_REJECTION_KEY):
+        return False
     return bool(provider_entry.get("api")) and provider_protocol(provider_entry) is not None
+
+
+def provider_display_name(provider_id, provider_entry):
+    """Provider name including the provenance of Loki-supplied defaults."""
+    name = provider_entry.get("name") or provider_id
+    if provider_entry.get(_LOKI_API_SOURCE_KEY) == (
+            _OPENAI_PLATFORM_API_SOURCE):
+        return f"{name} Platform API [endpoint supplied by Loki]"
+    return name
+
+
+def provider_description(provider_entry):
+    """ACP/provider description with any endpoint repair made explicit."""
+    description = provider_entry.get("api") or ""
+    if provider_entry.get(_LOKI_API_SOURCE_KEY) == (
+            _OPENAI_PLATFORM_API_SOURCE):
+        return (
+            f"{description}; endpoint supplied by Loki because models.dev "
+            "omits the native SDK default")
+    return description
 
 
 def provider_access(provider_entry, credentials: CredentialStore):
@@ -445,7 +533,10 @@ def _model_rows(groups):
         search = " ".join(
             [name]
             + [pid for pid, _, _ in catalog_members]
-            + [p.get("name") or "" for _, p, _ in catalog_members]
+            + [
+                provider_display_name(pid, provider)
+                for pid, provider, _ in catalog_members
+            ]
             + [m.get("status") or "" for _, _, m in catalog_members]
             + [
                 value
@@ -472,7 +563,7 @@ def _provider_rows(members):
             rows.append((member, label))
             continue
         pid, prov, m = member
-        parts = [prov.get("name") or pid]
+        parts = [provider_display_name(pid, prov)]
         model_id = m.get("id")
         if model_id:
             parts.append(f"id={model_id}")
@@ -557,8 +648,8 @@ def flattened_config_option_choices(
                 continue
             provider_id, provider_entry, model_entry = member
             model_id = model_entry.get("id") or model_entry.get("name")
-            label = provider_entry.get("name") or provider_id
-            description = provider_entry.get("api") or ""
+            label = provider_display_name(provider_id, provider_entry)
+            description = provider_description(provider_entry)
             choices.append(({
                 "value": f"{provider_id}/{model_id}",
                 "name": f"{model_id} ({label})",

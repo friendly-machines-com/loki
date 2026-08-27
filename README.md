@@ -36,10 +36,16 @@ captured credential is available. Provider-specific variables such as
 `OPENROUTER_API_KEY` can therefore be supplied by the VM/container launcher
 without also exposing them to ordinary tool subprocesses. Deprecated catalog
 entries remain selectable but are labeled in the picker and status bar.
+Models.dev omits the OpenAI Platform endpoint because its native JavaScript
+SDK supplies that default internally. When the catalog entry exactly matches
+the canonical OpenAI provider signature, Loki supplies
+`https://api.openai.com/v1` and labels the provider
+`OpenAI Platform API [endpoint supplied by Loki]`. A changed signature or
+non-OpenAI endpoint is rejected rather than receiving `OPENAI_API_KEY`.
 
-Loki has no built-in provider connection. Without an explicit
-`LOKI_API_BASE` or a saved session connection, it starts disconnected and
-`/model` can be used to choose among providers represented by captured
+Loki does not select a built-in provider connection at startup. Without an
+explicit `LOKI_API_BASE` or a saved session connection, it starts disconnected
+and `/model` can be used to choose among providers represented by captured
 credentials. An explicitly configured endpoint uses `LOKI_API_KEY` when it is
 set; when it is absent, Loki sends no authentication header. Loki never
 substitutes another provider's credential based merely on the endpoint's wire

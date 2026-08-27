@@ -766,6 +766,38 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.model_status, "deprecated")
         self.assertTrue(config.stream)
 
+    def test_normalized_openai_selection_preserves_visible_provenance(self):
+        provider_entry = modelsdev.normalize_catalog({
+            "openai": {
+                "id": "openai",
+                "name": "OpenAI",
+                "npm": "@ai-sdk/openai",
+                "env": ["OPENAI_API_KEY"],
+                "models": {},
+            },
+        })["openai"]
+
+        config = loki.config_from_modelsdev_selection(
+            "openai",
+            provider_entry,
+            {"id": "gpt-test", "name": "GPT Test"},
+            CredentialStore({"OPENAI_API_KEY": "selected-key"}),
+        )
+
+        self.assertEqual(
+            config.provider_name,
+            "OpenAI Platform API [endpoint supplied by Loki]",
+        )
+        self.assertEqual(
+            config.chat_provider.chat_url,
+            "https://api.openai.com/v1/responses",
+        )
+        self.assertEqual(
+            config.chat_provider.models_url,
+            "https://api.openai.com/v1/models",
+        )
+        self.assertEqual(config.credential_env, "OPENAI_API_KEY")
+
 
 class ModelLoadingTests(unittest.TestCase):
     def setUp(self):
