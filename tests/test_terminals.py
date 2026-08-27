@@ -269,18 +269,123 @@ class RecordingTerminal:
         self.calls.append(("flush",))
 
 
+class TerminfoKeySequenceTests(unittest.TestCase):
+    def test_import_failure_returns_no_sequences(self):
+        original_import = __import__
+
+        def import_without_curses(name, *args, **kwargs):
+            if name == "curses":
+                raise ImportError("curses unavailable")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch(
+                "builtins.__import__", side_effect=import_without_curses):
+            sequences = terminals.terminfo_key_sequences(output_fd=7)
+
+        self.assertEqual(sequences, {})
+
+    def test_setup_failure_returns_no_sequences(self):
+        fake_curses = mock.Mock()
+        fake_curses.setupterm.side_effect = RuntimeError(
+            "terminfo unavailable")
+
+        with mock.patch.dict(sys.modules, {"curses": fake_curses}):
+            sequences = terminals.terminfo_key_sequences(output_fd=7)
+
+        self.assertEqual(sequences, {})
+        fake_curses.setupterm.assert_called_once_with(fd=7)
+        fake_curses.tigetstr.assert_not_called()
+
+    def test_lookup_is_best_effort_and_rejects_unsafe_values(self):
+        values = {
+            "kcuu1": b"\x1b[9A",
+            "kcud1": None,
+            "kcuf1": "not bytes",
+            "kcub1": b"D",
+            "khome": b"\x1b" + b"x" * terminals.MAX_KEY_SEQUENCE_BYTES,
+            "kend": b"\x1b[99~",
+            "kpp": b"\x1b[77~",
+        }
+        fake_curses = mock.Mock()
+
+        def lookup(capability):
+            if capability == "kdch1":
+                raise RuntimeError("one broken capability")
+            return values.get(capability)
+
+        fake_curses.tigetstr.side_effect = lookup
+        with mock.patch.dict(sys.modules, {"curses": fake_curses}):
+            sequences = terminals.terminfo_key_sequences(output_fd=7)
+
+        self.assertEqual(
+            sequences,
+            {
+                b"\x1b[9A": "CURSOR_UP",
+                b"\x1b[99~": "END",
+                b"\x1b[77~": "PAGE_UP",
+            },
+        )
+        fake_curses.setupterm.assert_called_once_with(fd=7)
+        self.assertEqual(
+            fake_curses.tigetstr.call_count,
+            len(terminals.TERMINFO_KEY_CAPABILITIES),
+        )
+        fake_curses.initscr.assert_not_called()
+        fake_curses.newterm.assert_not_called()
+        fake_curses.raw.assert_not_called()
+        fake_curses.cbreak.assert_not_called()
+        fake_curses.putp.assert_not_called()
+
+    def test_reader_uses_terminfo_additively(self):
+        optional_sequences = {
+            b"\x1b[A": "DELETE",
+            b"\x1b[99~": "HOME",
+            b"\x1bOA": "CURSOR_UP",
+        }
+        with mock.patch.object(
+                terminals, "terminfo_key_sequences",
+                return_value=optional_sequences) as lookup:
+            reader = terminals.AsyncKeyReader(
+                fd=0, use_terminfo=True, output_fd=7)
+
+        lookup.assert_called_once_with(7)
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[A"),
+            [terminals.KeyEvent("CURSOR_UP")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[99~"),
+            [terminals.KeyEvent("HOME")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bOA"),
+            [terminals.KeyEvent("CURSOR_UP")],
+        )
+
+    def test_reader_does_not_lookup_terminfo_unless_enabled(self):
+        with mock.patch.object(
+                terminals, "terminfo_key_sequences") as lookup:
+            terminals.AsyncKeyReader(fd=0)
+
+        lookup.assert_not_called()
+
+
 class AsyncKeyReaderTests(unittest.TestCase):
-    def tty_attrs(self, erase=b"\x7f", word_erase=b"\x17"):
+    def tty_attrs(
+            self, erase=b"\x7f", word_erase=b"\x17",
+            interrupt=b"\x03"):
         cc = [b"\0"] * (
             max(
                 terminals.termios.VERASE,
                 terminals.termios.VWERASE,
+                terminals.termios.VINTR,
                 terminals.termios.VMIN,
                 terminals.termios.VTIME,
             ) + 1
         )
         cc[terminals.termios.VERASE] = erase
         cc[terminals.termios.VWERASE] = word_erase
+        cc[terminals.termios.VINTR] = interrupt
         return [0, 0, 0, 0, 0, 0, cc]
 
     def test_decodes_text_ascii_and_utf8(self):
@@ -291,12 +396,14 @@ class AsyncKeyReaderTests(unittest.TestCase):
         self.assertEqual(feed_bytes(reader, bytes([0xa9])), [terminals.KeyEvent("TEXT", "\u00e9")])
 
     def test_decodes_control_keys(self):
-        erase_bytes = (
+        control_bytes = (
             terminals.FALLBACK_BACKSPACE_BYTES,
             terminals.FALLBACK_BACKSPACE_WORD_BYTES,
+            terminals.FALLBACK_INTERRUPT_BYTES,
         )
         with mock.patch.object(
-                terminals, "terminal_erase_bytes", return_value=erase_bytes):
+                terminals, "terminal_control_bytes",
+                return_value=control_bytes):
             reader = terminals.AsyncKeyReader(fd=0)
 
         events = feed_bytes(reader, b"\x03\x04\r\n\x7f\x08\x17")
@@ -313,6 +420,23 @@ class AsyncKeyReaderTests(unittest.TestCase):
                 terminals.KeyEvent("BACKSPACE_WORD"),
             ],
         )
+
+    def test_uses_configured_interrupt_byte(self):
+        attrs = self.tty_attrs(interrupt=b"\x18")
+        with (
+            mock.patch.object(
+                terminals.termios, "tcgetattr", return_value=attrs),
+            mock.patch.object(
+                terminals.os, "fpathconf", return_value=0xff),
+        ):
+            reader = terminals.AsyncKeyReader(fd=123)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x18"),
+            [terminals.KeyEvent("CTRL_C")],
+        )
+        self.assertTrue(reader.cancel_requested)
+        self.assertTrue(reader.cancel_event.is_set())
 
     def test_uses_configured_character_and_word_erase_bytes(self):
         cases = [
@@ -364,7 +488,8 @@ class AsyncKeyReaderTests(unittest.TestCase):
         )
 
     def test_invalid_or_disabled_values_use_independent_fallbacks(self):
-        attrs = self.tty_attrs(b"invalid", b"\x15")
+        attrs = self.tty_attrs(
+            b"invalid", b"\x15", interrupt=b"\x15")
         with (
             mock.patch.object(
                 terminals.termios, "tcgetattr", return_value=attrs),
@@ -374,26 +499,28 @@ class AsyncKeyReaderTests(unittest.TestCase):
             reader = terminals.AsyncKeyReader(fd=123)
 
         self.assertEqual(
-            feed_bytes(reader, b"\x08\x7f\x17"),
+            feed_bytes(reader, b"\x08\x7f\x17\x03"),
             [
                 terminals.KeyEvent("BACKSPACE"),
                 terminals.KeyEvent("BACKSPACE"),
                 terminals.KeyEvent("BACKSPACE_WORD"),
+                terminals.KeyEvent("CTRL_C"),
             ],
         )
 
-    def test_termios_error_uses_erase_fallbacks(self):
+    def test_termios_error_uses_control_fallbacks(self):
         error = terminals.termios.error(25, "not a tty")
         with mock.patch.object(
                 terminals.termios, "tcgetattr", side_effect=error):
             reader = terminals.AsyncKeyReader(fd=123)
 
         self.assertEqual(
-            feed_bytes(reader, b"\x08\x7f\x17"),
+            feed_bytes(reader, b"\x08\x7f\x17\x03"),
             [
                 terminals.KeyEvent("BACKSPACE"),
                 terminals.KeyEvent("BACKSPACE"),
                 terminals.KeyEvent("BACKSPACE_WORD"),
+                terminals.KeyEvent("CTRL_C"),
             ],
         )
 
@@ -654,7 +781,7 @@ class PromptControllerTests(unittest.TestCase):
                 return False
 
         class FakeKeyReader:
-            def __init__(self, fd, watch_resize=False):
+            def __init__(self, fd, watch_resize=False, **kwargs):
                 self.events = list(events)
 
             async def __aenter__(self):
@@ -695,6 +822,58 @@ class PromptControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(result, "aXbc!")
+
+    def test_reader_configuration_precedes_tty_mode_change(self):
+        calls = []
+
+        class TtyOutput(io.StringIO):
+            def fileno(self):
+                return 1
+
+        class RecordingReader:
+            def __init__(
+                    self, fd, watch_resize=False, use_terminfo=False,
+                    output_fd=None):
+                calls.append(
+                    ("reader", watch_resize, use_terminfo, output_fd))
+
+            async def __aenter__(self):
+                calls.append("reader enter")
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                calls.append("reader exit")
+
+            async def read_key(self):
+                return terminals.KeyEvent("ENTER")
+
+        class RecordingMode:
+            def __init__(self, fd, enabled):
+                pass
+
+            def __enter__(self):
+                calls.append("mode enter")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                calls.append("mode exit")
+
+        with (
+            mock.patch.object(terminals, "new_stdin", 123),
+            mock.patch.object(terminals.os, "isatty", return_value=True),
+            mock.patch.object(terminals, "AsyncKeyReader", RecordingReader),
+            mock.patch.object(terminals, "TerminalMode", RecordingMode),
+            contextlib.redirect_stdout(TtyOutput()),
+        ):
+            result = asyncio.run(
+                terminals.PromptController(RecordingTerminal()).read_text())
+
+        self.assertEqual(result, "")
+        self.assertEqual(calls[0][0:3], ("reader", True, True))
+        self.assertEqual(
+            calls[1:],
+            ["mode enter", "reader enter", "reader exit", "mode exit"],
+        )
 
     def test_read_text_applies_ctrl_backspace_after_ctrl_left(self):
         result = self.read_with_events(

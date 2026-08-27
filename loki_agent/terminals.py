@@ -763,6 +763,7 @@ PASTE_START_SEQUENCE = b'\x1b[200~'
 PASTE_END_SEQUENCE = b'\x1b[201~'
 FALLBACK_BACKSPACE_BYTES = frozenset((0x08, 0x7f))
 FALLBACK_BACKSPACE_WORD_BYTES = frozenset((0x17,))
+FALLBACK_INTERRUPT_BYTES = frozenset((0x03,))
 
 
 def _control_character_byte(value):
@@ -779,8 +780,8 @@ def _control_character_byte(value):
     return byte
 
 
-def terminal_erase_bytes(fd: int):
-    """Return configured character-erase and word-erase input bytes."""
+def terminal_control_bytes(fd: int):
+    """Return configured character-erase, word-erase, and interrupt bytes."""
     try:
         [
             iflag,
@@ -792,7 +793,11 @@ def terminal_erase_bytes(fd: int):
             cc,
         ] = termios.tcgetattr(fd)
     except (termios.error, OSError, TypeError, ValueError):
-        return FALLBACK_BACKSPACE_BYTES, FALLBACK_BACKSPACE_WORD_BYTES
+        return (
+            FALLBACK_BACKSPACE_BYTES,
+            FALLBACK_BACKSPACE_WORD_BYTES,
+            FALLBACK_INTERRUPT_BYTES,
+        )
 
     # POSIX lets each tty choose the byte that disables a control character.
     try:
@@ -824,7 +829,12 @@ def terminal_erase_bytes(fd: int):
             termios.VWERASE, FALLBACK_BACKSPACE_WORD_BYTES)
     except AttributeError:
         backspace_word_bytes = FALLBACK_BACKSPACE_WORD_BYTES
-    return backspace_bytes, backspace_word_bytes
+    try:
+        interrupt_bytes = configured(
+            termios.VINTR, FALLBACK_INTERRUPT_BYTES)
+    except AttributeError:
+        interrupt_bytes = FALLBACK_INTERRUPT_BYTES
+    return backspace_bytes, backspace_word_bytes, interrupt_bytes
 
 
 KEY_SEQUENCES = {
@@ -843,18 +853,76 @@ KEY_SEQUENCES = {
     b'\x1b[1;5C': 'CURSOR_WORD_RIGHT',
     b'\x1b[Z': 'MODE_CYCLE',
 }
+TERMINFO_KEY_CAPABILITIES = (
+    ("kcuu1", "CURSOR_UP"),
+    ("kcud1", "CURSOR_DOWN"),
+    ("kcuf1", "CURSOR_RIGHT"),
+    ("kcub1", "CURSOR_LEFT"),
+    ("khome", "HOME"),
+    ("kend", "END"),
+    ("kdch1", "DELETE"),
+    ("kpp", "PAGE_UP"),
+    ("knp", "PAGE_DOWN"),
+    ("kLFT5", "CURSOR_WORD_LEFT"),
+    ("kRIT5", "CURSOR_WORD_RIGHT"),
+    ("kcbt", "MODE_CYCLE"),
+)
+MAX_KEY_SEQUENCE_BYTES = 32
 CSI_FINAL_BYTES = set(range(0x40, 0x7f))
 KEY_READER_WAKE = object()
 
 
+def terminfo_key_sequences(output_fd=None):
+    """Return optional key encodings without making curses a dependency."""
+    try:
+        import curses
+
+        if output_fd is None:
+            output_fd = sys.stdout.fileno()
+        curses.setupterm(fd=output_fd)
+    except Exception:
+        return {}
+
+    sequences = {}
+    for capability, kind in TERMINFO_KEY_CAPABILITIES:
+        try:
+            sequence = curses.tigetstr(capability)
+        except Exception:
+            continue
+        # Input capabilities should be control sequences. Refuse values which
+        # could capture ordinary text, consume unbounded parser state, or
+        # cannot be decoded by Loki's ESC-prefixed input path.
+        if (not isinstance(sequence, bytes)
+                or not 2 <= len(sequence) <= MAX_KEY_SEQUENCE_BYTES
+                or not sequence.startswith(b'\x1b')):
+            continue
+        sequences.setdefault(sequence, kind)
+    return sequences
+
+
+def _sequence_prefixes(sequences):
+    return {
+        sequence[:length]
+        for sequence in sequences
+        for length in range(1, len(sequence))
+    }
+
+
 class AsyncKeyReader:
-    def __init__(self, fd: int, watch_resize: bool = False):
+    def __init__(self, fd: int, watch_resize: bool = False,
+                 use_terminfo: bool = False, output_fd=None):
         self.fd = fd
         self.watch_resize = watch_resize
         (
             self.backspace_bytes,
             self.backspace_word_bytes,
-        ) = terminal_erase_bytes(fd)
+            self.interrupt_bytes,
+        ) = terminal_control_bytes(fd)
+        self.key_sequences = dict(KEY_SEQUENCES)
+        if use_terminfo:
+            for sequence, kind in terminfo_key_sequences(output_fd).items():
+                self.key_sequences.setdefault(sequence, kind)
+        self.key_sequence_prefixes = _sequence_prefixes(self.key_sequences)
         self.byte_reader = AsyncByteReader(fd)
         self.pending = collections.deque()
         self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
@@ -950,10 +1018,23 @@ class AsyncKeyReader:
 
         if self.escape:
             self.escape.append(byte)
-            if self.escape == b'\x1b[':
+            sequence = bytes(self.escape)
+            kind = self.key_sequences.get(sequence)
+            if kind is not None:
+                self.escape.clear()
+                if kind == "PASTE_START":
+                    self.paste_mode = True
+                    self.paste_bytes.clear()
+                    self.pending.append(KeyEvent(kind))
+                elif kind == "MODE_CYCLE":
+                    self.mode_cycle_requested = True
+                    self.pending.append(KeyEvent(kind))
+                else:
+                    self.pending.append(KeyEvent(kind))
                 return
-            if self.escape.startswith(b'\x1b[') and byte in CSI_FINAL_BYTES:
-                sequence = bytes(self.escape)
+            if sequence in self.key_sequence_prefixes:
+                return
+            if sequence.startswith(b'\x1b[') and byte in CSI_FINAL_BYTES:
                 self.escape.clear()
 
                 if byte == 0x52: # 0x52 is 'R'
@@ -964,21 +1045,11 @@ class AsyncKeyReader:
                         self.pending.append(KeyEvent("CPR", sequence.decode('ascii')))
                         return
 
-                kind = KEY_SEQUENCES.get(sequence)
-                if kind == "PASTE_START":
-                    self.paste_mode = True
-                    self.paste_bytes.clear()
-                    self.pending.append(KeyEvent(kind))
-                elif kind == "MODE_CYCLE":
-                    self.mode_cycle_requested = True
-                    self.pending.append(KeyEvent(kind))
-                elif kind:
-                    self.pending.append(KeyEvent(kind))
                 return
-            if len(self.escape) == 2 and not self.escape.startswith(b'\x1b['):
+            if len(self.escape) == 2 and not sequence.startswith(b'\x1b['):
                 self.escape.clear()
                 return
-            if len(self.escape) > 32:
+            if len(self.escape) > MAX_KEY_SEQUENCE_BYTES:
                 # Unsupported escape sequences should not leave the input
                 # parser stuck forever waiting for a final byte.
                 self.escape.clear()
@@ -986,7 +1057,7 @@ class AsyncKeyReader:
 
         if byte == 0x1b:
             self.escape.append(byte)
-        elif byte == 0x03:
+        elif byte in self.interrupt_bytes:
             self.cancel_requested = True
             self.cancel_event.set()
             self.pending.append(KeyEvent("CTRL_C"))
@@ -1170,8 +1241,14 @@ class PromptController:
             return await self._read_text_from_reader(self.session, interactive, buffer, renderer,
                                                      output_row, output_col, history_index, saved_input)
         # No session: manage our own raw mode + reader for this one call.
+        reader = AsyncKeyReader(
+            fd,
+            watch_resize=interactive,
+            use_terminfo=interactive,
+            output_fd=sys.stdout.fileno() if interactive else None,
+        )
         with TerminalMode(fd, interactive):
-            async with AsyncKeyReader(fd, watch_resize=interactive) as reader:
+            async with reader:
                 return await self._read_text_from_reader(reader, interactive, buffer, renderer,
                                                          output_row, output_col, history_index, saved_input)
 
@@ -1373,7 +1450,12 @@ class InputSession:
                  on_queue_size_change=None):
         self.fd = fd if fd is not None else new_stdin
         self.interactive = os.isatty(self.fd) and os.isatty(sys.stdout.fileno())
-        self.reader = AsyncKeyReader(self.fd, watch_resize=self.interactive)
+        self.reader = AsyncKeyReader(
+            self.fd,
+            watch_resize=self.interactive,
+            use_terminfo=self.interactive,
+            output_fd=sys.stdout.fileno() if self.interactive else None,
+        )
         self.user_messages = UserMessageQueue(on_queue_size_change)
         self._producer = None
         self._mode = None
