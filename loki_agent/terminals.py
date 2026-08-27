@@ -1,6 +1,7 @@
 import asyncio
 import codecs
 import collections
+import contextlib
 import fcntl
 import os
 import re
@@ -668,6 +669,7 @@ class AsyncByteReader:
         self.loop = None
         self.queue = asyncio.Queue()
         self.old_flags = None
+        self._reader_registered = False
 
     def _on_readable(self):
         try:
@@ -682,15 +684,35 @@ class AsyncByteReader:
     async def __aenter__(self):
         self.loop = asyncio.get_running_loop()
         self.old_flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-        fcntl.fcntl(self.fd, fcntl.F_SETFL, self.old_flags | os.O_NONBLOCK)
-        self.loop.add_reader(self.fd, self._on_readable)
+        try:
+            fcntl.fcntl(
+                self.fd, fcntl.F_SETFL, self.old_flags | os.O_NONBLOCK)
+            self.loop.add_reader(self.fd, self._on_readable)
+            self._reader_registered = True
+        except BaseException:
+            try:
+                self._restore_flags()
+            finally:
+                self.loop = None
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self.loop is not None:
-            self.loop.remove_reader(self.fd)
-        if self.old_flags is not None:
-            fcntl.fcntl(self.fd, fcntl.F_SETFL, self.old_flags)
+        try:
+            if self._reader_registered and self.loop is not None:
+                self.loop.remove_reader(self.fd)
+                self._reader_registered = False
+        finally:
+            try:
+                self._restore_flags()
+            finally:
+                self.loop = None
+
+    def _restore_flags(self):
+        if self.old_flags is None:
+            return
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, self.old_flags)
+        self.old_flags = None
 
     async def read(self):
         item = await self.queue.get()
@@ -708,7 +730,8 @@ class TerminalMode:
     def __enter__(self):
         if self.enabled:
             self.old_attrs = termios.tcgetattr(self.fd)
-            new_attrs = termios.tcgetattr(self.fd)
+            new_attrs = self.old_attrs.copy()
+            new_attrs[6] = self.old_attrs[6].copy()
             # ISIG too: with it set, the tty driver turns Ctrl+C into SIGINT
             # for the foreground process group before the byte reaches the
             # reader, so AsyncKeyReader.cancel_requested can never fire and
@@ -719,12 +742,21 @@ class TerminalMode:
             new_attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
             new_attrs[6][termios.VMIN] = 1
             new_attrs[6][termios.VTIME] = 0
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, new_attrs)
+            try:
+                termios.tcsetattr(
+                    self.fd, termios.TCSADRAIN, new_attrs)
+            except BaseException:
+                self.restore()
+                raise
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        self.restore()
+
+    def restore(self):
         if self.old_attrs is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
+            self.old_attrs = None
 
 
 PASTE_START_SEQUENCE = b'\x1b[200~'
@@ -831,6 +863,7 @@ class AsyncKeyReader:
         self.paste_bytes = bytearray()
         self.eof = False
         self.loop = None
+        self._resources = None
         self.cancel_requested = False
         # Event-driven counterpart of cancel_requested.  Set in _feed_byte,
         # which runs inside read_key(), which runs as a task on the same
@@ -849,25 +882,47 @@ class AsyncKeyReader:
 
     async def __aenter__(self):
         self.loop = asyncio.get_running_loop()
-        await self.byte_reader.__aenter__()
-        if self.watch_resize:
+        resources = contextlib.AsyncExitStack()
+        try:
+            await resources.enter_async_context(self.byte_reader)
+            if self.watch_resize:
+                try:
+                    self.loop.add_signal_handler(
+                        signal.SIGWINCH, self._on_resize)
+                except (NotImplementedError, RuntimeError):
+                    # Some event loops/platforms do not expose signal
+                    # handlers; the prompt remains usable without live resize
+                    # events.
+                    pass
+                else:
+                    resources.callback(self._remove_resize_handler)
+        except BaseException:
             try:
-                self.loop.add_signal_handler(signal.SIGWINCH, self._on_resize)
-            except (NotImplementedError, RuntimeError):
-                # Some event loops/platforms do not expose signal handlers; the
-                # prompt remains usable without live resize events.
-                pass
+                await resources.__aexit__(*sys.exc_info())
+            finally:
+                self.loop = None
+            raise
+        self._resources = resources
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self.watch_resize and self.loop is not None:
-            try:
-                self.loop.remove_signal_handler(signal.SIGWINCH)
-            except (NotImplementedError, RuntimeError):
-                # Match the add path: absence of signal-handler support is not
-                # a terminal-state cleanup failure.
-                pass
-        await self.byte_reader.__aexit__(exc_type, exc, tb)
+        resources = self._resources
+        self._resources = None
+        try:
+            if resources is not None:
+                await resources.__aexit__(exc_type, exc, tb)
+        finally:
+            self.loop = None
+
+    def _remove_resize_handler(self):
+        if self.loop is None:
+            return
+        try:
+            self.loop.remove_signal_handler(signal.SIGWINCH)
+        except (NotImplementedError, RuntimeError):
+            # Match the add path: absence of signal-handler support is not a
+            # terminal-state cleanup failure.
+            pass
 
     def _emit_text_byte(self, byte: int):
         text = self.decoder.decode(bytes([byte]), final=False)
@@ -1323,29 +1378,47 @@ class InputSession:
         self._producer = None
         self._mode = None
         self._modal = None
+        self._resources = None
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
         self.history_provider = history_provider
 
     async def __aenter__(self):
-        self._mode = TerminalMode(self.fd, self.interactive)
-        self._mode.__enter__()
-        await self.reader.__aenter__()
-        self._producer = asyncio.create_task(self._produce())
+        resources = contextlib.AsyncExitStack()
+        try:
+            self._mode = resources.enter_context(
+                TerminalMode(self.fd, self.interactive))
+            await resources.enter_async_context(self.reader)
+            self._producer = asyncio.create_task(self._produce())
+        except BaseException:
+            try:
+                await resources.__aexit__(*sys.exc_info())
+            finally:
+                self._mode = None
+            raise
+        self._resources = resources
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self._producer is not None:
-            self._producer.cancel()
+        resources = self._resources
+        self._resources = None
+        try:
             try:
-                await self._producer
-            except (asyncio.CancelledError, EOFError):
-                pass
-            self._producer = None
-        self.user_messages.discard_pending_messages()
-        await self.reader.__aexit__(exc_type, exc, tb)
-        if self._mode is not None:
-            self._mode.__exit__(exc_type, exc, tb)
-            self._mode = None
+                if self._producer is not None:
+                    self._producer.cancel()
+                    try:
+                        await self._producer
+                    except (asyncio.CancelledError, EOFError):
+                        pass
+                    finally:
+                        self._producer = None
+            finally:
+                self.user_messages.discard_pending_messages()
+        finally:
+            try:
+                if resources is not None:
+                    await resources.__aexit__(*sys.exc_info())
+            finally:
+                self._mode = None
 
     async def _produce(self):
         while True:
