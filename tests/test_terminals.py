@@ -341,6 +341,7 @@ class TerminfoKeySequenceTests(unittest.TestCase):
             b"\x1b[A": "DELETE",
             b"\x1b[99~": "HOME",
             b"\x1bOA": "CURSOR_UP",
+            b"\x1bxy": "PAGE_UP",
         }
         with mock.patch.object(
                 terminals, "terminfo_key_sequences",
@@ -361,6 +362,17 @@ class TerminfoKeySequenceTests(unittest.TestCase):
             feed_bytes(reader, b"\x1bOA"),
             [terminals.KeyEvent("CURSOR_UP")],
         )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bxy"),
+            [terminals.KeyEvent("PAGE_UP")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bxz"),
+            [
+                terminals.KeyEvent("TEXT", "x"),
+                terminals.KeyEvent("TEXT", "z"),
+            ],
+        )
 
     def test_reader_does_not_lookup_terminfo_unless_enabled(self):
         with mock.patch.object(
@@ -368,6 +380,68 @@ class TerminfoKeySequenceTests(unittest.TestCase):
             terminals.AsyncKeyReader(fd=0)
 
         lookup.assert_not_called()
+
+
+class EscapeSequenceParserTests(unittest.TestCase):
+    def test_frames_csi_parameters_intermediates_and_final(self):
+        parser = terminals.EscapeSequenceParser()
+        parser.begin()
+        result = None
+        for byte in b"[12;34 A":
+            result = parser.feed(byte)
+
+        self.assertEqual(
+            result,
+            terminals.EscapeParseResult(
+                sequence=terminals.ControlSequence(
+                    introducer="CSI",
+                    parameters=b"12;34",
+                    intermediates=b" ",
+                    final=ord("A"),
+                    raw=b"\x1b[12;34 A",
+                ),
+            ),
+        )
+        self.assertFalse(parser.active)
+
+    def test_frames_ss3(self):
+        parser = terminals.EscapeSequenceParser()
+        parser.begin()
+
+        self.assertIsNone(parser.feed(ord("O")))
+        result = parser.feed(ord("D"))
+
+        self.assertEqual(
+            result.sequence,
+            terminals.ControlSequence(
+                introducer="SS3",
+                parameters=b"",
+                intermediates=b"",
+                final=ord("D"),
+                raw=b"\x1bOD",
+            ),
+        )
+
+    def test_oversized_sequence_stays_bounded_until_final(self):
+        parser = terminals.EscapeSequenceParser(max_bytes=8)
+        parser.begin()
+        for byte in b"[" + b"1" * 20:
+            parser.feed(byte)
+
+        self.assertEqual(parser.state, "discard")
+        self.assertLessEqual(len(parser.raw), parser.max_bytes)
+        self.assertIsNone(parser.feed(ord("A")))
+        self.assertFalse(parser.active)
+
+    def test_malformed_csi_discards_through_final(self):
+        parser = terminals.EscapeSequenceParser()
+        parser.begin()
+        for byte in b"[1 23":
+            parser.feed(byte)
+
+        self.assertEqual(parser.state, "discard")
+        self.assertIsNone(parser.feed(ord("A")))
+        self.assertFalse(parser.active)
 
 
 class AsyncKeyReaderTests(unittest.TestCase):
@@ -537,6 +611,50 @@ class AsyncKeyReaderTests(unittest.TestCase):
         self.assertEqual(feed_bytes(reader, b"\x1b[5~"), [terminals.KeyEvent("PAGE_UP")])
         self.assertEqual(feed_bytes(reader, b"\x1b[6~"), [terminals.KeyEvent("PAGE_DOWN")])
 
+    def test_decodes_ss3_navigation_sequences(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bOA"),
+            [terminals.KeyEvent("CURSOR_UP")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bOB"),
+            [terminals.KeyEvent("CURSOR_DOWN")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bOC"),
+            [terminals.KeyEvent("CURSOR_RIGHT")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bOD"),
+            [terminals.KeyEvent("CURSOR_LEFT")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bOH"),
+            [terminals.KeyEvent("HOME")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bOF"),
+            [terminals.KeyEvent("END")],
+        )
+
+    def test_decodes_structured_csi_modifiers(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[1;5D\x1b[1;5C"),
+            [
+                terminals.KeyEvent("CURSOR_WORD_LEFT"),
+                terminals.KeyEvent("CURSOR_WORD_RIGHT"),
+            ],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[1;2Z"),
+            [terminals.KeyEvent("MODE_CYCLE")],
+        )
+        self.assertTrue(reader.mode_cycle_requested)
+
     def test_cpr_requires_exact_two_numeric_parameters(self):
         reader = terminals.AsyncKeyReader(fd=0)
 
@@ -610,11 +728,123 @@ class AsyncKeyReaderTests(unittest.TestCase):
             ],
         )
 
-    def test_unknown_short_escape_sequence_is_ignored(self):
+    def test_unknown_legacy_meta_prefix_preserves_graphic_text(self):
         reader = terminals.AsyncKeyReader(fd=0)
 
-        self.assertEqual(feed_bytes(reader, b"\x1bX"), [])
-        self.assertEqual(reader.escape, bytearray())
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bX"),
+            [terminals.KeyEvent("TEXT", "X")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b\xc3\xa9"),
+            [terminals.KeyEvent("TEXT", "\u00e9")],
+        )
+        self.assertFalse(reader.escape_parser.active)
+
+    def test_unknown_legacy_meta_prefix_does_not_swallow_interrupt(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b\x03"),
+            [terminals.KeyEvent("CTRL_C")],
+        )
+        self.assertTrue(reader.cancel_requested)
+
+    def test_unknown_csi_is_discarded_atomically(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[5Ax"),
+            [terminals.KeyEvent("TEXT", "x")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[1;2;3;4ty"),
+            [terminals.KeyEvent("TEXT", "y")],
+        )
+
+    def test_malformed_and_oversized_csi_discard_until_final(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        malformed = b"\x1b[1 23Az"
+        self.assertEqual(
+            feed_bytes(reader, malformed),
+            [terminals.KeyEvent("TEXT", "z")],
+        )
+
+        oversized = (
+            b"\x1b["
+            + b"1" * terminals.MAX_KEY_SEQUENCE_BYTES
+            + b"Aw"
+        )
+        self.assertEqual(
+            feed_bytes(reader, oversized),
+            [terminals.KeyEvent("TEXT", "w")],
+        )
+
+    def test_malformed_ss3_discards_until_final(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x1bO12Aq"),
+            [terminals.KeyEvent("TEXT", "q")],
+        )
+
+    def test_decodes_kitty_csi_u_control_actions(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[99;5u"),
+            [terminals.KeyEvent("CTRL_C")],
+        )
+        self.assertTrue(reader.cancel_requested)
+        self.assertTrue(reader.cancel_event.is_set())
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[119;6u"),
+            [terminals.KeyEvent("BACKSPACE_WORD")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[9;2u"),
+            [terminals.KeyEvent("MODE_CYCLE")],
+        )
+
+    def test_kitty_csi_u_uses_configured_interrupt_character(self):
+        attrs = self.tty_attrs(interrupt=b"\x18")
+        with (
+            mock.patch.object(
+                terminals.termios, "tcgetattr", return_value=attrs),
+            mock.patch.object(
+                terminals.os, "fpathconf", return_value=0xff),
+        ):
+            reader = terminals.AsyncKeyReader(fd=123)
+
+        self.assertEqual(feed_bytes(reader, b"\x1b[99;5u"), [])
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[120;5u"),
+            [terminals.KeyEvent("CTRL_C")],
+        )
+
+    def test_decodes_kitty_text_repeat_and_ignores_release(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[97;2;65u"),
+            [terminals.KeyEvent("TEXT", "A")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[97;1:2;97u"),
+            [terminals.KeyEvent("TEXT", "a")],
+        )
+        self.assertEqual(
+            feed_bytes(reader, b"\x1b[97;1:3;97u"),
+            [],
+        )
+
+    def test_invalid_kitty_csi_u_is_discarded(self):
+        reader = terminals.AsyncKeyReader(fd=0)
+
+        self.assertEqual(feed_bytes(reader, b"\x1b[97;0u"), [])
+        self.assertEqual(feed_bytes(reader, b"\x1b[97;1:4u"), [])
+        self.assertEqual(feed_bytes(reader, b"\x1b[97;1;3u"), [])
 
     def test_read_key_returns_eof_for_empty_chunk_without_pending_events(self):
         class EmptyByteReader:

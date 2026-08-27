@@ -4,11 +4,11 @@ import collections
 import contextlib
 import fcntl
 import os
-import re
 import signal
 import sys
 import termios
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import IntEnum, IntFlag
 
 
 STATUS_COLOR = 4
@@ -837,22 +837,6 @@ def terminal_control_bytes(fd: int):
     return backspace_bytes, backspace_word_bytes, interrupt_bytes
 
 
-KEY_SEQUENCES = {
-    b'\x1b[A': "CURSOR_UP",
-    b'\x1b[B': "CURSOR_DOWN",
-    b'\x1b[C': "CURSOR_RIGHT",
-    b'\x1b[D': "CURSOR_LEFT",
-    b'\x1b[H': "HOME",
-    b'\x1b[F': "END",
-    b'\x1b[3~': "DELETE",
-    b'\x1b[5~': "PAGE_UP",
-    b'\x1b[6~': "PAGE_DOWN",
-    PASTE_START_SEQUENCE: "PASTE_START",
-    PASTE_END_SEQUENCE: "PASTE_END",
-    b'\x1b[1;5D': 'CURSOR_WORD_LEFT',
-    b'\x1b[1;5C': 'CURSOR_WORD_RIGHT',
-    b'\x1b[Z': 'MODE_CYCLE',
-}
 TERMINFO_KEY_CAPABILITIES = (
     ("kcuu1", "CURSOR_UP"),
     ("kcud1", "CURSOR_DOWN"),
@@ -868,8 +852,63 @@ TERMINFO_KEY_CAPABILITIES = (
     ("kcbt", "MODE_CYCLE"),
 )
 MAX_KEY_SEQUENCE_BYTES = 32
-CSI_FINAL_BYTES = set(range(0x40, 0x7f))
+CSI_PARAMETER_MIN = 0x30
+CSI_PARAMETER_MAX = 0x3f
+CSI_INTERMEDIATE_MIN = 0x20
+CSI_INTERMEDIATE_MAX = 0x2f
+CSI_FINAL_MIN = 0x40
+CSI_FINAL_MAX = 0x7e
 KEY_READER_WAKE = object()
+
+
+class KittyModifier(IntFlag):
+    SHIFT = 1
+    ALT = 2
+    CTRL = 4
+    SUPER = 8
+    HYPER = 16
+    META = 32
+    CAPS_LOCK = 64
+    NUM_LOCK = 128
+
+
+KITTY_LOCK_MODIFIERS = (
+    KittyModifier.CAPS_LOCK | KittyModifier.NUM_LOCK)
+KITTY_ALL_MODIFIERS = (
+    KittyModifier.SHIFT
+    | KittyModifier.ALT
+    | KittyModifier.CTRL
+    | KittyModifier.SUPER
+    | KittyModifier.HYPER
+    | KittyModifier.META
+    | KittyModifier.CAPS_LOCK
+    | KittyModifier.NUM_LOCK
+)
+
+
+class KittyEventType(IntEnum):
+    """Wire values from Kitty's modifiers:event-type field."""
+
+    PRESS = 1
+    REPEAT = 2
+    RELEASE = 3
+
+
+class KittyKeyCode(IntEnum):
+    TAB = 9
+    ENTER = 13
+    ESCAPE = 27
+    BACKSPACE = 127
+    KP_ENTER = 57414
+    KP_LEFT = 57417
+    KP_RIGHT = 57418
+    KP_UP = 57419
+    KP_DOWN = 57420
+    KP_PAGE_UP = 57421
+    KP_PAGE_DOWN = 57422
+    KP_HOME = 57423
+    KP_END = 57424
+    KP_DELETE = 57426
 
 
 def terminfo_key_sequences(output_fd=None):
@@ -900,12 +939,439 @@ def terminfo_key_sequences(output_fd=None):
     return sequences
 
 
-def _sequence_prefixes(sequences):
+@dataclass(frozen=True)
+class ControlSequence:
+    introducer: str
+    parameters: bytes
+    intermediates: bytes
+    final: int
+    raw: bytes
+
+
+@dataclass(frozen=True)
+class EscapeParseResult:
+    sequence: ControlSequence | None = None
+    replay: bytes = b""
+
+
+@dataclass
+class EscapeSequenceParser:
+    """Frame bounded ESC-prefixed terminal input without timing guesses."""
+
+    exact_sequences: frozenset[bytes] = frozenset()
+    max_bytes: int = MAX_KEY_SEQUENCE_BYTES
+    state: str = field(default="ground", init=False)
+    raw: bytearray = field(default_factory=bytearray, init=False)
+    parameters: bytearray = field(default_factory=bytearray, init=False)
+    intermediates: bytearray = field(default_factory=bytearray, init=False)
+    exact_prefixes: frozenset[bytes] = field(init=False)
+
+    def __post_init__(self):
+        self.exact_sequences = frozenset(self.exact_sequences)
+        self.exact_prefixes = frozenset(
+            sequence[:length]
+            for sequence in self.exact_sequences
+            for length in range(2, len(sequence))
+        )
+
+    @property
+    def active(self):
+        return self.state != "ground"
+
+    def begin(self):
+        self._reset()
+        self.state = "escape"
+        self.raw.append(0x1b)
+
+    def _reset(self):
+        self.state = "ground"
+        self.raw.clear()
+        self.parameters.clear()
+        self.intermediates.clear()
+
+    @staticmethod
+    def _is_final(byte):
+        return CSI_FINAL_MIN <= byte <= CSI_FINAL_MAX
+
+    def _discard(self, byte):
+        # Once framing is invalid, retain no attacker-controlled payload.
+        # A final byte still terminates the malformed sequence atomically.
+        self.raw.clear()
+        self.parameters.clear()
+        self.intermediates.clear()
+        if self._is_final(byte):
+            self.state = "ground"
+        else:
+            self.state = "discard"
+
+    def _complete(self, introducer):
+        sequence = ControlSequence(
+            introducer=introducer,
+            parameters=bytes(self.parameters),
+            intermediates=bytes(self.intermediates),
+            final=self.raw[-1],
+            raw=bytes(self.raw),
+        )
+        self._reset()
+        return EscapeParseResult(sequence=sequence)
+
+    def feed(self, byte):
+        if not self.active:
+            raise RuntimeError("escape parser is not active")
+
+        if self.state == "discard":
+            if self._is_final(byte):
+                self._reset()
+            return None
+
+        if len(self.raw) >= self.max_bytes:
+            self._discard(byte)
+            return None
+        self.raw.append(byte)
+        raw = bytes(self.raw)
+
+        if self.state == "escape":
+            if byte == 0x1b:
+                # With no timeout, another ESC is the only unambiguous way to
+                # restart an otherwise standalone Escape prefix.
+                self.raw[:] = b"\x1b"
+                return None
+            if byte == ord("["):
+                self.state = "csi_parameters"
+                return None
+            if byte == ord("O"):
+                self.state = "ss3"
+                return None
+            if raw in self.exact_sequences:
+                return self._complete("TERMINFO")
+            if raw in self.exact_prefixes:
+                self.state = "terminfo"
+                return None
+
+            replay = bytes((byte,))
+            self._reset()
+            return EscapeParseResult(replay=replay)
+
+        if self.state == "terminfo":
+            if raw in self.exact_sequences:
+                return self._complete("TERMINFO")
+            if raw in self.exact_prefixes:
+                return None
+
+            replay = raw[1:]
+            self._reset()
+            return EscapeParseResult(replay=replay)
+
+        if self.state == "ss3":
+            if self._is_final(byte):
+                return self._complete("SS3")
+            self._discard(byte)
+            return None
+
+        if CSI_PARAMETER_MIN <= byte <= CSI_PARAMETER_MAX:
+            if self.state != "csi_parameters":
+                self._discard(byte)
+                return None
+            self.parameters.append(byte)
+            return None
+        if CSI_INTERMEDIATE_MIN <= byte <= CSI_INTERMEDIATE_MAX:
+            self.state = "csi_intermediates"
+            self.intermediates.append(byte)
+            return None
+        if self._is_final(byte):
+            return self._complete("CSI")
+
+        self._discard(byte)
+        return None
+
+
+@dataclass(frozen=True)
+class KittyKey:
+    code: int
+    shifted_code: int | None
+    base_layout_code: int | None
+    modifiers: KittyModifier
+    event_type: KittyEventType
+    text: tuple[int, ...] | None
+
+
+def _numeric_parameter_fields(parameters):
+    if not parameters:
+        return ()
+    if any(
+            not (
+                ord("0") <= byte <= ord("9")
+                or byte in (ord(";"), ord(":"))
+            )
+            for byte in parameters):
+        return None
+
+    fields = []
+    for field_bytes in parameters.split(b";"):
+        subfields = []
+        for value in field_bytes.split(b":"):
+            subfields.append(None if not value else int(value))
+        fields.append(tuple(subfields))
+    return tuple(fields)
+
+
+def _modifier_field(field):
+    if not 1 <= len(field) <= 2:
+        return None
+    # Kitty adds one to the modifier bit field, so wire value 1 means that
+    # no modifier is active. The optional colon subfield is the event type.
+    encoded_modifiers = 1 if field[0] is None else field[0]
+    event_value = (
+        KittyEventType.PRESS
+        if len(field) == 1 or field[1] is None
+        else field[1]
+    )
+    if not 1 <= encoded_modifiers <= int(KITTY_ALL_MODIFIERS) + 1:
+        return None
+    try:
+        event_type = KittyEventType(event_value)
+    except ValueError:
+        return None
+    return KittyModifier(encoded_modifiers - 1), event_type
+
+
+def _functional_parameters(parameters):
+    """Decode Kitty's CSI 1;modifier:event functional-key prefix."""
+    fields = _numeric_parameter_fields(parameters)
+    if fields is None:
+        return None
+    if not fields:
+        return KittyModifier(0), KittyEventType.PRESS
+    if fields == ((1,),):
+        return KittyModifier(0), KittyEventType.PRESS
+    if len(fields) != 2 or fields[0] != (1,):
+        return None
+    return _modifier_field(fields[1])
+
+
+def _tilde_parameters(parameters):
+    fields = _numeric_parameter_fields(parameters)
+    if fields is None or not 1 <= len(fields) <= 2:
+        return None
+    if len(fields[0]) != 1 or fields[0][0] is None:
+        return None
+    if len(fields) == 1:
+        modifiers = KittyModifier(0)
+        event_type = KittyEventType.PRESS
+    else:
+        decoded = _modifier_field(fields[1])
+        if decoded is None:
+            return None
+        modifiers, event_type = decoded
+    return fields[0][0], modifiers, event_type
+
+
+def _unicode_scalar(code):
+    return (
+        isinstance(code, int)
+        and 0 <= code <= 0x10ffff
+        and not 0xd800 <= code <= 0xdfff
+    )
+
+
+def _kitty_text_scalar(code):
+    return (
+        _unicode_scalar(code)
+        and code >= 0x20
+        and not 0x7f <= code <= 0x9f
+    )
+
+
+def parse_kitty_key(sequence):
+    if (
+            sequence.introducer != "CSI"
+            or sequence.final != ord("u")
+            or sequence.intermediates):
+        return None
+
+    fields = _numeric_parameter_fields(sequence.parameters)
+    if fields is None or not 1 <= len(fields) <= 3:
+        return None
+
+    key_field = fields[0]
+    if (
+            not 1 <= len(key_field) <= 3
+            or key_field[0] is None
+            or not _unicode_scalar(key_field[0])):
+        return None
+    alternate_codes = list(key_field[1:]) + [None, None]
+    shifted_code, base_layout_code = alternate_codes[:2]
+    if (
+            shifted_code is not None
+            and not _unicode_scalar(shifted_code)):
+        return None
+    if (
+            base_layout_code is not None
+            and not _unicode_scalar(base_layout_code)):
+        return None
+
+    modifiers = KittyModifier(0)
+    event_type = KittyEventType.PRESS
+    if len(fields) >= 2:
+        decoded = _modifier_field(fields[1])
+        if decoded is None:
+            return None
+        modifiers, event_type = decoded
+
+    text = None
+    if len(fields) == 3:
+        if not fields[2] or any(
+                code is None or not _kitty_text_scalar(code)
+                for code in fields[2]):
+            return None
+        text = tuple(fields[2])
+
+    return KittyKey(
+        code=key_field[0],
+        shifted_code=shifted_code,
+        base_layout_code=base_layout_code,
+        modifiers=modifiers,
+        event_type=event_type,
+        text=text,
+    )
+
+
+CSI_FINAL_KEY_KINDS = {
+    ord("A"): "CURSOR_UP",
+    ord("B"): "CURSOR_DOWN",
+    ord("C"): "CURSOR_RIGHT",
+    ord("D"): "CURSOR_LEFT",
+    ord("H"): "HOME",
+    ord("F"): "END",
+}
+CSI_TILDE_KEY_KINDS = {
+    3: "DELETE",
+    5: "PAGE_UP",
+    6: "PAGE_DOWN",
+    7: "HOME",
+    8: "END",
+}
+KITTY_KEYPAD_KEY_KINDS = {
+    KittyKeyCode.KP_ENTER: "ENTER",
+    KittyKeyCode.KP_LEFT: "CURSOR_LEFT",
+    KittyKeyCode.KP_RIGHT: "CURSOR_RIGHT",
+    KittyKeyCode.KP_UP: "CURSOR_UP",
+    KittyKeyCode.KP_DOWN: "CURSOR_DOWN",
+    KittyKeyCode.KP_PAGE_UP: "PAGE_UP",
+    KittyKeyCode.KP_PAGE_DOWN: "PAGE_DOWN",
+    KittyKeyCode.KP_HOME: "HOME",
+    KittyKeyCode.KP_END: "END",
+    KittyKeyCode.KP_DELETE: "DELETE",
+}
+
+
+def decode_legacy_control_sequence(sequence):
+    """Return (recognized, event) for Loki's supported CSI/SS3 keys."""
+    if sequence.introducer == "SS3":
+        kind = CSI_FINAL_KEY_KINDS.get(sequence.final)
+        return (kind is not None, KeyEvent(kind) if kind else None)
+    if sequence.introducer != "CSI" or sequence.intermediates:
+        return False, None
+
+    if sequence.final in CSI_FINAL_KEY_KINDS:
+        decoded = _functional_parameters(sequence.parameters)
+        if decoded is None:
+            return False, None
+        modifiers, event_type = decoded
+        modifiers &= ~KITTY_LOCK_MODIFIERS
+        if event_type == KittyEventType.RELEASE:
+            return True, None
+
+        kind = CSI_FINAL_KEY_KINDS[sequence.final]
+        if not modifiers:
+            return True, KeyEvent(kind)
+        if (
+                modifiers == KittyModifier.CTRL
+                and kind == "CURSOR_LEFT"):
+            return True, KeyEvent("CURSOR_WORD_LEFT")
+        if (
+                modifiers == KittyModifier.CTRL
+                and kind == "CURSOR_RIGHT"):
+            return True, KeyEvent("CURSOR_WORD_RIGHT")
+        return True, None
+
+    if sequence.final == ord("~"):
+        decoded = _tilde_parameters(sequence.parameters)
+        if decoded is None:
+            return False, None
+        number, modifiers, event_type = decoded
+        if (
+                number in (200, 201)
+                and not modifiers
+                and event_type == KittyEventType.PRESS):
+            kind = "PASTE_START" if number == 200 else "PASTE_END"
+            return True, KeyEvent(kind)
+
+        kind = CSI_TILDE_KEY_KINDS.get(number)
+        if kind is None:
+            return False, None
+        modifiers &= ~KITTY_LOCK_MODIFIERS
+        if event_type == KittyEventType.RELEASE or modifiers:
+            return True, None
+        return True, KeyEvent(kind)
+
+    if sequence.final == ord("Z"):
+        decoded = _functional_parameters(sequence.parameters)
+        if decoded is None:
+            return False, None
+        modifiers, event_type = decoded
+        modifiers &= ~KITTY_LOCK_MODIFIERS
+        # CSI Z is the historical no-parameter form. Kitty's structured form
+        # spells the same Shift-Tab key as CSI 1;2 Z.
+        if not sequence.parameters:
+            modifiers = KittyModifier.SHIFT
+        if (
+                event_type == KittyEventType.RELEASE
+                or modifiers != KittyModifier.SHIFT):
+            return True, None
+        return True, KeyEvent("MODE_CYCLE")
+
+    if sequence.final == ord("R"):
+        fields = _numeric_parameter_fields(sequence.parameters)
+        if (
+                fields is not None
+                and len(fields) == 2
+                and all(
+                    len(field) == 1 and field[0] is not None
+                    for field in fields
+                )):
+            return True, KeyEvent(
+                "CPR", sequence.raw.decode("ascii"))
+        # Never reinterpret an ambiguous CSI R as a function key.
+        return True, None
+
+    return False, None
+
+
+def _kitty_control_byte(code):
+    if ord("a") <= code <= ord("z"):
+        return code - ord("a") + 1
+    if ord("A") <= code <= ord("Z"):
+        return code - ord("A") + 1
     return {
-        sequence[:length]
-        for sequence in sequences
-        for length in range(1, len(sequence))
-    }
+        ord(" "): 0,
+        ord("2"): 0,
+        ord("@"): 0,
+        ord("3"): 27,
+        ord("["): 27,
+        ord("4"): 28,
+        ord("\\"): 28,
+        ord("5"): 29,
+        ord("]"): 29,
+        ord("6"): 30,
+        ord("^"): 30,
+        ord("~"): 30,
+        ord("7"): 31,
+        ord("/"): 31,
+        ord("_"): 31,
+        ord("8"): 127,
+        ord("?"): 127,
+    }.get(code)
 
 
 class AsyncKeyReader:
@@ -918,15 +1384,14 @@ class AsyncKeyReader:
             self.backspace_word_bytes,
             self.interrupt_bytes,
         ) = terminal_control_bytes(fd)
-        self.key_sequences = dict(KEY_SEQUENCES)
+        self.key_sequences = {}
         if use_terminfo:
-            for sequence, kind in terminfo_key_sequences(output_fd).items():
-                self.key_sequences.setdefault(sequence, kind)
-        self.key_sequence_prefixes = _sequence_prefixes(self.key_sequences)
+            self.key_sequences.update(terminfo_key_sequences(output_fd))
+        self.escape_parser = EscapeSequenceParser(
+            frozenset(self.key_sequences))
         self.byte_reader = AsyncByteReader(fd)
         self.pending = collections.deque()
         self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
-        self.escape = bytearray()
         self.paste_mode = False
         self.paste_bytes = bytearray()
         self.eof = False
@@ -1008,6 +1473,126 @@ class AsyncKeyReader:
             self.pending.append(KeyEvent("TEXT", text))
         self.pending.append(KeyEvent("PASTE_END"))
 
+    def _queue_event(self, event):
+        if event.kind == "PASTE_START":
+            self.paste_mode = True
+            self.paste_bytes.clear()
+        elif event.kind == "MODE_CYCLE":
+            self.mode_cycle_requested = True
+        elif event.kind == "CTRL_C":
+            self.cancel_requested = True
+            self.cancel_event.set()
+        self.pending.append(event)
+
+    def _feed_plain_byte(self, byte):
+        if byte in self.interrupt_bytes:
+            self._queue_event(KeyEvent("CTRL_C"))
+        elif byte == 0x04:
+            self._queue_event(KeyEvent("CTRL_D"))
+        elif byte in (0x0a, 0x0d):
+            self._queue_event(KeyEvent("ENTER"))
+        elif byte in self.backspace_bytes:
+            self._queue_event(KeyEvent("BACKSPACE"))
+        elif byte in self.backspace_word_bytes:
+            self._queue_event(KeyEvent("BACKSPACE_WORD"))
+        else:
+            self._emit_text_byte(byte)
+
+    def _kitty_control_is_supported(self, byte):
+        return (
+            byte in self.interrupt_bytes
+            or byte == 0x04
+            or byte in (0x09, 0x0a, 0x0d)
+            or byte in self.backspace_bytes
+            or byte in self.backspace_word_bytes
+        )
+
+    def _handle_kitty_key(self, key):
+        if key.event_type == KittyEventType.RELEASE:
+            return
+        if key.text is not None:
+            self._queue_event(KeyEvent(
+                "TEXT", "".join(chr(code) for code in key.text)))
+            return
+
+        modifiers = key.modifiers & ~KITTY_LOCK_MODIFIERS
+        if (
+                modifiers & KittyModifier.CTRL
+                and not modifiers & ~(
+                    KittyModifier.CTRL | KittyModifier.SHIFT)):
+            for code in (key.code, key.base_layout_code):
+                if code is None:
+                    continue
+                byte = _kitty_control_byte(code)
+                if (
+                        byte is not None
+                        and self._kitty_control_is_supported(byte)):
+                    self._feed_plain_byte(byte)
+                    return
+
+        kind = KITTY_KEYPAD_KEY_KINDS.get(key.code)
+        if kind is not None:
+            if not modifiers:
+                self._queue_event(KeyEvent(kind))
+            elif (
+                    modifiers == KittyModifier.CTRL
+                    and kind == "CURSOR_LEFT"):
+                self._queue_event(KeyEvent("CURSOR_WORD_LEFT"))
+            elif (
+                    modifiers == KittyModifier.CTRL
+                    and kind == "CURSOR_RIGHT"):
+                self._queue_event(KeyEvent("CURSOR_WORD_RIGHT"))
+            return
+
+        if key.code == KittyKeyCode.ENTER and not modifiers:
+            self._queue_event(KeyEvent("ENTER"))
+            return
+        if key.code == KittyKeyCode.BACKSPACE and not modifiers:
+            self._queue_event(KeyEvent("BACKSPACE"))
+            return
+        if key.code == KittyKeyCode.TAB:
+            if not modifiers:
+                self._queue_event(KeyEvent("TEXT", "\t"))
+            elif modifiers == KittyModifier.SHIFT:
+                self._queue_event(KeyEvent("MODE_CYCLE"))
+            return
+
+        text_code = None
+        if modifiers in (KittyModifier(0), KittyModifier.ALT):
+            text_code = key.code
+        elif modifiers in (
+                KittyModifier.SHIFT,
+                KittyModifier.SHIFT | KittyModifier.ALT):
+            text_code = key.shifted_code
+            if (
+                    text_code is None
+                    and ord("a") <= key.code <= ord("z")):
+                text_code = ord(chr(key.code).upper())
+        if (
+                text_code is not None
+                and not 57344 <= text_code <= 63743
+                and _kitty_text_scalar(text_code)):
+            self._queue_event(KeyEvent("TEXT", chr(text_code)))
+
+    def _handle_control_sequence(self, sequence):
+        if sequence.introducer != "TERMINFO":
+            recognized, event = decode_legacy_control_sequence(sequence)
+            if recognized:
+                if event is not None:
+                    self._queue_event(event)
+                return
+            if (
+                    sequence.introducer == "CSI"
+                    and sequence.final == ord("u")):
+                key = parse_kitty_key(sequence)
+                if key is not None:
+                    self._handle_kitty_key(key)
+                return
+
+        kind = self.key_sequences.get(sequence.raw)
+        if kind is not None:
+            self._queue_event(KeyEvent(kind))
+
     def _feed_byte(self, byte: int):
         if self.paste_mode:
             self.paste_bytes.append(byte)
@@ -1016,64 +1601,21 @@ class AsyncKeyReader:
                 self._finish_paste()
             return
 
-        if self.escape:
-            self.escape.append(byte)
-            sequence = bytes(self.escape)
-            kind = self.key_sequences.get(sequence)
-            if kind is not None:
-                self.escape.clear()
-                if kind == "PASTE_START":
-                    self.paste_mode = True
-                    self.paste_bytes.clear()
-                    self.pending.append(KeyEvent(kind))
-                elif kind == "MODE_CYCLE":
-                    self.mode_cycle_requested = True
-                    self.pending.append(KeyEvent(kind))
-                else:
-                    self.pending.append(KeyEvent(kind))
+        if self.escape_parser.active:
+            result = self.escape_parser.feed(byte)
+            if result is None:
                 return
-            if sequence in self.key_sequence_prefixes:
-                return
-            if sequence.startswith(b'\x1b[') and byte in CSI_FINAL_BYTES:
-                self.escape.clear()
-
-                if byte == 0x52: # 0x52 is 'R'
-                    # Only consume the exact two-parameter CPR reply that Loki
-                    # asked for with DSR 6. Other CSI ... R sequences are not
-                    # treated as cursor position guesses.
-                    if re.match(br'^\x1b\[\d+;\d+R$', sequence):
-                        self.pending.append(KeyEvent("CPR", sequence.decode('ascii')))
-                        return
-
-                return
-            if len(self.escape) == 2 and not sequence.startswith(b'\x1b['):
-                self.escape.clear()
-                return
-            if len(self.escape) > MAX_KEY_SEQUENCE_BYTES:
-                # Unsupported escape sequences should not leave the input
-                # parser stuck forever waiting for a final byte.
-                self.escape.clear()
+            if result.sequence is not None:
+                self._handle_control_sequence(result.sequence)
+            else:
+                for replay_byte in result.replay:
+                    self._feed_byte(replay_byte)
             return
 
         if byte == 0x1b:
-            self.escape.append(byte)
-        elif byte in self.interrupt_bytes:
-            self.cancel_requested = True
-            self.cancel_event.set()
-            self.pending.append(KeyEvent("CTRL_C"))
-        elif byte == 0x04:
-            self.pending.append(KeyEvent("CTRL_D"))
-        elif byte in [0x0a, 0x0d]:
-            if self.paste_mode:
-                self.pending.append(KeyEvent("TEXT", "\n"))
-            else:
-                self.pending.append(KeyEvent("ENTER"))
-        elif byte in self.backspace_bytes:
-            self.pending.append(KeyEvent("BACKSPACE"))
-        elif byte in self.backspace_word_bytes:
-            self.pending.append(KeyEvent("BACKSPACE_WORD"))
+            self.escape_parser.begin()
         else:
-            self._emit_text_byte(byte)
+            self._feed_plain_byte(byte)
 
     async def read_key(self) -> KeyEvent:
         while True:
