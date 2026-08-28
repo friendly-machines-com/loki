@@ -8,7 +8,12 @@ from loki_agent.connections import (
     ConnectionDescriptor,
     ConnectionDescriptorError,
 )
-from loki_agent.credentials import CredentialStore, is_credential_name
+from loki_agent.credentials import (
+    CredentialScrubError,
+    CredentialStore,
+    _validate_entries_in_range,
+    is_credential_name,
+)
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +67,16 @@ class CredentialStoreTests(unittest.TestCase):
             store.first_available(["SECOND_TOKEN", "FIRST_KEY"]),
             ("SECOND_TOKEN", "two"),
         )
+
+    def test_native_entry_range_validation_includes_terminating_nul(self):
+        matches = {"EXAMPLE_TOKEN": [(100, 20, 14)]}
+
+        _validate_entries_in_range(matches, 100, 121)
+
+        for low, high in [(101, 121), (100, 120)]:
+            with self.subTest(low=low, high=high):
+                with self.assertRaises(CredentialScrubError):
+                    _validate_entries_in_range(matches, low, high)
 
     @unittest.skipUnless(
         sys.platform.startswith("linux"), "Linux /proc environment semantics")
@@ -140,6 +155,98 @@ print(json.dumps({
         )
         self.assertEqual(result["spawned"], "missing")
         self.assertEqual(result["forked"], "missing")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin", "Darwin KERN_PROCARGS2 semantics")
+    def test_process_capture_scrubs_darwin_procargs_environment(self):
+        code = r'''
+import ctypes
+import json
+import os
+import subprocess
+import sys
+
+from loki_agent.credentials import capture_process_credentials
+
+
+def process_arguments():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.sysctl.argtypes = (
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    )
+    libc.sysctl.restype = ctypes.c_int
+    mib = (ctypes.c_int * 3)(1, 49, os.getpid())
+    size = ctypes.c_size_t(os.sysconf("SC_ARG_MAX"))
+    buffer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return buffer.raw[:size.value]
+
+
+store = capture_process_credentials()
+libc = ctypes.CDLL(None)
+libc.getenv.argtypes = (ctypes.c_char_p,)
+libc.getenv.restype = ctypes.c_char_p
+raw = process_arguments()
+filler = b"x" * len(b"LOKI_TEST_TOKEN=top-secret")
+child_code = (
+    "import os; "
+    "print(os.environ.get('LOKI_TEST_TOKEN', 'missing'))"
+)
+spawned = subprocess.check_output(
+    [sys.executable, "-c", child_code],
+    text=True,
+).strip()
+print(json.dumps({
+    "stored": store.get("LOKI_TEST_TOKEN"),
+    "bootstrap": store.startup_environment().get("LOKI_TEST_TOKEN"),
+    "python_has_secret": "LOKI_TEST_TOKEN" in os.environ,
+    "native_secret": libc.getenv(b"LOKI_TEST_TOKEN") is not None,
+    "native_after": libc.getenv(b"LOKI_TEST_AFTER") == b"after",
+    "raw_has_name": b"LOKI_TEST_TOKEN=" in raw,
+    "raw_has_value": b"top-secret" in raw,
+    "filler_offset": raw.find(filler + b"\0"),
+    "after_offset": raw.find(b"LOKI_TEST_AFTER=after\0"),
+    "spawned": spawned,
+}))
+'''
+        env = {
+            "PYTHONPATH": ROOT,
+            "LOKI_TEST_BEFORE": "before",
+            "LOKI_TEST_TOKEN": "top-secret",
+            "LOKI_TEST_AFTER": "after",
+        }
+
+        process = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        result = json.loads(process.stdout)
+        self.assertEqual(result["stored"], "top-secret")
+        self.assertEqual(result["bootstrap"], "top-secret")
+        self.assertFalse(result["python_has_secret"])
+        self.assertFalse(result["native_secret"])
+        self.assertTrue(result["native_after"])
+        self.assertFalse(result["raw_has_name"])
+        self.assertFalse(result["raw_has_value"])
+        self.assertGreaterEqual(result["filler_offset"], 0)
+        self.assertGreater(
+            result["after_offset"],
+            result["filler_offset"],
+        )
+        self.assertEqual(result["spawned"], "missing")
 
     @unittest.skipUnless(
         sys.platform.startswith("linux"), "Linux /proc environment semantics")

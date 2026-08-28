@@ -68,16 +68,97 @@ class CredentialScrubError(RuntimeError):
 _PROCESS_CREDENTIALS: CredentialStore | None = None
 
 
+def _native_environ(libc: ctypes.CDLL):
+    """Return the platform's live ``char **environ`` pointer."""
+    environ_type = ctypes.POINTER(ctypes.c_void_p)
+    try:
+        if sys.platform == "darwin":
+            # Darwin documents _NSGetEnviron() in environ(7) for programs
+            # which cannot safely refer to the environ symbol directly.
+            get_environ = libc._NSGetEnviron
+            get_environ.argtypes = ()
+            get_environ.restype = ctypes.POINTER(environ_type)
+            environ_pointer = get_environ()
+            if not environ_pointer or not environ_pointer[0]:
+                raise CredentialScrubError(
+                    "_NSGetEnviron() returned no process environment"
+                )
+            return environ_pointer[0]
+        return environ_type.in_dll(libc, "environ")
+    except (AttributeError, OSError, ValueError) as error:
+        raise CredentialScrubError(
+            f"could not access the native process environment: {error}"
+        ) from error
+
+
+def _darwin_main_stack_bounds(libc: ctypes.CDLL) -> tuple[int, int]:
+    """Return the original main-thread stack's low and high addresses."""
+    try:
+        pthread_main_np = libc.pthread_main_np
+        pthread_main_np.argtypes = ()
+        pthread_main_np.restype = ctypes.c_int
+        pthread_self = libc.pthread_self
+        pthread_self.argtypes = ()
+        pthread_self.restype = ctypes.c_void_p
+        pthread_get_stackaddr_np = libc.pthread_get_stackaddr_np
+        pthread_get_stackaddr_np.argtypes = (ctypes.c_void_p,)
+        pthread_get_stackaddr_np.restype = ctypes.c_void_p
+        pthread_get_stacksize_np = libc.pthread_get_stacksize_np
+        pthread_get_stacksize_np.argtypes = (ctypes.c_void_p,)
+        pthread_get_stacksize_np.restype = ctypes.c_size_t
+    except (AttributeError, OSError, ValueError) as error:
+        raise CredentialScrubError(
+            f"could not inspect the Darwin main-thread stack: {error}"
+        ) from error
+
+    if pthread_main_np() != 1:
+        raise CredentialScrubError(
+            "Darwin credential capture must run on the main thread"
+        )
+    thread = pthread_self()
+    stack_high = pthread_get_stackaddr_np(thread)
+    stack_size = int(pthread_get_stacksize_np(thread))
+    if not thread or not stack_high or stack_size <= 0:
+        raise CredentialScrubError(
+            "Darwin returned invalid main-thread stack bounds"
+        )
+    stack_high = int(stack_high)
+    stack_low = stack_high - stack_size
+    if stack_low < 0:
+        raise CredentialScrubError(
+            "Darwin returned invalid main-thread stack bounds"
+        )
+    return stack_low, stack_high
+
+
+def _validate_entries_in_range(
+        matches: dict[str, list[tuple[int, int, int]]],
+        low: int,
+        high: int,
+) -> None:
+    """Require every complete native string to lie within one address range."""
+    for name, entries in matches.items():
+        for address, length, _prefix_length in entries:
+            end = address + length + 1
+            if address < low or end > high or end <= address:
+                raise CredentialScrubError(
+                    f"credential variable {name} was not stored in the "
+                    "Darwin initial main-thread stack"
+                )
+
+
 def _native_credential_entries(
         names: list[str],
 ) -> dict[str, list[tuple[int, int, int]]]:
     """Preflight native ``environ`` entries without copying secret values."""
     try:
         libc = ctypes.CDLL(None)
-        environ = ctypes.POINTER(ctypes.c_void_p).in_dll(libc, "environ")
+        environ = _native_environ(libc)
         strlen = libc.strlen
         strlen.argtypes = (ctypes.c_void_p,)
         strlen.restype = ctypes.c_size_t
+    except CredentialScrubError:
+        raise
     except (AttributeError, OSError, ValueError) as error:
         raise CredentialScrubError(
             f"could not access the native process environment: {error}"
@@ -113,6 +194,9 @@ def _native_credential_entries(
             "credential variables were present in os.environ but absent "
             f"from native environ: {rendered}"
         )
+    if sys.platform == "darwin":
+        stack_low, stack_high = _darwin_main_stack_bounds(libc)
+        _validate_entries_in_range(matches, stack_low, stack_high)
     return matches
 
 
@@ -141,10 +225,11 @@ def _scrub_native_credentials(
     for name in names:
         del environ[name]
 
-    # These addresses are initial exec storage: unsetenv() removed pointers
-    # to them but did not unmap the strings.  Fill the retained NAME= bytes
-    # without touching the final NUL, so /proc/PID/environ remains a sequence
-    # of same-length, NUL-delimited records.
+    # On Linux these addresses are initial exec storage; on Darwin the
+    # preflight above proved that they are in the initial main-thread stack.
+    # unsetenv() removed pointers to them but did not free or unmap the
+    # strings.  Fill the retained NAME= bytes without touching the final NUL,
+    # preserving the same-length, NUL-delimited startup records.
     for entries in matches.values():
         for address, _length, prefix_length in entries:
             ctypes.memset(address, ord("x"), prefix_length)
@@ -154,9 +239,10 @@ def capture_process_credentials() -> CredentialStore:
     """Capture and scrub credentials once, at process startup.
 
     Linux exposes the initial exec environment through /proc/PID/environ even
-    after unsetenv().  On Linux, overwrite those original credential records
-    in place before continuing.  Other platforms retain the existing
-    os.environ/unsetenv behavior.
+    after unsetenv(), and Darwin's KERN_PROCARGS2 exposes the corresponding
+    initial stack region.  On both platforms, overwrite the original
+    credential records in place before continuing.  Other platforms retain
+    the existing os.environ/unsetenv behavior.
     """
     global _PROCESS_CREDENTIALS
     if _PROCESS_CREDENTIALS is not None:
@@ -164,7 +250,10 @@ def capture_process_credentials() -> CredentialStore:
 
     values = dict(os.environ)
     names = [name for name in os.environ if is_credential_name(name)]
-    if sys.platform.startswith("linux") and names:
+    if (
+            (sys.platform.startswith("linux") or sys.platform == "darwin")
+            and names
+    ):
         _scrub_native_credentials(os.environ, names)
         store = CredentialStore(values)
     else:
