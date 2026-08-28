@@ -14,6 +14,7 @@ import tempfile
 import unittest
 
 from loki_agent import acps
+from loki_agent.credentials import is_credential_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -280,6 +281,90 @@ class FrontWorkerTests(unittest.TestCase):
                           "sessionId": session_id,
                           "prompt": [{"type": "text", "text": "closed"}]}})
                 self.assertIn("error", recv_reply(5))
+            finally:
+                front.stdin.close()
+                try:
+                    front.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    front.kill()
+                    front.wait()
+
+    def test_front_passes_then_both_processes_scrub_worker_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                name: value
+                for name, value in self._front_env(tmpdir).items()
+                if not is_credential_name(name)
+            }
+            credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
+            credential_value = "secret-" + ("v" * 137)
+            env[credential_name] = credential_value
+            env["LOKI_ACP_AFTER"] = "visible"
+            record_length = len(
+                f"{credential_name}={credential_value}".encode("utf-8"))
+            filler = b"x" * record_length
+
+            front = subprocess.Popen(
+                [sys.executable, "-m", "loki_agent.acp_main"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=tmpdir,
+            )
+            self.addCleanup(_close_process_streams, front)
+            try:
+                def send(message):
+                    front.stdin.write(json.dumps(message) + "\n")
+                    front.stdin.flush()
+
+                def recv_reply(reply_id):
+                    while True:
+                        line = front.stdout.readline()
+                        self.assertTrue(line, "front produced no message")
+                        message = json.loads(line)
+                        if message.get("id") == reply_id:
+                            return message
+
+                send({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": 1},
+                })
+                self.assertIn("result", recv_reply(1))
+                send({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {"cwd": tmpdir},
+                })
+                self.assertIn("result", recv_reply(2))
+
+                children_path = (
+                    f"/proc/{front.pid}/task/{front.pid}/children")
+                with open(children_path, encoding="ascii") as stream:
+                    children = stream.read().split()
+                self.assertEqual(len(children), 1)
+
+                for pid in (front.pid, int(children[0])):
+                    with open(f"/proc/{pid}/environ", "rb") as stream:
+                        raw = stream.read()
+                    records = raw.split(b"\0")
+                    self.assertNotIn(
+                        f"{credential_name}=".encode("utf-8"),
+                        raw,
+                    )
+                    self.assertNotIn(
+                        credential_value.encode("utf-8"),
+                        raw,
+                    )
+                    self.assertIn(filler, records)
+                    self.assertGreater(
+                        raw.find(b"LOKI_ACP_AFTER=visible\0"),
+                        raw.find(filler + b"\0"),
+                    )
             finally:
                 front.stdin.close()
                 try:

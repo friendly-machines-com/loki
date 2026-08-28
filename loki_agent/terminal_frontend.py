@@ -25,7 +25,7 @@ from . import models as modelsdev
 from . import protocols
 from . import savefiles
 from . import terminals
-from .credentials import CredentialStore
+from .credentials import capture_process_credentials
 from . import tool_runtime
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .loki import RuntimeConfig, computer
@@ -881,7 +881,7 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
 def main() -> int:
     # Capture credentials into the core's module state; the rest of this
     # module reads them via _core.CREDENTIALS at call time.
-    _core.CREDENTIALS = CredentialStore.capture(os.environ)
+    _core.CREDENTIALS = capture_process_credentials()
     try:
         configure_tool_hook_pipeline()
     except tool_runtime.HookConfigurationError as error:

@@ -10,12 +10,14 @@ import asyncio
 import os
 import sys
 
-from . import acps, loki
-from .acp_worker import Worker
-from .sessions import Session
+from .credentials import CredentialStore, capture_process_credentials
 
 
-async def amain() -> int:
+async def amain(credentials: CredentialStore) -> int:
+    from . import acps, loki
+    from .acp_worker import Worker
+    from .sessions import Session
+
     session = Session(shell_cwd=os.getcwd())
     # Single-session process: make it the process default so loki's
     # current_*() helpers (chat-log bookkeeping, job manager, model) all
@@ -26,7 +28,7 @@ async def amain() -> int:
     write = acps.make_writer(saved_stdout)
     worker = Worker(session, write)
 
-    loki.CREDENTIALS = loki.CredentialStore.capture(os.environ)
+    loki.CREDENTIALS = credentials
     try:
         loki.apply_runtime_config(loki.build_config_from_env(
             credentials=loki.CREDENTIALS))
@@ -67,7 +69,8 @@ async def amain() -> int:
 
 
 def main() -> int:
-    return asyncio.run(amain())
+    credentials = capture_process_credentials()
+    return asyncio.run(amain(credentials))
 
 
 if __name__ == "__main__":

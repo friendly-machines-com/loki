@@ -31,6 +31,11 @@ provider and model must support image input.
 
 At startup Loki captures the environment and removes variables ending in
 `_KEY`, `_TOKEN`, or `_PAT` from the environment inherited by tools. The
+Linux startup path also overwrites each such variable's original
+`/proc/PID/environ` record with same-length `x` bytes while preserving its
+terminating NUL and the framing of later records. ACP front processes pass the
+captured startup environment only to new ACP workers, which immediately
+capture and scrub their own environments. The
 `/model` picker fetches models.dev lazily and shows only providers for which a
 captured credential is available. Provider-specific variables such as
 `OPENROUTER_API_KEY` can therefore be supplied by the VM/container launcher

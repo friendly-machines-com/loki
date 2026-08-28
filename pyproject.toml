@@ -22,4 +22,4 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-loki = "loki_agent.terminal_frontend:main"
+loki = "loki_agent.__main__:main"

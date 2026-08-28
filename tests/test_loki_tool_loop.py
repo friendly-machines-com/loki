@@ -1367,7 +1367,8 @@ class ExitStatusTests(unittest.TestCase):
                     return async_status
 
                 with self.subTest(async_status=async_status), mock.patch(
-                        "loki_agent.terminal_frontend.CredentialStore.capture",
+                        "loki_agent.terminal_frontend."
+                        "capture_process_credentials",
                         return_value=CredentialStore({})), mock.patch(
                             "loki_agent.terminal_frontend.signal.signal"), mock.patch(
                                 "loki_agent.terminal_frontend.signal.pthread_sigmask"

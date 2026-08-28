@@ -17,6 +17,7 @@ import sys
 import uuid
 
 from . import acps, savefiles
+from .credentials import CredentialStore
 from .loki import CHAT_LOG_DIR
 
 PROTOCOL_VERSION = 1
@@ -157,9 +158,10 @@ class WorkerChannel:
 
 
 class Front:
-    def __init__(self, read, write):
+    def __init__(self, read, write, credentials: CredentialStore):
         self.read = read
         self.write = write
+        self.credentials = credentials
         self.workers: dict[str, WorkerChannel] = {}
         self._next_worker_id = 0
         self._tasks: set[asyncio.Task] = set()
@@ -335,6 +337,7 @@ class Front:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=None,
+            env=self.credentials.startup_environment(),
         )
         channel = WorkerChannel(session_id, process, self.write)
         self.workers[session_id] = channel

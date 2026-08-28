@@ -1,3 +1,7 @@
+import json
+import os
+import subprocess
+import sys
 import unittest
 
 from loki_agent.connections import (
@@ -5,6 +9,9 @@ from loki_agent.connections import (
     ConnectionDescriptorError,
 )
 from loki_agent.credentials import CredentialStore, is_credential_name
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class CredentialStoreTests(unittest.TestCase):
@@ -55,6 +62,152 @@ class CredentialStoreTests(unittest.TestCase):
             store.first_available(["SECOND_TOKEN", "FIRST_KEY"]),
             ("SECOND_TOKEN", "two"),
         )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "Linux /proc environment semantics")
+    def test_process_capture_scrubs_record_without_hiding_later_entries(self):
+        code = r'''
+import ctypes
+import json
+import os
+import subprocess
+import sys
+
+from loki_agent.credentials import capture_process_credentials
+
+store = capture_process_credentials()
+libc = ctypes.CDLL(None)
+libc.getenv.argtypes = (ctypes.c_char_p,)
+libc.getenv.restype = ctypes.c_char_p
+raw = open("/proc/self/environ", "rb").read()
+filler = b"x" * len(b"LOKI_TEST_TOKEN=top-secret")
+child_code = (
+    "import os; "
+    "print(os.environ.get('LOKI_TEST_TOKEN', 'missing'))"
+)
+spawned = subprocess.check_output(
+    [sys.executable, "-c", child_code],
+    text=True,
+).strip()
+forked = subprocess.check_output(
+    [sys.executable, "-c", child_code],
+    text=True,
+    preexec_fn=lambda: None,
+).strip()
+print(json.dumps({
+    "stored": store.get("LOKI_TEST_TOKEN"),
+    "bootstrap": store.startup_environment().get("LOKI_TEST_TOKEN"),
+    "python_has_secret": "LOKI_TEST_TOKEN" in os.environ,
+    "native_secret": libc.getenv(b"LOKI_TEST_TOKEN") is not None,
+    "native_after": libc.getenv(b"LOKI_TEST_AFTER") == b"after",
+    "raw_has_name": b"LOKI_TEST_TOKEN=" in raw,
+    "raw_has_value": b"top-secret" in raw,
+    "filler_offset": raw.find(filler + b"\0"),
+    "after_offset": raw.find(b"LOKI_TEST_AFTER=after\0"),
+    "spawned": spawned,
+    "forked": forked,
+}))
+'''
+        env = {
+            "PYTHONPATH": ROOT,
+            "LOKI_TEST_BEFORE": "before",
+            "LOKI_TEST_TOKEN": "top-secret",
+            "LOKI_TEST_AFTER": "after",
+        }
+
+        process = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        result = json.loads(process.stdout)
+        self.assertEqual(result["stored"], "top-secret")
+        self.assertEqual(result["bootstrap"], "top-secret")
+        self.assertFalse(result["python_has_secret"])
+        self.assertFalse(result["native_secret"])
+        self.assertTrue(result["native_after"])
+        self.assertFalse(result["raw_has_name"])
+        self.assertFalse(result["raw_has_value"])
+        self.assertGreaterEqual(result["filler_offset"], 0)
+        self.assertGreater(
+            result["after_offset"],
+            result["filler_offset"],
+        )
+        self.assertEqual(result["spawned"], "missing")
+        self.assertEqual(result["forked"], "missing")
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "Linux /proc environment semantics")
+    def test_process_capture_scrubs_duplicate_execve_entries(self):
+        second_stage = r'''
+import json
+import os
+
+from loki_agent.credentials import capture_process_credentials
+
+store = capture_process_credentials()
+raw = open("/proc/self/environ", "rb").read()
+records = raw.split(b"\0")
+print(json.dumps({
+    "stored": store.get("DUPLICATE_TOKEN"),
+    "python_has_secret": "DUPLICATE_TOKEN" in os.environ,
+    "raw_has_name": b"DUPLICATE_TOKEN=" in raw,
+    "raw_has_one": b"one" in raw,
+    "raw_has_two": b"two" in raw,
+    "filler_count": records.count(
+        b"x" * len(b"DUPLICATE_TOKEN=one")),
+    "after": b"AFTER=visible" in records,
+}))
+'''
+        launcher = f'''
+import ctypes
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.execve.argtypes = (
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.POINTER(ctypes.c_char_p),
+)
+libc.execve.restype = ctypes.c_int
+executable = os.fsencode(sys.executable)
+code = {second_stage.encode("utf-8")!r}
+argv = (ctypes.c_char_p * 4)(executable, b"-c", code, None)
+entries = [
+    {("PYTHONPATH=" + ROOT).encode("utf-8")!r},
+    b"BEFORE=visible",
+    b"DUPLICATE_TOKEN=one",
+    b"DUPLICATE_TOKEN=two",
+    b"AFTER=visible",
+]
+envp = (ctypes.c_char_p * (len(entries) + 1))(*entries, None)
+libc.execve(executable, argv, envp)
+raise OSError(ctypes.get_errno(), "execve failed")
+'''
+
+        process = subprocess.run(
+            [sys.executable, "-c", launcher],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        result = json.loads(process.stdout)
+        self.assertIn(result["stored"], ("one", "two"))
+        self.assertFalse(result["python_has_secret"])
+        self.assertFalse(result["raw_has_name"])
+        self.assertFalse(result["raw_has_one"])
+        self.assertFalse(result["raw_has_two"])
+        self.assertEqual(result["filler_count"], 2)
+        self.assertTrue(result["after"])
 
 
 class ConnectionDescriptorTests(unittest.TestCase):

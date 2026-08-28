@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from loki_agent.terminal_frontend import main
+from loki_agent.__main__ import main
 
 
 if __name__ == "__main__":

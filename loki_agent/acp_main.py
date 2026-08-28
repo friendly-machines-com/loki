@@ -9,11 +9,13 @@ from __future__ import annotations
 import asyncio
 import os
 
-from . import acps
-from .acp import Front
+from .credentials import CredentialStore, capture_process_credentials
 
 
-async def amain() -> int:
+async def amain(credentials: CredentialStore) -> int:
+    from . import acps
+    from .acp import Front
+
     saved_stdout = os.dup(1)
     acps.quarantine_stdout()
     write = acps.make_writer(saved_stdout)
@@ -38,13 +40,14 @@ async def amain() -> int:
                 continue
             yield message
 
-    front = Front(read, write)
+    front = Front(read, write, credentials)
     await front.run()
     return 0
 
 
 def main() -> int:
-    return asyncio.run(amain())
+    credentials = capture_process_credentials()
+    return asyncio.run(amain(credentials))
 
 
 if __name__ == "__main__":
