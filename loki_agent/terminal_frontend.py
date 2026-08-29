@@ -496,11 +496,41 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
         print(result)
 
 
+USAGE = """\
+usage: loki [options]
+
+Options:
+  -r, --resume LOG        resume a saved chat log (bare --resume: picker)
+  -p, --prompt TEXT       one prompt for --subagent / --headless mode
+      --subagent TYPE     run a subagent prompt instead of the TUI
+      --headless          headless single-prompt mode
+      --toolset NAME      toolset for headless mode
+      --dangerously-skip-permissions
+                          skip permission prompts
+  -h, --help              show this help and exit
+
+Without options, loki starts the interactive TUI. ACP mode is a separate
+entry point: python3 -m loki_agent.acp_main
+"""
+
+
 async def async_main(args) -> int:
     # getopt's "resume=" requires a value; normalize a bare `--resume` to
     # `--resume=` so it opens the picker instead of erroring out.
     args = ['--resume=' if a == '--resume' else a for a in args]
-    options, args = getopt.getopt(args, 'r:p:', ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=', 'dangerously-skip-permissions'])
+    try:
+        options, args = getopt.getopt(
+            args, 'r:p:h',
+            ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=',
+             'dangerously-skip-permissions', 'help'])
+    except getopt.GetoptError as error:
+        print(f"loki: {error}", file=sys.stderr)
+        print(USAGE, end='', file=sys.stderr)
+        return 2
+    for option_name, _option_value in options:
+        if option_name in ('-h', '--help'):
+            print(USAGE, end='')
+            return 0
     prompt_arg = None
     subagent_type = None
     headless = False
