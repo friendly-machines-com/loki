@@ -16,7 +16,10 @@
   (source (local-file (dirname (current-filename))
                       "loki-checkout"
                        #:recursive? #t 
-                       #:select? (git-predicate (dirname (current-filename)))))
+                       #:select?
+                       (lambda (file stat)
+                         (and ((git-predicate (dirname (current-filename))) file stat)
+                              (not (string-suffix? ".scm" file))))))
   (build-system pyproject-build-system)
   (arguments
    (list #:tests? #f ; unittest suite wants credentials/network; run separately
