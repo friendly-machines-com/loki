@@ -4742,5 +4742,144 @@ class HarnessProjectionTests(unittest.TestCase):
         self.assertEqual(records, [])
 
 
+class QuestionGuardTests(unittest.TestCase):
+    """The question guard: when the user's turn asks a question, the
+    agent answers -- state-changing tools are refused for that whole
+    turn.
+
+    The guard was added in ed8c342 and its trigger silently dropped in
+    1a0c19a. These tests pin the trigger, the gate, and the explore
+    tool set so none of them can change silently again.
+    """
+
+    def setUp(self):
+        self._state = save_loki_state(
+            ["agent_mode", "last_instructed_agent_mode"])
+
+    def tearDown(self):
+        restore_loki_state(self._state)
+
+    def _context_for(self, text):
+        items = [formats.message_item("user", text)]
+        return loki.get_tool_loop_extra_context(items)
+
+    def test_question_mark_inhibits(self):
+        self.assertEqual(
+            self._context_for("what does run_edit do?")["inhibit_edits"],
+            "answering the user's question")
+
+    def test_what_anywhere_inhibits(self):
+        self.assertEqual(
+            self._context_for("that is odd, what? exactly fails here")
+            ["inhibit_edits"],
+            "answering the user's question")
+
+    def test_plain_request_does_not_inhibit(self):
+        self.assertFalse(
+            self._context_for("please fix the failing tests")
+            ["inhibit_edits"])
+
+    def test_only_a_trailing_user_message_counts(self):
+        items = [
+            formats.message_item("user", "what is this?"),
+            formats.message_item("assistant", "an answer"),
+        ]
+        self.assertFalse(
+            loki.get_tool_loop_extra_context(items)["inhibit_edits"])
+
+    def test_guard_spans_whole_turn_and_resets_next_turn(self):
+        # The guard is decided once at turn start and binds the whole
+        # turn: a tool call issued after the model already produced
+        # text is still refused. The next user turn decides anew.
+        transcript = [formats.message_item(
+            "user", "why does the build fail?")]
+        first_calls = [
+            [formats.message_item("assistant", "let me check"),
+             formats.tool_call_item("t1", "Bash", {"command": "echo ok"})],
+            [formats.message_item("assistant", "because dependencies")],
+        ]
+
+        async def scripted_chat(items):
+            return first_calls.pop(0)
+
+        asyncio.run(loki.run_tool_loop_async(
+            transcript, chat_fn=scripted_chat))
+        # The Bash call in this question turn must have been refused --
+        # the refusal reason can only enter the transcript that way.
+        self.assertIn("answering the user's question", str(transcript))
+
+        transcript.append(formats.message_item("user", "fix it now"))
+        second_calls = [
+            [formats.tool_call_item("t2", "Bash", {"command": "echo ok"})],
+            [formats.message_item("assistant", "done")],
+        ]
+
+        async def scripted_chat2(items):
+            return second_calls.pop(0)
+
+        before = len(transcript)
+        asyncio.run(loki.run_tool_loop_async(
+            transcript, chat_fn=scripted_chat2))
+        self.assertNotIn(
+            "answering the user's question", str(transcript[before:]))
+        self.assertIn("ok", str(transcript[before:]))
+
+    def test_explore_and_plan_modes_inhibit(self):
+        for mode in ("explore", "plan"):
+            with self.subTest(mode=mode):
+                loki.current_session().agent_mode = mode
+                self.assertEqual(
+                    loki.get_tool_loop_extra_context(
+                        [formats.message_item("user", "hi")])
+                    ["inhibit_edits"],
+                    f"{mode} mode")
+
+    def test_question_refuses_state_changing_tools(self):
+        extra = self._context_for("what does run_edit do?")
+        for name, args in (
+                ("Edit", {
+                    "file_path": __file__,
+                    "old_string": "x",
+                    "new_string": "y"}),
+                ("Write", {
+                    "file_path": "/tmp/loki-guard-test",
+                    "content": "x"}),
+                ("Bash", {"command": "true"}),
+        ):
+            with self.subTest(tool=name):
+                result = asyncio.run(loki.dispatch_tool_async(
+                    name, args, extra_context=extra))
+                self.assertFalse(result["ok"])
+                self.assertIn(
+                    "answering the user's question", result["content"])
+
+    def test_question_allows_read_only_tools(self):
+        extra = self._context_for("what is in this file?")
+        result = asyncio.run(loki.dispatch_tool_async(
+            "Read", {"file_path": __file__}, extra_context=extra))
+        self.assertTrue(result["ok"])
+
+    def test_explore_tools_registry_shape_is_pinned(self):
+        # Any change to the explore-allowed set must show up here,
+        # deliberately, as a diff to this expected set.
+        self.assertEqual(
+            loki.EXPLORE_TOOLS,
+            {"Read", "Glob", "Grep", "Jobs", "JobStatus", "TodoRead",
+             "WebFetch", "WebSearch"})
+
+    def test_agent_description_matches_explore_tools(self):
+        description = next(
+            spec["function"]["description"] for spec in loki.TOOLS
+            if spec["function"]["name"] == "Agent")
+        marker = "(Tools: "
+        start = description.find(marker)
+        self.assertGreaterEqual(start, 0, "no tool list in description")
+        end = description.find(")", start)
+        advertised = {
+            part.strip()
+            for part in description[start + len(marker):end].split(",")}
+        self.assertEqual(advertised, loki.EXPLORE_TOOLS)
+
+
 if __name__ == "__main__":
     unittest.main()

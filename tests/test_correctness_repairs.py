@@ -230,7 +230,13 @@ class AgentModeContractTests(unittest.TestCase):
         finally:
             loki.current_session().agent_mode = old_mode
 
-    def test_question_punctuation_does_not_revoke_implementation(self):
+    def test_question_punctuation_inhibits_edits_for_that_turn(self):
+        # The question guard (ed8c342) refuses tool calls for any turn
+        # that opens with a question. 1a0c19a silently dropped the
+        # trigger and pinned its absence here; reinstated verbatim by
+        # owner decision on 2026-08-29: a prompt ending in '?' is a
+        # question -- including "Can you fix X?" -- so the agent
+        # answers it; implementation waits for a non-question turn.
         old_mode = loki.current_session().agent_mode
         try:
             loki.current_session().agent_mode = "normal"
@@ -238,9 +244,10 @@ class AgentModeContractTests(unittest.TestCase):
                 loki.formats.message_item(
                     "user", "Can you fix the broken resume?"),
             ]
-            self.assertFalse(
+            self.assertEqual(
                 loki.get_tool_loop_extra_context(transcript)[
-                    "inhibit_edits"])
+                    "inhibit_edits"],
+                "answering the user's question")
         finally:
             loki.current_session().agent_mode = old_mode
 

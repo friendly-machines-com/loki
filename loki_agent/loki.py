@@ -2186,10 +2186,42 @@ async def execute_tool_call_async(
         invocation, outcome, defaults)
 
 
+def _last_user_question(transcript_items: list) -> bool:
+    """True when the pending turn opens with a user question.
+
+    run_tool_loop_async calls this exactly once per turn, before the
+    first model response, so the transcript's last item is then the
+    user's message. If the turn opens as a question, the whole turn's
+    non-explore tool calls are refused; the next user turn starts with
+    a fresh decision. Detection is the original ed8c342 semantics --
+    do not change it silently; QuestionGuardTests pins it.
+    """
+    if not transcript_items:
+        return False
+    item = transcript_items[-1]
+    if item.get("type") != "message" or item.get("role") != "user":
+        return False
+    content = item.get("content")
+    if not isinstance(content, list):
+        return False
+    text_blocks = [
+        block for block in content
+        if isinstance(block, dict) and block.get("type") == "text"]
+    if not text_blocks:
+        return False
+    text = text_blocks[-1].get("text")
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    return stripped.endswith("?") or "what?" in stripped.lower()
+
+
 def get_tool_loop_extra_context(transcript_items: list):
     inhibit_edits = False
     if current_agent_mode() in ("explore", "plan"):
         inhibit_edits = f"{current_agent_mode()} mode"
+    if _last_user_question(transcript_items):
+        inhibit_edits = "answering the user's question"
 
     return {'inhibit_edits': inhibit_edits}
 
@@ -3321,7 +3353,7 @@ TOOLS = [
                 "Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.",
                 "",
                 "Available agent types and the tools they have access to:",
-                "- Explore: Read-only search agent for broad fan-out searches - when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: \"medium\" for moderate exploration, \"very thorough\" for multiple locations and naming conventions. (Tools: Glob, Grep, Read, Jobs, JobStatus, WebFetch, WebSearch)",
+                "- Explore: Read-only search agent for broad fan-out searches - when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: \"medium\" for moderate exploration, \"very thorough\" for multiple locations and naming conventions. (Tools: Glob, Grep, Read, Jobs, JobStatus, TodoRead, WebFetch, WebSearch)",
                 "",
                 "When using the Agent tool, specify a subagent_type parameter to select which agent type to use. If omitted, the \"Explore\" agent is used.",
                 "",
@@ -3477,7 +3509,7 @@ TOOL_HANDLERS = {
         "handler": _handle_agent,
         "async_handler": _handle_agent_async,
     },
-    "Skill": {"handler": _handle_skill, "explore": True},
+    "Skill": {"handler": _handle_skill},
     "WebFetch": {"async_handler": _handle_webfetch_async, "explore": True},
     "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
 }
