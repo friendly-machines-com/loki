@@ -1,9 +1,8 @@
 """End-to-end UI test: run the real loki_agent TUI under a pty with the
 dummy provider (no network) and assert on what the terminal actually shows.
 
-The raw-byte assertions work everywhere. When pyte is importable, the same
-run is additionally decoded into a pyte screen so SGR attributes can be
-checked as attributes (bold / cyan), not just as substrings.
+The assertions check the SGR runs (bold / cyan) as raw byte substrings of
+what was written to the tty.
 """
 
 import fcntl
@@ -22,16 +21,148 @@ import time
 import unittest
 
 
-try:
-    import pyte
-except ImportError:
-    pyte = None
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 REPLY = "**boldword** and `codeword` done"
 BOLD_RUN = b"\x1b[1mboldword\x1b[0m"
 CODE_RUN = b"\x1b[36mcodeword\x1b[0m"
+
+
+class _SgrStreamTracker:
+    """Tiny VT byte-stream tracker, stdlib only.
+
+    Parses escape-sequence boundaries (CSI, OSC, DCS/SOS/PM/APC, 2-char
+    and charset escapes) and records the SGR attribute state that was
+    active while each printable character was emitted. It deliberately
+    does NOT emulate a screen: no grid, no cursor addressing, no
+    erase/scroll semantics. It validates the byte stream itself --
+    sequences terminate, styles end reset -- and where attributes were
+    active. It proves nothing about any real terminal.
+    """
+
+    ANSI_FG = {30: "black", 31: "red", 32: "green", 33: "yellow",
+               34: "blue", 35: "magenta", 36: "cyan", 37: "white"}
+
+    def __init__(self):
+        self.bold = False
+        self.fg = "default"
+        self.text = []      # printable characters, in emission order
+        self.states = []    # (bold, fg) per character
+        self.unterminated = 0
+
+    # -- SGR -----------------------------------------------------------
+
+    def _apply_sgr(self, params: bytes):
+        fields = params.decode("ascii", "replace").split(";")
+        if fields == [""]:
+            fields = ["0"]
+        i = 0
+        while i < len(fields):
+            raw = fields[i]
+            n = int(raw) if raw.isdigit() else 0
+            if n == 0:
+                self.bold = False
+                self.fg = "default"
+            elif n == 1:
+                self.bold = True
+            elif n == 22:
+                self.bold = False
+            elif n in self.ANSI_FG:
+                self.fg = self.ANSI_FG[n]
+            elif n == 39:
+                self.fg = "default"
+            elif n == 38:  # 38;5;n or 38;2;r;g;b extended color
+                if i + 1 < len(fields) and fields[i + 1] == "5":
+                    i += 2
+                    self.fg = "indexed"
+                elif i + 1 < len(fields) and fields[i + 1] == "2":
+                    i += 4
+                    self.fg = "rgb"
+                else:
+                    self.fg = "unknown"
+            i += 1
+
+    # -- byte-stream parsing --------------------------------------------
+
+    def _escape(self, data: bytes, i: int) -> int:
+        n = len(data)
+        if i + 1 >= n:
+            self.unterminated += 1
+            return n
+        c = data[i + 1]
+        if c == 0x5B:  # ESC [ : CSI
+            j = i + 2
+            while j < n and 0x30 <= data[j] <= 0x3F:   # parameter bytes
+                j += 1
+            while j < n and 0x20 <= data[j] <= 0x2F:   # intermediates
+                j += 1
+            if j >= n:
+                self.unterminated += 1
+                return n
+            if data[j] == 0x6D:  # final 'm'
+                self._apply_sgr(data[i + 2:j])
+            return j + 1
+        if c in (0x5D, 0x50, 0x58, 0x5E, 0x5F):  # OSC/DCS/SOS/PM/APC
+            j = i + 2
+            while j < n:
+                if data[j] == 0x07:                      # BEL terminator
+                    return j + 1
+                if data[j] == 0x1B and j + 1 < n and data[j + 1] == 0x5C:
+                    return j + 2                          # ST terminator
+                j += 1
+            self.unterminated += 1
+            return n
+        j = i + 1
+        while j < n and 0x20 <= data[j] <= 0x2F:  # charset/intermediates
+            j += 1
+        if j >= n:
+            self.unterminated += 1
+            return n
+        return j + 1  # single final byte: ESC 7, ESC 8, ESC ( B, ...
+
+    def feed(self, data: bytes):
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if b == 0x1B:
+                i = self._escape(data, i)
+            elif 0x20 <= b != 0x7F:
+                if b < 0x80:
+                    self.text.append(chr(b))
+                    self.states.append((self.bold, self.fg))
+                    i += 1
+                else:
+                    width = 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+                    try:
+                        ch = data[i:i + width].decode("utf-8")
+                    except UnicodeDecodeError:
+                        i += 1
+                        continue
+                    self.text.append(ch)
+                    self.states.append((self.bold, self.fg))
+                    i += width
+            else:
+                i += 1  # C0 control bytes carry no SGR state
+
+    # -- queries ----------------------------------------------------------
+
+    def printed_with(self, needle: str, *, bold=None, fg=None) -> bool:
+        """True if `needle` was emitted with the attribute(s) active."""
+        hay = "".join(self.text)
+        start = 0
+        while True:
+            k = hay.find(needle, start)
+            if k < 0:
+                return False
+            span = self.states[k:k + len(needle)]
+            ok = True
+            if bold is not None:
+                ok = ok and all(s[0] == bold for s in span)
+            if fg is not None:
+                ok = ok and all(s[1] == fg for s in span)
+            if ok:
+                return True
+            start = k + 1
 
 
 def _set_size(fd):
@@ -231,37 +362,39 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"queued messages: 1, queued images: 0", before_release)
         self.assertIn(b"queued messages: 0, queued images: 1", output)
 
-    @unittest.skipIf(pyte is None, "pyte not installed")
-    def test_pyte_screen_attributes(self):
+    def test_full_stream_parses_and_styles_land(self):
+        # Whole-stream validation of the tty byte output: every escape
+        # sequence terminates, the stream ends with SGR state reset (no
+        # dangling styles), and the styled words were emitted with their
+        # attributes actually active. This is a spec-shaped parser check
+        # of Loki's output -- it does not emulate a screen and proves
+        # nothing about any real terminal.
         for stream in (False, True):
             with self.subTest(stream=stream):
-                if stream:
-                    chunks = [
-                        "visible prefix ",
-                        "**boldword** and `codeword` done",
-                    ]
-                else:
-                    chunks = None
+                chunks = (["visible prefix ",
+                           "**boldword** and `codeword` done"]
+                          if stream else None)
                 output, _before_release = run_loki_pty_reply(
                     stream=stream, stream_chunks=chunks)
-                screen = pyte.Screen(80, 24)
-                pyte_stream = pyte.Stream(screen)
-                pyte_stream.feed(output.decode("utf-8", errors="replace"))
 
-                text = "\n".join(screen.display)
-                row = next((i for i, line in enumerate(screen.display)
-                            if "boldword" in line), None)
-                self.assertIsNotNone(
-                    row, f"reply not on screen; got:\n{text}")
-                col = screen.display[row].index("boldword")
-                self.assertTrue(screen.buffer[row][col].bold)
-                self.assertEqual(screen.buffer[row][col].data, "b")
+                tracker = _SgrStreamTracker()
+                tracker.feed(output)
 
-                row = next(i for i, line in enumerate(screen.display)
-                           if "codeword" in line)
-                col = screen.display[row].index("codeword")
-                self.assertEqual(screen.buffer[row][col].fg, "cyan")
-                self.assertEqual(screen.buffer[row][col].data, "c")
+                self.assertEqual(
+                    tracker.unterminated, 0,
+                    "escape sequence ran past end of stream")
+                self.assertFalse(
+                    tracker.bold, "stream ended with bold still active")
+                self.assertEqual(
+                    tracker.fg, "default",
+                    "stream ended with a foreground color still active")
+                self.assertTrue(
+                    tracker.printed_with("boldword", bold=True),
+                    "boldword was never emitted with bold active")
+                self.assertTrue(
+                    tracker.printed_with("codeword", fg="cyan"),
+                    "codeword was never emitted with cyan foreground")
+
 
 
 if __name__ == "__main__":
