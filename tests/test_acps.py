@@ -18,6 +18,13 @@ from loki_agent.credentials import is_credential_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+LOKI_ACP = os.path.join(ROOT, "loki-acp")
+
+
+def loki_acp_command():
+    """The user-facing ACP entrypoint, as shipped."""
+    return [LOKI_ACP]
+
 
 def _close_process_streams(process):
     for name in ("stdin", "stdout", "stderr"):
@@ -131,7 +138,6 @@ class NativeAsyncStdinTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = dict(os.environ)
             env.update({
-                "PYTHONPATH": ROOT,
                 "HOME": tmpdir,
                 "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
                 "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -189,11 +195,27 @@ class NativeAsyncStdinTests(unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
+class EntrypointTests(unittest.TestCase):
+    def test_loki_acp_script_is_shipped_and_executable(self):
+        # The user-facing ACP entrypoint is the deliverable; these tests
+        # fail if it is deleted or loses its exec bit.
+        self.assertTrue(os.path.isfile(LOKI_ACP),
+                        f"{LOKI_ACP} is missing")
+        self.assertTrue(os.access(LOKI_ACP, os.X_OK),
+                        f"{LOKI_ACP} is not executable")
+
+    def test_pyproject_declares_installed_acp_entrypoint(self):
+        content = open(os.path.join(ROOT, "pyproject.toml")).read()
+        self.assertIn(
+            'loki-acp = "loki_agent.acp_main:main"', content,
+            "installed users need the loki-acp console script")
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class FrontWorkerTests(unittest.TestCase):
     def _front_env(self, tmpdir):
         env = dict(os.environ)
         env.update({
-            "PYTHONPATH": ROOT,
             "HOME": tmpdir,
             "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
             "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -209,7 +231,7 @@ class FrontWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._front_env(tmpdir)
             front = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, env=env, cwd=tmpdir)
             self.addCleanup(_close_process_streams, front)
@@ -305,7 +327,7 @@ class FrontWorkerTests(unittest.TestCase):
             filler = b"x" * record_length
 
             front = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -377,7 +399,7 @@ class FrontWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._front_env(tmpdir)
             front = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, env=env, cwd=tmpdir)
             self.addCleanup(_close_process_streams, front)
@@ -487,7 +509,6 @@ class UpdateStreamingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = dict(os.environ)
             env.update({
-                "PYTHONPATH": ROOT,
                 "HOME": tmpdir,
                 "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
                 "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -498,7 +519,7 @@ class UpdateStreamingTests(unittest.TestCase):
                 "LOKI_DUMMY_REPLY": "plain answer",
             })
             front = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
             self.addCleanup(_close_process_streams, front)
@@ -557,7 +578,6 @@ class CancelEndToEndTests(unittest.TestCase):
             gate = os.path.join(tmpdir, "release")
             env = dict(os.environ)
             env.update({
-                "PYTHONPATH": ROOT,
                 "HOME": tmpdir,
                 "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
                 "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -572,7 +592,7 @@ class CancelEndToEndTests(unittest.TestCase):
                 "LOKI_DUMMY_STREAM_GATE": gate,
             })
             front = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
             self.addCleanup(_close_process_streams, front)
@@ -646,7 +666,7 @@ class CancelEndToEndTests(unittest.TestCase):
 class LoadReplayTests(unittest.TestCase):
     def _front(self, env, cwd):
         process = subprocess.Popen(
-            [sys.executable, "-m", "loki_agent.acp_main"],
+            loki_acp_command(),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, env=env, cwd=cwd)
         self.addCleanup(_close_process_streams, process)
@@ -655,7 +675,6 @@ class LoadReplayTests(unittest.TestCase):
     def _env(self, tmpdir, reply="loadable answer"):
         env = dict(os.environ)
         env.update({
-            "PYTHONPATH": ROOT,
             "HOME": tmpdir,
             "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
             "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -778,7 +797,6 @@ class SessionListTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = dict(os.environ)
             env.update({
-                "PYTHONPATH": ROOT,
                 "HOME": tmpdir,
                 "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
                 "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -789,7 +807,7 @@ class SessionListTests(unittest.TestCase):
                 "LOKI_DUMMY_REPLY": "one",
             })
             front = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
             self.addCleanup(_close_process_streams, front)
@@ -828,7 +846,7 @@ class SessionListTests(unittest.TestCase):
 
             # A second front process sees the saved conversation listed.
             front2 = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
             self.addCleanup(_close_process_streams, front2)
@@ -869,7 +887,6 @@ class ConfigOptionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = dict(os.environ)
             env.update({
-                "PYTHONPATH": ROOT,
                 "HOME": tmpdir,
                 "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
                 "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -880,7 +897,7 @@ class ConfigOptionTests(unittest.TestCase):
                 "LOKI_DUMMY_REPLY": "x",
             })
             front = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
             self.addCleanup(_close_process_streams, front)
@@ -963,7 +980,6 @@ class TtyStdinTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = dict(os.environ)
             env.update({
-                "PYTHONPATH": ROOT,
                 "HOME": tmpdir,
                 "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
                 "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
@@ -974,7 +990,7 @@ class TtyStdinTests(unittest.TestCase):
                 "LOKI_DUMMY_REPLY": "x",
             })
             proc = subprocess.Popen(
-                [sys.executable, "-m", "loki_agent.acp_main"],
+                loki_acp_command(),
                 stdin=slave, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, env=env, cwd=tmpdir,
                 preexec_fn=child_setup, text=True)

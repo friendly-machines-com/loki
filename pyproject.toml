@@ -23,3 +23,4 @@ dependencies = []
 
 [project.scripts]
 loki = "loki_agent.__main__:main"
+loki-acp = "loki_agent.acp_main:main"
