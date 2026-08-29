@@ -514,16 +514,25 @@ entry point: python3 -m loki_agent.acp_main
 """
 
 
-async def async_main(args) -> int:
+CLI_SHORT_OPTS = 'r:p:h'
+CLI_LONG_OPTS = ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=',
+                 'dangerously-skip-permissions', 'help']
+
+
+def parse_cli_args(args):
+    """Normalize and getopt-parse CLI args (raises getopt.GetoptError)."""
     # getopt's "resume=" requires a value; normalize a bare `--resume` to
     # `--resume=` so it opens the picker instead of erroring out.
     args = ['--resume=' if a == '--resume' else a for a in args]
+    return getopt.getopt(args, CLI_SHORT_OPTS, CLI_LONG_OPTS)
+
+
+async def async_main(args) -> int:
     try:
-        options, args = getopt.getopt(
-            args, 'r:p:h',
-            ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=',
-             'dangerously-skip-permissions', 'help'])
+        options, args = parse_cli_args(args)
     except getopt.GetoptError as error:
+        # main() handles argument errors before any terminal setup; this
+        # fallback only serves direct async_main callers.
         print(f"loki: {error}", file=sys.stderr)
         print(USAGE, end='', file=sys.stderr)
         return 2
@@ -912,6 +921,19 @@ def main() -> int:
     # Capture credentials into the core's module state; the rest of this
     # module reads them via _core.CREDENTIALS at call time.
     _core.CREDENTIALS = capture_process_credentials()
+    # --help and argument errors must leave the user's terminal exactly as
+    # it was: handle them before initialize_terminal_overlay touches the
+    # screen. No cursor hiding, scroll regions, or teardown output.
+    try:
+        options, _positional = parse_cli_args(sys.argv[1:])
+    except getopt.GetoptError as error:
+        print(f"loki: {error}", file=sys.stderr)
+        print(USAGE, end='', file=sys.stderr)
+        return 2
+    for option_name, _option_value in options:
+        if option_name in ('-h', '--help'):
+            print(USAGE, end='')
+            return 0
     try:
         configure_tool_hook_pipeline()
     except tool_runtime.HookConfigurationError as error:

@@ -396,6 +396,100 @@ class PtyUiTests(unittest.TestCase):
                     "codeword was never emitted with cyan foreground")
 
 
+@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
+class PtyCliUsageTests(unittest.TestCase):
+    """--help and argument errors must not touch the terminal.
+
+    These exits run before initialize_terminal_overlay. With stdin AND
+    stdout on a real tty (the real Terminal class is selected at import
+    time), they must emit no escape sequences at all -- otherwise every
+    usage error enters and leaves TUI mode, hiding the cursor, setting
+    scroll regions, and clearing the user's screen on the way out.
+    """
+
+    def _run_cli(self, cwd, *cli_args):
+        pid, master = pty.fork()
+        if pid == 0:  # child: pty on stdin/stdout, hermetic dirs
+            try:
+                _set_size(0)
+                os.chdir(cwd)
+                env = {
+                    "HOME": cwd,
+                    "XDG_CONFIG_HOME": os.path.join(cwd, "config"),
+                    "XDG_STATE_HOME": os.path.join(cwd, "state"),
+                    "PATH": os.environ.get("PATH", ""),
+                    "TERM": "xterm",
+                    "PYTHONPATH": str(ROOT),
+                }
+                os.execvpe(
+                    sys.executable,
+                    [sys.executable, str(ROOT / "loki.py"), *cli_args],
+                    env)
+            except Exception:
+                pass
+            os._exit(127)
+        output = b""
+        exit_code = None
+        try:
+            _set_size(master)
+            output = _read_with_timeout(master, 4.0)
+            status = None
+            # Bounded wait: a usage-path regression that waits for input
+            # instead of exiting must FAIL the test, not hang the suite.
+            for _ in range(50):  # up to 5s
+                try:
+                    done_pid, status = os.waitpid(pid, os.WNOHANG)
+                except OSError:
+                    break
+                if done_pid:
+                    break
+                time.sleep(0.1)
+            if status is not None:
+                exit_code = os.waitstatus_to_exitcode(status)
+        finally:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    break
+                time.sleep(0.2)
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            os.close(master)
+        if exit_code is None:
+            self.fail(
+                f"loki{tuple(cli_args)!r} never exited on the usage path; "
+                f"output captured: {output!r}")
+        return exit_code, output
+
+    def test_help_and_arg_errors_leave_terminal_untouched(self):
+        # Invariants only: the expected exit code, help actually printing
+        # something, a bad option being named back to the user, and not a
+        # single escape byte -- usage exits must not enter/leave TUI mode.
+        cases = [
+            (("--help",), 0),
+            (("--definitely-not-an-option",), 2),
+        ]
+        for cli_args, expected_exit in cases:
+            with self.subTest(args=cli_args):
+                with tempfile.TemporaryDirectory() as cwd:
+                    exit_code, output = self._run_cli(cwd, *cli_args)
+                self.assertEqual(exit_code, expected_exit)
+                self.assertNotIn(
+                    b"\x1b", output,
+                    "usage exits must not emit escape sequences; got: "
+                    f"{output!r}")
+                if expected_exit == 0:
+                    self.assertTrue(output, "help printed nothing")
+                else:
+                    self.assertIn(
+                        cli_args[0].encode(), output,
+                        "the rejected option must be named back to the "
+                        "user")
+
+
 
 if __name__ == "__main__":
     unittest.main()
