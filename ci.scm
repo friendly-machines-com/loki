@@ -3,4 +3,4 @@
   #:use-module (guix profiles))
 
 (packages->manifest (list (primitive-load (string-append (dirname (current-filename))
-                                                         "/guix.scm"))))
+                                                         "/guix1.scm"))))
