@@ -251,7 +251,7 @@ class AgentModeContractTests(unittest.TestCase):
         finally:
             loki.current_session().agent_mode = old_mode
 
-    def test_terminal_advertises_only_read_only_tools_in_plan_mode(self):
+    def test_terminal_advertises_plan_toolset_in_plan_mode(self):
         captured = []
         old_mode = loki.current_session().agent_mode
         old_toolsets = list(loki.current_session().session_toolsets)
@@ -278,7 +278,8 @@ class AgentModeContractTests(unittest.TestCase):
             loki.current_session().agent_mode = old_mode
             loki.current_session().session_toolsets = old_toolsets
 
-        self.assertEqual(set(captured), loki.EXPLORE_TOOLS)
+        # Plan mode advertises the read-only set plus TodoWrite.
+        self.assertEqual(set(captured), loki.PLAN_TOOLS)
 
 
 if __name__ == "__main__":

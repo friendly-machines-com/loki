@@ -4867,6 +4867,40 @@ class QuestionGuardTests(unittest.TestCase):
             {"Read", "Glob", "Grep", "Jobs", "JobStatus", "TodoRead",
              "WebFetch", "WebSearch"})
 
+    def test_plan_tools_registry_shape_is_pinned(self):
+        # Plan mode additionally allows TodoWrite (session-scoped plan
+        # state); anything else landing here must be a deliberate diff.
+        self.assertEqual(
+            loki.PLAN_TOOLS,
+            loki.EXPLORE_TOOLS | {"TodoWrite"})
+
+    def test_plan_mode_allows_todowrite_but_blocks_workspace_and_system(self):
+        loki.current_session().agent_mode = "plan"
+        context = loki.get_tool_loop_extra_context(
+            [formats.message_item("user", "plan the refactor")])
+        for name in ("TodoWrite", "Read", "Grep"):
+            with self.subTest(tool=name):
+                self.assertIsNone(
+                    loki._tool_access_error(name, extra_context=context))
+        for name in ("Edit", "Write", "Bash", "Skill", "JobStop"):
+            with self.subTest(tool=name):
+                self.assertIsNotNone(
+                    loki._tool_access_error(name, extra_context=context))
+
+    def test_explore_mode_and_questions_still_block_todowrite(self):
+        loki.current_session().agent_mode = "explore"
+        explore_context = loki.get_tool_loop_extra_context(
+            [formats.message_item("user", "explore this")])
+        self.assertIsNotNone(
+            loki._tool_access_error(
+                "TodoWrite", extra_context=explore_context))
+        loki.current_session().agent_mode = "normal"
+        question_context = loki.get_tool_loop_extra_context(
+            [formats.message_item("user", "what about todos?")])
+        self.assertIsNotNone(
+            loki._tool_access_error(
+                "TodoWrite", extra_context=question_context))
+
     def test_agent_description_matches_explore_tools(self):
         description = next(
             spec["function"]["description"] for spec in loki.TOOLS

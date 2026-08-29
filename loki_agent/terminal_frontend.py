@@ -33,6 +33,7 @@ from . import loki as _core
 from .loki import (
     ERROR_COLOR,
     EXPLORE_TOOLS,
+    PLAN_TOOLS,
     TOOLS,
     TOOL_CALL_COLOR,
     _remember_session_toolset,
@@ -369,10 +370,12 @@ def _terminal_agent_event(event: dict):
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None) -> str:
     read_only = current_agent_mode() in ("explore", "plan")
+    mode_tools = (
+        PLAN_TOOLS if current_agent_mode() == "plan" else EXPLORE_TOOLS)
     active_tools = (
         [
             tool for tool in TOOLS
-            if tool.get("function", {}).get("name") in EXPLORE_TOOLS
+            if tool.get("function", {}).get("name") in mode_tools
         ]
         if read_only else TOOLS
     )
@@ -385,7 +388,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
 
     return await run_tool_loop_async(
         transcript_items,
-        allowed=EXPLORE_TOOLS if read_only else None,
+        allowed=mode_tools if read_only else None,
         chat_fn=chat_fn,
         on_event=_terminal_agent_event,
         cancel_check=cancel_check,

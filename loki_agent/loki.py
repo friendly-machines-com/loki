@@ -758,6 +758,7 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
             "handler": sync_handler,
             "async_handler": async_handler,
             "explore": handler.get("explore", False),
+            "plan": handler.get("plan", False),
         }
 
     extra_handlers = sorted(set(handlers) - seen)
@@ -1908,9 +1909,12 @@ def _tool_access_error(fn_name: str, allowed=None, extra_context=None):
             f"Tool {fn_name} not available in this subagent "
             f"(allowed: {sorted(allowed)})")
     if inhibit_edits and spec.get('explore') is not True:
-        return (
-            f"Tool {fn_name} is unavailable while "
-            f"{inhibit_edits} is active.")
+        plan_only_tool = (
+            inhibit_edits == "plan mode" and spec.get('plan') is True)
+        if not plan_only_tool:
+            return (
+                f"Tool {fn_name} is unavailable while "
+                f"{inhibit_edits} is active.")
     return None
 
 
@@ -2240,8 +2244,8 @@ def record_agent_mode_instruction():
             "but do not modify files, todos, jobs, or other state."),
         "plan": (
             "Plan mode is active for this turn. Inspect read-only context and "
-            "produce a plan; do not modify files, todos, jobs, or other "
-            "state."),
+            "produce a plan; do not modify files, jobs, or other state. "
+            "Tracking the plan with TodoWrite is allowed."),
         "edit": (
             "Edit mode is active. Implement the requested changes and verify "
             "them with the available tools."),
@@ -3504,7 +3508,7 @@ TOOL_HANDLERS = {
         },
     },
     "TodoRead": {"handler": _handle_todoread, "explore": True},
-    "TodoWrite": {"handler": _handle_todowrite},
+    "TodoWrite": {"handler": _handle_todowrite, "plan": True},
     "Agent": {
         "handler": _handle_agent,
         "async_handler": _handle_agent_async,
@@ -3516,6 +3520,8 @@ TOOL_HANDLERS = {
 TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]
 EXPLORE_TOOLS = {name for name, spec in TOOL_REGISTRY.items() if spec["explore"]}
+PLAN_TOOLS = EXPLORE_TOOLS | {
+    name for name, spec in TOOL_REGISTRY.items() if spec.get("plan")}
 TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
 
 
