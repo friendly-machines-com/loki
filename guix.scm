@@ -3,6 +3,7 @@
 ;;; Install with: guix package -f guix.scm
 
 (use-modules (guix packages)
+             (guix git-download) 
              (guix build-system pyproject)
              (guix build utils)
              (guix gexp)
