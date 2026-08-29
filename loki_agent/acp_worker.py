@@ -111,7 +111,7 @@ class Worker:
             self.cancel_event.set()
             return {}
         if method == "session/open":
-            return self.open(params)
+            return await self.open(params)
         if method == "session/set_config_option":
             return self.set_config_option(params)
         raise acps.TransportError(
@@ -236,7 +236,7 @@ class Worker:
         choices.append(self._disconnected_choice())
         self._set_choices(choices, "loki-disconnected")
 
-    def open(self, params: dict) -> dict:
+    async def open(self, params: dict) -> dict:
         cwd = params.get("cwd")
         if (not isinstance(cwd, str) or not os.path.isabs(cwd)
                 or not os.path.isdir(cwd)):
@@ -278,8 +278,6 @@ class Worker:
                     f"could not load saved session {resume!r}: {error}",
                     code=acps.INVALID_PARAMS,
                 ) from error
-            # ACP's cwd parameter is the working directory for the newly
-            # loaded live session; saved history does not override it.
             self.session.shell_cwd = cwd
         else:
             self.session.shell_cwd = cwd
@@ -291,7 +289,21 @@ class Worker:
         self._install_initial_choices(saved_descriptor)
         if params.get("replay") and resume:
             self._replay_transcript()
-        self._start_catalog_discovery()
+
+        # Await discovery so initial session/open reply contains all discovered choices
+        explicit = loki.explicit_connection_option(loki.CREDENTIALS)
+        try:
+            _data, groups = await modelsdev.ensure_index()
+            discovered = modelsdev.flattened_config_option_choices(
+                loki.CREDENTIALS,
+                explicit_connection=explicit,
+                groups=groups,
+            )
+            if discovered:
+                self._install_catalog_choices(discovered)
+        except Exception as error:
+            print(f"models.dev discovery failed: {error}", file=sys.stderr)
+
         return {"configOptions": self.config_options()}
 
     def _start_catalog_discovery(self):
