@@ -1,3 +1,3 @@
 (use-modules (guix packages))
 (use-modules (guix profiles))
-(packages->manifest (list (primitive-load "guix.scm")))
+(packages->manifest (list (primitive-load (string-append (current-source-directory) "/guix.scm"))))
