@@ -183,8 +183,8 @@ class PtyUiTests(unittest.TestCase):
         output, _before_release = run_loki_pty_reply(stream=False)
         self.assertIn(b"Remote: API: dummy.invalid", output)
         self.assertIn(
-            b"Local: turn=idle, queued_messages=0, "
-            b"queued_images=0; mode=normal",
+            b"Local: turn: idle, queued messages: 0, "
+            b"queued images: 0, mode: normal",
             output,
         )
 
@@ -208,17 +208,17 @@ class PtyUiTests(unittest.TestCase):
             queued_inputs=["second", "third"],
         )
 
-        self.assertIn(b"queued_messages=1, queued_images=0", before_release)
-        self.assertIn(b"queued_messages=2, queued_images=0", before_release)
+        self.assertIn(b"queued messages: 1, queued images: 0", before_release)
+        self.assertIn(b"queued messages: 2, queued images: 0", before_release)
         self.assertIn(
-            b"turn=running, queued_messages=2, queued_images=0",
+            b"turn: running, queued messages: 2, queued images: 0",
             before_release,
         )
         self.assertIn(
-            b"turn=idle, queued_messages=0, queued_images=0",
+            b"turn: idle, queued messages: 0, queued images: 0",
             output,
         )
-        self.assertIn(b"queued_messages=0, queued_images=0", output)
+        self.assertIn(b"queued messages: 0, queued images: 0", output)
 
     def test_status_bar_tracks_image_after_queued_command_is_validated(self):
         output, before_release = run_loki_pty_reply(
@@ -228,8 +228,8 @@ class PtyUiTests(unittest.TestCase):
             create_image=True,
         )
 
-        self.assertIn(b"queued_messages=1, queued_images=0", before_release)
-        self.assertIn(b"queued_messages=0, queued_images=1", output)
+        self.assertIn(b"queued messages: 1, queued images: 0", before_release)
+        self.assertIn(b"queued messages: 0, queued images: 1", output)
 
     @unittest.skipIf(pyte is None, "pyte not installed")
     def test_pyte_screen_attributes(self):

@@ -292,8 +292,8 @@ class TerminalImageCommandTests(unittest.TestCase):
             }],
         })
         self.assertIn("Attached image for next prompt:", stderr)
-        self.assertIn("queued_images=1", status_updates[0])
-        self.assertIn("queued_images=0", status_updates[1])
+        self.assertIn("queued images: 1", status_updates[0])
+        self.assertIn("queued images: 0", status_updates[1])
 
     def test_empty_prompt_submits_all_staged_images_without_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1451,8 +1451,8 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             text,
             "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
-            "Local: turn=running, queued_messages=2, queued_images=1; "
-            f"mode={loki.current_agent_mode()}; CWD: {loki.STARTUP_CWD}; "
+            "Local: turn: running, queued messages: 2, queued images: 1, "
+            f"mode: {loki.current_agent_mode()}, CWD: {loki.STARTUP_CWD}; "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)

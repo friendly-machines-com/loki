@@ -405,8 +405,8 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
         displayed_model += " (deprecated)"
     return (
         'Remote: API: {}; Model: {}; /model\n'
-        'Local: turn={}, queued_messages={}, queued_images={}; '
-        'mode={}; CWD: {}; '
+        'Local: turn: {}, queued messages: {}, queued images: {}, '
+        'mode: {}, CWD: {}; '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         terminals.user_text_for_terminal(_status_api_base()),
