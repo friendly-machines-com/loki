@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 
 from .credentials import CredentialStore, capture_process_credentials
 
@@ -46,6 +47,9 @@ async def amain(credentials: CredentialStore) -> int:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--worker"]:
+        from .acp_worker_main import main as worker_main
+        return worker_main()
     credentials = capture_process_credentials()
     return asyncio.run(amain(credentials))
 
