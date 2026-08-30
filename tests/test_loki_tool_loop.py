@@ -3741,7 +3741,63 @@ class SubagentLaunchTests(unittest.TestCase):
             "Explore",
             "--prompt",
             "inspect this",
+            "--shell-cwd",
+            loki.current_cwd(),
         ])
+
+    def test_subagent_inherits_process_cwd_and_receives_shell_cwd(self):
+        saved = save_loki_state(["shell_cwd"])
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                loki.current_session().shell_cwd = tmpdir
+                manager = mock.Mock()
+                manager.run_exec = mock.AsyncMock(return_value=(
+                    types.SimpleNamespace(exit_code=0),
+                    "exited",
+                    "",
+                    "",
+                ))
+                with mock.patch.object(
+                        loki, "current_job_manager",
+                        return_value=manager):
+                    asyncio.run(loki.run_agent_async(
+                        "inspect", "inspect this"))
+
+                args, kwargs = manager.run_exec.await_args
+                self.assertEqual(kwargs["cwd"], os.getcwd())
+                self.assertEqual(
+                    args[0][-2:],
+                    ["--shell-cwd", tmpdir],
+                )
+        finally:
+            restore_loki_state(saved)
+
+    def test_subagent_cli_applies_explicit_shell_cwd(self):
+        saved = save_loki_state(["shell_cwd"])
+        runner = mock.AsyncMock()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir, \
+                    mock.patch.object(
+                        terminal_frontend, "build_config_from_env"), \
+                    mock.patch.object(
+                        terminal_frontend, "apply_runtime_config"), \
+                    mock.patch.object(
+                        terminal_frontend, "current_model",
+                        return_value="model"), \
+                    mock.patch.object(
+                        terminal_frontend, "run_subagent_cli_async",
+                        new=runner):
+                status = asyncio.run(terminal_frontend.async_main([
+                    "--subagent", "Explore",
+                    "--prompt", "inspect this",
+                    "--shell-cwd", tmpdir,
+                ]))
+
+                self.assertEqual(status, 0)
+                self.assertEqual(loki.current_cwd(), tmpdir)
+                self.assertEqual(os.getcwd(), loki.STARTUP_CWD)
+        finally:
+            restore_loki_state(saved)
 
     def test_subagent_environment_contains_only_active_normalized_key(self):
         names = ["runtime_config"]

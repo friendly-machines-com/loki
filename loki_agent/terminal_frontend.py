@@ -519,7 +519,7 @@ entry point: python3 -m loki_agent.acp_main
 
 CLI_SHORT_OPTS = 'r:p:h'
 CLI_LONG_OPTS = ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=',
-                 'dangerously-skip-permissions', 'help']
+                 'shell-cwd=', 'dangerously-skip-permissions', 'help']
 
 
 def parse_cli_args(args):
@@ -547,6 +547,7 @@ async def async_main(args) -> int:
     subagent_type = None
     headless = False
     toolset = None
+    shell_cwd = None
     for option_name, option_value in options:
         if option_name in ['--prompt', '-p']:
             prompt_arg = option_value
@@ -556,6 +557,16 @@ async def async_main(args) -> int:
             headless = True
         elif option_name == '--toolset':
             toolset = option_value
+        elif option_name == '--shell-cwd':
+            shell_cwd = option_value
+
+    if shell_cwd is not None:
+        try:
+            _core.change_shell_cwd(shell_cwd)
+        except (FileNotFoundError, NotADirectoryError) as error:
+            print(f"Configuration error: cwd is not a directory: {error}",
+                  file=sys.stderr)
+            return 2
 
     if subagent_type or headless:
         try:

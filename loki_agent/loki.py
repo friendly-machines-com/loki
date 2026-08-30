@@ -2672,6 +2672,8 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
         agent_type,
         '--prompt',
         prompt,
+        '--shell-cwd',
+        current_cwd(),
     ]
 
 
@@ -2693,13 +2695,14 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         job = await current_job_manager().run_background_exec(
             argv,
             description=description or "subagent task",
-            env=_subagent_env())
+            env=_subagent_env(),
+            cwd=os.getcwd())
         return _format_started_background_job(job, "subagent")
 
     job, status, stdout, stderr = await current_job_manager().run_exec(
         argv, SUBAGENT_TIMEOUT_S * 1000,
         description=description or "subagent task",
-        env=_subagent_env(), cancel_event=cancel_event)
+        env=_subagent_env(), cwd=os.getcwd(), cancel_event=cancel_event)
     if status == "cancelled":
         return "Error: subagent was cancelled by the user"
     if status == "timed_out":
