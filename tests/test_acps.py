@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from loki_agent import acps
 from loki_agent.credentials import is_credential_name
@@ -99,6 +100,25 @@ class AsyncFdLineReaderTests(unittest.TestCase):
             os.close(read_fd)
             os.close(write_fd)
 
+    def test_reads_through_event_loop_readiness_without_an_executor(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"message\n")
+
+            async def scenario():
+                reader = acps.AsyncFdLineReader(read_fd)
+                with mock.patch.object(
+                        asyncio.BaseEventLoop,
+                        "run_in_executor",
+                        side_effect=AssertionError(
+                            "ACP stdin used an executor")):
+                    return await reader.readline()
+
+            self.assertEqual(asyncio.run(scenario()), b"message\n")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
 
 class QuarantineTests(unittest.TestCase):
     def test_stdout_is_reserved_for_protocol(self):
@@ -132,7 +152,10 @@ class EntrypointTests(unittest.TestCase):
                         f"{LOKI_ACP} is not executable")
 
     def test_pyproject_declares_installed_acp_entrypoint(self):
-        content = open(os.path.join(ROOT, "pyproject.toml")).read()
+        with open(
+                os.path.join(ROOT, "pyproject.toml"),
+                encoding="utf-8") as stream:
+            content = stream.read()
         self.assertIn(
             'loki-acp = "loki_agent.acp_main:main"', content,
             "installed users need the loki-acp console script")
@@ -881,10 +904,9 @@ class ConfigOptionTests(unittest.TestCase):
 class TtyStdinTests(unittest.TestCase):
     """The front must work when stdin is a tty, not just a pipe.
 
-    terminals.py closes sys.stdin at import when stdin is a tty (the
-    terminal UI owns fd 0 via /dev/tty); the ACP processes read fd 0
-    directly instead.  This test gives the front a real controlling
-    pty, exactly like an interactive manual run.
+    ACP owns its protocol stdin and reads fd 0 directly. This test gives
+    the shipped front executable a real controlling pty, exactly like an
+    interactive manual run.
     """
 
     def test_front_answers_initialize_with_tty_stdin(self):
@@ -1127,7 +1149,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 worker = Worker(session, lambda message: None)
                 with mock.patch(
                         "loki_agent.acp_worker.modelsdev.ensure_index",
-                        new=mock.AsyncMock(return_value=({}, []))):
+                        new=mock.AsyncMock(return_value=({}, {}))):
                     result = asyncio.run(worker.open({
                         "sessionId": "live-session",
                         "cwd": client_cwd,
@@ -1168,7 +1190,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                     worker = Worker(session, lambda message: None)
                     with mock.patch.object(
                             models, "ensure_index",
-                            new=mock.AsyncMock(return_value=({}, []))):
+                            new=mock.AsyncMock(return_value=({}, {}))):
                         result = asyncio.run(worker.open({
                             "sessionId": f"live-{number}",
                             "cwd": tmpdir,
