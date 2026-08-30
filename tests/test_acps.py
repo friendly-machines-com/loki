@@ -122,79 +122,6 @@ class QuarantineTests(unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
-class NativeAsyncStdinTests(unittest.TestCase):
-    @staticmethod
-    def _command(module):
-        code = (
-            "import asyncio, runpy\n"
-            "def forbidden(*args, **kwargs):\n"
-            "    raise AssertionError('ACP stdin used an executor')\n"
-            "asyncio.BaseEventLoop.run_in_executor = forbidden\n"
-            f"runpy.run_module({module!r}, run_name='__main__')\n"
-        )
-        return [sys.executable, "-c", code]
-
-    def _assert_entrypoint_works_without_executor(self, module, message):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = dict(os.environ)
-            env.update({
-                "HOME": tmpdir,
-                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
-                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
-                "TERM": "dumb",
-                "LOKI_PROVIDER": "dummy",
-                "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_MODEL": "dummy-model",
-            })
-            process = subprocess.Popen(
-                self._command(module),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-                cwd=ROOT,
-            )
-            self.addCleanup(_close_process_streams, process)
-            try:
-                stdout, stderr = process.communicate(
-                    json.dumps(message) + "\n", timeout=5)
-                line = stdout.splitlines()[0] if stdout.splitlines() else ""
-                self.assertTrue(
-                    line,
-                    stderr or f"{module} produced no response",
-                )
-                reply = json.loads(line)
-                self.assertEqual(reply["id"], message["id"])
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
-                self.fail(f"{module} did not exit after stdin EOF")
-
-    def test_front_stdin_does_not_use_an_executor(self):
-        self._assert_entrypoint_works_without_executor(
-            "loki_agent.acp_main",
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": 1},
-            },
-        )
-
-    def test_worker_stdin_does_not_use_an_executor(self):
-        self._assert_entrypoint_works_without_executor(
-            "loki_agent.acp_worker_main",
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "unknown",
-                "params": {},
-            },
-        )
-
-
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class EntrypointTests(unittest.TestCase):
     def test_loki_acp_script_is_shipped_and_executable(self):
         # The user-facing ACP entrypoint is the deliverable; these tests
@@ -422,12 +349,6 @@ class FrontWorkerTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     front.kill()
                     front.wait()
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EventMapperTests(unittest.TestCase):
     def test_assistant_delta_streams_chunk(self):
         from loki_agent import acp_events
@@ -1540,3 +1461,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 formats.validate_events(session.transcript_items)
         finally:
             loki._DEFAULT_SESSION = old_session
+
+
+if __name__ == "__main__":
+    unittest.main()

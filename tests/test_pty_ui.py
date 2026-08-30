@@ -22,6 +22,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+LOKI = ROOT / "loki.py"
 
 REPLY = "**boldword** and `codeword` done"
 BOLD_RUN = b"\x1b[1mboldword\x1b[0m"
@@ -221,13 +222,11 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
                 "LOKI_DUMMY_REPLY": (
                     "".join(stream_chunks) if stream_chunks else REPLY),
                 "LOKI_STREAM": "1" if stream else "0",
-                "PYTHONPATH": str(ROOT),
             }
             if stream_chunks:
                 env["LOKI_DUMMY_STREAM_CHUNKS"] = json.dumps(stream_chunks)
                 env["LOKI_DUMMY_STREAM_GATE"] = gate
-            os.execvpe(
-                sys.executable, [sys.executable, "-m", "loki_agent"], env)
+            os.execve(str(LOKI), [str(LOKI)], env)
         except Exception:
             pass
         os._exit(127)
@@ -419,12 +418,9 @@ class PtyCliUsageTests(unittest.TestCase):
                     "XDG_STATE_HOME": os.path.join(cwd, "state"),
                     "PATH": os.environ.get("PATH", ""),
                     "TERM": "xterm",
-                    "PYTHONPATH": str(ROOT),
                 }
-                os.execvpe(
-                    sys.executable,
-                    [sys.executable, str(ROOT / "loki.py"), *cli_args],
-                    env)
+                os.execve(
+                    str(LOKI), [str(LOKI), *cli_args], env)
             except Exception:
                 pass
             os._exit(127)
@@ -488,12 +484,6 @@ class PtyCliUsageTests(unittest.TestCase):
                         cli_args[0].encode(), output,
                         "the rejected option must be named back to the "
                         "user")
-
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
 class PtyCtrlCTests(unittest.TestCase):
@@ -658,3 +648,7 @@ class PtyTurnCancelTests(unittest.TestCase):
             os.close(master)
         self.assertIn(b"EVENT_SET", out)
         self.assertNotIn(b"EVENT_NOT_SET", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

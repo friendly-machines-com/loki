@@ -327,14 +327,13 @@ class ExternalHookTests(unittest.TestCase):
             env = {
                 "HOME": directory,
                 "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": str(root),
                 "TERM": "dumb",
                 "LOKI_HOOKS": config_path,
             }
 
             result = subprocess.run(
-                [sys.executable, str(root / "loki.py"), "--headless"],
-                cwd=root,
+                [str(root / "loki.py"), "--headless"],
+                cwd=directory,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

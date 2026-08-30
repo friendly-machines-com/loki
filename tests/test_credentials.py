@@ -124,7 +124,6 @@ print(json.dumps({
 }))
 '''
         env = {
-            "PYTHONPATH": ROOT,
             "LOKI_TEST_BEFORE": "before",
             "LOKI_TEST_TOKEN": "top-secret",
             "LOKI_TEST_AFTER": "after",
@@ -217,7 +216,6 @@ print(json.dumps({
 }))
 '''
         env = {
-            "PYTHONPATH": ROOT,
             "LOKI_TEST_BEFORE": "before",
             "LOKI_TEST_TOKEN": "top-secret",
             "LOKI_TEST_AFTER": "after",
@@ -287,7 +285,6 @@ executable = os.fsencode(sys.executable)
 code = {second_stage.encode("utf-8")!r}
 argv = (ctypes.c_char_p * 4)(executable, b"-c", code, None)
 entries = [
-    {("PYTHONPATH=" + ROOT).encode("utf-8")!r},
     b"BEFORE=visible",
     b"DUPLICATE_TOKEN=one",
     b"DUPLICATE_TOKEN=two",

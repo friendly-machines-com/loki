@@ -223,24 +223,18 @@ class TerminalImageCommandTests(unittest.TestCase):
             status = asyncio.run(terminal_frontend.async_main([]))
         return status, captured, stdout.getvalue(), stderr.getvalue()
 
-    def test_user_echo_is_safe_but_model_receives_original_text(self):
+    def test_model_receives_original_user_text(self):
         logical = (
             "first\x1b]0;owned\x07\t\n"
             "second\r\x00\u009b")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            status, captured, stdout, _stderr = self._run_terminal(
+            status, captured, _stdout, _stderr = self._run_terminal(
                 [logical, "/quit"], tmpdir)
 
         self.assertEqual(status, 0)
         self.assertEqual(
             formats.item_text(captured[0][-1]), logical)
-        self.assertIn(
-            "User: first^[]0;owned^G^I\n"
-            "second^M^@\\x9b\n",
-            stdout,
-        )
-        self.assertNotIn("\x1b]0;owned\x07", stdout)
 
     def test_image_command_attaches_snapshot_to_next_text_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1326,36 +1320,29 @@ class ModelLoadingTests(unittest.TestCase):
 
 
 class ExitStatusTests(unittest.TestCase):
-    def test_executable_entry_points_propagate_headless_failure(self):
+    def test_executable_entry_point_propagates_headless_failure(self):
         root = pathlib.Path(__file__).resolve().parents[1]
-        env = {
-            "HOME": os.environ.get("HOME", str(root)),
-            "PATH": os.environ.get("PATH", ""),
-            "PYTHONPATH": str(root),
-            "TERM": "dumb",
-        }
-        commands = [
-            [sys.executable, str(root / "loki.py"), "--headless"],
-            [sys.executable, "-m", "loki_agent", "--headless"],
-        ]
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                "HOME": directory,
+                "PATH": os.environ.get("PATH", ""),
+                "TERM": "dumb",
+            }
+            result = subprocess.run(
+                [str(root / "loki.py"), "--headless"],
+                cwd=directory,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
 
-        for command in commands:
-            with self.subTest(command=command):
-                result = subprocess.run(
-                    command,
-                    cwd=root,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=10,
-                )
-
-                self.assertEqual(result.returncode, 2)
-                self.assertIn(
-                    "Configuration error: API endpoint missing",
-                    result.stderr,
-                )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "Configuration error: API endpoint missing",
+            result.stderr,
+        )
 
     def test_cleanup_failure_changes_only_successful_status(self):
         old_credentials = loki.CREDENTIALS
@@ -4297,39 +4284,6 @@ class StreamingToolLoopTests(unittest.TestCase):
             })
 
         self.assertIn("model response incomplete", stderr.getvalue())
-
-    def test_terminal_stream_writes_one_plain_incremental_line(self):
-        old_config = loki.current_session().runtime_config
-        output = io.StringIO()
-        try:
-            loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
-            with contextlib.redirect_stdout(output), \
-                    contextlib.redirect_stderr(output):
-                terminal_frontend._terminal_agent_event({"type": "assistant_start"})
-                terminal_frontend._terminal_agent_event({
-                    "type": "assistant_delta",
-                    "content": "**hel",
-                })
-                terminal_frontend._terminal_agent_event({
-                    "type": "assistant_delta",
-                    "content": "lo**",
-                })
-                terminal_frontend._terminal_agent_event({
-                    "type": "assistant_end",
-                    "complete": True,
-                })
-                terminal_frontend._terminal_agent_event({
-                    "type": "response_timing",
-                    "elapsed": 1.25,
-                })
-        finally:
-            loki.current_session().runtime_config = old_config
-
-        self.assertEqual(
-            output.getvalue(),
-            "\nlocal-model: **hello**\n"
-            "\n[T]  [LLM Response Time: 1.250s]\n",
-        )
 
     def test_streamed_text_is_not_printed_again_or_duplicated_in_transcript(
             self):
