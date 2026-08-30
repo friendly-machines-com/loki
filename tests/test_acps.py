@@ -153,7 +153,7 @@ class NativeAsyncStdinTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 env=env,
-                cwd=tmpdir,
+                cwd=ROOT,
             )
             self.addCleanup(_close_process_streams, process)
             try:
@@ -1204,13 +1204,14 @@ class WorkerSessionContractTests(unittest.TestCase):
                 })
                 loki.CHAT_LOG_DIR = chat_dir
                 worker = Worker(session, lambda message: None)
-                with mock.patch.object(
-                        worker, "_start_catalog_discovery"):
-                    result = worker.open({
+                with mock.patch(
+                        "loki_agent.acp_worker.modelsdev.ensure_index",
+                        new=mock.AsyncMock(return_value=({}, []))):
+                    result = asyncio.run(worker.open({
                         "sessionId": "live-session",
                         "cwd": client_cwd,
                         "resume": saved_name,
-                    })
+                    }))
 
                 self.assertEqual(session.shell_cwd, client_cwd)
                 self.assertEqual(session.model, "saved-model")
@@ -1225,7 +1226,7 @@ class WorkerSessionContractTests(unittest.TestCase):
             loki.CREDENTIALS = old_credentials
             loki.CHAT_LOG_DIR = old_chat_dir
 
-    def test_new_sessions_get_distinct_persistent_logs_without_catalog_io(self):
+    def test_new_sessions_get_distinct_persistent_logs_with_empty_catalog(self):
         from unittest import mock
         from loki_agent import loki, models
         from loki_agent.acp_worker import Worker
@@ -1244,17 +1245,13 @@ class WorkerSessionContractTests(unittest.TestCase):
                     session = Session(shell_cwd=tmpdir)
                     loki._DEFAULT_SESSION = session
                     worker = Worker(session, lambda message: None)
-                    with (
-                            mock.patch.object(
-                                worker, "_start_catalog_discovery"),
-                            mock.patch.object(
-                                models, "ensure_index",
-                                side_effect=AssertionError(
-                                    "session/open performed catalog I/O"))):
-                        result = worker.open({
+                    with mock.patch.object(
+                            models, "ensure_index",
+                            new=mock.AsyncMock(return_value=({}, []))):
+                        result = asyncio.run(worker.open({
                             "sessionId": f"live-{number}",
                             "cwd": tmpdir,
-                        })
+                        }))
                     paths.append(session.chat_log_path)
                     option = result["configOptions"][0]
                     self.assertEqual(
