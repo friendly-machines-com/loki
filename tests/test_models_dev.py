@@ -899,12 +899,6 @@ class PickerTests(unittest.TestCase):
                          " cost: in $1.5 per 1M tokens, out $3.25 per 1M tokens")
         self.assertEqual(models.cost_text(no_cost), "")
         self.assertEqual(models.cost_range_text([("p", {}, no_cost)]), "")
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class NpmProtocolDetectionTests(unittest.TestCase):
     def test_openai_compatible_npm_maps_to_openai_chat(self):
         from loki_agent import protocols
@@ -948,3 +942,7 @@ class ConfigOptionAvailabilityTests(unittest.TestCase):
             ["loki-explicit"],
         )
         self.assertIs(choices[0][1], explicit)
+
+
+if __name__ == "__main__":
+    unittest.main()

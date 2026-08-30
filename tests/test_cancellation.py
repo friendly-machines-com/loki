@@ -264,12 +264,6 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
             [event["type"] for event in events],
             ["assistant_message", "response_refusal"],
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ForegroundJobCancelTests(unittest.TestCase):
     """Ctrl-C must interrupt the foreground job a turn is awaiting."""
 
@@ -322,3 +316,7 @@ class ForegroundJobCancelTests(unittest.TestCase):
 
         job, status, stdout, stderr = asyncio.run(run())
         self.assertEqual(status, "timed_out")
+
+
+if __name__ == "__main__":
+    unittest.main()
