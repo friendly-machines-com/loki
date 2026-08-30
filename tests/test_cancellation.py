@@ -264,6 +264,8 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
             [event["type"] for event in events],
             ["assistant_message", "response_refusal"],
         )
+
+
 class ForegroundJobCancelTests(unittest.TestCase):
     """Ctrl-C must interrupt the foreground job a turn is awaiting."""
 

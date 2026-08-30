@@ -14,7 +14,6 @@ import select
 import shutil
 import signal
 import struct
-import sys
 import tempfile
 import termios
 import time
