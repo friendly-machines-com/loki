@@ -3736,26 +3736,7 @@ class SubagentLaunchTests(unittest.TestCase):
 
         self.assertEqual(argv, [
             sys.executable,
-            os.path.abspath("./loki.py"),
-            "--subagent",
-            "Explore",
-            "--prompt",
-            "inspect this",
-        ])
-
-    def test_subagent_launch_preserves_module_entrypoint(self):
-        old_argv = sys.argv[:]
-        try:
-            sys.argv = [os.path.abspath("loki_agent/__main__.py")]
-
-            argv = loki._subagent_argv("Explore", "inspect this")
-        finally:
-            sys.argv = old_argv
-
-        self.assertEqual(argv, [
-            sys.executable,
-            "-m",
-            "loki_agent",
+            "./loki.py",
             "--subagent",
             "Explore",
             "--prompt",

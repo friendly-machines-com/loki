@@ -2664,21 +2664,10 @@ def _format_started_background_job(job: Job, kind: str = "job") -> str:
     ])
 
 
-def _current_entrypoint_argv() -> list[str]:
-    argv0 = sys.argv[0]
-    if argv0 and os.path.basename(argv0) != "__main__.py":
-        script = shutil.which(argv0) if not os.path.dirname(argv0) else argv0
-        script = script or argv0
-        if not os.path.isabs(script):
-            script = os.path.join(STARTUP_CWD, script)
-        return [sys.executable, os.path.abspath(script)]
-    # python -m loki_agent sets sys.argv[0] to loki_agent/__main__.py. Running
-    # that file directly would lose package context and break relative imports.
-    return [sys.executable, "-m", "loki_agent"]
-
-
 def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
-    return _current_entrypoint_argv() + [
+    return [
+        sys.executable,
+        sys.argv[0],
         '--subagent',
         agent_type,
         '--prompt',

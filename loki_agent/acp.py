@@ -18,7 +18,7 @@ import uuid
 
 from . import acps, savefiles
 from .credentials import CredentialStore
-from .loki import CHAT_LOG_DIR, _current_entrypoint_argv
+from .loki import CHAT_LOG_DIR
 
 PROTOCOL_VERSION = 1
 AGENT_INFO = {"name": "loki", "title": "Loki", "version": "0.1"}
@@ -29,7 +29,7 @@ SESSION_METHODS = (
     "session/set_config_option",
 )
 
-WORKER_COMMAND = _current_entrypoint_argv() + ["--worker"]
+WORKER_COMMAND = [sys.executable, sys.argv[0], "--worker"]
 
 
 class WorkerChannel:
