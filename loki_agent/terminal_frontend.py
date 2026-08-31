@@ -973,10 +973,8 @@ async def async_main(args) -> int:
                         terminal.write_text(cmd)
                         print("]")
                         cmd_output = await run_bash_async(cmd)
-                        # This is the explicit Unix escape hatch: a command
-                        # entered with "!" owns its terminal output, including
-                        # any control sequences it deliberately produces.
-                        print(cmd_output)  # Show output to you in the terminal
+                        terminal.write_text(cmd_output, multiline=True)
+                        print()
                         # Morph the user input so the AI sees exactly what you did and the result
                         user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
                     else:

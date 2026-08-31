@@ -331,7 +331,7 @@ class PtyUiTests(unittest.TestCase):
             output,
         )
 
-    def test_explicit_bang_command_keeps_raw_unix_output(self):
+    def test_explicit_bang_command_output_is_terminal_safe(self):
         attack = b"\x1b]777;LOKI_COMMAND_OUTPUT\x07"
 
         output, _ = run_loki_pty_reply(
@@ -340,7 +340,8 @@ class PtyUiTests(unittest.TestCase):
             raw_file_data=attack,
         )
 
-        self.assertIn(attack, output)
+        self.assertNotIn(attack, output)
+        self.assertIn(b"^[]777;LOKI_COMMAND_OUTPUT^G", output)
 
     def test_status_bar_shows_api_and_mode(self):
         # Regression for the frontend split dropping the status text
