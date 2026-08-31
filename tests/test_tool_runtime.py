@@ -425,6 +425,31 @@ class ExternalHookTests(unittest.TestCase):
             "external.transform",
         )
 
+    def test_external_hook_does_not_inherit_unlisted_descriptors(self):
+        read_fd, write_fd = os.pipe()
+        script = (
+            "import json, os, sys\n"
+            "try:\n"
+            "    os.fstat(int(sys.argv[1]))\n"
+            "except OSError:\n"
+            "    json.dump({'owner_fd': 'closed'}, sys.stdout)\n"
+            "else:\n"
+            "    json.dump({'owner_fd': 'inherited'}, sys.stdout)\n"
+        )
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                result = asyncio.run(tool_runtime._run_hook_command(
+                    [sys.executable, "-c", script, str(read_fd)],
+                    {},
+                    directory,
+                    1000,
+                ))
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+        self.assertEqual(result, {"owner_fd": "closed"})
+
     def test_external_post_hook_can_only_append_note(self):
         script = (
             "import json, sys; "

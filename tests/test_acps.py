@@ -996,6 +996,20 @@ class WireCwdTests(unittest.TestCase):
 
 
 class WorkerSessionContractTests(unittest.TestCase):
+    def test_worker_close_reaps_session_owned_jobs(self):
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        session = Session(shell_cwd="/tmp")
+        manager = mock.Mock()
+        manager.close_session_owned = mock.AsyncMock()
+        session.job_manager = manager
+        worker = Worker(session, lambda message: None, "session")
+
+        asyncio.run(worker.close())
+
+        manager.close_session_owned.assert_awaited_once_with()
+
     def test_catalog_discovery_runs_as_an_event_loop_task(self):
         from unittest import mock
         from loki_agent import loki, models

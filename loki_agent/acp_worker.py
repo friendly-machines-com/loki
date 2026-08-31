@@ -72,18 +72,25 @@ class Worker:
         await self._answer(message)
 
     async def close(self):
-        self.cancel_event.set()
-        catalog_task = self._catalog_task
-        if catalog_task is not None and not catalog_task.done():
-            catalog_task.cancel()
-            await asyncio.gather(catalog_task, return_exceptions=True)
-        task = self._prompt_task
-        if task is not None and not task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=3)
-            except asyncio.TimeoutError:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+        try:
+            self.cancel_event.set()
+            catalog_task = self._catalog_task
+            if catalog_task is not None and not catalog_task.done():
+                catalog_task.cancel()
+                await asyncio.gather(
+                    catalog_task, return_exceptions=True)
+            task = self._prompt_task
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=3)
+                except asyncio.TimeoutError:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        finally:
+            manager = self.session.job_manager
+            if manager is not None:
+                await manager.close_session_owned()
 
     async def _answer(self, message: dict):
         request_id = message.get("id")

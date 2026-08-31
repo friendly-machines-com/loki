@@ -182,6 +182,62 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertEqual(metadata["status"], "cancelled")
         self.assertEqual(metadata["exit_code"], job.process.returncode)
 
+    def test_session_close_reaps_owned_jobs_only(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            owned_script = (
+                "import os,sys\n"
+                "owner_fd = int(sys.argv[-1])\n"
+                "print('owned-ready', flush=True)\n"
+                "os.read(owner_fd, 1)\n"
+            )
+            ordinary_script = (
+                "import time\n"
+                "print('ordinary-ready', flush=True)\n"
+                "time.sleep(30)\n"
+            )
+            owned = await manager.run_background_exec(
+                [sys.executable, "-c", owned_script],
+                cwd=tmpdir,
+                session_owned=True,
+            )
+            ordinary = await manager.run_background_exec(
+                [sys.executable, "-c", ordinary_script],
+                cwd=tmpdir,
+            )
+            try:
+                deadline = asyncio.get_running_loop().time() + 3
+                while (
+                        "owned-ready" not in loki._read_spool_tail(
+                            owned.stdout_path)
+                        or "ordinary-ready" not in loki._read_spool_tail(
+                            ordinary.stdout_path)
+                ):
+                    if asyncio.get_running_loop().time() >= deadline:
+                        self.fail("background processes did not become ready")
+                    await asyncio.sleep(0.01)
+
+                await manager.close_session_owned()
+                self.assertIsNotNone(owned.process.returncode)
+                self.assertIsNone(ordinary.process.returncode)
+                with open(
+                        owned.metadata_path,
+                        encoding="utf-8") as metadata_file:
+                    metadata = json.load(metadata_file)
+                return owned, ordinary, metadata
+            finally:
+                if ordinary.process.returncode is None:
+                    os.killpg(ordinary.pgid, signal.SIGKILL)
+                    await ordinary.process.wait()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            owned, ordinary, metadata = asyncio.run(scenario(tmpdir))
+        self.assertEqual(owned.status, "owner_closed")
+        self.assertEqual(owned.exit_code, 0)
+        self.assertTrue(metadata["session_owned"])
+        self.assertEqual(metadata["status"], "owner_closed")
+        self.assertIsNotNone(ordinary.process.returncode)
+
     def test_bash_timeout_is_a_failed_tool_result(self):
         async def scenario(tmpdir):
             old_manager = loki.current_session().job_manager

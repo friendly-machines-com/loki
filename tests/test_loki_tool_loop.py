@@ -3799,12 +3799,147 @@ class SubagentLaunchTests(unittest.TestCase):
 
                 args, kwargs = manager.run_exec.await_args
                 self.assertEqual(kwargs["cwd"], os.getcwd())
+                self.assertTrue(kwargs["session_owned"])
                 self.assertEqual(
                     args[0][-2:],
                     ["--shell-cwd", tmpdir],
                 )
         finally:
             restore_loki_state(saved)
+
+    def test_subagent_operation_is_cancelled_when_owner_fd_closes(self):
+        async def scenario():
+            read_fd, write_fd = os.pipe()
+            cancelled = asyncio.Event()
+
+            async def operation():
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+
+            task = asyncio.create_task(
+                terminal_frontend._run_until_session_owner_closes(
+                    operation(), read_fd))
+            await asyncio.sleep(0)
+            os.close(write_fd)
+            completed = await asyncio.wait_for(task, timeout=1)
+            return completed, cancelled.is_set()
+
+        completed, cancelled = asyncio.run(scenario())
+        self.assertFalse(completed)
+        self.assertTrue(cancelled)
+
+    def test_subagent_owner_fd_is_not_inherited_by_child_commands(self):
+        async def scenario():
+            read_fd, write_fd = os.pipe()
+            inherited = []
+
+            async def operation():
+                code = (
+                    "import os,sys\n"
+                    "try:\n"
+                    "    os.fstat(int(sys.argv[1]))\n"
+                    "except OSError:\n"
+                    "    print('closed')\n"
+                    "else:\n"
+                    "    print('inherited')\n"
+                )
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    code,
+                    str(read_fd),
+                    stdout=asyncio.subprocess.PIPE,
+                    close_fds=True,
+                )
+                stdout, _stderr = await process.communicate()
+                inherited.append(stdout.decode("ascii").strip())
+
+            try:
+                completed = await (
+                    terminal_frontend._run_until_session_owner_closes(
+                        operation(), read_fd))
+            finally:
+                os.close(write_fd)
+            return completed, inherited
+
+        completed, inherited = asyncio.run(scenario())
+        self.assertTrue(completed)
+        self.assertEqual(inherited, ["closed"])
+
+    def test_owner_fd_is_closed_when_not_attached_to_a_subagent(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                status = asyncio.run(terminal_frontend.async_main([
+                    "--session-owner-fd", str(read_fd),
+                ]))
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+        finally:
+            os.close(write_fd)
+
+        self.assertEqual(status, 2)
+
+    def test_owner_fd_is_closed_when_subagent_cwd_is_invalid(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                missing = os.path.join(directory, "missing")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    status = asyncio.run(terminal_frontend.async_main([
+                        "--subagent", "Explore",
+                        "--session-owner-fd", str(read_fd),
+                        "--shell-cwd", missing,
+                    ]))
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+        finally:
+            os.close(write_fd)
+
+        self.assertEqual(status, 2)
+
+    def test_owner_fd_is_closed_when_subagent_config_is_invalid(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with mock.patch.object(
+                    terminal_frontend,
+                    "build_config_from_env",
+                    side_effect=ValueError("invalid config")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                status = asyncio.run(terminal_frontend.async_main([
+                    "--subagent", "Explore",
+                    "--session-owner-fd", str(read_fd),
+                ]))
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+        finally:
+            os.close(write_fd)
+
+        self.assertEqual(status, 2)
+
+    def test_owner_fd_is_closed_when_subagent_model_is_missing(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with mock.patch.object(
+                    terminal_frontend, "build_config_from_env"), \
+                    mock.patch.object(
+                        terminal_frontend, "apply_runtime_config"), \
+                    mock.patch.object(
+                        terminal_frontend, "current_model",
+                        return_value=""), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                status = asyncio.run(terminal_frontend.async_main([
+                    "--subagent", "Explore",
+                    "--session-owner-fd", str(read_fd),
+                ]))
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+        finally:
+            os.close(write_fd)
+
+        self.assertEqual(status, 2)
 
     def test_subagent_cli_applies_explicit_shell_cwd(self):
         saved = save_loki_state(["shell_cwd"])

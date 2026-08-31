@@ -47,27 +47,33 @@ async def amain(credentials: CredentialStore) -> int:
         return 2
 
     import json
-    async for raw_line in acps.AsyncFdLineReader(0):
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            write(acps.response(
-                None, error={"code": acps.PARSE_ERROR, "message": str(error)}))
-            continue
-        if not isinstance(message, dict):
-            write(acps.response(
-                None,
-                error={"code": acps.PARSE_ERROR,
-                       "message": "not a JSON object"}))
-            continue
-        # session/prompt runs as a task so the read loop keeps consuming;
-        # otherwise a session/cancel arriving mid-turn would queue behind
-        # the prompt it is meant to interrupt.
-        await worker.handle(message, concurrent=True)
-    await worker.close()
+    try:
+        async for raw_line in acps.AsyncFdLineReader(0):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                write(acps.response(
+                    None,
+                    error={
+                        "code": acps.PARSE_ERROR,
+                        "message": str(error),
+                    }))
+                continue
+            if not isinstance(message, dict):
+                write(acps.response(
+                    None,
+                    error={"code": acps.PARSE_ERROR,
+                           "message": "not a JSON object"}))
+                continue
+            # session/prompt runs as a task so the read loop keeps consuming;
+            # otherwise a session/cancel arriving mid-turn would queue behind
+            # the prompt it is meant to interrupt.
+            await worker.handle(message, concurrent=True)
+    finally:
+        await worker.close()
     return 0
 
 

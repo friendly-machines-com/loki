@@ -20,6 +20,7 @@ import sys
 from dataclasses import dataclass
 from pprint import pformat
 
+from . import acps
 from . import formats
 from . import models as modelsdev
 from . import protocols
@@ -639,7 +640,8 @@ entry point: python3 -m loki_agent.acp_main
 
 CLI_SHORT_OPTS = 'r:p:h'
 CLI_LONG_OPTS = ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=',
-                 'shell-cwd=', 'dangerously-skip-permissions', 'help']
+                 'shell-cwd=', 'session-owner-fd=',
+                 'dangerously-skip-permissions', 'help']
 
 
 def parse_cli_args(args):
@@ -648,6 +650,33 @@ def parse_cli_args(args):
     # `--resume=` so it opens the picker instead of erroring out.
     args = ['--resume=' if a == '--resume' else a for a in args]
     return getopt.getopt(args, CLI_SHORT_OPTS, CLI_LONG_OPTS)
+
+
+async def _run_until_session_owner_closes(coroutine, owner_fd: int) -> bool:
+    """Run a trusted child operation while its owner capability is live."""
+    os.set_inheritable(owner_fd, False)
+    owner_task = asyncio.create_task(
+        acps.AsyncFdLineReader(owner_fd).readline(),
+        name="loki-session-owner",
+    )
+    operation_task = asyncio.create_task(
+        coroutine, name="loki-session-owned-operation")
+    try:
+        done, _pending = await asyncio.wait(
+            {owner_task, operation_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in done:
+            await operation_task
+            return True
+        operation_task.cancel()
+        await asyncio.gather(operation_task, return_exceptions=True)
+        return False
+    finally:
+        if not owner_task.done():
+            owner_task.cancel()
+        await asyncio.gather(owner_task, return_exceptions=True)
+        os.close(owner_fd)
 
 
 async def async_main(args) -> int:
@@ -668,6 +697,7 @@ async def async_main(args) -> int:
     headless = False
     toolset = None
     shell_cwd = None
+    session_owner_fd = None
     for option_name, option_value in options:
         if option_name in ['--prompt', '-p']:
             prompt_arg = option_value
@@ -679,6 +709,29 @@ async def async_main(args) -> int:
             toolset = option_value
         elif option_name == '--shell-cwd':
             shell_cwd = option_value
+        elif option_name == '--session-owner-fd':
+            try:
+                session_owner_fd = int(option_value)
+                if session_owner_fd < 3:
+                    raise ValueError(
+                        "owner descriptor must be at least 3")
+                os.fstat(session_owner_fd)
+            except (OSError, ValueError) as error:
+                print(
+                    f"Configuration error: invalid session owner "
+                    f"descriptor: {error}",
+                    file=sys.stderr,
+                )
+                return 2
+
+    if session_owner_fd is not None and not subagent_type:
+        os.close(session_owner_fd)
+        print(
+            "Configuration error: a session owner descriptor is only "
+            "valid for a subagent.",
+            file=sys.stderr,
+        )
+        return 2
 
     if shell_cwd is not None:
         try:
@@ -689,6 +742,8 @@ async def async_main(args) -> int:
                 str(error),
                 file=sys.stderr,
             )
+            if session_owner_fd is not None:
+                os.close(session_owner_fd)
             return 2
 
     if subagent_type or headless:
@@ -699,13 +754,23 @@ async def async_main(args) -> int:
             _print_text_line(
                 "Configuration error: ", e, file=sys.stderr,
                 multiline=True)
+            if session_owner_fd is not None:
+                os.close(session_owner_fd)
             return 2
         if not current_model():
             print("Configuration error: model missing; set LOKI_MODEL.",
                   file=sys.stderr)
+            if session_owner_fd is not None:
+                os.close(session_owner_fd)
             return 2
-        await run_subagent_cli_async(subagent_type or toolset or "Explore", prompt_arg)
-        return 0
+        operation = run_subagent_cli_async(
+            subagent_type or toolset or "Explore", prompt_arg)
+        if session_owner_fd is None:
+            await operation
+            return 0
+        completed = await _run_until_session_owner_closes(
+            operation, session_owner_fd)
+        return 0 if completed else 1
 
     log_filename = None
     for option_name, option_value in options:
@@ -1134,9 +1199,17 @@ def main() -> int:
 
     initialize_terminal_overlay(terminal)
 
+    async def run_with_session_cleanup():
+        try:
+            return await async_main(sys.argv[1:])
+        finally:
+            manager = current_session().job_manager
+            if manager is not None:
+                await manager.close_session_owned()
+
     exit_status = 1
     try:
-        exit_status = asyncio.run(async_main(sys.argv[1:]))
+        exit_status = asyncio.run(run_with_session_cleanup())
     finally:
         clean_up()
     if exit_status == 0 and cleanup_failed:

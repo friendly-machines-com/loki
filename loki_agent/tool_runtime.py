@@ -789,6 +789,7 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            close_fds=True,
         )
     except OSError as error:
         raise HookExecutionError(

@@ -963,6 +963,8 @@ class Job:
     finished_at: float | None = None
     finished_at_iso: str | None = None
     timeout_ms: int | None = None
+    session_owned: bool = False
+    owner_signal_fd: int | None = field(default=None, repr=False)
 
 
 class JobManager:
@@ -1004,6 +1006,7 @@ class JobManager:
             "started_at": job.started_at_iso,
             "finished_at": job.finished_at_iso,
             "timeout_ms": job.timeout_ms,
+            "session_owned": job.session_owned,
             "stdout_path": job.stdout_path,
             "stderr_path": job.stderr_path,
         }
@@ -1011,14 +1014,28 @@ class JobManager:
     def _write_metadata(self, job: Job):
         _atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
 
+    @staticmethod
+    def _close_owner_signal(job: Job):
+        fd = job.owner_signal_fd
+        job.owner_signal_fd = None
+        if fd is None:
+            return
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def _record_exit(self, job: Job, exit_code: int):
         # Status records why Loki ended the job; exit_code/signal record
         # how the child process actually terminated.
         job.signal = -exit_code if exit_code < 0 else None
-        if job.status in ["cancelled", "timed_out", "stopped"]:
+        if job.status in [
+                "cancelled", "timed_out", "stopped", "owner_closed"]:
             # Preserve the user-visible reason even after wait() reports the
             # eventual process exit code.
             pass
+        elif job.status == "owner_closing":
+            job.status = "owner_closed"
         elif job.status == "stopping":
             job.status = "stopped"
         elif exit_code < 0:
@@ -1028,6 +1045,7 @@ class JobManager:
         job.exit_code = exit_code
         job.finished_at = time.time()
         job.finished_at_iso = _now_iso()
+        self._close_owner_signal(job)
         self._write_metadata(job)
 
     def _refresh_job(self, job: Job):
@@ -1039,7 +1057,11 @@ class JobManager:
 
     async def _spawn(self, command, display_command: str, description: str,
                      background: bool, timeout_ms: int | None, shell: bool,
-                     env: dict | None = None, cwd: str = None) -> Job:
+                     env: dict | None = None, cwd: str = None,
+                     session_owned: bool = False) -> Job:
+        if session_owned and shell:
+            raise ValueError(
+                "session-owned jobs require a direct executable")
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -1061,6 +1083,7 @@ class JobManager:
             started_at=time.time(),
             started_at_iso=_now_iso(),
             timeout_ms=timeout_ms,
+            session_owned=session_owned,
         )
 
         # Helper to unblock inherited signal masks in the child process context
@@ -1068,30 +1091,57 @@ class JobManager:
             import signal
             signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT, signal.SIGTERM])
 
-        with open(stdout_path, 'wb') as stdout_file, open(stderr_path, 'wb') as stderr_file:
-            if shell:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    start_new_session=True,
-                    env=env,
-                    cwd=cwd or current_cwd(),
-                    preexec_fn=unblock_child_signals,  # Unblocks the signals
-                )
-            else:
-                proc = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    start_new_session=True,
-                    env=env,
-                    cwd=cwd or current_cwd(),
-                    preexec_fn=unblock_child_signals,  # Unblocks the signals
-                )
+        owner_read_fd = None
+        owner_write_fd = None
+        spawn_command = command
+        if session_owned:
+            owner_read_fd, owner_write_fd = os.pipe()
+            spawn_command = [
+                *command,
+                "--session-owner-fd",
+                str(owner_read_fd),
+            ]
+
+        proc = None
+        try:
+            with open(stdout_path, 'wb') as stdout_file, \
+                    open(stderr_path, 'wb') as stderr_file:
+                if shell:
+                    proc = await asyncio.create_subprocess_shell(
+                        spawn_command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        start_new_session=True,
+                        close_fds=True,
+                        env=env,
+                        cwd=cwd or current_cwd(),
+                        preexec_fn=unblock_child_signals,
+                    )
+                else:
+                    pass_fds = (
+                        (owner_read_fd,)
+                        if owner_read_fd is not None else ())
+                    proc = await asyncio.create_subprocess_exec(
+                        *spawn_command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        start_new_session=True,
+                        close_fds=True,
+                        pass_fds=pass_fds,
+                        env=env,
+                        cwd=cwd or current_cwd(),
+                        preexec_fn=unblock_child_signals,
+                    )
+        finally:
+            if owner_read_fd is not None:
+                os.close(owner_read_fd)
+            if proc is None and owner_write_fd is not None:
+                os.close(owner_write_fd)
+
         job.process = proc
+        job.owner_signal_fd = owner_write_fd
         job.pid = proc.pid
         try:
             job.pgid = os.getpgid(proc.pid)
@@ -1115,6 +1165,7 @@ class JobManager:
             job.status = "monitor_error"
             job.finished_at = time.time()
             job.finished_at_iso = _now_iso()
+            self._close_owner_signal(job)
             with open(job.stderr_path, 'ab') as stderr_file:
                 stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
             self._write_metadata(job)
@@ -1123,9 +1174,11 @@ class JobManager:
                              description: str = "", shell: bool = False,
                              output_chars: int = BASH_MAX_OUTPUT_CHARS,
                              env: dict | None = None, cwd: str = None,
-                             cancel_event: asyncio.Event | None = None):
+                             cancel_event: asyncio.Event | None = None,
+                             session_owned: bool = False):
         job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
-                                env=env, cwd=cwd)
+                                env=env, cwd=cwd,
+                                session_owned=session_owned)
 
         # Define the exit_task and nested signal helpers first so they are
         # available throughout the entire function.
@@ -1269,23 +1322,79 @@ class JobManager:
     async def run_exec(self, argv: list[str], timeout_ms: int, description: str = "",
                        output_chars: int = BASH_MAX_OUTPUT_CHARS,
                        env: dict | None = None, cwd: str = None,
-                       cancel_event: asyncio.Event | None = None):
+                       cancel_event: asyncio.Event | None = None,
+                       session_owned: bool = False):
         if not argv:
             raise ValueError("argv must not be empty")
         return await self.run_foreground(argv, " ".join(argv), timeout_ms,
                                          description=description, shell=False,
                                          output_chars=output_chars, env=env,
                                          cwd=cwd or current_cwd(),
-                                         cancel_event=cancel_event)
+                                         cancel_event=cancel_event,
+                                         session_owned=session_owned)
 
     async def run_background_exec(self, argv: list[str], description: str = "",
-                                  env: dict | None = None, cwd: str = None) -> Job:
+                                  env: dict | None = None, cwd: str = None,
+                                  session_owned: bool = False) -> Job:
         if not argv:
             raise ValueError("argv must not be empty")
         job = await self._spawn(argv, " ".join(argv), description, True, None, False,
-                                env=env, cwd=cwd or current_cwd())
+                                env=env, cwd=cwd or current_cwd(),
+                                session_owned=session_owned)
         asyncio.get_running_loop().create_task(self._monitor_background_job(job))
         return job
+
+    @staticmethod
+    def _signal_process_group(job: Job, signum) -> bool:
+        if job.process is None or job.process.returncode is not None:
+            return False
+        try:
+            os.killpg(job.pgid or job.pid, signum)
+            return True
+        except ProcessLookupError:
+            return False
+
+    async def _finish_owned_job(self, job: Job):
+        exit_task = asyncio.create_task(job.process.wait())
+        try:
+            try:
+                exit_code = await asyncio.wait_for(
+                    asyncio.shield(exit_task), timeout=2)
+            except asyncio.TimeoutError:
+                self._signal_process_group(job, signal.SIGTERM)
+                try:
+                    exit_code = await asyncio.wait_for(
+                        asyncio.shield(exit_task), timeout=2)
+                except asyncio.TimeoutError:
+                    self._signal_process_group(job, signal.SIGKILL)
+                    exit_code = await exit_task
+        finally:
+            if not exit_task.done():
+                exit_task.cancel()
+                await asyncio.gather(exit_task, return_exceptions=True)
+        if job.finished_at is None:
+            self._record_exit(job, exit_code)
+
+    async def close_session_owned(self):
+        """End and reap every live process owned by this Loki session."""
+        owned = []
+        for job in list(self.jobs.values()):
+            self._refresh_job(job)
+            if not job.session_owned:
+                continue
+            if job.process is None or job.process.returncode is not None:
+                self._close_owner_signal(job)
+                continue
+            job.status = "owner_closing"
+            self._write_metadata(job)
+            # EOF asks a cooperating Loki child to cancel its current work.
+            # Process-group signals below enforce the ownership boundary if
+            # the child is stuck or does not understand the owner channel.
+            self._close_owner_signal(job)
+            owned.append(job)
+        if owned:
+            await asyncio.gather(
+                *(self._finish_owned_job(job) for job in owned))
 
     def _get_job(self, job_id: str) -> Job | None:
         job = self.jobs.get(str(job_id))
@@ -2696,13 +2805,15 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
             argv,
             description=description or "subagent task",
             env=_subagent_env(),
-            cwd=os.getcwd())
+            cwd=os.getcwd(),
+            session_owned=True)
         return _format_started_background_job(job, "subagent")
 
     job, status, stdout, stderr = await current_job_manager().run_exec(
         argv, SUBAGENT_TIMEOUT_S * 1000,
         description=description or "subagent task",
-        env=_subagent_env(), cwd=os.getcwd(), cancel_event=cancel_event)
+        env=_subagent_env(), cwd=os.getcwd(), cancel_event=cancel_event,
+        session_owned=True)
     if status == "cancelled":
         return "Error: subagent was cancelled by the user"
     if status == "timed_out":
