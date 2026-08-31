@@ -36,6 +36,52 @@ ITALIC_OFF = '\033[23m'
 FOREGROUND_OFF = '\033[39m'
 
 
+_SINGLE_LINE_CONTROL_TRANSLATIONS = {
+    code: "^" + chr(code + 0x40)
+    for code in range(0x20)
+}
+_SINGLE_LINE_CONTROL_TRANSLATIONS[0x7f] = "^?"
+_SINGLE_LINE_CONTROL_TRANSLATIONS.update({
+    code: f"\\x{code:02x}"
+    for code in range(0x80, 0xa0)
+})
+_MULTILINE_CONTROL_TRANSLATIONS = dict(
+    _SINGLE_LINE_CONTROL_TRANSLATIONS)
+del _MULTILINE_CONTROL_TRANSLATIONS[ord("\n")]
+
+
+def _escape_terminal_text(text: str, *, multiline: bool) -> str:
+    """Neutralize terminal controls without classifying other Unicode."""
+    if not isinstance(text, str):
+        raise TypeError("terminal text must be a string")
+    translations = (
+        _MULTILINE_CONTROL_TRANSLATIONS
+        if multiline else _SINGLE_LINE_CONTROL_TRANSLATIONS)
+    return text.translate(translations)
+
+
+class _TerminalTextOutput:
+    markdown_style = False
+
+    def write_text(
+            self, text: str, *, multiline: bool = False, file=None) -> None:
+        """Write logical text with only explicitly allowed LF layout."""
+        escaped_text = _escape_terminal_text(text, multiline=multiline)
+        print(escaped_text, end="", file=file)
+
+    @staticmethod
+    def _write_rendered_markdown(
+            text: str, *, flush: bool = False) -> None:
+        """Emit output produced internally by the Markdown renderer."""
+        print(text, end="", flush=flush)
+
+    def write_markdown(self, text: str) -> None:
+        """Safely render and write one complete Markdown document."""
+        renderer = BoundedMarkdownAnsi(style=self.markdown_style)
+        for fragment in renderer.feed(text) + renderer.finish():
+            self._write_rendered_markdown(fragment)
+
+
 def open_terminal_stdin() -> int:
     """Own the keyboard: replace fd 0 with a fresh /dev/tty open.
 
@@ -66,11 +112,13 @@ if not os.isatty(new_stdin):
     # Noninteractive tests and headless runs still import terminal helpers. The
     # no-op terminal keeps those paths from emitting escape sequences or touching
     # terminal state when stdin is not a TTY.
-    class Terminal:
+    class Terminal(_TerminalTextOutput):
         def __getattr__(self, x):
             return lambda *args, **kwargs: None
 else:
-    class Terminal:
+    class Terminal(_TerminalTextOutput):
+        markdown_style = True
+
         def __init__(self):
             self.bracketed_paste = False
 
@@ -132,10 +180,6 @@ else:
 
         def disable_bracketed_paste_mode(self):
             print('\033[?2004l', end='')
-
-        def markdown_to_ansi(self, text: str) -> str:
-            return markdown_line_to_ansi(text)
-
 
 terminal = Terminal()
 
@@ -509,10 +553,11 @@ class BoundedMarkdownAnsi:
             raise RuntimeError("cannot feed a finished Markdown renderer")
         if not isinstance(text, str):
             raise TypeError("Markdown chunks must be strings")
+        escaped_text = _escape_terminal_text(text, multiline=True)
         if not self.style:
-            return (text,) if text else ()
+            return (escaped_text,) if escaped_text else ()
         output = []
-        for character in text:
+        for character in escaped_text:
             self._consume(character, output)
         return self._fragments(output)
 
@@ -530,7 +575,7 @@ class BoundedMarkdownAnsi:
 
 
 def _terminal_supports_markdown_ansi():
-    return terminal.markdown_to_ansi("") is not None
+    return terminal.markdown_style
 
 
 def render_markdown(text, *, style=None,
@@ -543,15 +588,11 @@ def render_markdown(text, *, style=None,
     return "".join(renderer.feed(text) + renderer.finish())
 
 
-def markdown_line_to_ansi(text: str) -> str:
-    """Compatibility entry point for explicitly ANSI-styled text."""
-    return render_markdown(text, style=True)
-
-
 class AssistantMarkdownPresentation:
     """Own one terminal assistant turn's Markdown-renderer lifecycle."""
 
-    def __init__(self):
+    def __init__(self, active_terminal):
+        self.terminal = active_terminal
         self._renderer = None
 
     @property
@@ -559,28 +600,30 @@ class AssistantMarkdownPresentation:
         return self._renderer is not None
 
     def start(self):
-        stale = self.finish()
+        self.finish()
         self._renderer = BoundedMarkdownAnsi(
-            style=_terminal_supports_markdown_ansi())
-        return stale
+            style=self.terminal.markdown_style)
 
     def feed(self, text):
         if self._renderer is None:
             self.start()
-        return self._renderer.feed(text)
+        for fragment in self._renderer.feed(text):
+            self.terminal._write_rendered_markdown(
+                fragment, flush=True)
 
     def finish(self):
         if self._renderer is None:
-            return ()
+            return
         renderer = self._renderer
         self._renderer = None
-        return renderer.finish()
+        for fragment in renderer.finish():
+            self.terminal._write_rendered_markdown(fragment)
 
     def reset(self):
         self._renderer = None
 
 
-terminal.assistant_markdown = AssistantMarkdownPresentation()
+terminal.assistant_markdown = AssistantMarkdownPresentation(terminal)
 
 
 try:
@@ -617,7 +660,7 @@ def update_status_bar():
     terminal.goto_position(1, 1)
     terminal.set_background_color(STATUS_COLOR)
     terminal.clear_to_end_of_screen()
-    print(_status_text_provider(), end='')
+    _status_text_provider()
 
 
 def redraw_status_bar():
@@ -1707,40 +1750,6 @@ class InputBuffer:
         self.cursor = len(self.chars)
 
 
-def user_text_for_terminal(text: str, *, multiline: bool = False) -> str:
-    """Return display text that cannot introduce terminal control functions.
-
-    LF is retained only for an explicitly multiline presentation. Every other
-    C0 control and DEL uses familiar caret notation; C1 controls use a visible
-    hexadecimal escape. The caller's logical text is never modified.
-    """
-    displayed = []
-    for character in text:
-        code = ord(character)
-        if character == "\n" and multiline:
-            displayed.append("\n")
-        elif code < 0x20:
-            displayed.append("^" + chr(code + 0x40))
-        elif code == 0x7f:
-            displayed.append("^?")
-        elif 0x80 <= code <= 0x9f:
-            displayed.append(f"\\x{code:02x}")
-        else:
-            displayed.append(character)
-    return "".join(displayed)
-
-
-def write_user_text(
-        text: str, *, multiline: bool = False, file=None) -> None:
-    """Write safe logical input, generating allowlisted line breaks itself."""
-    displayed = user_text_for_terminal(text, multiline=multiline)
-    lines = displayed.split("\n")
-    for index, line in enumerate(lines):
-        print(line, end="", file=file)
-        if index + 1 < len(lines):
-            print(file=file)
-
-
 class PromptRenderer:
     def __init__(self, terminal, prompt: str):
         self.terminal = terminal
@@ -1769,8 +1778,9 @@ class PromptRenderer:
             self.terminal.set_clipping_region(*input_area)
             self.terminal.goto_position(1, 1)
             self.terminal.set_background_color(INPUT_COLOR)
-            print(self.prompt, end='')
-            write_user_text(buffer.before_cursor(), multiline=True)
+            self.terminal.write_text(self.prompt)
+            self.terminal.write_text(
+                buffer.before_cursor(), multiline=True)
 
             # Draw the fake (reverse-video) caret at the insertion point,
             # then the text after it.
@@ -1782,14 +1792,14 @@ class PromptRenderer:
                     # logical insertion point before generating that layout.
                     print(' ', end='')
                 else:
-                    write_user_text(after[0])
+                    self.terminal.write_text(after[0])
             else:
                 print(' ', end='')
             self.terminal.set_reverse_video(False)
             if after:
                 if after[0] == "\n":
                     print()
-                write_user_text(after[1:], multiline=True)
+                self.terminal.write_text(after[1:], multiline=True)
         finally:
             # Restore the output scroll region and the cursor position.
             # The real cursor is back in the output area where output
@@ -2107,9 +2117,16 @@ class InputSession:
                 # user_messages.get() forever. Log and treat it as session EOF
                 # so the main loop breaks and main()'s clean_up runs.
                 import traceback
-                print(f"input session error: {type(e).__name__}: {e}",
-                      file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
+                formatted_traceback = "".join(
+                    traceback.TracebackException.from_exception(e).format())
+                terminal.write_text(
+                    "input session error:\n" + formatted_traceback,
+                    multiline=True,
+                    file=sys.stderr,
+                )
+                if not formatted_traceback.endswith("\n"):
+                    print(file=sys.stderr)
+                sys.stderr.flush()
                 self.user_messages.put_nowait(None)
                 return
             self.user_messages.put_nowait(text)

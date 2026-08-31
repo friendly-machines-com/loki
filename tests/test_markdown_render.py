@@ -31,14 +31,30 @@ ITALIC_OFF = "\033[23m"
 FOREGROUND_OFF = "\033[39m"
 
 
-class StyledTerminal:
-    def markdown_to_ansi(self, text):
-        return terminals.markdown_line_to_ansi(text)
+class PresentationTerminal(terminals._TerminalTextOutput):
+    def __init__(self, *, style):
+        self.markdown_style = style
+        self.assistant_markdown = terminals.AssistantMarkdownPresentation(
+            self)
+
+    def set_background_color(self, _index):
+        pass
+
+    def set_foreground_color(self, _index):
+        pass
+
+    def reset_colors_and_flags(self):
+        pass
 
 
-class NoneTerminal:
-    def markdown_to_ansi(self, text):
-        return None
+class StyledTerminal(PresentationTerminal):
+    def __init__(self):
+        super().__init__(style=True)
+
+
+class NoneTerminal(PresentationTerminal):
+    def __init__(self):
+        super().__init__(style=False)
 
 
 def split_at(text, cuts):
@@ -115,6 +131,37 @@ class BoundedRendererTests(unittest.TestCase):
                 + fragment.count(CODE)
             )
             self.assertEqual(fragment.count(RESET), opens)
+
+    def test_source_controls_are_neutralized_before_markdown_styling(self):
+        logical = (
+            "before \x1b]0;owned\x07 **bold** "
+            "\u009b31m \U0001f469\u200d\U0001f4bb")
+
+        rendered = self.collect(
+            self.renderer(),
+            ["before \x1b]", "0;owned\x07 **bo",
+             "ld** \u009b31m \U0001f469\u200d\U0001f4bb"],
+        )
+
+        self.assertEqual(
+            rendered,
+            "before ^[]0;owned^G "
+            f"{BOLD}bold{RESET} "
+            "\\x9b31m \U0001f469\u200d\U0001f4bb",
+        )
+        self.assertNotIn("\x1b]0;owned\x07", rendered)
+        self.assertEqual(
+            rendered,
+            terminals.render_markdown(logical, style=True),
+        )
+
+    def test_non_ansi_mode_still_neutralizes_source_controls(self):
+        renderer = terminals.BoundedMarkdownAnsi(style=False)
+
+        self.assertEqual(
+            self.collect(renderer, ["a\x1b", "[2J\nb\u009b"]),
+            "a^[[2J\nb\\x9b",
+        )
 
     def test_unclosed_span_becomes_literal_at_newline(self):
         renderer = self.renderer()
@@ -425,7 +472,8 @@ class TerminalWiringTests(unittest.TestCase):
 
     def replay(self, events, terminal_stub):
         output = io.StringIO()
-        with mock.patch.object(terminals, "terminal", terminal_stub), \
+        with mock.patch.object(
+                terminal_frontend, "terminal", terminal_stub), \
                 contextlib.redirect_stdout(output), \
                 contextlib.redirect_stderr(io.StringIO()):
             for event in events:
@@ -444,7 +492,8 @@ class TerminalWiringTests(unittest.TestCase):
 
     def test_plain_delta_is_visible_before_assistant_end(self):
         output = io.StringIO()
-        with mock.patch.object(terminals, "terminal", StyledTerminal()), \
+        with mock.patch.object(
+                terminal_frontend, "terminal", StyledTerminal()), \
                 contextlib.redirect_stdout(output):
             terminal_frontend._terminal_agent_event({"type": "assistant_start"})
             terminal_frontend._terminal_agent_event({
@@ -478,6 +527,53 @@ class TerminalWiringTests(unittest.TestCase):
             f"{CODE}world{RESET} done\n",
         )
         self.assertEqual(streamed, batch)
+
+    def test_batch_and_split_stream_neutralize_model_terminal_controls(self):
+        full = "before \x1b]0;owned\x07 **bold** after\u009b"
+        chunks = ["before \x1b]", "0;owned", "\x07 **bo", "ld** after\u009b"]
+
+        streamed = self.replay(
+            self.stream_events(chunks), StyledTerminal())
+        batch = self.replay(
+            [{"type": "assistant_message", "content": full}],
+            StyledTerminal())
+
+        self.assertEqual(streamed, batch)
+        self.assertNotIn("\x1b]0;owned\x07", streamed)
+        self.assertIn("^[]0;owned^G", streamed)
+        self.assertIn("\\x9b", streamed)
+        self.assertIn(f"{BOLD}bold{RESET}", streamed)
+
+    def test_multiline_tool_error_is_readable_but_controls_are_not_raw(self):
+        output = self.replay(
+            [{
+                "type": "tool_error",
+                "result": "first\x1b]0;owned\x07\nsecond\u009b",
+            }],
+            StyledTerminal(),
+        )
+
+        self.assertEqual(
+            output, "first^[]0;owned^G\nsecond\\x9b\n")
+
+    def test_tool_name_and_arguments_are_programming_representations(self):
+        output = self.replay(
+            [{
+                "type": "tool_call",
+                "name": "Read\x1b]0;owned\x07\nnext",
+                "args": {
+                    "path": "file\x1b]0;path-owned\x07\nname",
+                    "label": "\u6a21\u578b",
+                },
+            }],
+            StyledTerminal(),
+        )
+
+        self.assertNotIn("\x1b]0;owned\x07", output)
+        self.assertNotIn("\x1b]0;path-owned\x07", output)
+        self.assertIn("\\x1b", output)
+        self.assertIn("\\nnext", output)
+        self.assertIn("\u6a21\u578b", output)
 
     def test_non_tty_terminal_emits_original_markdown(self):
         streamed = self.replay(
@@ -588,7 +684,8 @@ class ToolLoopWiringTests(unittest.TestCase):
         )
 
         output = io.StringIO()
-        with mock.patch.object(terminals, "terminal", StyledTerminal()), \
+        with mock.patch.object(
+                terminal_frontend, "terminal", StyledTerminal()), \
                 contextlib.redirect_stdout(output), \
                 contextlib.redirect_stderr(io.StringIO()):
             for event in events:
@@ -598,6 +695,27 @@ class ToolLoopWiringTests(unittest.TestCase):
             output.getvalue(),
             f"\nlocal-model: prefix {BOLD}hello{RESET} "
             f"{CODE}world{RESET}\n",
+        )
+
+
+class TerminalDiagnosticTests(unittest.TestCase):
+    def test_hook_stderr_stays_multiline_but_neutralizes_controls(self):
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with mock.patch.object(
+                terminal_frontend, "terminal", StyledTerminal()), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            terminal_frontend._report_hook_stderr(
+                ["hook\x1b]0;name\x07"],
+                "first\x1b]0;owned\x07\n"
+                "second\u009b \u6a21\u578b",
+            )
+
+        self.assertEqual(
+            stderr.getvalue(),
+            "Hook 'hook\\x1b]0;name\\x07' stderr:\n"
+            "first^[]0;owned^G\nsecond\\x9b \u6a21\u578b\n",
         )
 
 

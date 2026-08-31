@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import http_client, models, protocols
+from loki_agent import http_client, models, protocols, terminals
 from loki_agent.credentials import CredentialStore
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
@@ -76,6 +76,10 @@ def _input_script(inputs):
             raise EOFError
 
     return fake
+
+
+def _write_text(text):
+    print(text, end="")
 
 
 class CatalogFetchTests(unittest.TestCase):
@@ -584,19 +588,47 @@ class ProtocolAndKeyTests(unittest.TestCase):
 class MenuTests(unittest.TestCase):
     def test_menu_selects_by_number(self):
         rows = [("a", "Alpha"), ("b", "Beta")]
-        result = asyncio.run(models._numbered_menu_async(rows, "Choice: ", _input_script(["2"])))
+        result = asyncio.run(models._numbered_menu_async(
+            rows, "Choice: ", _input_script(["2"]),
+            text_writer=_write_text))
         self.assertEqual(result, "b")
 
     def test_menu_filter_narrows_then_selects(self):
         rows = [("a", "Alpha beta"), ("b", "Beta gamma")]
         result = asyncio.run(models._numbered_menu_async(
-            rows, "Choice: ", _input_script(["filter alpha", "1"])))
+            rows, "Choice: ", _input_script(["filter alpha", "1"]),
+            text_writer=_write_text))
         self.assertEqual(result, "a")
 
     def test_menu_empty_cancels(self):
         rows = [("a", "Alpha")]
-        result = asyncio.run(models._numbered_menu_async(rows, "Choice: ", _input_script([""])))
+        result = asyncio.run(models._numbered_menu_async(
+            rows, "Choice: ", _input_script([""]),
+            text_writer=_write_text))
         self.assertIsNone(result)
+
+    def test_terminal_writer_neutralizes_remote_menu_row_controls(self):
+        rows = [(
+            "a",
+            "Model \x1b]0;owned\x07\n"
+            "\u6a21\u578b \U0001f469\u200d\U0001f4bb",
+        )]
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = asyncio.run(models._numbered_menu_async(
+                rows,
+                "Choice: ",
+                _input_script(["1"]),
+                text_writer=terminals.terminal.write_text,
+            ))
+
+        self.assertEqual(result, "a")
+        self.assertEqual(
+            output.getvalue(),
+            "1. Model ^[]0;owned^G^J"
+            "\u6a21\u578b \U0001f469\u200d\U0001f4bb\n",
+        )
 
     def test_menu_header_separates_every_rendered_block(self):
         rows = [("a", "Alpha"), ("b", "Beta")]
@@ -607,6 +639,7 @@ class MenuTests(unittest.TestCase):
                 rows,
                 "Choice: ",
                 _input_script(["filter beta", "1"]),
+                text_writer=_write_text,
                 header="Usable things:",
             ))
 
@@ -657,14 +690,16 @@ class MenuTests(unittest.TestCase):
         # "filter openrouter" must narrow to GLM-5.2 even though "openrouter"
         # appears only among its providers, not in the model name.
         result = asyncio.run(models._numbered_menu_async(
-            rows, "Choice: ", _input_script(["filter openrouter", "1"])))
+            rows, "Choice: ", _input_script(["filter openrouter", "1"]),
+            text_writer=_write_text))
         self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
 
     def test_model_menu_filter_matches_provider_display_name(self):
         rows = models._model_rows(_groups())
         # "Zhipu AI" is the provider's display name, not its id (zhipuai).
         result = asyncio.run(models._numbered_menu_async(
-            rows, "Choice: ", _input_script(["filter zhipu ai", "1"])))
+            rows, "Choice: ", _input_script(["filter zhipu ai", "1"]),
+            text_writer=_write_text))
         self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
 
     def test_provider_rows_show_catalog_api_url(self):
@@ -721,6 +756,7 @@ class PickerTests(unittest.TestCase):
                     _input_script(["1", "1"]),
                     CredentialStore({}),
                     explicit_connection=explicit,
+                    text_writer=_write_text,
                 ))
         finally:
             models._index_cache = saved
@@ -744,6 +780,7 @@ class PickerTests(unittest.TestCase):
                 _input_script(["1"]),
                 [],
                 explicit_connection=explicit,
+                text_writer=_write_text,
             ))
 
         self.assertIs(result, explicit)
@@ -770,6 +807,7 @@ class PickerTests(unittest.TestCase):
             result = asyncio.run(models.run_model_picker_async(
                 _input_script(["1", "1"]),
                 CredentialStore({"PROVIDER_API_KEY": "key"}),
+                text_writer=_write_text,
             ))
         finally:
             models._index_cache = saved
@@ -787,7 +825,8 @@ class PickerTests(unittest.TestCase):
             # Provider menu (sorted): 1. OpenRouter, 2. Zhipu AI.
             with contextlib.redirect_stdout(output):
                 result = asyncio.run(models.run_model_picker_async(
-                    _input_script(["2", "1"]), _credentials()))
+                    _input_script(["2", "1"]), _credentials(),
+                    text_writer=_write_text))
         finally:
             models._index_cache = saved
 
@@ -807,7 +846,8 @@ class PickerTests(unittest.TestCase):
         models._index_cache = (DATA, models.build_groups(DATA))
         try:
             result = asyncio.run(models.run_model_picker_async(
-                _input_script([""]), _credentials()))
+                _input_script([""]), _credentials(),
+                text_writer=_write_text))
         finally:
             models._index_cache = saved
         self.assertIsNone(result)
@@ -818,24 +858,27 @@ class PickerTests(unittest.TestCase):
         models._index_cache = (DATA, models.build_groups(DATA))
         try:
             result = asyncio.run(models.run_model_picker_async(
-                _input_script(["1", ""]), _credentials()))
+                _input_script(["1", ""]), _credentials(),
+                text_writer=_write_text))
         finally:
             models._index_cache = saved
         self.assertIsNone(result)
 
     def test_run_flat_model_picker_selects_by_number(self):
         result = asyncio.run(models.run_flat_model_picker_async(
-            _input_script(["2"]), ["alpha", "beta"]))
+            _input_script(["2"]), ["alpha", "beta"],
+            text_writer=_write_text))
         self.assertEqual(result, "beta")
 
     def test_run_flat_model_picker_empty_list_returns_none(self):
         result = asyncio.run(models.run_flat_model_picker_async(
-            _input_script([]), []))
+            _input_script([]), [], text_writer=_write_text))
         self.assertIsNone(result)
 
     def test_run_flat_model_picker_cancel_returns_none(self):
         result = asyncio.run(models.run_flat_model_picker_async(
-            _input_script([""]), ["alpha"]))
+            _input_script([""]), ["alpha"],
+            text_writer=_write_text))
         self.assertIsNone(result)
 
     def test_run_model_picker_fetch_failure_propagates(self):
@@ -846,7 +889,8 @@ class PickerTests(unittest.TestCase):
                         side_effect=OSError("boom")):
             with self.assertRaises(OSError):
                 asyncio.run(models.run_model_picker_async(
-                    _input_script([]), _credentials()))
+                    _input_script([]), _credentials(),
+                    text_writer=_write_text))
 
     def test_picker_prompts_advertise_filter_gesture(self):
         saved = models._index_cache
@@ -858,7 +902,8 @@ class PickerTests(unittest.TestCase):
             raise EOFError
 
         try:
-            asyncio.run(models.run_model_picker_async(capture, _credentials()))
+            asyncio.run(models.run_model_picker_async(
+                capture, _credentials(), text_writer=_write_text))
         except EOFError:
             pass
         finally:

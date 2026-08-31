@@ -1,9 +1,8 @@
-"""On-disk chat-log format, path resolution, listing, and picker UI.
+"""On-disk chat-log format, path resolution, and presentation data.
 
-This module is the leaf data layer for session savefiles. It owns no
-live agent state (path/transcript/todos/session state live in loki.py)
-and has no upward dependency on loki.py -- every
-function that needs context takes it as a parameter.
+This module owns no live agent state and no terminal policy. Picker output is
+written through an injected text writer, and resume presentation is returned
+as typed text segments for a front-end to render.
 """
 
 import json
@@ -114,7 +113,8 @@ def filtered_chat_log_paths(query: str, chat_log_dir: str) -> list[str]:
     return matches
 
 
-async def run_session_picker_async(*, input_fn, terminal, chat_log_dir: str):
+async def run_session_picker_async(
+        *, input_fn, chat_log_dir: str, text_writer):
     # Three gestures: "filter <words>" / bare "filter" sets/clears the filter;
     # a bare int selects that row; empty cancels (returns None -> caller starts
     # a fresh chat).
@@ -127,7 +127,8 @@ async def run_session_picker_async(*, input_fn, terminal, chat_log_dir: str):
         print("bare \"filter\" clears it; a number selects that row; empty cancels.")
         if matches:
             for i, path in enumerate(matches, 1):
-                print(format_picker_row(i, path))
+                text_writer(format_picker_row(i, path))
+                print()
         else:
             print("  (no chats match -- broaden your filter, or type \"filter\" to clear)")
         selection = await input_fn('number opens that row, "filter WORDS" narrows, empty cancels: ')
@@ -208,7 +209,13 @@ def write_chat_log(file_obj, events: list, todos: list,
 
 
 class ResumeTranscriptRenderer:
-    """Render a loaded transcript as the previous terminal conversation."""
+    """Describe and render the visible conversation in a loaded transcript.
+
+    ``presentation`` keeps fixed punctuation, single-line dynamic atoms,
+    multiline text, and assistant Markdown as separate segments. A terminal
+    front-end can therefore apply its own output policy without this shared
+    module importing terminal code.
+    """
 
     def __init__(self, assistant_label: str = "Assistant",
                  assistant_text_renderer=None, user_text_renderer=None):
@@ -222,156 +229,219 @@ class ResumeTranscriptRenderer:
             if user_text_renderer is not None
             else (lambda text: text))
 
-    def _message_label(self, item: dict) -> str:
+    def _message_label(self, item: dict):
         role = item.get("role")
         if role == "user":
-            return "User"
+            return "literal", "User"
         if role == "assistant":
-            return self.assistant_label
-        return str(role or "Message").capitalize()
+            return "atom", self.assistant_label
+        return "atom", str(role or "Message").capitalize()
 
-    def _render_message(self, item: dict, label=None) -> str:
+    def _message_blocks(self, item: dict, label=None):
         blocks = []
         text = formats.item_text(item)
         if text.strip():
-            if item.get("role") == "assistant":
-                text = self.assistant_text_renderer(text)
-            elif item.get("role") == "user":
-                text = self.user_text_renderer(text)
-            blocks.append(
-                f"{label or self._message_label(item)}: {text}")
+            label_segment = (
+                ("atom", label) if label is not None
+                else self._message_label(item))
+            role = item.get("role")
+            content_kind = (
+                "assistant_markdown" if role == "assistant"
+                else "user_text" if role == "user"
+                else "text")
+            blocks.append([
+                label_segment,
+                ("literal", ": "),
+                (content_kind, text),
+            ])
         for content in item.get("content", []):
             if not isinstance(content, dict):
                 continue
-            if content.get("type") == "image":
-                blocks.append("[Image content]")
-            elif content.get("type") in ["file", "document"]:
-                blocks.append("[File content]")
-            elif content.get("type") == "audio":
-                blocks.append("[Audio content]")
-        return "\n\n".join(blocks)
+            marker = {
+                "image": "[Image content]",
+                "file": "[File content]",
+                "document": "[File content]",
+                "audio": "[Audio content]",
+            }.get(content.get("type"))
+            if marker:
+                blocks.append([("literal", marker)])
+        return blocks
 
-    def _render_tool_call(self, item: dict) -> str:
+    @staticmethod
+    def _tool_call_blocks(item: dict):
         name = formats.tool_call_name(item) or "<unknown>"
         if item.get("execution", "client") != "client":
-            return (
-                f"Provider tool call: {name}\n"
-                f"{pformat(item, width=100)}")
+            return [[
+                ("literal", "Provider tool call: "),
+                ("program_atom", name),
+                ("literal", "\n"),
+                ("text", pformat(item, width=100)),
+            ]]
         try:
             input_value = formats.tool_call_input(item)
         except formats.TranscriptFormatError:
             input_value = item.get("arguments", item.get("input", {}))
-        args = pformat(input_value, width=100)
-        return f"Tool call: {name}\n{args}"
+        return [[
+            ("literal", "Tool call: "),
+            ("program_atom", name),
+            ("literal", "\n"),
+            ("text", pformat(input_value, width=100)),
+        ]]
 
-    def _render_tool_result(self, item: dict) -> str:
+    @staticmethod
+    def _tool_result_blocks(item: dict):
         name = item.get("name") or item.get("call_id") or "<unknown>"
         label = "Tool error" if item.get("is_error") else "Tool result"
         text = formats.item_text(item).strip()
-        return f"{label}: {name}" + (f"\n{text}" if text else "")
+        block = [
+            ("literal", label + ": "),
+            ("program_atom", name),
+        ]
+        if text:
+            block.extend([("literal", "\n"), ("text", text)])
+        return [block]
 
-    def _render_reasoning(self, item: dict) -> str:
+    @staticmethod
+    def _reasoning_blocks(item: dict):
         value = item.get("value", item)
         summary = value.get("summary") if isinstance(value, dict) else None
         if not summary:
-            return ""
-        return "Reasoning summary:\n" + pformat(summary, width=100)
+            return []
+        return [[
+            ("literal", "Reasoning summary:\n"),
+            ("text", pformat(summary, width=100)),
+        ]]
 
-    def _render_native_item(
-            self, item: dict, response_protocol=None) -> str:
+    @staticmethod
+    def _native_item_blocks(item: dict, response_protocol=None):
         provider = (
             item.get("protocol")
             or item.get("provider")
             or response_protocol
             or "unknown")
-        return f"[Provider-specific transcript item: {provider}]\n{pformat(item.get('value'), width=100)}"
+        return [[
+            ("literal", "[Provider-specific transcript item: "),
+            ("program_atom", provider),
+            ("literal", "]\n"),
+            ("text", pformat(item.get("value"), width=100)),
+        ]]
 
-    def _render_provider_tool_result(
-            self, item: dict, response_protocol=None) -> str:
+    @staticmethod
+    def _provider_tool_result_blocks(item: dict, response_protocol=None):
         provider = response_protocol or "provider"
         call_id = item.get("call_id") or "<unknown>"
-        return (
-            f"Provider tool result ({provider}): {call_id}\n"
-            f"{pformat(item.get('content'), width=100)}"
-        )
+        return [[
+            ("literal", "Provider tool result ("),
+            ("program_atom", provider),
+            ("literal", "): "),
+            ("program_atom", call_id),
+            ("literal", "\n"),
+            ("text", pformat(item.get("content"), width=100)),
+        ]]
 
-    def _render_provider_operation(
-            self, item: dict, response_protocol=None) -> str:
+    @staticmethod
+    def _provider_operation_blocks(item: dict, response_protocol=None):
         provider = response_protocol or "provider"
         name = item.get("name") or "<unknown>"
-        parts = [
-            f"Provider operation ({provider}): {name}",
-            pformat(item.get("input"), width=100),
+        block = [
+            ("literal", "Provider operation ("),
+            ("program_atom", provider),
+            ("literal", "): "),
+            ("program_atom", name),
+            ("literal", "\n"),
+            ("text", pformat(item.get("input"), width=100)),
         ]
         if item.get("output") is not None:
-            parts.extend([
-                "Provider operation result:",
-                pformat(item.get("output"), width=100),
+            block.extend([
+                ("literal", "\nProvider operation result:\n"),
+                ("text", pformat(item.get("output"), width=100)),
             ])
-        return "\n".join(parts)
+        return [block]
 
-    def _render_response(self, event: dict) -> str:
+    def _response_blocks(self, event: dict):
         label = event.get("model") or self.assistant_label
         blocks = []
         status = event.get("status", "completed")
         if status != "completed":
+            block = [
+                ("literal", "[Model response "),
+                ("atom", str(status)),
+                ("literal", "]"),
+            ]
             detail = event.get("protocol_data")
-            rendered = f"[Model response {status}]"
             if detail:
-                rendered += "\n" + pformat(detail, width=100)
-            blocks.append(rendered)
+                block.extend([
+                    ("literal", "\n"),
+                    ("text", pformat(detail, width=100)),
+                ])
+            blocks.append(block)
         for item in event.get("items", []):
             item_type = item.get("type")
             if item_type == "message":
-                rendered = self._render_message(item, label=label)
+                rendered = self._message_blocks(item, label=label)
             elif item_type == "function_call":
-                rendered = self._render_tool_call(item)
+                rendered = self._tool_call_blocks(item)
             elif item_type == "openai_reasoning":
-                rendered = self._render_reasoning(item)
+                rendered = self._reasoning_blocks(item)
             elif item_type in [
                     "anthropic_thinking",
                     "anthropic_redacted_thinking"]:
-                rendered = ""
-            elif item_type in [
-                    "native_output", "provider_output"]:
-                rendered = self._render_native_item(
+                rendered = []
+            elif item_type in ["native_output", "provider_output"]:
+                rendered = self._native_item_blocks(
                     item, response_protocol=event.get("protocol"))
             elif item_type == "provider_tool_result":
-                rendered = self._render_provider_tool_result(
+                rendered = self._provider_tool_result_blocks(
                     item, response_protocol=event.get("protocol"))
             elif item_type == "provider_operation":
-                rendered = self._render_provider_operation(
+                rendered = self._provider_operation_blocks(
                     item, response_protocol=event.get("protocol"))
             else:
-                rendered = (
-                    f"[Model response item: {item_type or 'unknown'}]\n"
-                    f"{pformat(item, width=100)}")
-            if rendered:
-                blocks.append(rendered)
-        return "\n\n".join(blocks)
+                rendered = [[
+                    ("literal", "[Model response item: "),
+                    ("atom", str(item_type or "unknown")),
+                    ("literal", "]\n"),
+                    ("text", pformat(item, width=100)),
+                ]]
+            blocks.extend(rendered)
+        return blocks
 
-    def render_event(self, item: dict) -> str:
+    def _event_blocks(self, item: dict):
         item_type = item.get("type")
         if item_type == "message" and item.get("role") in [
                 "system", "developer"]:
-            return ""
+            return []
         if item_type == "message":
-            return self._render_message(item)
+            return self._message_blocks(item)
         if item_type == "model_response":
-            return self._render_response(item)
+            return self._response_blocks(item)
         if item_type == "tool_result":
-            return self._render_tool_result(item)
-        return (
-            f"[Session event: {item_type or 'unknown'}]\n"
-            f"{pformat(item, width=100)}")
+            return self._tool_result_blocks(item)
+        return [[
+            ("literal", "[Session event: "),
+            ("atom", str(item_type or "unknown")),
+            ("literal", "]\n"),
+            ("text", pformat(item, width=100)),
+        ]]
 
-    def render(self, events: list) -> str:
+    def presentation(self, events: list):
         blocks = []
         for event in events:
-            rendered = self.render_event(event)
-            if rendered:
-                blocks.append(rendered)
-        return "\n\n".join(blocks)
+            blocks.extend(self._event_blocks(event))
+        return blocks
+
+    def render(self, events: list) -> str:
+        rendered_blocks = []
+        for block in self.presentation(events):
+            rendered_segments = []
+            for kind, text in block:
+                if kind == "assistant_markdown":
+                    text = self.assistant_text_renderer(text)
+                elif kind == "user_text":
+                    text = self.user_text_renderer(text)
+                rendered_segments.append(text)
+            rendered_blocks.append("".join(rendered_segments))
+        return "\n\n".join(rendered_blocks)
 
 
 def render_resume_transcript(
@@ -382,17 +452,3 @@ def render_resume_transcript(
         assistant_text_renderer=assistant_text_renderer,
         user_text_renderer=user_text_renderer,
     ).render(events)
-
-
-def print_resume_transcript(
-        events: list, assistant_label: str,
-        assistant_text_renderer=None, user_text_renderer=None) -> None:
-    rendered = render_resume_transcript(
-        events,
-        assistant_label,
-        assistant_text_renderer=assistant_text_renderer,
-        user_text_renderer=user_text_renderer,
-    )
-    if rendered:
-        print(rendered)
-    print('----')

@@ -193,7 +193,8 @@ def _read_with_timeout(master, total=4.0):
 
 def run_loki_pty_reply(stream: bool, stream_chunks=None,
                        queued_inputs=None, create_image=False,
-                       initial_input=b"hi"):
+                       initial_input=b"hi", reply=None,
+                       raw_file_data=None):
     """Run one real TUI turn; optionally pause after its first delta.
 
     Returns ``(all_output, before_stream_release)``. The second value is only
@@ -204,6 +205,8 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
     if create_image:
         pathlib.Path(tmpdir, "image.png").write_bytes(
             b"\x89PNG\r\n\x1a\npayload")
+    if raw_file_data is not None:
+        pathlib.Path(tmpdir, "attack.bin").write_bytes(raw_file_data)
     gate = os.path.join(tmpdir, "release-stream") if stream_chunks else None
     pid, master = pty.fork()
     if pid == 0:  # child: real tty on stdin/stdout, hermetic dirs
@@ -219,7 +222,8 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
                 "LOKI_PROVIDER": "dummy",
                 "LOKI_API_BASE": "http://dummy.invalid/v1",
                 "LOKI_DUMMY_REPLY": (
-                    "".join(stream_chunks) if stream_chunks else REPLY),
+                    "".join(stream_chunks) if stream_chunks
+                    else REPLY if reply is None else reply),
                 "LOKI_STREAM": "1" if stream else "0",
             }
             if stream_chunks:
@@ -289,6 +293,27 @@ class PtyUiTests(unittest.TestCase):
         output, _before_release = run_loki_pty_reply(stream=False)
         self._assert_styled_output(output)
 
+    def test_batch_and_split_stream_model_controls_are_not_executed(self):
+        attack = "\x1b]777;LOKI_MODEL_ATTACK\x07"
+        visible = b"^[]777;LOKI_MODEL_ATTACK^G"
+
+        batch, _ = run_loki_pty_reply(
+            stream=False, reply=f"before {attack} **boldword**")
+        streamed, _ = run_loki_pty_reply(
+            stream=True,
+            stream_chunks=[
+                "before \x1b]",
+                "777;LOKI_MODEL_ATTACK",
+                "\x07 **bold",
+                "word**",
+            ],
+        )
+
+        for output in [batch, streamed]:
+            self.assertNotIn(attack.encode(), output)
+            self.assertIn(visible, output)
+            self.assertIn(BOLD_RUN, output)
+
     def test_pasted_terminal_controls_are_displayed_not_executed(self):
         attack = b"\x1b]777;LOKI_INPUT_ATTACK\x07"
         pasted = (
@@ -305,6 +330,17 @@ class PtyUiTests(unittest.TestCase):
             b"first^[]777;LOKI_INPUT_ATTACK^G^I\r\nnext",
             output,
         )
+
+    def test_explicit_bang_command_keeps_raw_unix_output(self):
+        attack = b"\x1b]777;LOKI_COMMAND_OUTPUT\x07"
+
+        output, _ = run_loki_pty_reply(
+            stream=False,
+            initial_input=b"!cat attack.bin",
+            raw_file_data=attack,
+        )
+
+        self.assertIn(attack, output)
 
     def test_status_bar_shows_api_and_mode(self):
         # Regression for the frontend split dropping the status text
@@ -483,6 +519,18 @@ class PtyCliUsageTests(unittest.TestCase):
                         cli_args[0].encode(), output,
                         "the rejected option must be named back to the "
                         "user")
+
+    def test_argument_error_represents_supplied_terminal_controls(self):
+        attack = "\x1b]777;LOKI_OPTION_ATTACK\x07"
+        with tempfile.TemporaryDirectory() as cwd:
+            exit_code, output = self._run_cli(
+                cwd, "--not-an-option-" + attack)
+
+        self.assertEqual(exit_code, 2)
+        self.assertNotIn(attack.encode(), output)
+        self.assertNotIn(b"\x1b", output)
+        self.assertIn(b"\\x1b", output)
+
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
 class PtyCtrlCTests(unittest.TestCase):

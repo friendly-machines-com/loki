@@ -3517,7 +3517,7 @@ PLAN_TOOLS = EXPLORE_TOOLS | {
 TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
 
 
-def configure_tool_hook_pipeline(environ=os.environ):
+def configure_tool_hook_pipeline(environ=os.environ, stderr_reporter=None):
     """Load trusted user-selected command hooks; project hooks are never automatic."""
     global TOOL_HOOK_PIPELINE
     configured = environ.get("LOKI_HOOKS")
@@ -3530,7 +3530,8 @@ def configure_tool_hook_pipeline(environ=os.environ):
     path = os.path.expanduser(configured)
     if not os.path.isabs(path):
         path = os.path.join(STARTUP_CWD, path)
-    TOOL_HOOK_PIPELINE = tool_runtime.load_hook_pipeline(path)
+    TOOL_HOOK_PIPELINE = tool_runtime.load_hook_pipeline(
+        path, stderr_reporter=stderr_reporter)
     return path
 
 
@@ -3960,7 +3961,7 @@ def _status_api_base() -> str:
     return host + path
 
 
-async def load_models_async():
+async def load_models_async(diagnostic_writer=None):
     """Fetch the active provider's /models listing; [] when unavailable."""
     if not current_config():
         return [current_model()] if current_model() else []
@@ -3998,8 +3999,8 @@ async def load_models_async():
         if loaded:
             return loaded
 
-    if errors:
-        print("Model list failed:\n" + "\n".join(errors), file=sys.stderr)
+    if errors and diagnostic_writer is not None:
+        diagnostic_writer("\n".join(errors))
     return [current_model()] if current_model() else []
 
 # models = ['hy3-preview', 'glm-5.2', 'glm-5.1', 'kimi-k2.7', 'kimi-k2.6', 'deepseek-v4-pro', 'deepseek-v4-flash', 'mimo-v2.5', 'mimo-v2.5-pro']
@@ -4052,7 +4053,7 @@ def record_shell_cwd_instruction():
 def _print_display_line(prefix, text, *, text_writer=None, file=None):
     print(prefix, end="", file=file)
     if text_writer is None:
-        print(text, end="", file=file)
+        print(repr(text), end="", file=file)
     else:
         text_writer(text, file=file)
     print(file=file)
@@ -4191,7 +4192,10 @@ def load_session_state(state: dict):
     try:
         change_shell_cwd(loaded_shell_cwd)
     except FileNotFoundError:
-        print(f"Warning: saved cwd no longer exists: {loaded_shell_cwd}", file=sys.stderr)
+        print(
+            f"Warning: saved cwd no longer exists: {loaded_shell_cwd!r}",
+            file=sys.stderr,
+        )
 
 
 def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:

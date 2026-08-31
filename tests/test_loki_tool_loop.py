@@ -963,7 +963,8 @@ class ModelLoadingTests(unittest.TestCase):
             "visible\x1b]0;owned\x07 resumed question\nnext\tline")
         assistant_markdown = (
             "## Resume heading\n\n"
-            "**visible resumed answer** and `code`\n\n"
+            "**visible resumed answer** and `code` "
+            "\x1b]0;assistant-owned\x07\u009b\n\n"
             "```python\n"
             "print('raw **inside fence**')\n"
             "```"
@@ -1005,9 +1006,9 @@ class ModelLoadingTests(unittest.TestCase):
                     return_value=session), mock.patch(
                         "loki_agent.terminal_frontend.confirm_saved_connection_async",
                         new=confirm), mock.patch(
-                            "loki_agent.terminals."
-                            "_terminal_supports_markdown_ansi",
-                            return_value=True), mock.patch(
+                            "loki_agent.terminal_frontend."
+                            "terminal.markdown_style",
+                            True), mock.patch(
                             "loki_agent.terminal_frontend.restore_output_area_after_input"), \
                     contextlib.redirect_stdout(stdout):
                 status = asyncio.run(
@@ -1022,6 +1023,10 @@ class ModelLoadingTests(unittest.TestCase):
             rendered,
         )
         self.assertNotIn("\x1b]0;owned\x07", rendered)
+        self.assertNotIn(
+            "\x1b]0;assistant-owned\x07", rendered)
+        self.assertIn(
+            "^[]0;assistant-owned^G\\x9b", rendered)
         self.assertIn(
             "local-model: "
             + terminals.render_markdown(assistant_markdown, style=True),
@@ -1086,7 +1091,7 @@ class ModelLoadingTests(unittest.TestCase):
         })
         session = ScriptedInputSession(["/model", "/quit"])
 
-        async def load_provider_models():
+        async def load_provider_models(diagnostic_writer=None):
             loki.current_session().models = ["current-model", "other-model"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1127,7 +1132,7 @@ class ModelLoadingTests(unittest.TestCase):
         })
         session = ScriptedInputSession(["/model", "/quit"])
 
-        async def load_provider_models():
+        async def load_provider_models(diagnostic_writer=None):
             loki.current_session().models = ["first-model", "selected-model"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1230,7 +1235,7 @@ class ModelLoadingTests(unittest.TestCase):
         seen_explicit = []
 
         async def pick_model(*, input_fn, credentials,
-                             explicit_connection=None):
+                             explicit_connection=None, text_writer):
             seen_explicit.append(explicit_connection)
             if len(seen_explicit) == 1:
                 return "catalog", catalog_provider, catalog_model
@@ -1286,7 +1291,7 @@ class ModelLoadingTests(unittest.TestCase):
         seen_explicit = []
 
         async def pick_flat(input_fn, model_ids,
-                            explicit_connection=None):
+                            explicit_connection=None, *, text_writer):
             seen_explicit.append(explicit_connection)
             return explicit_connection
 
@@ -1455,14 +1460,17 @@ class StatusTextTests(unittest.TestCase):
             loki.current_session().runtime_config = None
             loki.current_session().shell_cwd = (
                 "/tmp/unsafe\x1b[2J\nnext")
-            text = terminal_frontend.status_text()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                terminal_frontend._write_status_text()
+            displayed = output.getvalue()
         finally:
             restore_loki_state(old_values)
 
         self.assertIn(
-            "CWD: /tmp/unsafe^[[2J^Jnext;", text)
-        self.assertNotIn("\x1b", text)
-        self.assertEqual(text.count("\n"), 1)
+            "CWD: /tmp/unsafe^[[2J^Jnext;", displayed)
+        self.assertNotIn("\x1b", displayed)
+        self.assertEqual(displayed.count("\n"), 1)
 
     def test_status_text_marks_a_deprecated_selected_model(self):
         names = ["runtime_config", "shell_cwd"]
@@ -1676,6 +1684,39 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         self.assertNotIn("\nNone", text)
         self.assertIn("[Model response failed]", text)
         self.assertIn("visible failure", text)
+
+    def test_terminal_resume_presentation_neutralizes_every_segment_kind(self):
+        tool_name = "Read\x1b]0;name\x07\nnext"
+        items = [
+            formats.model_response_event(
+                formats.OPENAI_CHAT,
+                [formats.tool_call_item(
+                    "call_1", tool_name,
+                    {"path": "a\x1b]0;path\x07\nb"})],
+                model="model\x1b]0;model\x07\nnext",
+            ),
+            formats.tool_result_item(
+                "call_1",
+                "first\x1b]0;result\x07\n"
+                "second\u009b \u6a21\u578b",
+                name=tool_name,
+            ),
+        ]
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            terminal_frontend._ResumeTranscriptPresenter(
+                "Assistant").write(items)
+
+        rendered = output.getvalue()
+        self.assertNotIn("\x1b]0;", rendered)
+        self.assertIn(
+            "'Read\\x1b]0;name\\x07\\nnext'", rendered)
+        self.assertIn("\\x1b]0;path\\x07\\nb", rendered)
+        self.assertIn(
+            "first^[]0;result^G\nsecond\\x9b \u6a21\u578b",
+            rendered,
+        )
 
 
 class SessionResponsePersistenceTests(unittest.TestCase):
@@ -3065,6 +3106,11 @@ class SessionPickerTests(unittest.TestCase):
             def flush(self, *a, **k):
                 self.calls.append(("flush",))
 
+            def write_text(
+                    self, text, *, multiline=False, file=None):
+                terminals._TerminalTextOutput.write_text(
+                    self, text, multiline=multiline, file=file)
+
         terminal_frontend.terminal = _FakeTerminal()
 
         def restore():
@@ -3665,13 +3711,14 @@ class ShellCwdTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertTrue(rendered.startswith("\nSaved connection:\n"))
         self.assertIn("Saved connection:", rendered)
-        self.assertIn("Provider: OpenRouter", rendered)
-        self.assertIn("Model: z-ai/glm", rendered)
+        self.assertIn("Provider: 'OpenRouter'", rendered)
+        self.assertIn("Model: 'z-ai/glm'", rendered)
         self.assertIn(
-            "Chat endpoint: https://openrouter.ai/api/v1/chat/completions",
+            "Chat endpoint: "
+            "'https://openrouter.ai/api/v1/chat/completions'",
             rendered,
         )
-        self.assertIn("Credential: OPENROUTER_API_KEY", rendered)
+        self.assertIn("Credential: 'OPENROUTER_API_KEY'", rendered)
 
     def test_saved_credentialless_connection_confirmation_identifies_no_auth(
             self):

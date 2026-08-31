@@ -1,12 +1,43 @@
 import asyncio
+import ast
 import contextlib
 import io
+import pathlib
 import sys
 import unittest
 from unittest import mock
 
 
 from loki_agent import terminals
+
+
+class TerminalDependencyBoundaryTests(unittest.TestCase):
+    def test_core_shared_and_acp_modules_do_not_import_terminals(self):
+        package_dir = pathlib.Path(terminals.__file__).resolve().parent
+        violations = []
+        for path in package_dir.glob("*.py"):
+            if path.name in ["terminals.py", "terminal_frontend.py"]:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    if (
+                            node.module in [
+                                "terminals", "loki_agent.terminals"]
+                            or (
+                                node.level
+                                and node.module in [None, "loki_agent"]
+                                and any(
+                                    alias.name == "terminals"
+                                    for alias in node.names))):
+                        violations.append((path.name, node.lineno))
+                elif isinstance(node, ast.Import):
+                    if any(
+                            alias.name == "loki_agent.terminals"
+                            for alias in node.names):
+                        violations.append((path.name, node.lineno))
+
+        self.assertEqual(violations, [])
 
 
 def feed_bytes(reader, data):
@@ -264,6 +295,10 @@ class RecordingTerminal:
 
     def flush(self):
         self.calls.append(("flush",))
+
+    def write_text(self, text, *, multiline=False, file=None):
+        terminals._TerminalTextOutput.write_text(
+            self, text, multiline=multiline, file=file)
 
 
 class TerminfoKeySequenceTests(unittest.TestCase):
@@ -1275,25 +1310,26 @@ class InputModalTests(unittest.TestCase):
         self.assertIsNone(session._modal)
 
 
-class UserTextDisplayTests(unittest.TestCase):
+class TerminalTextOutputTests(unittest.TestCase):
     def test_escapes_terminal_controls_and_allowlists_multiline_lf(self):
         logical = (
             "\x00A\t\nB\r\x1b\x7f\u0085")
+        single_line = io.StringIO()
+        multiline = io.StringIO()
 
-        self.assertEqual(
-            terminals.user_text_for_terminal(logical),
-            "^@A^I^JB^M^[^?\\x85",
-        )
-        self.assertEqual(
-            terminals.user_text_for_terminal(
-                logical, multiline=True),
-            "^@A^I\nB^M^[^?\\x85",
-        )
+        terminals.terminal.write_text(logical, file=single_line)
+        terminals.terminal.write_text(
+            logical, multiline=True, file=multiline)
+
+        self.assertEqual(single_line.getvalue(), "^@A^I^JB^M^[^?\\x85")
+        self.assertEqual(multiline.getvalue(), "^@A^I\nB^M^[^?\\x85")
 
     def test_no_control_code_survives_single_line_display(self):
         logical = "".join(chr(code) for code in range(0xa0))
+        out = io.StringIO()
 
-        displayed = terminals.user_text_for_terminal(logical)
+        terminals.terminal.write_text(logical, file=out)
+        displayed = out.getvalue()
 
         self.assertFalse(any(
             ord(character) < 0x20
@@ -1305,7 +1341,7 @@ class UserTextDisplayTests(unittest.TestCase):
         logical = "first\x1b[2J\t\nsecond\r\x00"
         out = io.StringIO()
 
-        terminals.write_user_text(
+        terminals.terminal.write_text(
             logical, multiline=True, file=out)
 
         displayed = out.getvalue()
@@ -1315,6 +1351,16 @@ class UserTextDisplayTests(unittest.TestCase):
         self.assertNotIn("\t", displayed)
         self.assertNotIn("\r", displayed)
         self.assertNotIn("\x00", displayed)
+
+    def test_writer_preserves_unicode_outside_terminal_control_ranges(self):
+        logical = (
+            "e\u0301 \u6a21\u578b "
+            "\U0001f469\u200d\U0001f4bb \u202e")
+        out = io.StringIO()
+
+        terminals.terminal.write_text(logical, file=out)
+
+        self.assertEqual(out.getvalue(), logical)
 
 
 class PromptRendererTests(unittest.TestCase):

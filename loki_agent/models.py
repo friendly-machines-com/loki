@@ -436,7 +436,8 @@ def _row_matches(row, query):
     return all(w in blob for w in words)
 
 
-async def _numbered_menu_async(rows, prompt, input_fn, header=None):
+async def _numbered_menu_async(
+        rows, prompt, input_fn, *, text_writer, header=None):
     """Numbered menu over rows=[(value, display_text)] (optionally a third
     search_text element for filtering beyond the visible line).
 
@@ -450,7 +451,9 @@ async def _numbered_menu_async(rows, prompt, input_fn, header=None):
             print()
             print(header)
         for i, row in enumerate(shown, 1):
-            print(f"{i}. {row[1]}")
+            print(f"{i}. ", end="")
+            text_writer(row[1])
+            print()
         choice = (await input_fn(prompt) or "").strip()
         if choice == "filter" or choice.startswith("filter "):
             query = choice[len("filter"):].strip()
@@ -585,7 +588,9 @@ def _provider_rows(members):
 
 async def run_flat_model_picker_async(
         input_fn, model_ids,
-        explicit_connection: ExplicitConnectionOption | None = None):
+        explicit_connection: ExplicitConnectionOption | None = None,
+        *,
+        text_writer):
     """Single-level menu over a flat list of model ids (outage fallback).
 
     Used when models.dev is unreachable: loki.py fetches the current
@@ -615,6 +620,7 @@ async def run_flat_model_picker_async(
         rows,
         'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
         input_fn,
+        text_writer=text_writer,
         header="Usable models:")
 
 
@@ -673,7 +679,9 @@ def flattened_config_options(credentials, explicit_connection=None,
 async def run_model_picker_async(input_fn, credentials: CredentialStore,
                                  cache_path=None,
                                  explicit_connection:
-                                 ExplicitConnectionOption | None = None):
+                                 ExplicitConnectionOption | None = None,
+                                 *,
+                                 text_writer):
     """Two-level picker: conflated model -> provider.
 
     Returns (provider_id, provider_entry, model_entry) for the chosen
@@ -700,6 +708,7 @@ async def run_model_picker_async(input_fn, credentials: CredentialStore,
         model_rows,
         'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
         input_fn,
+        text_writer=text_writer,
         header="Usable models:")
     if members is None:
         return None
@@ -709,6 +718,7 @@ async def run_model_picker_async(input_fn, credentials: CredentialStore,
         provider_rows,
         'Provider choice (number selects, "filter WORDS" narrows, empty cancels): ',
         input_fn,
+        text_writer=text_writer,
         header="Usable providers:")
     if picked is None:
         return None

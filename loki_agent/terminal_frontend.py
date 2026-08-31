@@ -18,7 +18,7 @@ import signal
 import stat
 import sys
 from dataclasses import dataclass
-from pprint import pprint
+from pprint import pformat
 
 from . import formats
 from . import models as modelsdev
@@ -220,15 +220,79 @@ def load_image_attachment(path_text: str, *,
 
 def _print_tool_args(args):
     if not isinstance(args, dict):
-        pprint(args)
+        terminal.write_text(pformat(args), multiline=True)
+        print()
         return
     for k, v in args.items():
-        pprint((k, v))
+        terminal.write_text(pformat((k, v)), multiline=True)
+        print()
 
 
-def _print_terminal_fragments(fragments):
-    for fragment in fragments:
-        print(fragment, end='', flush=True)
+def _print_text_line(prefix, text, *, file=None, multiline=False):
+    print(prefix, end="", file=file)
+    terminal.write_text(str(text), multiline=multiline, file=file)
+    print(file=file)
+
+
+def _print_repr_line(prefix, value, *, file=None):
+    _print_text_line(prefix, repr(value), file=file)
+
+
+def _print_json_diagnostic(prefix, payload, *, file):
+    print(prefix, end="", file=file)
+    terminal.write_text(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, default=str),
+        multiline=True,
+        file=file,
+    )
+    print(file=file)
+
+
+def _report_model_list_errors(text):
+    print("Model list failed:", file=sys.stderr)
+    terminal.write_text(text, multiline=True, file=sys.stderr)
+    print(file=sys.stderr)
+    sys.stderr.flush()
+
+
+def _report_hook_stderr(command, text):
+    sys.stdout.flush()
+    print(f"Hook {command[0]!r} stderr:", file=sys.stderr)
+    terminal.write_text(text, multiline=True, file=sys.stderr)
+    print(file=sys.stderr)
+    sys.stderr.flush()
+
+
+class _ResumeTranscriptPresenter:
+    """Write a saved transcript without mixing untrusted text with ANSI."""
+
+    def __init__(self, assistant_label):
+        self.renderer = savefiles.ResumeTranscriptRenderer(
+            assistant_label=assistant_label)
+
+    def write(self, events):
+        blocks = self.renderer.presentation(events)
+        for block_index, block in enumerate(blocks):
+            if block_index:
+                print("\n\n", end="")
+            for kind, text in block:
+                if kind == "literal":
+                    print(text, end="")
+                elif kind == "atom":
+                    terminal.write_text(text)
+                elif kind == "program_atom":
+                    terminal.write_text(repr(text))
+                elif kind in ["text", "user_text"]:
+                    terminal.write_text(text, multiline=True)
+                elif kind == "assistant_markdown":
+                    terminal.write_markdown(text)
+                else:
+                    raise AssertionError(
+                        f"unknown transcript presentation kind {kind!r}")
+        if blocks:
+            print()
+        print("----")
 
 
 def _terminal_agent_event(event: dict):
@@ -239,49 +303,50 @@ def _terminal_agent_event(event: dict):
         print("\n[!] [Max Loop Limit Reached - Stopping Autonomous Execution]")
     elif kind == "api_error":
         terminal.set_background_color(ERROR_COLOR)
-        print(event["error"].formatted(), end='')
+        terminal.write_text(
+            event["error"].formatted(), multiline=True)
         terminal.reset_colors_and_flags()
         print()
     elif kind == "network_error":
-        print(f"\n{computer}: NETWORK ERROR: {event['error']}")
+        _print_text_line(
+            f"\n{computer}: NETWORK ERROR: ", event["error"],
+            multiline=True)
     elif kind == "transcript_error":
         terminal.set_background_color(ERROR_COLOR)
         error = event["error"]
-        print(f"Transcript render error: {error}", end='')
+        print("Transcript render error: ", end="")
+        terminal.write_text(str(error), multiline=True)
         terminal.reset_colors_and_flags()
         print()
         sys.stdout.flush()
         payload = getattr(error, "payload", None)
         if payload is not None:
-            print(
-                "Provider payload:\n"
-                + json.dumps(
-                    payload, ensure_ascii=False, sort_keys=True,
-                    default=str),
-                file=sys.stderr,
-            )
+            _print_json_diagnostic(
+                "Provider payload:\n", payload, file=sys.stderr)
             sys.stderr.flush()
     elif kind == "provider_error":
         terminal.set_background_color(ERROR_COLOR)
         error = event["error"]
-        print(f"Provider protocol error: {error}", end='')
+        print("Provider protocol error: ", end="")
+        terminal.write_text(str(error), multiline=True)
         terminal.reset_colors_and_flags()
         print()
         sys.stdout.flush()
     elif kind == "assistant_message":
-        rendered_content = terminals.render_markdown(event["content"])
-        print(f"\n{current_model()}: {rendered_content}")
+        print()
+        terminal.write_text(current_model())
+        print(": ", end="")
+        terminal.write_markdown(event["content"])
+        print()
     elif kind == "assistant_start":
-        was_active = terminal.assistant_markdown.active
-        stale = terminal.assistant_markdown.start()
-        if was_active:
-            _print_terminal_fragments(stale)
-        print(f"\n{current_model()}: ", end='', flush=True)
+        terminal.assistant_markdown.start()
+        print()
+        terminal.write_text(current_model())
+        print(": ", end="", flush=True)
     elif kind == "assistant_delta":
-        _print_terminal_fragments(
-            terminal.assistant_markdown.feed(event["content"]))
+        terminal.assistant_markdown.feed(event["content"])
     elif kind == "assistant_end":
-        _print_terminal_fragments(terminal.assistant_markdown.finish())
+        terminal.assistant_markdown.finish()
         print()
         sys.stdout.flush()
     elif kind == "response_timing":
@@ -303,66 +368,85 @@ def _terminal_agent_event(event: dict):
     elif kind == "response_incomplete":
         sys.stdout.flush()
         detail = event.get("protocol_data")
-        suffix = (
-            "\n" + json.dumps(
-                detail, ensure_ascii=False, sort_keys=True, default=str)
-            if detail else "")
         print(
-            "[model response incomplete; provider output saved]"
-            + suffix,
-            file=sys.stderr)
+            "[model response incomplete; provider output saved]",
+            end="",
+            file=sys.stderr,
+        )
+        if detail:
+            print(file=sys.stderr)
+            terminal.write_text(
+                json.dumps(
+                    detail, ensure_ascii=False, sort_keys=True,
+                    default=str),
+                multiline=True,
+                file=sys.stderr,
+            )
+        print(file=sys.stderr)
         sys.stderr.flush()
     elif kind == "response_failed":
         sys.stdout.flush()
         detail = event.get("protocol_data")
-        suffix = (
-            "\n" + json.dumps(
-                detail, ensure_ascii=False, sort_keys=True, default=str)
-            if detail else "")
-        print("[model response failed; provider output saved]" + suffix,
-              file=sys.stderr)
+        print(
+            "[model response failed; provider output saved]",
+            end="",
+            file=sys.stderr,
+        )
+        if detail:
+            print(file=sys.stderr)
+            terminal.write_text(
+                json.dumps(
+                    detail, ensure_ascii=False, sort_keys=True,
+                    default=str),
+                multiline=True,
+                file=sys.stderr,
+            )
+        print(file=sys.stderr)
         sys.stderr.flush()
     elif kind == "stream_error":
         error = event["error"]
         terminal.set_background_color(ERROR_COLOR)
+        print("Streaming response error: ", end="")
+        terminal.write_text(str(error), multiline=True)
         print(
-            f"Streaming response error: {error}\n"
-            "Set LOKI_STREAM=0 to disable streaming for this connection.",
-            end='')
+            "\nSet LOKI_STREAM=0 to disable streaming for this connection.",
+            end="")
         terminal.reset_colors_and_flags()
         print()
         sys.stdout.flush()
         payload = getattr(error, "payload", None)
         if payload is not None:
-            print(
-                "Provider payload:\n"
-                + json.dumps(
-                    payload, ensure_ascii=False, sort_keys=True,
-                    default=str),
-                file=sys.stderr,
-            )
+            _print_json_diagnostic(
+                "Provider payload:\n", payload, file=sys.stderr)
             sys.stderr.flush()
     elif kind == "tool_input_repaired":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
-        print(f"{computer}: Repaired Tool Input: {event['name']}")
+        _print_repr_line(
+            f"{computer}: Repaired Tool Input: ", event["name"])
         for repair in event["repairs"]:
-            print(
-                f"  {repair['display_path']}: "
-                f"{repair['rule'].replace('_', ' ')}")
+            print("  ", end="")
+            terminal.write_text(repr(repair["display_path"]))
+            print(": ", end="")
+            terminal.write_text(repair["rule"].replace("_", " "))
+            print()
         terminal.reset_colors_and_flags()
     elif kind == "tool_call":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
-        print(f"{computer}: Executing Tool: {event['name']} with args:")
+        print(f"{computer}: Executing Tool: ", end="")
+        terminal.write_text(repr(event["name"]))
+        print(" with args:")
         _print_tool_args(event["args"])
         terminal.reset_colors_and_flags()
     elif kind == "tool_rejected":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
-        print(f"{computer}: Rejected Tool: {event['name']} with invalid args:")
+        print(f"{computer}: Rejected Tool: ", end="")
+        terminal.write_text(repr(event["name"]))
+        print(" with invalid args:")
         _print_tool_args(event["args"])
         terminal.reset_colors_and_flags()
     elif kind == "tool_error":
         terminal.set_background_color(ERROR_COLOR)
-        print(event["result"], end='')
+        terminal.write_text(event["result"], multiline=True)
         terminal.reset_colors_and_flags()
         print()
 
@@ -400,34 +484,68 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     )
 
 
-def status_text(activity: TerminalActivityStatus | None = None) -> str:
+def _status_fields(activity):
     activity = activity or _terminal_activity
     displayed_model = current_model()
     if (current_config() is not None
             and current_config().model_status == "deprecated"):
         displayed_model += " (deprecated)"
+    return {
+        "api": _status_api_base(),
+        "model": displayed_model,
+        "turn": "running" if activity.turn_running else "idle",
+        "queued_messages": activity.queued_messages,
+        "queued_images": activity.queued_images,
+        "mode": current_agent_mode(),
+        "cwd": display_path(current_cwd()),
+    }
+
+
+def status_text(activity: TerminalActivityStatus | None = None) -> str:
+    fields = _status_fields(activity)
     return (
         'Remote: API: {}; Model: {}; /model\n'
         'Local: turn: {}, queued messages: {}, queued images: {}, '
         'mode: {}, CWD: {}; '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
-        terminals.user_text_for_terminal(_status_api_base()),
-        terminals.user_text_for_terminal(displayed_model),
-        "running" if activity.turn_running else "idle",
-        activity.queued_messages, activity.queued_images,
-        terminals.user_text_for_terminal(current_agent_mode()),
-        terminals.user_text_for_terminal(display_path(current_cwd())))
+        fields["api"],
+        fields["model"],
+        fields["turn"],
+        fields["queued_messages"],
+        fields["queued_images"],
+        fields["mode"],
+        fields["cwd"])
 
 
-terminals.set_status_text_provider(status_text)
+def _write_status_text():
+    fields = _status_fields(None)
+    print("Remote: API: ", end="")
+    terminal.write_text(fields["api"])
+    print("; Model: ", end="")
+    terminal.write_text(fields["model"])
+    print("; /model\nLocal: turn: ", end="")
+    terminal.write_text(fields["turn"])
+    print(", queued messages: ", end="")
+    terminal.write_text(str(fields["queued_messages"]))
+    print(", queued images: ", end="")
+    terminal.write_text(str(fields["queued_images"]))
+    print(", mode: ", end="")
+    terminal.write_text(fields["mode"])
+    print(", CWD: ", end="")
+    terminal.write_text(fields["cwd"])
+    print("; /pwd, /cd DIR, /ps, /image PATH, !foo, /quit", end="")
+
+
+terminals.set_status_text_provider(_write_status_text)
 
 
 async def run_session_picker_async(session):
     async with session.modal() as modal:
         picked = await savefiles.run_session_picker_async(
             input_fn=modal.prompt,
-            terminal=terminal, chat_log_dir=_core.CHAT_LOG_DIR)
+            chat_log_dir=_core.CHAT_LOG_DIR,
+            text_writer=terminal.write_text)
         # Finish the picker's output cleanup while the modal still owns the
         # terminal. Only then may the normal input producer resume.
         terminal.goto_position(1, 1)
@@ -449,15 +567,16 @@ async def confirm_saved_connection_async(
     async with session.modal() as modal:
         print()
         print("Saved connection:")
-        print(f"  Provider: {provider}")
-        print(f"  Model: {selected_model}")
-        print(f"  Chat endpoint: {endpoint}")
+        _print_repr_line("  Provider: ", provider)
+        _print_repr_line("  Model: ", selected_model)
+        _print_repr_line("  Chat endpoint: ", endpoint)
         if models_endpoint:
-            print(f"  Models endpoint: {models_endpoint}")
+            _print_repr_line("  Models endpoint: ", models_endpoint)
         if descriptor.credential_env is None:
             print("  Authentication: none")
         else:
-            print(f"  Credential: {descriptor.credential_env}")
+            _print_repr_line(
+                "  Credential: ", descriptor.credential_env)
         print(f"  Streaming: {'yes' if descriptor.stream else 'no'}")
         if descriptor.protocol == protocols.ANTHROPIC_MESSAGES:
             print(
@@ -496,7 +615,8 @@ async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
     prompt = prompt if prompt is not None else sys.stdin.read().strip()
     result = await run_subagent_prompt_async(subagent_type, prompt)
     if result:
-        print(result)
+        terminal.write_text(result, multiline=True)
+        print()
 
 
 USAGE = """\
@@ -536,7 +656,7 @@ async def async_main(args) -> int:
     except getopt.GetoptError as error:
         # main() handles argument errors before any terminal setup; this
         # fallback only serves direct async_main callers.
-        print(f"loki: {error}", file=sys.stderr)
+        _print_repr_line("loki: ", str(error), file=sys.stderr)
         print(USAGE, end='', file=sys.stderr)
         return 2
     for option_name, _option_value in options:
@@ -564,8 +684,11 @@ async def async_main(args) -> int:
         try:
             _core.change_shell_cwd(shell_cwd)
         except (FileNotFoundError, NotADirectoryError) as error:
-            print(f"Configuration error: cwd is not a directory: {error}",
-                  file=sys.stderr)
+            _print_repr_line(
+                "Configuration error: cwd is not a directory: ",
+                str(error),
+                file=sys.stderr,
+            )
             return 2
 
     if subagent_type or headless:
@@ -573,7 +696,9 @@ async def async_main(args) -> int:
             apply_runtime_config(build_config_from_env(
                 credentials=_core.CREDENTIALS))
         except (protocols.ProtocolError, ValueError) as e:
-            print(f"Configuration error: {e}", file=sys.stderr)
+            _print_text_line(
+                "Configuration error: ", e, file=sys.stderr,
+                multiline=True)
             return 2
         if not current_model():
             print("Configuration error: model missing; set LOKI_MODEL.",
@@ -627,7 +752,9 @@ async def async_main(args) -> int:
                     _, _, saved_state, _ = loaded_chat
             except (OSError, json.JSONDecodeError,
                     formats.TranscriptFormatError) as e:
-                print(f"Could not resume chat: {e}", file=sys.stderr)
+                _print_text_line(
+                    "Could not resume chat: ", e, file=sys.stderr,
+                    multiline=True)
                 return 1
 
         try:
@@ -647,7 +774,9 @@ async def async_main(args) -> int:
                         return 0
         except (ConnectionDescriptorError, protocols.ProtocolError,
                 ValueError) as e:
-            print(f"Configuration error: {e}", file=sys.stderr)
+            _print_text_line(
+                "Configuration error: ", e, file=sys.stderr,
+                multiline=True)
             print("Starting without a provider; use /model or correct the "
                   "LOKI_* configuration.", file=sys.stderr)
             sys.stderr.flush()
@@ -666,14 +795,9 @@ async def async_main(args) -> int:
 
         if resolved_log_filename:
             load_chat_log(resolved_log_filename, loaded_chat)
-            savefiles.print_resume_transcript(
-                current_transcript(),
+            _ResumeTranscriptPresenter(
                 current_model() or "Assistant",
-                assistant_text_renderer=terminals.render_markdown,
-                user_text_renderer=lambda text: (
-                    terminals.user_text_for_terminal(
-                        text, multiline=True)),
-            )
+            ).write(current_transcript())
         else:
             new_chat_log(new_chat_log_path())
 
@@ -691,7 +815,7 @@ async def async_main(args) -> int:
 
             terminal.set_background_color(terminals.INPUT_COLOR)
             print('User: ', end='')
-            terminals.write_user_text(user_in, multiline=True)
+            terminal.write_text(user_in, multiline=True)
             terminal.reset_colors_and_flags()
             print()
             command_text = user_in.strip()
@@ -705,19 +829,23 @@ async def async_main(args) -> int:
                             picked = await modelsdev.run_model_picker_async(
                                 input_fn=modal.prompt,
                                 credentials=_core.CREDENTIALS,
-                                explicit_connection=explicit_option)
+                                explicit_connection=explicit_option,
+                                text_writer=terminal.write_text)
                         except (OSError, json.JSONDecodeError) as e:
                             # models.dev unreachable (network errors) or answered
                             # with non-JSON garbage: fall back to the current
                             # provider's own /models list in the same modal.
-                            print(f"models.dev unavailable: {e}",
-                                  file=sys.stderr)
+                            _print_text_line(
+                                "models.dev unavailable: ", e,
+                                file=sys.stderr, multiline=True)
                             sys.stderr.flush()
-                            models_list = await load_models_async()
+                            models_list = await load_models_async(
+                                diagnostic_writer=_report_model_list_errors)
                             selected_model = (
                                 await modelsdev.run_flat_model_picker_async(
                                     modal.prompt, models_list,
-                                    explicit_connection=explicit_option))
+                                    explicit_connection=explicit_option,
+                                    text_writer=terminal.write_text))
                             if selected_model:
                                 if isinstance(
                                         selected_model,
@@ -741,9 +869,13 @@ async def async_main(args) -> int:
                                     set_session_connection(descriptor)
                                 save_chat_log()
                                 print(
-                                    f"Selected model: {selected_label}"
-                                    f"{selected_via}",
+                                    "Selected model: ", end="",
                                     file=sys.stderr)
+                                terminal.write_text(
+                                    repr(selected_label), file=sys.stderr)
+                                terminal.write_text(
+                                    selected_via, file=sys.stderr)
+                                print(file=sys.stderr)
                                 sys.stderr.flush()
                                 continue
                             print("Model selection cancelled.",
@@ -772,30 +904,37 @@ async def async_main(args) -> int:
                                     _core.CREDENTIALS,
                                 ))
                             via = (
-                                f" via {provider_id}" if provider_id else "")
+                                f" via {provider_id!r}"
+                                if provider_id else "")
                     except (protocols.ProtocolError, ValueError) as e:
-                        print(f"Could not switch model: {e}",
-                              file=sys.stderr)
+                        _print_text_line(
+                            "Could not switch model: ", e,
+                            file=sys.stderr, multiline=True)
                         sys.stderr.flush()
                         continue
                     descriptor = active_connection_descriptor()
                     if descriptor is not None:
                         set_session_connection(descriptor)
                     save_chat_log()
-                    print(f"Selected model: {current_model()}{via}", file=sys.stderr)
+                    print("Selected model: ", end="", file=sys.stderr)
+                    terminal.write_text(
+                        repr(current_model()), file=sys.stderr)
+                    terminal.write_text(via, file=sys.stderr)
+                    print(file=sys.stderr)
                     sys.stderr.flush()
                     continue
                 case '/pwd':
                     print_shell_cwd(
-                        text_writer=terminals.write_user_text)
+                        text_writer=terminal.write_text)
                     continue
                 case '/ps':
-                    print(run_jobs())
+                    terminal.write_text(run_jobs(), multiline=True)
+                    print()
                     continue
                 case _ if command_text == '/cd' or command_text.startswith('/cd '):
                     change_shell_cwd_from_text(
                         command_text[3:].strip(),
-                        text_writer=terminals.write_user_text)
+                        text_writer=terminal.write_text)
                     continue
                 case _ if (command_text == '/image'
                            or (len(command_text) > len('/image')
@@ -807,7 +946,7 @@ async def async_main(args) -> int:
                     except ImageAttachmentError as error:
                         sys.stdout.flush()
                         print("image: ", end="", file=sys.stderr)
-                        terminals.write_user_text(
+                        terminal.write_text(
                             str(error), file=sys.stderr)
                         print(file=sys.stderr)
                         sys.stderr.flush()
@@ -818,7 +957,7 @@ async def async_main(args) -> int:
                     sys.stdout.flush()
                     print("Attached image for next prompt: ",
                           end="", file=sys.stderr)
-                    terminals.write_user_text(
+                    terminal.write_text(
                         display_path(image.path), file=sys.stderr)
                     print(
                         f" ({image.media_type}, {image.byte_size} bytes)",
@@ -831,9 +970,12 @@ async def async_main(args) -> int:
                         print(
                             f"{computer}: [Running local command: ",
                             end="")
-                        terminals.write_user_text(cmd)
+                        terminal.write_text(cmd)
                         print("]")
                         cmd_output = await run_bash_async(cmd)
+                        # This is the explicit Unix escape hatch: a command
+                        # entered with "!" owns its terminal output, including
+                        # any control sequences it deliberately produces.
                         print(cmd_output)  # Show output to you in the terminal
                         # Morph the user input so the AI sees exactly what you did and the result
                         user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
@@ -941,7 +1083,7 @@ def main() -> int:
     try:
         options, _positional = parse_cli_args(sys.argv[1:])
     except getopt.GetoptError as error:
-        print(f"loki: {error}", file=sys.stderr)
+        _print_repr_line("loki: ", str(error), file=sys.stderr)
         print(USAGE, end='', file=sys.stderr)
         return 2
     for option_name, _option_value in options:
@@ -949,9 +1091,12 @@ def main() -> int:
             print(USAGE, end='')
             return 0
     try:
-        configure_tool_hook_pipeline()
+        configure_tool_hook_pipeline(
+            stderr_reporter=_report_hook_stderr)
     except tool_runtime.HookConfigurationError as error:
-        print(f"Hook configuration error: {error}", file=sys.stderr)
+        _print_text_line(
+            "Hook configuration error: ", error,
+            file=sys.stderr, multiline=True)
         sys.stderr.flush()
         return 2
     cleanup_done = False
@@ -965,7 +1110,11 @@ def main() -> int:
             cleanup_failed = True
             # Terminal cleanup is best-effort: one failed restore step should
             # not prevent later steps from disabling modes or resetting colors.
-            print(f"Cleanup error: {type(e).__name__}: {e}", file=sys.stderr)
+            print(
+                f"Cleanup error: {type(e).__name__}: ", end="",
+                file=sys.stderr)
+            terminal.write_text(str(e), file=sys.stderr)
+            print(file=sys.stderr)
             sys.stderr.flush()
 
     def clean_up(*args, **kwargs):

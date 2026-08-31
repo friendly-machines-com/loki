@@ -302,7 +302,10 @@ class Worker:
             if discovered:
                 self._install_catalog_choices(discovered)
         except Exception as error:
-            print(f"models.dev discovery failed: {error}", file=sys.stderr)
+            print(
+                f"models.dev discovery failed: {error!r}",
+                file=sys.stderr,
+            )
 
         return {"configOptions": self.config_options()}
 
@@ -329,7 +332,7 @@ class Worker:
             raise
         except Exception as error:
             print(
-                f"models.dev discovery failed: {error}",
+                f"models.dev discovery failed: {error!r}",
                 file=sys.stderr,
             )
             return

@@ -219,7 +219,7 @@ class Front:
             await self.dispatch(method, params)
         except Exception as error:
             print(
-                f"ACP notification {method} failed: {error}",
+                f"ACP notification {method!r} failed: {error!r}",
                 file=sys.stderr,
             )
 

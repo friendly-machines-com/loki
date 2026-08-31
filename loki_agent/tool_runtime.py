@@ -770,7 +770,8 @@ def _hook_environment():
 
 async def _run_hook_command(command, payload, cwd, timeout_ms,
                             stdout_limit=1_000_000,
-                            stderr_limit=100_000):
+                            stderr_limit=100_000,
+                            stderr_reporter=None):
     try:
         stdin_data = json.dumps(
             payload,
@@ -838,12 +839,15 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
         raise HookExecutionError(
             f"hook exited with status {returncode}{detail}")
     if stderr_text:
-        sys.stdout.flush()
-        print(
-            f"Hook {command[0]!r} stderr:\n{stderr_text}",
-            file=sys.stderr,
-        )
-        sys.stderr.flush()
+        if stderr_reporter is None:
+            sys.stdout.flush()
+            print(
+                f"Hook {command[0]!r} stderr:\n{stderr_text}",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+        else:
+            stderr_reporter(command, stderr_text)
     if not stdout.strip():
         return {}
     try:
@@ -865,6 +869,7 @@ class ExternalHook:
     timeout_ms: int
     workspace_side_effects: bool = False
     event_name: str = "pre_tool_call"
+    stderr_reporter: object = None
 
     def matches(self, tool_name):
         return "*" in self.tools or tool_name in self.tools
@@ -891,6 +896,7 @@ class ExternalHook:
             },
             invocation.cwd,
             self.timeout_ms,
+            stderr_reporter=self.stderr_reporter,
         )
         action = result.get("action", "continue")
         arguments = result.get("arguments", _UNSET)
@@ -922,6 +928,7 @@ class ExternalHook:
             },
             invocation.cwd,
             self.timeout_ms,
+            stderr_reporter=self.stderr_reporter,
         )
         note = result.get("note")
         if note is not None and not isinstance(note, str):
@@ -934,7 +941,8 @@ class ExternalHook:
         )
 
 
-def _external_hook_from_dict(value, path, default_timeout):
+def _external_hook_from_dict(
+        value, path, default_timeout, stderr_reporter=None):
     if not isinstance(value, dict):
         raise HookConfigurationError(f"{path} must be an object")
     hook_id = value.get("id")
@@ -973,10 +981,11 @@ def _external_hook_from_dict(value, path, default_timeout):
         tuple(command),
         timeout_ms,
         workspace_side_effects=side_effects,
+        stderr_reporter=stderr_reporter,
     ), on_error
 
 
-def load_hook_pipeline(path):
+def load_hook_pipeline(path, stderr_reporter=None):
     try:
         with open(path, "r", encoding="utf-8") as stream:
             config = json.load(stream)
@@ -1004,7 +1013,11 @@ def load_hook_pipeline(path):
                 f"{section} must be a list")
         for index, value in enumerate(values):
             hook, on_error = _external_hook_from_dict(
-                value, f"{section}[{index}]", default_timeout)
+                value,
+                f"{section}[{index}]",
+                default_timeout,
+                stderr_reporter=stderr_reporter,
+            )
             hook.event_name = section
             if section == "post_tool_call" and on_error == "deny":
                 raise HookConfigurationError(

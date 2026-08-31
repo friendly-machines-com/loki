@@ -40,7 +40,10 @@ async def amain(credentials: CredentialStore) -> int:
     try:
         loki.configure_tool_hook_pipeline()
     except loki.tool_runtime.HookConfigurationError as error:
-        print(f"Hook configuration error: {error}", file=sys.stderr)
+        print(
+            f"Hook configuration error: {error!r}",
+            file=sys.stderr,
+        )
         return 2
 
     import json
