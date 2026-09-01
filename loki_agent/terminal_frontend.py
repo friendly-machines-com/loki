@@ -633,8 +633,7 @@ Options:
                           skip permission prompts
   -h, --help              show this help and exit
 
-Without options, loki starts the interactive TUI. ACP mode is a separate
-entry point: python3 -m loki_agent.acp_main
+Without options, loki starts the interactive TUI.
 """
 
 
