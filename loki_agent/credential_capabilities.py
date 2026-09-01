@@ -33,7 +33,14 @@ class CapabilityError(CredentialError):
     pass
 
 
-async def _streams_from_fd(fd: int):
+def _endpoint_from_fd(fd: int) -> socket.socket:
+    """Take synchronous ownership of an inherited capability descriptor.
+
+    This is deliberately not async. Delegated-process startup races capability
+    initialization against owner revocation; ownership must transfer before
+    that race can cancel the initialization task, or a task canceled before
+    its first instruction could leave the inherited credential FD open.
+    """
     try:
         os.set_inheritable(fd, False)
         endpoint = socket.socket(fileno=fd)
@@ -42,6 +49,10 @@ async def _streams_from_fd(fd: int):
             os.close(fd)
         raise
     endpoint.setblocking(False)
+    return endpoint
+
+
+async def _streams_from_endpoint(endpoint: socket.socket):
     try:
         return await asyncio.open_connection(
             sock=endpoint,
@@ -90,6 +101,30 @@ def _safe_error_text(error: Exception) -> str:
     return "credential request failed"
 
 
+class _CredentialClientInitializer:
+    """Own a capability socket until its async transport takes ownership."""
+
+    def __init__(self, client_class, endpoint: socket.socket):
+        self._client_class = client_class
+        self._endpoint = endpoint
+
+    async def connect(self):
+        endpoint = self._endpoint
+        try:
+            reader, writer = await _streams_from_endpoint(endpoint)
+        finally:
+            # open_connection() either transferred ownership to its transport
+            # or _streams_from_endpoint() closed the socket on failure.
+            self._endpoint = None
+        return await self._client_class._from_streams(reader, writer)
+
+    def close_now(self):
+        endpoint = self._endpoint
+        self._endpoint = None
+        if endpoint is not None:
+            endpoint.close()
+
+
 class CredentialClient:
     """Multiplex async credential requests over one delegated capability."""
 
@@ -106,8 +141,27 @@ class CredentialClient:
             self._read_messages(), name="credential-capability-client")
 
     @classmethod
-    async def from_fd(cls, fd: int) -> "CredentialClient":
-        reader, writer = await _streams_from_fd(fd)
+    def from_fd(cls, fd: int):
+        """Return an initialization awaitable after taking ownership of FD."""
+        initializer = cls.take_fd(fd)
+
+        async def connect():
+            try:
+                return await initializer.connect()
+            finally:
+                initializer.close_now()
+
+        return connect()
+
+    @classmethod
+    def take_fd(cls, fd: int) -> _CredentialClientInitializer:
+        """Take FD now so a later task cancellation cannot leak it."""
+        return _CredentialClientInitializer(
+            cls, _endpoint_from_fd(fd))
+
+    @classmethod
+    async def _from_streams(
+            cls, reader, writer) -> "CredentialClient":
         client = cls(reader, writer)
         try:
             raw_refs = await client._request("describe", {})

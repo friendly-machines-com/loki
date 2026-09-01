@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -4148,6 +4149,7 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_operation_is_cancelled_when_owner_fd_closes(self):
         async def scenario():
             read_fd, write_fd = os.pipe()
+            owner = subagents._SessionOwner(read_fd)
             cancelled = asyncio.Event()
 
             async def operation():
@@ -4156,21 +4158,53 @@ class SubagentLaunchTests(unittest.TestCase):
                 finally:
                     cancelled.set()
 
-            task = asyncio.create_task(
-                subagents._run_until_session_owner_closes(
-                    operation(), read_fd))
-            await asyncio.sleep(0)
-            os.close(write_fd)
-            completed = await asyncio.wait_for(task, timeout=1)
-            return completed, cancelled.is_set()
+            try:
+                task = asyncio.create_task(
+                    subagents._run_until_session_owner_closes(
+                        operation(), owner))
+                await asyncio.sleep(0)
+                os.close(write_fd)
+                write_fd = None
+                completed = await asyncio.wait_for(task, timeout=1)
+                return completed, cancelled.is_set()
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
+                await owner.close()
 
         completed, cancelled = asyncio.run(scenario())
         self.assertFalse(completed)
         self.assertTrue(cancelled)
 
+    def test_owner_close_cancels_pending_credential_handshake(self):
+        async def scenario():
+            read_fd, write_fd = os.pipe()
+            owner = subagents._SessionOwner(read_fd)
+            broker_socket, child_socket = socket.socketpair()
+            capability_fd = child_socket.detach()
+            try:
+                task = asyncio.create_task(
+                    subagents._connect_credential_while_owned(
+                        capability_fd, owner))
+                await asyncio.sleep(0)
+                os.close(write_fd)
+                write_fd = None
+                result = await asyncio.wait_for(task, timeout=1)
+                with self.assertRaises(OSError):
+                    os.fstat(capability_fd)
+                return result
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
+                broker_socket.close()
+                await owner.close()
+
+        self.assertIsNone(asyncio.run(scenario()))
+
     def test_subagent_operation_is_cancelled_when_broker_closes(self):
         async def scenario():
             read_fd, write_fd = os.pipe()
+            owner = subagents._SessionOwner(read_fd)
             broker_closed = asyncio.Event()
             cancelled = asyncio.Event()
 
@@ -4187,13 +4221,14 @@ class SubagentLaunchTests(unittest.TestCase):
             try:
                 task = asyncio.create_task(
                     subagents._run_until_session_owner_closes(
-                        operation(), read_fd, CredentialClient()))
+                        operation(), owner, CredentialClient()))
                 await asyncio.sleep(0)
                 broker_closed.set()
                 completed = await asyncio.wait_for(task, timeout=1)
                 return completed, cancelled.is_set()
             finally:
                 os.close(write_fd)
+                await owner.close()
 
         completed, cancelled = asyncio.run(scenario())
         self.assertFalse(completed)
@@ -4202,6 +4237,7 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_owner_fd_is_not_inherited_by_child_commands(self):
         async def scenario():
             read_fd, write_fd = os.pipe()
+            owner = subagents._SessionOwner(read_fd)
             inherited = []
 
             async def operation():
@@ -4228,9 +4264,10 @@ class SubagentLaunchTests(unittest.TestCase):
             try:
                 completed = await (
                     subagents._run_until_session_owner_closes(
-                        operation(), read_fd))
+                        operation(), owner))
             finally:
                 os.close(write_fd)
+                await owner.close()
             return completed, inherited
 
         completed, inherited = asyncio.run(scenario())
