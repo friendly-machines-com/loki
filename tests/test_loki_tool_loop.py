@@ -20,6 +20,7 @@ os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 
 from loki_agent import formats
 from loki_agent import authentications
+from loki_agent import http_client
 from loki_agent import loki
 from loki_agent import subagents
 from loki_agent import terminal_frontend
@@ -1530,12 +1531,6 @@ class ExitStatusTests(unittest.TestCase):
                     return async_status
 
                 with self.subTest(async_status=async_status), mock.patch(
-                        "loki_agent.terminal_frontend."
-                        "capture_process_credentials",
-                        return_value=CredentialStore({})), mock.patch(
-                            "loki_agent.terminal_frontend."
-                            "process_protections."
-                            "protect_credential_process"), mock.patch(
                             "loki_agent.terminal_frontend.signal.signal"), mock.patch(
                                 "loki_agent.terminal_frontend.signal.pthread_sigmask"
                             ), mock.patch(
@@ -1551,7 +1546,7 @@ class ExitStatusTests(unittest.TestCase):
                                     "chat_log_path",
                                     None,
                                 ), contextlib.redirect_stderr(stderr):
-                    status = terminal_frontend.main()
+                    status = terminal_frontend.main(CredentialStore({}))
 
                 self.assertEqual(status, expected_status)
         finally:
@@ -2186,6 +2181,101 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             "Anthropic payload contains dangling server calls: "
             f"{provider_pending!r}",
         )
+
+    def test_switch_and_resume_lease_the_selected_request_credential(self):
+        session = loki.current_session()
+        old_authority = session.credential_authority
+        old_credentials = loki.CREDENTIALS
+        try:
+            with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
+                store = CredentialStore({
+                    "PROVIDER_A_API_KEY": "key-a",
+                    "PROVIDER_B_API_KEY": "key-b",
+                })
+                broker = authentications.CredentialBroker()
+                store.install_static_credentials(broker)
+                session.credential_authority = broker
+                loki.CREDENTIALS = store.inventory()
+
+                provider_a = loki.make_runtime_config(
+                    "https://provider-a.example/v1/responses",
+                    protocols.OPENAI_RESPONSES,
+                    model="model-a",
+                    provider_id="provider-a",
+                    provider_name="Provider A",
+                    credential_ref=(
+                        authentications.CredentialRef.environment(
+                            "PROVIDER_A_API_KEY")),
+                )
+                provider_b = loki.make_runtime_config(
+                    "https://provider-b.example/v1/messages",
+                    protocols.ANTHROPIC_MESSAGES,
+                    model="model-b",
+                    provider_id="provider-b",
+                    provider_name="Provider B",
+                    credential_ref=(
+                        authentications.CredentialRef.environment(
+                            "PROVIDER_B_API_KEY")),
+                )
+                requests = []
+
+                async def request(method, url, **kwargs):
+                    requests.append({
+                        "method": method,
+                        "url": url,
+                        "headers": dict(kwargs["headers_in"]),
+                    })
+                    return http_client.HttpResponse(
+                        url, 200, "OK",
+                        {"content-type": "application/json"},
+                        b"{}",
+                    )
+
+                path = os.path.join(tmpdir, "credential-resume.json")
+                with mock.patch.object(
+                        http_client, "async_http_request", new=request):
+                    loki.apply_runtime_config(provider_a)
+                    asyncio.run(loki.async_chat_request(
+                        provider_a.chat_provider.chat_url, {}))
+
+                    loki.apply_runtime_config(provider_b)
+                    loki.new_chat_log(path)
+                    asyncio.run(loki.async_chat_request(
+                        provider_b.chat_provider.chat_url, {}))
+                    loki.save_chat_log()
+
+                    loki.apply_runtime_config(provider_a)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        loki.load_chat_log(path)
+                    descriptor = loki.connection_from_session_state(
+                        loki.current_state())
+                    resumed = loki.config_from_connection_descriptor(
+                        descriptor, loki.CREDENTIALS)
+                    loki.apply_runtime_config(resumed)
+                    asyncio.run(loki.async_chat_request(
+                        resumed.chat_provider.chat_url, {}))
+
+                self.assertEqual(
+                    [request["url"] for request in requests],
+                    [
+                        provider_a.chat_provider.chat_url,
+                        provider_b.chat_provider.chat_url,
+                        provider_b.chat_provider.chat_url,
+                    ],
+                )
+                self.assertEqual(
+                    requests[0]["headers"]["Authorization"],
+                    "Bearer key-a",
+                )
+                self.assertNotIn("x-api-key", requests[0]["headers"])
+                for request in requests[1:]:
+                    self.assertEqual(
+                        request["headers"]["x-api-key"], "key-b")
+                    self.assertNotIn(
+                        "Authorization", request["headers"])
+        finally:
+            session.credential_authority = old_authority
+            loki.CREDENTIALS = old_credentials
 
     def test_same_protocol_provider_switch_continues_tools_and_resumes(self):
         with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:

@@ -279,6 +279,26 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(auth.RefreshPermanentError):
                 await auth.request_openai_token_refresh("refresh")
 
+    async def test_http_error_response_makes_refresh_outcome_indeterminate(self):
+        for body in (b'{"error":"temporarily_unavailable"}', b"not json"):
+            with self.subTest(body=body):
+                response = http_client.HttpResponse(
+                    auth.OPENAI_REFRESH_URL,
+                    503,
+                    "Service Unavailable",
+                    {"content-type": "application/json"},
+                    body,
+                )
+                with mock.patch.object(
+                        http_client, "async_http_request",
+                        new=mock.AsyncMock(return_value=response)):
+                    with self.assertRaises(
+                            auth.RefreshTransientError) as raised:
+                        await auth.request_openai_token_refresh("refresh")
+
+                self.assertTrue(
+                    raised.exception.request_may_have_been_sent)
+
     async def test_refresh_exchange_is_one_shot_and_has_no_api_key_header(self):
         response = http_client.HttpResponse(
             auth.OPENAI_REFRESH_URL,
@@ -310,6 +330,10 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertNotIn("Authorization", kwargs["headers_in"])
+        self.assertEqual(
+            kwargs["headers_in"]["originator"],
+            auth.OPENAI_ORIGINATOR,
+        )
         self.assertEqual(result.refresh_token, "refresh-b")
 
 
@@ -328,6 +352,7 @@ class AuthorizationHeaderTests(unittest.TestCase):
 
         self.assertEqual(headers, {
             "Authorization": "Bearer access",
+            "originator": "loki",
             "ChatGPT-Account-ID": "account",
             "X-OpenAI-Fedramp": "true",
         })

@@ -8,6 +8,7 @@ over pipes with the dummy provider (no network): initialize, session/new
 import asyncio
 import json
 import os
+import select
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ import unittest
 from unittest import mock
 
 from loki_agent import acp, acps, authentications
-from loki_agent.credentials import CredentialStore
+from loki_agent.credentials import CredentialStore, is_credential_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -118,6 +119,33 @@ class AsyncFdLineReaderTests(unittest.TestCase):
         finally:
             os.close(read_fd)
             os.close(write_fd)
+
+
+class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_exit_awaits_credential_capability_cleanup(self):
+        class Output:
+            async def readline(self):
+                return b""
+
+        class Process:
+            stdout = Output()
+            stdin = None
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        capability = mock.Mock()
+        capability.close_now = mock.Mock()
+        capability.close = mock.AsyncMock()
+        channel = acp.WorkerChannel(
+            "session", Process(), lambda message: None, capability)
+
+        await channel._reader_task
+
+        capability.close_now.assert_called_once_with()
+        capability.close.assert_awaited_once_with()
+        self.assertIsNone(channel.credential_capability)
 
 
 class QuarantineTests(unittest.TestCase):
@@ -317,6 +345,144 @@ class FrontWorkerTests(unittest.TestCase):
         self.assertEqual(front.credentials.get(credential_name), "")
         lease = asyncio.run(front.credential_broker.lease(credential))
         self.assertEqual(lease.value, credential_value)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and os.path.isdir("/proc/self"),
+        "Linux process environment contract",
+    )
+    def test_real_front_scrubs_and_real_worker_never_receives_credential(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                name: value
+                for name, value in self._front_env(tmpdir).items()
+                if not is_credential_name(name)
+            }
+            credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
+            credential_value = "secret-" + ("v" * 137)
+            env[credential_name] = credential_value
+            env["LOKI_ACP_AFTER"] = "visible"
+
+            observer_dir = os.path.join(tmpdir, "observer")
+            report_dir = os.path.join(tmpdir, "reports")
+            os.makedirs(observer_dir)
+            os.makedirs(report_dir)
+            sitecustomize = os.path.join(observer_dir, "sitecustomize.py")
+            with open(sitecustomize, "w", encoding="ascii") as stream:
+                stream.write(
+                    "import json, os, sys\n"
+                    "from loki_agent import credentials\n"
+                    "_capture = credentials.capture_process_credentials\n"
+                    "def capture_process_credentials():\n"
+                    "    store = _capture()\n"
+                    "    with open('/proc/self/environ', 'rb') as source:\n"
+                    "        raw = source.read()\n"
+                    f"    name = {credential_name!r}.encode('ascii')\n"
+                    f"    value = {credential_value!r}.encode('ascii')\n"
+                    "    filler = b'x' * len(name + b'=' + value)\n"
+                    "    after = b'LOKI_ACP_AFTER=visible\\0'\n"
+                    "    report = {\n"
+                    "        'worker': '--worker' in sys.argv,\n"
+                    "        'name_present': name + b'=' in raw,\n"
+                    "        'value_present': value in raw,\n"
+                    "        'filler_present': filler in raw.split(b'\\0'),\n"
+                    "        'after_present': after in raw,\n"
+                    "        'after_follows_filler': (\n"
+                    "            raw.find(after) > raw.find(filler + b'\\0')\n"
+                    "            if filler + b'\\0' in raw else False),\n"
+                    "    }\n"
+                    "    path = os.path.join(\n"
+                    "        os.environ['LOKI_TEST_REPORT_DIR'],\n"
+                    "        f'{os.getpid()}.json')\n"
+                    "    with open(path, 'w', encoding='ascii') as output:\n"
+                    "        json.dump(report, output)\n"
+                    "    return store\n"
+                    "credentials.capture_process_credentials = (\n"
+                    "    capture_process_credentials)\n"
+                )
+            env["LOKI_TEST_REPORT_DIR"] = report_dir
+            env["PYTHONPATH"] = os.pathsep.join(
+                [observer_dir, ROOT])
+
+            front = subprocess.Popen(
+                loki_acp_command(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=tmpdir,
+            )
+            self.addCleanup(_close_process_streams, front)
+            try:
+                def send(message):
+                    front.stdin.write(json.dumps(message) + "\n")
+                    front.stdin.flush()
+
+                def recv_reply(reply_id):
+                    while True:
+                        ready, _writable, _exceptional = select.select(
+                            [front.stdout], [], [], 5)
+                        if not ready:
+                            stderr_ready, _writable, _exceptional = (
+                                select.select([front.stderr], [], [], 0))
+                            diagnostic = (
+                                front.stderr.read()
+                                if stderr_ready else "")
+                            self.fail(
+                                "front produced no message"
+                                f" (status={front.poll()}): {diagnostic}")
+                        line = front.stdout.readline()
+                        self.assertTrue(
+                            line,
+                            "front closed its protocol output",
+                        )
+                        message = json.loads(line)
+                        if message.get("id") == reply_id:
+                            return message
+
+                send({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": 1},
+                })
+                self.assertIn("result", recv_reply(1))
+                send({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {"cwd": tmpdir},
+                })
+                self.assertIn("result", recv_reply(2))
+
+                report_names = os.listdir(report_dir)
+                self.assertEqual(len(report_names), 2)
+                reports = []
+                for name in report_names:
+                    with open(
+                            os.path.join(report_dir, name),
+                            encoding="ascii") as stream:
+                        reports.append(json.load(stream))
+                front_report = next(
+                    report for report in reports if not report["worker"])
+                worker_report = next(
+                    report for report in reports if report["worker"])
+
+                for report in reports:
+                    self.assertFalse(report["name_present"])
+                    self.assertFalse(report["value_present"])
+                    self.assertTrue(report["after_present"])
+                self.assertTrue(front_report["filler_present"])
+                self.assertTrue(front_report["after_follows_filler"])
+                self.assertFalse(worker_report["filler_present"])
+                self.assertFalse(worker_report["after_follows_filler"])
+            finally:
+                front.stdin.close()
+                try:
+                    front.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    front.kill()
+                    front.wait()
 
     def test_unknown_session_is_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:

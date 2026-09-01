@@ -1142,11 +1142,23 @@ class JobManager:
             pass
 
     @staticmethod
-    def _close_credential_capability(job: Job):
+    def _revoke_credential_capability(job: Job):
         capability = job.credential_capability
-        job.credential_capability = None
         if capability is not None:
             capability.close_now()
+
+    @staticmethod
+    async def _close_credential_capability(job: Job):
+        """Revoke a job capability immediately, then finish async cleanup."""
+        capability = job.credential_capability
+        if capability is None:
+            return
+        capability.close_now()
+        try:
+            await capability.close()
+        finally:
+            if job.credential_capability is capability:
+                job.credential_capability = None
 
     def _record_exit(self, job: Job, exit_code: int):
         # Status records why Loki ended the job; exit_code/signal record
@@ -1169,7 +1181,7 @@ class JobManager:
         job.finished_at = time.time()
         job.finished_at_iso = _now_iso()
         self._close_owner_signal(job)
-        self._close_credential_capability(job)
+        self._revoke_credential_capability(job)
         self._write_metadata(job)
 
     def _refresh_job(self, job: Job):
@@ -1317,10 +1329,12 @@ class JobManager:
             job.finished_at = time.time()
             job.finished_at_iso = _now_iso()
             self._close_owner_signal(job)
-            self._close_credential_capability(job)
+            self._revoke_credential_capability(job)
             with open(job.stderr_path, 'ab') as stderr_file:
                 stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
             self._write_metadata(job)
+        finally:
+            await self._close_credential_capability(job)
 
     async def run_foreground(self, command, display_command: str, timeout_ms: int,
                              description: str = "", shell: bool = False,
@@ -1372,6 +1386,7 @@ class JobManager:
             job.status = "cancelled"
             self._write_metadata(job)
             self._record_exit(job, exit_code)
+            await self._close_credential_capability(job)
             return job, "cancelled", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
         cancel_task = (asyncio.create_task(cancel_event.wait())
@@ -1391,6 +1406,7 @@ class JobManager:
             job.status = "cancelled"
             self._write_metadata(job)
             self._record_exit(job, exit_code)
+            await self._close_credential_capability(job)
             raise
         finally:
             # Clean up pending cancel task if it is still running to prevent memory leaks
@@ -1411,6 +1427,7 @@ class JobManager:
             pass  # Fall through to the kill path below
         elif exit_task in done:
             self._record_exit(job, exit_task.result())
+            await self._close_credential_capability(job)
             return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
         # The job is still running; either the user cancelled or the
@@ -1423,6 +1440,7 @@ class JobManager:
         self._write_metadata(job)
 
         self._record_exit(job, exit_code)
+        await self._close_credential_capability(job)
         status = "cancelled" if interrupted else "timed_out"
         return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
@@ -1532,17 +1550,20 @@ class JobManager:
                 await asyncio.gather(exit_task, return_exceptions=True)
         if job.finished_at is None:
             self._record_exit(job, exit_code)
+        await self._close_credential_capability(job)
 
     async def close_session_owned(self):
         """End and reap every live process owned by this Loki session."""
         owned = []
+        cleanup = []
         for job in list(self.jobs.values()):
             self._refresh_job(job)
             if not job.session_owned:
                 continue
             if job.process is None or job.process.returncode is not None:
                 self._close_owner_signal(job)
-                self._close_credential_capability(job)
+                self._revoke_credential_capability(job)
+                cleanup.append(job)
                 continue
             job.status = "owner_closing"
             self._write_metadata(job)
@@ -1550,8 +1571,12 @@ class JobManager:
             # Process-group signals below enforce the ownership boundary if
             # the child is stuck or does not understand the owner channel.
             self._close_owner_signal(job)
-            self._close_credential_capability(job)
+            self._revoke_credential_capability(job)
             owned.append(job)
+        if cleanup:
+            await asyncio.gather(
+                *(self._close_credential_capability(job)
+                  for job in cleanup))
         if owned:
             await asyncio.gather(
                 *(self._finish_owned_job(job) for job in owned))

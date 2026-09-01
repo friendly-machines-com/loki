@@ -25,6 +25,7 @@ from . import http_client
 
 OPENAI_REFRESH_URL = "https://auth.openai.com/oauth/token"
 OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OPENAI_ORIGINATOR = "loki"
 OPENAI_ACCESS_TOKEN_REFRESH_WINDOW_S = 5 * 60
 OPENAI_FALLBACK_REFRESH_INTERVAL_S = 8 * 24 * 60 * 60
 OPENAI_REFRESH_TIMEOUT_S = 30
@@ -474,7 +475,10 @@ def authorization_headers(
         raise CredentialUnavailable(
             f"no lease for {spec.credential.encode()!r}")
     if spec.scheme == "openai-subscription":
-        headers = {"Authorization": f"Bearer {lease.value}"}
+        headers = {
+            "Authorization": f"Bearer {lease.value}",
+            "originator": OPENAI_ORIGINATOR,
+        }
         if lease.account_id:
             headers["ChatGPT-Account-ID"] = lease.account_id
         if lease.fedramp:
@@ -562,6 +566,7 @@ async def request_openai_token_refresh(
             headers_in={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "originator": OPENAI_ORIGINATOR,
             },
             timeout=OPENAI_REFRESH_TIMEOUT_S,
             max_bytes=OPENAI_REFRESH_MAX_BYTES,
@@ -586,7 +591,10 @@ async def request_openai_token_refresh(
                 "OpenAI token refresh returned invalid JSON") from error
         raise RefreshTransientError(
             f"OpenAI token refresh returned HTTP {response.status}",
-            request_may_have_been_sent=False,
+            # Receiving any HTTP response proves that the request crossed the
+            # local delivery boundary. An intermediary error cannot prove that
+            # an upstream rotating-token exchange did not commit.
+            request_may_have_been_sent=True,
         ) from error
 
     if not 200 <= response.status < 300:
@@ -603,7 +611,7 @@ async def request_openai_token_refresh(
                 "OpenAI refresh token is expired, reused, or revoked")
         raise RefreshTransientError(
             f"OpenAI token refresh returned HTTP {response.status}",
-            request_may_have_been_sent=False,
+            request_may_have_been_sent=True,
         )
 
     access_token = data.get("access_token")

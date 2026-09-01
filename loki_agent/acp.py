@@ -131,6 +131,7 @@ class WorkerChannel:
             self._closed = True
             if self.credential_capability is not None:
                 self.credential_capability.close_now()
+                await self.credential_capability.close()
                 self.credential_capability = None
             failure = failure or acps.TransportError(
                 f"worker for {self.session_id} closed")

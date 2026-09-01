@@ -22,7 +22,7 @@ def main() -> int:
         from .subagents import main as subagent_main
         return subagent_main(sys.argv[2:], credentials)
     from .terminal_frontend import main as terminal_main
-    return terminal_main()
+    return terminal_main(credentials)
 
 
 if __name__ == "__main__":

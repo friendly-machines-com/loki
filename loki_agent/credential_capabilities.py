@@ -254,6 +254,7 @@ class CredentialCapabilityServer:
         self._reader = reader
         self._writer = writer
         self._write_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
         self._requests: set[asyncio.Task] = set()
         self._closed = False
         self._reader_task = asyncio.create_task(
@@ -357,13 +358,12 @@ class CredentialCapabilityServer:
         return lease.to_wire()
 
     async def _close_writer(self):
-        if self._closed:
-            return
-        self._closed = True
-        self._writer.close()
-        with contextlib.suppress(
-                BrokenPipeError, ConnectionError, OSError):
-            await self._writer.wait_closed()
+        async with self._close_lock:
+            self._closed = True
+            self._writer.close()
+            with contextlib.suppress(
+                    BrokenPipeError, ConnectionError, OSError):
+                await self._writer.wait_closed()
 
     async def close(self):
         self.close_now()
@@ -373,6 +373,7 @@ class CredentialCapabilityServer:
             task.cancel()
         if requests:
             await asyncio.gather(*requests, return_exceptions=True)
+        await self._close_writer()
 
     def close_now(self):
         """Revoke a child capability without awaiting task cleanup."""

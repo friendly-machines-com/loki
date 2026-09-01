@@ -5,6 +5,7 @@ import pathlib
 import signal
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -16,6 +17,8 @@ from loki_agent import (
     protocols,
     terminal_frontend,
 )
+from loki_agent import __main__ as terminal_entrypoint
+from loki_agent.credentials import CredentialStore
 
 
 class ProviderResponseContractTests(unittest.TestCase):
@@ -112,6 +115,49 @@ class FileObservationContractTests(unittest.TestCase):
 
 
 class JobOwnershipContractTests(unittest.TestCase):
+    def test_exit_revokes_then_awaits_credential_capability_cleanup(self):
+        class Capability:
+            def __init__(self):
+                self.revoked = False
+                self.closed = False
+
+            def close_now(self):
+                self.revoked = True
+
+            async def close(self):
+                self.assert_revoked()
+                await asyncio.sleep(0)
+                self.closed = True
+
+            def assert_revoked(self):
+                if not self.revoked:
+                    raise AssertionError("cleanup started before revocation")
+
+        async def scenario():
+            manager = loki.JobManager("/tmp/loki-job-cleanup-test")
+            capability = Capability()
+            job = types.SimpleNamespace(
+                status="running",
+                signal=None,
+                exit_code=None,
+                finished_at=None,
+                finished_at_iso=None,
+                owner_signal_fd=None,
+                credential_capability=capability,
+            )
+            with mock.patch.object(manager, "_write_metadata"):
+                manager._record_exit(job, 0)
+                self.assertTrue(capability.revoked)
+                self.assertFalse(capability.closed)
+                self.assertIs(job.credential_capability, capability)
+                await manager._close_credential_capability(job)
+            return job, capability
+
+        job, capability = asyncio.run(scenario())
+
+        self.assertTrue(capability.closed)
+        self.assertIsNone(job.credential_capability)
+
     def test_job_state_uses_event_loop_ownership_without_a_thread_lock(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
@@ -366,6 +412,27 @@ class JobOwnershipContractTests(unittest.TestCase):
             result = asyncio.run(scenario(tmpdir))
         self.assertFalse(result["ok"])
         self.assertIn("timed_out", result["content"])
+
+
+class TerminalEntrypointContractTests(unittest.TestCase):
+    def test_security_initialization_happens_once_before_terminal_frontend(self):
+        credentials = CredentialStore({})
+        with mock.patch.object(
+                terminal_entrypoint,
+                "capture_process_credentials",
+                return_value=credentials) as capture, mock.patch.object(
+                    terminal_entrypoint,
+                    "protect_credential_process") as protect, mock.patch.object(
+                        terminal_frontend,
+                        "main",
+                        return_value=17) as terminal_main, mock.patch.object(
+                            sys, "argv", ["loki.py"]):
+            status = terminal_entrypoint.main()
+
+        self.assertEqual(status, 17)
+        capture.assert_called_once_with()
+        protect.assert_called_once_with()
+        terminal_main.assert_called_once_with(credentials)
 
 
 class AgentModeContractTests(unittest.TestCase):

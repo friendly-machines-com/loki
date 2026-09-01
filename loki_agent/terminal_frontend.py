@@ -22,12 +22,11 @@ from pprint import pformat
 
 from . import formats
 from . import models as modelsdev
-from . import process_protections
 from . import protocols
 from . import savefiles
 from . import subagents
 from . import terminals
-from .credentials import capture_process_credentials
+from .credentials import CredentialStore
 from . import tool_runtime
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .loki import RuntimeConfig, computer
@@ -1042,13 +1041,8 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
     run_step(active_terminal.flush)
 
 
-def main() -> int:
-    credential_store = capture_process_credentials()
-    try:
-        process_protections.protect_credential_process()
-    except process_protections.ProcessProtectionError as error:
-        print(f"Security initialization error: {error}", file=sys.stderr)
-        return 2
+def main(credential_store: CredentialStore) -> int:
+    """Run the terminal frontend after entry-point security initialization."""
     _core.install_root_credential_broker(credential_store)
     # Provider selection needs names and non-secret settings, not values.
     # Keeping only an inventory outside the broker makes accidental direct

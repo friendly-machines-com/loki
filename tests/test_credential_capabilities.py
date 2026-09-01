@@ -1,6 +1,7 @@
 import asyncio
 import os
 import unittest
+from unittest import mock
 
 from loki_agent import authentications
 from loki_agent import credential_capabilities
@@ -135,6 +136,19 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             await pending
         with self.assertRaises(credential_capabilities.CapabilityError):
             await self.client.lease(self.first)
+
+    async def test_awaited_server_close_waits_for_transport_cleanup(self):
+        await self.connect({self.first})
+        wait_closed = mock.AsyncMock(
+            wraps=self.server._writer.wait_closed)
+
+        with mock.patch.object(
+                self.server._writer,
+                "wait_closed",
+                new=wait_closed):
+            await self.server.close()
+
+        wait_closed.assert_awaited()
 
     def test_wire_messages_are_bounded_and_must_be_objects(self):
         with self.assertRaises(
