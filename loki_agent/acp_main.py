@@ -11,6 +11,10 @@ import os
 import sys
 
 from .credentials import CredentialStore, capture_process_credentials
+from .process_protections import (
+    ProcessProtectionError,
+    protect_credential_process,
+)
 
 
 async def amain(credentials: CredentialStore) -> int:
@@ -51,6 +55,14 @@ def main() -> int:
         from .acp_worker_main import main as worker_main
         return worker_main()
     credentials = capture_process_credentials()
+    try:
+        protect_credential_process()
+    except ProcessProtectionError as error:
+        print(f"Security initialization error: {error}", file=sys.stderr)
+        return 2
+    if sys.argv[1:2] == ["--subagent"]:
+        from .subagents import main as subagent_main
+        return subagent_main(sys.argv[2:], credentials)
     return asyncio.run(amain(credentials))
 
 

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from .authentications import CredentialRef
 from .credentials import is_credential_name
 
 
@@ -34,12 +35,25 @@ class ConnectionDescriptor:
     models_url: str | None
     protocol: str
     credential_env: str | None
+    credential_ref: CredentialRef | None = None
     max_tokens: int = 4096
     anthropic_version: str = "2023-06-01"
     auth_header: str | None = None
+    auth_scheme: str | None = None
     model_status: str | None = None
     stream: bool = False
     prompt_cache: bool = False
+
+    def __post_init__(self):
+        environment_ref = (
+            CredentialRef.environment(self.credential_env)
+            if self.credential_env is not None else None)
+        if self.credential_ref is None and environment_ref is not None:
+            object.__setattr__(self, "credential_ref", environment_ref)
+        elif (environment_ref is not None
+              and self.credential_ref != environment_ref):
+            raise ConnectionDescriptorError(
+                "connection credential and credential_env disagree")
 
     def to_dict(self) -> dict:
         return {
@@ -50,9 +64,13 @@ class ConnectionDescriptor:
             "models_url": self.models_url,
             "protocol": self.protocol,
             "credential_env": self.credential_env,
+            "credential": (
+                self.credential_ref.to_dict()
+                if self.credential_ref is not None else None),
             "max_tokens": self.max_tokens,
             "anthropic_version": self.anthropic_version,
             "auth_header": self.auth_header,
+            "auth_scheme": self.auth_scheme,
             "model_status": self.model_status,
             "stream": self.stream,
             "prompt_cache": self.prompt_cache,
@@ -84,6 +102,21 @@ class ConnectionDescriptor:
             raise ConnectionDescriptorError(
                 "connection credential_env must be null or end in "
                 "_KEY, _TOKEN, or _PAT")
+        raw_credential = value.get("credential")
+        if raw_credential is None:
+            credential_ref = (
+                CredentialRef.environment(credential_env)
+                if credential_env is not None else None)
+        else:
+            try:
+                credential_ref = CredentialRef.from_dict(raw_credential)
+            except ValueError as error:
+                raise ConnectionDescriptorError(str(error)) from error
+        if (credential_env is not None
+                and credential_ref
+                != CredentialRef.environment(credential_env)):
+            raise ConnectionDescriptorError(
+                "connection credential and credential_env disagree")
         return cls(
             provider_id=_optional_string(value.get("provider_id"), "provider_id"),
             provider_name=_optional_string(value.get("provider_name"), "provider_name"),
@@ -92,11 +125,14 @@ class ConnectionDescriptor:
             models_url=_optional_string(value.get("models_url"), "models_url"),
             protocol=_required_string(value.get("protocol"), "protocol"),
             credential_env=credential_env,
+            credential_ref=credential_ref,
             max_tokens=max_tokens,
             anthropic_version=_required_string(
                 value.get("anthropic_version", "2023-06-01"),
                 "anthropic_version"),
             auth_header=_optional_string(value.get("auth_header"), "auth_header"),
+            auth_scheme=_optional_string(
+                value.get("auth_scheme"), "auth_scheme"),
             model_status=_optional_string(
                 value.get("model_status"), "model_status"),
             stream=stream,

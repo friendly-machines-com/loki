@@ -1,9 +1,15 @@
 """In-memory startup credentials with process-environment scrubbing."""
 
+from __future__ import annotations
+
 import ctypes
 import os
 import sys
 from collections.abc import Iterable, MutableMapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .authentications import CredentialBroker, CredentialRef
 
 
 CREDENTIAL_SUFFIXES = ("_KEY", "_TOKEN", "_PAT")
@@ -40,25 +46,98 @@ class CredentialStore:
     def has(self, name: str) -> bool:
         return bool(self.get(name))
 
-    def first_available(self, names: Iterable[str]) -> tuple[str | None, str]:
+    def first_available_name(self, names: Iterable[str]) -> str | None:
         for name in names:
-            value = self.get(name)
-            if value:
-                return name, value
-        return None, ""
+            if self.has(name):
+                return name
+        return None
 
-    def startup_environment(self) -> dict[str, str]:
-        """Return a fresh copy of the captured startup environment.
+    def sanitized_environment(self) -> dict[str, str]:
+        """Return captured startup configuration without known credentials."""
+        return {
+            name: value for name, value in self.__values.items()
+            if not is_credential_name(name)
+        }
 
-        This is intentionally credential-bearing.  It exists for the ACP
-        front to bootstrap a worker, which immediately captures and scrubs
-        its own process environment.
-        """
-        return dict(self.__values)
+    def credential_refs(self) -> frozenset[CredentialRef]:
+        from .authentications import CredentialRef
+
+        return frozenset(
+            CredentialRef.environment(name)
+            for name, value in self.__values.items()
+            if is_credential_name(name) and value
+        )
+
+    def has_ref(self, credential: CredentialRef) -> bool:
+        return (
+            credential.kind == "env"
+            and self.has(credential.name))
+
+    def inventory(self) -> "CredentialInventory":
+        return CredentialInventory(
+            self.sanitized_environment(), self.credential_refs())
+
+    def install_static_credentials(self, broker: CredentialBroker) -> None:
+        """Register environment-shaped request secrets with the root broker."""
+        from .authentications import CredentialRef
+
+        for name, value in self.__values.items():
+            if is_credential_name(name) and value:
+                broker.install_static(
+                    CredentialRef.environment(name), value)
 
     def __repr__(self) -> str:
         present = sum(1 for value in self.__values.values() if value)
         return f"CredentialStore(<redacted>, {present} populated names)"
+
+
+class CredentialInventory:
+    """Non-secret configuration and credential availability for a process."""
+
+    def __init__(
+            self, values: dict[str, str],
+            credentials: Iterable[CredentialRef] = ()):
+        self.__values = {
+            name: value for name, value in values.items()
+            if not is_credential_name(name)
+        }
+        self.__credentials = frozenset(credentials)
+
+    @classmethod
+    def from_environment(
+            cls, environ: MutableMapping[str, str],
+            credentials: Iterable[CredentialRef] = ()):
+        return cls(dict(environ), credentials)
+
+    def get(self, name: str, default: str = "") -> str:
+        value = self.__values.get(name, default)
+        return value if isinstance(value, str) else default
+
+    def has(self, name: str) -> bool:
+        if is_credential_name(name):
+            return any(
+                credential.kind == "env" and credential.name == name
+                for credential in self.__credentials)
+        return bool(self.get(name))
+
+    def first_available_name(
+            self, names: Iterable[str]) -> str | None:
+        for name in names:
+            if self.has(name):
+                return name
+        return None
+
+    def credential_refs(self) -> frozenset[CredentialRef]:
+        return self.__credentials
+
+    def has_ref(self, credential: CredentialRef) -> bool:
+        return credential in self.__credentials
+
+    def __repr__(self) -> str:
+        return (
+            "CredentialInventory("
+            f"{len(self.__values)} settings, "
+            f"{len(self.__credentials)} credential names)")
 
 
 class CredentialScrubError(RuntimeError):

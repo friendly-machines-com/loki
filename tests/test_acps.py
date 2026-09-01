@@ -14,8 +14,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import acps
-from loki_agent.credentials import is_credential_name
+from loki_agent import acp, acps, authentications
+from loki_agent.credentials import CredentialStore
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -261,89 +261,62 @@ class FrontWorkerTests(unittest.TestCase):
                     front.kill()
                     front.wait()
 
-    def test_front_passes_then_both_processes_scrub_worker_credentials(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = {
-                name: value
-                for name, value in self._front_env(tmpdir).items()
-                if not is_credential_name(name)
-            }
-            credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
-            credential_value = "secret-" + ("v" * 137)
-            env[credential_name] = credential_value
-            env["LOKI_ACP_AFTER"] = "visible"
-            record_length = len(
-                f"{credential_name}={credential_value}".encode("utf-8"))
-            filler = b"x" * record_length
+    def test_front_delegates_credentials_without_worker_environment_values(self):
+        credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
+        credential_value = "secret-" + ("v" * 137)
+        store = CredentialStore({
+            "LOKI_API_BASE": "http://dummy.invalid/v1",
+            "LOKI_PROVIDER": "dummy",
+            "LOKI_MODEL": "dummy-model",
+            credential_name: credential_value,
+        })
+        front = acp.Front(
+            lambda: None, lambda message: None, store)
+        spawned = {}
 
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-                cwd=tmpdir,
-            )
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(message):
-                    front.stdin.write(json.dumps(message) + "\n")
-                    front.stdin.flush()
+        class FakeProcess:
+            pass
 
-                def recv_reply(reply_id):
-                    while True:
-                        line = front.stdout.readline()
-                        self.assertTrue(line, "front produced no message")
-                        message = json.loads(line)
-                        if message.get("id") == reply_id:
-                            return message
+        class FakeChannel:
+            def __init__(
+                    self, session_id, process, forward,
+                    credential_capability):
+                self.session_id = session_id
+                self.credential_capability = credential_capability
 
-                send({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {"protocolVersion": 1},
-                })
-                self.assertIn("result", recv_reply(1))
-                send({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "session/new",
-                    "params": {"cwd": tmpdir},
-                })
-                self.assertIn("result", recv_reply(2))
+            async def request(self, method, params):
+                return {}
 
-                children_path = (
-                    f"/proc/{front.pid}/task/{front.pid}/children")
-                with open(children_path, encoding="ascii") as stream:
-                    children = stream.read().split()
-                self.assertEqual(len(children), 1)
+            async def close(self):
+                await self.credential_capability.close()
 
-                for pid in (front.pid, int(children[0])):
-                    with open(f"/proc/{pid}/environ", "rb") as stream:
-                        raw = stream.read()
-                    records = raw.split(b"\0")
-                    self.assertNotIn(
-                        f"{credential_name}=".encode("utf-8"),
-                        raw,
-                    )
-                    self.assertNotIn(
-                        credential_value.encode("utf-8"),
-                        raw,
-                    )
-                    self.assertIn(filler, records)
-                    self.assertGreater(
-                        raw.find(b"LOKI_ACP_AFTER=visible\0"),
-                        raw.find(filler + b"\0"),
-                    )
-            finally:
-                front.stdin.close()
-                try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
+        async def fake_spawn(*args, **kwargs):
+            spawned["args"] = args
+            spawned["kwargs"] = kwargs
+            return FakeProcess()
+
+        async def scenario():
+            with mock.patch.object(
+                    acp.asyncio, "create_subprocess_exec",
+                    new=fake_spawn), mock.patch.object(
+                        acp, "WorkerChannel", FakeChannel):
+                session_id, _reply = await front._open_worker(cwd=ROOT)
+                await front.workers.pop(session_id).close()
+
+        asyncio.run(scenario())
+
+        child_environment = spawned["kwargs"]["env"]
+        self.assertNotIn(credential_name, child_environment)
+        self.assertNotIn(credential_value, repr(child_environment))
+        self.assertTrue(spawned["kwargs"]["close_fds"])
+        self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 1)
+        self.assertIn("--credential-capability-fd", spawned["args"])
+        credential = authentications.CredentialRef.environment(
+            credential_name)
+        self.assertTrue(front.credentials.has_ref(credential))
+        self.assertEqual(front.credentials.get(credential_name), "")
+        lease = asyncio.run(front.credential_broker.lease(credential))
+        self.assertEqual(lease.value, credential_value)
 
     def test_unknown_session_is_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -372,6 +345,8 @@ class FrontWorkerTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     front.kill()
                     front.wait()
+
+
 class EventMapperTests(unittest.TestCase):
     def test_assistant_delta_streams_chunk(self):
         from loki_agent import acp_events

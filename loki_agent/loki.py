@@ -35,11 +35,17 @@ from . import formats
 from . import http_client
 from . import models as modelsdev
 from . import protocols
+from . import authentications
+from . import credential_capabilities
 from . import savefiles
 from . import sse
 from . import tool_runtime
 from .connections import ConnectionDescriptor
-from .credentials import CredentialStore
+from .credentials import (
+    CredentialInventory,
+    CredentialStore,
+    is_credential_name,
+)
 from .sessions import Session, default_session
 
 # Backwards-compatible public name; the implementation belongs to savefiles.
@@ -225,15 +231,18 @@ class RuntimeConfig:
     url: str
     provider_kind: str
     netloc: str
-    api_key: str
     chat_provider: protocols.Provider
     headers: dict
     model: str
+    # Authentication is intentionally a non-secret request-time recipe.
+    # Neither RuntimeConfig nor Provider retains a credential value.
+    auth_spec: authentications.AuthSpec | None = None
     # Retained from startup env so a mid-session Provider reinstall
     # (e.g. /model choosing a model on a different provider) can reproduce
     # the exact same Provider settings instead of falling back to defaults.
     anthropic_version: str = "2023-06-01"
     auth_header: str | None = None
+    auth_scheme: str | None = None
     provider_id: str | None = None
     provider_name: str | None = None
     credential_env: str | None = None
@@ -242,10 +251,10 @@ class RuntimeConfig:
     prompt_cache: bool = False
 
 
-CREDENTIALS: CredentialStore | None = None
+CREDENTIALS: CredentialStore | CredentialInventory | None = None
 
 
-def _int_setting(name, default, credentials: CredentialStore):
+def _int_setting(name, default, credentials):
     value = credentials.get(name)
     if not value:
         return default
@@ -255,7 +264,7 @@ def _int_setting(name, default, credentials: CredentialStore):
         return default
 
 
-def _bool_setting(name, default, credentials: CredentialStore):
+def _bool_setting(name, default, credentials):
     value = credentials.get(name)
     if not value:
         return default
@@ -268,11 +277,47 @@ def _bool_setting(name, default, credentials: CredentialStore):
         f"{name} must be one of: 1, 0, true, false, yes, no, on, off")
 
 
-def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=None,
-                        max_tokens=4096, anthropic_version="2023-06-01",
-                        auth_header=None, provider_id=None, provider_name=None,
-                        credential_env=None, model_status=None, stream=False,
-                        prompt_cache=False):
+def _auth_spec(provider_kind, credential_ref, auth_header=None,
+               auth_scheme=None):
+    if credential_ref is None:
+        if auth_scheme is not None:
+            raise ValueError(
+                "authentication scheme requires a credential reference")
+        return None
+    if auth_scheme is not None:
+        scheme = auth_scheme
+    elif credential_ref.kind == "openai-subscription":
+        scheme = "openai-subscription"
+    elif auth_header:
+        scheme = "custom"
+    elif provider_kind == protocols.ANTHROPIC_MESSAGES:
+        scheme = "anthropic"
+    else:
+        scheme = "bearer"
+    if scheme not in {
+            "anthropic", "bearer", "custom", "openai-subscription"}:
+        raise ValueError(f"unknown authentication scheme {scheme!r}")
+    if ((credential_ref.kind == "openai-subscription")
+            != (scheme == "openai-subscription")):
+        raise ValueError(
+            "OpenAI subscription credentials require the "
+            "openai-subscription authentication scheme")
+    if scheme == "custom" and not auth_header:
+        raise ValueError(
+            "custom authentication requires an authentication header")
+    return authentications.AuthSpec(
+        credential=credential_ref,
+        scheme=scheme,
+        header_name=auth_header if scheme == "custom" else None,
+    )
+
+
+def make_runtime_config(
+        url, provider_kind, *, model="", models_url=None,
+        max_tokens=4096, anthropic_version="2023-06-01",
+        auth_header=None, auth_scheme=None, provider_id=None,
+        provider_name=None, credential_ref=None, model_status=None,
+        stream=False, prompt_cache=False):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -283,36 +328,74 @@ def make_runtime_config(url, provider_kind, api_key, *, model="", models_url=Non
     chat_provider = protocols.make_provider(
         url,
         provider=provider_kind,
-        api_key=api_key,
         models_url=models_url,
         max_tokens=max_tokens,
         anthropic_version=anthropic_version,
-        auth_header=auth_header,
         provider_id=provider_id,
         provider_name=provider_name,
         prompt_cache=prompt_cache,
     )
+    auth_spec = _auth_spec(
+        provider_kind, credential_ref, auth_header, auth_scheme)
     return RuntimeConfig(
         url=url,
         provider_kind=provider_kind,
         netloc=urllib.parse.urlparse(url).netloc,
-        api_key=api_key,
         chat_provider=chat_provider,
         headers=chat_provider.headers,
         model=model,
+        auth_spec=auth_spec,
         anthropic_version=anthropic_version,
         auth_header=auth_header,
+        auth_scheme=auth_spec.scheme if auth_spec is not None else None,
         provider_id=provider_id,
         provider_name=provider_name,
-        credential_env=credential_env,
+        credential_env=(
+            credential_ref.name
+            if (credential_ref is not None
+                and credential_ref.kind == "env") else None),
         model_status=model_status,
         stream=stream,
         prompt_cache=prompt_cache,
     )
 
 
-def build_config_from_env(environ=os.environ,
-                          credentials: CredentialStore | None = None):
+def _available_environment_credential(credentials, names):
+    name = credentials.first_available_name(names)
+    return (
+        authentications.CredentialRef.environment(name)
+        if name is not None else None)
+
+
+def _explicit_credential_ref(credentials):
+    encoded = credentials.get("LOKI_CREDENTIAL_REF")
+    if not encoded:
+        return _available_environment_credential(
+            credentials, ["LOKI_API_KEY"])
+    try:
+        credential = authentications.CredentialRef.decode(encoded)
+    except ValueError as error:
+        raise ValueError(f"invalid LOKI_CREDENTIAL_REF: {error}") from error
+    if not credentials.has_ref(credential):
+        raise ValueError(
+            "LOKI_CREDENTIAL_REF names an unavailable credential: "
+            f"{credential.encode()}")
+    return credential
+
+
+def install_root_credential_broker(
+        credentials: CredentialStore,
+        session: Session | None = None) -> authentications.CredentialBroker:
+    """Install all captured secrets in the top-level process's broker."""
+    broker = authentications.CredentialBroker()
+    credentials.install_static_credentials(broker)
+    (session or current_session()).credential_authority = broker
+    return broker
+
+
+def build_config_from_env(
+        environ=os.environ,
+        credentials: CredentialStore | CredentialInventory | None = None):
     """Build an explicit/default runtime config from captured startup values."""
     if credentials is None:
         credentials = CredentialStore.capture(environ)
@@ -329,12 +412,10 @@ def build_config_from_env(environ=os.environ,
 
     if config_provider_kind == protocols.DUMMY:
         # No-op provider for testing: no network, no API key, fake URL.
-        config_api_key = "dummy-key"
         config_model = credentials.get("LOKI_MODEL") or "dummy"
         return make_runtime_config(
             config_url,
             config_provider_kind,
-            config_api_key,
             model=config_model,
             max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
             anthropic_version=credentials.get(
@@ -347,22 +428,21 @@ def build_config_from_env(environ=os.environ,
     # Never infer credential ownership from the wire protocol. An explicitly
     # configured endpoint uses LOKI_API_KEY when present and otherwise sends
     # no authentication header.
-    credential_env, config_api_key = credentials.first_available(
-        ["LOKI_API_KEY"])
+    credential_ref = _explicit_credential_ref(credentials)
 
     config_model = credentials.get("LOKI_MODEL") or ""
     return make_runtime_config(
         config_url,
         config_provider_kind,
-        config_api_key,
         model=config_model,
         models_url=credentials.get("LOKI_MODELS_URL") or None,
         max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
         anthropic_version=credentials.get(
             "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
+        auth_scheme=credentials.get("LOKI_AUTH_SCHEME") or None,
         provider_name="Explicit LOKI_* connection",
-        credential_env=credential_env,
+        credential_ref=credential_ref,
         stream=_bool_setting("LOKI_STREAM", False, credentials),
         prompt_cache=_bool_setting(
             "LOKI_PROMPT_CACHE",
@@ -373,12 +453,12 @@ def build_config_from_env(environ=os.environ,
     )
 
 
-def explicit_api_base_configured(credentials: CredentialStore) -> bool:
+def explicit_api_base_configured(credentials) -> bool:
     return bool(credentials.get("LOKI_API_BASE"))
 
 
 def explicit_connection_option(
-        credentials: CredentialStore
+        credentials
 ) -> modelsdev.ExplicitConnectionOption | None:
     """Return a selectable captured LOKI_* connection when it is complete."""
     try:
@@ -396,15 +476,13 @@ def explicit_connection_option(
 
 def config_from_connection_descriptor(
         descriptor: ConnectionDescriptor,
-        credentials: CredentialStore) -> RuntimeConfig:
-    if descriptor.credential_env is None:
-        api_key = ""
-    else:
-        api_key = credentials.get(descriptor.credential_env)
-        if not api_key:
-            raise ValueError(
-                "saved connection requires missing "
-                f"{descriptor.credential_env}")
+        credentials) -> RuntimeConfig:
+    credential_ref = descriptor.credential_ref
+    if (credential_ref is not None
+            and not credentials.has_ref(credential_ref)):
+        raise ValueError(
+            "saved connection requires missing "
+            f"{credential_ref.encode()}")
 
     provider_kind = credentials.get("LOKI_PROVIDER") or descriptor.protocol
     configured_model = credentials.get("LOKI_MODEL")
@@ -423,6 +501,13 @@ def config_from_connection_descriptor(
         credentials.get("LOKI_AUTH_HEADER")
         if credentials.get("LOKI_AUTH_HEADER")
         else descriptor.auth_header)
+    configured_auth_scheme = credentials.get("LOKI_AUTH_SCHEME") or None
+    auth_scheme = (
+        configured_auth_scheme
+        if configured_auth_scheme is not None
+        else (None
+              if credentials.get("LOKI_AUTH_HEADER")
+              else descriptor.auth_scheme))
     stream = (
         _bool_setting("LOKI_STREAM", descriptor.stream, credentials)
         if credentials.get("LOKI_STREAM") else descriptor.stream)
@@ -436,15 +521,15 @@ def config_from_connection_descriptor(
         # deriving it again from a catalog base URL.
         descriptor.chat_url,
         provider_kind,
-        api_key,
         model=config_model,
         models_url=descriptor.models_url,
         max_tokens=max_tokens,
         anthropic_version=anthropic_version,
         auth_header=auth_header,
+        auth_scheme=auth_scheme,
         provider_id=descriptor.provider_id,
         provider_name=descriptor.provider_name,
-        credential_env=descriptor.credential_env,
+        credential_ref=credential_ref,
         model_status=model_status,
         stream=stream,
         prompt_cache=prompt_cache,
@@ -455,7 +540,7 @@ def config_from_modelsdev_selection(
         provider_id: str,
         provider_entry: dict,
         model_entry: dict,
-        credentials: CredentialStore) -> RuntimeConfig:
+        credentials) -> RuntimeConfig:
     access = modelsdev.provider_access(provider_entry, credentials)
     if access is None:
         raise ValueError(
@@ -469,16 +554,17 @@ def config_from_modelsdev_selection(
     return make_runtime_config(
         access.api_url,
         access.protocol,
-        credentials.get(access.credential_env),
         model=selected_model,
         max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
         anthropic_version=credentials.get(
             "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
+        auth_scheme=credentials.get("LOKI_AUTH_SCHEME") or None,
         provider_id=provider_id,
         provider_name=modelsdev.provider_display_name(
             provider_id, provider_entry),
-        credential_env=access.credential_env,
+        credential_ref=authentications.CredentialRef.environment(
+            access.credential_env),
         model_status=model_status,
         stream=_bool_setting("LOKI_STREAM", False, credentials),
         prompt_cache=_bool_setting(
@@ -502,9 +588,13 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         models_url=provider.models_url,
         protocol=current_config().provider_kind,
         credential_env=credential_env,
+        credential_ref=(
+            current_config().auth_spec.credential
+            if current_config().auth_spec is not None else None),
         max_tokens=provider.max_tokens,
         anthropic_version=current_config().anthropic_version,
         auth_header=current_config().auth_header,
+        auth_scheme=current_config().auth_scheme,
         model_status=current_config().model_status,
         stream=current_config().stream,
         prompt_cache=current_config().prompt_cache,
@@ -520,11 +610,11 @@ def apply_runtime_config(config: RuntimeConfig):
 _UNSET = object()
 
 
-def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None,
+def reinstall_provider(*, model=None, url=None, provider_kind=None,
                        models_url=None, max_tokens=None, anthropic_version=None,
-                       auth_header=None, provider_id=None, provider_name=None,
-                       credential_env=None, model_status=_UNSET, stream=None,
-                       prompt_cache=None):
+                       auth_header=_UNSET, provider_id=None, provider_name=None,
+                       credential_ref=_UNSET, auth_scheme=_UNSET,
+                       model_status=_UNSET, stream=None, prompt_cache=None):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -535,12 +625,37 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
         raise RuntimeError("cannot reinstall provider before startup config is applied")
     new_url = url if url is not None else current.url
     new_kind = provider_kind if provider_kind is not None else current.provider_kind
-    new_api_key = api_key if api_key is not None else current.api_key
     new_model = model if model is not None else current.model
     new_anthropic_version = anthropic_version if anthropic_version is not None else current.anthropic_version
-    new_auth_header = auth_header if auth_header is not None else current.auth_header
     new_provider_id = (
         provider_id if provider_id is not None else current.provider_id)
+    provider_connection_changed = (
+        (provider_kind is not None
+         and provider_kind != current.provider_kind)
+        or (url is not None and url != current.url)
+        or (provider_id is not None
+            and provider_id != current.provider_id))
+    auth_identity_changed = (
+        provider_connection_changed
+        or credential_ref is not _UNSET)
+    if auth_header is _UNSET:
+        new_auth_header = (
+            None if auth_identity_changed else current.auth_header)
+    else:
+        new_auth_header = auth_header
+    new_credential_ref = (
+        (None
+         if provider_connection_changed
+         else (current.auth_spec.credential
+               if current.auth_spec is not None else None))
+        if credential_ref is _UNSET else credential_ref)
+    if auth_scheme is _UNSET:
+        new_auth_scheme = (
+            None
+            if auth_identity_changed or auth_header is not _UNSET
+            else current.auth_scheme)
+    else:
+        new_auth_scheme = auth_scheme
     if model_status is _UNSET:
         same_catalog_entry = (
             new_model == current.model
@@ -554,7 +669,6 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
     apply_runtime_config(make_runtime_config(
         new_url,
         new_kind,
-        new_api_key,
         model=new_model,
         # models_url is passed through as-is (None -> derive from new_url);
         # never carry the previous provider's models URL across a provider
@@ -563,11 +677,11 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None, api_key=None
         max_tokens=max_tokens if max_tokens is not None else current.chat_provider.max_tokens,
         anthropic_version=new_anthropic_version,
         auth_header=new_auth_header,
+        auth_scheme=new_auth_scheme,
         provider_id=new_provider_id,
         provider_name=(provider_name if provider_name is not None
                        else current.provider_name),
-        credential_env=(credential_env if credential_env is not None
-                        else current.credential_env),
+        credential_ref=new_credential_ref,
         model_status=new_model_status,
         stream=stream if stream is not None else current.stream,
         prompt_cache=(
@@ -965,6 +1079,8 @@ class Job:
     timeout_ms: int | None = None
     session_owned: bool = False
     owner_signal_fd: int | None = field(default=None, repr=False)
+    credential_capability: object | None = field(
+        default=None, repr=False)
 
 
 class JobManager:
@@ -1025,6 +1141,13 @@ class JobManager:
         except OSError:
             pass
 
+    @staticmethod
+    def _close_credential_capability(job: Job):
+        capability = job.credential_capability
+        job.credential_capability = None
+        if capability is not None:
+            capability.close_now()
+
     def _record_exit(self, job: Job, exit_code: int):
         # Status records why Loki ended the job; exit_code/signal record
         # how the child process actually terminated.
@@ -1046,6 +1169,7 @@ class JobManager:
         job.finished_at = time.time()
         job.finished_at_iso = _now_iso()
         self._close_owner_signal(job)
+        self._close_credential_capability(job)
         self._write_metadata(job)
 
     def _refresh_job(self, job: Job):
@@ -1058,10 +1182,14 @@ class JobManager:
     async def _spawn(self, command, display_command: str, description: str,
                      background: bool, timeout_ms: int | None, shell: bool,
                      env: dict | None = None, cwd: str = None,
-                     session_owned: bool = False) -> Job:
+                     session_owned: bool = False,
+                     credential_refs=None) -> Job:
         if session_owned and shell:
             raise ValueError(
                 "session-owned jobs require a direct executable")
+        if credential_refs is not None and shell:
+            raise ValueError(
+                "credential capabilities require a direct executable")
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -1093,17 +1221,35 @@ class JobManager:
 
         owner_read_fd = None
         owner_write_fd = None
+        credential_fd = None
+        credential_server = None
         spawn_command = command
-        if session_owned:
-            owner_read_fd, owner_write_fd = os.pipe()
-            spawn_command = [
-                *command,
-                "--session-owner-fd",
-                str(owner_read_fd),
-            ]
-
         proc = None
         try:
+            # Descriptor acquisition belongs inside the same cleanup boundary
+            # as process creation. A failed relay setup must not leave either
+            # end of the already-created owner pipe live.
+            if session_owned:
+                owner_read_fd, owner_write_fd = os.pipe()
+                spawn_command = [
+                    *command,
+                    "--session-owner-fd",
+                    str(owner_read_fd),
+                ]
+            if credential_refs is not None:
+                authority = current_session().credential_authority
+                if authority is None:
+                    raise RuntimeError(
+                        "cannot delegate credentials without an authority")
+                credential_server, credential_fd = await (
+                    credential_capabilities.CredentialRelay.create(
+                        authority, credential_refs))
+                spawn_command = [
+                    *spawn_command,
+                    "--credential-capability-fd",
+                    str(credential_fd),
+                ]
+
             with open(stdout_path, 'wb') as stdout_file, \
                     open(stderr_path, 'wb') as stderr_file:
                 if shell:
@@ -1119,9 +1265,9 @@ class JobManager:
                         preexec_fn=unblock_child_signals,
                     )
                 else:
-                    pass_fds = (
-                        (owner_read_fd,)
-                        if owner_read_fd is not None else ())
+                    pass_fds = tuple(
+                        fd for fd in (owner_read_fd, credential_fd)
+                        if fd is not None)
                     proc = await asyncio.create_subprocess_exec(
                         *spawn_command,
                         stdin=subprocess.DEVNULL,
@@ -1137,11 +1283,16 @@ class JobManager:
         finally:
             if owner_read_fd is not None:
                 os.close(owner_read_fd)
+            if credential_fd is not None:
+                os.close(credential_fd)
             if proc is None and owner_write_fd is not None:
                 os.close(owner_write_fd)
+            if proc is None and credential_server is not None:
+                await credential_server.close()
 
         job.process = proc
         job.owner_signal_fd = owner_write_fd
+        job.credential_capability = credential_server
         job.pid = proc.pid
         try:
             job.pgid = os.getpgid(proc.pid)
@@ -1166,6 +1317,7 @@ class JobManager:
             job.finished_at = time.time()
             job.finished_at_iso = _now_iso()
             self._close_owner_signal(job)
+            self._close_credential_capability(job)
             with open(job.stderr_path, 'ab') as stderr_file:
                 stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
             self._write_metadata(job)
@@ -1175,10 +1327,12 @@ class JobManager:
                              output_chars: int = BASH_MAX_OUTPUT_CHARS,
                              env: dict | None = None, cwd: str = None,
                              cancel_event: asyncio.Event | None = None,
-                             session_owned: bool = False):
+                             session_owned: bool = False,
+                             credential_refs=None):
         job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
                                 env=env, cwd=cwd,
-                                session_owned=session_owned)
+                                session_owned=session_owned,
+                                credential_refs=credential_refs)
 
         # Define the exit_task and nested signal helpers first so they are
         # available throughout the entire function.
@@ -1323,7 +1477,8 @@ class JobManager:
                        output_chars: int = BASH_MAX_OUTPUT_CHARS,
                        env: dict | None = None, cwd: str = None,
                        cancel_event: asyncio.Event | None = None,
-                       session_owned: bool = False):
+                       session_owned: bool = False,
+                       credential_refs=None):
         if not argv:
             raise ValueError("argv must not be empty")
         return await self.run_foreground(argv, " ".join(argv), timeout_ms,
@@ -1331,16 +1486,19 @@ class JobManager:
                                          output_chars=output_chars, env=env,
                                          cwd=cwd or current_cwd(),
                                          cancel_event=cancel_event,
-                                         session_owned=session_owned)
+                                         session_owned=session_owned,
+                                         credential_refs=credential_refs)
 
     async def run_background_exec(self, argv: list[str], description: str = "",
                                   env: dict | None = None, cwd: str = None,
-                                  session_owned: bool = False) -> Job:
+                                  session_owned: bool = False,
+                                  credential_refs=None) -> Job:
         if not argv:
             raise ValueError("argv must not be empty")
         job = await self._spawn(argv, " ".join(argv), description, True, None, False,
                                 env=env, cwd=cwd or current_cwd(),
-                                session_owned=session_owned)
+                                session_owned=session_owned,
+                                credential_refs=credential_refs)
         asyncio.get_running_loop().create_task(self._monitor_background_job(job))
         return job
 
@@ -1384,6 +1542,7 @@ class JobManager:
                 continue
             if job.process is None or job.process.returncode is not None:
                 self._close_owner_signal(job)
+                self._close_credential_capability(job)
                 continue
             job.status = "owner_closing"
             self._write_metadata(job)
@@ -1391,6 +1550,7 @@ class JobManager:
             # Process-group signals below enforce the ownership boundary if
             # the child is stuck or does not understand the owner channel.
             self._close_owner_signal(job)
+            self._close_credential_capability(job)
             owned.append(job)
         if owned:
             await asyncio.gather(
@@ -2733,17 +2893,18 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
 
 
 def _subagent_env() -> dict:
-    env = os.environ.copy()
-    # Parent startup consumes provider-specific key variables. Subagents receive
-    # only the normalized runtime provider/url/model/key they should use.
+    env = {
+        name: value for name, value in os.environ.items()
+        if not is_credential_name(name)
+    }
+    # Subagents receive only non-secret provider configuration. The request
+    # credential travels through a fresh capability socket, never through
+    # argv or the process environment.
     if current_config():
         env['LOKI_PROVIDER'] = current_config().chat_provider.kind
         env['LOKI_API_BASE'] = current_config().chat_provider.input_url
         env['LOKI_MODEL'] = current_model()
-        if current_config().api_key:
-            env['LOKI_API_KEY'] = current_config().api_key
-        else:
-            env.pop('LOKI_API_KEY', None)
+        env.pop('LOKI_API_KEY', None)
         env['LOKI_STREAM'] = '1' if current_config().stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
             '1' if current_config().prompt_cache else '0')
@@ -2755,11 +2916,28 @@ def _subagent_env() -> dict:
             env['LOKI_AUTH_HEADER'] = current_config().auth_header
         else:
             env.pop('LOKI_AUTH_HEADER', None)
+        if current_config().auth_spec is not None:
+            # This is an identifier and policy, not a token. The child uses
+            # it to request precisely this credential from its delegated
+            # capability instead of inferring identity from absent env data.
+            env['LOKI_CREDENTIAL_REF'] = (
+                current_config().auth_spec.credential.encode())
+            env['LOKI_AUTH_SCHEME'] = current_config().auth_spec.scheme
+        else:
+            env.pop('LOKI_CREDENTIAL_REF', None)
+            env.pop('LOKI_AUTH_SCHEME', None)
         if provider.models_url:
             env['LOKI_MODELS_URL'] = provider.models_url
         else:
             env.pop('LOKI_MODELS_URL', None)
     return env
+
+
+def _subagent_credential_refs():
+    config = current_config()
+    if config is None or config.auth_spec is None:
+        return frozenset()
+    return frozenset({config.auth_spec.credential})
 
 
 def _format_started_background_job(job: Job, kind: str = "job") -> str:
@@ -2775,7 +2953,6 @@ def _format_started_background_job(job: Job, kind: str = "job") -> str:
 
 def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
     return [
-        sys.executable,
         sys.argv[0],
         '--subagent',
         agent_type,
@@ -2806,14 +2983,16 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
             description=description or "subagent task",
             env=_subagent_env(),
             cwd=os.getcwd(),
-            session_owned=True)
+            session_owned=True,
+            credential_refs=_subagent_credential_refs())
         return _format_started_background_job(job, "subagent")
 
     job, status, stdout, stderr = await current_job_manager().run_exec(
         argv, SUBAGENT_TIMEOUT_S * 1000,
         description=description or "subagent task",
         env=_subagent_env(), cwd=os.getcwd(), cancel_event=cancel_event,
-        session_owned=True)
+        session_owned=True,
+        credential_refs=_subagent_credential_refs())
     if status == "cancelled":
         return "Error: subagent was cancelled by the user"
     if status == "timed_out":
@@ -3460,7 +3639,19 @@ TOOLS = [
                 "Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.",
                 "",
                 "Available agent types and the tools they have access to:",
-                "- Explore: Read-only search agent for broad fan-out searches - when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: \"medium\" for moderate exploration, \"very thorough\" for multiple locations and naming conventions. (Tools: Glob, Grep, Read, Jobs, JobStatus, TodoRead, WebFetch, WebSearch)",
+                (
+                    "- Explore: Read-only search agent for broad fan-out "
+                    "searches - when answering means sweeping many files, "
+                    "directories, or naming conventions and you only need "
+                    "the conclusion, not the file dumps. It reads excerpts "
+                    "rather than whole files, so it locates code; it doesn't "
+                    "review or audit it. It may delegate further read-only "
+                    "Explore searches. Specify search breadth: \"medium\" "
+                    "for moderate exploration, \"very thorough\" for "
+                    "multiple locations and naming conventions. (Tools: "
+                    "Agent, Glob, Grep, Read, Jobs, JobStatus, TodoRead, "
+                    "WebFetch, WebSearch)"
+                ),
                 "",
                 "When using the Agent tool, specify a subagent_type parameter to select which agent type to use. If omitted, the \"Explore\" agent is used.",
                 "",
@@ -3615,6 +3806,7 @@ TOOL_HANDLERS = {
     "Agent": {
         "handler": _handle_agent,
         "async_handler": _handle_agent_async,
+        "explore": True,
     },
     "Skill": {"handler": _handle_skill},
     "WebFetch": {"async_handler": _handle_webfetch_async, "explore": True},
@@ -3622,7 +3814,8 @@ TOOL_HANDLERS = {
 }
 TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]
-EXPLORE_TOOLS = {name for name, spec in TOOL_REGISTRY.items() if spec["explore"]}
+EXPLORE_TOOLS = {
+    name for name, spec in TOOL_REGISTRY.items() if spec["explore"]}
 PLAN_TOOLS = EXPLORE_TOOLS | {
     name for name, spec in TOOL_REGISTRY.items() if spec.get("plan")}
 TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
@@ -3646,46 +3839,84 @@ def configure_tool_hook_pipeline(environ=os.environ, stderr_reporter=None):
     return path
 
 
+async def _authorized_request_headers(
+        base_headers: dict, config: RuntimeConfig | None,
+        rejected_generation: int | None = None
+) -> tuple[dict, authentications.CredentialLease | None]:
+    """Resolve authentication immediately before an HTTP attempt."""
+    headers = dict(base_headers)
+    if config is None or config.auth_spec is None:
+        return headers, None
+    authority = current_session().credential_authority
+    if authority is None:
+        raise authentications.CredentialUnavailable(
+            "no credential authority is installed")
+    lease = await authority.lease(
+        config.auth_spec.credential,
+        rejected_generation=rejected_generation,
+    )
+    headers.update(authentications.authorization_headers(
+        config.auth_spec, lease))
+    return headers, lease
+
+
 async def async_chat_request(request_url: str, payload, request_headers: dict = None,
                              report_errors: bool = False, show_timing: bool = False,
                              cancel_check=None) -> dict:
     start = time.perf_counter()
+    config = current_config()
     body = json.dumps(payload).encode('utf-8') if payload is not None else b''
     method = 'POST' if payload is not None else 'GET'
 
-    headers_to_use = request_headers
-    if headers_to_use is None:
-        headers_to_use = current_config().headers if current_config() else {}
+    base_headers = request_headers
+    if base_headers is None:
+        base_headers = config.headers if config else {}
     # Copy so the per-call idempotency key below does not mutate the cached
     # provider headers shared across requests.
-    headers_to_use = dict(headers_to_use)
+    base_headers = dict(base_headers)
 
     retry_attempts = HTTP_RETRY_MAX_ATTEMPTS
     request_timeout = WEBFETCH_TIMEOUT_S
     if method == 'POST':
         # Best-effort server-side dedup; Anthropic honors this header on
         # /v1/messages. OpenAI-compat servers may ignore it.
-        kind = current_config().provider_kind if current_config() else None
+        kind = config.provider_kind if config else None
         header = (LLM_IDEMPOTENCY_HEADER_ANTHROPIC
                   if kind == protocols.ANTHROPIC_MESSAGES
                   else LLM_IDEMPOTENCY_HEADER_OPENAI)
-        headers_to_use[header] = uuid.uuid4().hex
+        base_headers[header] = uuid.uuid4().hex
         retry_attempts = HTTP_RETRY_MAX_ATTEMPTS_LLM
         request_timeout = LLM_REQUEST_TIMEOUT_S
 
-    response = await http_client.async_http_request(
-        method,
-        request_url,
-        body=body,
-        headers_in=headers_to_use,
-        timeout=request_timeout,
-        max_bytes=HTTP_MAX_RESPONSE_BYTES,
-        retry_max_attempts=retry_attempts,
-        retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
-        retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
-        retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
-        cancel_check=cancel_check,
-    )
+    rejected_generation = None
+    recovered = False
+    while True:
+        headers_to_use, lease = await _authorized_request_headers(
+            base_headers, config, rejected_generation)
+        response = await http_client.async_http_request(
+            method,
+            request_url,
+            body=body,
+            headers_in=headers_to_use,
+            timeout=request_timeout,
+            max_bytes=HTTP_MAX_RESPONSE_BYTES,
+            retry_max_attempts=retry_attempts,
+            retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
+            retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
+            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
+            cancel_check=cancel_check,
+        )
+        if (response.status == 401
+                and lease is not None
+                and lease.refreshable
+                and not recovered):
+            # The generation check in the broker ensures concurrent stale
+            # 401s observe an already-refreshed token instead of replaying
+            # the rotating refresh token.
+            rejected_generation = lease.generation
+            recovered = True
+            continue
+        break
     response_text = _decode_http_text(response.body, response.headers)
     if response.status >= 400:
         raise ApiError(request_url, response.status, response.reason, response_text)
@@ -3886,22 +4117,27 @@ async def async_chat_stream_request(
         on_text_delta=None, cancel_check=None,
         report_errors: bool = False, show_timing: bool = False) -> dict:
     start = time.perf_counter()
+    config = current_config()
     callback = on_text_delta or (lambda text: None)
     cancel = cancel_check or (lambda: False)
-    headers_to_use = dict(
+    base_headers = dict(
         request_headers if request_headers is not None
-        else (current_config().headers if current_config() else {}))
-    headers_to_use.setdefault("Accept", "text/event-stream")
-    kind = current_config().provider_kind if current_config() else None
+        else (config.headers if config else {}))
+    base_headers.setdefault("Accept", "text/event-stream")
+    kind = config.provider_kind if config else None
     idempotency_header = (
         LLM_IDEMPOTENCY_HEADER_ANTHROPIC
         if kind == protocols.ANTHROPIC_MESSAGES
         else LLM_IDEMPOTENCY_HEADER_OPENAI)
-    headers_to_use[idempotency_header] = uuid.uuid4().hex
+    base_headers[idempotency_header] = uuid.uuid4().hex
 
-    attempt = 0
+    transport_attempt = 0
+    rejected_generation = None
+    recovered = False
     while True:
-        attempt += 1
+        headers_to_use, lease = await _authorized_request_headers(
+            base_headers, config, rejected_generation)
+        transport_attempt += 1
         try:
             data = await _async_chat_stream_request_once(
                 request_url, payload, headers_to_use, callback, cancel)
@@ -3909,12 +4145,24 @@ async def async_chat_stream_request(
         except http_client.HttpRequestCancelled:
             raise StreamCancelled()
         except Exception as exc:
-            if (attempt >= HTTP_RETRY_MAX_ATTEMPTS_LLM
+            if (isinstance(exc, StreamingApiError)
+                    and exc.status == 401
+                    and lease is not None
+                    and lease.refreshable
+                    and not recovered):
+                rejected_generation = lease.generation
+                recovered = True
+                # Authentication recovery is independent of transport retry
+                # accounting and preserves the same idempotency key.
+                transport_attempt = 0
+                continue
+            if (transport_attempt >= HTTP_RETRY_MAX_ATTEMPTS_LLM
                     or not http_client.is_transient_error(exc)):
                 raise
             delay = (
                 HTTP_RETRY_BASE_DELAY_S
-                * (HTTP_RETRY_BACKOFF_FACTOR ** (attempt - 1)))
+                * (HTTP_RETRY_BACKOFF_FACTOR
+                   ** (transport_attempt - 1)))
             if HTTP_RETRY_MAX_JITTER_S:
                 delay += random.uniform(0, HTTP_RETRY_MAX_JITTER_S)
             try:

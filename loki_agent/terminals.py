@@ -10,6 +10,8 @@ import termios
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 
+from .texts import escape_terminal_text
+
 
 STATUS_COLOR = 4
 INPUT_COLOR = 7
@@ -36,37 +38,13 @@ ITALIC_OFF = '\033[23m'
 FOREGROUND_OFF = '\033[39m'
 
 
-_SINGLE_LINE_CONTROL_TRANSLATIONS = {
-    code: "^" + chr(code + 0x40)
-    for code in range(0x20)
-}
-_SINGLE_LINE_CONTROL_TRANSLATIONS[0x7f] = "^?"
-_SINGLE_LINE_CONTROL_TRANSLATIONS.update({
-    code: f"\\x{code:02x}"
-    for code in range(0x80, 0xa0)
-})
-_MULTILINE_CONTROL_TRANSLATIONS = dict(
-    _SINGLE_LINE_CONTROL_TRANSLATIONS)
-del _MULTILINE_CONTROL_TRANSLATIONS[ord("\n")]
-
-
-def _escape_terminal_text(text: str, *, multiline: bool) -> str:
-    """Neutralize terminal controls without classifying other Unicode."""
-    if not isinstance(text, str):
-        raise TypeError("terminal text must be a string")
-    translations = (
-        _MULTILINE_CONTROL_TRANSLATIONS
-        if multiline else _SINGLE_LINE_CONTROL_TRANSLATIONS)
-    return text.translate(translations)
-
-
 class _TerminalTextOutput:
     markdown_style = False
 
     def write_text(
             self, text: str, *, multiline: bool = False, file=None) -> None:
         """Write logical text with only explicitly allowed LF layout."""
-        escaped_text = _escape_terminal_text(text, multiline=multiline)
+        escaped_text = escape_terminal_text(text, multiline=multiline)
         print(escaped_text, end="", file=file)
 
     @staticmethod
@@ -553,7 +531,7 @@ class BoundedMarkdownAnsi:
             raise RuntimeError("cannot feed a finished Markdown renderer")
         if not isinstance(text, str):
             raise TypeError("Markdown chunks must be strings")
-        escaped_text = _escape_terminal_text(text, multiline=True)
+        escaped_text = escape_terminal_text(text, multiline=True)
         if not self.style:
             return (escaped_text,) if escaped_text else ()
         output = []

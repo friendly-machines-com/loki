@@ -16,7 +16,8 @@ import os
 import sys
 import uuid
 
-from . import acps, savefiles
+from . import acps, credential_capabilities, savefiles
+from .authentications import CredentialBroker
 from .credentials import CredentialStore
 from .loki import CHAT_LOG_DIR
 
@@ -36,10 +37,11 @@ class WorkerChannel:
     """One request multiplexer around one worker subprocess."""
 
     def __init__(self, session_id: str, process: asyncio.subprocess.Process,
-                 forward):
+                 forward, credential_capability=None):
         self.session_id = session_id
         self.process = process
         self.forward = forward
+        self.credential_capability = credential_capability
         self._pending: dict[str, asyncio.Future] = {}
         self._next_request_id = 0
         self._write_lock = asyncio.Lock()
@@ -127,6 +129,9 @@ class WorkerChannel:
                 f"worker channel for {self.session_id} failed: {error}")
         finally:
             self._closed = True
+            if self.credential_capability is not None:
+                self.credential_capability.close_now()
+                self.credential_capability = None
             failure = failure or acps.TransportError(
                 f"worker for {self.session_id} closed")
             for future in list(self._pending.values()):
@@ -155,13 +160,19 @@ class WorkerChannel:
         with contextlib.suppress(
                 asyncio.CancelledError, acps.TransportError):
             await self._reader_task
+        if self.credential_capability is not None:
+            await self.credential_capability.close()
+            self.credential_capability = None
 
 
 class Front:
     def __init__(self, read, write, credentials: CredentialStore):
         self.read = read
         self.write = write
-        self.credentials = credentials
+        self.environment = credentials.sanitized_environment()
+        self.credentials = credentials.inventory()
+        self.credential_broker = CredentialBroker()
+        credentials.install_static_credentials(self.credential_broker)
         self.workers: dict[str, WorkerChannel] = {}
         self._next_worker_id = 0
         self._tasks: set[asyncio.Task] = set()
@@ -332,14 +343,28 @@ class Front:
                 f"session {session_id!r} is already active",
                 code=acps.INVALID_PARAMS,
             )
-        process = await asyncio.create_subprocess_exec(
-            *WORKER_COMMAND,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=None,
-            env=self.credentials.startup_environment(),
-        )
-        channel = WorkerChannel(session_id, process, self.write)
+        credential_server, credential_fd = await (
+            credential_capabilities.CredentialCapabilityServer.create(
+                self.credential_broker))
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *WORKER_COMMAND,
+                "--credential-capability-fd",
+                str(credential_fd),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=None,
+                close_fds=True,
+                pass_fds=(credential_fd,),
+                env=self.environment,
+            )
+        finally:
+            os.close(credential_fd)
+            if process is None:
+                await credential_server.close()
+        channel = WorkerChannel(
+            session_id, process, self.write, credential_server)
         self.workers[session_id] = channel
         try:
             reply = await channel.request(

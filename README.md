@@ -37,10 +37,21 @@ terminating NUL and the framing of later records. This removes the credential
 from Linux `/proc/PID/environ` and macOS `KERN_PROCARGS2` inspection. The
 macOS path uses the documented `_NSGetEnviron()` interface and refuses to
 write unless every target record is within the initial main-thread stack.
-ACP front processes pass the captured startup environment only to new ACP
-workers, which immediately capture and scrub their own environments. The
-`/model` picker fetches models.dev lazily and shows only providers for which a
-captured credential is available. Provider-specific variables such as
+The top-level terminal or ACP front installs captured credential values in an
+in-memory broker; the rest of the runtime uses only non-secret credential
+names. ACP workers receive a sanitized environment and an anonymous socket
+capability restricted to the brokered credentials they may request. Subagents
+receive a fresh capability restricted to the current provider, and nested
+subagents get a newly relayed capability rather than inheriting their parent's
+descriptor. Rotating refresh tokens stay in the top-level broker; delegated
+processes can lease an access token but cannot obtain the refresh token.
+Ordinary commands and hooks are started with other descriptors closed. On
+Linux, credential-bearing Loki processes also make themselves
+non-dumpable so same-UID tool children cannot inspect their memory or open
+descriptors through ptrace-governed `/proc` interfaces.
+
+The `/model` picker fetches models.dev lazily and shows only providers for
+which a captured credential is available. Provider-specific variables such as
 `OPENROUTER_API_KEY` can therefore be supplied by the VM/container launcher
 without also exposing them to ordinary tool subprocesses. Deprecated catalog
 entries remain selectable but are labeled in the picker and status bar.
@@ -61,9 +72,9 @@ protocol.
 
 All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
 `LOKI_PROVIDER`, `LOKI_MODEL`, `LOKI_API_KEY`, `LOKI_MODELS_URL`,
-`LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, `LOKI_ANTHROPIC_VERSION`, and
-`LOKI_STREAM`. `LOKI_PROMPT_CACHE` controls Anthropic Messages prompt-cache
-metadata.
+`LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, `LOKI_AUTH_SCHEME`,
+`LOKI_ANTHROPIC_VERSION`, and `LOKI_STREAM`. `LOKI_PROMPT_CACHE` controls
+Anthropic Messages prompt-cache metadata.
 Loki never chooses the first model returned by a provider. A new explicit
 connection needs `LOKI_MODEL`, or the model must be selected with `/model`
 before sending a chat request. A complete captured `LOKI_*` connection also

@@ -10,11 +10,21 @@ import asyncio
 import os
 import sys
 
-from .credentials import CredentialStore, capture_process_credentials
+from .credentials import (
+    CredentialInventory,
+    CredentialStore,
+    capture_process_credentials,
+)
+from .process_protections import (
+    ProcessProtectionError,
+    protect_credential_process,
+)
 
 
-async def amain(credentials: CredentialStore) -> int:
-    from . import acps, loki
+async def amain(
+        credentials: CredentialStore,
+        credential_capability_fd: int | None = None) -> int:
+    from . import acps, credential_capabilities, loki
     from .acp_worker import Worker
     from .sessions import Session
 
@@ -28,7 +38,17 @@ async def amain(credentials: CredentialStore) -> int:
     write = acps.make_writer(saved_stdout)
     worker = Worker(session, write)
 
-    loki.CREDENTIALS = credentials
+    credential_client = None
+    if credential_capability_fd is None:
+        loki.install_root_credential_broker(credentials, session)
+        loki.CREDENTIALS = credentials.inventory()
+    else:
+        credential_client = (
+            await credential_capabilities.CredentialClient.from_fd(
+                credential_capability_fd))
+        session.credential_authority = credential_client
+        loki.CREDENTIALS = CredentialInventory.from_environment(
+            os.environ, credential_client.available())
     try:
         loki.apply_runtime_config(loki.build_config_from_env(
             credentials=loki.CREDENTIALS))
@@ -74,12 +94,41 @@ async def amain(credentials: CredentialStore) -> int:
             await worker.handle(message, concurrent=True)
     finally:
         await worker.close()
+        if credential_client is not None:
+            await credential_client.close()
     return 0
+
+
+def _credential_capability_fd(args) -> int | None:
+    if not args:
+        return None
+    if len(args) != 2 or args[0] != "--credential-capability-fd":
+        raise ValueError("invalid ACP worker arguments")
+    try:
+        fd = int(args[1])
+        if fd < 3:
+            raise ValueError()
+        os.fstat(fd)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "invalid ACP worker credential capability descriptor") from error
+    return fd
 
 
 def main() -> int:
     credentials = capture_process_credentials()
-    return asyncio.run(amain(credentials))
+    try:
+        protect_credential_process()
+    except ProcessProtectionError as error:
+        print(f"Security initialization error: {error}", file=sys.stderr)
+        return 2
+    args = sys.argv[2:] if sys.argv[1:2] == ["--worker"] else sys.argv[1:]
+    try:
+        credential_fd = _credential_capability_fd(args)
+    except ValueError as error:
+        print(f"Configuration error: {error}", file=sys.stderr)
+        return 2
+    return asyncio.run(amain(credentials, credential_fd))
 
 
 if __name__ == "__main__":

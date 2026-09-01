@@ -13,20 +13,18 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "https://api.openai.com/v1",
             provider=protocols.OPENAI_RESPONSES,
-            api_key="test-key",
         )
 
         self.assertEqual(provider.kind, protocols.OPENAI_RESPONSES)
         self.assertEqual(provider.chat_url, "https://api.openai.com/v1/responses")
         self.assertEqual(provider.models_url, "https://api.openai.com/v1/models")
         self.assertIn("https://api.openai.com/v1/models", provider.model_urls)
-        self.assertEqual(provider.headers["Authorization"], "Bearer test-key")
+        self.assertNotIn("Authorization", provider.headers)
 
     def test_provider_with_empty_key_omits_authentication_header(self):
         provider = protocols.make_provider(
             "http://localhost:8000/v1",
             provider=protocols.OPENAI_RESPONSES,
-            api_key="",
         )
 
         self.assertNotIn("Authorization", provider.headers)
@@ -36,7 +34,6 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "https://example.test/prefix/v1/responses?trace=1",
             provider=protocols.AUTO,
-            api_key="test-key",
         )
 
         self.assertEqual(provider.kind, protocols.OPENAI_RESPONSES)
@@ -47,7 +44,6 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "https://api.openai.com/v1/responses",
             provider=protocols.OPENAI_RESPONSES,
-            api_key="test-key",
             max_tokens=1234,
         )
         items = [
@@ -107,7 +103,6 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "https://api.openai.com/v1/responses",
             provider=protocols.OPENAI_RESPONSES,
-            api_key="test-key",
         )
 
         payload = provider.chat_payload([formats.message_item("user", "hi")], [], "gpt-test")
@@ -119,7 +114,6 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "https://api.openai.com/v1/responses",
             provider=protocols.OPENAI_RESPONSES,
-            api_key="test-key",
         )
         response = {
             "id": "resp_1",
@@ -163,7 +157,6 @@ class AnthropicMessagesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "http://localhost:8000/v1/messages",
             provider=protocols.ANTHROPIC_MESSAGES,
-            api_key="",
             anthropic_version="2024-01-01",
         )
 
@@ -176,7 +169,6 @@ class AnthropicMessagesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "https://api.anthropic.com/v1/messages",
             provider=protocols.ANTHROPIC_MESSAGES,
-            api_key="test-key",
             prompt_cache=True,
         )
 
@@ -198,7 +190,6 @@ class AnthropicMessagesProviderTests(unittest.TestCase):
         provider = protocols.make_provider(
             "http://localhost:8000/v1/messages",
             provider=protocols.ANTHROPIC_MESSAGES,
-            api_key="",
         )
 
         payload = provider.chat_payload(
@@ -1531,7 +1522,6 @@ class StreamAccumulatorTests(unittest.TestCase):
         provider = protocols.make_provider(
             "http://localhost:8000/v1",
             provider=protocols.OPENAI_CHAT,
-            api_key="",
         )
         items = [formats.message_item("user", "hello")]
 

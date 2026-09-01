@@ -24,6 +24,22 @@ class FakeWriter:
         self.wait_closed_called = True
 
 
+class FailingWriter(FakeWriter):
+    def __init__(self, *, fail_write=False, fail_drain=False):
+        super().__init__()
+        self.fail_write = fail_write
+        self.fail_drain = fail_drain
+
+    def write(self, data):
+        if self.fail_write:
+            raise BrokenPipeError("write failed")
+        super().write(data)
+
+    async def drain(self):
+        if self.fail_drain:
+            raise BrokenPipeError("drain failed")
+
+
 class FakeConnector:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -66,6 +82,106 @@ class PatchedOpenConnection:
 
 
 class HttpClientRequestTests(unittest.TestCase):
+    def test_connect_failure_is_annotated_as_not_sent(self):
+        connector = FakeConnector([])
+
+        async def failed_open(*args, **kwargs):
+            raise ConnectionRefusedError("offline")
+
+        connector.open_connection = failed_open
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(
+                    http_client.HttpRequestDeliveryError) as raised:
+                asyncio.run(http_client.async_http_request(
+                    "POST",
+                    "https://example.test/token",
+                    body=b"{}",
+                ))
+
+        self.assertFalse(raised.exception.request_may_have_been_sent)
+
+    def test_drain_failure_is_annotated_as_possibly_sent(self):
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ])
+
+        async def open_with_failing_drain(*args, **kwargs):
+            reader = asyncio.StreamReader()
+            reader.feed_data(connector.responses.pop(0))
+            reader.feed_eof()
+            writer = FailingWriter(fail_drain=True)
+            connector.writers.append(writer)
+            return reader, writer
+
+        connector.open_connection = open_with_failing_drain
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(
+                    http_client.HttpRequestDeliveryError) as raised:
+                asyncio.run(http_client.async_http_request(
+                    "POST",
+                    "https://example.test/token",
+                    body=b"{}",
+                ))
+
+        self.assertTrue(raised.exception.request_may_have_been_sent)
+
+    def test_write_failure_is_conservatively_possibly_sent(self):
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ])
+
+        async def open_with_failing_write(*args, **kwargs):
+            reader = asyncio.StreamReader()
+            writer = FailingWriter(fail_write=True)
+            connector.writers.append(writer)
+            return reader, writer
+
+        connector.open_connection = open_with_failing_write
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(
+                    http_client.HttpRequestDeliveryError) as raised:
+                asyncio.run(http_client.async_http_request(
+                    "POST",
+                    "https://example.test/token",
+                    body=b"{}",
+                ))
+
+        self.assertTrue(raised.exception.request_may_have_been_sent)
+
+    def test_task_cancellation_preserves_delivery_state(self):
+        connector = FakeConnector([])
+        draining = asyncio.Event()
+
+        async def blocked_open(*args, **kwargs):
+            reader = asyncio.StreamReader()
+            writer = FakeWriter()
+
+            async def drain():
+                draining.set()
+                await asyncio.Event().wait()
+
+            writer.drain = drain
+            return reader, writer
+
+        connector.open_connection = blocked_open
+
+        async def scenario():
+            task = asyncio.create_task(http_client.async_http_request(
+                "POST",
+                "https://example.test/token",
+                body=b"{}",
+            ))
+            await draining.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await task
+            return raised.exception
+
+        with PatchedOpenConnection(connector):
+            error = asyncio.run(scenario())
+
+        self.assertTrue(error.request_may_have_been_sent)
+
     def test_buffered_request_can_be_cancelled_during_connect(self):
         connector = FakeConnector([])
         entered = asyncio.Event()

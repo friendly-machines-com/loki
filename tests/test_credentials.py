@@ -4,6 +4,7 @@ import subprocess
 import sys
 import unittest
 
+from loki_agent.authentications import CredentialRef
 from loki_agent.connections import (
     ConnectionDescriptor,
     ConnectionDescriptorError,
@@ -20,6 +21,26 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class CredentialStoreTests(unittest.TestCase):
+    def test_startup_scrubber_does_not_import_authentication_runtime(self):
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys\n"
+                    "from loki_agent import credentials\n"
+                    "print('loki_agent.authentications' in sys.modules)\n"
+                ),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.stdout.strip(), "False")
+
     def test_capture_retains_snapshot_and_scrubs_narrow_suffixes(self):
         env = {
             "OPENAI_API_KEY": "key",
@@ -64,8 +85,8 @@ class CredentialStoreTests(unittest.TestCase):
     def test_first_available_preserves_declaration_order(self):
         store = CredentialStore({"FIRST_KEY": "one", "SECOND_TOKEN": "two"})
         self.assertEqual(
-            store.first_available(["SECOND_TOKEN", "FIRST_KEY"]),
-            ("SECOND_TOKEN", "two"),
+            store.first_available_name(["SECOND_TOKEN", "FIRST_KEY"]),
+            "SECOND_TOKEN",
         )
 
     def test_native_entry_range_validation_includes_terminating_nul(self):
@@ -111,7 +132,6 @@ forked = subprocess.check_output(
 ).strip()
 print(json.dumps({
     "stored": store.get("LOKI_TEST_TOKEN"),
-    "bootstrap": store.startup_environment().get("LOKI_TEST_TOKEN"),
     "python_has_secret": "LOKI_TEST_TOKEN" in os.environ,
     "native_secret": libc.getenv(b"LOKI_TEST_TOKEN") is not None,
     "native_after": libc.getenv(b"LOKI_TEST_AFTER") == b"after",
@@ -141,7 +161,6 @@ print(json.dumps({
         self.assertEqual(process.returncode, 0, process.stderr)
         result = json.loads(process.stdout)
         self.assertEqual(result["stored"], "top-secret")
-        self.assertEqual(result["bootstrap"], "top-secret")
         self.assertFalse(result["python_has_secret"])
         self.assertFalse(result["native_secret"])
         self.assertTrue(result["native_after"])
@@ -204,7 +223,6 @@ spawned = subprocess.check_output(
 ).strip()
 print(json.dumps({
     "stored": store.get("LOKI_TEST_TOKEN"),
-    "bootstrap": store.startup_environment().get("LOKI_TEST_TOKEN"),
     "python_has_secret": "LOKI_TEST_TOKEN" in os.environ,
     "native_secret": libc.getenv(b"LOKI_TEST_TOKEN") is not None,
     "native_after": libc.getenv(b"LOKI_TEST_AFTER") == b"after",
@@ -233,7 +251,6 @@ print(json.dumps({
         self.assertEqual(process.returncode, 0, process.stderr)
         result = json.loads(process.stdout)
         self.assertEqual(result["stored"], "top-secret")
-        self.assertEqual(result["bootstrap"], "top-secret")
         self.assertFalse(result["python_has_secret"])
         self.assertFalse(result["native_secret"])
         self.assertTrue(result["native_after"])
@@ -376,6 +393,30 @@ class ConnectionDescriptorTests(unittest.TestCase):
         self.assertIsNone(encoded["credential_env"])
         self.assertIs(encoded["stream"], True)
         self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
+
+    def test_subscription_connection_preserves_authentication_policy(self):
+        descriptor = ConnectionDescriptor(
+            provider_id="openai-subscription",
+            provider_name="OpenAI ChatGPT subscription",
+            model="gpt-5-codex",
+            chat_url="https://chatgpt.com/backend-api/codex/responses",
+            models_url=None,
+            protocol="openai_responses",
+            credential_env=None,
+            credential_ref=CredentialRef.openai_subscription(),
+            auth_scheme="openai-subscription",
+            stream=True,
+        )
+
+        encoded = descriptor.to_dict()
+        restored = ConnectionDescriptor.from_dict(encoded)
+
+        self.assertEqual(restored, descriptor)
+        self.assertEqual(
+            encoded["credential"],
+            {"kind": "openai-subscription", "name": "openai"},
+        )
+        self.assertEqual(encoded["auth_scheme"], "openai-subscription")
 
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):

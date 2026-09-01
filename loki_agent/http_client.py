@@ -33,6 +33,15 @@ class HttpRequestCancelled(Exception):
     pass
 
 
+class HttpRequestDeliveryError(OSError):
+    """Transport failure annotated with whether request bytes were queued."""
+
+    def __init__(self, cause: BaseException, request_may_have_been_sent: bool):
+        self.cause = cause
+        self.request_may_have_been_sent = request_may_have_been_sent
+        super().__init__(str(cause))
+
+
 async def _wait_with_cancel(awaitable, timeout, cancel_check):
     task = asyncio.create_task(awaitable)
     deadline = asyncio.get_running_loop().time() + timeout
@@ -71,6 +80,8 @@ async def _wait_with_cancel(awaitable, timeout, cancel_check):
 
 
 def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, HttpRequestDeliveryError):
+        return _is_transient(exc.cause)
     if isinstance(exc, asyncio.TimeoutError):
         return True
     if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
@@ -361,8 +372,14 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
                                    body: bytes = b'', timeout: int = 30,
                                    max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                    cancel_check=None) -> HttpResponse:
+    # Validate and format caller-controlled URL/header data before entering
+    # transport delivery tracking. A local ValueError is not a failed network
+    # delivery and must remain distinguishable to callers.
+    parsed, raw_request = _build_raw_request(
+        method, request_url, headers_in, body)
+    delivery = {"request_may_have_been_sent": False}
+
     async def request_once() -> HttpResponse:
-        parsed, raw_request = _build_raw_request(method, request_url, headers_in, body)
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
         ssl_context = ssl.create_default_context() if parsed.scheme == 'https' else None
         reader, writer = await asyncio.open_connection(
@@ -372,6 +389,11 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
             server_hostname=parsed.hostname if ssl_context else None,
         )
         try:
+            # Mark first, because an arbitrary transport's write() contract
+            # does not prove that an exception means zero bytes were queued.
+            # A false positive costs a login; a false negative can replay a
+            # rotating refresh token and destroy the newer credential state.
+            delivery["request_may_have_been_sent"] = True
             writer.write(raw_request)
             await writer.drain()
 
@@ -399,8 +421,23 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
                 # should not replace the real request result.
                 pass
 
-    return await _wait_with_cancel(
-        request_once(), timeout, cancel_check or (lambda: False))
+    try:
+        return await _wait_with_cancel(
+            request_once(), timeout, cancel_check or (lambda: False))
+    except asyncio.CancelledError as error:
+        # Task cancellation is control flow, so preserve its type. Rotating
+        # credential callers still need the delivery fact to decide whether
+        # replaying a refresh token is safe.
+        error.request_may_have_been_sent = (
+            delivery["request_may_have_been_sent"])
+        raise
+    except HttpRequestCancelled:
+        raise
+    except HttpRequestDeliveryError:
+        raise
+    except Exception as error:
+        raise HttpRequestDeliveryError(
+            error, delivery["request_may_have_been_sent"]) from error
 
 
 @contextlib.asynccontextmanager

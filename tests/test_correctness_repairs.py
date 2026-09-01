@@ -8,7 +8,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import formats, http_client, loki, protocols, terminal_frontend
+from loki_agent import (
+    authentications,
+    formats,
+    http_client,
+    loki,
+    protocols,
+    terminal_frontend,
+)
 
 
 class ProviderResponseContractTests(unittest.TestCase):
@@ -160,6 +167,49 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertEqual(metadata["exit_code"], -signal.SIGKILL)
         self.assertEqual(metadata["signal"], signal.SIGKILL)
 
+    def test_failed_credential_relay_setup_closes_owner_pipe(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            session = loki.current_session()
+            old_authority = session.credential_authority
+            session.credential_authority = (
+                authentications.CredentialBroker())
+            pipe_fds = []
+            real_pipe = loki.os.pipe
+
+            def recording_pipe():
+                pair = real_pipe()
+                pipe_fds.extend(pair)
+                return pair
+
+            try:
+                with mock.patch.object(
+                        loki.os, "pipe", side_effect=recording_pipe), \
+                        mock.patch.object(
+                            loki.credential_capabilities.CredentialRelay,
+                            "create",
+                            new=mock.AsyncMock(
+                                side_effect=RuntimeError("relay failed"))):
+                    with self.assertRaisesRegex(
+                            RuntimeError, "relay failed"):
+                        await manager.run_background_exec(
+                            [sys.executable, "-c", "pass"],
+                            cwd=tmpdir,
+                            session_owned=True,
+                            credential_refs=frozenset(),
+                        )
+            finally:
+                session.credential_authority = old_authority
+            return pipe_fds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipe_fds = asyncio.run(scenario(tmpdir))
+
+        self.assertEqual(len(pipe_fds), 2)
+        for fd in pipe_fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
     def test_cancelling_owner_task_reaps_foreground_process(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
@@ -238,6 +288,63 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertEqual(metadata["status"], "owner_closed")
         self.assertIsNotNone(ordinary.process.returncode)
 
+    def test_delegated_credential_fd_is_not_inherited_by_child_command(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            credential = authentications.CredentialRef.environment(
+                "EXAMPLE_API_KEY")
+            broker = authentications.CredentialBroker()
+            broker.install_static(credential, "delegated-secret")
+            session = loki.current_session()
+            old_authority = session.credential_authority
+            session.credential_authority = broker
+            probe_code = (
+                "import os,sys\n"
+                "try:\n"
+                "    os.fstat(int(sys.argv[1]))\n"
+                "except OSError:\n"
+                "    print('closed')\n"
+                "else:\n"
+                "    print('inherited')\n"
+            )
+            script = (
+                "import asyncio,os,subprocess,sys\n"
+                "from loki_agent import authentications\n"
+                "from loki_agent import credential_capabilities\n"
+                "async def main():\n"
+                "    fd = int(sys.argv[-1])\n"
+                "    client = await "
+                "credential_capabilities.CredentialClient.from_fd(fd)\n"
+                "    lease = await client.lease("
+                "authentications.CredentialRef.environment("
+                "'EXAMPLE_API_KEY'))\n"
+                "    probe = subprocess.check_output([\n"
+                f"        sys.executable, '-c', {probe_code!r},\n"
+                "        str(fd)], stderr=subprocess.STDOUT, text=True)\n"
+                "    print(lease.value)\n"
+                "    print(probe.strip())\n"
+                "    await client.close()\n"
+                "asyncio.run(main())\n"
+            )
+            try:
+                return await manager.run_exec(
+                    [sys.executable, "-c", script],
+                    10_000,
+                    cwd=os.path.dirname(os.path.dirname(__file__)),
+                    credential_refs={credential},
+                )
+            finally:
+                session.credential_authority = old_authority
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job, status, stdout, stderr = asyncio.run(scenario(tmpdir))
+
+        self.assertEqual(status, "completed", stderr)
+        self.assertEqual(job.exit_code, 0, stderr)
+        self.assertIn("delegated-secret", stdout)
+        self.assertIn("closed", stdout)
+        self.assertNotIn("inherited", stdout)
+
     def test_bash_timeout_is_a_failed_tool_result(self):
         async def scenario(tmpdir):
             old_manager = loki.current_session().job_manager
@@ -268,7 +375,7 @@ class AgentModeContractTests(unittest.TestCase):
         self.assertNotIn("Edit", loki.EXPLORE_TOOLS)
         self.assertNotIn("TodoWrite", loki.EXPLORE_TOOLS)
         self.assertNotIn("JobStop", loki.EXPLORE_TOOLS)
-        self.assertNotIn("Agent", loki.EXPLORE_TOOLS)
+        self.assertIn("Agent", loki.EXPLORE_TOOLS)
         self.assertIn("Read", loki.EXPLORE_TOOLS)
         self.assertIn("Grep", loki.EXPLORE_TOOLS)
 

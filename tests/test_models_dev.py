@@ -330,7 +330,6 @@ class CatalogNormalizationTests(unittest.TestCase):
         provider = protocols.make_provider(
             access.api_url,
             provider=access.protocol,
-            api_key="secret",
         )
         self.assertEqual(
             provider.chat_url,

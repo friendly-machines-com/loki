@@ -23,6 +23,10 @@ class Session:
     # RuntimeConfig, or None before startup config is applied.
     runtime_config: Any = None
 
+    # Async request-time credential authority. Top-level processes install a
+    # local broker; workers and subagents install a delegated client.
+    credential_authority: Any = None
+
     transcript_items: list = field(default_factory=list)
     session_todos: list = field(default_factory=list)
     session_toolsets: list = field(default_factory=list)

@@ -30,7 +30,11 @@ from dataclasses import dataclass
 
 from . import http_client
 from . import protocols
-from .credentials import CredentialStore, is_credential_name
+from .credentials import (
+    CredentialInventory,
+    CredentialStore,
+    is_credential_name,
+)
 
 MODELS_DEV_URL = "https://models.dev/api.json"
 USER_AGENT = "loki-models.dev-picker/1.0"
@@ -356,7 +360,9 @@ def provider_description(provider_entry):
     return description
 
 
-def provider_access(provider_entry, credentials: CredentialStore):
+def provider_access(
+        provider_entry,
+        credentials: CredentialStore | CredentialInventory):
     """Resolve a catalog provider against the captured startup environment.
 
     Returns the credential name, expanded API URL, and implemented protocol.
@@ -369,9 +375,8 @@ def provider_access(provider_entry, credentials: CredentialStore):
         name for name in (provider_entry.get("env") or [])
         if is_credential_name(name)
     ]
-    credential_env, credential_value = credentials.first_available(
-        credential_names)
-    if not credential_env or not credential_value:
+    credential_env = credentials.first_available_name(credential_names)
+    if not credential_env:
         return None
 
     api_template = provider_entry.get("api")
@@ -397,7 +402,9 @@ def is_deprecated(model_entry):
     return model_entry.get("status") == "deprecated"
 
 
-def filter_supported_groups(groups, credentials: CredentialStore | None = None):
+def filter_supported_groups(
+        groups,
+        credentials: CredentialStore | CredentialInventory | None = None):
     """Drop unusable provider members and then empty model groups.
 
     With a credential store, usable also means that a declared credential and
@@ -676,12 +683,13 @@ def flattened_config_options(credentials, explicit_connection=None,
     ]
 
 
-async def run_model_picker_async(input_fn, credentials: CredentialStore,
-                                 cache_path=None,
-                                 explicit_connection:
-                                 ExplicitConnectionOption | None = None,
-                                 *,
-                                 text_writer):
+async def run_model_picker_async(
+        input_fn,
+        credentials: CredentialStore | CredentialInventory,
+        cache_path=None,
+        explicit_connection: ExplicitConnectionOption | None = None,
+        *,
+        text_writer):
     """Two-level picker: conflated model -> provider.
 
     Returns (provider_id, provider_entry, model_entry) for the chosen

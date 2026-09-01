@@ -20,11 +20,12 @@ import sys
 from dataclasses import dataclass
 from pprint import pformat
 
-from . import acps
 from . import formats
 from . import models as modelsdev
+from . import process_protections
 from . import protocols
 from . import savefiles
+from . import subagents
 from . import terminals
 from .credentials import capture_process_credentials
 from . import tool_runtime
@@ -573,11 +574,15 @@ async def confirm_saved_connection_async(
         _print_repr_line("  Chat endpoint: ", endpoint)
         if models_endpoint:
             _print_repr_line("  Models endpoint: ", models_endpoint)
-        if descriptor.credential_env is None:
+        if descriptor.credential_ref is None:
             print("  Authentication: none")
         else:
+            credential_label = (
+                descriptor.credential_ref.name
+                if descriptor.credential_ref.kind == "env"
+                else descriptor.credential_ref.encode())
             _print_repr_line(
-                "  Credential: ", descriptor.credential_env)
+                "  Credential: ", credential_label)
         print(f"  Streaming: {'yes' if descriptor.stream else 'no'}")
         if descriptor.protocol == protocols.ANTHROPIC_MESSAGES:
             print(
@@ -588,45 +593,12 @@ async def confirm_saved_connection_async(
         return answer.strip().lower() in ("y", "yes")
 
 
-def run_subagent_prompt(subagent_type: str, prompt: str) -> str:
-    return asyncio.run(run_subagent_prompt_async(subagent_type, prompt))
-
-
-async def run_subagent_prompt_async(subagent_type: str, prompt: str) -> str:
-    if subagent_type != "Explore":
-        return f"Error: unknown subagent_type {subagent_type!r} (only 'Explore' is supported)"
-    if not prompt:
-        return ""
-    msgs = [
-        formats.instruction_item(
-            "You are a focused, read-only Explore subagent. Use "
-            "Glob/Grep/Read/WebFetch/WebSearch to investigate, then write a "
-            "concise final answer."),
-        formats.message_item("user", prompt),
-    ]
-    current_session().agent_mode = "explore"
-    return await run_tool_loop_async(msgs, allowed=EXPLORE_TOOLS)
-
-
-def run_subagent_cli(subagent_type: str, prompt: str = None):
-    asyncio.run(run_subagent_cli_async(subagent_type, prompt))
-
-
-async def run_subagent_cli_async(subagent_type: str, prompt: str = None):
-    prompt = prompt if prompt is not None else sys.stdin.read().strip()
-    result = await run_subagent_prompt_async(subagent_type, prompt)
-    if result:
-        terminal.write_text(result, multiline=True)
-        print()
-
-
 USAGE = """\
 usage: loki [options]
 
 Options:
   -r, --resume LOG        resume a saved chat log (bare --resume: picker)
-  -p, --prompt TEXT       one prompt for --subagent / --headless mode
-      --subagent TYPE     run a subagent prompt instead of the TUI
+  -p, --prompt TEXT       one prompt for --headless mode
       --headless          headless single-prompt mode
       --toolset NAME      toolset for headless mode
       --dangerously-skip-permissions
@@ -638,8 +610,8 @@ Without options, loki starts the interactive TUI.
 
 
 CLI_SHORT_OPTS = 'r:p:h'
-CLI_LONG_OPTS = ['resume=', 'prompt=', 'subagent=', 'headless', 'toolset=',
-                 'shell-cwd=', 'session-owner-fd=',
+CLI_LONG_OPTS = ['resume=', 'prompt=', 'headless', 'toolset=',
+                 'shell-cwd=',
                  'dangerously-skip-permissions', 'help']
 
 
@@ -649,33 +621,6 @@ def parse_cli_args(args):
     # `--resume=` so it opens the picker instead of erroring out.
     args = ['--resume=' if a == '--resume' else a for a in args]
     return getopt.getopt(args, CLI_SHORT_OPTS, CLI_LONG_OPTS)
-
-
-async def _run_until_session_owner_closes(coroutine, owner_fd: int) -> bool:
-    """Run a trusted child operation while its owner capability is live."""
-    os.set_inheritable(owner_fd, False)
-    owner_task = asyncio.create_task(
-        acps.AsyncFdLineReader(owner_fd).readline(),
-        name="loki-session-owner",
-    )
-    operation_task = asyncio.create_task(
-        coroutine, name="loki-session-owned-operation")
-    try:
-        done, _pending = await asyncio.wait(
-            {owner_task, operation_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if operation_task in done:
-            await operation_task
-            return True
-        operation_task.cancel()
-        await asyncio.gather(operation_task, return_exceptions=True)
-        return False
-    finally:
-        if not owner_task.done():
-            owner_task.cancel()
-        await asyncio.gather(owner_task, return_exceptions=True)
-        os.close(owner_fd)
 
 
 async def async_main(args) -> int:
@@ -692,45 +637,18 @@ async def async_main(args) -> int:
             print(USAGE, end='')
             return 0
     prompt_arg = None
-    subagent_type = None
     headless = False
     toolset = None
     shell_cwd = None
-    session_owner_fd = None
     for option_name, option_value in options:
         if option_name in ['--prompt', '-p']:
             prompt_arg = option_value
-        elif option_name == '--subagent':
-            subagent_type = option_value
         elif option_name == '--headless':
             headless = True
         elif option_name == '--toolset':
             toolset = option_value
         elif option_name == '--shell-cwd':
             shell_cwd = option_value
-        elif option_name == '--session-owner-fd':
-            try:
-                session_owner_fd = int(option_value)
-                if session_owner_fd < 3:
-                    raise ValueError(
-                        "owner descriptor must be at least 3")
-                os.fstat(session_owner_fd)
-            except (OSError, ValueError) as error:
-                print(
-                    f"Configuration error: invalid session owner "
-                    f"descriptor: {error}",
-                    file=sys.stderr,
-                )
-                return 2
-
-    if session_owner_fd is not None and not subagent_type:
-        os.close(session_owner_fd)
-        print(
-            "Configuration error: a session owner descriptor is only "
-            "valid for a subagent.",
-            file=sys.stderr,
-        )
-        return 2
 
     if shell_cwd is not None:
         try:
@@ -741,11 +659,9 @@ async def async_main(args) -> int:
                 str(error),
                 file=sys.stderr,
             )
-            if session_owner_fd is not None:
-                os.close(session_owner_fd)
             return 2
 
-    if subagent_type or headless:
+    if headless:
         try:
             apply_runtime_config(build_config_from_env(
                 credentials=_core.CREDENTIALS))
@@ -753,23 +669,14 @@ async def async_main(args) -> int:
             _print_text_line(
                 "Configuration error: ", e, file=sys.stderr,
                 multiline=True)
-            if session_owner_fd is not None:
-                os.close(session_owner_fd)
             return 2
         if not current_model():
             print("Configuration error: model missing; set LOKI_MODEL.",
                   file=sys.stderr)
-            if session_owner_fd is not None:
-                os.close(session_owner_fd)
             return 2
-        operation = run_subagent_cli_async(
-            subagent_type or toolset or "Explore", prompt_arg)
-        if session_owner_fd is None:
-            await operation
-            return 0
-        completed = await _run_until_session_owner_closes(
-            operation, session_owner_fd)
-        return 0 if completed else 1
+        await subagents.run_cli_async(
+            toolset or "Explore", prompt_arg)
+        return 0
 
     log_filename = None
     for option_name, option_value in options:
@@ -1136,9 +1043,17 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
 
 
 def main() -> int:
-    # Capture credentials into the core's module state; the rest of this
-    # module reads them via _core.CREDENTIALS at call time.
-    _core.CREDENTIALS = capture_process_credentials()
+    credential_store = capture_process_credentials()
+    try:
+        process_protections.protect_credential_process()
+    except process_protections.ProcessProtectionError as error:
+        print(f"Security initialization error: {error}", file=sys.stderr)
+        return 2
+    _core.install_root_credential_broker(credential_store)
+    # Provider selection needs names and non-secret settings, not values.
+    # Keeping only an inventory outside the broker makes accidental direct
+    # credential reads impossible in the rest of the terminal runtime.
+    _core.CREDENTIALS = credential_store.inventory()
     # --help and argument errors must leave the user's terminal exactly as
     # it was: handle them before initialize_terminal_overlay touches the
     # screen. No cursor hiding, scroll regions, or teardown output.

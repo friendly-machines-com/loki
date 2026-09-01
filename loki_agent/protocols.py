@@ -862,8 +862,9 @@ def model_url_candidates(input_url, protocol, primary_models_url=None, explicit_
     return candidates
 
 
-def build_headers(protocol, api_key, anthropic_version="2023-06-01",
-                  auth_header=None, user_agent="TinyAgent/1.0"):
+def build_headers(protocol, anthropic_version="2023-06-01",
+                  user_agent="TinyAgent/1.0"):
+    """Build non-secret protocol headers."""
     headers = {
         "Content-Type": "application/json",
         "User-Agent": user_agent,
@@ -872,24 +873,12 @@ def build_headers(protocol, api_key, anthropic_version="2023-06-01",
         # This identifies the Anthropic wire format; it is required protocol
         # metadata, not an authentication credential.
         headers["anthropic-version"] = anthropic_version
-    if not api_key:
-        return headers
-    if auth_header:
-        # Compatibility gateways sometimes use a nonstandard auth header. When
-        # configured, honor it exactly instead of also adding Bearer/x-api-key.
-        headers[auth_header] = api_key
-        return headers
-    if protocol == ANTHROPIC_MESSAGES:
-        headers["x-api-key"] = api_key
-    else:
-        headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
 
-def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
+def make_provider(input_url, provider=AUTO, models_url=None,
                   max_tokens=4096, anthropic_version="2023-06-01",
-                  auth_header=None, provider_id=None, provider_name=None,
-                  prompt_cache=False):
+                  provider_id=None, provider_name=None, prompt_cache=False):
     protocol = resolve_protocol(input_url, provider)
     if protocol == DUMMY:
         # No-op provider for testing: no real endpoint or URL structure.
@@ -908,8 +897,8 @@ def make_provider(input_url, provider=AUTO, api_key="", models_url=None,
     chat_url, resolved_models_url = endpoint_urls(input_url, protocol, models_url=models_url)
     model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
                                       explicit_models_url=models_url)
-    headers = build_headers(protocol, api_key, anthropic_version=anthropic_version,
-                            auth_header=auth_header)
+    headers = build_headers(
+        protocol, anthropic_version=anthropic_version)
     return Provider(
         kind=protocol,
         input_url=input_url,
