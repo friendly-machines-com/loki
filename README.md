@@ -37,18 +37,32 @@ terminating NUL and the framing of later records. This removes the credential
 from Linux `/proc/PID/environ` and macOS `KERN_PROCARGS2` inspection. The
 macOS path uses the documented `_NSGetEnviron()` interface and refuses to
 write unless every target record is within the initial main-thread stack.
-The top-level terminal or ACP front installs captured credential values in an
-in-memory broker; the rest of the runtime uses only non-secret credential
-names. ACP workers receive a sanitized environment and an anonymous socket
-capability restricted to the brokered credentials they may request. Subagents
+Every public entrypoint first becomes a credential-owning supervisor. For the
+terminal and headless interfaces it starts a separate runtime through the same
+executable; the ACP front starts one runtime worker per session. A runtime
+receives only a sanitized environment, an owner-lifetime pipe, and an
+anonymous socket capability restricted to the brokered credentials it may
+request. Losing either supervisor channel cancels the runtime. Subagents
 receive a fresh capability restricted to the current provider, and nested
 subagents get a newly relayed capability rather than inheriting their parent's
 descriptor. Rotating refresh tokens stay in the top-level broker; delegated
 processes can lease an access token but cannot obtain the refresh token.
-Ordinary commands and hooks are started with other descriptors closed. On
-Linux, credential-bearing Loki processes also make themselves
-non-dumpable so same-UID tool children cannot inspect their memory or open
-descriptors through ptrace-governed `/proc` interfaces.
+
+The supervisor/runtime split also gives persistent credentials a pathname
+boundary. On Linux, if Loki's dedicated
+`$XDG_CONFIG_HOME/loki/credentials` directory exists, each runtime enters a
+private user and mount namespace before importing the agent core and covers
+that directory with an empty read-only filesystem. Tools and nested subagents
+inherit the covered view; only the supervisor retains the original view
+needed to load and later update credentials. Runtimes then discard their
+namespace capabilities and enable `NO_NEW_PRIVS`, so they cannot remove the
+cover mount. This is not a general sandbox: Loki still expects the surrounding
+VM or container described above to confine arbitrary tool activity.
+
+Ordinary commands and hooks are started with other descriptors closed.
+Credential-owning supervisors and credential-consuming runtimes also make
+themselves non-dumpable on Linux, so same-UID tool children cannot inspect
+their memory or open descriptors through ptrace-governed `/proc` interfaces.
 
 The `/model` picker fetches models.dev lazily and shows only providers for
 which a captured credential is available. Provider-specific variables such as

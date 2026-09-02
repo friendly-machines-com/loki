@@ -309,6 +309,7 @@ class CredentialCapabilityServer:
         self._writer = writer
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
+        self._writer_close_task = None
         self._requests: set[asyncio.Task] = set()
         self._closed = False
         self._reader_task = asyncio.create_task(
@@ -415,9 +416,24 @@ class CredentialCapabilityServer:
         async with self._close_lock:
             self._closed = True
             self._writer.close()
-            with contextlib.suppress(
-                    BrokenPipeError, ConnectionError, OSError):
-                await self._writer.wait_closed()
+            if self._writer_close_task is None:
+                # On Python 3.10, cancelling one task directly awaiting
+                # StreamWriter.wait_closed() can cancel the transport's
+                # shared close waiter. The reader task is deliberately
+                # cancelled during revocation, so keep the actual transport
+                # wait in a separately shielded task which close() can still
+                # join afterward.
+                async def wait_closed():
+                    with contextlib.suppress(
+                            BrokenPipeError, ConnectionError, OSError):
+                        await self._writer.wait_closed()
+
+                self._writer_close_task = asyncio.create_task(
+                    wait_closed(),
+                    name="credential-capability-writer-close",
+                )
+            close_task = self._writer_close_task
+        await asyncio.shield(close_task)
 
     async def close(self):
         self.close_now()

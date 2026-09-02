@@ -54,15 +54,28 @@ def main() -> int:
     if sys.argv[1:2] == ["--worker"]:
         from .acp_worker_main import main as worker_main
         return worker_main()
+
+    if sys.argv[1:2] == ["--subagent"]:
+        try:
+            # ACP subagents inherit the worker's already-covered mount
+            # namespace. Re-unsharing would add a namespace level for no
+            # security gain and can hit kernel nesting or policy limits.
+            protect_credential_process()
+        except ProcessProtectionError as error:
+            print(
+                f"Security initialization error: {error}",
+                file=sys.stderr,
+            )
+            return 2
+        from .subagents import main as subagent_main
+        return subagent_main(sys.argv[2:])
+
     credentials = capture_process_credentials()
     try:
         protect_credential_process()
     except ProcessProtectionError as error:
         print(f"Security initialization error: {error}", file=sys.stderr)
         return 2
-    if sys.argv[1:2] == ["--subagent"]:
-        from .subagents import main as subagent_main
-        return subagent_main(sys.argv[2:], credentials)
     return asyncio.run(amain(credentials))
 
 

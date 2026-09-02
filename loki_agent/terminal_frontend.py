@@ -21,12 +21,13 @@ from dataclasses import dataclass
 from pprint import pformat
 
 from . import formats
+from . import credential_capabilities
+from . import credential_runtimes
 from . import models as modelsdev
 from . import protocols
 from . import savefiles
 from . import subagents
 from . import terminals
-from .credentials import CredentialStore
 from . import tool_runtime
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .loki import RuntimeConfig, computer
@@ -1041,18 +1042,13 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
     run_step(active_terminal.flush)
 
 
-def main(credential_store: CredentialStore) -> int:
-    """Run the terminal frontend after entry-point security initialization."""
-    _core.install_root_credential_broker(credential_store)
-    # Provider selection needs names and non-secret settings, not values.
-    # Keeping only an inventory outside the broker makes accidental direct
-    # credential reads impossible in the rest of the terminal runtime.
-    _core.CREDENTIALS = credential_store.inventory()
+async def _run_frontend(args) -> int:
+    """Own terminal setup and teardown inside one already-authorized runtime."""
     # --help and argument errors must leave the user's terminal exactly as
     # it was: handle them before initialize_terminal_overlay touches the
     # screen. No cursor hiding, scroll regions, or teardown output.
     try:
-        options, _positional = parse_cli_args(sys.argv[1:])
+        options, _positional = parse_cli_args(args)
     except getopt.GetoptError as error:
         _print_repr_line("loki: ", str(error), file=sys.stderr)
         print(USAGE, end='', file=sys.stderr)
@@ -1109,7 +1105,7 @@ def main(credential_store: CredentialStore) -> int:
 
     async def run_with_session_cleanup():
         try:
-            return await async_main(sys.argv[1:])
+            return await async_main(args)
         finally:
             manager = current_session().job_manager
             if manager is not None:
@@ -1117,9 +1113,48 @@ def main(credential_store: CredentialStore) -> int:
 
     exit_status = 1
     try:
-        exit_status = asyncio.run(run_with_session_cleanup())
+        exit_status = await run_with_session_cleanup()
     finally:
         clean_up()
     if exit_status == 0 and cleanup_failed:
         return 1
     return exit_status
+
+
+async def _run_credential_runtime(
+        args, owner_fd: int, capability_fd: int) -> int:
+    runtime = None
+    try:
+        try:
+            runtime = await credential_runtimes.CredentialRuntime.connect(
+                owner_fd, capability_fd)
+        except (
+                credential_capabilities.CapabilityError,
+                OSError,
+        ) as error:
+            _print_text_line(
+                "Configuration error: credential capability: ",
+                error,
+                file=sys.stderr,
+                multiline=True,
+            )
+            return 2
+        if runtime is None:
+            return 1
+
+        # Terminal and headless runtimes are capability consumers just like
+        # ACP workers and subagents. Root broker installation belongs solely
+        # to their supervisor; retaining a local fallback here would recreate
+        # the asymmetric in-process credential escape hatch.
+        _core.CREDENTIALS = runtime.install(current_session())
+        completed, result = await runtime.run(_run_frontend(args))
+        return result if completed else 1
+    finally:
+        if runtime is not None:
+            await runtime.close()
+
+
+def main(args, owner_fd: int, capability_fd: int) -> int:
+    """Run the capability-only terminal/headless runtime."""
+    return asyncio.run(
+        _run_credential_runtime(args, owner_fd, capability_fd))

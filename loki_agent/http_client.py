@@ -427,7 +427,10 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
     except asyncio.CancelledError as error:
         # Task cancellation is control flow, so preserve its type. Rotating
         # credential callers still need the delivery fact to decide whether
-        # replaying a refresh token is safe.
+        # replaying a refresh token is safe. CPython 3.10 reconstructs a plain
+        # CancelledError when an already-cancelled Task is awaited, losing
+        # custom attributes; callers must therefore default a missing fact to
+        # "possibly sent", as the refresh broker does.
         error.request_may_have_been_sent = (
             delivery["request_may_have_been_sent"])
         raise

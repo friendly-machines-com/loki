@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import acp, acps, authentications
+from loki_agent import acp, acp_main, acps, authentications
 from loki_agent.credentials import CredentialStore, is_credential_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -135,17 +135,17 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
             async def wait(self):
                 return 0
 
-        capability = mock.Mock()
-        capability.close_now = mock.Mock()
-        capability.close = mock.AsyncMock()
+        delegation = mock.Mock()
+        delegation.revoke_now = mock.Mock()
+        delegation.close = mock.AsyncMock()
         channel = acp.WorkerChannel(
-            "session", Process(), lambda message: None, capability)
+            "session", Process(), lambda message: None, delegation)
 
         await channel._reader_task
 
-        capability.close_now.assert_called_once_with()
-        capability.close.assert_awaited_once_with()
-        self.assertIsNone(channel.credential_capability)
+        delegation.revoke_now.assert_called_once_with()
+        delegation.close.assert_awaited_once_with()
+        self.assertIsNone(channel.credential_delegation)
 
 
 class QuarantineTests(unittest.TestCase):
@@ -188,10 +188,42 @@ class EntrypointTests(unittest.TestCase):
             'loki-acp = "loki_agent.acp_main:main"', content,
             "installed users need the loki-acp console script")
 
+    def test_subagent_uses_inherited_worker_authority(self):
+        with mock.patch.object(
+                acp_main,
+                "capture_process_credentials") as capture, \
+                mock.patch.object(
+                    acp_main,
+                    "protect_credential_process") as protect, \
+                mock.patch(
+                    "loki_agent.subagents.main",
+                    return_value=31) as subagent_main, \
+                mock.patch.object(sys, "argv", [
+                    "/installed/bin/loki-acp",
+                    "--subagent",
+                    "Explore",
+                    "--session-owner-fd", "7",
+                    "--credential-capability-fd", "8",
+                ]):
+            status = acp_main.main()
+
+        self.assertEqual(status, 31)
+        capture.assert_not_called()
+        protect.assert_called_once_with()
+        subagent_main.assert_called_once_with([
+            "Explore",
+            "--session-owner-fd", "7",
+            "--credential-capability-fd", "8",
+        ])
+
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class FrontWorkerTests(unittest.TestCase):
     def _front_env(self, tmpdir):
+        os.makedirs(
+            os.path.join(tmpdir, "config", "loki", "credentials"),
+            exist_ok=True,
+        )
         env = dict(os.environ)
         env.update({
             "HOME": tmpdir,
@@ -308,15 +340,15 @@ class FrontWorkerTests(unittest.TestCase):
         class FakeChannel:
             def __init__(
                     self, session_id, process, forward,
-                    credential_capability):
+                    credential_delegation):
                 self.session_id = session_id
-                self.credential_capability = credential_capability
+                self.credential_delegation = credential_delegation
 
             async def request(self, method, params):
                 return {}
 
             async def close(self):
-                await self.credential_capability.close()
+                await self.credential_delegation.close()
 
         async def fake_spawn(*args, **kwargs):
             spawned["args"] = args
@@ -337,8 +369,10 @@ class FrontWorkerTests(unittest.TestCase):
         self.assertNotIn(credential_name, child_environment)
         self.assertNotIn(credential_value, repr(child_environment))
         self.assertTrue(spawned["kwargs"]["close_fds"])
-        self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 1)
+        self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 2)
+        self.assertIn("--session-owner-fd", spawned["args"])
         self.assertIn("--credential-capability-fd", spawned["args"])
+        self.assertTrue(spawned["kwargs"]["start_new_session"])
         credential = authentications.CredentialRef.environment(
             credential_name)
         self.assertTrue(front.credentials.has_ref(credential))
@@ -372,8 +406,7 @@ class FrontWorkerTests(unittest.TestCase):
                     "import json, os, sys\n"
                     "from loki_agent import credentials\n"
                     "_capture = credentials.capture_process_credentials\n"
-                    "def capture_process_credentials():\n"
-                    "    store = _capture()\n"
+                    "def report_environment():\n"
                     "    with open('/proc/self/environ', 'rb') as source:\n"
                     "        raw = source.read()\n"
                     f"    name = {credential_name!r}.encode('ascii')\n"
@@ -381,6 +414,7 @@ class FrontWorkerTests(unittest.TestCase):
                     "    filler = b'x' * len(name + b'=' + value)\n"
                     "    after = b'LOKI_ACP_AFTER=visible\\0'\n"
                     "    report = {\n"
+                    "        'pid': os.getpid(),\n"
                     "        'worker': '--worker' in sys.argv,\n"
                     "        'name_present': name + b'=' in raw,\n"
                     "        'value_present': value in raw,\n"
@@ -395,9 +429,14 @@ class FrontWorkerTests(unittest.TestCase):
                     "        f'{os.getpid()}.json')\n"
                     "    with open(path, 'w', encoding='ascii') as output:\n"
                     "        json.dump(report, output)\n"
+                    "def capture_process_credentials():\n"
+                    "    store = _capture()\n"
+                    "    report_environment()\n"
                     "    return store\n"
                     "credentials.capture_process_credentials = (\n"
                     "    capture_process_credentials)\n"
+                    "if '--worker' in sys.argv:\n"
+                    "    report_environment()\n"
                 )
             env["LOKI_TEST_REPORT_DIR"] = report_dir
             env["PYTHONPATH"] = os.pathsep.join(
@@ -476,6 +515,17 @@ class FrontWorkerTests(unittest.TestCase):
                 self.assertTrue(front_report["after_follows_filler"])
                 self.assertFalse(worker_report["filler_present"])
                 self.assertFalse(worker_report["after_follows_filler"])
+                credential_dir = os.path.join(
+                    tmpdir, "config", "loki", "credentials")
+                with open(
+                        f"/proc/{worker_report['pid']}/mountinfo",
+                        encoding="ascii") as stream:
+                    worker_mounts = stream.read()
+                self.assertTrue(any(
+                    f" {credential_dir} " in line
+                    and " - tmpfs " in line
+                    for line in worker_mounts.splitlines()
+                ), worker_mounts)
             finally:
                 front.stdin.close()
                 try:

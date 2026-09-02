@@ -14,13 +14,12 @@ import os
 import sys
 from dataclasses import dataclass
 
-from . import acps
 from . import credential_capabilities
+from . import credential_runtimes
 from . import formats
 from . import loki as _core
 from . import protocols
 from . import texts
-from .credentials import CredentialInventory, CredentialStore
 
 
 USAGE_OPTIONS = """\
@@ -51,38 +50,6 @@ class SubagentOptions:
     session_owner_fd: int | None = None
     credential_capability_fd: int | None = None
     help: bool = False
-
-
-class _SessionOwner:
-    """One inherited session-lifetime capability.
-
-    The read end becomes ready only when its parent closes the write end.
-    Monitoring begins before credential initialization because ownership
-    applies to the delegated process's complete lifetime, not merely its first
-    model turn.
-    """
-
-    def __init__(self, fd: int):
-        os.set_inheritable(fd, False)
-        self.fd = fd
-        self.closed_task = asyncio.create_task(
-            acps.AsyncFdLineReader(fd).readline(),
-            name="loki-session-owner",
-        )
-        self._closed = False
-
-    async def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        if not self.closed_task.done():
-            self.closed_task.cancel()
-        await asyncio.gather(
-            self.closed_task, return_exceptions=True)
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
 
 
 def _print_text_line(prefix, text, *, file=None):
@@ -189,87 +156,6 @@ async def run_cli_async(
         print()
 
 
-async def _connect_credential_while_owned(
-        capability_fd: int,
-        owner: _SessionOwner):
-    """Initialize a credential client only while its session owner is live."""
-    # CredentialClient.take_fd() takes FD ownership synchronously. That is a
-    # security property: if owner revocation wins before the new task receives
-    # a timeslice, canceling the task must still close the inherited capability.
-    initializer = (
-        credential_capabilities.CredentialClient.take_fd(capability_fd))
-    client_task = asyncio.create_task(
-        initializer.connect(),
-        name="loki-credential-initialization",
-    )
-    try:
-        done, _pending = await asyncio.wait(
-            {owner.closed_task, client_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-    except BaseException:
-        # Cancellation of startup is also revocation. Do not leave either the
-        # initialization task or its not-yet-transferred socket behind.
-        if not client_task.done():
-            client_task.cancel()
-        await asyncio.gather(client_task, return_exceptions=True)
-        initializer.close_now()
-        raise
-    if owner.closed_task not in done:
-        return await client_task
-
-    # Owner closure wins a simultaneous handshake completion. A credential
-    # channel has no independent lifetime: it was delegated by this owner and
-    # must not survive the owner's revocation.
-    if not client_task.done():
-        client_task.cancel()
-    result = (await asyncio.gather(
-        client_task, return_exceptions=True))[0]
-    initializer.close_now()
-    if isinstance(
-            result, credential_capabilities.CredentialClient):
-        await result.close()
-    return None
-
-
-async def _run_until_session_owner_closes(
-        coroutine, owner: _SessionOwner,
-        credential_client=None) -> bool:
-    """Run only while the owning session and credential broker are alive."""
-    operation_task = asyncio.create_task(
-        coroutine, name="loki-session-owned-operation")
-    capability_task = (
-        asyncio.create_task(
-            credential_client.wait_closed(),
-            name="loki-credential-owner",
-        )
-        if credential_client is not None else None
-    )
-    monitored = {owner.closed_task, operation_task}
-    if capability_task is not None:
-        monitored.add(capability_task)
-    try:
-        done, _pending = await asyncio.wait(
-            monitored,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if operation_task in done:
-            await operation_task
-            return True
-        operation_task.cancel()
-        await asyncio.gather(operation_task, return_exceptions=True)
-        return False
-    finally:
-        monitor_tasks = []
-        if capability_task is not None:
-            if not capability_task.done():
-                capability_task.cancel()
-            monitor_tasks.append(capability_task)
-        if monitor_tasks:
-            await asyncio.gather(
-                *monitor_tasks, return_exceptions=True)
-
-
 def _close_descriptors(options: SubagentOptions) -> None:
     for fd in (
             options.session_owner_fd,
@@ -281,8 +167,7 @@ def _close_descriptors(options: SubagentOptions) -> None:
                 pass
 
 
-async def async_main(
-        args, credentials: CredentialStore) -> int:
+async def async_main(args) -> int:
     try:
         options = parse_args(args)
     except (getopt.GetoptError, ValueError) as error:
@@ -297,46 +182,37 @@ async def async_main(
 
     owner_fd = options.session_owner_fd
     capability_fd = options.credential_capability_fd
-    if (owner_fd is None) != (capability_fd is None):
+    if owner_fd is None or capability_fd is None:
         _close_descriptors(options)
         print(
-            "Configuration error: delegated subagents require both the "
-            "session owner and credential capability descriptors.",
+            "Configuration error: subagent runtimes require both the session "
+            "owner and credential capability descriptors.",
             file=sys.stderr,
         )
         return 2
 
-    owner = _SessionOwner(owner_fd) if owner_fd is not None else None
-    credential_client = None
+    runtime = None
     try:
-        if capability_fd is not None:
-            try:
-                credential_client = (
-                    await _connect_credential_while_owned(
-                        capability_fd, owner))
-            except (
-                    credential_capabilities.CapabilityError,
-                    OSError,
-            ) as error:
-                _print_text_line(
-                    "Configuration error: credential capability: ",
-                    error,
-                    file=sys.stderr,
-                )
-                return 2
-            if credential_client is None:
-                return 1
-            # A delegated process installs exactly the restricted authority it
-            # received. It must not also create a parallel root broker, even
-            # though its environment is expected to contain no credentials.
-            _core.current_session().credential_authority = credential_client
-            _core.CREDENTIALS = CredentialInventory.from_environment(
-                os.environ, credential_client.available())
-        else:
-            # A directly invoked top-level subagent has no delegating parent,
-            # so its own captured startup credentials form the root authority.
-            _core.install_root_credential_broker(credentials)
-            _core.CREDENTIALS = credentials.inventory()
+        try:
+            runtime = await credential_runtimes.CredentialRuntime.connect(
+                owner_fd, capability_fd)
+        except (
+                credential_capabilities.CapabilityError,
+                OSError,
+        ) as error:
+            _print_text_line(
+                "Configuration error: credential capability: ",
+                error,
+                file=sys.stderr,
+            )
+            return 2
+        if runtime is None:
+            return 1
+        # A subagent installs exactly the restricted authority it received.
+        # There is intentionally no direct/root fallback: such a fallback
+        # would let an internal runtime silently bypass its supervisor.
+        _core.CREDENTIALS = runtime.install(
+            _core.current_session())
 
         if options.shell_cwd is not None:
             try:
@@ -365,18 +241,12 @@ async def async_main(
 
         operation = run_cli_async(
             options.subagent_type, options.prompt)
-        if owner is None:
-            await operation
-            return 0
-        completed = await _run_until_session_owner_closes(
-            operation, owner, credential_client)
+        completed, _result = await runtime.run(operation)
         return 0 if completed else 1
     finally:
-        if credential_client is not None:
-            await credential_client.close()
-        if owner is not None:
-            await owner.close()
+        if runtime is not None:
+            await runtime.close()
 
 
-def main(args, credentials: CredentialStore) -> int:
-    return asyncio.run(async_main(args, credentials))
+def main(args) -> int:
+    return asyncio.run(async_main(args))

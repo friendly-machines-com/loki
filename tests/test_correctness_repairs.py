@@ -415,24 +415,102 @@ class JobOwnershipContractTests(unittest.TestCase):
 
 
 class TerminalEntrypointContractTests(unittest.TestCase):
-    def test_security_initialization_happens_once_before_terminal_frontend(self):
+    def test_public_entrypoint_protects_credential_supervisor(self):
         credentials = CredentialStore({})
+        supervisor = mock.Mock()
+        supervisor.run_terminal_runtime = mock.AsyncMock(
+            return_value=17)
         with mock.patch.object(
                 terminal_entrypoint,
                 "capture_process_credentials",
                 return_value=credentials) as capture, mock.patch.object(
                     terminal_entrypoint,
-                    "protect_credential_process") as protect, mock.patch.object(
-                        terminal_frontend,
-                        "main",
-                        return_value=17) as terminal_main, mock.patch.object(
-                            sys, "argv", ["loki.py"]):
+                    "protect_credential_process") as protect, mock.patch(
+                            "loki_agent.credential_supervisors."
+                            "CredentialSupervisor",
+                            return_value=supervisor) as supervisor_class, \
+                mock.patch.object(
+                    sys, "argv", ["/checkout/loki.py", "--headless"]):
             status = terminal_entrypoint.main()
 
         self.assertEqual(status, 17)
         capture.assert_called_once_with()
         protect.assert_called_once_with()
-        terminal_main.assert_called_once_with(credentials)
+        supervisor_class.assert_called_once_with(credentials)
+        supervisor.run_terminal_runtime.assert_awaited_once_with(
+            "/checkout/loki.py", ["--headless"])
+
+    def test_internal_runtime_never_captures_root_credentials(self):
+        owner_read, owner_write = os.pipe()
+        capability_read, capability_write = os.pipe()
+        try:
+            with mock.patch.object(
+                    terminal_entrypoint,
+                    "capture_process_credentials") as capture, \
+                    mock.patch.object(
+                        terminal_entrypoint,
+                        "isolate_credential_directory") as isolate, \
+                    mock.patch.object(
+                        terminal_entrypoint,
+                        "protect_credential_process") as protect, \
+                    mock.patch.object(
+                        terminal_frontend,
+                        "main",
+                        return_value=19) as terminal_main, \
+                    mock.patch.object(sys, "argv", [
+                        "/checkout/loki.py",
+                        "--runtime",
+                        "--session-owner-fd", str(owner_read),
+                        "--credential-capability-fd",
+                        str(capability_read),
+                        "--",
+                        "--headless",
+                    ]):
+                status = terminal_entrypoint.main()
+
+            self.assertEqual(status, 19)
+            capture.assert_not_called()
+            isolate.assert_called_once_with()
+            protect.assert_called_once_with()
+            terminal_main.assert_called_once_with(
+                ["--headless"], owner_read, capability_read)
+        finally:
+            os.close(owner_read)
+            os.close(owner_write)
+            os.close(capability_read)
+            os.close(capability_write)
+
+    def test_subagent_inherits_parent_isolation_and_never_captures(self):
+        with mock.patch.object(
+                terminal_entrypoint,
+                "capture_process_credentials") as capture, \
+                mock.patch.object(
+                    terminal_entrypoint,
+                    "isolate_credential_directory") as isolate, \
+                mock.patch.object(
+                    terminal_entrypoint,
+                    "protect_credential_process") as protect, \
+                mock.patch(
+                    "loki_agent.subagents.main",
+                    return_value=29) as subagent_main, \
+                mock.patch.object(sys, "argv", [
+                    "/checkout/loki.py",
+                    "--subagent",
+                    "Explore",
+                    "--session-owner-fd", "7",
+                    "--credential-capability-fd", "8",
+                ]):
+            status = terminal_entrypoint.main()
+
+        self.assertEqual(status, 29)
+        capture.assert_not_called()
+        isolate.assert_not_called()
+        protect.assert_called_once_with()
+        subagent_main.assert_called_once_with([
+            "Explore",
+            "--session-owner-fd", "7",
+            "--credential-capability-fd", "8",
+        ])
 
 
 class AgentModeContractTests(unittest.TestCase):

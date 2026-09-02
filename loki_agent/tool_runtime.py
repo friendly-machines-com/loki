@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import inspect
 import json
@@ -805,6 +806,12 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
             await process.stdin.drain()
         finally:
             process.stdin.close()
+            # Python 3.10 records a broken child stdin on the stream's close
+            # waiter. Await it so timeout cancellation consumes that result
+            # instead of leaking an unretrieved-future warning at loop exit.
+            with contextlib.suppress(
+                    BrokenPipeError, ConnectionError, OSError):
+                await process.stdin.wait_closed()
 
     stdin_task = asyncio.create_task(write_stdin())
 

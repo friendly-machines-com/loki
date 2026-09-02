@@ -34,6 +34,7 @@ from pprint import pformat
 from . import formats
 from . import http_client
 from . import models as modelsdev
+from . import paths
 from . import protocols
 from . import authentications
 from . import credential_capabilities
@@ -139,9 +140,9 @@ SEARCH_TIMEOUT_S = 30
 SUBAGENT_TIMEOUT_S = 600
 TODO_MAX_TODOS = 100
 SKILL_MAX_BYTES = 100_000
-LOKI_CONFIG_DIR_NAME = "loki"
-XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-LOKI_CONFIG_DIR = os.path.join(os.path.expanduser(XDG_CONFIG_HOME), LOKI_CONFIG_DIR_NAME)
+LOKI_CONFIG_DIR_NAME = paths.LOKI_CONFIG_DIR_NAME
+XDG_CONFIG_HOME = paths.xdg_config_home()
+LOKI_CONFIG_DIR = paths.loki_config_dir()
 XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
 LOKI_STATE_DIR = os.path.join(os.path.expanduser(XDG_STATE_HOME), LOKI_CONFIG_DIR_NAME)
 LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
@@ -381,16 +382,6 @@ def _explicit_credential_ref(credentials):
             "LOKI_CREDENTIAL_REF names an unavailable credential: "
             f"{credential.encode()}")
     return credential
-
-
-def install_root_credential_broker(
-        credentials: CredentialStore,
-        session: Session | None = None) -> authentications.CredentialBroker:
-    """Install all captured secrets in the top-level process's broker."""
-    broker = authentications.CredentialBroker()
-    credentials.install_static_credentials(broker)
-    (session or current_session()).credential_authority = broker
-    return broker
 
 
 def build_config_from_env(

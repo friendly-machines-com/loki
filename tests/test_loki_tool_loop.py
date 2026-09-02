@@ -21,6 +21,8 @@ os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
 
 from loki_agent import formats
 from loki_agent import authentications
+from loki_agent import credential_runtimes
+from loki_agent import credential_supervisors
 from loki_agent import http_client
 from loki_agent import loki
 from loki_agent import subagents
@@ -1527,18 +1529,15 @@ class ExitStatusTests(unittest.TestCase):
         stderr = io.StringIO()
         try:
             for async_status, expected_status in [(0, 1), (2, 2)]:
-                def finish(coroutine):
-                    coroutine.close()
-                    return async_status
-
                 with self.subTest(async_status=async_status), mock.patch(
                             "loki_agent.terminal_frontend.signal.signal"), mock.patch(
                                 "loki_agent.terminal_frontend.signal.pthread_sigmask"
                             ), mock.patch(
                                 "loki_agent.terminal_frontend.initialize_terminal_overlay"
                             ), mock.patch(
-                                "loki_agent.terminal_frontend.asyncio.run",
-                                side_effect=finish), mock.patch(
+                                "loki_agent.terminal_frontend.async_main",
+                                new=mock.AsyncMock(
+                                    return_value=async_status)), mock.patch(
                                     "loki_agent.terminal_frontend."
                                     "restore_terminal_overlay",
                                     side_effect=OSError("restore failed")
@@ -1547,7 +1546,8 @@ class ExitStatusTests(unittest.TestCase):
                                     "chat_log_path",
                                     None,
                                 ), contextlib.redirect_stderr(stderr):
-                    status = terminal_frontend.main(CredentialStore({}))
+                    status = asyncio.run(
+                        terminal_frontend._run_frontend([]))
 
                 self.assertEqual(status, expected_status)
         finally:
@@ -4019,6 +4019,22 @@ class ShellCwdTests(unittest.TestCase):
 
 
 class SubagentLaunchTests(unittest.TestCase):
+    async def _run_delegated_subagent(self, args, credentials=None):
+        supervisor = credential_supervisors.CredentialSupervisor(
+            credentials or CredentialStore({}))
+        delegation = await supervisor.delegate()
+        owner_fd = os.dup(delegation.owner_read_fd)
+        capability_fd = os.dup(delegation.credential_fd)
+        delegation.child_spawned()
+        try:
+            return await subagents.async_main([
+                *args,
+                "--session-owner-fd", str(owner_fd),
+                "--credential-capability-fd", str(capability_fd),
+            ])
+        finally:
+            await delegation.close()
+
     def test_subagent_launch_reuses_its_own_dispatcher(self):
         old_argv = sys.argv[:]
         try:
@@ -4149,8 +4165,12 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_operation_is_cancelled_when_owner_fd_closes(self):
         async def scenario():
             read_fd, write_fd = os.pipe()
-            owner = subagents._SessionOwner(read_fd)
+            owner = credential_runtimes.SessionOwner(read_fd)
             cancelled = asyncio.Event()
+
+            class CredentialClient:
+                async def wait_closed(self):
+                    await asyncio.Event().wait()
 
             async def operation():
                 try:
@@ -4159,13 +4179,15 @@ class SubagentLaunchTests(unittest.TestCase):
                     cancelled.set()
 
             try:
+                runtime = credential_runtimes.CredentialRuntime(
+                    owner, CredentialClient())
                 task = asyncio.create_task(
-                    subagents._run_until_session_owner_closes(
-                        operation(), owner))
+                    runtime.run(operation()))
                 await asyncio.sleep(0)
                 os.close(write_fd)
                 write_fd = None
-                completed = await asyncio.wait_for(task, timeout=1)
+                completed, _result = await asyncio.wait_for(
+                    task, timeout=1)
                 return completed, cancelled.is_set()
             finally:
                 if write_fd is not None:
@@ -4176,15 +4198,73 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertFalse(completed)
         self.assertTrue(cancelled)
 
+    def test_owner_revocation_wins_simultaneous_operation_completion(self):
+        async def scenario():
+            owner_closed = asyncio.get_running_loop().create_future()
+            owner_closed.set_result(b"")
+
+            class Owner:
+                closed_task = owner_closed
+
+            class CredentialClient:
+                async def wait_closed(self):
+                    await asyncio.Event().wait()
+
+            ran = False
+
+            async def operation():
+                nonlocal ran
+                ran = True
+                return "too late"
+
+            runtime = credential_runtimes.CredentialRuntime(
+                Owner(), CredentialClient())
+            completed, result = await runtime.run(operation())
+            return completed, result, ran
+
+        completed, result, ran = asyncio.run(scenario())
+        self.assertFalse(completed)
+        self.assertIsNone(result)
+        self.assertFalse(ran)
+
+    def test_runtime_task_cancellation_cancels_its_operation(self):
+        async def scenario():
+            owner_closed = asyncio.get_running_loop().create_future()
+            operation_cancelled = asyncio.Event()
+
+            class Owner:
+                closed_task = owner_closed
+
+            class CredentialClient:
+                async def wait_closed(self):
+                    await asyncio.Event().wait()
+
+            async def operation():
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    operation_cancelled.set()
+
+            runtime = credential_runtimes.CredentialRuntime(
+                Owner(), CredentialClient())
+            task = asyncio.create_task(runtime.run(operation()))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return operation_cancelled.is_set()
+
+        self.assertTrue(asyncio.run(scenario()))
+
     def test_owner_close_cancels_pending_credential_handshake(self):
         async def scenario():
             read_fd, write_fd = os.pipe()
-            owner = subagents._SessionOwner(read_fd)
+            owner = credential_runtimes.SessionOwner(read_fd)
             broker_socket, child_socket = socket.socketpair()
             capability_fd = child_socket.detach()
             try:
                 task = asyncio.create_task(
-                    subagents._connect_credential_while_owned(
+                    credential_runtimes._connect_while_owned(
                         capability_fd, owner))
                 await asyncio.sleep(0)
                 os.close(write_fd)
@@ -4204,7 +4284,7 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_operation_is_cancelled_when_broker_closes(self):
         async def scenario():
             read_fd, write_fd = os.pipe()
-            owner = subagents._SessionOwner(read_fd)
+            owner = credential_runtimes.SessionOwner(read_fd)
             broker_closed = asyncio.Event()
             cancelled = asyncio.Event()
 
@@ -4219,12 +4299,14 @@ class SubagentLaunchTests(unittest.TestCase):
                     cancelled.set()
 
             try:
+                runtime = credential_runtimes.CredentialRuntime(
+                    owner, CredentialClient())
                 task = asyncio.create_task(
-                    subagents._run_until_session_owner_closes(
-                        operation(), owner, CredentialClient()))
+                    runtime.run(operation()))
                 await asyncio.sleep(0)
                 broker_closed.set()
-                completed = await asyncio.wait_for(task, timeout=1)
+                completed, _result = await asyncio.wait_for(
+                    task, timeout=1)
                 return completed, cancelled.is_set()
             finally:
                 os.close(write_fd)
@@ -4237,8 +4319,12 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_owner_fd_is_not_inherited_by_child_commands(self):
         async def scenario():
             read_fd, write_fd = os.pipe()
-            owner = subagents._SessionOwner(read_fd)
+            owner = credential_runtimes.SessionOwner(read_fd)
             inherited = []
+
+            class CredentialClient:
+                async def wait_closed(self):
+                    await asyncio.Event().wait()
 
             async def operation():
                 code = (
@@ -4262,9 +4348,9 @@ class SubagentLaunchTests(unittest.TestCase):
                 inherited.append(stdout.decode("ascii").strip())
 
             try:
-                completed = await (
-                    subagents._run_until_session_owner_closes(
-                        operation(), owner))
+                runtime = credential_runtimes.CredentialRuntime(
+                    owner, CredentialClient())
+                completed, _result = await runtime.run(operation())
             finally:
                 os.close(write_fd)
                 await owner.close()
@@ -4281,7 +4367,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 status = asyncio.run(subagents.async_main([
                     "Explore",
                     "--session-owner-fd", str(read_fd),
-                ], CredentialStore({})))
+                ]))
             with self.assertRaises(OSError):
                 os.fstat(read_fd)
         finally:
@@ -4296,10 +4382,11 @@ class SubagentLaunchTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 missing = os.path.join(directory, "missing")
                 with contextlib.redirect_stderr(io.StringIO()):
-                    status = asyncio.run(subagents.async_main([
-                        "Explore",
-                        "--shell-cwd", missing,
-                    ], CredentialStore({})))
+                    status = asyncio.run(
+                        self._run_delegated_subagent([
+                            "Explore",
+                            "--shell-cwd", missing,
+                        ]))
         finally:
             restore_loki_state(saved)
 
@@ -4314,8 +4401,8 @@ class SubagentLaunchTests(unittest.TestCase):
                     "build_config_from_env",
                     side_effect=ValueError("invalid config")), \
                     contextlib.redirect_stderr(io.StringIO()):
-                status = asyncio.run(subagents.async_main(
-                    ["Explore"], CredentialStore({})))
+                status = asyncio.run(
+                    self._run_delegated_subagent(["Explore"]))
         finally:
             restore_loki_state(saved)
 
@@ -4333,8 +4420,8 @@ class SubagentLaunchTests(unittest.TestCase):
                         subagents._core, "current_model",
                         return_value=""), \
                     contextlib.redirect_stderr(io.StringIO()):
-                status = asyncio.run(subagents.async_main(
-                    ["Explore"], CredentialStore({})))
+                status = asyncio.run(
+                    self._run_delegated_subagent(["Explore"]))
         finally:
             restore_loki_state(saved)
 
@@ -4358,11 +4445,12 @@ class SubagentLaunchTests(unittest.TestCase):
                     mock.patch.object(
                         subagents, "run_cli_async",
                         new=runner):
-                status = asyncio.run(subagents.async_main([
-                    "Explore",
-                    "--prompt", "inspect this",
-                    "--shell-cwd", tmpdir,
-                ], CredentialStore({})))
+                status = asyncio.run(
+                    self._run_delegated_subagent([
+                        "Explore",
+                        "--prompt", "inspect this",
+                        "--shell-cwd", tmpdir,
+                    ]))
 
                 self.assertEqual(status, 0)
                 self.assertEqual(loki.current_cwd(), tmpdir)
