@@ -93,6 +93,10 @@ def main() -> int:
         protect_credential_process()
     except ProcessProtectionError as error:
         return _report_security_error(error)
+    if sys.argv[1:2] == ["auth"]:
+        from .authentication_commands import main as authentication_main
+        return authentication_main(
+            sys.argv[2:], program=sys.argv[0])
     from .credential_supervisors import CredentialSupervisor
 
     supervisor = CredentialSupervisor(credentials)

@@ -24,6 +24,9 @@ from . import http_client
 
 
 OPENAI_REFRESH_URL = "https://auth.openai.com/oauth/token"
+# OAuth client identifiers are public protocol identifiers, not client
+# secrets.  This is the native Codex client ID accepted by OpenAI's ChatGPT
+# Codex authorization flow; refresh tokens remain the actual secret.
 OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_ORIGINATOR = "loki"
 OPENAI_ACCESS_TOKEN_REFRESH_WINDOW_S = 5 * 60
@@ -193,12 +196,14 @@ class OpenAITokenSet:
             expires_at = jwt_expiration(self.access_token)
         account_id = self.account_id or token_account_id(
             self.id_token or self.access_token)
+        fedramp = self.fedramp or token_fedramp(
+            self.id_token or self.access_token)
         return OpenAITokenSet(
             access_token=self.access_token,
             refresh_token=self.refresh_token,
             id_token=self.id_token,
             account_id=account_id,
-            fedramp=self.fedramp,
+            fedramp=fedramp,
             expires_at=expires_at,
             last_refresh=(
                 self.last_refresh
@@ -520,6 +525,21 @@ def jwt_expiration(token: str) -> float | None:
     if isinstance(expiry, (int, float)) and not isinstance(expiry, bool):
         return float(expiry)
     return None
+
+
+def token_fedramp(token: str) -> bool:
+    payload = _decode_jwt_payload(token)
+    if payload is None:
+        return False
+    direct = payload.get("chatgpt_account_is_fedramp")
+    if isinstance(direct, bool):
+        return direct
+    auth_claims = payload.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict):
+        nested = auth_claims.get("chatgpt_account_is_fedramp")
+        if isinstance(nested, bool):
+            return nested
+    return False
 
 
 def token_account_id(token: str) -> str | None:
