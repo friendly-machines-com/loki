@@ -17,6 +17,11 @@ import sys
 import uuid
 
 from . import acps, credential_supervisors, savefiles
+from .connections import (
+    ConnectionDescriptor,
+    ConnectionDescriptorError,
+    connection_display_fields,
+)
 from .credentials import CredentialStore
 from .loki import CHAT_LOG_DIR
 
@@ -178,8 +183,12 @@ class Front:
         self.credentials = self.credential_supervisor.inventory
         self.credential_broker = self.credential_supervisor.broker
         self.workers: dict[str, WorkerChannel] = {}
+        self._opening_sessions: set[str] = set()
         self._next_worker_id = 0
         self._tasks: set[asyncio.Task] = set()
+        self._client_requests: dict[str, asyncio.Future] = {}
+        self._next_client_request_id = 0
+        self._client_supports_form_elicitation = False
 
     async def run(self):
         try:
@@ -191,6 +200,11 @@ class Front:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            failure = acps.TransportError("ACP client connection closed")
+            for future in list(self._client_requests.values()):
+                if not future.done():
+                    future.set_exception(failure)
+            self._client_requests.clear()
             channels = list(self.workers.values())
             self.workers.clear()
             if channels:
@@ -209,12 +223,14 @@ class Front:
         method = message.get("method")
         request_id = message.get("id")
         if method is None:
+            self._resolve_client_response(message)
             return
         if request_id is None and method not in (
                 "session/cancel", "session/close"):
             return
-        if method == "session/prompt":
-            # The transport loop remains free to route cancellation.
+        if method in ("session/prompt", "session/load"):
+            # The transport loop must remain free to route cancellation and
+            # responses to reverse requests such as elicitation/create.
             self._start_task(
                 self._answer(message),
                 name=f"acp-client-request-{request_id}",
@@ -242,7 +258,11 @@ class Front:
         method = message.get("method")
         request_id = message.get("id")
         try:
-            result = await self.dispatch(method, message.get("params") or {})
+            result = await self.dispatch(
+                method,
+                message.get("params") or {},
+                request_id=request_id,
+            )
         except acps.TransportError as error:
             self.write(acps.response(
                 request_id,
@@ -256,13 +276,15 @@ class Front:
             return
         self.write(acps.response(request_id, result=result))
 
-    async def dispatch(self, method: str, params: dict):
+    async def dispatch(
+            self, method: str, params: dict, request_id=None):
         if method == "initialize":
             return self.initialize(params)
         if method == "session/new":
             return await self.new_session(params)
         if method == "session/load":
-            return await self.load_session(params)
+            return await self.load_session(
+                params, request_id=request_id)
         if method == "session/list":
             return self.list_sessions(params)
         if method == "session/close":
@@ -273,6 +295,14 @@ class Front:
             f"method not found: {method}", code=acps.METHOD_NOT_FOUND)
 
     def initialize(self, params: dict) -> dict:
+        client_capabilities = params.get("clientCapabilities")
+        if not isinstance(client_capabilities, dict):
+            client_capabilities = {}
+        elicitation = client_capabilities.get("elicitation")
+        self._client_supports_form_elicitation = (
+            isinstance(elicitation, dict)
+            and isinstance(elicitation.get("form"), dict)
+        )
         return {
             "protocolVersion": PROTOCOL_VERSION,
             "agentInfo": AGENT_INFO,
@@ -294,6 +324,85 @@ class Front:
                 },
             },
         }
+
+    def _resolve_client_response(self, message: dict) -> None:
+        request_id = message.get("id")
+        future = self._client_requests.get(str(request_id))
+        if future is None or future.done():
+            return
+        if "error" in message:
+            error = message.get("error") or {}
+            future.set_exception(acps.TransportError(
+                str(error.get("message") or "ACP client request failed"),
+                code=error.get("code", acps.INTERNAL_ERROR),
+            ))
+        elif "result" in message:
+            future.set_result(message.get("result"))
+        else:
+            future.set_exception(acps.TransportError(
+                "ACP client response has neither result nor error",
+                code=acps.INVALID_PARAMS,
+            ))
+
+    async def _request_client(self, method: str, params: dict):
+        self._next_client_request_id += 1
+        request_id = f"loki-{self._next_client_request_id}"
+        future = asyncio.get_running_loop().create_future()
+        self._client_requests[request_id] = future
+        try:
+            self.write(acps.request(request_id, method, params))
+            return await future
+        finally:
+            self._client_requests.pop(request_id, None)
+
+    async def _authorize_saved_connection(
+            self, descriptor: ConnectionDescriptor,
+            load_request_id) -> None:
+        if not self._client_supports_form_elicitation:
+            raise acps.TransportError(
+                "loading a saved network connection requires an ACP "
+                "client with form elicitation support",
+                code=acps.INVALID_PARAMS,
+            )
+        facts = "\n".join(
+            f"{label}: {json.dumps(value, ensure_ascii=True)}"
+            for label, value in connection_display_fields(descriptor)
+        )
+        result = await self._request_client("elicitation/create", {
+            # session/load has not committed a session yet, so ACP requires
+            # request scope rather than a fabricated active session scope.
+            "requestId": load_request_id,
+            "mode": "form",
+            "message": (
+                "Authorize Loki to use this saved connection?\n" + facts),
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "authorize": {
+                        "type": "boolean",
+                        "title": "Use saved connection",
+                        "description": (
+                            "Allow this resumed session to make requests "
+                            "using the connection shown above."),
+                        "default": False,
+                    },
+                },
+                "required": ["authorize"],
+            },
+        })
+        content = (
+            result.get("content") if isinstance(result, dict) else None)
+        accepted = (
+            isinstance(result, dict)
+            and result.get("action") == "accept"
+            and isinstance(content, dict)
+            and content.get("authorize") is True
+        )
+        if not accepted:
+            raise acps.TransportError(
+                "saved connection authorization was not accepted",
+                code=acps.INVALID_PARAMS,
+            )
 
     @staticmethod
     def _working_directory(params: dict) -> str:
@@ -338,43 +447,46 @@ class Front:
 
     async def _open_worker(self, *, cwd: str, resume=None,
                            session_id: str | None = None,
-                           replay: bool = False) -> tuple[str, dict]:
+                           replay: bool = False,
+                           load_request_id=None) -> tuple[str, dict]:
         if session_id is None:
             self._next_worker_id += 1
             session_id = f"loki-{uuid.uuid4()}"
-        if session_id in self.workers:
+        if (session_id in self.workers
+                or session_id in self._opening_sessions):
             raise acps.TransportError(
                 f"session {session_id!r} is already active",
                 code=acps.INVALID_PARAMS,
             )
-        delegation = await self.credential_supervisor.delegate()
-        process = None
+        self._opening_sessions.add(session_id)
+        channel = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                *WORKER_COMMAND,
-                *delegation.child_arguments(),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=None,
-                close_fds=True,
-                pass_fds=delegation.child_fds(),
-                env=self.environment,
-                # ACP uses pipes, not a terminal. A new session prevents an
-                # inherited controlling terminal from becoming an escape
-                # channel through TIOCSTI or terminal-generated signals.
-                start_new_session=True,
-            )
-        finally:
-            if process is None:
-                await delegation.close()
-            else:
-                delegation.child_spawned()
-        channel = WorkerChannel(
-            session_id, process, self.write, delegation)
-        self.workers[session_id] = channel
-        try:
-            reply = await channel.request(
-                "session/open",
+            delegation = await self.credential_supervisor.delegate()
+            process = None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *WORKER_COMMAND,
+                    *delegation.child_arguments(),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=None,
+                    close_fds=True,
+                    pass_fds=delegation.child_fds(),
+                    env=self.environment,
+                    # ACP uses pipes, not a terminal. A new session prevents
+                    # an inherited controlling terminal from becoming an
+                    # escape channel through TIOCSTI or terminal signals.
+                    start_new_session=True,
+                )
+            finally:
+                if process is None:
+                    await delegation.close()
+                else:
+                    delegation.child_spawned()
+            channel = WorkerChannel(
+                session_id, process, self.write, delegation)
+            prepared = await channel.request(
+                "session/prepare_open",
                 {
                     "sessionId": session_id,
                     "cwd": cwd,
@@ -382,11 +494,29 @@ class Front:
                     "replay": replay,
                 },
             )
+            raw_descriptor = (prepared or {}).get(
+                "authorizationConnection")
+            if raw_descriptor is not None:
+                try:
+                    descriptor = ConnectionDescriptor.from_dict(
+                        raw_descriptor)
+                except ConnectionDescriptorError as error:
+                    raise acps.TransportError(
+                        f"worker returned an invalid connection: {error}"
+                    ) from error
+                await self._authorize_saved_connection(
+                    descriptor, load_request_id)
+            reply = await channel.request("session/commit_open", {})
+            # Publication is the commit point. Before this assignment no
+            # prompt, config change, or close request can reach the worker.
+            self.workers[session_id] = channel
+            return session_id, reply or {}
         except BaseException:
-            self.workers.pop(session_id, None)
-            await channel.close()
+            if channel is not None:
+                await channel.close()
             raise
-        return session_id, reply or {}
+        finally:
+            self._opening_sessions.discard(session_id)
 
     async def new_session(self, params: dict) -> dict:
         # session/new is intentionally fresh.  Resumption has its own
@@ -400,7 +530,7 @@ class Front:
             result["configOptions"] = config_options
         return result
 
-    async def load_session(self, params: dict) -> dict:
+    async def load_session(self, params: dict, request_id=None) -> dict:
         saved_id = params.get("sessionId")
         if not isinstance(saved_id, str) or not saved_id:
             raise acps.TransportError(
@@ -413,6 +543,7 @@ class Front:
             resume=saved_id,
             session_id=saved_id,
             replay=params.get("replay", True) is not False,
+            load_request_id=request_id,
         )
         result = {}
         config_options = worker_reply.get("configOptions")

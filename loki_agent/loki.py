@@ -665,18 +665,18 @@ def config_from_modelsdev_selection(
     )
 
 
-def active_connection_descriptor() -> ConnectionDescriptor | None:
-    if (not current_config()
-            or current_config().chat_provider.kind == protocols.DUMMY):
+def connection_descriptor_from_config(
+        config: RuntimeConfig) -> ConnectionDescriptor | None:
+    if config.chat_provider.kind == protocols.DUMMY:
         return None
-    auth_spec = current_config().auth_spec
+    auth_spec = config.auth_spec
     credential_ref = (
         auth_spec.credential if auth_spec is not None else None)
-    provider = current_config().chat_provider
+    provider = config.chat_provider
     return ConnectionDescriptor(
         provider_id=provider.provider_id,
         provider_name=provider.provider_name,
-        model=current_model(),
+        model=config.model,
         chat_url=provider.chat_url,
         models_url=provider.models_url,
         protocol=provider.kind,
@@ -689,11 +689,18 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
             if auth_spec is not None
             and auth_spec.scheme == "custom" else None),
         auth_scheme=auth_spec.scheme if auth_spec is not None else None,
-        model_status=current_config().model_status,
-        stream=current_config().stream,
+        model_status=config.model_status,
+        stream=config.stream,
         prompt_cache=provider.prompt_cache,
         openai_request_profile=provider.openai_request_profile,
     )
+
+
+def active_connection_descriptor() -> ConnectionDescriptor | None:
+    config = current_config()
+    if config is None:
+        return None
+    return connection_descriptor_from_config(config)
 
 
 def apply_runtime_config(config: RuntimeConfig):

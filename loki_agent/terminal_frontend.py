@@ -29,7 +29,11 @@ from . import savefiles
 from . import subagents
 from . import terminals
 from . import tool_runtime
-from .connections import ConnectionDescriptor, ConnectionDescriptorError
+from .connections import (
+    ConnectionDescriptor,
+    ConnectionDescriptorError,
+    connection_display_fields,
+)
 from .loki import RuntimeConfig, computer
 from . import loki as _core
 from .loki import (
@@ -47,6 +51,7 @@ from .loki import (
     change_shell_cwd_from_text,
     config_from_connection_descriptor,
     config_from_modelsdev_selection,
+    connection_descriptor_from_config,
     configure_tool_hook_pipeline,
     connection_from_session_state,
     current_agent_mode,
@@ -561,35 +566,22 @@ async def run_session_picker_async(session):
 async def confirm_saved_connection_async(
         descriptor: ConnectionDescriptor, session,
         config: RuntimeConfig | None = None) -> bool:
-    provider = descriptor.provider_name or descriptor.provider_id or "custom"
-    selected_model = config.model if config is not None else descriptor.model
-    endpoint = (config.chat_provider.chat_url
-                if config is not None else descriptor.chat_url)
-    models_endpoint = (config.chat_provider.models_url
-                       if config is not None else descriptor.models_url)
+    displayed = (
+        connection_descriptor_from_config(config)
+        if config is not None else descriptor)
+    if displayed is None:
+        raise ValueError("a dummy provider cannot be resumed")
 
     async with session.modal() as modal:
         print()
         print("Saved connection:")
-        _print_repr_line("  Provider: ", provider)
-        _print_repr_line("  Model: ", selected_model)
-        _print_repr_line("  Chat endpoint: ", endpoint)
-        if models_endpoint:
-            _print_repr_line("  Models endpoint: ", models_endpoint)
-        if descriptor.credential_ref is None:
-            print("  Authentication: none")
-        else:
-            credential_label = (
-                descriptor.credential_ref.name
-                if descriptor.credential_ref.kind == "env"
-                else descriptor.credential_ref.encode())
-            _print_repr_line(
-                "  Credential: ", credential_label)
-        print(f"  Streaming: {'yes' if descriptor.stream else 'no'}")
-        if descriptor.protocol == protocols.ANTHROPIC_MESSAGES:
-            print(
-                "  Anthropic prompt cache: "
-                f"{'yes' if descriptor.prompt_cache else 'no'}")
+        for label, value in connection_display_fields(displayed):
+            if label in {
+                    "Authentication", "Streaming",
+                    "Anthropic prompt cache"}:
+                print(f"  {label}: {value}")
+            else:
+                _print_repr_line(f"  {label}: ", value)
         answer = (await modal.prompt(
             "Use this saved connection? [y/N]: ") or "")
         return answer.strip().lower() in ("y", "yes")

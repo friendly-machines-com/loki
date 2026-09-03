@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import sys
+from dataclasses import dataclass
 
 from . import acps, acp_events, formats, loki, models as modelsdev, replays
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
@@ -14,6 +15,23 @@ from .sessions import Session
 
 
 _DISCONNECTED = object()
+_UNCHANGED = object()
+
+
+@dataclass(frozen=True)
+class PendingSessionOpen:
+    """Prepared session state which is inert until the front commits it.
+
+    Saved logs are untrusted input. The worker may parse and reconcile one
+    before approval, but network-capable configuration, log rewrites, and
+    transcript replay become observable only after the front reports that
+    the client accepted the exact effective connection.
+    """
+
+    runtime_config: loki.RuntimeConfig | None
+    connection_update: object
+    replay: bool
+    resumed: bool
 
 
 class TurnFailure(Exception):
@@ -31,6 +49,7 @@ class Worker:
         self._option_leaves: dict[str, object] = {}
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
+        self._pending_open: PendingSessionOpen | None = None
 
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
@@ -110,8 +129,10 @@ class Worker:
         if method == "session/cancel":
             self.cancel_event.set()
             return {}
-        if method == "session/open":
-            return await self.open(params)
+        if method == "session/prepare_open":
+            return await self.prepare_open(params)
+        if method == "session/commit_open":
+            return self.commit_open()
         if method == "session/set_config_option":
             return self.set_config_option(params)
         raise acps.TransportError(
@@ -236,7 +257,12 @@ class Worker:
         choices.append(self._disconnected_choice())
         self._set_choices(choices, "loki-disconnected")
 
-    async def open(self, params: dict) -> dict:
+    async def prepare_open(self, params: dict) -> dict:
+        if self._pending_open is not None:
+            raise acps.TransportError(
+                "session open is already prepared",
+                code=acps.INVALID_PARAMS,
+            )
         cwd = params.get("cwd")
         if (not isinstance(cwd, str) or not os.path.isabs(cwd)
                 or not os.path.isdir(cwd)):
@@ -254,6 +280,7 @@ class Worker:
 
         resume = params.get("resume")
         saved_descriptor = None
+        connection_update = _UNCHANGED
         if resume:
             if (not isinstance(resume, str)
                     or os.path.basename(resume) != resume):
@@ -317,20 +344,53 @@ class Worker:
                 self._configuration_error = (
                     f"Saved connection is unavailable: {error}")
                 saved_descriptor = None
-                self.session.session_state.pop("connection", None)
-                loki.mark_chat_log_dirty()
-                loki.save_chat_log()
+                connection_update = None
             else:
                 if saved_descriptor != original_descriptor:
-                    loki.set_session_connection(saved_descriptor)
-                    loki.save_chat_log()
+                    connection_update = saved_descriptor
 
         self._install_initial_choices(saved_descriptor)
         if discovered:
             self._install_catalog_choices(discovered)
-        if params.get("replay") and resume:
-            self._replay_transcript()
+        runtime_config = self.session.runtime_config
+        authorization_descriptor = None
+        if (self._current_option_value == "loki-saved"
+                and runtime_config is not None):
+            authorization_descriptor = (
+                loki.connection_descriptor_from_config(runtime_config))
+        # Preparation must not leave a network-capable session reachable.
+        # The front holds the only commit authority after user approval.
+        self.session.runtime_config = None
+        self._pending_open = PendingSessionOpen(
+            runtime_config=runtime_config,
+            connection_update=connection_update,
+            replay=bool(params.get("replay")),
+            resumed=bool(resume),
+        )
+        result = {}
+        if authorization_descriptor is not None:
+            result["authorizationConnection"] = (
+                authorization_descriptor.to_dict())
+        return result
 
+    def commit_open(self) -> dict:
+        pending = self._pending_open
+        if pending is None:
+            raise acps.TransportError(
+                "session open was not prepared",
+                code=acps.INVALID_PARAMS,
+            )
+        self._pending_open = None
+        self.session.runtime_config = pending.runtime_config
+        if pending.connection_update is not _UNCHANGED:
+            if pending.connection_update is None:
+                self.session.session_state.pop("connection", None)
+                loki.mark_chat_log_dirty()
+            else:
+                loki.set_session_connection(pending.connection_update)
+            loki.save_chat_log()
+        if pending.replay and pending.resumed:
+            self._replay_transcript()
         return {"configOptions": self.config_options()}
 
     def _install_catalog_choices(self, discovered):
@@ -340,24 +400,10 @@ class Worker:
             (option, self._option_leaves[option["value"]])
             for option in self._model_options
         ]
-        before = self.config_options()
         self._set_choices(
             existing + list(discovered),
             self._current_option_value,
         )
-        after = self.config_options()
-        if after == before:
-            return
-        try:
-            self.write(acps.notification("session/update", {
-                "sessionId": self.session_id,
-                "update": {
-                    "sessionUpdate": "config_option_update",
-                    "configOptions": after,
-                },
-            }))
-        except (BrokenPipeError, OSError):
-            pass
 
     def set_config_option(self, params: dict) -> dict:
         if params.get("configId") != "model":

@@ -11,6 +11,36 @@ class ConnectionDescriptorError(ValueError):
     pass
 
 
+def connection_display_fields(
+        descriptor: "ConnectionDescriptor") -> list[tuple[str, str]]:
+    """Return the complete non-secret connection facts shown for approval."""
+    provider = (
+        descriptor.provider_name or descriptor.provider_id or "custom")
+    fields = [
+        ("Provider", provider),
+        ("Model", descriptor.model),
+        ("Chat endpoint", descriptor.chat_url),
+    ]
+    if descriptor.models_url:
+        fields.append(("Models endpoint", descriptor.models_url))
+    if descriptor.credential_ref is None:
+        fields.append(("Authentication", "none"))
+    else:
+        credential = descriptor.credential_ref
+        fields.append((
+            "Credential",
+            credential.name if credential.kind == "env"
+            else credential.encode(),
+        ))
+    fields.append(("Streaming", "yes" if descriptor.stream else "no"))
+    if descriptor.protocol == "anthropic_messages":
+        fields.append((
+            "Anthropic prompt cache",
+            "yes" if descriptor.prompt_cache else "no",
+        ))
+    return fields
+
+
 def _optional_string(value, field_name):
     if value is None:
         return None

@@ -148,6 +148,175 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(channel.credential_delegation)
 
 
+class SavedConnectionAuthorizationTests(
+        unittest.IsolatedAsyncioTestCase):
+    def _descriptor(self):
+        from loki_agent import protocols
+        from loki_agent.connections import ConnectionDescriptor
+
+        return ConnectionDescriptor(
+            provider_id=None,
+            provider_name="Saved Provider",
+            model="saved-model",
+            chat_url="https://saved.example/v1/chat/completions",
+            models_url="https://saved.example/v1/models",
+            protocol=protocols.OPENAI_CHAT,
+        )
+
+    async def _load(
+            self, action, *, advertise=True,
+            authorization_connection=True):
+        messages = []
+        requests = []
+        descriptor = self._descriptor()
+        front = None
+        test_case = self
+
+        class Delegation:
+            def child_arguments(self):
+                return ()
+
+            def child_fds(self):
+                return ()
+
+            def child_spawned(self):
+                return None
+
+            async def close(self):
+                return None
+
+        class Channel:
+            def __init__(self, session_id, process, forward, delegation):
+                self.session_id = session_id
+                self.closed = False
+
+            async def request(self, method, params):
+                requests.append((method, params))
+                if method == "session/prepare_open":
+                    return (
+                        {
+                            "authorizationConnection":
+                                descriptor.to_dict(),
+                        }
+                        if authorization_connection else {})
+                if method == "session/commit_open":
+                    test_case.assertNotIn(
+                        self.session_id, front.workers)
+                    return {"configOptions": []}
+                raise AssertionError(method)
+
+            async def close(self):
+                self.closed = True
+
+        def write(message):
+            messages.append(message)
+            if message.get("method") == "elicitation/create":
+                async def respond():
+                    await front.handle(acps.response(
+                        message["id"],
+                        result=(
+                            {
+                                "action": "accept",
+                                "content": {"authorize": True},
+                            }
+                            if action == "accept"
+                            else {"action": action}
+                        ),
+                    ))
+
+                asyncio.create_task(respond())
+
+        front = acp.Front(
+            lambda: None, write, CredentialStore({}))
+        if advertise:
+            front.initialize({
+                "clientCapabilities": {
+                    "elicitation": {"form": {}},
+                },
+            })
+        delegation = Delegation()
+        with mock.patch.object(
+                front.credential_supervisor,
+                "delegate",
+                new=mock.AsyncMock(return_value=delegation)), \
+                mock.patch.object(
+                    acp.asyncio,
+                    "create_subprocess_exec",
+                    new=mock.AsyncMock(return_value=object())), \
+                mock.patch.object(acp, "WorkerChannel", Channel):
+            try:
+                result = await front.load_session(
+                    {"sessionId": "saved", "cwd": ROOT},
+                    request_id=73,
+                )
+            except Exception as error:
+                return front, requests, messages, error
+        return front, requests, messages, result
+
+    async def test_accepts_exact_connection_before_publishing_worker(self):
+        front, requests, messages, result = await self._load("accept")
+
+        self.assertEqual(result, {})
+        self.assertIn("saved", front.workers)
+        self.assertEqual(
+            [method for method, _params in requests],
+            ["session/prepare_open", "session/commit_open"],
+        )
+        elicitation = next(
+            message for message in messages
+            if message.get("method") == "elicitation/create")
+        self.assertEqual(elicitation["params"]["requestId"], 73)
+        self.assertEqual(elicitation["params"]["mode"], "form")
+        self.assertIs(
+            elicitation["params"]["requestedSchema"]["properties"]
+            ["authorize"]["default"],
+            False,
+        )
+        self.assertIn(
+            '"https://saved.example/v1/chat/completions"',
+            elicitation["params"]["message"],
+        )
+
+    async def test_decline_closes_provisional_worker_without_commit(self):
+        front, requests, _messages, error = await self._load("decline")
+
+        self.assertIsInstance(error, acps.TransportError)
+        self.assertEqual(
+            [method for method, _params in requests],
+            ["session/prepare_open"],
+        )
+        self.assertNotIn("saved", front.workers)
+        self.assertNotIn("saved", front._opening_sessions)
+
+    async def test_load_fails_closed_without_form_elicitation(self):
+        front, requests, messages, error = await self._load(
+            "accept", advertise=False)
+
+        self.assertIsInstance(error, acps.TransportError)
+        self.assertEqual(
+            [method for method, _params in requests],
+            ["session/prepare_open"],
+        )
+        self.assertFalse(any(
+            message.get("method") == "elicitation/create"
+            for message in messages))
+        self.assertNotIn("saved", front.workers)
+
+    async def test_explicit_startup_connection_needs_no_saved_approval(self):
+        front, requests, messages, result = await self._load(
+            "accept", authorization_connection=False)
+
+        self.assertEqual(result, {})
+        self.assertIn("saved", front.workers)
+        self.assertEqual(
+            [method for method, _params in requests],
+            ["session/prepare_open", "session/commit_open"],
+        )
+        self.assertFalse(any(
+            message.get("method") == "elicitation/create"
+            for message in messages))
+
+
 class QuarantineTests(unittest.TestCase):
     def test_stdout_is_reserved_for_protocol(self):
         code = (
@@ -1166,19 +1335,30 @@ class WireCwdTests(unittest.TestCase):
 
     def test_open_sets_shell_cwd_and_tools_resolve(self):
         from loki_agent.acp_worker import Worker
+        from loki_agent.credentials import CredentialStore
         from loki_agent.sessions import Session
         from loki_agent import loki
 
         async def run():
             session = Session(shell_cwd="/")  # worker cwd, deliberately wrong
             worker = Worker(session, lambda message: None)
-            await worker.handle({
-                "jsonrpc": "2.0", "id": 1, "method": "session/open",
-                "params": {"sessionId": "w", "cwd": ROOT}}, concurrent=False)
-            result = await loki.dispatch_tool_async(
-                "Bash", {"command": "cat tests/test_acps.py",
-                         "description": "probe"})
-            return session.shell_cwd, result
+            old_credentials = loki.CREDENTIALS
+            old_session = loki._DEFAULT_SESSION
+            try:
+                loki.CREDENTIALS = CredentialStore({})
+                loki._DEFAULT_SESSION = session
+                await worker.prepare_open({
+                    "sessionId": "w",
+                    "cwd": ROOT,
+                })
+                worker.commit_open()
+                result = await loki.dispatch_tool_async(
+                    "Bash", {"command": "cat tests/test_acps.py",
+                             "description": "probe"})
+                return session.shell_cwd, result
+            finally:
+                loki.CREDENTIALS = old_credentials
+                loki._DEFAULT_SESSION = old_session
 
         shell_cwd, result = asyncio.run(run())
         self.assertEqual(shell_cwd, ROOT)
@@ -1305,10 +1485,11 @@ class WorkerSessionContractTests(unittest.TestCase):
                             "ensure_index",
                             new=mock.AsyncMock(
                                 return_value=(catalog, groups))):
-                        opened = await first_worker.open({
+                        await first_worker.prepare_open({
                             "sessionId": "first",
                             "cwd": tmpdir,
                         })
+                        opened = first_worker.commit_open()
                     options = opened["configOptions"][0]["options"]
                     value = "openai-subscription/gpt-test"
                     self.assertIn(
@@ -1361,11 +1542,26 @@ class WorkerSessionContractTests(unittest.TestCase):
                                     refreshed_catalog,
                                     refreshed_groups,
                                 ))):
-                        resumed = await resumed_worker.open({
+                        prepared = await resumed_worker.prepare_open({
                             "sessionId": "resumed",
                             "cwd": tmpdir,
                             "resume": saved_name,
                         })
+                        self.assertIsNone(resumed_session.runtime_config)
+                        self.assertEqual(
+                            prepared["authorizationConnection"]["model"],
+                            "gpt-test",
+                        )
+                        with open(
+                                resumed_session.chat_log_path,
+                                "r", encoding="utf-8") as stream:
+                            self.assertEqual(stream.read(), saved_text)
+                        resumed = resumed_worker.commit_open()
+                    with open(
+                            resumed_session.chat_log_path,
+                            "r", encoding="utf-8") as stream:
+                        committed_text = stream.read()
+                    self.assertNotEqual(committed_text, saved_text)
                     self.assertEqual(
                         resumed["configOptions"][0]["currentValue"],
                         "loki-saved",
@@ -1495,11 +1691,15 @@ class WorkerSessionContractTests(unittest.TestCase):
                 with mock.patch(
                         "loki_agent.acp_worker.modelsdev.ensure_index",
                         new=mock.AsyncMock(return_value=({}, {}))):
-                    result = asyncio.run(worker.open({
-                        "sessionId": "live-session",
-                        "cwd": client_cwd,
-                        "resume": saved_name,
-                    }))
+                    async def open_worker():
+                        await worker.prepare_open({
+                            "sessionId": "live-session",
+                            "cwd": client_cwd,
+                            "resume": saved_name,
+                        })
+                        return worker.commit_open()
+
+                    result = asyncio.run(open_worker())
 
                 self.assertEqual(session.shell_cwd, client_cwd)
                 self.assertEqual(session.model, "saved-model")
@@ -1536,10 +1736,14 @@ class WorkerSessionContractTests(unittest.TestCase):
                     with mock.patch.object(
                             models, "ensure_index",
                             new=mock.AsyncMock(return_value=({}, {}))):
-                        result = asyncio.run(worker.open({
-                            "sessionId": f"live-{number}",
-                            "cwd": tmpdir,
-                        }))
+                        async def open_worker():
+                            await worker.prepare_open({
+                                "sessionId": f"live-{number}",
+                                "cwd": tmpdir,
+                            })
+                            return worker.commit_open()
+
+                        result = asyncio.run(open_worker())
                     paths.append(session.chat_log_path)
                     option = result["configOptions"][0]
                     self.assertEqual(
