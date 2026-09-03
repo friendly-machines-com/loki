@@ -93,6 +93,32 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
         complete.assert_awaited_once_with(authorization)
         browser.assert_not_called()
 
+    async def test_browser_launcher_runs_outside_the_callback_loop(self):
+        class Login:
+            authorization_url = "https://auth.example/authorize"
+
+            async def complete(inner_self):
+                return tokens()
+
+        offload = mock.AsyncMock(return_value=True)
+        with mock.patch.object(
+                authentication_commands.oauth_logins,
+                "start_openai_browser_login",
+                new=mock.AsyncMock(return_value=Login())), \
+                mock.patch.object(
+                    authentication_commands.asyncio,
+                    "to_thread",
+                    new=offload), \
+                contextlib.redirect_stdout(io.StringIO()):
+            await authentication_commands.run(
+                ["login", "openai"], storage=self.storage)
+
+        offload.assert_awaited_once_with(
+            authentication_commands.webbrowser.open,
+            "https://auth.example/authorize",
+            new=2,
+        )
+
     async def test_failed_login_preserves_previous_credential(self):
         previous = tokens()
         await self.storage.store_openai_login(previous)

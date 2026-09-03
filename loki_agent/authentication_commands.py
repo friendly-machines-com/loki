@@ -74,8 +74,15 @@ async def _login_openai(arguments, storage):
         print(login.authorization_url)
         if not arguments.no_browser:
             try:
-                opened = webbrowser.open(
-                    login.authorization_url, new=2)
+                # Some webbrowser controllers synchronously run a text-mode
+                # browser. The OAuth callback server uses this event loop, so
+                # blocking it here can prevent the login we just opened from
+                # completing.
+                opened = await asyncio.to_thread(
+                    webbrowser.open,
+                    login.authorization_url,
+                    new=2,
+                )
             except webbrowser.Error:
                 opened = False
             if not opened:
