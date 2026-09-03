@@ -166,11 +166,14 @@ class WorkerChannel:
 
 
 class Front:
-    def __init__(self, read, write, credentials: CredentialStore):
+    def __init__(
+            self, read, write, credentials: CredentialStore,
+            credential_storage=None):
         self.read = read
         self.write = write
         self.credential_supervisor = (
-            credential_supervisors.CredentialSupervisor(credentials))
+            credential_supervisors.CredentialSupervisor(
+                credentials, credential_storage))
         self.environment = self.credential_supervisor.environment
         self.credentials = self.credential_supervisor.inventory
         self.credential_broker = self.credential_supervisor.broker

@@ -263,7 +263,10 @@ class StaticCredential:
         )
 
 
-RefreshFunction = Callable[[str], Awaitable[RefreshResult]]
+RotationFunction = Callable[
+    [OpenAITokenSet],
+    Awaitable[OpenAITokenSet],
+]
 
 
 class OpenAIChatGPTCredential:
@@ -271,13 +274,13 @@ class OpenAIChatGPTCredential:
 
     def __init__(
             self, tokens: OpenAITokenSet, *,
-            refresh: RefreshFunction | None = None,
+            rotate: RotationFunction | None = None,
             clock: Callable[[], float] = time.time,
             generation: int = 0):
         self.credential = CredentialRef.openai_subscription()
         self._clock = clock
         self._tokens = tokens.normalized(clock())
-        self._refresh = refresh or request_openai_token_refresh
+        self._rotate = rotate or rotate_openai_tokens
         self._generation = generation
         self._refresh_lock = asyncio.Lock()
         self._permanent_failure: tuple[int, CredentialError] | None = None
@@ -348,14 +351,14 @@ class OpenAIChatGPTCredential:
 
             try:
                 refresh_generation = self._generation
-                result = await self._refresh(self._tokens.refresh_token)
+                tokens = await self._rotate(self._tokens)
                 if refresh_generation != self._generation:
                     # An explicit credential replacement won the race while
                     # the exchange was in flight. Its newer state is
                     # authoritative; never overwrite it with the old
                     # generation's late response.
                     return self._lease()
-                self._install_refresh_result(result, now)
+                self._install_rotation_result(tokens)
             except asyncio.CancelledError as error:
                 if (refresh_generation == self._generation
                         and getattr(
@@ -390,42 +393,17 @@ class OpenAIChatGPTCredential:
                 return self._lease()
             return self._lease()
 
-    def _install_refresh_result(
-            self, result: RefreshResult, now: float) -> None:
-        if not isinstance(result, RefreshResult):
+    def _install_rotation_result(
+            self, tokens: OpenAITokenSet) -> None:
+        if not isinstance(tokens, OpenAITokenSet):
             raise RefreshIndeterminateError(
-                "OpenAI token refresh returned an invalid result")
-        if (not isinstance(result.access_token, str)
-                or not result.access_token):
+                "OpenAI token rotation returned an invalid result")
+        try:
+            self._tokens = tokens.normalized(self._clock())
+        except ValueError as error:
             raise RefreshIndeterminateError(
-                "OpenAI token refresh succeeded without an access token")
-        if (result.refresh_token is not None
-                and (not isinstance(result.refresh_token, str)
-                     or not result.refresh_token)):
-            raise RefreshIndeterminateError(
-                "OpenAI token refresh returned an invalid refresh token")
-        if (result.id_token is not None
-                and (not isinstance(result.id_token, str)
-                     or not result.id_token)):
-            raise RefreshIndeterminateError(
-                "OpenAI token refresh returned an invalid id token")
-        account_id = token_account_id(
-            result.id_token or result.access_token)
-        if (account_id is not None
-                and self._tokens.account_id is not None
-                and account_id != self._tokens.account_id):
-            raise RefreshPermanentError(
-                "OpenAI token refresh changed the selected account")
-        self._tokens = OpenAITokenSet(
-            access_token=result.access_token,
-            refresh_token=(
-                result.refresh_token or self._tokens.refresh_token),
-            id_token=result.id_token or self._tokens.id_token,
-            account_id=self._tokens.account_id or account_id,
-            fedramp=self._tokens.fedramp,
-            expires_at=jwt_expiration(result.access_token),
-            last_refresh=now,
-        )
+                f"OpenAI token rotation returned invalid tokens: "
+                f"{error}") from error
         self._generation += 1
         self._permanent_failure = None
 
@@ -446,7 +424,7 @@ class CredentialBroker:
 
     def install_openai_subscription(
             self, tokens: OpenAITokenSet, *,
-            refresh: RefreshFunction | None = None,
+            rotate: RotationFunction | None = None,
             clock: Callable[[], float] = time.time) -> None:
         credential = CredentialRef.openai_subscription()
         current = self._records.get(credential)
@@ -454,7 +432,7 @@ class CredentialBroker:
             current.replace(tokens)
             return
         self._records[credential] = OpenAIChatGPTCredential(
-            tokens, refresh=refresh, clock=clock)
+            tokens, rotate=rotate, clock=clock)
 
     def openai_tokens(self) -> OpenAITokenSet | None:
         record = self._records.get(CredentialRef.openai_subscription())
@@ -555,6 +533,57 @@ def token_account_id(token: str) -> str | None:
         if isinstance(nested, str) and nested:
             return nested
     return None
+
+
+def refreshed_openai_tokens(
+        current: OpenAITokenSet,
+        result: RefreshResult,
+        now: float | None = None) -> OpenAITokenSet:
+    """Validate a token-endpoint result and preserve account invariants."""
+    if not isinstance(result, RefreshResult):
+        raise RefreshIndeterminateError(
+            "OpenAI token refresh returned an invalid result")
+    if (not isinstance(result.access_token, str)
+            or not result.access_token):
+        raise RefreshIndeterminateError(
+            "OpenAI token refresh succeeded without an access token")
+    if (result.refresh_token is not None
+            and (not isinstance(result.refresh_token, str)
+                 or not result.refresh_token)):
+        raise RefreshIndeterminateError(
+            "OpenAI token refresh returned an invalid refresh token")
+    if (result.id_token is not None
+            and (not isinstance(result.id_token, str)
+                 or not result.id_token)):
+        raise RefreshIndeterminateError(
+            "OpenAI token refresh returned an invalid id token")
+    current = current.normalized(now)
+    identity_token = result.id_token or result.access_token
+    account_id = token_account_id(identity_token)
+    if (account_id is not None
+            and current.account_id is not None
+            and account_id != current.account_id):
+        raise RefreshPermanentError(
+            "OpenAI token refresh changed the selected account")
+    return OpenAITokenSet(
+        access_token=result.access_token,
+        refresh_token=result.refresh_token or current.refresh_token,
+        id_token=result.id_token or current.id_token,
+        account_id=current.account_id or account_id,
+        fedramp=(
+            token_fedramp(identity_token)
+            if result.id_token is not None
+            else current.fedramp),
+        expires_at=jwt_expiration(result.access_token),
+        last_refresh=time.time() if now is None else now,
+    ).normalized(now)
+
+
+async def rotate_openai_tokens(
+        current: OpenAITokenSet) -> OpenAITokenSet:
+    result = await request_openai_token_refresh(
+        current.refresh_token)
+    return refreshed_openai_tokens(current, result)
 
 
 def _refresh_error_code(data) -> str | None:

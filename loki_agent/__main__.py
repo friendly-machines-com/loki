@@ -97,9 +97,18 @@ def main() -> int:
         from .authentication_commands import main as authentication_main
         return authentication_main(
             sys.argv[2:], program=sys.argv[0])
+    from .credential_storages import (
+        CredentialStorageError,
+        JsonCredentialStorage,
+    )
     from .credential_supervisors import CredentialSupervisor
 
-    supervisor = CredentialSupervisor(credentials)
+    try:
+        supervisor = CredentialSupervisor(
+            credentials, JsonCredentialStorage())
+    except CredentialStorageError as error:
+        print(f"Credential storage error: {error}", file=sys.stderr)
+        return 2
     try:
         return asyncio.run(supervisor.run_terminal_runtime(
             sys.argv[0], sys.argv[1:]))

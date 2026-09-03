@@ -20,6 +20,7 @@ from .process_protections import (
 async def amain(credentials: CredentialStore) -> int:
     from . import acps
     from .acp import Front
+    from .credential_storages import JsonCredentialStorage
 
     saved_stdout = os.dup(1)
     acps.quarantine_stdout()
@@ -45,7 +46,8 @@ async def amain(credentials: CredentialStore) -> int:
                 continue
             yield message
 
-    front = Front(read, write, credentials)
+    front = Front(
+        read, write, credentials, JsonCredentialStorage())
     await front.run()
     return 0
 
@@ -76,7 +78,12 @@ def main() -> int:
     except ProcessProtectionError as error:
         print(f"Security initialization error: {error}", file=sys.stderr)
         return 2
-    return asyncio.run(amain(credentials))
+    from .credential_storages import CredentialStorageError
+    try:
+        return asyncio.run(amain(credentials))
+    except CredentialStorageError as error:
+        print(f"Credential storage error: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

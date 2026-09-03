@@ -22,17 +22,35 @@ from dataclasses import dataclass
 
 from . import credential_capabilities
 from .authentications import CredentialBroker
-from .credentials import CredentialStore
+from .credentials import CredentialInventory, CredentialStore
 
 
 class CredentialSupervisor:
     """Credential-owning state shared by terminal and ACP supervisors."""
 
-    def __init__(self, credentials: CredentialStore):
+    def __init__(self, credentials: CredentialStore, storage=None):
         self.environment = credentials.sanitized_environment()
         self.broker = CredentialBroker()
         credentials.install_static_credentials(self.broker)
-        self.inventory = credentials.inventory()
+        self.storage = storage
+        if storage is not None:
+            # This must happen before a runtime starts.  Even an empty
+            # credential directory has to exist when Linux establishes the
+            # runtime's cover mount; creating it after that point would expose
+            # a later login file in an already-running runtime.
+            storage.ensure_directory()
+            stored = storage.load_openai_subscription()
+            if (stored is not None
+                    and stored.state == "active"
+                    and stored.tokens is not None):
+                self.broker.install_openai_subscription(
+                    stored.tokens,
+                    rotate=storage.rotate_openai_subscription,
+                )
+        self.inventory = CredentialInventory(
+            self.environment,
+            self.broker.available(),
+        )
 
     async def delegate(self, allowed=None) -> "RuntimeDelegation":
         return await RuntimeDelegation.create(self.broker, allowed)

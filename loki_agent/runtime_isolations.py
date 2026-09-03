@@ -232,9 +232,10 @@ def _drop_namespace_capabilities(libc) -> None:
 def isolate_credential_directory(directory: str | None = None) -> bool:
     """Hide the credential directory in this runtime and its descendants.
 
-    The supervisor creates the dedicated directory before spawning a runtime
-    once persistent credentials are enabled.  Until then, an absent directory
-    means there is no persistent credential pathname to hide.
+    Production supervisors create the dedicated directory before spawning
+    every runtime, including before the first login.  The absent-directory
+    case remains useful only for runtimes constructed without persistent
+    storage, such as focused tests.
     """
     if not sys.platform.startswith("linux"):
         return False

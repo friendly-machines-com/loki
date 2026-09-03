@@ -20,8 +20,10 @@ import json
 import os
 import secrets
 import stat
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 from . import authentications, paths
 
@@ -431,3 +433,100 @@ class JsonCredentialStorage:
                 del document["credentials"][OPENAI_CREDENTIAL_KEY]
                 self._write_document_at(directory_fd, document)
             return existed
+
+    async def rotate_openai_subscription(
+            self,
+            current: authentications.OpenAITokenSet,
+            refresh: Callable[
+                [str],
+                Awaitable[authentications.RefreshResult],
+            ] = authentications.request_openai_token_refresh,
+            clock=None):
+        """Refresh once under a cross-process, crash-safe transaction."""
+        async with self._locked_document() as (
+                directory_fd, document):
+            now = (clock or time.time)()
+            stored = _openai_record(document)
+            if stored is None:
+                raise authentications.RefreshPermanentError(
+                    "OpenAI subscription was logged out")
+            if stored.state != "active" or stored.tokens is None:
+                raise authentications.RefreshPermanentError(
+                    "an interrupted OpenAI refresh requires login")
+            if stored.tokens != current:
+                # Another supervisor completed a login or refresh first.
+                # Its durable state wins without using our stale token.
+                return stored.tokens
+
+            attempt_id = secrets.token_urlsafe(24)
+            refreshing_revision = self._next_revision(document)
+            document["credentials"][OPENAI_CREDENTIAL_KEY] = (
+                _inactive_record(
+                    "refreshing",
+                    refreshing_revision,
+                    attempt_id,
+                ))
+            self._write_document_at(directory_fd, document)
+
+            try:
+                result = await refresh(current.refresh_token)
+                refreshed = authentications.refreshed_openai_tokens(
+                    current, result, now)
+            except asyncio.CancelledError:
+                self._record_reauth_required(
+                    directory_fd, document)
+                raise
+            except authentications.RefreshTransientError as error:
+                if not error.request_may_have_been_sent:
+                    self._restore_after_unsent_failure(
+                        directory_fd, document, current)
+                else:
+                    self._record_reauth_required(
+                        directory_fd, document)
+                raise
+            except authentications.RefreshPermanentError:
+                self._record_reauth_required(
+                    directory_fd, document)
+                raise
+            except BaseException as error:
+                self._record_reauth_required(
+                    directory_fd, document)
+                raise authentications.RefreshIndeterminateError(
+                    "OpenAI refresh failed after its durable attempt "
+                    "record was created") from error
+
+            try:
+                revision = self._next_revision(document)
+                document["credentials"][OPENAI_CREDENTIAL_KEY] = (
+                    _active_record(refreshed, revision))
+                self._write_document_at(directory_fd, document)
+            except CredentialStorageError as error:
+                # The already-durable refreshing record omits the old refresh
+                # token. Even if the final write fails, another process will
+                # fail closed instead of replaying it.
+                raise authentications.RefreshIndeterminateError(
+                    "OpenAI returned refreshed tokens but Loki could not "
+                    "persist them; login is required") from error
+            return refreshed
+
+    def _restore_after_unsent_failure(
+            self, directory_fd, document, tokens):
+        try:
+            revision = self._next_revision(document)
+            document["credentials"][OPENAI_CREDENTIAL_KEY] = (
+                _active_record(tokens, revision))
+            self._write_document_at(directory_fd, document)
+        except CredentialStorageError as error:
+            raise authentications.RefreshIndeterminateError(
+                "OpenAI refresh was not sent, but Loki could not restore "
+                "the active credential record") from error
+
+    def _record_reauth_required(self, directory_fd, document):
+        try:
+            revision = self._next_revision(document)
+            document["credentials"][OPENAI_CREDENTIAL_KEY] = (
+                _inactive_record("reauth-required", revision))
+            self._write_document_at(directory_fd, document)
+        except CredentialStorageError:
+            # The previously fsynced refreshing record is already fail-closed.
+            pass
