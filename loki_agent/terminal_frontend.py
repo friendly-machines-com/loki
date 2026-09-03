@@ -1032,6 +1032,11 @@ async def async_main(args) -> int:
                 continue
             finally:
                 _terminal_activity.set_turn_running(False)
+                # A turn can append user, response, and tool-result state even
+                # when it is cancelled or fails. Persist that state before
+                # another prompt can be accepted; whole-process cleanup is
+                # only a fallback for later termination.
+                save_chat_log()
 
         pending_images.clear()
         _terminal_activity.set_queued_images(0)

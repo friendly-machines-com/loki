@@ -260,6 +260,35 @@ class TerminalImageCommandTests(unittest.TestCase):
         self.assertEqual(
             formats.item_text(captured[0][-1]), logical)
 
+    def test_completed_turn_is_saved_before_terminal_cleanup(self):
+        async def complete_turn(items, **_kwargs):
+            items.append(formats.message_item(
+                "assistant", "durable terminal answer"))
+            return "durable terminal answer"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status, _captured, _stdout, _stderr = self._run_terminal(
+                ["durable terminal question", "/quit"],
+                tmpdir,
+                turn_runner=complete_turn,
+            )
+            with open(
+                    os.path.join(tmpdir, "chat-test.json"),
+                    "r", encoding="utf-8") as file_obj:
+                events, _todos, _state, _toolsets = (
+                    savefiles.read_chat_log(file_obj))
+
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "durable terminal question",
+            [formats.item_text(item) for item in events],
+        )
+        self.assertIn(
+            "durable terminal answer",
+            [formats.item_text(item) for item in events],
+        )
+        self.assertFalse(loki.current_dirty())
+
     def test_image_command_attaches_snapshot_to_next_text_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data = b"\x89PNG\r\n\x1a\npicture"
@@ -351,9 +380,18 @@ class TerminalImageCommandTests(unittest.TestCase):
                 tmpdir,
                 turn_runner=cancel_turn,
             )
+            with open(
+                    os.path.join(tmpdir, "chat-test.json"),
+                    "r", encoding="utf-8") as file_obj:
+                events, _todos, _state, _toolsets = (
+                    savefiles.read_chat_log(file_obj))
 
         self.assertEqual(status, 0)
         self.assertEqual(observed, [True])
+        self.assertIn(
+            "cancel this turn",
+            [formats.item_text(item) for item in events],
+        )
         self.assertFalse(
             terminal_frontend._terminal_activity.turn_running)
 
@@ -384,8 +422,17 @@ class TerminalImageCommandTests(unittest.TestCase):
                     tmpdir,
                     turn_runner=fail_turn,
                 )
+            with open(
+                    os.path.join(tmpdir, "chat-test.json"),
+                    "r", encoding="utf-8") as file_obj:
+                events, _todos, _state, _toolsets = (
+                    savefiles.read_chat_log(file_obj))
 
         self.assertEqual(observed, [True])
+        self.assertIn(
+            "fail this turn",
+            [formats.item_text(item) for item in events],
+        )
         self.assertFalse(
             terminal_frontend._terminal_activity.turn_running)
 
