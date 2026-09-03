@@ -293,14 +293,13 @@ class Worker:
                 loki.chat_log_filename(session_id),
             ))
 
-        self._install_initial_choices(saved_descriptor)
-        if params.get("replay") and resume:
-            self._replay_transcript()
-
-        # Await discovery so initial session/open reply contains all discovered choices
+        # Await discovery so a resumed subscription uses fresh exact-slug
+        # request data before any config choice or prompt becomes available.
         explicit = loki.explicit_connection_option(loki.CREDENTIALS)
+        catalog = {}
+        discovered = []
         try:
-            _data, groups = await modelsdev.ensure_index(
+            catalog, groups = await modelsdev.ensure_index(
                 credential_authority=self.session.credential_authority,
                 diagnostic_writer=lambda message: print(
                     message, file=sys.stderr),
@@ -310,13 +309,34 @@ class Worker:
                 explicit_connection=explicit,
                 groups=groups,
             )
-            if discovered:
-                self._install_catalog_choices(discovered)
         except Exception as error:
             print(
                 f"models.dev discovery failed: {error!r}",
                 file=sys.stderr,
             )
+
+        if saved_descriptor is not None:
+            original_descriptor = saved_descriptor
+            try:
+                saved_descriptor = loki.reconcile_connection_descriptor(
+                    saved_descriptor, catalog)
+            except ValueError as error:
+                self._configuration_error = (
+                    f"Saved connection is unavailable: {error}")
+                saved_descriptor = None
+                self.session.session_state.pop("connection", None)
+                loki.mark_chat_log_dirty()
+                loki.save_chat_log()
+            else:
+                if saved_descriptor != original_descriptor:
+                    loki.set_session_connection(saved_descriptor)
+                    loki.save_chat_log()
+
+        self._install_initial_choices(saved_descriptor)
+        if discovered:
+            self._install_catalog_choices(discovered)
+        if params.get("replay") and resume:
+            self._replay_transcript()
 
         return {"configOptions": self.config_options()}
 

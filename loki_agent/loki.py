@@ -27,13 +27,14 @@ import uuid
 import tempfile
 import shutil
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from pprint import pformat
 
 from . import formats
 from . import http_client
 from . import models as modelsdev
+from . import openai_models
 from . import paths
 from . import protocols
 from . import authentications
@@ -269,7 +270,15 @@ class RuntimeConfig:
     model_status: str | None = None
     stream: bool = False
     prompt_cache: bool = False
-    responses_lite: bool = False
+    openai_request_profile: (
+        openai_models.CodexModelRequestProfile | None) = None
+
+    @property
+    def responses_lite(self):
+        return (
+            self.openai_request_profile is not None
+            and self.openai_request_profile.use_responses_lite
+        )
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
@@ -338,7 +347,7 @@ def make_runtime_config(
         max_tokens=4096, anthropic_version="2023-06-01",
         auth_header=None, auth_scheme=None, provider_id=None,
         provider_name=None, credential_ref=None, model_status=None,
-        stream=False, prompt_cache=False, responses_lite=False):
+        stream=False, prompt_cache=False, openai_request_profile=None):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -346,6 +355,15 @@ def make_runtime_config(
     reinstall_provider() which reuses this to rebuild the Provider from the
     current config plus per-model overrides.
     """
+    auth_spec = _auth_spec(
+        provider_kind, credential_ref, auth_header, auth_scheme)
+    if (auth_spec is not None
+            and auth_spec.scheme == "openai-subscription"
+            and provider_id
+            != modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID):
+        raise ValueError(
+            "OpenAI subscription authentication requires the "
+            "openai-subscription provider identity")
     chat_provider = protocols.make_provider(
         url,
         provider=provider_kind,
@@ -355,10 +373,8 @@ def make_runtime_config(
         provider_id=provider_id,
         provider_name=provider_name,
         prompt_cache=prompt_cache,
-        responses_lite=responses_lite,
+        openai_request_profile=openai_request_profile,
     )
-    auth_spec = _auth_spec(
-        provider_kind, credential_ref, auth_header, auth_scheme)
     authentications.validate_authorization_target(
         auth_spec, chat_provider.chat_url)
     return RuntimeConfig(
@@ -381,7 +397,7 @@ def make_runtime_config(
         model_status=model_status,
         stream=stream,
         prompt_cache=prompt_cache,
-        responses_lite=responses_lite,
+        openai_request_profile=openai_request_profile,
     )
 
 
@@ -406,6 +422,26 @@ def _explicit_credential_ref(credentials):
             "LOKI_CREDENTIAL_REF names an unavailable credential: "
             f"{credential.encode()}")
     return credential
+
+
+def _openai_request_profile_setting(credentials, subscription):
+    encoded = credentials.get("LOKI_OPENAI_REQUEST_PROFILE")
+    if not encoded:
+        if subscription:
+            raise ValueError(
+                "OpenAI subscription configuration requires "
+                "LOKI_OPENAI_REQUEST_PROFILE; select the model with /model")
+        return None
+    if not subscription:
+        raise ValueError(
+            "LOKI_OPENAI_REQUEST_PROFILE requires an OpenAI subscription "
+            "credential")
+    try:
+        value = json.loads(encoded)
+        return openai_models.CodexModelRequestProfile.from_dict(value)
+    except ValueError as error:
+        raise ValueError(
+            f"invalid LOKI_OPENAI_REQUEST_PROFILE: {error}") from error
 
 
 def build_config_from_env(
@@ -447,6 +483,8 @@ def build_config_from_env(
     subscription = (
         credential_ref is not None
         and credential_ref.kind == "openai-subscription")
+    openai_request_profile = _openai_request_profile_setting(
+        credentials, subscription)
 
     config_model = credentials.get("LOKI_MODEL") or ""
     return make_runtime_config(
@@ -473,8 +511,7 @@ def build_config_from_env(
             == "api.anthropic.com",
             credentials,
         ),
-        responses_lite=_bool_setting(
-            "LOKI_RESPONSES_LITE", False, credentials),
+        openai_request_profile=openai_request_profile,
     )
 
 
@@ -516,10 +553,10 @@ def config_from_connection_descriptor(
         descriptor.model_status
         if not configured_model or configured_model == descriptor.model
         else None)
-    responses_lite = (
-        descriptor.responses_lite
+    openai_request_profile = (
+        descriptor.openai_request_profile
         if not configured_model or configured_model == descriptor.model
-        else False)
+        else None)
     max_tokens = (
         _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)
         if credentials.get("LOKI_MAX_TOKENS") else descriptor.max_tokens)
@@ -573,8 +610,49 @@ def config_from_connection_descriptor(
         model_status=model_status,
         stream=stream,
         prompt_cache=prompt_cache,
-        responses_lite=responses_lite,
+        openai_request_profile=openai_request_profile,
     )
+
+
+def _is_openai_subscription_connection(descriptor):
+    return (
+        descriptor.provider_id
+        == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
+        and descriptor.protocol == protocols.OPENAI_RESPONSES
+        and descriptor.credential_ref
+        == authentications.CredentialRef.openai_subscription()
+    )
+
+
+def reconcile_connection_descriptor(descriptor, catalog):
+    """Replace saved subscription request data with fresh exact-slug data."""
+    if not _is_openai_subscription_connection(descriptor):
+        return descriptor
+    profile = modelsdev.reconcile_openai_subscription_profile(
+        descriptor.model,
+        descriptor.openai_request_profile,
+        catalog,
+    )
+    return replace(descriptor, openai_request_profile=profile)
+
+
+async def refresh_connection_descriptor_async(
+        descriptor, credential_authority, diagnostic_writer=None):
+    """Refresh a subscription descriptor, retaining it only on fetch failure."""
+    if not _is_openai_subscription_connection(descriptor):
+        return descriptor
+    try:
+        response = await modelsdev.fetch_openai_subscription_models(
+            credential_authority)
+        catalog = modelsdev.add_openai_subscription_catalog(
+            {}, response, diagnostic_writer=diagnostic_writer)
+    except (OSError, authentications.CredentialError) as error:
+        if diagnostic_writer is not None:
+            diagnostic_writer(
+                "OpenAI subscription model discovery failed; using saved "
+                f"request profile: {error}")
+        catalog = {}
+    return reconcile_connection_descriptor(descriptor, catalog)
 
 
 def config_from_modelsdev_selection(
@@ -617,7 +695,7 @@ def config_from_modelsdev_selection(
             provider_id == "anthropic",
             credentials,
         ),
-        responses_lite=modelsdev.model_uses_responses_lite(
+        openai_request_profile=modelsdev.openai_request_profile(
             provider_entry, model_entry),
     )
 
@@ -645,7 +723,7 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         model_status=current_config().model_status,
         stream=current_config().stream,
         prompt_cache=current_config().prompt_cache,
-        responses_lite=provider.responses_lite,
+        openai_request_profile=provider.openai_request_profile,
     )
 
 
@@ -663,7 +741,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
                        auth_header=_UNSET, provider_id=None, provider_name=None,
                        credential_ref=_UNSET, auth_scheme=_UNSET,
                        model_status=_UNSET, stream=None, prompt_cache=None,
-                       responses_lite=_UNSET):
+                       openai_request_profile=_UNSET):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -715,14 +793,16 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             current.model_status if same_catalog_entry else None)
     else:
         new_model_status = model_status
-    if responses_lite is _UNSET:
-        # Responses-Lite is a per-model contract. Preserve it only when this
-        # is genuinely the same catalog leaf; carrying it to another model or
-        # provider would put that request on the wrong wire protocol.
-        new_responses_lite = (
-            current.responses_lite if same_catalog_entry else False)
+    if openai_request_profile is _UNSET:
+        # The authenticated request profile is one indivisible per-model
+        # contract.
+        # Preserve it only for the same catalog leaf; carrying even part of it
+        # across a model/provider change would manufacture capabilities.
+        new_openai_request_profile = (
+            current.openai_request_profile
+            if same_catalog_entry else None)
     else:
-        new_responses_lite = responses_lite
+        new_openai_request_profile = openai_request_profile
     apply_runtime_config(make_runtime_config(
         new_url,
         new_kind,
@@ -745,7 +825,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             prompt_cache
             if prompt_cache is not None
             else current.prompt_cache),
-        responses_lite=new_responses_lite,
+        openai_request_profile=new_openai_request_profile,
     ))
 
 
@@ -3060,8 +3140,21 @@ def _subagent_env() -> dict:
         env['LOKI_STREAM'] = '1' if current_config().stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
             '1' if current_config().prompt_cache else '0')
-        env['LOKI_RESPONSES_LITE'] = (
-            '1' if current_config().responses_lite else '0')
+        if current_config().openai_request_profile is not None:
+            # This compact, non-secret request profile is process
+            # configuration. Credentials still cross only the anonymous
+            # capability socket. The full authenticated catalog record,
+            # including application prompts, never enters the environment.
+            env['LOKI_OPENAI_REQUEST_PROFILE'] = json.dumps(
+                current_config().openai_request_profile.to_dict(),
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        else:
+            env.pop('LOKI_OPENAI_REQUEST_PROFILE', None)
+        env.pop('LOKI_RESPONSES_LITE', None)
         provider = current_config().chat_provider
         env['LOKI_MAX_TOKENS'] = str(provider.max_tokens)
         env['LOKI_ANTHROPIC_VERSION'] = (

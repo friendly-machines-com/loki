@@ -11,6 +11,7 @@ from loki_agent import (
     authentications,
     http_client,
     models,
+    openai_models,
     protocols,
     terminals,
 )
@@ -88,18 +89,31 @@ def _write_text(text):
     print(text, end="")
 
 
+def _subscription_model(slug, **overrides):
+    value = {
+        "slug": slug,
+        "display_name": slug.replace("-", " ").title(),
+        "visibility": "list",
+        "input_modalities": ["text", "image"],
+        "supported_reasoning_levels": [
+            {"effort": "medium", "description": "Medium"},
+        ],
+        "default_reasoning_level": "medium",
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "supports_parallel_tool_calls": True,
+        "shell_type": "shell_command",
+    }
+    value.update(overrides)
+    return value
+
+
 def _subscription_catalog(*slugs):
     return {
         "models": [
-            {
-                "slug": slug,
-                "display_name": slug.replace("-", " ").title(),
-                "visibility": "list",
-                "input_modalities": ["text", "image"],
-                "supported_reasoning_levels": [
-                    {"effort": "medium", "description": "Medium"},
-                ],
-            }
+            _subscription_model(slug)
             for slug in slugs
         ],
     }
@@ -557,39 +571,41 @@ class CatalogNormalizationTests(unittest.TestCase):
     def test_subscription_uses_only_visible_text_models(self):
         response = {
             "models": [
-                {
-                    "slug": "visible",
-                    "display_name": "Visible",
-                    "visibility": "list",
-                    "input_modalities": ["text"],
-                    "supported_reasoning_levels": [],
-                },
-                {
-                    "slug": "hidden",
-                    "display_name": "Hidden",
-                    "visibility": "hide",
-                    "input_modalities": ["text"],
-                },
-                {
-                    "slug": "audio-only",
-                    "display_name": "Audio",
-                    "visibility": "list",
-                    "input_modalities": ["audio"],
-                },
-                {
-                    "slug": "responses-lite",
-                    "display_name": "Responses Lite",
-                    "visibility": "list",
-                    "input_modalities": ["text"],
-                    "use_responses_lite": True,
-                },
-                {
-                    "slug": "special-tool-mode",
-                    "display_name": "Special Tool Mode",
-                    "visibility": "list",
-                    "input_modalities": ["text"],
-                    "tool_mode": "code_mode_only",
-                },
+                _subscription_model(
+                    "visible",
+                    display_name="Visible",
+                    input_modalities=["text"],
+                    supported_reasoning_levels=[],
+                    default_reasoning_level=None,
+                    context_window={"malformed": "and ignored"},
+                    truncation_policy="malformed but ignored",
+                    service_tiers="malformed but ignored",
+                    default_service_tier="priority",
+                    shell_type="unified_exec",
+                ),
+                _subscription_model(
+                    "hidden",
+                    display_name="Hidden",
+                    visibility="hide",
+                    input_modalities=["text"],
+                ),
+                _subscription_model(
+                    "audio-only",
+                    display_name="Audio",
+                    input_modalities=["audio"],
+                ),
+                _subscription_model(
+                    "responses-lite",
+                    display_name="Responses Lite",
+                    input_modalities=["text"],
+                    use_responses_lite=True,
+                ),
+                _subscription_model(
+                    "special-tool-mode",
+                    display_name="Special Tool Mode",
+                    input_modalities=["text"],
+                    tool_mode="code_mode_only",
+                ),
             ],
         }
 
@@ -601,22 +617,86 @@ class CatalogNormalizationTests(unittest.TestCase):
             list(entries),
             ["visible", "responses-lite", "special-tool-mode"],
         )
-        self.assertFalse(models.model_uses_responses_lite(
-            provider, entries["visible"]))
-        self.assertTrue(models.model_uses_responses_lite(
-            provider, entries["responses-lite"]))
+        visible = models.openai_request_profile(
+            provider, entries["visible"])
+        lite = models.openai_request_profile(
+            provider, entries["responses-lite"])
+        special = models.openai_request_profile(
+            provider, entries["special-tool-mode"])
+        self.assertFalse(visible.use_responses_lite)
+        self.assertTrue(lite.use_responses_lite)
+        self.assertIsNotNone(special)
+        self.assertFalse(hasattr(visible, "tool_mode"))
+        self.assertFalse(hasattr(special, "tool_mode"))
+        self.assertFalse(hasattr(visible, "context_window"))
 
-    def test_downloaded_catalog_cannot_enable_responses_lite(self):
-        self.assertFalse(models.model_uses_responses_lite(
+    def test_downloaded_catalog_cannot_supply_openai_request_profile(self):
+        profile = (
+            openai_models.CodexModelRequestProfile.from_catalog_model(
+                _subscription_model("model")))
+        self.assertIsNone(models.openai_request_profile(
             {
                 "id": "forged",
-                "_loki_responses_lite": True,
+                "_loki_openai_request_profile": profile,
             },
             {
                 "id": "model",
-                "_loki_responses_lite": True,
+                "_loki_openai_request_profile": profile,
             },
         ))
+
+    def test_bad_request_fields_drop_only_the_affected_model(self):
+        diagnostics = []
+        normalized = models.add_openai_subscription_catalog(
+            {},
+            {
+                "models": [
+                    _subscription_model(
+                        "bad", supports_parallel_tool_calls="yes"),
+                    _subscription_model("good"),
+                ],
+            },
+            diagnostic_writer=diagnostics.append,
+        )
+
+        self.assertEqual(
+            list(normalized["openai-subscription"]["models"]), ["good"])
+        self.assertTrue(any("'bad'" in item for item in diagnostics))
+
+    def test_fresh_catalog_replaces_saved_profile_by_exact_slug(self):
+        old = openai_models.CodexModelRequestProfile.from_catalog_model(
+            _subscription_model(
+                "selected", supports_parallel_tool_calls=False))
+        catalog = models.add_openai_subscription_catalog(
+            {},
+            _subscription_catalog("selected"),
+        )
+
+        refreshed = models.reconcile_openai_subscription_profile(
+            "selected", old, catalog)
+
+        self.assertTrue(refreshed.supports_parallel_tool_calls)
+        self.assertIsNot(refreshed, old)
+
+    def test_successful_catalog_removal_does_not_use_saved_profile(self):
+        saved = openai_models.CodexModelRequestProfile.from_catalog_model(
+            _subscription_model("removed"))
+        catalog = models.add_openai_subscription_catalog(
+            {}, _subscription_catalog("other"))
+
+        with self.assertRaisesRegex(ValueError, "not present"):
+            models.reconcile_openai_subscription_profile(
+                "removed", saved, catalog)
+
+    def test_offline_catalog_uses_saved_profile(self):
+        saved = openai_models.CodexModelRequestProfile.from_catalog_model(
+            _subscription_model("selected"))
+
+        self.assertIs(
+            models.reconcile_openai_subscription_profile(
+                "selected", saved, {}),
+            saved,
+        )
 
     def test_downloaded_private_credential_marker_is_not_authority(self):
         credential = (

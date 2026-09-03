@@ -4,6 +4,7 @@ import subprocess
 import sys
 import unittest
 
+from loki_agent import openai_models
 from loki_agent.authentications import CredentialRef
 from loki_agent.connections import (
     ConnectionDescriptor,
@@ -18,6 +19,22 @@ from loki_agent.credentials import (
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _codex_model(slug="gpt-5-codex", **overrides):
+    value = {
+        "slug": slug,
+        "display_name": slug,
+        "visibility": "list",
+        "supported_reasoning_levels": [],
+        "supports_reasoning_summaries": False,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": False,
+        "supports_parallel_tool_calls": True,
+        "shell_type": "shell_command",
+    }
+    value.update(overrides)
+    return openai_models.CodexModelRequestProfile.from_catalog_model(value)
 
 
 class CredentialStoreTests(unittest.TestCase):
@@ -406,7 +423,10 @@ class ConnectionDescriptorTests(unittest.TestCase):
             credential_ref=CredentialRef.openai_subscription(),
             auth_scheme="openai-subscription",
             stream=True,
-            responses_lite=True,
+            openai_request_profile=_codex_model(
+                use_responses_lite=True,
+                context_window=200000,
+            ),
         )
 
         encoded = descriptor.to_dict()
@@ -418,7 +438,10 @@ class ConnectionDescriptorTests(unittest.TestCase):
             {"kind": "openai-subscription", "name": "openai"},
         )
         self.assertEqual(encoded["auth_scheme"], "openai-subscription")
-        self.assertIs(encoded["responses_lite"], True)
+        self.assertIs(
+            encoded["openai_request_profile"]["use_responses_lite"], True)
+        self.assertNotIn(
+            "context_window", encoded["openai_request_profile"])
 
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):
@@ -463,20 +486,19 @@ class ConnectionDescriptorTests(unittest.TestCase):
             })
         with self.assertRaises(ConnectionDescriptorError):
             ConnectionDescriptor.from_dict({
+                "provider_id": "openai-subscription",
                 "model": "x",
-                "chat_url": "https://example.test/v1/responses",
+                "chat_url":
+                    "https://chatgpt.com/backend-api/codex/responses",
                 "protocol": "openai_responses",
                 "credential_env": None,
-                "responses_lite": "yes",
-            })
-        with self.assertRaises(ConnectionDescriptorError):
-            ConnectionDescriptor.from_dict({
-                "provider_id": "compatible",
-                "model": "x",
-                "chat_url": "https://example.test/v1/responses",
-                "protocol": "openai_responses",
-                "credential_env": None,
-                "responses_lite": True,
+                "credential": {
+                    "kind": "openai-subscription",
+                    "name": "openai",
+                },
+                "openai_request_profile": {
+                    "supports_parallel_tool_calls": "yes",
+                },
             })
 
 

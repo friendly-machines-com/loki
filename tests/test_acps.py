@@ -1266,7 +1266,7 @@ class WorkerSessionContractTests(unittest.TestCase):
         )
 
     def test_subscription_option_and_resume_use_brokered_credential(self):
-        from loki_agent import http_client, loki, models
+        from loki_agent import formats, http_client, loki, models
         from loki_agent.acp_worker import Worker
         from loki_agent.credentials import CredentialInventory
         from loki_agent.sessions import Session
@@ -1289,11 +1289,46 @@ class WorkerSessionContractTests(unittest.TestCase):
                     "display_name": "GPT Test",
                     "visibility": "list",
                     "input_modalities": ["text"],
-                    "supported_reasoning_levels": [],
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "Low"},
+                    ],
+                    "default_reasoning_level": "low",
+                    "supports_reasoning_summaries": True,
+                    "default_reasoning_summary": "none",
+                    "support_verbosity": True,
+                    "default_verbosity": "low",
+                    "supports_parallel_tool_calls": False,
+                    "use_responses_lite": True,
+                    "tool_mode": "code_mode_only",
+                    "context_window": 200000,
+                    "base_instructions":
+                        "must not be copied into the session log",
                 }],
             },
         )
         groups = models.build_groups(catalog)
+        refreshed_catalog = models.add_openai_subscription_catalog(
+            {},
+            {
+                "models": [{
+                    "slug": "gpt-test",
+                    "display_name": "GPT Test",
+                    "visibility": "list",
+                    "input_modalities": ["text"],
+                    "supported_reasoning_levels": [
+                        {"effort": "high", "description": "High"},
+                    ],
+                    "default_reasoning_level": "high",
+                    "supports_reasoning_summaries": True,
+                    "default_reasoning_summary": "detailed",
+                    "support_verbosity": True,
+                    "default_verbosity": "medium",
+                    "supports_parallel_tool_calls": True,
+                    "use_responses_lite": False,
+                }],
+            },
+        )
+        refreshed_groups = models.build_groups(refreshed_catalog)
         broker = authentications.CredentialBroker()
         broker.install_openai_subscription(
             authentications.OpenAITokenSet(
@@ -1348,6 +1383,14 @@ class WorkerSessionContractTests(unittest.TestCase):
                         "configId": "model",
                         "value": value,
                     })
+                    first_profile = (
+                        loki.current_config().openai_request_profile)
+                    first_payload = (
+                        loki.current_config().chat_provider.chat_payload(
+                            [formats.message_item("user", "hello")],
+                            [],
+                            "gpt-test",
+                        ))
                     with mock.patch.object(
                             http_client,
                             "async_http_request",
@@ -1356,6 +1399,10 @@ class WorkerSessionContractTests(unittest.TestCase):
                             loki.current_config().url, {})
                     saved_name = os.path.basename(
                         first_session.chat_log_path)
+                    with open(
+                            first_session.chat_log_path,
+                            "r", encoding="utf-8") as stream:
+                        saved_text = stream.read()
                     await first_worker.close()
 
                     resumed_session = Session(shell_cwd=tmpdir)
@@ -1370,7 +1417,10 @@ class WorkerSessionContractTests(unittest.TestCase):
                             models,
                             "ensure_index",
                             new=mock.AsyncMock(
-                                return_value=({}, {}))):
+                                return_value=(
+                                    refreshed_catalog,
+                                    refreshed_groups,
+                                ))):
                         resumed = await resumed_worker.open({
                             "sessionId": "resumed",
                             "cwd": tmpdir,
@@ -1380,6 +1430,14 @@ class WorkerSessionContractTests(unittest.TestCase):
                         resumed["configOptions"][0]["currentValue"],
                         "loki-saved",
                     )
+                    resumed_profile = (
+                        loki.current_config().openai_request_profile)
+                    resumed_payload = (
+                        loki.current_config().chat_provider.chat_payload(
+                            [formats.message_item("user", "hello")],
+                            [],
+                            "gpt-test",
+                        ))
                     with mock.patch.object(
                             http_client,
                             "async_http_request",
@@ -1387,9 +1445,42 @@ class WorkerSessionContractTests(unittest.TestCase):
                         await loki.async_chat_request(
                             loki.current_config().url, {})
                     await resumed_worker.close()
+                    return (
+                        first_profile,
+                        resumed_profile,
+                        first_payload,
+                        resumed_payload,
+                        saved_text,
+                    )
 
-                asyncio.run(scenario())
+                (
+                    first_profile,
+                    resumed_profile,
+                    first_payload,
+                    resumed_payload,
+                    saved_text,
+                ) = asyncio.run(scenario())
 
+                self.assertNotEqual(first_profile, resumed_profile)
+                self.assertFalse(hasattr(first_profile, "tool_mode"))
+                self.assertFalse(hasattr(first_profile, "context_window"))
+                self.assertEqual(
+                    first_payload["reasoning"],
+                    {"effort": "low", "context": "all_turns"},
+                )
+                self.assertEqual(
+                    first_payload["text"], {"verbosity": "low"})
+                self.assertFalse(first_payload["parallel_tool_calls"])
+                self.assertEqual(
+                    resumed_payload["reasoning"],
+                    {"effort": "high", "summary": "detailed"},
+                )
+                self.assertEqual(
+                    resumed_payload["text"], {"verbosity": "medium"})
+                self.assertTrue(resumed_payload["parallel_tool_calls"])
+                self.assertNotIn("context", resumed_payload["reasoning"])
+                self.assertNotIn(
+                    "must not be copied into the session log", saved_text)
                 self.assertEqual(len(requests), 2)
                 for _method, url, headers in requests:
                     self.assertEqual(

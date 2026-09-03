@@ -718,6 +718,8 @@ async def async_main(args) -> int:
             resolve_chat_log_path(log_filename) if log_filename else None)
         loaded_chat = None
         saved_state = {}
+        refreshed_descriptor = None
+        discard_saved_connection = False
         if resolved_log_filename:
             try:
                 with open(resolved_log_filename, "r", encoding="utf-8") as f:
@@ -738,10 +740,24 @@ async def async_main(args) -> int:
                 if descriptor is None:
                     config = None
                 else:
+                    try:
+                        refreshed_descriptor = (
+                            await _core.refresh_connection_descriptor_async(
+                                descriptor,
+                                current_session().credential_authority,
+                                diagnostic_writer=_report_model_list_errors,
+                            ))
+                    except ValueError:
+                        # A successful authenticated catalog which no longer
+                        # contains this exact slug is authoritative. Keeping
+                        # the stale descriptor would repeat the same failure
+                        # on every resume.
+                        discard_saved_connection = True
+                        raise
                     config = config_from_connection_descriptor(
-                        descriptor, _core.CREDENTIALS)
+                        refreshed_descriptor, _core.CREDENTIALS)
                     confirmed = await confirm_saved_connection_async(
-                        descriptor, session, config=config)
+                        refreshed_descriptor, session, config=config)
                     if not confirmed:
                         print("Resume cancelled.", file=sys.stderr)
                         return 0
@@ -768,6 +784,15 @@ async def async_main(args) -> int:
 
         if resolved_log_filename:
             load_chat_log(resolved_log_filename, loaded_chat)
+            if discard_saved_connection:
+                current_session().session_state.pop("connection", None)
+                mark_chat_log_dirty()
+                save_chat_log()
+            elif (refreshed_descriptor is not None
+                    and refreshed_descriptor.to_dict()
+                    != saved_state.get("connection")):
+                set_session_connection(refreshed_descriptor)
+                save_chat_log()
             _ResumeTranscriptPresenter(
                 current_model() or "Assistant",
             ).write(current_transcript())

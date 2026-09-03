@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 from . import authentications
 from . import http_client
+from . import openai_models
 from . import protocols
 from .credentials import (
     CredentialInventory,
@@ -58,7 +59,7 @@ _OPENAI_SUBSCRIPTION_API_SOURCE = (
     "built-in OpenAI ChatGPT subscription endpoint")
 _LOKI_CREDENTIAL_REF_KEY = "_loki_credential_ref"
 _LOKI_MODELS_URL_KEY = "_loki_models_url"
-_LOKI_RESPONSES_LITE_KEY = "_loki_responses_lite"
+_LOKI_OPENAI_REQUEST_PROFILE_KEY = "_loki_openai_request_profile"
 _LOKI_SYNTHETIC_KEY = "_loki_synthetic"
 _OPENAI_SUBSCRIPTION_SENTINEL = object()
 OPENAI_SUBSCRIPTION_PROVIDER_ID = "openai-subscription"
@@ -188,7 +189,8 @@ def normalize_catalog(data):
     return normalized
 
 
-def _openai_subscription_model_entries(response):
+def _openai_subscription_model_entries(
+        response, *, diagnostic_writer=None):
     """Translate the authenticated Codex catalog into picker metadata."""
     if not isinstance(response, dict):
         raise ValueError("OpenAI subscription model catalog is not an object")
@@ -198,70 +200,83 @@ def _openai_subscription_model_entries(response):
             "OpenAI subscription model catalog has no models array")
 
     result = {}
-    for model in models:
+    seen_slugs = set()
+    for index, model in enumerate(models):
         if not isinstance(model, dict):
-            raise ValueError(
-                "OpenAI subscription model catalog contains a non-object")
+            if diagnostic_writer is not None:
+                diagnostic_writer(
+                    "Ignoring OpenAI subscription model "
+                    f"{index}: entry is not an object")
+            continue
         slug = model.get("slug")
         if not isinstance(slug, str) or not slug:
-            raise ValueError(
-                "OpenAI subscription model catalog contains an invalid slug")
-        if slug in result:
-            raise ValueError(
-                f"OpenAI subscription model catalog repeats slug {slug!r}")
+            if diagnostic_writer is not None:
+                diagnostic_writer(
+                    "Ignoring OpenAI subscription model "
+                    f"{index}: invalid slug")
+            continue
+        if slug in seen_slugs:
+            if diagnostic_writer is not None:
+                diagnostic_writer(
+                    "Ignoring repeated OpenAI subscription model "
+                    f"slug {slug!r}")
+            continue
+        seen_slugs.add(slug)
 
-        # Codex distinguishes picker-visible models from hidden compatibility
-        # entries. The authenticated account catalog remains authoritative:
-        # model capability fields affect request construction, not whether
-        # Loki silently removes a model the service made visible.
         if model.get("visibility") != "list":
             continue
-        responses_lite = model.get("use_responses_lite", False)
-        if not isinstance(responses_lite, bool):
-            raise ValueError(
-                f"OpenAI subscription model {slug!r} has invalid "
-                "Responses-Lite metadata")
-        tool_mode = model.get("tool_mode")
-        if tool_mode is not None and not isinstance(tool_mode, str):
-            raise ValueError(
-                f"OpenAI subscription model {slug!r} has invalid tool mode")
-        modalities = model.get("input_modalities")
-        if modalities is not None:
-            if (not isinstance(modalities, list)
-                    or not all(isinstance(item, str)
-                               for item in modalities)):
-                raise ValueError(
-                    f"OpenAI subscription model {slug!r} has invalid "
-                    "input modalities")
-            if "text" not in modalities:
-                continue
+
+        # These fields are used only to construct the picker entry. They do
+        # not cross into saved connections or request construction.
+        modalities = model.get("input_modalities", ["text", "image"])
+        reasoning_levels = model.get("supported_reasoning_levels", [])
+        if (not isinstance(modalities, list)
+                or not all(isinstance(item, str) for item in modalities)
+                or not isinstance(reasoning_levels, list)
+                or not all(
+                    isinstance(item, dict)
+                    and isinstance(item.get("effort"), str)
+                    and bool(item["effort"])
+                    for item in reasoning_levels)):
+            if diagnostic_writer is not None:
+                diagnostic_writer(
+                    "Ignoring OpenAI subscription model "
+                    f"{slug!r}: invalid discovery metadata")
+            continue
+        if "text" not in modalities:
+            continue
+        try:
+            request_profile = (
+                openai_models.CodexModelRequestProfile.from_catalog_model(
+                    model))
+        except openai_models.OpenAIModelProfileError as error:
+            if diagnostic_writer is not None:
+                diagnostic_writer(
+                    "Ignoring OpenAI subscription model "
+                    f"{slug!r}: {error}")
+            continue
+
         display_name = model.get("display_name")
         if not isinstance(display_name, str) or not display_name:
             display_name = slug
-        reasoning_levels = model.get("supported_reasoning_levels")
-        reasoning = (
-            isinstance(reasoning_levels, list)
-            and bool(reasoning_levels)
-        )
         result[slug] = {
             "id": slug,
             "name": display_name,
-            "reasoning": reasoning,
+            "reasoning": bool(reasoning_levels),
             "tool_call": True,
             "temperature": False,
-            "attachment": (
-                modalities is None or "image" in modalities),
+            "attachment": "image" in modalities,
             "structured_output": False,
             "open_weights": False,
-            # This is request-contract metadata, not a picker feature. Keep it
-            # on the synthetic in-memory leaf so selecting the model can build
-            # the matching Provider and persist that choice for resume.
-            _LOKI_RESPONSES_LITE_KEY: responses_lite,
+            # The full catalog entry stops here. Only request-relevant fields
+            # may cross selection, resume, ACP, and subagent boundaries.
+            _LOKI_OPENAI_REQUEST_PROFILE_KEY: request_profile,
         }
     return result
 
 
-def add_openai_subscription_catalog(data, response):
+def add_openai_subscription_catalog(
+        data, response, *, diagnostic_writer=None):
     """Add only models advertised for the authenticated ChatGPT account."""
     normalized = dict(data)
     normalized[OPENAI_SUBSCRIPTION_PROVIDER_ID] = {
@@ -270,7 +285,8 @@ def add_openai_subscription_catalog(data, response):
         "npm": "@ai-sdk/openai",
         "api": authentications.OPENAI_CHATGPT_RESPONSES_URL,
         "env": [],
-        "models": _openai_subscription_model_entries(response),
+        "models": _openai_subscription_model_entries(
+            response, diagnostic_writer=diagnostic_writer),
         _LOKI_API_SOURCE_KEY: _OPENAI_SUBSCRIPTION_API_SOURCE,
         _LOKI_CREDENTIAL_REF_KEY: (
             authentications.CredentialRef.openai_subscription().encode()),
@@ -284,19 +300,50 @@ def add_openai_subscription_catalog(data, response):
     return normalized
 
 
-def model_uses_responses_lite(provider_entry, model_entry):
-    """Return trusted per-model framing from Loki's synthetic catalog.
+def openai_request_profile(provider_entry, model_entry):
+    """Return a trusted request profile from Loki's synthetic catalog.
 
     Downloaded models.dev JSON is untrusted configuration and must not be
-    able to turn on a private OpenAI request contract. The unforgeable
+    able to configure the private OpenAI request contract. The unforgeable
     in-process sentinel proves both objects came through authenticated
-    ChatGPT discovery before this private model field is honored.
+    ChatGPT discovery before this request profile is honored.
     """
+    if provider_entry.get(_LOKI_SYNTHETIC_KEY) is not (
+            _OPENAI_SUBSCRIPTION_SENTINEL):
+        return None
+    profile = model_entry.get(_LOKI_OPENAI_REQUEST_PROFILE_KEY)
     return (
-        provider_entry.get(_LOKI_SYNTHETIC_KEY) is
-        _OPENAI_SUBSCRIPTION_SENTINEL
-        and model_entry.get(_LOKI_RESPONSES_LITE_KEY) is True
+        profile
+        if isinstance(profile, openai_models.CodexModelRequestProfile)
+        else None
     )
+
+
+def reconcile_openai_subscription_profile(
+        model, saved_profile, catalog):
+    """Use fresh exact-slug data, or a saved profile only while offline.
+
+    A present synthetic provider means authenticated discovery succeeded, even
+    when its model mapping is empty. In that case absence of ``model`` is an
+    authoritative removal and must not silently fall back to stale saved data.
+    """
+    provider = catalog.get(OPENAI_SUBSCRIPTION_PROVIDER_ID)
+    if provider is None:
+        if saved_profile is None:
+            raise ValueError(
+                "OpenAI subscription request profile is unavailable")
+        return saved_profile
+    model_entry = (provider.get("models") or {}).get(model)
+    if model_entry is None:
+        raise ValueError(
+            f"OpenAI subscription model {model!r} is not present in the "
+            "authenticated catalog")
+    profile = openai_request_profile(provider, model_entry)
+    if profile is None:
+        raise ValueError(
+            f"OpenAI subscription model {model!r} has no trusted request "
+            "profile")
+    return profile
 
 
 async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
@@ -440,7 +487,11 @@ async def ensure_index(
         try:
             response = await fetch_openai_subscription_models(
                 credential_authority)
-            data = add_openai_subscription_catalog(data, response)
+            data = add_openai_subscription_catalog(
+                data,
+                response,
+                diagnostic_writer=diagnostic_writer,
+            )
         except Exception as error:
             subscription_error = error
 

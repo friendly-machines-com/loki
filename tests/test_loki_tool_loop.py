@@ -28,6 +28,7 @@ from loki_agent import loki
 from loki_agent import subagents
 from loki_agent import terminal_frontend
 from loki_agent import models as modelsdev
+from loki_agent import openai_models
 from loki_agent import protocols
 from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
@@ -36,6 +37,23 @@ from loki_agent import terminals
 
 
 _MISSING = object()
+
+
+def _codex_model(slug="gpt-5-codex", **overrides):
+    value = {
+        "slug": slug,
+        "display_name": slug,
+        "visibility": "list",
+        "input_modalities": ["text", "image"],
+        "supported_reasoning_levels": [],
+        "supports_reasoning_summaries": False,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": False,
+        "supports_parallel_tool_calls": True,
+        "shell_type": "shell_command",
+    }
+    value.update(overrides)
+    return openai_models.CodexModelRequestProfile.from_catalog_model(value)
 
 
 def save_loki_state(names):
@@ -444,11 +462,16 @@ class ProviderReinstallTests(unittest.TestCase):
                 "https://chatgpt.com/backend-api/codex/responses",
                 protocols.OPENAI_RESPONSES,
                 model="old-model",
+                provider_id="openai-subscription",
                 credential_ref=credential,
                 auth_scheme="openai-subscription",
+                openai_request_profile=_codex_model("old-model"),
             ))
 
-            loki.reinstall_provider(model="new-model")
+            loki.reinstall_provider(
+                model="new-model",
+                openai_request_profile=_codex_model("new-model"),
+            )
 
             self.assertEqual(
                 loki.current_config().auth_spec.scheme,
@@ -583,7 +606,7 @@ class ProviderReinstallTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
-    def test_reinstall_preserves_responses_lite_only_for_same_model(self):
+    def test_reinstall_preserves_request_profile_only_for_same_model(self):
         saved = save_loki_state(["runtime_config"])
         try:
             loki.apply_runtime_config(loki.make_runtime_config(
@@ -593,18 +616,17 @@ class ProviderReinstallTests(unittest.TestCase):
                 provider_id="openai-subscription",
                 credential_ref=(
                     authentications.CredentialRef.openai_subscription()),
-                responses_lite=True,
+                openai_request_profile=_codex_model(
+                    "gpt-5.6-sol", use_responses_lite=True),
             ))
 
             loki.reinstall_provider(model="gpt-5.6-sol")
             self.assertTrue(loki.current_config().responses_lite)
 
-            loki.reinstall_provider(model="gpt-5.5")
-            self.assertFalse(loki.current_config().responses_lite)
-            self.assertNotIn(
-                protocols.RESPONSES_LITE_HEADER,
-                loki.current_config().headers,
-            )
+            with self.assertRaisesRegex(
+                    protocols.ProtocolError,
+                    "require authenticated request profile"):
+                loki.reinstall_provider(model="gpt-5.5")
         finally:
             restore_loki_state(saved)
 
@@ -612,6 +634,8 @@ class ProviderReinstallTests(unittest.TestCase):
 class RuntimeConfigTests(unittest.TestCase):
     def test_delegated_config_reconstructs_subscription_authentication(self):
         credential = authentications.CredentialRef.openai_subscription()
+        profile = _codex_model(
+            "gpt-5-codex", use_responses_lite=True)
         inventory = CredentialInventory({
             "LOKI_API_BASE":
                 "https://chatgpt.com/backend-api/codex/responses",
@@ -619,7 +643,8 @@ class RuntimeConfigTests(unittest.TestCase):
             "LOKI_MODEL": "gpt-5-codex",
             "LOKI_CREDENTIAL_REF": credential.encode(),
             "LOKI_AUTH_SCHEME": "openai-subscription",
-            "LOKI_RESPONSES_LITE": "1",
+            "LOKI_OPENAI_REQUEST_PROFILE": json.dumps(
+                profile.to_dict()),
         }, {credential})
 
         config = loki.build_config_from_env(credentials=inventory)
@@ -861,7 +886,8 @@ class RuntimeConfigTests(unittest.TestCase):
             credential_ref=credential,
             auth_scheme="openai-subscription",
             stream=True,
-            responses_lite=True,
+            openai_request_profile=_codex_model(
+                "gpt-5-codex", use_responses_lite=True),
         )
         inventory = CredentialInventory({}, {credential})
 
@@ -879,6 +905,78 @@ class RuntimeConfigTests(unittest.TestCase):
             config.chat_provider.models_url,
             authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
         )
+
+    def test_subscription_descriptor_refreshes_from_authenticated_catalog(
+            self):
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        descriptor = ConnectionDescriptor(
+            provider_id="openai-subscription",
+            provider_name="OpenAI ChatGPT subscription",
+            model="gpt-test",
+            chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
+            models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+            protocol=protocols.OPENAI_RESPONSES,
+            credential_env=None,
+            credential_ref=credential,
+            auth_scheme="openai-subscription",
+            openai_request_profile=_codex_model(
+                supports_parallel_tool_calls=False),
+        )
+        response = {
+            "models": [{
+                "slug": "gpt-test",
+                "display_name": "GPT Test",
+                "visibility": "list",
+                "input_modalities": ["text"],
+                "supported_reasoning_levels": [],
+                "supports_parallel_tool_calls": True,
+            }],
+        }
+
+        with mock.patch.object(
+                modelsdev,
+                "fetch_openai_subscription_models",
+                new=mock.AsyncMock(return_value=response)):
+            refreshed = asyncio.run(
+                loki.refresh_connection_descriptor_async(
+                    descriptor, object()))
+
+        self.assertIsNot(refreshed, descriptor)
+        self.assertTrue(
+            refreshed.openai_request_profile.supports_parallel_tool_calls)
+
+    def test_subscription_descriptor_uses_saved_profile_only_when_offline(
+            self):
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        descriptor = ConnectionDescriptor(
+            provider_id="openai-subscription",
+            provider_name="OpenAI ChatGPT subscription",
+            model="gpt-test",
+            chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
+            models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+            protocol=protocols.OPENAI_RESPONSES,
+            credential_env=None,
+            credential_ref=credential,
+            auth_scheme="openai-subscription",
+            openai_request_profile=_codex_model(),
+        )
+        diagnostics = []
+
+        with mock.patch.object(
+                modelsdev,
+                "fetch_openai_subscription_models",
+                new=mock.AsyncMock(side_effect=OSError("offline"))):
+            refreshed = asyncio.run(
+                loki.refresh_connection_descriptor_async(
+                    descriptor,
+                    object(),
+                    diagnostic_writer=diagnostics.append,
+                ))
+
+        self.assertEqual(refreshed, descriptor)
+        self.assertTrue(any("using saved" in item for item in diagnostics))
 
     def test_synthesized_subscription_selection_is_streaming_and_confined(
             self):
@@ -902,6 +1000,7 @@ class RuntimeConfigTests(unittest.TestCase):
                     "input_modalities": ["text"],
                     "supported_reasoning_levels": [],
                     "use_responses_lite": True,
+                    "supports_parallel_tool_calls": False,
                 }],
             },
         )
@@ -944,6 +1043,7 @@ class RuntimeConfigTests(unittest.TestCase):
             credential_env=None,
             credential_ref=credential,
             auth_scheme="openai-subscription",
+            openai_request_profile=_codex_model("gpt-test"),
         )
 
         with self.assertRaises(
@@ -1610,6 +1710,96 @@ class ModelLoadingTests(unittest.TestCase):
             seen_explicit[0], modelsdev.ExplicitConnectionOption)
         self.assertEqual(loki.current_config().url, explicit_url)
         self.assertEqual(loki.current_config().model, "private-model")
+
+
+class SubscriptionResumeTests(unittest.TestCase):
+    _state_names = [
+        "CREDENTIALS",
+        "runtime_config",
+        "credential_authority",
+        "transcript_items",
+        "session_todos",
+        "session_toolsets",
+        "session_state",
+        "chat_log_path",
+        "chat_log_dirty",
+    ]
+
+    def setUp(self):
+        self.saved_state = save_loki_state(self._state_names)
+
+    def tearDown(self):
+        restore_loki_state(self.saved_state)
+
+    def test_terminal_resume_confirms_and_saves_refreshed_profile(self):
+        credential = authentications.CredentialRef.openai_subscription()
+        old_profile = _codex_model(
+            supports_parallel_tool_calls=False)
+        new_profile = _codex_model(
+            supports_parallel_tool_calls=True)
+        old_descriptor = ConnectionDescriptor(
+            provider_id="openai-subscription",
+            provider_name="OpenAI ChatGPT subscription",
+            model="gpt-5-codex",
+            chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
+            models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+            protocol=protocols.OPENAI_RESPONSES,
+            credential_env=None,
+            credential_ref=credential,
+            auth_scheme="openai-subscription",
+            stream=True,
+            openai_request_profile=old_profile,
+        )
+        new_descriptor = ConnectionDescriptor(
+            **{
+                **old_descriptor.__dict__,
+                "openai_request_profile": new_profile,
+            },
+        )
+        loki.CREDENTIALS = CredentialInventory({}, {credential})
+        loki.current_session().credential_authority = object()
+        session = ScriptedInputSession([None])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            blob = formats.new_log_blob(
+                loki.initial_transcript_items(), [])
+            blob["session_state"] = {
+                "shell_cwd": tmpdir,
+                "connection": old_descriptor.to_dict(),
+            }
+            pathlib.Path(path).write_text(
+                json.dumps(blob), encoding="utf-8")
+            refresh = mock.AsyncMock(return_value=new_descriptor)
+            confirm = mock.AsyncMock(return_value=True)
+            with mock.patch(
+                    "loki_agent.terminal_frontend.input_session",
+                    return_value=session), mock.patch.object(
+                        loki,
+                        "refresh_connection_descriptor_async",
+                        new=refresh), mock.patch(
+                            "loki_agent.terminal_frontend."
+                            "confirm_saved_connection_async",
+                            new=confirm), mock.patch(
+                                "loki_agent.terminal_frontend."
+                                "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                status = asyncio.run(
+                    terminal_frontend.async_main([f"--resume={path}"]))
+            saved = json.loads(
+                pathlib.Path(path).read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 0)
+        refresh.assert_awaited_once_with(
+            old_descriptor,
+            loki.current_session().credential_authority,
+            diagnostic_writer=terminal_frontend._report_model_list_errors,
+        )
+        self.assertEqual(confirm.await_args.args[0], new_descriptor)
+        self.assertEqual(
+            saved["session_state"]["connection"],
+            new_descriptor.to_dict(),
+        )
 
 
 class ExitStatusTests(unittest.TestCase):
@@ -4243,6 +4433,16 @@ class SubagentLaunchTests(unittest.TestCase):
         saved = save_loki_state(["runtime_config"])
         credential = (
             authentications.CredentialRef.openai_subscription())
+        profile = _codex_model(
+            "gpt-5-codex",
+            use_responses_lite=True,
+            tool_mode="code_mode_only",
+            default_reasoning_level="high",
+            supported_reasoning_levels=[{"effort": "high"}],
+            supports_reasoning_summaries=True,
+            context_window=200000,
+            base_instructions="must not enter the child environment",
+        )
         manager = mock.Mock()
         manager.run_exec = mock.AsyncMock(return_value=(
             types.SimpleNamespace(exit_code=0),
@@ -4258,7 +4458,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 provider_id="openai-subscription",
                 credential_ref=credential,
                 auth_scheme="openai-subscription",
-                responses_lite=True,
+                openai_request_profile=profile,
             ))
             with mock.patch.object(
                     loki, "current_job_manager",
@@ -4278,8 +4478,14 @@ class SubagentLaunchTests(unittest.TestCase):
             kwargs["env"]["LOKI_AUTH_SCHEME"],
             "openai-subscription",
         )
+        encoded_profile = json.loads(
+            kwargs["env"]["LOKI_OPENAI_REQUEST_PROFILE"])
         self.assertEqual(
-            kwargs["env"]["LOKI_RESPONSES_LITE"], "1")
+            openai_models.CodexModelRequestProfile.from_dict(
+                encoded_profile),
+            profile,
+        )
+        self.assertNotIn("base_instructions", encoded_profile)
 
     def test_subagent_operation_is_cancelled_when_owner_fd_closes(self):
         async def scenario():
@@ -4605,7 +4811,9 @@ class SubagentLaunchTests(unittest.TestCase):
 
         self.assertNotIn("LOKI_API_KEY", child_env)
         self.assertEqual(child_env["LOKI_STREAM"], "0")
-        self.assertEqual(child_env["LOKI_RESPONSES_LITE"], "0")
+        self.assertNotIn("LOKI_OPENAI_REQUEST_PROFILE", child_env)
+        self.assertNotIn("LOKI_OPENAI_MODEL_METADATA", child_env)
+        self.assertNotIn("LOKI_RESPONSES_LITE", child_env)
         self.assertEqual(child_env["LOKI_MAX_TOKENS"], "12345")
         self.assertEqual(
             child_env["LOKI_ANTHROPIC_VERSION"], "2026-01-02")
@@ -4680,10 +4888,12 @@ class RequestTimeCredentialTests(unittest.TestCase):
             "https://chatgpt.com/backend-api/codex/responses",
             protocols.OPENAI_RESPONSES,
             model="gpt-5-codex",
+            provider_id="openai-subscription",
             credential_ref=(
                 authentications.CredentialRef.openai_subscription()),
             auth_scheme="openai-subscription",
             stream=stream,
+            openai_request_profile=_codex_model("gpt-5-codex"),
         ))
 
     def test_buffered_401_refreshes_once_with_same_idempotency_key(self):

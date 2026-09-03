@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from . import openai_models
 from .authentications import CredentialRef
 from .credentials import is_credential_name
 
@@ -43,7 +44,8 @@ class ConnectionDescriptor:
     model_status: str | None = None
     stream: bool = False
     prompt_cache: bool = False
-    responses_lite: bool = False
+    openai_request_profile: (
+        openai_models.CodexModelRequestProfile | None) = None
 
     def __post_init__(self):
         environment_ref = (
@@ -55,14 +57,22 @@ class ConnectionDescriptor:
               and self.credential_ref != environment_ref):
             raise ConnectionDescriptorError(
                 "connection credential and credential_env disagree")
-        if self.responses_lite and (
-                self.provider_id != "openai-subscription"
-                or self.protocol != "openai_responses"
-                or self.credential_ref
-                != CredentialRef.openai_subscription()):
+        subscription = (
+            self.provider_id == "openai-subscription"
+            and self.protocol == "openai_responses"
+            and self.credential_ref
+            == CredentialRef.openai_subscription())
+        if (self.openai_request_profile is not None
+                and not isinstance(
+                    self.openai_request_profile,
+                    openai_models.CodexModelRequestProfile)):
             raise ConnectionDescriptorError(
-                "connection responses_lite requires the OpenAI ChatGPT "
-                "subscription Responses provider")
+                "connection OpenAI request profile has the wrong type")
+        if ((self.openai_request_profile is not None) != subscription):
+            raise ConnectionDescriptorError(
+                "OpenAI ChatGPT subscription connections require "
+                "an authenticated request profile, and other connections must "
+                "not contain it")
 
     def to_dict(self) -> dict:
         return {
@@ -83,7 +93,9 @@ class ConnectionDescriptor:
             "model_status": self.model_status,
             "stream": self.stream,
             "prompt_cache": self.prompt_cache,
-            "responses_lite": self.responses_lite,
+            "openai_request_profile": (
+                self.openai_request_profile.to_dict()
+                if self.openai_request_profile is not None else None),
         }
 
     @classmethod
@@ -102,10 +114,6 @@ class ConnectionDescriptor:
         if not isinstance(prompt_cache, bool):
             raise ConnectionDescriptorError(
                 "connection prompt_cache must be a boolean")
-        responses_lite = value.get("responses_lite", False)
-        if not isinstance(responses_lite, bool):
-            raise ConnectionDescriptorError(
-                "connection responses_lite must be a boolean")
         if "credential_env" not in value:
             raise ConnectionDescriptorError(
                 "connection credential_env must be present")
@@ -131,6 +139,16 @@ class ConnectionDescriptor:
                 != CredentialRef.environment(credential_env)):
             raise ConnectionDescriptorError(
                 "connection credential and credential_env disagree")
+        raw_openai_request_profile = value.get("openai_request_profile")
+        if raw_openai_request_profile is None:
+            openai_request_profile = None
+        else:
+            try:
+                openai_request_profile = (
+                    openai_models.CodexModelRequestProfile.from_dict(
+                        raw_openai_request_profile))
+            except openai_models.OpenAIModelProfileError as error:
+                raise ConnectionDescriptorError(str(error)) from error
         return cls(
             provider_id=_optional_string(value.get("provider_id"), "provider_id"),
             provider_name=_optional_string(value.get("provider_name"), "provider_name"),
@@ -151,5 +169,5 @@ class ConnectionDescriptor:
                 value.get("model_status"), "model_status"),
             stream=stream,
             prompt_cache=prompt_cache,
-            responses_lite=responses_lite,
+            openai_request_profile=openai_request_profile,
         )

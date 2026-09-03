@@ -5,6 +5,7 @@ import urllib.parse
 from dataclasses import dataclass
 
 from . import formats
+from . import openai_models
 
 
 OPENAI_CHAT = "openai_chat"
@@ -62,6 +63,30 @@ class ResponseApiError(ProtocolError):
         if self.code:
             label += f" ({self.code})"
         return f"{label}: {self}"
+
+
+def _codex_reasoning_parameter(profile):
+    if not profile.supports_reasoning_summaries:
+        return None
+    reasoning = {}
+    if profile.default_reasoning_level is not None:
+        # Codex accepts "ultra" in model/config metadata but the Responses
+        # request contract currently represents it as "max".
+        reasoning["effort"] = (
+            "max"
+            if profile.default_reasoning_level == "ultra"
+            else profile.default_reasoning_level)
+    if profile.default_reasoning_summary != "none":
+        reasoning["summary"] = profile.default_reasoning_summary
+    if profile.use_responses_lite:
+        reasoning["context"] = "all_turns"
+    return reasoning
+
+
+def _codex_text_parameter(profile):
+    if not profile.supports_verbosity or profile.default_verbosity is None:
+        return None
+    return {"verbosity": profile.default_verbosity}
 
 
 _RESPONSE_RETRY_AFTER_RE = re.compile(
@@ -129,7 +154,15 @@ class Provider:
     provider_id: str | None = None
     provider_name: str | None = None
     prompt_cache: bool = False
-    responses_lite: bool = False
+    openai_request_profile: (
+        openai_models.CodexModelRequestProfile | None) = None
+
+    @property
+    def responses_lite(self):
+        return (
+            self.openai_request_profile is not None
+            and self.openai_request_profile.use_responses_lite
+        )
 
     def projection_target(self, model):
         return formats.projection_target(
@@ -180,26 +213,50 @@ class Provider:
                 "max_output_tokens": self.max_tokens,
             }
             if self.provider_id == "openai-subscription":
+                profile = self.openai_request_profile
+                if profile is None:
+                    raise ProtocolError(
+                        "OpenAI subscription requests require authenticated "
+                        "request profile for the selected model")
                 # ChatGPT's Codex backend is not the public Responses API.
-                # Match the native Codex client's explicit, stateless request
-                # contract while keeping generic compatible providers free of
-                # these OpenAI-specific controls.  In particular, encrypted
-                # reasoning must be returned so it can be replayed on the next
-                # full-history request, and subscription traffic must never
-                # ask the service to retain a response.
+                # The authenticated model catalog is part of this request
+                # contract. Do not infer capabilities from a framing flag:
+                # each selected model explicitly controls parallel tools,
+                # reasoning, and verbosity.
+                #
+                # tool_mode is deliberately absent here. It chooses Codex's
+                # client-side direct/code-mode tool plan; it is not a wire
+                # parameter. Loki always advertises its own direct function
+                # tools, including for models whose Codex catalog recommends
+                # code mode.
                 payload.pop("max_output_tokens")
                 payload.update({
                     "tool_choice": "auto",
-                    "parallel_tool_calls": not self.responses_lite,
+                    "parallel_tool_calls": (
+                        profile.supports_parallel_tool_calls
+                        and not profile.use_responses_lite),
                     "store": False,
-                    "include": ["reasoning.encrypted_content"],
                 })
+                reasoning = _codex_reasoning_parameter(profile)
+                if reasoning is not None:
+                    payload["reasoning"] = reasoning
+                    # Loki sends full history rather than provider-side
+                    # response IDs, so encrypted reasoning must be returned
+                    # and replayed with later requests.
+                    payload["include"] = [
+                        "reasoning.encrypted_content"]
+                text = _codex_text_parameter(profile)
+                if text is not None:
+                    payload["text"] = text
+                # Loki has no service-tier setting. Omitting service_tier asks
+                # the backend for its ordinary default; Codex likewise does
+                # not copy default_service_tier into a request unless a tier
+                # was selected by client configuration.
             if self.responses_lite:
                 # Responses-Lite is a distinct ChatGPT Codex request
                 # contract. Its header requires all-turn reasoning context,
                 # and its instructions and client tools are input items
                 # rather than top-level request fields.
-                payload["reasoning"] = {"context": "all_turns"}
                 prefix = []
                 lite_tools = (
                     formats.openai_tools_to_responses_lite_tools(tools))
@@ -1038,14 +1095,25 @@ def build_headers(protocol, anthropic_version="2023-06-01",
 def make_provider(input_url, provider=AUTO, models_url=None,
                   max_tokens=4096, anthropic_version="2023-06-01",
                   provider_id=None, provider_name=None, prompt_cache=False,
-                  responses_lite=False):
+                  openai_request_profile=None):
     protocol = resolve_protocol(input_url, provider)
-    if responses_lite and (
+    if (openai_request_profile is not None
+            and not isinstance(
+                openai_request_profile,
+                openai_models.CodexModelRequestProfile)):
+        raise ProtocolError(
+            "openai_request_profile must be CodexModelRequestProfile or null")
+    if openai_request_profile is not None and (
             protocol != OPENAI_RESPONSES
             or provider_id != "openai-subscription"):
         raise ProtocolError(
-            "Responses-Lite is only valid for the OpenAI ChatGPT "
-            "subscription Responses provider")
+            "OpenAI Codex request profiles are only valid for the OpenAI "
+            "ChatGPT subscription Responses provider")
+    if (provider_id == "openai-subscription"
+            and openai_request_profile is None):
+        raise ProtocolError(
+            "OpenAI ChatGPT subscription providers require authenticated "
+            "request profiles")
     if protocol == DUMMY:
         # No-op provider for testing: no real endpoint or URL structure.
         return Provider(
@@ -1059,14 +1127,15 @@ def make_provider(input_url, provider=AUTO, models_url=None,
             provider_id=provider_id,
             provider_name=provider_name,
             prompt_cache=False,
-            responses_lite=False,
+            openai_request_profile=None,
         )
     chat_url, resolved_models_url = endpoint_urls(input_url, protocol, models_url=models_url)
     model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
                                       explicit_models_url=models_url)
     headers = build_headers(
         protocol, anthropic_version=anthropic_version)
-    if responses_lite:
+    if (openai_request_profile is not None
+            and openai_request_profile.use_responses_lite):
         headers[RESPONSES_LITE_HEADER] = "true"
     return Provider(
         kind=protocol,
@@ -1079,7 +1148,7 @@ def make_provider(input_url, provider=AUTO, models_url=None,
         provider_id=provider_id,
         provider_name=provider_name,
         prompt_cache=prompt_cache,
-        responses_lite=responses_lite,
+        openai_request_profile=openai_request_profile,
     )
 
 

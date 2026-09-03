@@ -4,11 +4,62 @@ import json
 import unittest
 
 from loki_agent import formats
+from loki_agent import openai_models
 from loki_agent import protocols
 from loki_agent import sse
 
 
+def _codex_model(slug="gpt-test", **overrides):
+    value = {
+        "slug": slug,
+        "display_name": slug,
+        "visibility": "list",
+        "input_modalities": ["text", "image"],
+        "supported_reasoning_levels": [
+            {"effort": "high", "description": "High"},
+        ],
+        "default_reasoning_level": "high",
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "detailed",
+        "support_verbosity": True,
+        "default_verbosity": "medium",
+        "supports_parallel_tool_calls": True,
+        "shell_type": "shell_command",
+    }
+    value.update(overrides)
+    return openai_models.CodexModelRequestProfile.from_catalog_model(value)
+
+
 class OpenAIResponsesProviderTests(unittest.TestCase):
+    def test_codex_request_profile_ignores_non_request_model_fields(
+            self):
+        profile = _codex_model(
+            tool_mode="code_mode_only",
+            service_tiers={"malformed": "and ignored"},
+            context_window={"malformed": "and ignored"},
+            truncation_policy="malformed but ignored",
+            base_instructions="Codex application prompt",
+            model_messages={"instructions_template": "large UI prompt"},
+            server_extension={"future": True},
+        )
+
+        encoded = profile.to_dict()
+        decoded = openai_models.CodexModelRequestProfile.from_dict(encoded)
+
+        self.assertEqual(decoded, profile)
+        self.assertEqual(set(encoded), {
+            "use_responses_lite",
+            "supports_parallel_tool_calls",
+            "supports_reasoning_summaries",
+            "default_reasoning_level",
+            "default_reasoning_summary",
+            "supports_verbosity",
+            "default_verbosity",
+        })
+        self.assertNotIn("base_instructions", encoded)
+        self.assertNotIn("model_messages", encoded)
+        self.assertNotIn("server_extension", encoded)
+
     def test_responses_provider_derives_endpoint_from_v1_root(self):
         provider = protocols.make_provider(
             "https://api.openai.com/v1",
@@ -116,6 +167,7 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             provider=protocols.OPENAI_RESPONSES,
             provider_id="openai-subscription",
             max_tokens=1234,
+            openai_request_profile=_codex_model(),
         )
 
         payload = provider.streaming_chat_payload(
@@ -130,14 +182,83 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         self.assertTrue(payload["stream"])
         self.assertEqual(
             payload["include"], ["reasoning.encrypted_content"])
+        self.assertEqual(payload["reasoning"], {
+            "effort": "high",
+            "summary": "detailed",
+        })
+        self.assertEqual(payload["text"], {"verbosity": "medium"})
         self.assertNotIn("max_output_tokens", payload)
+
+    def test_subscription_parallel_tool_calls_follow_request_profile(self):
+        provider = protocols.make_provider(
+            "https://chatgpt.com/backend-api/codex/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="openai-subscription",
+            openai_request_profile=_codex_model(
+                supports_parallel_tool_calls=False),
+        )
+
+        payload = provider.streaming_chat_payload(
+            [formats.message_item("user", "hi")],
+            [],
+            "gpt-test",
+        )
+
+        self.assertFalse(payload["parallel_tool_calls"])
+
+    def test_unsupported_reasoning_and_verbosity_are_not_requested(self):
+        provider = protocols.make_provider(
+            "https://chatgpt.com/backend-api/codex/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="openai-subscription",
+            openai_request_profile=_codex_model(
+                supports_reasoning_summaries=False,
+                default_reasoning_level={"ignored": True},
+                default_reasoning_summary={"ignored": True},
+                support_verbosity=False,
+                default_verbosity={"ignored": True},
+            ),
+        )
+
+        payload = provider.streaming_chat_payload(
+            [formats.message_item("user", "hi")],
+            [],
+            "gpt-test",
+        )
+
+        self.assertNotIn("reasoning", payload)
+        self.assertNotIn("include", payload)
+        self.assertNotIn("text", payload)
+
+    def test_subscription_maps_catalog_ultra_reasoning_to_wire_max(self):
+        provider = protocols.make_provider(
+            "https://chatgpt.com/backend-api/codex/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="openai-subscription",
+            openai_request_profile=_codex_model(
+                default_reasoning_level="ultra"),
+        )
+
+        payload = provider.streaming_chat_payload(
+            [formats.message_item("user", "hi")],
+            [],
+            "gpt-test",
+        )
+
+        self.assertEqual(payload["reasoning"]["effort"], "max")
 
     def test_responses_lite_uses_input_items_for_instructions_and_tools(self):
         provider = protocols.make_provider(
             "https://chatgpt.com/backend-api/codex/responses",
             provider=protocols.OPENAI_RESPONSES,
             provider_id="openai-subscription",
-            responses_lite=True,
+            openai_request_profile=_codex_model(
+                "gpt-5.6-sol",
+                use_responses_lite=True,
+                tool_mode="code_mode_only",
+                default_reasoning_level="low",
+                default_reasoning_summary="none",
+            ),
         )
         tools = [{
             "type": "function",
@@ -166,7 +287,10 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         self.assertEqual(
             provider.headers[protocols.RESPONSES_LITE_HEADER], "true")
         self.assertFalse(payload["parallel_tool_calls"])
-        self.assertEqual(payload["reasoning"], {"context": "all_turns"})
+        self.assertEqual(payload["reasoning"], {
+            "effort": "low",
+            "context": "all_turns",
+        })
         self.assertNotIn("instructions", payload)
         self.assertNotIn("tools", payload)
         self.assertEqual(
@@ -193,7 +317,7 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             protocols.make_provider(
                 "https://example.test/v1/responses",
                 provider=protocols.OPENAI_RESPONSES,
-                responses_lite=True,
+                openai_request_profile=_codex_model(),
             )
 
     def test_subscription_parses_codex_model_catalog(self):
@@ -201,6 +325,7 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             "https://chatgpt.com/backend-api/codex/responses",
             provider=protocols.OPENAI_RESPONSES,
             provider_id="openai-subscription",
+            openai_request_profile=_codex_model("visible"),
         )
 
         model_ids = provider.parse_model_ids({
