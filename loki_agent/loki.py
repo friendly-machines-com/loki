@@ -250,6 +250,7 @@ class RuntimeConfig:
     model_status: str | None = None
     stream: bool = False
     prompt_cache: bool = False
+    responses_lite: bool = False
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
@@ -318,7 +319,7 @@ def make_runtime_config(
         max_tokens=4096, anthropic_version="2023-06-01",
         auth_header=None, auth_scheme=None, provider_id=None,
         provider_name=None, credential_ref=None, model_status=None,
-        stream=False, prompt_cache=False):
+        stream=False, prompt_cache=False, responses_lite=False):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -335,6 +336,7 @@ def make_runtime_config(
         provider_id=provider_id,
         provider_name=provider_name,
         prompt_cache=prompt_cache,
+        responses_lite=responses_lite,
     )
     auth_spec = _auth_spec(
         provider_kind, credential_ref, auth_header, auth_scheme)
@@ -360,6 +362,7 @@ def make_runtime_config(
         model_status=model_status,
         stream=stream,
         prompt_cache=prompt_cache,
+        responses_lite=responses_lite,
     )
 
 
@@ -422,6 +425,9 @@ def build_config_from_env(
     # configured endpoint uses LOKI_API_KEY when present and otherwise sends
     # no authentication header.
     credential_ref = _explicit_credential_ref(credentials)
+    subscription = (
+        credential_ref is not None
+        and credential_ref.kind == "openai-subscription")
 
     config_model = credentials.get("LOKI_MODEL") or ""
     return make_runtime_config(
@@ -434,7 +440,12 @@ def build_config_from_env(
             "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
         auth_scheme=credentials.get("LOKI_AUTH_SCHEME") or None,
-        provider_name="Explicit LOKI_* connection",
+        provider_id=(
+            modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
+            if subscription else None),
+        provider_name=(
+            "OpenAI ChatGPT subscription"
+            if subscription else "Explicit LOKI_* connection"),
         credential_ref=credential_ref,
         stream=_bool_setting("LOKI_STREAM", False, credentials),
         prompt_cache=_bool_setting(
@@ -443,6 +454,8 @@ def build_config_from_env(
             == "api.anthropic.com",
             credentials,
         ),
+        responses_lite=_bool_setting(
+            "LOKI_RESPONSES_LITE", False, credentials),
     )
 
 
@@ -484,6 +497,10 @@ def config_from_connection_descriptor(
         descriptor.model_status
         if not configured_model or configured_model == descriptor.model
         else None)
+    responses_lite = (
+        descriptor.responses_lite
+        if not configured_model or configured_model == descriptor.model
+        else False)
     max_tokens = (
         _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)
         if credentials.get("LOKI_MAX_TOKENS") else descriptor.max_tokens)
@@ -537,6 +554,7 @@ def config_from_connection_descriptor(
         model_status=model_status,
         stream=stream,
         prompt_cache=prompt_cache,
+        responses_lite=responses_lite,
     )
 
 
@@ -580,6 +598,8 @@ def config_from_modelsdev_selection(
             provider_id == "anthropic",
             credentials,
         ),
+        responses_lite=modelsdev.model_uses_responses_lite(
+            provider_entry, model_entry),
     )
 
 
@@ -606,6 +626,7 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         model_status=current_config().model_status,
         stream=current_config().stream,
         prompt_cache=current_config().prompt_cache,
+        responses_lite=provider.responses_lite,
     )
 
 
@@ -622,7 +643,8 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
                        models_url=None, max_tokens=None, anthropic_version=None,
                        auth_header=_UNSET, provider_id=None, provider_name=None,
                        credential_ref=_UNSET, auth_scheme=_UNSET,
-                       model_status=_UNSET, stream=None, prompt_cache=None):
+                       model_status=_UNSET, stream=None, prompt_cache=None,
+                       responses_lite=_UNSET):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -664,16 +686,24 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             else current.auth_scheme)
     else:
         new_auth_scheme = auth_scheme
+    same_catalog_entry = (
+        new_model == current.model
+        and new_url == current.url
+        and new_kind == current.provider_kind
+        and new_provider_id == current.provider_id)
     if model_status is _UNSET:
-        same_catalog_entry = (
-            new_model == current.model
-            and new_url == current.url
-            and new_kind == current.provider_kind
-            and new_provider_id == current.provider_id)
         new_model_status = (
             current.model_status if same_catalog_entry else None)
     else:
         new_model_status = model_status
+    if responses_lite is _UNSET:
+        # Responses-Lite is a per-model contract. Preserve it only when this
+        # is genuinely the same catalog leaf; carrying it to another model or
+        # provider would put that request on the wrong wire protocol.
+        new_responses_lite = (
+            current.responses_lite if same_catalog_entry else False)
+    else:
+        new_responses_lite = responses_lite
     apply_runtime_config(make_runtime_config(
         new_url,
         new_kind,
@@ -696,6 +726,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             prompt_cache
             if prompt_cache is not None
             else current.prompt_cache),
+        responses_lite=new_responses_lite,
     ))
 
 
@@ -2941,6 +2972,8 @@ def _subagent_env() -> dict:
         env['LOKI_STREAM'] = '1' if current_config().stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
             '1' if current_config().prompt_cache else '0')
+        env['LOKI_RESPONSES_LITE'] = (
+            '1' if current_config().responses_lite else '0')
         provider = current_config().chat_provider
         env['LOKI_MAX_TOKENS'] = str(provider.max_tokens)
         env['LOKI_ANTHROPIC_VERSION'] = (

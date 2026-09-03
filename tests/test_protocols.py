@@ -132,6 +132,70 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             payload["include"], ["reasoning.encrypted_content"])
         self.assertNotIn("max_output_tokens", payload)
 
+    def test_responses_lite_uses_input_items_for_instructions_and_tools(self):
+        provider = protocols.make_provider(
+            "https://chatgpt.com/backend-api/codex/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="openai-subscription",
+            responses_lite=True,
+        )
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        }]
+
+        payload = provider.streaming_chat_payload(
+            [
+                formats.instruction_item("system marker"),
+                formats.message_item("user", "read marker"),
+            ],
+            tools,
+            "gpt-5.6-sol",
+        )
+
+        self.assertEqual(
+            provider.headers[protocols.RESPONSES_LITE_HEADER], "true")
+        self.assertFalse(payload["parallel_tool_calls"])
+        self.assertEqual(payload["reasoning"], {"context": "all_turns"})
+        self.assertNotIn("instructions", payload)
+        self.assertNotIn("tools", payload)
+        self.assertEqual(
+            [item["type"] for item in payload["input"]],
+            ["additional_tools", "message", "message"],
+        )
+        additional = payload["input"][0]
+        self.assertEqual(additional["role"], "developer")
+        namespace = additional["tools"][0]
+        self.assertEqual(namespace["type"], "namespace")
+        self.assertEqual(namespace["name"], "functions")
+        self.assertTrue(namespace["description"])
+        self.assertEqual(namespace["tools"][0]["type"], "function")
+        self.assertEqual(namespace["tools"][0]["name"], "Read")
+        self.assertEqual(payload["input"][1]["role"], "developer")
+        self.assertEqual(
+            payload["input"][1]["content"][0]["text"], "system marker")
+        self.assertEqual(payload["input"][2]["role"], "user")
+
+    def test_responses_lite_is_confined_to_chatgpt_subscription(self):
+        with self.assertRaisesRegex(
+                protocols.ProtocolError,
+                "only valid for the OpenAI ChatGPT subscription"):
+            protocols.make_provider(
+                "https://example.test/v1/responses",
+                provider=protocols.OPENAI_RESPONSES,
+                responses_lite=True,
+            )
+
     def test_subscription_parses_codex_model_catalog(self):
         provider = protocols.make_provider(
             "https://chatgpt.com/backend-api/codex/responses",
@@ -1488,6 +1552,10 @@ class StreamAccumulatorTests(unittest.TestCase):
         accumulator.feed(self.event(
             '{"type":"response.output_text.delta","delta":"lo"}'))
         accumulator.feed(self.event(
+            '{"type":"response.output_item.done","output_index":0,'
+            '"item":{"type":"message","role":"assistant","content":'
+            '[{"type":"output_text","text":"non-authoritative"}]}}'))
+        accumulator.feed(self.event(
             '{"type":"response.completed","response":'
             '{"id":"resp_1","object":"response","status":"completed",'
             '"output":[{"id":"msg_1","type":"message",'
@@ -1499,6 +1567,37 @@ class StreamAccumulatorTests(unittest.TestCase):
 
         self.assertEqual(deltas, ["hel", "lo"])
         self.assertEqual(formats.item_text(items[0]), "hello")
+
+    def test_openai_responses_recovers_stream_items_from_empty_envelope(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        accumulator.feed(self.event(
+            '{"type":"response.output_item.done","output_index":1,'
+            '"item":{"type":"function_call","call_id":"call_1",'
+            '"name":"Read","arguments":"{\\"file_path\\":\\"README.md\\"}",'
+            '"status":"completed"}}'))
+        accumulator.feed(self.event(
+            '{"type":"response.output_item.done","output_index":0,'
+            '"item":{"type":"reasoning","encrypted_content":"opaque"}}'))
+        accumulator.feed(self.event(
+            '{"type":"response.completed","response":'
+            '{"id":"resp_1","object":"response","status":"completed",'
+            '"output":[]}}'))
+
+        response = accumulator.finish()
+        turn = formats.openai_responses_response_to_items(response)
+
+        self.assertEqual(
+            [item["type"] for item in response["output"]],
+            ["reasoning", "function_call"],
+        )
+        calls = formats.response_tool_calls(turn.items)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "Read")
+        self.assertEqual(
+            formats.tool_call_input(calls[0]),
+            {"file_path": "README.md"},
+        )
 
     def test_openai_responses_incomplete_stream_returns_partial_turn(self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(

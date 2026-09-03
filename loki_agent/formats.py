@@ -2312,3 +2312,32 @@ def openai_tools_to_responses_tools(tools):
         _put_optional(item, "strict", function.get("strict"))
         result.append(item)
     return result
+
+
+def openai_tools_to_responses_lite_tools(tools):
+    """Group ordinary function tools into Responses-Lite's namespace form."""
+    responses_tools = openai_tools_to_responses_tools(tools)
+    if not responses_tools:
+        return responses_tools
+
+    result = []
+    functions = []
+    functions_index = None
+    for tool in responses_tools:
+        if tool.get("type") == "function":
+            if functions_index is None:
+                functions_index = len(result)
+            functions.append(tool)
+        else:
+            result.append(tool)
+    if functions:
+        # Responses-Lite makes these functions available directly to the
+        # model; "functions" is the protocol's conventional default
+        # namespace, not part of Loki's internal tool names.
+        result.insert(functions_index, {
+            "type": "namespace",
+            "name": "functions",
+            "description": "Tools in the functions namespace.",
+            "tools": functions,
+        })
+    return result

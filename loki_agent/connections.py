@@ -43,6 +43,7 @@ class ConnectionDescriptor:
     model_status: str | None = None
     stream: bool = False
     prompt_cache: bool = False
+    responses_lite: bool = False
 
     def __post_init__(self):
         environment_ref = (
@@ -54,6 +55,14 @@ class ConnectionDescriptor:
               and self.credential_ref != environment_ref):
             raise ConnectionDescriptorError(
                 "connection credential and credential_env disagree")
+        if self.responses_lite and (
+                self.provider_id != "openai-subscription"
+                or self.protocol != "openai_responses"
+                or self.credential_ref
+                != CredentialRef.openai_subscription()):
+            raise ConnectionDescriptorError(
+                "connection responses_lite requires the OpenAI ChatGPT "
+                "subscription Responses provider")
 
     def to_dict(self) -> dict:
         return {
@@ -74,6 +83,7 @@ class ConnectionDescriptor:
             "model_status": self.model_status,
             "stream": self.stream,
             "prompt_cache": self.prompt_cache,
+            "responses_lite": self.responses_lite,
         }
 
     @classmethod
@@ -92,6 +102,10 @@ class ConnectionDescriptor:
         if not isinstance(prompt_cache, bool):
             raise ConnectionDescriptorError(
                 "connection prompt_cache must be a boolean")
+        responses_lite = value.get("responses_lite", False)
+        if not isinstance(responses_lite, bool):
+            raise ConnectionDescriptorError(
+                "connection responses_lite must be a boolean")
         if "credential_env" not in value:
             raise ConnectionDescriptorError(
                 "connection credential_env must be present")
@@ -137,4 +151,5 @@ class ConnectionDescriptor:
                 value.get("model_status"), "model_status"),
             stream=stream,
             prompt_cache=prompt_cache,
+            responses_lite=responses_lite,
         )

@@ -121,10 +121,14 @@ Its selectable models come only from that account's authenticated ChatGPT
 Codex model catalog; Loki does not copy OpenAI Platform models from models.dev
 into the subscription provider. Subscription authorization is permitted only
 for the exact ChatGPT Codex Responses URL and the model-list request with
-Loki's pinned Codex compatibility level. Models requiring Responses-Lite or a
-specialized tool mode are excluded until Loki implements those request
-contracts. Subscription authorization is never attached to the models.dev
-catalog request or to the OpenAI Platform API.
+Loki's pinned, tested Codex compatibility level. The authenticated account's
+picker-visible models remain authoritative; Loki does not silently remove
+models based on their request metadata. Models advertising Responses-Lite
+are sent with that protocol's header, all-turn reasoning context, developer
+input items, and namespaced client-function tools; the selected framing is
+stored with the connection so resume, ACP, and delegated subagents agree.
+Subscription authorization is never attached to the models.dev catalog
+request or to the OpenAI Platform API.
 
 Loki does not select a built-in provider connection at startup. Without an
 explicit `LOKI_API_BASE` or a saved session connection, it starts disconnected

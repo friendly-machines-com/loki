@@ -39,13 +39,12 @@ OPENAI_CHATGPT_RESPONSES_URL = (
 OPENAI_CHATGPT_MODELS_URL = (
     "https://chatgpt.com/backend-api/codex/models")
 # The private endpoint interprets client_version in Codex's compatibility
-# namespace: sending Loki's package version returns an empty catalog. Pin the
-# newest Codex request contract Loki actually implements. Codex 0.144.0 added
-# Responses-Lite/code-mode models, whose different tool framing Loki does not
-# implement; 0.124.0 exposes only the regular stateless Responses contract.
+# namespace: sending Loki's package version returns an empty catalog. This
+# value selects the current account catalog Loki has tested, rather than
+# claiming that Loki's unrelated package version is a Codex protocol level.
 # Because the complete URL is authorization-allowlisted below, advancing this
-# boundary requires an explicit protocol review.
-OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION = "0.124.0"
+# boundary requires an explicit protocol review and a live model request.
+OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION = "0.144.0"
 OPENAI_CHATGPT_MODELS_REQUEST_URL = (
     f"{OPENAI_CHATGPT_MODELS_URL}?client_version="
     f"{OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION}")

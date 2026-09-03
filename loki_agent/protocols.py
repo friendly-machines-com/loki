@@ -16,6 +16,7 @@ AUTO = "auto"
 # consumers reference this instead of re-listing the constants, so adding a
 # protocol here is all that is needed to teach the rest of the code about it.
 SUPPORTED_PROTOCOLS = [OPENAI_CHAT, ANTHROPIC_MESSAGES, OPENAI_RESPONSES]
+RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 
 
 class ProtocolError(ValueError):
@@ -49,6 +50,7 @@ class Provider:
     provider_id: str | None = None
     provider_name: str | None = None
     prompt_cache: bool = False
+    responses_lite: bool = False
 
     def projection_target(self, model):
         return formats.projection_target(
@@ -109,15 +111,42 @@ class Provider:
                 payload.pop("max_output_tokens")
                 payload.update({
                     "tool_choice": "auto",
-                    "parallel_tool_calls": True,
+                    "parallel_tool_calls": not self.responses_lite,
                     "store": False,
                     "include": ["reasoning.encrypted_content"],
                 })
-            if instructions:
-                payload["instructions"] = instructions
-            responses_tools = formats.openai_tools_to_responses_tools(tools)
-            if responses_tools:
-                payload["tools"] = responses_tools
+            if self.responses_lite:
+                # Responses-Lite is a distinct ChatGPT Codex request
+                # contract. Its header requires all-turn reasoning context,
+                # and its instructions and client tools are input items
+                # rather than top-level request fields.
+                payload["reasoning"] = {"context": "all_turns"}
+                prefix = []
+                lite_tools = (
+                    formats.openai_tools_to_responses_lite_tools(tools))
+                if lite_tools:
+                    prefix.append({
+                        "type": "additional_tools",
+                        "role": "developer",
+                        "tools": lite_tools,
+                    })
+                if instructions:
+                    prefix.append({
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": instructions,
+                        }],
+                    })
+                payload["input"] = prefix + input_items
+            else:
+                if instructions:
+                    payload["instructions"] = instructions
+                responses_tools = (
+                    formats.openai_tools_to_responses_tools(tools))
+                if responses_tools:
+                    payload["tools"] = responses_tools
             return payload
         if self.kind == DUMMY:
             # Never sent over the wire; async_chat_completion short-circuits on
@@ -576,6 +605,8 @@ class OpenAIResponsesStreamAccumulator:
         self.failed_response = None
         self.stream_error = None
         self.stream_extensions = []
+        self.output_items = {}
+        self.unindexed_output_items = []
 
     def _preserve_extension(self, context, value):
         formats.report_unknown(OPENAI_RESPONSES, context, value)
@@ -598,6 +629,19 @@ class OpenAIResponsesStreamAccumulator:
             delta = data.get("delta")
             if isinstance(delta, str) and delta:
                 self.on_text_delta(delta)
+        elif event_type == "response.output_item.done":
+            item = data.get("item")
+            if not isinstance(item, dict):
+                raise StreamProtocolError(
+                    "response.output_item.done is missing its item")
+            output_index = data.get("output_index")
+            if (isinstance(output_index, int)
+                    and not isinstance(output_index, bool)
+                    and output_index >= 0):
+                self.output_items[output_index] = copy.deepcopy(item)
+            else:
+                self.unindexed_output_items.append(
+                    copy.deepcopy(item))
         elif event_type == "response.completed":
             response = data.get("response")
             if not isinstance(response, dict):
@@ -621,6 +665,24 @@ class OpenAIResponsesStreamAccumulator:
         elif not _known_responses_stream_event(event_type):
             self._preserve_extension("stream event", data)
 
+    def _finish_response(self, response):
+        # The ordinary Responses stream repeats all output in the terminal
+        # envelope. ChatGPT's Responses-Lite stream currently sends completed
+        # items in response.output_item.done events but leaves that envelope's
+        # output array empty. Recover only an absent/empty array; a populated
+        # terminal envelope remains authoritative.
+        if not response.get("output"):
+            streamed = [
+                item for _index, item in sorted(self.output_items.items())
+            ]
+            streamed.extend(self.unindexed_output_items)
+            if streamed:
+                response["output"] = streamed
+        if self.stream_extensions:
+            response["_loki_stream_extensions"] = (
+                self.stream_extensions)
+        return response
+
     def finish(self):
         if self.stream_error is not None:
             raise StreamProtocolError(
@@ -628,24 +690,13 @@ class OpenAIResponsesStreamAccumulator:
                 payload=self.stream_error)
         if self.completed_response is None:
             if self.incomplete_response is not None:
-                response = self.incomplete_response
-                if self.stream_extensions:
-                    response["_loki_stream_extensions"] = (
-                        self.stream_extensions)
-                return response
+                return self._finish_response(self.incomplete_response)
             if self.failed_response is not None:
-                response = self.failed_response
-                if self.stream_extensions:
-                    response["_loki_stream_extensions"] = (
-                        self.stream_extensions)
-                return response
+                return self._finish_response(self.failed_response)
             raise StreamProtocolError(
                 "OpenAI Responses stream ended before response.completed "
                 "or another terminal response event")
-        if self.stream_extensions:
-            self.completed_response["_loki_stream_extensions"] = (
-                self.stream_extensions)
-        return self.completed_response
+        return self._finish_response(self.completed_response)
 
 
 def _known_responses_stream_event(event_type):
@@ -903,8 +954,15 @@ def build_headers(protocol, anthropic_version="2023-06-01",
 
 def make_provider(input_url, provider=AUTO, models_url=None,
                   max_tokens=4096, anthropic_version="2023-06-01",
-                  provider_id=None, provider_name=None, prompt_cache=False):
+                  provider_id=None, provider_name=None, prompt_cache=False,
+                  responses_lite=False):
     protocol = resolve_protocol(input_url, provider)
+    if responses_lite and (
+            protocol != OPENAI_RESPONSES
+            or provider_id != "openai-subscription"):
+        raise ProtocolError(
+            "Responses-Lite is only valid for the OpenAI ChatGPT "
+            "subscription Responses provider")
     if protocol == DUMMY:
         # No-op provider for testing: no real endpoint or URL structure.
         return Provider(
@@ -918,12 +976,15 @@ def make_provider(input_url, provider=AUTO, models_url=None,
             provider_id=provider_id,
             provider_name=provider_name,
             prompt_cache=False,
+            responses_lite=False,
         )
     chat_url, resolved_models_url = endpoint_urls(input_url, protocol, models_url=models_url)
     model_urls = model_url_candidates(input_url, protocol, resolved_models_url,
                                       explicit_models_url=models_url)
     headers = build_headers(
         protocol, anthropic_version=anthropic_version)
+    if responses_lite:
+        headers[RESPONSES_LITE_HEADER] = "true"
     return Provider(
         kind=protocol,
         input_url=input_url,
@@ -935,6 +996,7 @@ def make_provider(input_url, provider=AUTO, models_url=None,
         provider_id=provider_id,
         provider_name=provider_name,
         prompt_cache=prompt_cache,
+        responses_lite=responses_lite,
     )
 
 

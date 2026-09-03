@@ -58,6 +58,7 @@ _OPENAI_SUBSCRIPTION_API_SOURCE = (
     "built-in OpenAI ChatGPT subscription endpoint")
 _LOKI_CREDENTIAL_REF_KEY = "_loki_credential_ref"
 _LOKI_MODELS_URL_KEY = "_loki_models_url"
+_LOKI_RESPONSES_LITE_KEY = "_loki_responses_lite"
 _LOKI_SYNTHETIC_KEY = "_loki_synthetic"
 _OPENAI_SUBSCRIPTION_SENTINEL = object()
 OPENAI_SUBSCRIPTION_PROVIDER_ID = "openai-subscription"
@@ -210,11 +211,9 @@ def _openai_subscription_model_entries(response):
                 f"OpenAI subscription model catalog repeats slug {slug!r}")
 
         # Codex distinguishes picker-visible models from hidden compatibility
-        # entries. Loki likewise offers only "list" entries, and only models
-        # that use the regular Responses contract. Responses-Lite and special
-        # tool modes require different request/tool framing; advertising them
-        # before Loki implements that framing would make selection succeed but
-        # the first model request fail or silently lose its tools.
+        # entries. The authenticated account catalog remains authoritative:
+        # model capability fields affect request construction, not whether
+        # Loki silently removes a model the service made visible.
         if model.get("visibility") != "list":
             continue
         responses_lite = model.get("use_responses_lite", False)
@@ -226,8 +225,6 @@ def _openai_subscription_model_entries(response):
         if tool_mode is not None and not isinstance(tool_mode, str):
             raise ValueError(
                 f"OpenAI subscription model {slug!r} has invalid tool mode")
-        if responses_lite or tool_mode is not None:
-            continue
         modalities = model.get("input_modalities")
         if modalities is not None:
             if (not isinstance(modalities, list)
@@ -256,6 +253,10 @@ def _openai_subscription_model_entries(response):
                 modalities is None or "image" in modalities),
             "structured_output": False,
             "open_weights": False,
+            # This is request-contract metadata, not a picker feature. Keep it
+            # on the synthetic in-memory leaf so selecting the model can build
+            # the matching Provider and persist that choice for resume.
+            _LOKI_RESPONSES_LITE_KEY: responses_lite,
         }
     return result
 
@@ -281,6 +282,21 @@ def add_openai_subscription_catalog(data, response):
         _LOKI_SYNTHETIC_KEY: _OPENAI_SUBSCRIPTION_SENTINEL,
     }
     return normalized
+
+
+def model_uses_responses_lite(provider_entry, model_entry):
+    """Return trusted per-model framing from Loki's synthetic catalog.
+
+    Downloaded models.dev JSON is untrusted configuration and must not be
+    able to turn on a private OpenAI request contract. The unforgeable
+    in-process sentinel proves both objects came through authenticated
+    ChatGPT discovery before this private model field is honored.
+    """
+    return (
+        provider_entry.get(_LOKI_SYNTHETIC_KEY) is
+        _OPENAI_SUBSCRIPTION_SENTINEL
+        and model_entry.get(_LOKI_RESPONSES_LITE_KEY) is True
+    )
 
 
 async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):

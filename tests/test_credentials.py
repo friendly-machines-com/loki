@@ -406,6 +406,7 @@ class ConnectionDescriptorTests(unittest.TestCase):
             credential_ref=CredentialRef.openai_subscription(),
             auth_scheme="openai-subscription",
             stream=True,
+            responses_lite=True,
         )
 
         encoded = descriptor.to_dict()
@@ -417,6 +418,7 @@ class ConnectionDescriptorTests(unittest.TestCase):
             {"kind": "openai-subscription", "name": "openai"},
         )
         self.assertEqual(encoded["auth_scheme"], "openai-subscription")
+        self.assertIs(encoded["responses_lite"], True)
 
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):
@@ -458,6 +460,23 @@ class ConnectionDescriptorTests(unittest.TestCase):
                 "protocol": "anthropic_messages",
                 "credential_env": None,
                 "prompt_cache": "yes",
+            })
+        with self.assertRaises(ConnectionDescriptorError):
+            ConnectionDescriptor.from_dict({
+                "model": "x",
+                "chat_url": "https://example.test/v1/responses",
+                "protocol": "openai_responses",
+                "credential_env": None,
+                "responses_lite": "yes",
+            })
+        with self.assertRaises(ConnectionDescriptorError):
+            ConnectionDescriptor.from_dict({
+                "provider_id": "compatible",
+                "model": "x",
+                "chat_url": "https://example.test/v1/responses",
+                "protocol": "openai_responses",
+                "credential_env": None,
+                "responses_lite": True,
             })
 
 

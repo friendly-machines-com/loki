@@ -583,6 +583,31 @@ class ProviderReinstallTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
+    def test_reinstall_preserves_responses_lite_only_for_same_model(self):
+        saved = save_loki_state(["runtime_config"])
+        try:
+            loki.apply_runtime_config(loki.make_runtime_config(
+                "https://chatgpt.com/backend-api/codex/responses",
+                protocols.OPENAI_RESPONSES,
+                model="gpt-5.6-sol",
+                provider_id="openai-subscription",
+                credential_ref=(
+                    authentications.CredentialRef.openai_subscription()),
+                responses_lite=True,
+            ))
+
+            loki.reinstall_provider(model="gpt-5.6-sol")
+            self.assertTrue(loki.current_config().responses_lite)
+
+            loki.reinstall_provider(model="gpt-5.5")
+            self.assertFalse(loki.current_config().responses_lite)
+            self.assertNotIn(
+                protocols.RESPONSES_LITE_HEADER,
+                loki.current_config().headers,
+            )
+        finally:
+            restore_loki_state(saved)
+
 
 class RuntimeConfigTests(unittest.TestCase):
     def test_delegated_config_reconstructs_subscription_authentication(self):
@@ -594,12 +619,18 @@ class RuntimeConfigTests(unittest.TestCase):
             "LOKI_MODEL": "gpt-5-codex",
             "LOKI_CREDENTIAL_REF": credential.encode(),
             "LOKI_AUTH_SCHEME": "openai-subscription",
+            "LOKI_RESPONSES_LITE": "1",
         }, {credential})
 
         config = loki.build_config_from_env(credentials=inventory)
 
         self.assertEqual(config.auth_spec.credential, credential)
         self.assertEqual(config.auth_spec.scheme, "openai-subscription")
+        self.assertEqual(
+            config.provider_id, "openai-subscription")
+        self.assertTrue(config.responses_lite)
+        self.assertEqual(
+            config.headers[protocols.RESPONSES_LITE_HEADER], "true")
 
     def test_delegated_config_rejects_undelegated_credential(self):
         inventory = CredentialInventory({
@@ -830,6 +861,7 @@ class RuntimeConfigTests(unittest.TestCase):
             credential_ref=credential,
             auth_scheme="openai-subscription",
             stream=True,
+            responses_lite=True,
         )
         inventory = CredentialInventory({}, {credential})
 
@@ -841,6 +873,8 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_spec.credential, credential)
         self.assertEqual(config.auth_spec.scheme, "openai-subscription")
         self.assertEqual(config.auth_scheme, "openai-subscription")
+        self.assertTrue(config.responses_lite)
+        self.assertTrue(config.chat_provider.responses_lite)
         self.assertEqual(
             config.chat_provider.models_url,
             authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
@@ -867,6 +901,7 @@ class RuntimeConfigTests(unittest.TestCase):
                     "visibility": "list",
                     "input_modalities": ["text"],
                     "supported_reasoning_levels": [],
+                    "use_responses_lite": True,
                 }],
             },
         )
@@ -892,6 +927,9 @@ class RuntimeConfigTests(unittest.TestCase):
             authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
         )
         self.assertTrue(config.stream)
+        self.assertTrue(config.responses_lite)
+        self.assertEqual(
+            config.headers[protocols.RESPONSES_LITE_HEADER], "true")
 
     def test_saved_subscription_cannot_redirect_access_token(self):
         credential = (
@@ -4215,8 +4253,10 @@ class SubagentLaunchTests(unittest.TestCase):
                 "https://chatgpt.com/backend-api/codex/responses",
                 protocols.OPENAI_RESPONSES,
                 model="gpt-5-codex",
+                provider_id="openai-subscription",
                 credential_ref=credential,
                 auth_scheme="openai-subscription",
+                responses_lite=True,
             ))
             with mock.patch.object(
                     loki, "current_job_manager",
@@ -4236,6 +4276,8 @@ class SubagentLaunchTests(unittest.TestCase):
             kwargs["env"]["LOKI_AUTH_SCHEME"],
             "openai-subscription",
         )
+        self.assertEqual(
+            kwargs["env"]["LOKI_RESPONSES_LITE"], "1")
 
     def test_subagent_operation_is_cancelled_when_owner_fd_closes(self):
         async def scenario():
@@ -4561,6 +4603,7 @@ class SubagentLaunchTests(unittest.TestCase):
 
         self.assertNotIn("LOKI_API_KEY", child_env)
         self.assertEqual(child_env["LOKI_STREAM"], "0")
+        self.assertEqual(child_env["LOKI_RESPONSES_LITE"], "0")
         self.assertEqual(child_env["LOKI_MAX_TOKENS"], "12345")
         self.assertEqual(
             child_env["LOKI_ANTHROPIC_VERSION"], "2026-01-02")

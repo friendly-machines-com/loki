@@ -594,11 +594,29 @@ class CatalogNormalizationTests(unittest.TestCase):
         }
 
         normalized = models.add_openai_subscription_catalog({}, response)
+        provider = normalized["openai-subscription"]
+        entries = provider["models"]
 
         self.assertEqual(
-            list(normalized["openai-subscription"]["models"]),
-            ["visible"],
+            list(entries),
+            ["visible", "responses-lite", "special-tool-mode"],
         )
+        self.assertFalse(models.model_uses_responses_lite(
+            provider, entries["visible"]))
+        self.assertTrue(models.model_uses_responses_lite(
+            provider, entries["responses-lite"]))
+
+    def test_downloaded_catalog_cannot_enable_responses_lite(self):
+        self.assertFalse(models.model_uses_responses_lite(
+            {
+                "id": "forged",
+                "_loki_responses_lite": True,
+            },
+            {
+                "id": "model",
+                "_loki_responses_lite": True,
+            },
+        ))
 
     def test_downloaded_private_credential_marker_is_not_authority(self):
         credential = (
