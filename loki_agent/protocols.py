@@ -65,6 +65,20 @@ class ResponseApiError(ProtocolError):
         return f"{label}: {self}"
 
 
+@dataclass(frozen=True)
+class ProviderResponse:
+    """Decoded provider payload plus response-scoped observations.
+
+    These observations describe the provider exchange, not conversation
+    content. Keeping them beside the payload prevents transport metadata from
+    being injected into model-visible transcript items.
+    """
+
+    payload: object
+    effective_model: str | None = None
+    notice_codes: tuple[str, ...] = ()
+
+
 def _codex_reasoning_parameter(profile):
     if not profile.supports_reasoning_summaries:
         return None

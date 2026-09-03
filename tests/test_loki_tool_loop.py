@@ -1224,8 +1224,9 @@ class ModelLoadingTests(unittest.TestCase):
         }
 
         with mock.patch(
-                "loki_agent.loki.async_chat_request",
-                new=mock.AsyncMock(return_value=response)):
+                "loki_agent.loki.async_provider_request",
+                new=mock.AsyncMock(
+                    return_value=protocols.ProviderResponse(response))):
             loaded_models = asyncio.run(loki.load_models_async())
 
         self.assertEqual(loaded_models, ["first-model", "second-model"])
@@ -2264,11 +2265,11 @@ class SessionResponsePersistenceTests(unittest.TestCase):
                 openai_request_profile=_codex_model(),
             ))
             loki.current_session().prompt_cache_key = "session-cache-key"
-            request = mock.AsyncMock(return_value={
+            request = mock.AsyncMock(return_value=protocols.ProviderResponse({
                 "object": "response",
                 "status": "completed",
                 "output": [],
-            })
+            }))
             with mock.patch.object(
                     loki, "async_chat_stream_request", new=request):
                 asyncio.run(loki.async_chat_completion(
@@ -2395,17 +2396,21 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
         queued = list(responses)
 
         async def request(
-                request_url, payload, request_headers=None,
+                method, request_url, payload=None, request_headers=None,
                 report_errors=False, show_timing=False,
                 codex_turn_state=None):
             if not queued:
                 raise AssertionError("unexpected provider request")
+            if method != "POST":
+                raise AssertionError(
+                    f"unexpected provider method {method!r}")
             captured.append({
                 "url": request_url,
                 "payload": copy.deepcopy(payload),
                 "headers": copy.deepcopy(request_headers),
             })
-            return copy.deepcopy(queued.pop(0))
+            return protocols.ProviderResponse(
+                copy.deepcopy(queued.pop(0)))
 
         def assert_exhausted():
             if queued:
@@ -2633,13 +2638,19 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 with mock.patch.object(
                         http_client, "async_http_request", new=request):
                     loki.apply_runtime_config(provider_a)
-                    asyncio.run(loki.async_chat_request(
-                        provider_a.chat_provider.chat_url, {}))
+                    asyncio.run(loki.async_provider_request(
+                        "POST",
+                        provider_a.chat_provider.chat_url,
+                        {},
+                    ))
 
                     loki.apply_runtime_config(provider_b)
                     loki.new_chat_log(path)
-                    asyncio.run(loki.async_chat_request(
-                        provider_b.chat_provider.chat_url, {}))
+                    asyncio.run(loki.async_provider_request(
+                        "POST",
+                        provider_b.chat_provider.chat_url,
+                        {},
+                    ))
                     loki.save_chat_log()
 
                     loki.apply_runtime_config(provider_a)
@@ -2650,8 +2661,11 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     resumed = loki.config_from_connection_descriptor(
                         descriptor, loki.CREDENTIALS)
                     loki.apply_runtime_config(resumed)
-                    asyncio.run(loki.async_chat_request(
-                        resumed.chat_provider.chat_url, {}))
+                    asyncio.run(loki.async_provider_request(
+                        "POST",
+                        resumed.chat_provider.chat_url,
+                        {},
+                    ))
 
                 self.assertEqual(
                     [request["url"] for request in requests],
@@ -2752,7 +2766,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 }
 
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=requests_a), mock.patch(
                         "loki_agent.loki.dispatch_tool_async",
                         new=dispatch):
@@ -2861,7 +2875,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 }
 
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=requests_b), mock.patch(
                         "loki_agent.loki.dispatch_tool_async",
                         new=dispatch_b):
@@ -2971,7 +2985,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 }
 
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=requests_resume), mock.patch(
                         "loki_agent.loki.dispatch_tool_async",
                         new=dispatch_resumed):
@@ -3065,7 +3079,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     "incomplete tool call must not be dispatched")
 
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=incomplete_request), mock.patch(
                         "loki_agent.loki.dispatch_tool_async",
                         new=forbidden_dispatch):
@@ -3142,7 +3156,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 }],
             }], captured_chat)
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=chat_request):
                 recovered = asyncio.run(loki.run_tool_loop_async(
                     loki.current_transcript(),
@@ -3251,7 +3265,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 },
             ], captured_a)
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=requests_a):
                 answer_a = asyncio.run(loki.run_tool_loop_async(
                     loki.current_transcript(),
@@ -3312,7 +3326,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 "stop_reason": "end_turn",
             }], captured_b)
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=requests_b):
                 answer_b = asyncio.run(loki.run_tool_loop_async(
                     loki.current_transcript(),
@@ -3417,7 +3431,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 return {"ok": True, "content": "exact tool result"}
 
             with mock.patch(
-                    "loki_agent.loki.async_chat_request",
+                    "loki_agent.loki.async_provider_request",
                     new=requests), mock.patch(
                         "loki_agent.loki.dispatch_tool_async",
                         new=dispatch):
@@ -3534,11 +3548,13 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 captured = []
 
                 async def fake_request(
-                        request_url, payload, request_headers=None,
+                        method, request_url, payload=None,
+                        request_headers=None,
                         report_errors=False, show_timing=False,
                         codex_turn_state=None):
+                    self.assertEqual(method, "POST")
                     captured.append(copy.deepcopy(payload))
-                    return {
+                    return protocols.ProviderResponse({
                         "object": "response",
                         "status": "completed",
                         "output": [
@@ -3568,10 +3584,10 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                                 "arguments": '{"pattern":"marker"}',
                             },
                         ],
-                    }
+                    })
 
                 with mock.patch(
-                        "loki_agent.loki.async_chat_request",
+                        "loki_agent.loki.async_provider_request",
                         side_effect=fake_request):
                     target_turn = asyncio.run(
                         loki.async_chat_completion(
@@ -5014,11 +5030,12 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         with mock.patch.object(
                 loki.http_client, "async_http_request", new=request):
-            result = asyncio.run(loki.async_chat_request(
+            result = asyncio.run(loki.async_provider_request(
+                "POST",
                 loki.current_config().chat_provider.input_url,
                 {"input": []}))
 
-        self.assertEqual(result, {})
+        self.assertEqual(result.payload, {})
         self.assertEqual(len(calls), 2)
         first_headers = calls[0][2]["headers_in"]
         second_headers = calls[1][2]["headers_in"]
@@ -5044,7 +5061,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
             if len(calls) == 1:
                 raise loki.StreamingApiError(
                     url, 401, "Unauthorized", "{}")
-            return {}
+            return protocols.ProviderResponse({})
 
         with mock.patch.object(
                 loki, "_async_chat_stream_request_once",
@@ -5053,7 +5070,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 loki.current_config().chat_provider.input_url,
                 {"input": []}))
 
-        self.assertEqual(result, {})
+        self.assertEqual(result.payload, {})
         self.assertEqual(
             calls[0]["Authorization"], "Bearer access-old")
         self.assertEqual(
@@ -5077,7 +5094,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                     code="server_error",
                     retryable=True,
                 )
-            return {"id": "response"}
+            return protocols.ProviderResponse({"id": "response"})
 
         with mock.patch.object(
                 loki, "_async_chat_stream_request_once",
@@ -5090,7 +5107,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 loki.current_config().chat_provider.input_url,
                 {"input": []}))
 
-        self.assertEqual(result, {"id": "response"})
+        self.assertEqual(result.payload, {"id": "response"})
         self.assertEqual(len(calls), 3)
         self.assertEqual(
             len({
@@ -5306,11 +5323,11 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 url, payload, headers, on_text_delta, cancel_check,
                 codex_turn_state=None):
             observed.append(dict(headers))
-            return {
+            return protocols.ProviderResponse({
                 "object": "response",
                 "status": "completed",
                 "output": [],
-            }
+            })
 
         with mock.patch.object(
                 loki, "_async_chat_stream_request_once",
@@ -5436,7 +5453,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         with mock.patch.object(
                 loki.http_client, "async_http_request", new=request):
             with self.assertRaises(loki.ApiError):
-                asyncio.run(loki.async_chat_request(
+                asyncio.run(loki.async_provider_request(
+                    "POST",
                     loki.current_config().chat_provider.input_url,
                     {"input": []}))
 
@@ -5579,11 +5597,11 @@ class StreamingCompletionTests(unittest.TestCase):
                 url, payload, headers, on_text_delta, cancel_check,
                 codex_turn_state=None):
             observed.append((dict(headers), codex_turn_state))
-            return {
+            return protocols.ProviderResponse({
                 "object": "response",
                 "status": "completed",
                 "output": [],
-            }
+            })
 
         with mock.patch.object(
                 loki, "_async_chat_stream_request_once",

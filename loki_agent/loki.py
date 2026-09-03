@@ -4122,14 +4122,23 @@ def _capture_codex_turn_state(headers, turn_state):
             return
 
 
-async def async_chat_request(request_url: str, payload, request_headers: dict = None,
-                             report_errors: bool = False, show_timing: bool = False,
-                             cancel_check=None,
-                             codex_turn_state=None) -> dict:
+async def async_provider_request(
+        method: str, request_url: str, payload=None,
+        request_headers: dict = None, report_errors: bool = False,
+        show_timing: bool = False, cancel_check=None,
+        codex_turn_state=None) -> protocols.ProviderResponse:
     start = time.perf_counter()
     config = current_config()
-    body = json.dumps(payload).encode('utf-8') if payload is not None else b''
-    method = 'POST' if payload is not None else 'GET'
+    method = method.upper()
+    if method not in {"GET", "POST"}:
+        raise ValueError("provider request method must be GET or POST")
+    if method == "GET" and payload is not None:
+        raise ValueError("GET provider requests cannot contain a payload")
+    if method == "POST" and payload is None:
+        raise ValueError("POST provider requests require a payload")
+    body = (
+        json.dumps(payload).encode("utf-8")
+        if method == "POST" else b"")
     turn_state = (
         _codex_turn_state_for_request(
             config, request_url, codex_turn_state)
@@ -4219,7 +4228,7 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     elapsed = time.perf_counter() - start
     if show_timing:
         print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]", file=sys.stderr)
-    return data
+    return protocols.ProviderResponse(data)
 
 
 async def _next_stream_chunk(iterator, cancel_check):
@@ -4322,7 +4331,7 @@ async def _first_body_chunk(iterator, cancel_check):
 
 async def _async_chat_stream_request_once(
         request_url, payload, request_headers, on_text_delta, cancel_check,
-        codex_turn_state=None):
+        codex_turn_state=None) -> protocols.ProviderResponse:
     body = json.dumps(payload).encode("utf-8")
     async with http_client.async_http_stream(
             "POST",
@@ -4366,8 +4375,9 @@ async def _async_chat_stream_request_once(
                         f"stream interrupted after output began: {e}") from e
                 raise
             try:
-                return json.loads(_decode_http_text(
-                    response_body, response.headers))
+                return protocols.ProviderResponse(json.loads(
+                    _decode_http_text(
+                        response_body, response.headers)))
             except json.JSONDecodeError as e:
                 raise protocols.StreamProtocolError(
                     "streaming response was neither valid SSE nor JSON: "
@@ -4380,7 +4390,8 @@ async def _async_chat_stream_request_once(
         try:
             for event in decoder.feed(first_chunk):
                 if accumulator.feed(event):
-                    return accumulator.finish()
+                    return protocols.ProviderResponse(
+                        accumulator.finish())
             while True:
                 try:
                     chunk = await _next_stream_chunk(
@@ -4390,10 +4401,12 @@ async def _async_chat_stream_request_once(
                 received_body = received_body or bool(chunk)
                 for event in decoder.feed(chunk):
                     if accumulator.feed(event):
-                        return accumulator.finish()
+                        return protocols.ProviderResponse(
+                            accumulator.finish())
             for event in decoder.finish():
                 if accumulator.feed(event):
-                    return accumulator.finish()
+                    return protocols.ProviderResponse(
+                        accumulator.finish())
         except StreamCancelled:
             raise
         except protocols.ResponseApiError:
@@ -4408,14 +4421,14 @@ async def _async_chat_stream_request_once(
                 raise protocols.StreamProtocolError(
                     f"stream interrupted after output began: {e}") from e
             raise
-        return accumulator.finish()
+        return protocols.ProviderResponse(accumulator.finish())
 
 
 async def async_chat_stream_request(
         request_url: str, payload, request_headers: dict = None,
         on_text_delta=None, cancel_check=None,
         report_errors: bool = False, show_timing: bool = False,
-        codex_turn_state=None) -> dict:
+        codex_turn_state=None) -> protocols.ProviderResponse:
     start = time.perf_counter()
     config = current_config()
     callback = on_text_delta or (lambda text: None)
@@ -4448,7 +4461,7 @@ async def async_chat_stream_request(
         _prepare_codex_turn_headers(headers_to_use, turn_state)
         transport_attempt += 1
         try:
-            data = await _async_chat_stream_request_once(
+            response = await _async_chat_stream_request_once(
                 request_url, payload, headers_to_use, callback, cancel,
                 codex_turn_state=turn_state)
             break
@@ -4497,7 +4510,7 @@ async def async_chat_stream_request(
     if show_timing:
         print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]",
               file=sys.stderr)
-    return data
+    return response
 
 
 async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
@@ -4571,11 +4584,12 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         }
         if codex_turn_state is not None:
             request_kwargs["codex_turn_state"] = codex_turn_state
-        data = await async_chat_stream_request(
+        response = await async_chat_stream_request(
             current_config().chat_provider.chat_url,
             payload,
             **request_kwargs,
         )
+        data = response.payload
     else:
         payload = current_config().chat_provider.chat_payload(
             transcript_items,
@@ -4594,11 +4608,13 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                 request_kwargs["cancel_check"] = cancel_check
             if codex_turn_state is not None:
                 request_kwargs["codex_turn_state"] = codex_turn_state
-            data = await async_chat_request(
+            response = await async_provider_request(
+                "POST",
                 current_config().chat_provider.chat_url,
                 payload,
                 **request_kwargs,
             )
+            data = response.payload
         except http_client.HttpRequestCancelled:
             raise StreamCancelled()
     if not isinstance(data, dict):
@@ -4674,9 +4690,9 @@ async def load_models_async(diagnostic_writer=None):
     errors = []
     for models_url in model_urls:
         try:
-            data = await async_chat_request(
+            response = await async_provider_request(
+                "GET",
                 models_url,
-                None,
                 request_headers=current_config().chat_provider.headers,
                 report_errors=True,
             )
@@ -4694,7 +4710,8 @@ async def load_models_async(diagnostic_writer=None):
             errors.append(
                 f"Model list at <{models_url}> was not JSON: {message}")
             continue
-        loaded = current_config().chat_provider.parse_model_ids(data)
+        loaded = current_config().chat_provider.parse_model_ids(
+            response.payload)
         if loaded:
             return loaded
 

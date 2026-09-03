@@ -1517,7 +1517,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                             http_client,
                             "async_http_request",
                             new=request):
-                        await loki.async_chat_request(
+                        await loki.async_provider_request(
+                            "POST",
                             loki.current_config().chat_provider.input_url,
                             {})
                     saved_name = os.path.basename(
@@ -1584,7 +1585,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                             http_client,
                             "async_http_request",
                             new=request):
-                        await loki.async_chat_request(
+                        await loki.async_provider_request(
+                            "POST",
                             loki.current_config().chat_provider.input_url,
                             {})
                     await resumed_worker.close()

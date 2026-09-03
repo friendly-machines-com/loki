@@ -35,8 +35,12 @@ class ProviderResponseContractTests(unittest.TestCase):
                 http_client, "async_http_request",
                 new=mock.AsyncMock(return_value=response)):
             with self.assertRaises(protocols.ProtocolError):
-                asyncio.run(loki.async_chat_request(
-                    response.url, {"model": "x"}, request_headers={}))
+                asyncio.run(loki.async_provider_request(
+                    "POST",
+                    response.url,
+                    {"model": "x"},
+                    request_headers={},
+                ))
 
     def test_chat_posts_and_model_gets_use_separate_timeouts(self):
         response = http_client.HttpResponse(
@@ -47,15 +51,23 @@ class ProviderResponseContractTests(unittest.TestCase):
             b"{}",
         )
 
-        for payload, expected_timeout in [
-                ({"model": "x"}, loki.LLM_REQUEST_TIMEOUT_S),
-                (None, loki.WEBFETCH_TIMEOUT_S)]:
+        for method, payload, expected_timeout in [
+                ("POST", {"model": "x"}, loki.LLM_REQUEST_TIMEOUT_S),
+                ("GET", None, loki.WEBFETCH_TIMEOUT_S)]:
             transport = mock.AsyncMock(return_value=response)
-            with self.subTest(payload=payload), mock.patch.object(
+            with self.subTest(method=method), mock.patch.object(
                     http_client, "async_http_request", new=transport):
-                asyncio.run(loki.async_chat_request(
-                    response.url, payload, request_headers={}))
+                provider_response = asyncio.run(loki.async_provider_request(
+                    method,
+                    response.url,
+                    payload,
+                    request_headers={},
+                ))
 
+            self.assertIsInstance(
+                provider_response, protocols.ProviderResponse)
+            self.assertEqual(provider_response.payload, {})
+            self.assertEqual(transport.await_args.args[0], method)
             self.assertEqual(
                 transport.await_args.kwargs["timeout"],
                 expected_timeout,
