@@ -190,7 +190,7 @@ def provider_operation_item(call_id, name, input_value, output=None, *,
 def model_response_event(protocol, items, *, provider=None, endpoint=None,
                          model=None,
                          status="completed", stop_reason=None, usage=None,
-                         protocol_data=None):
+                         end_turn=None, protocol_data=None):
     event = {
         "type": "model_response",
         "protocol": protocol,
@@ -202,6 +202,7 @@ def model_response_event(protocol, items, *, provider=None, endpoint=None,
     _put_optional(event, "model", model)
     _put_optional(event, "stop_reason", stop_reason)
     _put_optional(event, "usage", usage)
+    _put_optional(event, "end_turn", end_turn)
     if protocol_data:
         event["protocol_data"] = _copy(protocol_data)
     return event
@@ -247,6 +248,7 @@ class DecodedTurn:
             status=status,
             stop_reason=self.metadata.get("stop_reason"),
             usage=self.metadata.get("usage"),
+            end_turn=self.metadata.get("end_turn"),
             protocol_data=self.metadata.get("protocol_data"),
         )
 
@@ -474,6 +476,11 @@ def _validate_response(event, index):
             raise TranscriptFormatError(
                 f"event {index} model_response {field_name} "
                 "must be a string or null")
+    end_turn = event.get("end_turn")
+    if end_turn is not None and not isinstance(end_turn, bool):
+        raise TranscriptFormatError(
+            f"event {index} model_response end_turn "
+            "must be a boolean or null")
     response_calls = set()
     for item in items:
         if item.get("type") == "provider_operation":
@@ -1312,12 +1319,17 @@ def openai_responses_response_to_items(response):
             "background", "_loki_stream_extensions",
             "frequency_penalty", "moderation", "presence_penalty",
             "tool_usage",
+            "end_turn",
         }
     }
     if unknown_envelope:
         report_unknown(
             OPENAI_RESPONSES, "response fields", unknown_envelope)
     status = response.get("status", "completed")
+    end_turn = response.get("end_turn")
+    if end_turn is not None and not isinstance(end_turn, bool):
+        raise TranscriptFormatError(
+            "OpenAI Responses end_turn must be a boolean or null")
     protocol_data = {}
     for key in ["incomplete_details", "error"]:
         _put_optional(protocol_data, key, response.get(key))
@@ -1327,6 +1339,7 @@ def openai_responses_response_to_items(response):
             "protocol": OPENAI_RESPONSES,
             "status": status,
             "usage": _copy(response.get("usage")),
+            "end_turn": end_turn,
             "protocol_data": (
                 {OPENAI_RESPONSES: protocol_data}
                 if protocol_data else None),

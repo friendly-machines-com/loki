@@ -5728,6 +5728,42 @@ class ResponsesToolLoopTests(unittest.TestCase):
             ["message", "model_response", "model_response"],
         )
 
+    def test_responses_end_turn_false_requests_another_sample(self):
+        transcript = [formats.message_item("user", "continue")]
+        requests = []
+
+        async def chat_fn(items):
+            requests.append(copy.deepcopy(items))
+            if len(requests) == 1:
+                return formats.DecodedTurn(
+                    [formats.message_item("assistant", "first part")],
+                    {
+                        "protocol": formats.OPENAI_RESPONSES,
+                        "end_turn": False,
+                    },
+                )
+            return formats.DecodedTurn(
+                [formats.message_item("assistant", "finished")],
+                {
+                    "protocol": formats.OPENAI_RESPONSES,
+                    "end_turn": True,
+                },
+            )
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            transcript,
+            chat_fn=chat_fn,
+            max_loops=3,
+        ))
+
+        self.assertEqual(result, "finished")
+        self.assertEqual(len(requests), 2)
+        self.assertIs(requests[1][-1]["end_turn"], False)
+        self.assertEqual(
+            [item["type"] for item in transcript],
+            ["message", "model_response", "model_response"],
+        )
+
 
 class HarnessProjectionTests(unittest.TestCase):
     def test_allowed_tool_subset_is_the_only_schema_advertised(self):

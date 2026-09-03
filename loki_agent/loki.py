@@ -2848,6 +2848,16 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
             # tool-result event belongs between the two provider responses.
             continue
 
+        if turn.metadata.get("end_turn") is False and not tool_calls:
+            if loop_count >= max_loops:
+                on_event({"type": "max_loops"})
+                return assistant_text
+            # Responses-Lite can explicitly say that a completed response is
+            # not the end of the logical turn.  Preserve the real response
+            # boundary, then let the provider continue from that history
+            # without inventing a user message or tool result.
+            continue
+
         if not turn.items:
             return ""
         if not assistant_items and not tool_calls:

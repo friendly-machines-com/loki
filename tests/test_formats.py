@@ -584,6 +584,33 @@ class SameProtocolReplayTests(unittest.TestCase):
             ]))
         self.assertEqual(rendered, output)
 
+    def test_responses_end_turn_is_known_and_persisted(self):
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            turn = formats.openai_responses_response_to_items({
+                "object": "response",
+                "status": "completed",
+                "end_turn": False,
+                "output": [],
+            })
+
+        event = turn.to_event()
+
+        self.assertEqual(diagnostics.getvalue(), "")
+        self.assertIs(turn.metadata["end_turn"], False)
+        self.assertIs(event["end_turn"], False)
+        formats.validate_events([event])
+
+    def test_responses_end_turn_rejects_non_boolean_values(self):
+        with self.assertRaisesRegex(
+                formats.TranscriptFormatError, "end_turn"):
+            formats.openai_responses_response_to_items({
+                "object": "response",
+                "status": "completed",
+                "end_turn": "false",
+                "output": [],
+            })
+
     def test_native_replay_requires_the_originating_connection(self):
         event = formats.model_response_event(
             formats.OPENAI_RESPONSES,
