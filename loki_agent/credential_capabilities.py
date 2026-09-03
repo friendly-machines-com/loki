@@ -307,10 +307,8 @@ class CredentialCapabilityServer:
         self.allowed = allowed
         self._reader = reader
         self._writer = writer
-        self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._writer_close_task = None
-        self._requests: set[asyncio.Task] = set()
         self._closed = False
         self._reader_task = asyncio.create_task(
             self._read_messages(), name="credential-capability-server")
@@ -348,21 +346,16 @@ class CredentialCapabilityServer:
                 if not raw:
                     break
                 message = _decode(raw)
-                task = asyncio.create_task(
-                    self._answer(message),
-                    name="credential-capability-request",
-                )
-                self._requests.add(task)
-                task.add_done_callback(self._requests.discard)
+                # One capability has one ordered request stream. Processing it
+                # sequentially gives natural socket backpressure and prevents
+                # an untrusted child from creating an unbounded server task
+                # set. Credential refresh is single-flighted by the authority,
+                # so parallel server dispatch would add no useful concurrency.
+                await self._answer(message)
         except (CapabilityError, ConnectionError, OSError, ValueError):
             pass
         finally:
             await self._close_writer()
-            requests = list(self._requests)
-            for task in requests:
-                task.cancel()
-            if requests:
-                await asyncio.gather(*requests, return_exceptions=True)
 
     async def _answer(self, message: dict):
         request_id = message.get("id")
@@ -382,11 +375,10 @@ class CredentialCapabilityServer:
             }
         try:
             encoded = _encode(response)
-            async with self._write_lock:
-                if self._closed:
-                    return
-                self._writer.write(encoded)
-                await self._writer.drain()
+            if self._closed:
+                return
+            self._writer.write(encoded)
+            await self._writer.drain()
         except (BrokenPipeError, ConnectionError, OSError):
             pass
 
@@ -438,11 +430,6 @@ class CredentialCapabilityServer:
     async def close(self):
         self.close_now()
         await asyncio.gather(self._reader_task, return_exceptions=True)
-        requests = list(self._requests)
-        for task in requests:
-            task.cancel()
-        if requests:
-            await asyncio.gather(*requests, return_exceptions=True)
         await self._close_writer()
 
     def close_now(self):
@@ -452,5 +439,3 @@ class CredentialCapabilityServer:
             self._writer.close()
         if not self._reader_task.done():
             self._reader_task.cancel()
-        for task in list(self._requests):
-            task.cancel()

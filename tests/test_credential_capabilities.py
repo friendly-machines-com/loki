@@ -113,6 +113,41 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [lease.value for lease in leases].count("second-secret"), 10)
 
+    async def test_server_serializes_requests_for_bounded_backpressure(self):
+        active = 0
+        maximum = 0
+
+        class MeasuringAuthority:
+            def available(inner_self):
+                return frozenset({self.first})
+
+            async def lease(
+                    inner_self, credential,
+                    rejected_generation=None):
+                nonlocal active, maximum
+                active += 1
+                maximum = max(maximum, active)
+                try:
+                    await asyncio.sleep(0)
+                    return authentications.CredentialLease(
+                        credential, "secret")
+                finally:
+                    active -= 1
+
+        self.server, child_fd = (
+            await credential_capabilities.CredentialCapabilityServer.create(
+                MeasuringAuthority(), {self.first}))
+        self.client = (
+            await credential_capabilities.CredentialClient.from_fd(child_fd))
+
+        leases = await asyncio.gather(*[
+            self.client.lease(self.first) for _ in range(20)
+        ])
+
+        self.assertEqual(maximum, 1)
+        self.assertEqual(
+            [lease.value for lease in leases], ["secret"] * 20)
+
     async def test_owner_close_fails_pending_and_future_requests(self):
         started = asyncio.Event()
 
