@@ -1201,70 +1201,6 @@ class WorkerSessionContractTests(unittest.TestCase):
 
         manager.close_session_owned.assert_awaited_once_with()
 
-    def test_catalog_discovery_runs_as_an_event_loop_task(self):
-        from unittest import mock
-        from loki_agent import loki, models
-        from loki_agent.acp_worker import Worker
-        from loki_agent.credentials import CredentialStore
-        from loki_agent.sessions import Session
-
-        data = {
-            "provider": {
-                "name": "Provider",
-                "env": ["PROVIDER_API_KEY"],
-                "api": "https://provider.example/v1",
-                "models": {
-                    "model": {
-                        "id": "model",
-                        "name": "Model",
-                    },
-                },
-            },
-        }
-        groups = models.build_groups(data)
-        old_credentials = loki.CREDENTIALS
-        try:
-            loki.CREDENTIALS = CredentialStore({
-                "PROVIDER_API_KEY": "secret",
-            })
-
-            async def scenario():
-                messages = []
-                worker = Worker(
-                    Session(shell_cwd="/tmp"), messages.append, "session")
-                worker._install_initial_choices(None)
-                discovered = mock.AsyncMock(return_value=(data, groups))
-                with mock.patch.object(
-                        models, "ensure_index", new=discovered):
-                    worker._start_catalog_discovery()
-                    self.assertIsInstance(
-                        worker._catalog_task, asyncio.Task)
-                    await worker._catalog_task
-                await worker.close()
-                return worker, messages, discovered
-
-            worker, messages, discovered = asyncio.run(scenario())
-        finally:
-            loki.CREDENTIALS = old_credentials
-
-        discovered.assert_awaited_once_with(
-            credential_authority=worker.session.credential_authority,
-            diagnostic_writer=mock.ANY,
-        )
-        self.assertIn(
-            "provider/model",
-            [option["value"] for option in worker._model_options],
-        )
-        updates = [
-            message for message in messages
-            if message.get("method") == "session/update"
-        ]
-        self.assertEqual(len(updates), 1)
-        self.assertEqual(
-            updates[0]["params"]["update"]["sessionUpdate"],
-            "config_option_update",
-        )
-
     def test_subscription_option_and_resume_use_brokered_credential(self):
         from loki_agent import formats, http_client, loki, models
         from loki_agent.acp_worker import Worker
@@ -1504,47 +1440,6 @@ class WorkerSessionContractTests(unittest.TestCase):
             loki._DEFAULT_SESSION = old_session
             loki.CREDENTIALS = old_credentials
             loki.CHAT_LOG_DIR = old_chat_dir
-
-    def test_worker_close_cancels_catalog_discovery(self):
-        from unittest import mock
-        from loki_agent import loki, models
-        from loki_agent.acp_worker import Worker
-        from loki_agent.credentials import CredentialStore
-        from loki_agent.sessions import Session
-
-        old_credentials = loki.CREDENTIALS
-        try:
-            loki.CREDENTIALS = CredentialStore({})
-
-            async def scenario():
-                started = asyncio.Event()
-                finalized = asyncio.Event()
-
-                async def discover(**_kwargs):
-                    started.set()
-                    try:
-                        await asyncio.Event().wait()
-                    finally:
-                        finalized.set()
-
-                worker = Worker(
-                    Session(shell_cwd="/tmp"), lambda _message: None,
-                    "session")
-                worker._install_initial_choices(None)
-                with mock.patch.object(
-                        models, "ensure_index", new=discover):
-                    worker._start_catalog_discovery()
-                    await started.wait()
-                    task = worker._catalog_task
-                    await worker.close()
-                return task, finalized.is_set()
-
-            task, finalized = asyncio.run(scenario())
-        finally:
-            loki.CREDENTIALS = old_credentials
-
-        self.assertTrue(task.cancelled())
-        self.assertTrue(finalized)
 
     def test_load_applies_saved_connection_and_client_cwd(self):
         from unittest import mock

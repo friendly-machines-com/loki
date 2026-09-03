@@ -453,12 +453,6 @@ class CredentialBroker:
         self._records[credential] = OpenAIChatGPTCredential(
             tokens, rotate=rotate, clock=clock)
 
-    def openai_tokens(self) -> OpenAITokenSet | None:
-        record = self._records.get(CredentialRef.openai_subscription())
-        if isinstance(record, OpenAIChatGPTCredential):
-            return record.tokens
-        return None
-
     async def lease(
             self, credential: CredentialRef,
             rejected_generation: int | None = None) -> CredentialLease:

@@ -232,7 +232,8 @@ class JobOwnershipContractTests(unittest.TestCase):
                 with mock.patch.object(
                         loki.os, "pipe", side_effect=recording_pipe), \
                         mock.patch.object(
-                            loki.credential_capabilities.CredentialRelay,
+                            loki.credential_capabilities.
+                            CredentialCapabilityServer,
                             "create",
                             new=mock.AsyncMock(
                                 side_effect=RuntimeError("relay failed"))):

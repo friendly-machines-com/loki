@@ -140,10 +140,6 @@ async def run_prompt_async(subagent_type: str, prompt: str) -> str:
         messages, allowed=_core.EXPLORE_TOOLS)
 
 
-def run_prompt(subagent_type: str, prompt: str) -> str:
-    return asyncio.run(run_prompt_async(subagent_type, prompt))
-
-
 async def run_cli_async(
         subagent_type: str, prompt: str | None = None) -> None:
     prompt = prompt if prompt is not None else sys.stdin.read().strip()

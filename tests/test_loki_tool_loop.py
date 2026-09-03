@@ -2593,7 +2593,10 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 broker = authentications.CredentialBroker()
                 store.install_static_credentials(broker)
                 session.credential_authority = broker
-                loki.CREDENTIALS = store.inventory()
+                loki.CREDENTIALS = CredentialInventory(
+                    store.sanitized_environment(),
+                    store.credential_refs(),
+                )
 
                 provider_a = loki.make_runtime_config(
                     "https://provider-a.example/v1/responses",

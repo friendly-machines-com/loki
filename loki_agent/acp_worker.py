@@ -31,8 +31,6 @@ class Worker:
         self._option_leaves: dict[str, object] = {}
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
-        self._catalog_started = False
-        self._catalog_task: asyncio.Task | None = None
 
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
@@ -74,11 +72,6 @@ class Worker:
     async def close(self):
         try:
             self.cancel_event.set()
-            catalog_task = self._catalog_task
-            if catalog_task is not None and not catalog_task.done():
-                catalog_task.cancel()
-                await asyncio.gather(
-                    catalog_task, return_exceptions=True)
             task = self._prompt_task
             if task is not None and not task.done():
                 try:
@@ -339,39 +332,6 @@ class Worker:
             self._replay_transcript()
 
         return {"configOptions": self.config_options()}
-
-    def _start_catalog_discovery(self):
-        """Discover optional catalog choices without delaying session/open."""
-        if self._catalog_started:
-            return
-        self._catalog_started = True
-        explicit = loki.explicit_connection_option(loki.CREDENTIALS)
-        self._catalog_task = asyncio.create_task(
-            self._discover_catalog(explicit),
-            name=f"loki-model-catalog-{self.session_id}",
-        )
-
-    async def _discover_catalog(self, explicit):
-        try:
-            _data, groups = await modelsdev.ensure_index(
-                credential_authority=self.session.credential_authority,
-                diagnostic_writer=lambda message: print(
-                    message, file=sys.stderr),
-            )
-            choices = modelsdev.flattened_config_option_choices(
-                loki.CREDENTIALS,
-                explicit_connection=explicit,
-                groups=groups,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            print(
-                f"models.dev discovery failed: {error!r}",
-                file=sys.stderr,
-            )
-            return
-        self._install_catalog_choices(choices)
 
     def _install_catalog_choices(self, discovered):
         if not discovered:

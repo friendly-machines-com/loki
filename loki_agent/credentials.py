@@ -73,10 +73,6 @@ class CredentialStore:
             credential.kind == "env"
             and self.has(credential.name))
 
-    def inventory(self) -> "CredentialInventory":
-        return CredentialInventory(
-            self.sanitized_environment(), self.credential_refs())
-
     def install_static_credentials(self, broker: CredentialBroker) -> None:
         """Register environment-shaped request secrets with the root broker."""
         from .authentications import CredentialRef

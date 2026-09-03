@@ -43,10 +43,10 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(credential_capabilities.CapabilityError):
             await self.client.lease(self.second)
 
-    async def test_relay_can_delegate_strict_subset(self):
+    async def test_capability_can_delegate_strict_subset(self):
         await self.connect({self.first, self.second})
         relay, child_fd = (
-            await credential_capabilities.CredentialRelay.create(
+            await credential_capabilities.CredentialCapabilityServer.create(
                 self.client, {self.second}))
         grandchild = (
             await credential_capabilities.CredentialClient.from_fd(child_fd))
@@ -94,10 +94,10 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.value, "access-new")
         self.assertEqual(calls, ["refresh-old"])
         self.assertFalse(hasattr(second, "refresh_token"))
-        self.assertEqual(
-            self.broker.openai_tokens().refresh_token,
-            "refresh-new",
-        )
+        third = await self.client.lease(
+            credential, rejected_generation=second.generation)
+        self.assertEqual(third.value, "access-new")
+        self.assertEqual(calls, ["refresh-old", "refresh-new"])
 
     async def test_concurrent_requests_are_multiplexed(self):
         await self.connect({self.first, self.second})

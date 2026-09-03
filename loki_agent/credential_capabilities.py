@@ -454,13 +454,3 @@ class CredentialCapabilityServer:
             self._reader_task.cancel()
         for task in list(self._requests):
             task.cancel()
-
-
-class CredentialRelay(CredentialCapabilityServer):
-    """A freshly restricted child capability backed by an upstream client.
-
-    The wire protocol is identical to a root broker's capability server. The
-    distinct name documents the recursive trust boundary at nested-subagent
-    call sites: a child receives a new socket and cannot inherit or widen its
-    parent's upstream capability.
-    """

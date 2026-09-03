@@ -1396,7 +1396,7 @@ class JobManager:
                     raise RuntimeError(
                         "cannot delegate credentials without an authority")
                 credential_server, credential_fd = await (
-                    credential_capabilities.CredentialRelay.create(
+                    credential_capabilities.CredentialCapabilityServer.create(
                         authority, credential_refs))
                 spawn_command = [
                     *spawn_command,

@@ -110,8 +110,8 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, ["refresh-a"])
         self.assertEqual({lease.generation for lease in leases}, {1})
-        self.assertEqual(
-            broker.openai_tokens().refresh_token, "refresh-b")
+        await broker.lease(ref, rejected_generation=1)
+        self.assertEqual(calls, ["refresh-a", "refresh-b"])
 
     async def test_stale_401_does_not_refresh_new_generation(self):
         now = 10_000.0
