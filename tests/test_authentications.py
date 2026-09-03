@@ -442,10 +442,44 @@ class AuthorizedRequestHeaderTests(unittest.IsolatedAsyncioTestCase):
                 auth.CredentialError, "authentication-owned"):
             await auth.authorized_request_headers(
                 broker,
-                auth.AuthSpec(ref, "bearer"),
+                auth.AuthSpec(
+                    ref,
+                    "bearer",
+                    authorized_origins=frozenset({
+                        "https://example.test",
+                    }),
+                ),
                 "https://example.test/v1/responses",
                 {"authorization": "Bearer stale"},
             )
+
+    async def test_static_credential_is_bound_to_configured_origin(self):
+        broker = auth.CredentialBroker()
+        ref = auth.CredentialRef.environment("EXAMPLE_API_KEY")
+        broker.install_static(ref, "secret")
+        spec = auth.AuthSpec(
+            ref,
+            "bearer",
+            authorized_origins=frozenset({
+                auth.authorization_origin(
+                    "https://Example.Test:443/v1/responses"),
+            }),
+        )
+
+        headers, _lease = await auth.authorized_request_headers(
+            broker, spec, "https://example.test/other/path")
+        self.assertEqual(headers["Authorization"], "Bearer secret")
+
+        for target in [
+                "http://example.test/other/path",
+                "https://example.test:444/other/path",
+                "https://other.test/other/path",
+                "https://user@example.test/other/path",
+        ]:
+            with self.subTest(target=target), self.assertRaises(
+                    auth.CredentialUnavailable):
+                await auth.authorized_request_headers(
+                    broker, spec, target)
 
     async def test_validates_target_before_leasing(self):
         authority = mock.Mock()

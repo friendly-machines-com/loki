@@ -288,8 +288,8 @@ def _bool_setting(name, default, credentials):
         f"{name} must be one of: 1, 0, true, false, yes, no, on, off")
 
 
-def _auth_spec(provider_kind, credential_ref, auth_header=None,
-               auth_scheme=None):
+def _auth_spec(provider_kind, credential_ref, request_urls,
+               auth_header=None, auth_scheme=None):
     if credential_ref is None:
         if auth_scheme is not None:
             raise ValueError(
@@ -320,6 +320,11 @@ def _auth_spec(provider_kind, credential_ref, auth_header=None,
         credential=credential_ref,
         scheme=scheme,
         header_name=auth_header if scheme == "custom" else None,
+        authorized_origins=frozenset(
+            authentications.authorization_origin(url)
+            for url in request_urls
+            if url is not None
+        ),
     )
 
 
@@ -336,15 +341,6 @@ def make_runtime_config(
     reinstall_provider() which reuses this to rebuild the Provider from the
     current config plus per-model overrides.
     """
-    auth_spec = _auth_spec(
-        provider_kind, credential_ref, auth_header, auth_scheme)
-    if (auth_spec is not None
-            and auth_spec.scheme == "openai-subscription"
-            and provider_id
-            != modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID):
-        raise ValueError(
-            "OpenAI subscription authentication requires the "
-            "openai-subscription provider identity")
     chat_provider = protocols.make_provider(
         url,
         provider=provider_kind,
@@ -356,6 +352,20 @@ def make_runtime_config(
         prompt_cache=prompt_cache,
         openai_request_profile=openai_request_profile,
     )
+    auth_spec = _auth_spec(
+        provider_kind,
+        credential_ref,
+        (chat_provider.chat_url, chat_provider.models_url),
+        auth_header,
+        auth_scheme,
+    )
+    if (auth_spec is not None
+            and auth_spec.scheme == "openai-subscription"
+            and provider_id
+            != modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID):
+        raise ValueError(
+            "OpenAI subscription authentication requires the "
+            "openai-subscription provider identity")
     authentications.validate_authorization_target(
         auth_spec, chat_provider.chat_url)
     return RuntimeConfig(

@@ -109,6 +109,10 @@ class AuthSpec:
     credential: CredentialRef | None
     scheme: str = "bearer"
     header_name: str | None = None
+    # Static credentials may be used only at origins selected when the
+    # Provider was constructed. This binds authorization policy to provider
+    # configuration without retaining a secret in either object.
+    authorized_origins: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -494,8 +498,15 @@ def authorization_headers(
 
 def validate_authorization_target(
         spec: AuthSpec | None, request_url: str) -> None:
-    """Prevent a persisted connection from redirecting a brokered token."""
-    if spec is None or spec.scheme != "openai-subscription":
+    """Reject use of a credential outside its configured network targets."""
+    if spec is None or spec.credential is None:
+        return
+    if spec.scheme != "openai-subscription":
+        origin = authorization_origin(request_url)
+        if origin not in spec.authorized_origins:
+            raise CredentialUnavailable(
+                "credential may only be sent to its configured "
+                "provider origin")
         return
     try:
         parsed = urllib.parse.urlsplit(request_url)
@@ -515,6 +526,32 @@ def validate_authorization_target(
         raise CredentialUnavailable(
             "OpenAI subscription credentials may only be sent to "
             "the canonical ChatGPT Codex endpoints")
+
+
+def authorization_origin(request_url: str) -> str:
+    """Return a canonical HTTP origin suitable for authorization policy."""
+    try:
+        parsed = urllib.parse.urlsplit(request_url)
+        port = parsed.port
+    except (TypeError, ValueError) as error:
+        raise CredentialUnavailable(
+            "credential target is not a valid HTTP URL") from error
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname
+    if (scheme not in {"http", "https"}
+            or hostname is None
+            or parsed.username is not None
+            or parsed.password is not None):
+        raise CredentialUnavailable(
+            "credential target is not a valid HTTP URL")
+    hostname = hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    default_port = (
+        (scheme == "http" and port in {None, 80})
+        or (scheme == "https" and port in {None, 443}))
+    authority = hostname if default_port else f"{hostname}:{port}"
+    return f"{scheme}://{authority}"
 
 
 async def authorized_request_headers(
