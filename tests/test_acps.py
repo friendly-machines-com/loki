@@ -1247,7 +1247,10 @@ class WorkerSessionContractTests(unittest.TestCase):
         finally:
             loki.CREDENTIALS = old_credentials
 
-        discovered.assert_awaited_once_with()
+        discovered.assert_awaited_once_with(
+            credential_authority=worker.session.credential_authority,
+            diagnostic_writer=mock.ANY,
+        )
         self.assertIn(
             "provider/model",
             [option["value"] for option in worker._model_options],
@@ -1270,20 +1273,26 @@ class WorkerSessionContractTests(unittest.TestCase):
 
         credential = (
             authentications.CredentialRef.openai_subscription())
-        catalog = models.normalize_catalog({
-            "openai": {
-                "id": "openai",
-                "name": "OpenAI",
-                "npm": "@ai-sdk/openai",
-                "env": ["OPENAI_API_KEY"],
-                "models": {
-                    "gpt-test": {
-                        "id": "gpt-test",
-                        "name": "GPT Test",
-                    },
+        catalog = models.add_openai_subscription_catalog(
+            models.normalize_catalog({
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "npm": "@ai-sdk/openai",
+                    "env": ["OPENAI_API_KEY"],
+                    "models": {},
                 },
+            }),
+            {
+                "models": [{
+                    "slug": "gpt-test",
+                    "display_name": "GPT Test",
+                    "visibility": "list",
+                    "input_modalities": ["text"],
+                    "supported_reasoning_levels": [],
+                }],
             },
-        })
+        )
         groups = models.build_groups(catalog)
         broker = authentications.CredentialBroker()
         broker.install_openai_subscription(
@@ -1411,7 +1420,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 started = asyncio.Event()
                 finalized = asyncio.Event()
 
-                async def discover():
+                async def discover(**_kwargs):
                     started.set()
                     try:
                         await asyncio.Event().wait()

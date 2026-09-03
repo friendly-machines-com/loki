@@ -59,12 +59,19 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             "openai-subscription",
         )
 
+        self.assertEqual(
+            auth.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+            "https://chatgpt.com/backend-api/codex/models"
+            "?client_version=0.1.0",
+        )
         for url in auth.OPENAI_CHATGPT_AUTHORIZED_URLS:
             auth.validate_authorization_target(spec, url)
         for url in [
                 "http://chatgpt.com/backend-api/codex/responses",
                 "https://chatgpt.com:443/backend-api/codex/responses",
                 "https://chatgpt.com/backend-api/codex/responses?x=1",
+                auth.OPENAI_CHATGPT_MODELS_URL,
+                auth.OPENAI_CHATGPT_MODELS_URL + "?client_version=999.0.0",
                 "https://chatgpt.com.evil.test/backend-api/codex/responses",
                 "https://evil.test/backend-api/codex/responses",
         ]:

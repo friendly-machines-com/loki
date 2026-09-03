@@ -132,6 +132,22 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             payload["include"], ["reasoning.encrypted_content"])
         self.assertNotIn("max_output_tokens", payload)
 
+    def test_subscription_parses_codex_model_catalog(self):
+        provider = protocols.make_provider(
+            "https://chatgpt.com/backend-api/codex/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="openai-subscription",
+        )
+
+        model_ids = provider.parse_model_ids({
+            "models": [
+                {"slug": "visible", "visibility": "list"},
+                {"slug": "hidden", "visibility": "hide"},
+            ],
+        })
+
+        self.assertEqual(model_ids, ["visible"])
+
     def test_generic_responses_payload_omits_codex_backend_controls(self):
         provider = protocols.make_provider(
             "https://example.test/v1/responses",

@@ -300,7 +300,11 @@ class Worker:
         # Await discovery so initial session/open reply contains all discovered choices
         explicit = loki.explicit_connection_option(loki.CREDENTIALS)
         try:
-            _data, groups = await modelsdev.ensure_index()
+            _data, groups = await modelsdev.ensure_index(
+                credential_authority=self.session.credential_authority,
+                diagnostic_writer=lambda message: print(
+                    message, file=sys.stderr),
+            )
             discovered = modelsdev.flattened_config_option_choices(
                 loki.CREDENTIALS,
                 explicit_connection=explicit,
@@ -329,7 +333,11 @@ class Worker:
 
     async def _discover_catalog(self, explicit):
         try:
-            _data, groups = await modelsdev.ensure_index()
+            _data, groups = await modelsdev.ensure_index(
+                credential_authority=self.session.credential_authority,
+                diagnostic_writer=lambda message: print(
+                    message, file=sys.stderr),
+            )
             choices = modelsdev.flattened_config_option_choices(
                 loki.CREDENTIALS,
                 explicit_connection=explicit,

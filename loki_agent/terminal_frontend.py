@@ -801,6 +801,10 @@ async def async_main(args) -> int:
                                 input_fn=modal.prompt,
                                 credentials=_core.CREDENTIALS,
                                 explicit_connection=explicit_option,
+                                credential_authority=(
+                                    current_session().credential_authority),
+                                diagnostic_writer=(
+                                    _report_model_list_errors),
                                 text_writer=terminal.write_text)
                         except (OSError, json.JSONDecodeError) as e:
                             # models.dev unreachable (network errors) or answered

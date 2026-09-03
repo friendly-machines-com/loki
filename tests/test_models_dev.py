@@ -88,6 +88,23 @@ def _write_text(text):
     print(text, end="")
 
 
+def _subscription_catalog(*slugs):
+    return {
+        "models": [
+            {
+                "slug": slug,
+                "display_name": slug.replace("-", " ").title(),
+                "visibility": "list",
+                "input_modalities": ["text", "image"],
+                "supported_reasoning_levels": [
+                    {"effort": "medium", "description": "Medium"},
+                ],
+            }
+            for slug in slugs
+        ],
+    }
+
+
 class CatalogFetchTests(unittest.TestCase):
     def test_fetch_uses_loki_http_transport_with_catalog_bounds(self):
         response = http_client.HttpResponse(
@@ -230,6 +247,138 @@ class CatalogFetchTests(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, message):
                     asyncio.run(models.fetch_models_dev())
 
+    def test_subscription_fetch_uses_broker_and_codex_catalog_url(self):
+        broker = authentications.CredentialBroker()
+        broker.install_openai_subscription(
+            authentications.OpenAITokenSet(
+                "access-secret",
+                "refresh-secret",
+                account_id="account-a",
+                expires_at=10**12,
+            ))
+        response = http_client.HttpResponse(
+            authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+            200,
+            "OK",
+            {"content-type": "application/json"},
+            json.dumps(_subscription_catalog("gpt-codex")).encode("utf-8"),
+        )
+        transport = mock.AsyncMock(return_value=response)
+
+        result = asyncio.run(models.fetch_openai_subscription_models(
+            broker, request=transport))
+
+        self.assertEqual(result, _subscription_catalog("gpt-codex"))
+        self.assertEqual(
+            transport.await_args.args,
+            (
+                "GET",
+                authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+            ),
+        )
+        headers = transport.await_args.kwargs["headers_in"]
+        self.assertEqual(headers["Authorization"], "Bearer access-secret")
+        self.assertEqual(headers["ChatGPT-Account-ID"], "account-a")
+        self.assertEqual(
+            headers["originator"], authentications.OPENAI_ORIGINATOR)
+        self.assertNotIn("refresh-secret", repr(transport.await_args))
+
+    def test_subscription_fetch_refreshes_one_rejected_generation(self):
+        async def rotate(_tokens):
+            return authentications.OpenAITokenSet(
+                "access-b", "refresh-b", expires_at=10**12)
+
+        broker = authentications.CredentialBroker()
+        broker.install_openai_subscription(
+            authentications.OpenAITokenSet(
+                "access-a", "refresh-a", expires_at=10**12),
+            rotate=rotate,
+        )
+        responses = iter([
+            http_client.HttpResponse(
+                authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+                401, "Unauthorized", {}, b"{}"),
+            http_client.HttpResponse(
+                authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+                200, "OK", {},
+                json.dumps(
+                    _subscription_catalog("gpt-codex")).encode("utf-8")),
+        ])
+        authorizations = []
+
+        async def request(_method, _url, **kwargs):
+            authorizations.append(
+                kwargs["headers_in"]["Authorization"])
+            return next(responses)
+
+        result = asyncio.run(models.fetch_openai_subscription_models(
+            broker, request=request))
+
+        self.assertEqual(result, _subscription_catalog("gpt-codex"))
+        self.assertEqual(
+            authorizations, ["Bearer access-a", "Bearer access-b"])
+
+    def test_index_keeps_subscription_when_models_dev_is_offline(self):
+        broker = authentications.CredentialBroker()
+        broker.install_openai_subscription(
+            authentications.OpenAITokenSet(
+                "access", "refresh", expires_at=10**12))
+        saved = models._index_cache
+        models._index_cache = None
+        diagnostics = []
+        try:
+            with mock.patch.object(
+                    models, "fetch_models_dev",
+                    new=mock.AsyncMock(side_effect=OSError("offline"))
+            ), mock.patch.object(
+                    models, "fetch_openai_subscription_models",
+                    new=mock.AsyncMock(
+                        return_value=_subscription_catalog("gpt-codex"))
+            ):
+                data, groups = asyncio.run(models.ensure_index(
+                    credential_authority=broker,
+                    diagnostic_writer=diagnostics.append,
+                ))
+        finally:
+            models._index_cache = saved
+
+        self.assertIn("openai-subscription", data)
+        self.assertEqual(
+            groups["Gpt Codex"][0][2]["id"], "gpt-codex")
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("models.dev discovery failed", diagnostics[0])
+
+    def test_index_keeps_models_dev_when_subscription_is_offline(self):
+        broker = authentications.CredentialBroker()
+        broker.install_openai_subscription(
+            authentications.OpenAITokenSet(
+                "access", "refresh", expires_at=10**12))
+        saved = models._index_cache
+        models._index_cache = None
+        diagnostics = []
+        try:
+            with mock.patch.object(
+                    models, "fetch_models_dev",
+                    new=mock.AsyncMock(return_value=DATA)
+            ), mock.patch.object(
+                    models, "fetch_openai_subscription_models",
+                    new=mock.AsyncMock(side_effect=OSError("offline"))
+            ):
+                data, groups = asyncio.run(models.ensure_index(
+                    credential_authority=broker,
+                    diagnostic_writer=diagnostics.append,
+                ))
+        finally:
+            models._index_cache = saved
+
+        self.assertNotIn("openai-subscription", data)
+        self.assertIn("GLM-5.2", groups)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn(
+            "OpenAI subscription model discovery failed",
+            diagnostics[0],
+        )
+
 
 class CatalogNormalizationTests(unittest.TestCase):
     @staticmethod
@@ -351,9 +500,12 @@ class CatalogNormalizationTests(unittest.TestCase):
         )
 
     def test_openai_subscription_is_distinct_and_uses_credential_ref(self):
-        normalized = models.normalize_catalog({
-            "openai": self.openai_provider(),
-        })
+        normalized = models.add_openai_subscription_catalog(
+            models.normalize_catalog({
+                "openai": self.openai_provider(),
+            }),
+            _subscription_catalog("gpt-codex"),
+        )
         provider = normalized["openai-subscription"]
         credential = (
             authentications.CredentialRef.openai_subscription())
@@ -372,20 +524,67 @@ class CatalogNormalizationTests(unittest.TestCase):
         self.assertEqual(
             access.protocol, protocols.OPENAI_RESPONSES)
         self.assertEqual(
+            access.models_url,
+            authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL)
+        self.assertEqual(
             models.provider_display_name(
                 "openai-subscription", provider),
             "OpenAI ChatGPT subscription [endpoint supplied by Loki]",
         )
-        self.assertNotIn(
-            "cost", provider["models"]["gpt-test"])
+        self.assertEqual(
+            list(provider["models"]), ["gpt-codex"])
 
-    def test_subscription_is_not_synthesized_from_changed_signature(self):
+    def test_public_catalog_normalization_never_synthesizes_subscription(self):
         normalized = models.normalize_catalog({
             "openai": self.openai_provider(
                 env=["OTHER_API_KEY"]),
         })
 
         self.assertNotIn("openai-subscription", normalized)
+
+    def test_public_catalog_cannot_supply_subscription_namespace(self):
+        normalized = models.normalize_catalog({
+            "openai-subscription": {
+                "id": "openai-subscription",
+                "api": authentications.OPENAI_CHATGPT_RESPONSES_URL,
+                "env": [],
+                "models": {"forged": {"id": "forged"}},
+            },
+        })
+
+        self.assertNotIn("openai-subscription", normalized)
+
+    def test_subscription_uses_only_visible_text_models(self):
+        response = {
+            "models": [
+                {
+                    "slug": "visible",
+                    "display_name": "Visible",
+                    "visibility": "list",
+                    "input_modalities": ["text"],
+                    "supported_reasoning_levels": [],
+                },
+                {
+                    "slug": "hidden",
+                    "display_name": "Hidden",
+                    "visibility": "hide",
+                    "input_modalities": ["text"],
+                },
+                {
+                    "slug": "audio-only",
+                    "display_name": "Audio",
+                    "visibility": "list",
+                    "input_modalities": ["audio"],
+                },
+            ],
+        }
+
+        normalized = models.add_openai_subscription_catalog({}, response)
+
+        self.assertEqual(
+            list(normalized["openai-subscription"]["models"]),
+            ["visible"],
+        )
 
     def test_downloaded_private_credential_marker_is_not_authority(self):
         credential = (
@@ -440,7 +639,7 @@ class CatalogNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(
             [provider_id for provider_id, _, _ in groups["GPT Test"]],
-            ["openai", "openai-subscription"],
+            ["openai"],
         )
 
 
@@ -928,12 +1127,21 @@ class PickerTests(unittest.TestCase):
         })
         saved = models._index_cache
         models._index_cache = (data, models.build_groups(data))
+        broker = authentications.CredentialBroker()
+        broker.install_openai_subscription(
+            authentications.OpenAITokenSet(
+                "access", "refresh", expires_at=10**12))
         try:
-            result = asyncio.run(models.run_model_picker_async(
-                _input_script(["1", "1"]),
-                CredentialInventory({}, {credential}),
-                text_writer=_write_text,
-            ))
+            with mock.patch.object(
+                    models, "fetch_openai_subscription_models",
+                    new=mock.AsyncMock(
+                        return_value=_subscription_catalog("gpt-codex"))):
+                result = asyncio.run(models.run_model_picker_async(
+                    _input_script(["1", "1"]),
+                    CredentialInventory({}, {credential}),
+                    credential_authority=broker,
+                    text_writer=_write_text,
+                ))
         finally:
             models._index_cache = saved
 
@@ -943,7 +1151,7 @@ class PickerTests(unittest.TestCase):
             provider["api"],
             authentications.OPENAI_CHATGPT_RESPONSES_URL,
         )
-        self.assertEqual(model["id"], "gpt-test")
+        self.assertEqual(model["id"], "gpt-codex")
 
     def test_run_model_picker_cancel_returns_none(self):
         saved = models._index_cache

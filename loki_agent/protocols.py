@@ -156,6 +156,16 @@ class Provider:
     def parse_model_ids(self, response):
         if not isinstance(response, dict):
             return []
+        if self.provider_id == "openai-subscription":
+            models = response.get("models", [])
+            if not isinstance(models, list):
+                return []
+            return [
+                item["slug"] for item in models
+                if (isinstance(item, dict)
+                    and isinstance(item.get("slug"), str)
+                    and item.get("visibility") == "list")
+            ]
         data = response.get("data", [])
         if not isinstance(data, list):
             return []

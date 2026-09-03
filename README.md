@@ -114,11 +114,14 @@ the canonical OpenAI provider signature, Loki supplies
 `https://api.openai.com/v1` and labels the provider
 `OpenAI Platform API [endpoint supplied by Loki]`. A changed signature or
 non-OpenAI endpoint is rejected rather than receiving `OPENAI_API_KEY`.
-For a stored ChatGPT login, Loki also synthesizes the separate provider
+For a stored ChatGPT login, Loki also constructs the separate provider
 `OpenAI ChatGPT subscription [endpoint supplied by Loki]`, using the private
 ChatGPT Codex Responses endpoint and the brokered subscription credential.
-Subscription authorization is permitted only for the exact ChatGPT Codex
-Responses and model-list URLs; it is never attached to the models.dev
+Its selectable models come only from that account's authenticated ChatGPT
+Codex model catalog; Loki does not copy OpenAI Platform models from models.dev
+into the subscription provider. Subscription authorization is permitted only
+for the exact ChatGPT Codex Responses URL and the model-list request with
+Loki's fixed client version. It is never attached to the models.dev
 catalog request or to the OpenAI Platform API.
 
 Loki does not select a built-in provider connection at startup. Without an

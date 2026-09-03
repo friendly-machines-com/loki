@@ -38,9 +38,18 @@ OPENAI_CHATGPT_RESPONSES_URL = (
     "https://chatgpt.com/backend-api/codex/responses")
 OPENAI_CHATGPT_MODELS_URL = (
     "https://chatgpt.com/backend-api/codex/models")
+# The official client always supplies this query parameter, but its version
+# namespace describes Codex releases rather than a documented third-party
+# protocol level. Send Loki's own version instead of impersonating a Codex
+# release. Because the complete URL is authorization-allowlisted below, a
+# version change is an explicit review point rather than an arbitrary query.
+OPENAI_CHATGPT_MODELS_CLIENT_VERSION = "0.1.0"
+OPENAI_CHATGPT_MODELS_REQUEST_URL = (
+    f"{OPENAI_CHATGPT_MODELS_URL}?client_version="
+    f"{OPENAI_CHATGPT_MODELS_CLIENT_VERSION}")
 OPENAI_CHATGPT_AUTHORIZED_URLS = frozenset({
     OPENAI_CHATGPT_RESPONSES_URL,
-    OPENAI_CHATGPT_MODELS_URL,
+    OPENAI_CHATGPT_MODELS_REQUEST_URL,
 })
 
 
@@ -506,7 +515,6 @@ def validate_authorization_target(
             or parsed.scheme.lower() != "https"
             or parsed.hostname is None
             or parsed.hostname.lower() != "chatgpt.com"
-            or parsed.query
             or parsed.fragment
             or request_url not in OPENAI_CHATGPT_AUTHORIZED_URLS):
         raise CredentialUnavailable(

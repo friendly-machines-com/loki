@@ -42,6 +42,10 @@ USER_AGENT = "loki-models.dev-picker/1.0"
 MODELS_DEV_TIMEOUT_S = 30
 MODELS_DEV_MAX_BYTES = 20 * 1024 * 1024
 MODELS_DEV_RETRY_MAX_ATTEMPTS = 3
+OPENAI_MODELS_TIMEOUT_S = 5
+OPENAI_MODELS_MAX_BYTES = 20 * 1024 * 1024
+OPENAI_MODELS_RETRY_MAX_ATTEMPTS = 3
+OPENAI_USER_AGENT = "loki/0.1.0"
 
 # models.dev omits endpoints that its native JavaScript SDK packages know
 # internally.  Keep the downloaded catalog and cache faithful to models.dev,
@@ -53,6 +57,7 @@ _OPENAI_PLATFORM_API_SOURCE = "built-in OpenAI Platform default"
 _OPENAI_SUBSCRIPTION_API_SOURCE = (
     "built-in OpenAI ChatGPT subscription endpoint")
 _LOKI_CREDENTIAL_REF_KEY = "_loki_credential_ref"
+_LOKI_MODELS_URL_KEY = "_loki_models_url"
 _LOKI_SYNTHETIC_KEY = "_loki_synthetic"
 _OPENAI_SUBSCRIPTION_SENTINEL = object()
 OPENAI_SUBSCRIPTION_PROVIDER_ID = "openai-subscription"
@@ -86,6 +91,7 @@ class ProviderAccess:
     credential_ref: authentications.CredentialRef
     api_url: str
     protocol: str
+    models_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -146,13 +152,20 @@ def normalize_catalog(data):
 
     This function never mutates the raw downloaded or cached catalog.
     """
+    # This namespace belongs to Loki's authenticated ChatGPT discovery. Never
+    # let downloaded catalog data manufacture or shadow that provider.
+    normalized = data
+    if OPENAI_SUBSCRIPTION_PROVIDER_ID in data:
+        normalized = dict(data)
+        normalized.pop(OPENAI_SUBSCRIPTION_PROVIDER_ID, None)
+
     provider_entry = data.get("openai")
     if provider_entry is None:
-        return data
+        return normalized
     if not isinstance(provider_entry, dict):
-        return data
+        return normalized
 
-    normalized = dict(data)
+    normalized = dict(normalized)
     normalized_provider = dict(provider_entry)
     normalized["openai"] = normalized_provider
 
@@ -171,30 +184,88 @@ def normalize_catalog(data):
             "canonical OpenAI provider declared a non-OpenAI endpoint")
         return normalized
 
-    subscription = dict(normalized_provider)
-    subscription["id"] = OPENAI_SUBSCRIPTION_PROVIDER_ID
-    subscription["name"] = "OpenAI ChatGPT subscription"
-    subscription["api"] = (
-        authentications.OPENAI_CHATGPT_RESPONSES_URL)
-    subscription["env"] = []
-    subscription[_LOKI_API_SOURCE_KEY] = (
-        _OPENAI_SUBSCRIPTION_API_SOURCE)
-    subscription[_LOKI_CREDENTIAL_REF_KEY] = (
-        authentications.CredentialRef.openai_subscription().encode())
-    # A non-JSON sentinel ensures downloaded catalog fields that happen to
-    # use Loki's private names can never manufacture a broker credential ref.
-    subscription[_LOKI_SYNTHETIC_KEY] = (
-        _OPENAI_SUBSCRIPTION_SENTINEL)
-    subscription["models"] = {
-        model_id: {
-            key: value for key, value in model.items()
-            if key != "cost"
+    return normalized
+
+
+def _openai_subscription_model_entries(response):
+    """Translate the authenticated Codex catalog into picker metadata."""
+    if not isinstance(response, dict):
+        raise ValueError("OpenAI subscription model catalog is not an object")
+    models = response.get("models")
+    if not isinstance(models, list):
+        raise ValueError(
+            "OpenAI subscription model catalog has no models array")
+
+    result = {}
+    for model in models:
+        if not isinstance(model, dict):
+            raise ValueError(
+                "OpenAI subscription model catalog contains a non-object")
+        slug = model.get("slug")
+        if not isinstance(slug, str) or not slug:
+            raise ValueError(
+                "OpenAI subscription model catalog contains an invalid slug")
+        if slug in result:
+            raise ValueError(
+                f"OpenAI subscription model catalog repeats slug {slug!r}")
+
+        # Codex distinguishes picker-visible models from hidden compatibility
+        # entries. Loki likewise offers only "list" entries, and only models
+        # that explicitly support text (or omit the legacy modality field).
+        if model.get("visibility") != "list":
+            continue
+        modalities = model.get("input_modalities")
+        if modalities is not None:
+            if (not isinstance(modalities, list)
+                    or not all(isinstance(item, str)
+                               for item in modalities)):
+                raise ValueError(
+                    f"OpenAI subscription model {slug!r} has invalid "
+                    "input modalities")
+            if "text" not in modalities:
+                continue
+        display_name = model.get("display_name")
+        if not isinstance(display_name, str) or not display_name:
+            display_name = slug
+        reasoning_levels = model.get("supported_reasoning_levels")
+        reasoning = (
+            isinstance(reasoning_levels, list)
+            and bool(reasoning_levels)
+        )
+        result[slug] = {
+            "id": slug,
+            "name": display_name,
+            "reasoning": reasoning,
+            "tool_call": True,
+            "temperature": False,
+            "attachment": (
+                modalities is None or "image" in modalities),
+            "structured_output": False,
+            "open_weights": False,
         }
-        for model_id, model in (
-            normalized_provider.get("models") or {}).items()
-        if isinstance(model, dict)
+    return result
+
+
+def add_openai_subscription_catalog(data, response):
+    """Add only models advertised for the authenticated ChatGPT account."""
+    normalized = dict(data)
+    normalized[OPENAI_SUBSCRIPTION_PROVIDER_ID] = {
+        "id": OPENAI_SUBSCRIPTION_PROVIDER_ID,
+        "name": "OpenAI ChatGPT subscription",
+        "npm": "@ai-sdk/openai",
+        "api": authentications.OPENAI_CHATGPT_RESPONSES_URL,
+        "env": [],
+        "models": _openai_subscription_model_entries(response),
+        _LOKI_API_SOURCE_KEY: _OPENAI_SUBSCRIPTION_API_SOURCE,
+        _LOKI_CREDENTIAL_REF_KEY: (
+            authentications.CredentialRef.openai_subscription().encode()),
+        _LOKI_MODELS_URL_KEY: (
+            authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL),
+        # This object cannot arrive through JSON. provider_access() therefore
+        # accepts broker authority only for a provider constructed in memory
+        # by this function.
+        _LOKI_SYNTHETIC_KEY: _OPENAI_SUBSCRIPTION_SENTINEL,
     }
-    normalized[OPENAI_SUBSCRIPTION_PROVIDER_ID] = subscription
     return normalized
 
 
@@ -229,6 +300,65 @@ async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
     return data
 
 
+async def fetch_openai_subscription_models(
+        credential_authority, *, request=None):
+    """Fetch the account-specific model catalog through a brokered lease."""
+    credential = authentications.CredentialRef.openai_subscription()
+    if credential not in credential_authority.available():
+        raise authentications.CredentialUnavailable(
+            "OpenAI subscription credential is unavailable")
+    request_function = request or http_client.async_http_request
+    auth_spec = authentications.AuthSpec(
+        credential, "openai-subscription")
+    request_url = authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL
+    authentications.validate_authorization_target(auth_spec, request_url)
+
+    rejected_generation = None
+    recovered = False
+    while True:
+        lease = await credential_authority.lease(
+            credential, rejected_generation=rejected_generation)
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": OPENAI_USER_AGENT,
+        }
+        headers.update(authentications.authorization_headers(
+            auth_spec, lease))
+        response = await request_function(
+            "GET",
+            request_url,
+            headers_in=headers,
+            timeout=OPENAI_MODELS_TIMEOUT_S,
+            max_bytes=OPENAI_MODELS_MAX_BYTES,
+            retry_max_attempts=OPENAI_MODELS_RETRY_MAX_ATTEMPTS,
+        )
+        if (response.status == 401
+                and lease.refreshable
+                and not recovered):
+            # Match inference recovery: a rejected generation refreshes once;
+            # concurrent callers then observe the already-advanced generation.
+            rejected_generation = lease.generation
+            recovered = True
+            continue
+        break
+
+    if response.status >= 400:
+        raise OSError(
+            f"OpenAI subscription model catalog returned HTTP "
+            f"{response.status} {response.reason}")
+    if response.truncated:
+        raise OSError(
+            "OpenAI subscription model catalog exceeds its size limit")
+    try:
+        data = json.loads(response.body.decode("utf-8-sig"))
+        _openai_subscription_model_entries(data)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise OSError(
+            f"OpenAI subscription model catalog is invalid: {error}"
+        ) from error
+    return data
+
+
 def build_groups(data):
     """Group (provider_id, provider_entry, model_entry) by model name.
 
@@ -246,14 +376,61 @@ def build_groups(data):
     return dict(groups)
 
 
-async def ensure_index(cache_path=None):
-    """Fetch (once per session) and return (data, groups)."""
+async def ensure_index(
+        cache_path=None, *, credential_authority=None,
+        diagnostic_writer=None):
+    """Return all usable catalog sources without conflating their models.
+
+    models.dev is cached because it is public and account-independent. The
+    ChatGPT catalog is fetched from its authenticated endpoint for the current
+    account. A failure in one source does not discard a successful independent
+    source.
+    """
     global _index_cache
+    models_dev_error = None
     if _index_cache is None:
-        data = normalize_catalog(
-            await fetch_models_dev(cache_path=cache_path))
-        _index_cache = (data, build_groups(data))
-    return _index_cache
+        try:
+            data = normalize_catalog(
+                await fetch_models_dev(cache_path=cache_path))
+        except Exception as error:
+            models_dev_error = error
+            data = {}
+        else:
+            _index_cache = (data, build_groups(data))
+    else:
+        data, _groups = _index_cache
+
+    credential = authentications.CredentialRef.openai_subscription()
+    has_subscription = (
+        credential_authority is not None
+        and credential in credential_authority.available()
+    )
+    subscription_error = None
+    if has_subscription:
+        try:
+            response = await fetch_openai_subscription_models(
+                credential_authority)
+            data = add_openai_subscription_catalog(data, response)
+        except Exception as error:
+            subscription_error = error
+
+    if models_dev_error is not None and not (
+            has_subscription and subscription_error is None):
+        if subscription_error is not None and diagnostic_writer is not None:
+            diagnostic_writer(
+                f"OpenAI subscription model discovery failed: "
+                f"{subscription_error}")
+        raise models_dev_error
+
+    if diagnostic_writer is not None:
+        if models_dev_error is not None:
+            diagnostic_writer(
+                f"models.dev discovery failed: {models_dev_error}")
+        if subscription_error is not None:
+            diagnostic_writer(
+                f"OpenAI subscription model discovery failed: "
+                f"{subscription_error}")
+    return data, build_groups(data)
 
 
 # --------------------------------------------------------------------------
@@ -450,6 +627,11 @@ def provider_access(
         credential_ref=credential_ref,
         api_url=api_url,
         protocol=provider_protocol(provider_entry),
+        models_url=(
+            provider_entry.get(_LOKI_MODELS_URL_KEY)
+            if provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
+                _OPENAI_SUBSCRIPTION_SENTINEL)
+            else None),
     )
 
 
@@ -743,6 +925,8 @@ async def run_model_picker_async(
         credentials: CredentialStore | CredentialInventory,
         cache_path=None,
         explicit_connection: ExplicitConnectionOption | None = None,
+        credential_authority=None,
+        diagnostic_writer=None,
         *,
         text_writer):
     """Two-level picker: conflated model -> provider.
@@ -753,7 +937,11 @@ async def run_model_picker_async(
     cannot be fetched, the network exception from fetch_models_dev propagates
     naturally; the caller catches it and uses the outage picker.
     """
-    _, groups = await ensure_index(cache_path=cache_path)
+    _, groups = await ensure_index(
+        cache_path=cache_path,
+        credential_authority=credential_authority,
+        diagnostic_writer=diagnostic_writer,
+    )
     # Keep only models served by at least one provider whose wire protocol
     # Loki can speak, so the menu is not flooded with the long tail.
     groups = _add_explicit_connection(

@@ -509,13 +509,24 @@ def config_from_connection_descriptor(
             "LOKI_PROMPT_CACHE", descriptor.prompt_cache, credentials)
         if credentials.get("LOKI_PROMPT_CACHE")
         else descriptor.prompt_cache)
+    models_url = descriptor.models_url
+    if (credential_ref
+            == authentications.CredentialRef.openai_subscription()
+            and models_url in {
+                None,
+                authentications.OPENAI_CHATGPT_MODELS_URL,
+            }):
+        # Early subscription builds persisted the derived URL without Codex's
+        # required client_version query. Normalize those saved descriptors to
+        # the canonical, authorization-allowlisted catalog request.
+        models_url = authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL
     return make_runtime_config(
         # Restore the concrete endpoint that was actually used, rather than
         # deriving it again from a catalog base URL.
         descriptor.chat_url,
         provider_kind,
         model=config_model,
-        models_url=descriptor.models_url,
+        models_url=models_url,
         max_tokens=max_tokens,
         anthropic_version=anthropic_version,
         auth_header=auth_header,
@@ -548,6 +559,7 @@ def config_from_modelsdev_selection(
         access.api_url,
         access.protocol,
         model=selected_model,
+        models_url=access.models_url,
         max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
         anthropic_version=credentials.get(
             "LOKI_ANTHROPIC_VERSION", "2023-06-01"),

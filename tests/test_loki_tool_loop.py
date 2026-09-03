@@ -841,25 +841,35 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_spec.credential, credential)
         self.assertEqual(config.auth_spec.scheme, "openai-subscription")
         self.assertEqual(config.auth_scheme, "openai-subscription")
+        self.assertEqual(
+            config.chat_provider.models_url,
+            authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+        )
 
     def test_synthesized_subscription_selection_is_streaming_and_confined(
             self):
         credential = (
             authentications.CredentialRef.openai_subscription())
-        catalog = modelsdev.normalize_catalog({
-            "openai": {
-                "id": "openai",
-                "name": "OpenAI",
-                "npm": "@ai-sdk/openai",
-                "env": ["OPENAI_API_KEY"],
-                "models": {
-                    "gpt-test": {
-                        "id": "gpt-test",
-                        "name": "GPT Test",
-                    },
+        catalog = modelsdev.add_openai_subscription_catalog(
+            modelsdev.normalize_catalog({
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "npm": "@ai-sdk/openai",
+                    "env": ["OPENAI_API_KEY"],
+                    "models": {},
                 },
+            }),
+            {
+                "models": [{
+                    "slug": "gpt-test",
+                    "display_name": "GPT Test",
+                    "visibility": "list",
+                    "input_modalities": ["text"],
+                    "supported_reasoning_levels": [],
+                }],
             },
-        })
+        )
         provider = catalog["openai-subscription"]
         model = provider["models"]["gpt-test"]
 
@@ -877,6 +887,10 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_spec.credential, credential)
         self.assertEqual(
             config.auth_spec.scheme, "openai-subscription")
+        self.assertEqual(
+            config.chat_provider.models_url,
+            authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+        )
         self.assertTrue(config.stream)
 
     def test_saved_subscription_cannot_redirect_access_token(self):
@@ -1469,7 +1483,9 @@ class ModelLoadingTests(unittest.TestCase):
         seen_explicit = []
 
         async def pick_model(*, input_fn, credentials,
-                             explicit_connection=None, text_writer):
+                             explicit_connection=None,
+                             credential_authority=None,
+                             diagnostic_writer=None, text_writer):
             seen_explicit.append(explicit_connection)
             if len(seen_explicit) == 1:
                 return "catalog", catalog_provider, catalog_model
