@@ -4951,6 +4951,51 @@ class StreamingCompletionTests(unittest.TestCase):
         )
         self.assertEqual(formats.item_text(items[0]), "hello")
 
+    def test_responses_stream_returns_at_completed_without_waiting_for_eof(self):
+        loki.apply_runtime_config(loki.make_runtime_config(
+            "http://localhost:8000/v1/responses",
+            protocols.OPENAI_RESPONSES,
+            model="local-model",
+            stream=True,
+        ))
+
+        async def scenario():
+            keep_open = asyncio.Event()
+
+            async def response_body():
+                yield (
+                    b'data: {"type":"response.completed","response":{'
+                    b'"id":"response_1","status":"completed","output":[]}}'
+                    b'\n\n'
+                )
+                await keep_open.wait()
+
+            @contextlib.asynccontextmanager
+            async def fake_http_stream(method, request_url, **kwargs):
+                yield loki.http_client.HttpStreamResponse(
+                    request_url,
+                    200,
+                    "OK",
+                    {"content-type": "text/event-stream"},
+                    response_body(),
+                )
+
+            with mock.patch(
+                    "loki_agent.loki.http_client.async_http_stream",
+                    side_effect=fake_http_stream):
+                return await asyncio.wait_for(
+                    loki.async_chat_completion(
+                        [formats.message_item("user", "hello")],
+                        tools=[],
+                    ),
+                    timeout=0.2,
+                )
+
+        turn = asyncio.run(scenario())
+
+        self.assertTrue(turn.complete)
+        self.assertEqual(turn.items, [])
+
     def test_reasoning_deltas_are_silent_and_replay_only_at_origin(self):
         deltas = []
         diagnostics = io.StringIO()

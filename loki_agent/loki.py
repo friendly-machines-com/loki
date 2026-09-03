@@ -4166,7 +4166,8 @@ async def _async_chat_stream_request_once(
         received_body = bool(first_chunk)
         try:
             for event in decoder.feed(first_chunk):
-                accumulator.feed(event)
+                if accumulator.feed(event):
+                    return accumulator.finish()
             while True:
                 try:
                     chunk = await _next_stream_chunk(
@@ -4175,9 +4176,11 @@ async def _async_chat_stream_request_once(
                     break
                 received_body = received_body or bool(chunk)
                 for event in decoder.feed(chunk):
-                    accumulator.feed(event)
+                    if accumulator.feed(event):
+                        return accumulator.finish()
             for event in decoder.finish():
-                accumulator.feed(event)
+                if accumulator.feed(event):
+                    return accumulator.finish()
         except StreamCancelled:
             raise
         except protocols.ResponseApiError:

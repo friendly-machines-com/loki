@@ -721,6 +721,7 @@ class OpenAIResponsesStreamAccumulator:
             self.completed_response = copy.deepcopy(response)
             self.completed_response.setdefault("object", "response")
             self.completed_response.setdefault("status", "completed")
+            return True
         elif event_type == "response.incomplete":
             response = data.get("response")
             if not isinstance(response, dict):
@@ -747,6 +748,7 @@ class OpenAIResponsesStreamAccumulator:
             self.stream_error = copy.deepcopy(data)
         elif not _known_responses_stream_event(event_type):
             self._preserve_extension("stream event", data)
+        return False
 
     def _finish_response(self, response):
         # In the Responses streaming protocol, output_item.done carries each
