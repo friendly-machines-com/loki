@@ -28,6 +28,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 
+from . import authentications
 from . import http_client
 from . import protocols
 from .credentials import (
@@ -49,6 +50,12 @@ OPENAI_PLATFORM_API_BASE = "https://api.openai.com/v1"
 _LOKI_API_SOURCE_KEY = "_loki_api_source"
 _LOKI_API_REJECTION_KEY = "_loki_api_rejection"
 _OPENAI_PLATFORM_API_SOURCE = "built-in OpenAI Platform default"
+_OPENAI_SUBSCRIPTION_API_SOURCE = (
+    "built-in OpenAI ChatGPT subscription endpoint")
+_LOKI_CREDENTIAL_REF_KEY = "_loki_credential_ref"
+_LOKI_SYNTHETIC_KEY = "_loki_synthetic"
+_OPENAI_SUBSCRIPTION_SENTINEL = object()
+OPENAI_SUBSCRIPTION_PROVIDER_ID = "openai-subscription"
 
 # Feature flags shown in the pickers, in a stable order. A provider may set
 # each one differently for the same model; menus show the ones that are on.
@@ -76,7 +83,7 @@ _API_TEMPLATE_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 @dataclass(frozen=True)
 class ProviderAccess:
-    credential_env: str
+    credential_ref: authentications.CredentialRef
     api_url: str
     protocol: str
 
@@ -159,11 +166,35 @@ def normalize_catalog(data):
         normalized_provider["api"] = OPENAI_PLATFORM_API_BASE
         normalized_provider[_LOKI_API_SOURCE_KEY] = (
             _OPENAI_PLATFORM_API_SOURCE)
-        return normalized
-
-    if not _canonical_openai_platform_api(api):
+    elif not _canonical_openai_platform_api(api):
         normalized_provider[_LOKI_API_REJECTION_KEY] = (
             "canonical OpenAI provider declared a non-OpenAI endpoint")
+        return normalized
+
+    subscription = dict(normalized_provider)
+    subscription["id"] = OPENAI_SUBSCRIPTION_PROVIDER_ID
+    subscription["name"] = "OpenAI ChatGPT subscription"
+    subscription["api"] = (
+        authentications.OPENAI_CHATGPT_RESPONSES_URL)
+    subscription["env"] = []
+    subscription[_LOKI_API_SOURCE_KEY] = (
+        _OPENAI_SUBSCRIPTION_API_SOURCE)
+    subscription[_LOKI_CREDENTIAL_REF_KEY] = (
+        authentications.CredentialRef.openai_subscription().encode())
+    # A non-JSON sentinel ensures downloaded catalog fields that happen to
+    # use Loki's private names can never manufacture a broker credential ref.
+    subscription[_LOKI_SYNTHETIC_KEY] = (
+        _OPENAI_SUBSCRIPTION_SENTINEL)
+    subscription["models"] = {
+        model_id: {
+            key: value for key, value in model.items()
+            if key != "cost"
+        }
+        for model_id, model in (
+            normalized_provider.get("models") or {}).items()
+        if isinstance(model, dict)
+    }
+    normalized[OPENAI_SUBSCRIPTION_PROVIDER_ID] = subscription
     return normalized
 
 
@@ -346,6 +377,9 @@ def provider_display_name(provider_id, provider_entry):
     if provider_entry.get(_LOKI_API_SOURCE_KEY) == (
             _OPENAI_PLATFORM_API_SOURCE):
         return f"{name} Platform API [endpoint supplied by Loki]"
+    if provider_entry.get(_LOKI_API_SOURCE_KEY) == (
+            _OPENAI_SUBSCRIPTION_API_SOURCE):
+        return f"{name} [endpoint supplied by Loki]"
     return name
 
 
@@ -357,6 +391,11 @@ def provider_description(provider_entry):
         return (
             f"{description}; endpoint supplied by Loki because models.dev "
             "omits the native SDK default")
+    if provider_entry.get(_LOKI_API_SOURCE_KEY) == (
+            _OPENAI_SUBSCRIPTION_API_SOURCE):
+        return (
+            f"{description}; ChatGPT subscription provider synthesized "
+            "by Loki from the canonical OpenAI catalog entry")
     return description
 
 
@@ -371,13 +410,29 @@ def provider_access(
     """
     if not provider_supported(provider_entry):
         return None
-    credential_names = [
-        name for name in (provider_entry.get("env") or [])
-        if is_credential_name(name)
-    ]
-    credential_env = credentials.first_available_name(credential_names)
-    if not credential_env:
-        return None
+    encoded_ref = provider_entry.get(_LOKI_CREDENTIAL_REF_KEY)
+    if encoded_ref is not None:
+        if provider_entry.get(_LOKI_SYNTHETIC_KEY) is not (
+                _OPENAI_SUBSCRIPTION_SENTINEL):
+            return None
+        try:
+            credential_ref = authentications.CredentialRef.decode(
+                encoded_ref)
+        except ValueError:
+            return None
+        if not credentials.has_ref(credential_ref):
+            return None
+    else:
+        credential_names = [
+            name for name in (provider_entry.get("env") or [])
+            if is_credential_name(name)
+        ]
+        credential_env = credentials.first_available_name(
+            credential_names)
+        if not credential_env:
+            return None
+        credential_ref = authentications.CredentialRef.environment(
+            credential_env)
 
     api_template = provider_entry.get("api")
     template_names = _API_TEMPLATE_VAR_RE.findall(api_template)
@@ -392,7 +447,7 @@ def provider_access(
     api_url = _API_TEMPLATE_VAR_RE.sub(
         lambda match: credentials.get(match.group(1)), api_template)
     return ProviderAccess(
-        credential_env=credential_env,
+        credential_ref=credential_ref,
         api_url=api_url,
         protocol=provider_protocol(provider_entry),
     )

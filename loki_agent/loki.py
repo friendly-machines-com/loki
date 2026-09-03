@@ -338,6 +338,8 @@ def make_runtime_config(
     )
     auth_spec = _auth_spec(
         provider_kind, credential_ref, auth_header, auth_scheme)
+    authentications.validate_authorization_target(
+        auth_spec, chat_provider.chat_url)
     return RuntimeConfig(
         url=url,
         provider_kind=provider_kind,
@@ -554,10 +556,13 @@ def config_from_modelsdev_selection(
         provider_id=provider_id,
         provider_name=modelsdev.provider_display_name(
             provider_id, provider_entry),
-        credential_ref=authentications.CredentialRef.environment(
-            access.credential_env),
+        credential_ref=access.credential_ref,
         model_status=model_status,
-        stream=_bool_setting("LOKI_STREAM", False, credentials),
+        stream=_bool_setting(
+            "LOKI_STREAM",
+            provider_id == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID,
+            credentials,
+        ),
         prompt_cache=_bool_setting(
             "LOKI_PROMPT_CACHE",
             provider_id == "anthropic",
@@ -3857,12 +3862,15 @@ def configure_tool_hook_pipeline(environ=os.environ, stderr_reporter=None):
 
 async def _authorized_request_headers(
         base_headers: dict, config: RuntimeConfig | None,
+        request_url: str,
         rejected_generation: int | None = None
 ) -> tuple[dict, authentications.CredentialLease | None]:
     """Resolve authentication immediately before an HTTP attempt."""
     headers = dict(base_headers)
     if config is None or config.auth_spec is None:
         return headers, None
+    authentications.validate_authorization_target(
+        config.auth_spec, request_url)
     authority = current_session().credential_authority
     if authority is None:
         raise authentications.CredentialUnavailable(
@@ -3908,7 +3916,7 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     recovered = False
     while True:
         headers_to_use, lease = await _authorized_request_headers(
-            base_headers, config, rejected_generation)
+            base_headers, config, request_url, rejected_generation)
         response = await http_client.async_http_request(
             method,
             request_url,
@@ -4152,7 +4160,7 @@ async def async_chat_stream_request(
     recovered = False
     while True:
         headers_to_use, lease = await _authorized_request_headers(
-            base_headers, config, rejected_generation)
+            base_headers, config, request_url, rejected_generation)
         transport_attempt += 1
         try:
             data = await _async_chat_stream_request_once(

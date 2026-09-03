@@ -98,6 +98,21 @@ class Provider:
                 "input": input_items,
                 "max_output_tokens": self.max_tokens,
             }
+            if self.provider_id == "openai-subscription":
+                # ChatGPT's Codex backend is not the public Responses API.
+                # Match the native Codex client's explicit, stateless request
+                # contract while keeping generic compatible providers free of
+                # these OpenAI-specific controls.  In particular, encrypted
+                # reasoning must be returned so it can be replayed on the next
+                # full-history request, and subscription traffic must never
+                # ask the service to retain a response.
+                payload.pop("max_output_tokens")
+                payload.update({
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": True,
+                    "store": False,
+                    "include": ["reasoning.encrypted_content"],
+                })
             if instructions:
                 payload["instructions"] = instructions
             responses_tools = formats.openai_tools_to_responses_tools(tools)

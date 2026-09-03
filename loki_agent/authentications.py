@@ -17,6 +17,7 @@ import base64
 import json
 import math
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Protocol
 
@@ -33,6 +34,14 @@ OPENAI_ACCESS_TOKEN_REFRESH_WINDOW_S = 5 * 60
 OPENAI_FALLBACK_REFRESH_INTERVAL_S = 8 * 24 * 60 * 60
 OPENAI_REFRESH_TIMEOUT_S = 30
 OPENAI_REFRESH_MAX_BYTES = 256 * 1024
+OPENAI_CHATGPT_RESPONSES_URL = (
+    "https://chatgpt.com/backend-api/codex/responses")
+OPENAI_CHATGPT_MODELS_URL = (
+    "https://chatgpt.com/backend-api/codex/models")
+OPENAI_CHATGPT_AUTHORIZED_URLS = frozenset({
+    OPENAI_CHATGPT_RESPONSES_URL,
+    OPENAI_CHATGPT_MODELS_URL,
+})
 
 
 @dataclass(frozen=True, order=True)
@@ -477,6 +486,32 @@ def authorization_headers(
     if spec.scheme == "bearer":
         return {"Authorization": f"Bearer {lease.value}"}
     raise ValueError(f"unknown authentication scheme {spec.scheme!r}")
+
+
+def validate_authorization_target(
+        spec: AuthSpec | None, request_url: str) -> None:
+    """Prevent a persisted connection from redirecting a brokered token."""
+    if spec is None or spec.scheme != "openai-subscription":
+        return
+    try:
+        parsed = urllib.parse.urlsplit(request_url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        parsed = None
+        port = None
+    if (parsed is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.scheme.lower() != "https"
+            or parsed.hostname is None
+            or parsed.hostname.lower() != "chatgpt.com"
+            or parsed.query
+            or parsed.fragment
+            or request_url not in OPENAI_CHATGPT_AUTHORIZED_URLS):
+        raise CredentialUnavailable(
+            "OpenAI subscription credentials may only be sent to "
+            "the canonical ChatGPT Codex endpoints")
 
 
 def _decode_jwt_payload(token: str) -> dict | None:
