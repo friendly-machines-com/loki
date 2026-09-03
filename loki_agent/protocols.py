@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import urllib.parse
 from dataclasses import dataclass
 
@@ -36,6 +37,84 @@ class UnsupportedProtocolError(ProtocolError):
 class StreamProtocolError(ProtocolError):
     def __init__(self, message, payload=None):
         super().__init__(message, payload=payload)
+
+
+class ResponseApiError(ProtocolError):
+    """A terminal error reported inside a Responses protocol stream.
+
+    This is distinct from malformed SSE or an interrupted transport: the
+    server completed the protocol exchange with ``response.failed``.  Keeping
+    the classification on the exception lets the request layer retry only
+    failures for which replaying the same idempotent request is appropriate.
+    """
+
+    def __init__(
+            self, message, *, code=None, category="retryable",
+            retryable=False, retry_after=None, payload=None):
+        self.code = code
+        self.category = category
+        self.retryable = retryable
+        self.retry_after = retry_after
+        super().__init__(message, payload=payload)
+
+    def formatted(self):
+        label = "Responses API error"
+        if self.code:
+            label += f" ({self.code})"
+        return f"{label}: {self}"
+
+
+_RESPONSE_RETRY_AFTER_RE = re.compile(
+    r"try again in (\d+(?:\.\d+)?) (s|ms|seconds?)",
+    re.IGNORECASE,
+)
+
+
+def _response_retry_after(code, message):
+    # The Responses stream has no HTTP Retry-After header at this point.
+    # Codex's backend includes the delay in rate-limit messages, so recognize
+    # only that documented error class and its seconds/milliseconds forms.
+    if code != "rate_limit_exceeded" or not isinstance(message, str):
+        return None
+    match = _RESPONSE_RETRY_AFTER_RE.search(message)
+    if match is None:
+        return None
+    delay = float(match.group(1))
+    if match.group(2).lower() == "ms":
+        delay /= 1000
+    return delay
+
+
+def _response_failed_error(event):
+    response = event.get("response")
+    error = response.get("error") if isinstance(response, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(code, str):
+        code = None
+    if not isinstance(message, str) or not message:
+        message = "the provider returned response.failed"
+
+    categories = {
+        "context_length_exceeded": ("context_window", False),
+        "insufficient_quota": ("quota", False),
+        "usage_not_included": ("subscription", False),
+        "cyber_policy": ("cyber_policy", False),
+        "invalid_prompt": ("invalid_request", False),
+        "bio_policy": ("invalid_request", False),
+        "server_is_overloaded": ("overloaded", False),
+        "slow_down": ("overloaded", False),
+    }
+    category, retryable = categories.get(
+        code, ("retryable", True))
+    return ResponseApiError(
+        message,
+        code=code,
+        category=category,
+        retryable=retryable,
+        retry_after=_response_retry_after(code, message),
+        payload=event,
+    )
 
 
 @dataclass
@@ -650,7 +729,9 @@ class OpenAIResponsesStreamAccumulator:
             self.incomplete_response = copy.deepcopy(response)
             self.incomplete_response.setdefault("object", "response")
             self.incomplete_response.setdefault("status", "incomplete")
-        elif event_type in ("response.failed", "response.cancelled"):
+        elif event_type == "response.failed":
+            raise _response_failed_error(data)
+        elif event_type == "response.cancelled":
             response = data.get("response")
             if isinstance(response, dict):
                 self.failed_response = copy.deepcopy(response)

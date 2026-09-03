@@ -2707,6 +2707,18 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                 "saved": False,
             })
             return ""
+        except protocols.ResponseApiError as e:
+            if cancel_check():
+                finish_live_text(False, "cancelled")
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": live_text_started,
+                    "saved": False,
+                })
+                return ""
+            finish_live_text(False, "error")
+            on_event({"type": "api_error", "error": e})
+            return ""
         except protocols.StreamProtocolError as e:
             if cancel_check():
                 finish_live_text(False, "cancelled")
@@ -4168,6 +4180,8 @@ async def _async_chat_stream_request_once(
                 accumulator.feed(event)
         except StreamCancelled:
             raise
+        except protocols.ResponseApiError:
+            raise
         except protocols.StreamProtocolError:
             raise
         except ValueError as e:
@@ -4225,14 +4239,26 @@ async def async_chat_stream_request(
                 # accounting and preserves the same idempotency key.
                 transport_attempt = 0
                 continue
+            retryable_response_error = (
+                isinstance(exc, protocols.ResponseApiError)
+                and exc.retryable)
             if (transport_attempt >= HTTP_RETRY_MAX_ATTEMPTS_LLM
-                    or not http_client.is_transient_error(exc)):
+                    or not (
+                        retryable_response_error
+                        or http_client.is_transient_error(exc))):
                 raise
             delay = (
-                HTTP_RETRY_BASE_DELAY_S
-                * (HTTP_RETRY_BACKOFF_FACTOR
-                   ** (transport_attempt - 1)))
-            if HTTP_RETRY_MAX_JITTER_S:
+                exc.retry_after
+                if (retryable_response_error
+                    and exc.retry_after is not None)
+                else (
+                    HTTP_RETRY_BASE_DELAY_S
+                    * (HTTP_RETRY_BACKOFF_FACTOR
+                       ** (transport_attempt - 1))))
+            if (HTTP_RETRY_MAX_JITTER_S
+                    and not (
+                        retryable_response_error
+                        and exc.retry_after is not None)):
                 delay += random.uniform(0, HTTP_RETRY_MAX_JITTER_S)
             try:
                 await http_client._wait_with_cancel(

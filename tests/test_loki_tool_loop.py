@@ -4744,6 +4744,107 @@ class RequestTimeCredentialTests(unittest.TestCase):
             calls[1][loki.LLM_IDEMPOTENCY_HEADER_OPENAI],
         )
 
+    def test_streaming_response_failure_retries_when_classified_retryable(self):
+        self._install_subscription(stream=True)
+        calls = []
+
+        async def request_once(
+                url, payload, headers, on_text_delta, cancel_check):
+            calls.append(dict(headers))
+            if len(calls) < 3:
+                raise protocols.ResponseApiError(
+                    "temporary server failure",
+                    code="server_error",
+                    retryable=True,
+                )
+            return {"id": "response"}
+
+        with mock.patch.object(
+                loki, "_async_chat_stream_request_once",
+                new=request_once), \
+                mock.patch.object(
+                    loki, "HTTP_RETRY_BASE_DELAY_S", 0), \
+                mock.patch.object(
+                    loki, "HTTP_RETRY_MAX_JITTER_S", 0):
+            result = asyncio.run(loki.async_chat_stream_request(
+                loki.current_config().url, {"input": []}))
+
+        self.assertEqual(result, {"id": "response"})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            len({
+                headers[loki.LLM_IDEMPOTENCY_HEADER_OPENAI]
+                for headers in calls
+            }),
+            1,
+        )
+
+    def test_terminal_response_failure_is_not_saved_as_a_turn(self):
+        transcript = [formats.message_item("user", "hello")]
+        events = []
+
+        async def chat_fn(items, on_text_delta):
+            raise protocols.ResponseApiError(
+                "quota exhausted",
+                code="insufficient_quota",
+                category="quota",
+                retryable=False,
+            )
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            transcript,
+            chat_fn=chat_fn,
+            on_event=events.append,
+            stream_chat=True,
+        ))
+
+        self.assertEqual(result, "")
+        self.assertEqual(
+            [item["type"] for item in transcript],
+            ["message"],
+        )
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["api_error"],
+        )
+
+    def test_streamed_response_failure_reaches_retry_classifier(self):
+        self._install_subscription(stream=True)
+        calls = []
+
+        async def response_body():
+            yield (
+                b'data: {"type":"response.failed","response":{'
+                b'"status":"failed","error":{"code":"server_error",'
+                b'"message":"temporary failure"}}}\n\n'
+            )
+
+        @contextlib.asynccontextmanager
+        async def fake_http_stream(method, request_url, **kwargs):
+            calls.append(kwargs)
+            yield loki.http_client.HttpStreamResponse(
+                request_url,
+                200,
+                "OK",
+                {"content-type": "text/event-stream"},
+                response_body(),
+            )
+
+        with mock.patch.object(
+                loki.http_client, "async_http_stream",
+                side_effect=fake_http_stream), \
+                mock.patch.object(
+                    loki, "HTTP_RETRY_BASE_DELAY_S", 0), \
+                mock.patch.object(
+                    loki, "HTTP_RETRY_MAX_JITTER_S", 0):
+            with self.assertRaises(
+                    protocols.ResponseApiError) as raised:
+                asyncio.run(loki.async_chat_stream_request(
+                    loki.current_config().url, {"input": []}))
+
+        self.assertEqual(raised.exception.code, "server_error")
+        self.assertEqual(len(calls), 3)
+
     def test_static_credential_does_not_retry_a_401(self):
         credential = authentications.CredentialRef.environment(
             "EXAMPLE_API_KEY")

@@ -1155,19 +1155,6 @@ class StreamAccumulatorTests(unittest.TestCase):
                     }],
                 },
             ),
-            (
-                "response.failed",
-                {
-                    "id": "response_failed",
-                    "object": "response",
-                    "status": "failed",
-                    "error": {
-                        "code": "server_error",
-                        "message": "failed",
-                    },
-                    "output": [],
-                },
-            ),
         ]
         for terminal_type, buffered in cases:
             with self.subTest(terminal_type=terminal_type):
@@ -1627,25 +1614,68 @@ class StreamAccumulatorTests(unittest.TestCase):
             "max_output_tokens",
         )
 
-    def test_openai_responses_failed_stream_returns_failed_turn(self):
+    def test_openai_responses_failed_stream_raises_classified_api_error(self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(
             lambda text: None)
-        accumulator.feed(self.event(
-            '{"type":"response.failed","response":'
-            '{"id":"resp_1","object":"response","status":"failed",'
-            '"error":{"code":"server_error","message":"failed"},'
-            '"output":[]}}'))
+        with self.assertRaises(protocols.ResponseApiError) as raised:
+            accumulator.feed(self.event(
+                '{"type":"response.failed","response":'
+                '{"id":"resp_1","object":"response","status":"failed",'
+                '"error":{"code":"server_error","message":"failed"},'
+                '"output":[]}}'))
 
-        response = accumulator.finish()
-        turn = formats.openai_responses_response_to_items(response)
-
-        self.assertFalse(turn.complete)
-        self.assertEqual(turn.metadata["status"], "failed")
+        self.assertEqual(raised.exception.code, "server_error")
+        self.assertEqual(raised.exception.category, "retryable")
+        self.assertTrue(raised.exception.retryable)
         self.assertEqual(
-            turn.metadata["protocol_data"][protocols.OPENAI_RESPONSES]
-            ["error"]["code"],
-            "server_error",
-        )
+            raised.exception.payload["response"]["id"], "resp_1")
+
+    def test_response_failure_classes_match_codex(self):
+        cases = [
+            ("context_length_exceeded", "context_window", False),
+            ("insufficient_quota", "quota", False),
+            ("usage_not_included", "subscription", False),
+            ("cyber_policy", "cyber_policy", False),
+            ("invalid_prompt", "invalid_request", False),
+            ("bio_policy", "invalid_request", False),
+            ("server_is_overloaded", "overloaded", False),
+            ("slow_down", "overloaded", False),
+            ("unknown_transient_error", "retryable", True),
+        ]
+        for code, category, retryable in cases:
+            with self.subTest(code=code):
+                accumulator = protocols.OpenAIResponsesStreamAccumulator(
+                    lambda text: None)
+                with self.assertRaises(
+                        protocols.ResponseApiError) as raised:
+                    accumulator.feed(self.event(json.dumps({
+                        "type": "response.failed",
+                        "response": {
+                            "error": {
+                                "code": code,
+                                "message": "failure",
+                            },
+                        },
+                    })))
+                self.assertEqual(raised.exception.category, category)
+                self.assertIs(raised.exception.retryable, retryable)
+
+    def test_rate_limit_failure_carries_retry_delay(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        with self.assertRaises(protocols.ResponseApiError) as raised:
+            accumulator.feed(self.event(json.dumps({
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "rate_limit_exceeded",
+                        "message": "Please try again in 125 ms.",
+                    },
+                },
+            })))
+
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(raised.exception.retry_after, 0.125)
 
     def test_openai_responses_error_event_is_a_stream_error(self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(
