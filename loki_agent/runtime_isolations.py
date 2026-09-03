@@ -243,6 +243,12 @@ def isolate_credential_directory(directory: str | None = None) -> bool:
     if not os.path.isdir(target):
         return False
 
+    try:
+        original_cwd = os.getcwd()
+    except OSError as error:
+        raise RuntimeIsolationError(
+            f"could not record the runtime working directory: {error}"
+        ) from error
     libc = ctypes.CDLL(None, use_errno=True)
     # Once the new user namespace exists, an unmapped caller is reported as
     # the overflow identity. Preserve the real IDs before unshare so the map
@@ -252,5 +258,16 @@ def isolate_credential_directory(directory: str | None = None) -> bool:
     _unshare_user_and_mount_namespaces(libc)
     _map_current_identity(uid, gid)
     _mount_private_credential_view(libc, target)
+    try:
+        # A process whose cwd was the covered directory still holds a reference
+        # to the underlying pre-mount dentry. Resolve the same pathname again
+        # through the new mount table so relative opens see the empty cover,
+        # not the supervisor's credential files.
+        os.chdir(original_cwd)
+    except OSError as error:
+        raise RuntimeIsolationError(
+            "could not rebind the runtime working directory after hiding "
+            f"credentials: {error}"
+        ) from error
     _drop_namespace_capabilities(libc)
     return True

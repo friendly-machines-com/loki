@@ -91,6 +91,52 @@ class UnshareSelectionTests(unittest.TestCase):
     "Linux user and mount namespaces",
 )
 class LinuxIsolationTests(unittest.TestCase):
+    def test_runtime_rebinds_cwd_through_credential_cover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credentials = os.path.join(directory, "credentials")
+            os.mkdir(credentials)
+            marker = os.path.join(credentials, "secret")
+            with open(marker, "w", encoding="ascii") as stream:
+                stream.write("supervisor-visible")
+
+            code = r"""
+import json
+import os
+import sys
+
+from loki_agent.runtime_isolations import isolate_credential_directory
+
+target = sys.argv[1]
+os.chdir(target)
+isolated = isolate_credential_directory(target)
+try:
+    with open("secret", encoding="ascii") as stream:
+        stream.read()
+except (FileNotFoundError, PermissionError):
+    relative_hidden = True
+else:
+    relative_hidden = False
+print(json.dumps({
+    "isolated": isolated,
+    "cwd": os.getcwd(),
+    "relative_hidden": relative_hidden,
+}))
+"""
+            process = subprocess.run(
+                [sys.executable, "-c", code, credentials],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+
+            self.assertEqual(process.returncode, 0, process.stderr)
+            result = json.loads(process.stdout)
+            self.assertTrue(result["isolated"])
+            self.assertEqual(result["cwd"], credentials)
+            self.assertTrue(result["relative_hidden"])
+
     def test_runtime_hides_only_its_credential_directory_and_drops_caps(self):
         with tempfile.TemporaryDirectory() as directory:
             credentials = os.path.join(directory, "credentials")
