@@ -293,6 +293,11 @@ class HttpClientRequestTests(unittest.TestCase):
         self.assertEqual(raw_headers.split(b"\r\n")[0], b"POST /v1/messages?trace=1 HTTP/1.1")
         self.assertIn(b"Host: api.example.test:8443", raw_headers.split(b"\r\n"))
         self.assertIn(b"Connection: close", raw_headers.split(b"\r\n"))
+        self.assertIn(
+            f"User-Agent: {http_client.APPLICATION_USER_AGENT}".encode(
+                "ascii"),
+            raw_headers.split(b"\r\n"),
+        )
         self.assertIn(b"X-Test: ok", raw_headers.split(b"\r\n"))
         self.assertIn(b"Authorization: Bearer token", raw_headers.split(b"\r\n"))
         self.assertIn(b"Content-Length: 2", raw_headers.split(b"\r\n"))
@@ -329,6 +334,21 @@ class HttpClientRequestTests(unittest.TestCase):
                     "GET",
                     "https://example.test/",
                     headers_in={"X-Bad": "ok\r\nInjected: yes"},
+                    timeout=5,
+                ))
+
+        self.assertEqual(connector.calls, [])
+
+    def test_rejects_endpoint_owned_user_agent_before_connecting(self):
+        connector = FakeConnector([])
+
+        with PatchedOpenConnection(connector):
+            with self.assertRaisesRegex(
+                    ValueError, "User-Agent is owned by Loki"):
+                asyncio.run(http_client.async_http_request(
+                    "GET",
+                    "https://example.test/",
+                    headers_in={"user-agent": "feature-specific/1.0"},
                     timeout=5,
                 ))
 
@@ -627,6 +647,13 @@ class HttpClientStreamingTests(unittest.TestCase):
         self.assertEqual(chunks, [b"abc", b"defg"])
         self.assertTrue(connector.writers[0].closed)
         self.assertTrue(connector.writers[0].wait_closed_called)
+        raw_headers = bytes(
+            connector.writers[0].data).split(b"\r\n\r\n", 1)[0]
+        self.assertIn(
+            f"User-Agent: {http_client.APPLICATION_USER_AGENT}".encode(
+                "ascii"),
+            raw_headers.split(b"\r\n"),
+        )
 
     def test_stream_content_length_is_read_without_buffering_api(self):
         connector = FakeConnector([

@@ -5,7 +5,8 @@ build-backend = "flit_core.buildapi"
 [project]
 # Distribution name; flit normalizes it to the "loki_agent" package.
 name = "loki-agent"
-version = "0.1.0"
+# The package's __version__ is also Loki's HTTP identity version.
+dynamic = ["version"]
 description = "Really really minimal-dependency coding agent"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -140,7 +140,6 @@ class CatalogFetchTests(unittest.TestCase):
         self.assertEqual(
             transport.await_args.kwargs["headers_in"],
             {
-                "User-Agent": models.USER_AGENT,
                 "Accept": "application/json",
             },
         )

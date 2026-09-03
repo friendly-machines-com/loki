@@ -3449,7 +3449,6 @@ async def _fetch_url_async(url: str, cancel_check=None) -> dict:
         return {'error': f'invalid URL: {url}'}
 
     request_headers = {
-        'User-Agent': 'loki-WebFetch/0.1 (coding-agent)',
         'Accept': 'text/markdown;q=1.0, text/html;q=0.9, text/plain;q=0.8, application/json;q=0.7, */*;q=0.1',
         'Accept-Language': 'en-US,en;q=0.9',
     }
@@ -3551,8 +3550,7 @@ async def run_websearch_async(query: str, allowed_domains: list = None,
             'POST',
             DUCKDUCKGO_HTML_SEARCH_URL,
             body=form.encode('utf-8'),
-            headers_in={'User-Agent': 'loki-WebSearch/0.1 (coding-agent)',
-                        'Content-Type': 'application/x-www-form-urlencoded',
+            headers_in={'Content-Type': 'application/x-www-form-urlencoded',
                         'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'},
             timeout=WEBSEARCH_TIMEOUT_S,
             max_bytes=WEBSEARCH_MAX_RESPONSE_BYTES,

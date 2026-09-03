@@ -1090,12 +1090,10 @@ def model_url_candidates(input_url, protocol, primary_models_url=None, explicit_
     return candidates
 
 
-def build_headers(protocol, anthropic_version="2023-06-01",
-                  user_agent="TinyAgent/1.0"):
-    """Build non-secret protocol headers."""
+def build_headers(protocol, anthropic_version="2023-06-01"):
+    """Build non-secret wire-protocol headers."""
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": user_agent,
     }
     if protocol == ANTHROPIC_MESSAGES:
         # This identifies the Anthropic wire format; it is required protocol

@@ -39,14 +39,12 @@ from .credentials import (
 )
 
 MODELS_DEV_URL = "https://models.dev/api.json"
-USER_AGENT = "loki-models.dev-picker/1.0"
 MODELS_DEV_TIMEOUT_S = 30
 MODELS_DEV_MAX_BYTES = 20 * 1024 * 1024
 MODELS_DEV_RETRY_MAX_ATTEMPTS = 3
 OPENAI_MODELS_TIMEOUT_S = 5
 OPENAI_MODELS_MAX_BYTES = 20 * 1024 * 1024
 OPENAI_MODELS_RETRY_MAX_ATTEMPTS = 3
-OPENAI_USER_AGENT = "loki/0.1.0"
 
 # models.dev omits endpoints that its native JavaScript SDK packages know
 # internally.  Keep the downloaded catalog and cache faithful to models.dev,
@@ -357,7 +355,6 @@ async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
         "GET",
         url,
         headers_in={
-            "User-Agent": USER_AGENT,
             "Accept": "application/json",
         },
         timeout=MODELS_DEV_TIMEOUT_S,
@@ -397,7 +394,6 @@ async def fetch_openai_subscription_models(
             credential, rejected_generation=rejected_generation)
         headers = {
             "Accept": "application/json",
-            "User-Agent": OPENAI_USER_AGENT,
         }
         headers.update(authentications.authorization_headers(
             auth_spec, lease))

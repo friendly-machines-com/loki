@@ -5,12 +5,20 @@ import ssl
 import urllib.parse
 from dataclasses import dataclass
 
+from . import __version__
 
-# This is a small dependency-free HTTP/1.1 client for tool use, not a general
-# browser stack. Keep protocol policy here explicit because callers depend on
-# the exact redirect, truncation, and header-validation behavior.
+
+# This is Loki's small dependency-free HTTP/1.1 transport, not a general browser
+# stack. Every production Internet request uses it. Keep transport policy here
+# explicit because callers depend on exact redirect, truncation, identity, and
+# header-validation behavior.
 HTTP_HEADER_MAX_BYTES = 64 * 1024
 HTTP_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+# Application identity is a property of Loki, not of an endpoint or feature.
+# Every production HTTP path reaches _build_raw_request(), which installs this
+# value and rejects caller overrides. Protocol, authentication, and per-request
+# headers remain caller-owned and therefore cannot silently fork Loki's name.
+APPLICATION_USER_AGENT = f"loki/{__version__}"
 
 
 # Errno values for which retrying is safe: the failure is transport-level and
@@ -351,9 +359,15 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict = None,
     parsed = urllib.parse.urlparse(request_url)
     if parsed.scheme not in ['http', 'https'] or not parsed.hostname:
         raise ValueError(f"unsupported URL: {request_url}")
+    if any(
+            str(name).lower() == "user-agent"
+            for name in (headers_in or {})):
+        raise ValueError(
+            "User-Agent is owned by Loki's HTTP transport")
     request_headers = {
         'Host': _host_header(parsed),
         'Connection': 'close',
+        'User-Agent': APPLICATION_USER_AGENT,
     }
     if headers_in:
         request_headers.update(headers_in)
