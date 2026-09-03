@@ -9,8 +9,28 @@ modes use exactly one for the life of the process.
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def prompt_cache_key_for_path(path: str) -> str:
+    """Return a stable, non-secret cache partition for one persistent chat."""
+    real_path = os.path.realpath(path)
+    name = os.path.basename(real_path)
+    if name.startswith("chat-") and name.endswith(".json"):
+        chat_id = name[len("chat-"):-len(".json")]
+        # Terminal chats use a bare UUID; ACP-created chats use "loki-UUID".
+        candidate = (
+            chat_id[len("loki-"):]
+            if chat_id.startswith("loki-") else chat_id)
+        try:
+            return str(uuid.UUID(candidate))
+        except ValueError:
+            pass
+    # Explicitly named chat files still need the same partition after resume.
+    # uuid5 avoids sending the absolute path itself to the model service.
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, real_path))
 
 
 @dataclass
@@ -34,6 +54,15 @@ class Session:
     session_state: dict = field(default_factory=dict)
     chat_log_path: str | None = None
     chat_log_dirty: bool = False
+    # One cache partition belongs to one conversation. It is derived again
+    # from persistent chat identity on resume rather than trusting an
+    # arbitrary value in the chat log. A nonpersistent runtime keeps this
+    # fresh in-memory value for its own lifetime.
+    #
+    # This is not x-codex-turn-state: that routing token is created afresh for
+    # every logical user turn.
+    prompt_cache_key: str = field(
+        default_factory=lambda: str(uuid.uuid4()))
 
     # "normal" / "explore" / "plan" / "edit"
     agent_mode: str = "normal"
@@ -59,6 +88,7 @@ class Session:
         self.session_todos = todos
         self.session_toolsets = toolsets
         self.session_state = dict(state)
+        self.prompt_cache_key = prompt_cache_key_for_path(path)
         # Write through the real path, not a symlink naming it.
         self.chat_log_path = os.path.realpath(path) if path else None
         self.chat_log_dirty = False

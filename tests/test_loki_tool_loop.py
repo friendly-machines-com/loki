@@ -2192,6 +2192,77 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
 
 
 class SessionResponsePersistenceTests(unittest.TestCase):
+    def test_prompt_cache_key_is_derived_from_chat_identity(self):
+        names = [
+            "chat_log_path", "session_state", "chat_log_dirty",
+            "transcript_items", "session_todos", "session_toolsets",
+            "prompt_cache_key",
+        ]
+        old_values = save_loki_state(names)
+        chat_id = "5a72cf91-7370-409b-8b39-a68cc21b649e"
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, f"chat-{chat_id}.json")
+                loki.new_chat_log(path)
+                first_key = loki.current_session().prompt_cache_key
+                loki.save_chat_log()
+                blob = json.loads(pathlib.Path(path).read_text(
+                    encoding="utf-8"))
+
+                loki.current_session().prompt_cache_key = "different"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    loki.load_chat_log(path)
+                resumed_key = loki.current_session().prompt_cache_key
+        finally:
+            restore_loki_state(old_values)
+
+        self.assertEqual(first_key, chat_id)
+        self.assertEqual(resumed_key, first_key)
+        self.assertNotIn("prompt_cache_key", blob["session_state"])
+
+    def test_acp_chat_identity_uses_the_embedded_uuid(self):
+        chat_id = "5a72cf91-7370-409b-8b39-a68cc21b649e"
+        path = os.path.join(
+            "/tmp", f"chat-loki-{chat_id}.json")
+
+        self.assertEqual(
+            loki.prompt_cache_key_for_path(path),
+            chat_id,
+        )
+
+    def test_completion_sends_the_current_session_cache_key(self):
+        saved = save_loki_state(["runtime_config", "prompt_cache_key"])
+        try:
+            loki.apply_runtime_config(loki.make_runtime_config(
+                authentications.OPENAI_CHATGPT_RESPONSES_URL,
+                protocols.OPENAI_RESPONSES,
+                model="gpt-test",
+                provider_id="openai-subscription",
+                credential_ref=(
+                    authentications.CredentialRef.openai_subscription()),
+                auth_scheme="openai-subscription",
+                stream=True,
+                openai_request_profile=_codex_model(),
+            ))
+            loki.current_session().prompt_cache_key = "session-cache-key"
+            request = mock.AsyncMock(return_value={
+                "object": "response",
+                "status": "completed",
+                "output": [],
+            })
+            with mock.patch.object(
+                    loki, "async_chat_stream_request", new=request):
+                asyncio.run(loki.async_chat_completion(
+                    [formats.message_item("user", "hello")],
+                    tools=[],
+                ))
+        finally:
+            restore_loki_state(saved)
+
+        payload = request.await_args.args[1]
+        self.assertEqual(
+            payload["prompt_cache_key"], "session-cache-key")
+
     def test_saved_note_flushes_stdout_before_writing_stderr(self):
         class TrackingStdout(io.StringIO):
             def __init__(self):

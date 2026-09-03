@@ -48,7 +48,11 @@ from .credentials import (
     CredentialStore,
     is_credential_name,
 )
-from .sessions import Session, default_session
+from .sessions import (
+    Session,
+    default_session,
+    prompt_cache_key_for_path,
+)
 
 # Backwards-compatible public name; the implementation belongs to savefiles.
 ResumeTranscriptRenderer = savefiles.ResumeTranscriptRenderer
@@ -4568,7 +4572,11 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
 
     if current_config().stream:
         payload = current_config().chat_provider.streaming_chat_payload(
-            transcript_items, tools, current_model())
+            transcript_items,
+            tools,
+            current_model(),
+            prompt_cache_key=current_session().prompt_cache_key,
+        )
         request_kwargs = {
             "request_headers":
                 current_config().chat_provider.headers,
@@ -4586,7 +4594,11 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         )
     else:
         payload = current_config().chat_provider.chat_payload(
-            transcript_items, tools, current_model())
+            transcript_items,
+            tools,
+            current_model(),
+            prompt_cache_key=current_session().prompt_cache_key,
+        )
         try:
             request_kwargs = {
                 "request_headers":
@@ -4820,6 +4832,7 @@ def resolve_chat_log_path(resume_arg: str) -> str:
 
 def new_chat_log(filename):
     session = current_session()
+    session.prompt_cache_key = prompt_cache_key_for_path(filename)
     session.transcript_items = initial_transcript_items()
     session.session_todos = []
     session.session_toolsets = []

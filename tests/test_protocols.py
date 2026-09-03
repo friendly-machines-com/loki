@@ -174,6 +174,7 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             [formats.message_item("user", "hi")],
             [],
             "gpt-test",
+            prompt_cache_key="cache-key",
         )
 
         self.assertEqual(payload["tool_choice"], "auto")
@@ -187,6 +188,7 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             "summary": "detailed",
         })
         self.assertEqual(payload["text"], {"verbosity": "medium"})
+        self.assertEqual(payload["prompt_cache_key"], "cache-key")
         self.assertNotIn("max_output_tokens", payload)
 
     def test_subscription_parallel_tool_calls_follow_request_profile(self):
@@ -349,11 +351,13 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
             [formats.message_item("user", "hi")],
             [],
             "gpt-test",
+            prompt_cache_key="subscription-only",
         )
 
         self.assertEqual(payload["max_output_tokens"], 1234)
         for field in [
-                "tool_choice", "parallel_tool_calls", "store", "include"]:
+                "tool_choice", "parallel_tool_calls", "store", "include",
+                "prompt_cache_key"]:
             self.assertNotIn(field, payload)
 
     def test_responses_parse_response_separates_items_from_envelope(self):

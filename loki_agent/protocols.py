@@ -173,7 +173,8 @@ class Provider:
             model=model,
         )
 
-    def chat_payload(self, items, tools, model):
+    def chat_payload(
+            self, items, tools, model, *, prompt_cache_key=None):
         target = self.projection_target(model)
         if self.kind == OPENAI_CHAT:
             payload = {
@@ -248,6 +249,11 @@ class Provider:
                 text = _codex_text_parameter(profile)
                 if text is not None:
                     payload["text"] = text
+                if prompt_cache_key is not None:
+                    # This partitions server-side prefix caching by Loki
+                    # conversation. It is neither authentication nor the
+                    # per-turn sticky-routing token.
+                    payload["prompt_cache_key"] = prompt_cache_key
                 # Loki has no service-tier setting. Omitting service_tier asks
                 # the backend for its ordinary default; Codex likewise does
                 # not copy default_service_tier into a request unless a tier
@@ -290,8 +296,14 @@ class Provider:
             return {}
         raise ProtocolError(f"unknown protocol {self.kind!r}")
 
-    def streaming_chat_payload(self, items, tools, model):
-        payload = self.chat_payload(items, tools, model)
+    def streaming_chat_payload(
+            self, items, tools, model, *, prompt_cache_key=None):
+        payload = self.chat_payload(
+            items,
+            tools,
+            model,
+            prompt_cache_key=prompt_cache_key,
+        )
         if self.kind != DUMMY:
             payload["stream"] = True
         return payload
