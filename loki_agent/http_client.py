@@ -585,10 +585,18 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
         next_url = _redirect_location(response)
         if not next_url:
             return response
-        next_host = urllib.parse.urlparse(next_url).netloc
-        if next_host != original_host:
+        current_scheme = urllib.parse.urlparse(
+            current_url).scheme.lower()
+        next_parsed = urllib.parse.urlparse(next_url)
+        next_scheme = next_parsed.scheme.lower()
+        if (next_parsed.netloc != original_host
+                or next_scheme not in {"http", "https"}
+                or (current_scheme == "https"
+                    and next_scheme != "https")):
             # WebFetch surfaces cross-origin redirects to the model/user rather
-            # than silently fetching a different authority.
+            # than silently fetching a different authority. HTTPS is also a
+            # one-way security transition: after any hop reaches TLS, a later
+            # redirect cannot downgrade the remaining request or its headers.
             response.redirect_url = next_url
             return response
         current_url = next_url

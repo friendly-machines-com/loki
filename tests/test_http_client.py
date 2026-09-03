@@ -474,6 +474,61 @@ class HttpClientRedirectTests(unittest.TestCase):
         self.assertEqual(response.status, 302)
         self.assertEqual(response.redirect_url, "https://other.test/path")
 
+    def test_https_redirect_cannot_downgrade_on_the_same_host(self):
+        calls = []
+
+        async def fake_request(method, request_url, **kwargs):
+            calls.append(request_url)
+            return http_client.HttpResponse(
+                request_url,
+                302,
+                "Found",
+                {"location": "http://example.test/plaintext"},
+                b"",
+            )
+
+        with mock.patch.object(
+                http_client, "async_http_request", new=fake_request):
+            response = asyncio.run(
+                http_client.async_http_request_follow_same_host(
+                    "GET",
+                    "https://example.test/start",
+                    headers_in={"Authorization": "Bearer secret"},
+                ))
+
+        self.assertEqual(calls, ["https://example.test/start"])
+        self.assertEqual(
+            response.redirect_url,
+            "http://example.test/plaintext",
+        )
+
+    def test_http_may_upgrade_but_cannot_downgrade_afterward(self):
+        calls = []
+
+        async def fake_request(method, request_url, **kwargs):
+            calls.append(request_url)
+            location = (
+                "https://example.test/secure"
+                if request_url.startswith("http:")
+                else "http://example.test/plaintext")
+            return http_client.HttpResponse(
+                request_url, 302, "Found", {"location": location}, b"")
+
+        with mock.patch.object(
+                http_client, "async_http_request", new=fake_request):
+            response = asyncio.run(
+                http_client.async_http_request_follow_same_host(
+                    "GET", "http://example.test/start"))
+
+        self.assertEqual(calls, [
+            "http://example.test/start",
+            "https://example.test/secure",
+        ])
+        self.assertEqual(
+            response.redirect_url,
+            "http://example.test/plaintext",
+        )
+
 
 class HttpClientRetryTests(unittest.TestCase):
     def test_retry_preparation_sees_state_from_prior_response_headers(self):
