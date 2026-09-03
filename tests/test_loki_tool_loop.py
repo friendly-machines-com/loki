@@ -4473,6 +4473,8 @@ class SubagentLaunchTests(unittest.TestCase):
         capability_fd = os.dup(delegation.credential_fd)
         delegation.child_spawned()
         try:
+            if "--subagent-depth" not in args:
+                args = [*args, "--subagent-depth", "1"]
             return await subagents.async_main([
                 *args,
                 "--session-owner-fd", str(owner_fd),
@@ -4482,23 +4484,30 @@ class SubagentLaunchTests(unittest.TestCase):
             await delegation.close()
 
     def test_subagent_launch_reuses_its_own_dispatcher(self):
+        saved = save_loki_state(["subagent_depth"])
         old_argv = sys.argv[:]
         try:
             results = []
-            for parent_entrypoint in ("./loki.py", "./loki-acp"):
-                sys.argv = [parent_entrypoint]
-                results.append((
-                    parent_entrypoint,
-                    loki._subagent_argv("Explore", "inspect this"),
-                ))
+            for depth in (0, 2):
+                loki.current_session().subagent_depth = depth
+                for parent_entrypoint in ("./loki.py", "./loki-acp"):
+                    sys.argv = [parent_entrypoint]
+                    results.append((
+                        depth,
+                        parent_entrypoint,
+                        loki._subagent_argv("Explore", "inspect this"),
+                    ))
         finally:
             sys.argv = old_argv
+            restore_loki_state(saved)
 
-        for parent_entrypoint, result in results:
+        for depth, parent_entrypoint, result in results:
             self.assertEqual(result, [
                 parent_entrypoint,
                 "--subagent",
                 "Explore",
+                "--subagent-depth",
+                str(depth + 1),
                 "--prompt",
                 "inspect this",
                 "--shell-cwd",
@@ -4563,6 +4572,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 args, kwargs = manager.run_exec.await_args
                 self.assertEqual(kwargs["cwd"], os.getcwd())
                 self.assertTrue(kwargs["session_owned"])
+                self.assertTrue(kwargs["subagent"])
                 self.assertEqual(
                     args[0][-2:],
                     ["--shell-cwd", tmpdir],
@@ -4627,6 +4637,80 @@ class SubagentLaunchTests(unittest.TestCase):
             profile,
         )
         self.assertNotIn("base_instructions", encoded_profile)
+
+    def test_subagent_depth_is_bounded_at_the_entrypoint(self):
+        self.assertEqual(
+            subagents.parse_args([
+                "Explore",
+                "--subagent-depth",
+                str(loki.MAX_SUBAGENT_DEPTH),
+            ]).subagent_depth,
+            loki.MAX_SUBAGENT_DEPTH,
+        )
+        for value in ("0", str(loki.MAX_SUBAGENT_DEPTH + 1), "one"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                subagents.parse_args([
+                    "Explore", "--subagent-depth", value])
+
+    def test_maximum_depth_neither_advertises_nor_runs_agent(self):
+        saved = save_loki_state(["subagent_depth", "agent_mode"])
+        session = loki.current_session()
+        session.subagent_depth = loki.MAX_SUBAGENT_DEPTH
+        captured = {}
+
+        async def fake_loop(messages, allowed):
+            captured["messages"] = messages
+            captured["allowed"] = allowed
+            return "done"
+
+        try:
+            with mock.patch.object(
+                    loki, "run_tool_loop_async", side_effect=fake_loop):
+                result = asyncio.run(
+                    subagents.run_prompt_async("Explore", "inspect"))
+            manager = mock.Mock()
+            with mock.patch.object(
+                    loki, "current_job_manager",
+                    return_value=manager):
+                launch_result = asyncio.run(loki.run_agent_async(
+                    "nested", "inspect"))
+        finally:
+            restore_loki_state(saved)
+
+        self.assertEqual(result, "done")
+        self.assertNotIn("Agent", captured["allowed"])
+        self.assertIn(
+            "maximum delegation depth",
+            formats.item_text(captured["messages"][0]),
+        )
+        self.assertIn("maximum subagent depth", launch_result)
+        manager.run_exec.assert_not_called()
+        manager.run_background_exec.assert_not_called()
+
+    def test_lower_depth_advertises_recursive_agent(self):
+        saved = save_loki_state(["subagent_depth", "agent_mode"])
+        session = loki.current_session()
+        session.subagent_depth = loki.MAX_SUBAGENT_DEPTH - 1
+        captured = {}
+
+        async def fake_loop(messages, allowed):
+            captured["messages"] = messages
+            captured["allowed"] = allowed
+            return "done"
+
+        try:
+            with mock.patch.object(
+                    loki, "run_tool_loop_async", side_effect=fake_loop):
+                asyncio.run(
+                    subagents.run_prompt_async("Explore", "inspect"))
+        finally:
+            restore_loki_state(saved)
+
+        self.assertIn("Agent", captured["allowed"])
+        self.assertIn(
+            "delegate another read-only Explore search",
+            formats.item_text(captured["messages"][0]),
+        )
 
     def test_subagent_operation_is_cancelled_when_owner_fd_closes(self):
         async def scenario():

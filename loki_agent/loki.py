@@ -143,6 +143,11 @@ GLOB_MAX_RESULTS = 100
 GREP_DEFAULT_HEAD_LIMIT = 250
 SEARCH_TIMEOUT_S = 30
 SUBAGENT_TIMEOUT_S = 600
+# Each process may own two children, and only three descendant generations
+# may exist. Thus one root process can have at most 2 + 4 + 8 active
+# descendants instead of allowing recursive Agent calls to grow without bound.
+MAX_ACTIVE_DIRECT_SUBAGENTS = 2
+MAX_SUBAGENT_DEPTH = 3
 TODO_MAX_TODOS = 100
 SKILL_MAX_BYTES = 100_000
 LOKI_CONFIG_DIR_NAME = paths.LOKI_CONFIG_DIR_NAME
@@ -1224,6 +1229,13 @@ class Job:
     owner_signal_fd: int | None = field(default=None, repr=False)
     credential_capability: object | None = field(
         default=None, repr=False)
+    # Live resource accounting only. This is deliberately absent from
+    # job.json: after process exit it has no user-visible or recovery meaning.
+    subagent_slot: bool = field(default=False, repr=False)
+
+
+class SubagentCapacityError(RuntimeError):
+    """The process already owns its maximum number of live subagents."""
 
 
 class JobManager:
@@ -1241,6 +1253,24 @@ class JobManager:
         self.session_dir = os.path.join(base_dir, self.session_id)
         self.jobs = {}
         self._counter = 0
+        self._active_subagents = 0
+
+    def _reserve_subagent_slot(self):
+        # This check-and-increment contains no await and JobManager belongs to
+        # one event loop, so concurrent tasks cannot overbook the limit.
+        if self._active_subagents >= MAX_ACTIVE_DIRECT_SUBAGENTS:
+            raise SubagentCapacityError(
+                "maximum active direct subagents reached "
+                f"({MAX_ACTIVE_DIRECT_SUBAGENTS})")
+        self._active_subagents += 1
+
+    def _release_subagent_slot(self, job: Job):
+        # More than one observer can notice an exit. Ownership moves off the
+        # job before decrementing so the operation is idempotent.
+        if not getattr(job, "subagent_slot", False):
+            return
+        job.subagent_slot = False
+        self._active_subagents -= 1
 
     def _next_job_id(self) -> str:
         self._counter += 1
@@ -1325,6 +1355,7 @@ class JobManager:
         job.finished_at_iso = _now_iso()
         self._close_owner_signal(job)
         self._revoke_credential_capability(job)
+        self._release_subagent_slot(job)
         self._write_metadata(job)
 
     def _refresh_job(self, job: Job):
@@ -1338,13 +1369,15 @@ class JobManager:
                      background: bool, timeout_ms: int | None, shell: bool,
                      env: dict | None = None, cwd: str = None,
                      session_owned: bool = False,
-                     credential_refs=None) -> Job:
+                     credential_refs=None, subagent: bool = False) -> Job:
         if session_owned and shell:
             raise ValueError(
                 "session-owned jobs require a direct executable")
         if credential_refs is not None and shell:
             raise ValueError(
                 "credential capabilities require a direct executable")
+        if subagent and not session_owned:
+            raise ValueError("subagents must be session-owned")
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -1367,7 +1400,13 @@ class JobManager:
             started_at_iso=_now_iso(),
             timeout_ms=timeout_ms,
             session_owned=session_owned,
+            subagent_slot=subagent,
         )
+        if subagent:
+            # Reserve immediately before the first operation which can yield
+            # to another event-loop task. Directory/setup failures above have
+            # not launched anything and therefore consume no slot.
+            self._reserve_subagent_slot()
 
         # Helper to unblock inherited signal masks in the child process context
         def unblock_child_signals():
@@ -1435,6 +1474,11 @@ class JobManager:
                         cwd=cwd or current_cwd(),
                         preexec_fn=unblock_child_signals,
                     )
+        except BaseException:
+            # No Job has escaped to a reaper yet, so the launch attempt still
+            # owns the reservation.
+            self._release_subagent_slot(job)
+            raise
         finally:
             if owner_read_fd is not None:
                 os.close(owner_read_fd)
@@ -1473,6 +1517,8 @@ class JobManager:
             job.finished_at_iso = _now_iso()
             self._close_owner_signal(job)
             self._revoke_credential_capability(job)
+            # A broken waiter does not prove that the child exited. Retain its
+            # slot and fail closed instead of admitting an extra live child.
             with open(job.stderr_path, 'ab') as stderr_file:
                 stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
             self._write_metadata(job)
@@ -1485,11 +1531,13 @@ class JobManager:
                              env: dict | None = None, cwd: str = None,
                              cancel_event: asyncio.Event | None = None,
                              session_owned: bool = False,
-                             credential_refs=None):
+                             credential_refs=None,
+                             subagent: bool = False):
         job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
                                 env=env, cwd=cwd,
                                 session_owned=session_owned,
-                                credential_refs=credential_refs)
+                                credential_refs=credential_refs,
+                                subagent=subagent)
 
         # Define the exit_task and nested signal helpers first so they are
         # available throughout the entire function.
@@ -1639,7 +1687,8 @@ class JobManager:
                        env: dict | None = None, cwd: str = None,
                        cancel_event: asyncio.Event | None = None,
                        session_owned: bool = False,
-                       credential_refs=None):
+                       credential_refs=None,
+                       subagent: bool = False):
         if not argv:
             raise ValueError("argv must not be empty")
         return await self.run_foreground(argv, " ".join(argv), timeout_ms,
@@ -1648,18 +1697,21 @@ class JobManager:
                                          cwd=cwd or current_cwd(),
                                          cancel_event=cancel_event,
                                          session_owned=session_owned,
-                                         credential_refs=credential_refs)
+                                         credential_refs=credential_refs,
+                                         subagent=subagent)
 
     async def run_background_exec(self, argv: list[str], description: str = "",
                                   env: dict | None = None, cwd: str = None,
                                   session_owned: bool = False,
-                                  credential_refs=None) -> Job:
+                                  credential_refs=None,
+                                  subagent: bool = False) -> Job:
         if not argv:
             raise ValueError("argv must not be empty")
         job = await self._spawn(argv, " ".join(argv), description, True, None, False,
                                 env=env, cwd=cwd or current_cwd(),
                                 session_owned=session_owned,
-                                credential_refs=credential_refs)
+                                credential_refs=credential_refs,
+                                subagent=subagent)
         asyncio.get_running_loop().create_task(self._monitor_background_job(job))
         return job
 
@@ -3205,10 +3257,16 @@ def _format_started_background_job(job: Job, kind: str = "job") -> str:
 
 
 def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
+    depth = current_session().subagent_depth
+    if depth >= MAX_SUBAGENT_DEPTH:
+        raise ValueError(
+            f"maximum subagent depth reached ({MAX_SUBAGENT_DEPTH})")
     return [
         sys.argv[0],
         '--subagent',
         agent_type,
+        '--subagent-depth',
+        str(depth + 1),
         '--prompt',
         prompt,
         '--shell-cwd',
@@ -3229,23 +3287,35 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         return "Error: prompt is required"
     if agent_type != "Explore":
         return f"Error: unknown subagent_type {agent_type!r} (only 'Explore' is supported)"
-    argv = _subagent_argv(agent_type, prompt)
+    try:
+        argv = _subagent_argv(agent_type, prompt)
+    except ValueError as error:
+        return f"Error: {error}"
+    manager = current_job_manager()
     if run_in_background:
-        job = await current_job_manager().run_background_exec(
-            argv,
-            description=description or "subagent task",
-            env=_subagent_env(),
-            cwd=os.getcwd(),
-            session_owned=True,
-            credential_refs=_subagent_credential_refs())
+        try:
+            job = await manager.run_background_exec(
+                argv,
+                description=description or "subagent task",
+                env=_subagent_env(),
+                cwd=os.getcwd(),
+                session_owned=True,
+                credential_refs=_subagent_credential_refs(),
+                subagent=True)
+        except SubagentCapacityError as error:
+            return f"Error: {error}"
         return _format_started_background_job(job, "subagent")
 
-    job, status, stdout, stderr = await current_job_manager().run_exec(
-        argv, SUBAGENT_TIMEOUT_S * 1000,
-        description=description or "subagent task",
-        env=_subagent_env(), cwd=os.getcwd(), cancel_event=cancel_event,
-        session_owned=True,
-        credential_refs=_subagent_credential_refs())
+    try:
+        job, status, stdout, stderr = await manager.run_exec(
+            argv, SUBAGENT_TIMEOUT_S * 1000,
+            description=description or "subagent task",
+            env=_subagent_env(), cwd=os.getcwd(), cancel_event=cancel_event,
+            session_owned=True,
+            credential_refs=_subagent_credential_refs(),
+            subagent=True)
+    except SubagentCapacityError as error:
+        return f"Error: {error}"
     if status == "cancelled":
         return "Error: subagent was cancelled by the user"
     if status == "timed_out":

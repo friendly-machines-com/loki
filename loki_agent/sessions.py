@@ -68,6 +68,11 @@ class Session:
     agent_mode: str = "normal"
     last_instructed_agent_mode: str | None = None
 
+    # Delegation depth is runtime ownership state, not transcript state. Root
+    # terminal and ACP sessions start at zero; an internal subagent entrypoint
+    # installs the explicit depth delegated by its parent.
+    subagent_depth: int = 0
+
     # JobManager, created on first use.
     job_manager: Any = None
 

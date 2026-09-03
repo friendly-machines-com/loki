@@ -27,6 +27,7 @@ USAGE_OPTIONS = """\
 Options:
   -p, --prompt TEXT       prompt text (default: read stdin)
       --shell-cwd PATH    logical working directory inherited from the owner
+      --subagent-depth N  delegated generation, starting at 1
       --session-owner-fd FD
                           owner-lifetime descriptor
       --credential-capability-fd FD
@@ -47,6 +48,7 @@ class SubagentOptions:
     subagent_type: str
     prompt: str | None = None
     shell_cwd: str | None = None
+    subagent_depth: int | None = None
     session_owner_fd: int | None = None
     credential_capability_fd: int | None = None
     help: bool = False
@@ -74,6 +76,18 @@ def _descriptor(value: str, description: str) -> int:
             f"invalid {description} descriptor: {error}") from error
 
 
+def _subagent_depth(value: str) -> int:
+    try:
+        depth = int(value)
+    except ValueError as error:
+        raise ValueError("subagent depth must be an integer") from error
+    if not 1 <= depth <= _core.MAX_SUBAGENT_DEPTH:
+        raise ValueError(
+            "subagent depth must be between 1 and "
+            f"{_core.MAX_SUBAGENT_DEPTH}")
+    return depth
+
+
 def parse_args(args) -> SubagentOptions:
     if not args:
         raise getopt.GetoptError("subagent type is required")
@@ -87,6 +101,7 @@ def parse_args(args) -> SubagentOptions:
         [
             "prompt=",
             "shell-cwd=",
+            "subagent-depth=",
             "session-owner-fd=",
             "credential-capability-fd=",
             "help",
@@ -99,6 +114,7 @@ def parse_args(args) -> SubagentOptions:
     values = {
         "prompt": None,
         "shell_cwd": None,
+        "subagent_depth": None,
         "session_owner_fd": None,
         "credential_capability_fd": None,
         "help": False,
@@ -108,6 +124,8 @@ def parse_args(args) -> SubagentOptions:
             values["prompt"] = option_value
         elif option_name == "--shell-cwd":
             values["shell_cwd"] = option_value
+        elif option_name == "--subagent-depth":
+            values["subagent_depth"] = _subagent_depth(option_value)
         elif option_name == "--session-owner-fd":
             values["session_owner_fd"] = _descriptor(
                 option_value, "session owner")
@@ -127,17 +145,26 @@ async def run_prompt_async(subagent_type: str, prompt: str) -> str:
             "(only 'Explore' is supported)")
     if not prompt:
         return ""
+    may_delegate = (
+        _core.current_session().subagent_depth
+        < _core.MAX_SUBAGENT_DEPTH)
+    delegation_instruction = (
+        "You may use Agent to delegate another read-only Explore search."
+        if may_delegate else
+        "This is the maximum delegation depth; investigate directly.")
     messages = [
         formats.instruction_item(
             "You are a focused, read-only Explore subagent. Use "
-            "Glob/Grep/Read/WebFetch/WebSearch to investigate. You may use "
-            "Agent to delegate another read-only Explore search. Then write "
-            "a concise final answer."),
+            "Glob/Grep/Read/WebFetch/WebSearch to investigate. "
+            f"{delegation_instruction} Then write a concise final answer."),
         formats.message_item("user", prompt),
     ]
     _core.current_session().agent_mode = "explore"
+    allowed = _core.EXPLORE_TOOLS
+    if not may_delegate:
+        allowed = allowed - {"Agent"}
     return await _core.run_tool_loop_async(
-        messages, allowed=_core.EXPLORE_TOOLS)
+        messages, allowed=allowed)
 
 
 async def run_cli_async(
@@ -178,16 +205,21 @@ async def async_main(args) -> int:
 
     owner_fd = options.session_owner_fd
     capability_fd = options.credential_capability_fd
-    if owner_fd is None or capability_fd is None:
+    depth = options.subagent_depth
+    if owner_fd is None or capability_fd is None or depth is None:
         _close_descriptors(options)
         print(
-            "Configuration error: subagent runtimes require both the session "
-            "owner and credential capability descriptors.",
+            "Configuration error: subagent runtimes require a delegated "
+            "depth plus both the session owner and credential capability "
+            "descriptors.",
             file=sys.stderr,
         )
         return 2
 
     runtime = None
+    session = _core.current_session()
+    previous_depth = session.subagent_depth
+    session.subagent_depth = depth
     try:
         try:
             runtime = await credential_runtimes.CredentialRuntime.connect(
@@ -240,6 +272,7 @@ async def async_main(args) -> int:
         completed, _result = await runtime.run(operation)
         return 0 if completed else 1
     finally:
+        session.subagent_depth = previous_depth
         if runtime is not None:
             await runtime.close()
 

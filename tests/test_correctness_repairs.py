@@ -178,6 +178,77 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertEqual(manager._next_job_id(), "1")
         self.assertEqual(manager._next_job_id(), "2")
 
+    def test_subagent_slots_bound_concurrent_children_and_release_on_exit(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            command = [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            ]
+            first = await manager.run_background_exec(
+                command, cwd=tmpdir, session_owned=True, subagent=True)
+            second = await manager.run_background_exec(
+                command, cwd=tmpdir, session_owned=True, subagent=True)
+            third = None
+            try:
+                with self.assertRaises(loki.SubagentCapacityError):
+                    await manager.run_background_exec(
+                        command,
+                        cwd=tmpdir,
+                        session_owned=True,
+                        subagent=True,
+                    )
+
+                os.killpg(first.pgid, signal.SIGTERM)
+                await asyncio.wait_for(first.process.wait(), timeout=3)
+                manager._refresh_job(first)
+                third = await manager.run_background_exec(
+                    command,
+                    cwd=tmpdir,
+                    session_owned=True,
+                    subagent=True,
+                )
+                return manager, first, second, third
+            finally:
+                for job in (first, second, third):
+                    if (job is not None
+                            and job.process.returncode is None):
+                        os.killpg(job.pgid, signal.SIGKILL)
+                        await job.process.wait()
+                        manager._refresh_job(job)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager, first, second, third = asyncio.run(scenario(tmpdir))
+
+        self.assertFalse(first.subagent_slot)
+        self.assertFalse(second.subagent_slot)
+        self.assertFalse(third.subagent_slot)
+        self.assertEqual(manager._active_subagents, 0)
+
+    def test_failed_subagent_spawn_releases_its_slot(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            with mock.patch.object(
+                    loki.asyncio,
+                    "create_subprocess_exec",
+                    new=mock.AsyncMock(
+                        side_effect=OSError("spawn failed")),
+            ):
+                with self.assertRaisesRegex(OSError, "spawn failed"):
+                    await manager.run_background_exec(
+                        ["missing"],
+                        cwd=tmpdir,
+                        session_owned=True,
+                        subagent=True,
+                    )
+            return manager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = asyncio.run(scenario(tmpdir))
+
+        self.assertEqual(manager._active_subagents, 0)
+
     def test_force_stop_escalates_a_job_already_stopping(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
