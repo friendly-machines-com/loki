@@ -403,19 +403,24 @@ class ProviderReinstallTests(unittest.TestCase):
                 "EXAMPLE_API_KEY"),
         )
 
-        self.assertEqual(config.url, "https://api.example.test/v1/messages")
-        self.assertEqual(config.provider_kind, protocols.ANTHROPIC_MESSAGES)
-        self.assertEqual(config.netloc, "api.example.test")
+        self.assertEqual(
+            config.chat_provider.input_url,
+            "https://api.example.test/v1/messages")
+        self.assertEqual(
+            config.chat_provider.kind, protocols.ANTHROPIC_MESSAGES)
         self.assertEqual(config.model, "model-a")
         self.assertEqual(config.chat_provider.max_tokens, 1234)
         self.assertEqual(config.chat_provider.kind, protocols.ANTHROPIC_MESSAGES)
-        self.assertNotIn("X-Custom-Auth", config.headers)
+        self.assertNotIn(
+            "X-Custom-Auth", config.chat_provider.headers)
         self.assertEqual(config.auth_spec.scheme, "custom")
         self.assertEqual(
             config.auth_spec.credential,
             authentications.CredentialRef.environment("EXAMPLE_API_KEY"))
-        self.assertEqual(config.anthropic_version, "2024-01-01")
-        self.assertEqual(config.auth_header, "X-Custom-Auth")
+        self.assertEqual(
+            config.chat_provider.headers["anthropic-version"],
+            "2024-01-01")
+        self.assertEqual(config.auth_spec.header_name, "X-Custom-Auth")
 
     def test_reinstall_provider_swaps_provider_preserving_settings(self):
         env = {
@@ -446,10 +451,8 @@ class ProviderReinstallTests(unittest.TestCase):
                 loki.current_config().auth_spec.credential,
                 authentications.CredentialRef.environment("LOKI_API_KEY"))
             self.assertNotIn(
-                "Authorization", loki.current_config().headers)
-            # The copied headers field was rebuilt too, not left stale.
-            self.assertEqual(loki.current_config().headers,
-                             loki.current_config().chat_provider.headers)
+                "Authorization",
+                loki.current_config().chat_provider.headers)
         finally:
             restore_loki_state(old_values)
 
@@ -513,8 +516,8 @@ class ProviderReinstallTests(unittest.TestCase):
             self.assertEqual(provider.chat_url, "https://anthropic.example.test/v1/messages")
             self.assertNotIn("x-api-key", provider.headers)
             self.assertNotIn(
-                "x-api-key", loki.current_config().headers)
-            self.assertEqual(loki.current_config().provider_kind, protocols.ANTHROPIC_MESSAGES)
+                "x-api-key",
+                loki.current_config().chat_provider.headers)
             self.assertEqual(
                 loki.current_config().auth_spec.scheme, "anthropic")
         finally:
@@ -543,7 +546,8 @@ class ProviderReinstallTests(unittest.TestCase):
                         "ANTHROPIC_API_KEY")),
             )
 
-            self.assertIsNone(loki.current_config().auth_header)
+            self.assertIsNone(
+                loki.current_config().auth_spec.header_name)
             self.assertEqual(
                 loki.current_config().auth_spec.scheme, "anthropic")
         finally:
@@ -621,7 +625,8 @@ class ProviderReinstallTests(unittest.TestCase):
             ))
 
             loki.reinstall_provider(model="gpt-5.6-sol")
-            self.assertTrue(loki.current_config().responses_lite)
+            self.assertTrue(
+                loki.current_config().chat_provider.responses_lite)
 
             with self.assertRaisesRegex(
                     protocols.ProtocolError,
@@ -652,10 +657,11 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_spec.credential, credential)
         self.assertEqual(config.auth_spec.scheme, "openai-subscription")
         self.assertEqual(
-            config.provider_id, "openai-subscription")
-        self.assertTrue(config.responses_lite)
+            config.chat_provider.provider_id, "openai-subscription")
+        self.assertTrue(config.chat_provider.responses_lite)
         self.assertEqual(
-            config.headers[protocols.RESPONSES_LITE_HEADER], "true")
+            config.chat_provider.headers[
+                protocols.RESPONSES_LITE_HEADER], "true")
 
     def test_delegated_config_rejects_undelegated_credential(self):
         inventory = CredentialInventory({
@@ -683,16 +689,21 @@ class RuntimeConfigTests(unittest.TestCase):
 
         config = loki.build_config_from_env(env)
 
-        self.assertEqual(config.url, "https://api.deepseek.com/anthropic")
-        self.assertEqual(config.provider_kind, protocols.ANTHROPIC_MESSAGES)
-        self.assertEqual(config.netloc, "api.deepseek.com")
+        self.assertEqual(
+            config.chat_provider.input_url,
+            "https://api.deepseek.com/anthropic")
+        self.assertEqual(
+            config.chat_provider.kind, protocols.ANTHROPIC_MESSAGES)
         self.assertEqual(config.model, "deepseek-test")
         self.assertEqual(config.chat_provider.max_tokens, 123)
-        self.assertNotIn("x-api-key", config.headers)
-        self.assertEqual(config.headers["anthropic-version"], "2024-01-01")
+        self.assertNotIn("x-api-key", config.chat_provider.headers)
+        self.assertEqual(
+            config.chat_provider.headers["anthropic-version"],
+            "2024-01-01")
         self.assertEqual(config.auth_spec.scheme, "anthropic")
-        self.assertEqual(config.anthropic_version, "2024-01-01")
-        self.assertEqual(config.credential_env, "LOKI_API_KEY")
+        self.assertEqual(
+            config.auth_spec.credential,
+            authentications.CredentialRef.environment("LOKI_API_KEY"))
         self.assertNotIn("LOKI_API_KEY", env)
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("OPENAI_API_KEY", env)
@@ -707,10 +718,10 @@ class RuntimeConfigTests(unittest.TestCase):
         config = loki.build_config_from_env(env)
 
         self.assertIsNone(config.auth_spec)
-        self.assertIsNone(config.credential_env)
         self.assertEqual(config.model, "local-model")
-        self.assertNotIn("Authorization", config.headers)
-        self.assertNotIn("x-api-key", config.headers)
+        self.assertNotIn(
+            "Authorization", config.chat_provider.headers)
+        self.assertNotIn("x-api-key", config.chat_provider.headers)
         self.assertFalse(config.stream)
 
     def test_explicit_streaming_is_opt_in_and_validated(self):
@@ -759,9 +770,9 @@ class RuntimeConfigTests(unittest.TestCase):
             "LOKI_PROMPT_CACHE": "1",
         })
 
-        self.assertTrue(direct.prompt_cache)
-        self.assertFalse(compatible.prompt_cache)
-        self.assertTrue(opted_in.prompt_cache)
+        self.assertTrue(direct.chat_provider.prompt_cache)
+        self.assertFalse(compatible.chat_provider.prompt_cache)
+        self.assertTrue(opted_in.chat_provider.prompt_cache)
         with self.assertRaisesRegex(ValueError, "LOKI_PROMPT_CACHE must be"):
             loki.build_config_from_env({
                 "LOKI_API_BASE":
@@ -807,9 +818,10 @@ class RuntimeConfigTests(unittest.TestCase):
                 config = loki.build_config_from_env(env)
 
                 self.assertIsNone(config.auth_spec)
-                self.assertIsNone(config.credential_env)
-                self.assertNotIn("Authorization", config.headers)
-                self.assertNotIn("x-api-key", config.headers)
+                self.assertNotIn(
+                    "Authorization", config.chat_provider.headers)
+                self.assertNotIn(
+                    "x-api-key", config.chat_provider.headers)
 
     def test_apply_runtime_config_assigns_runtime_globals(self):
         env = {
@@ -855,15 +867,16 @@ class RuntimeConfigTests(unittest.TestCase):
                 "LOKI_MODEL": "override-model",
             }),
         )
-        self.assertEqual(config.url, descriptor.chat_url)
+        self.assertEqual(
+            config.chat_provider.input_url, descriptor.chat_url)
         self.assertEqual(
             config.auth_spec.credential,
             authentications.CredentialRef.environment(
                 "OPENROUTER_API_KEY"))
         self.assertEqual(config.model, "override-model")
         self.assertIsNone(config.model_status)
-        self.assertEqual(config.provider_id, "openrouter")
-        self.assertEqual(config.credential_env, "OPENROUTER_API_KEY")
+        self.assertEqual(
+            config.chat_provider.provider_id, "openrouter")
 
         restored = loki.config_from_connection_descriptor(
             descriptor,
@@ -898,8 +911,6 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(config.auth_spec.credential, credential)
         self.assertEqual(config.auth_spec.scheme, "openai-subscription")
-        self.assertEqual(config.auth_scheme, "openai-subscription")
-        self.assertTrue(config.responses_lite)
         self.assertTrue(config.chat_provider.responses_lite)
         self.assertEqual(
             config.chat_provider.models_url,
@@ -1015,7 +1026,7 @@ class RuntimeConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            config.url,
+            config.chat_provider.input_url,
             authentications.OPENAI_CHATGPT_RESPONSES_URL,
         )
         self.assertEqual(config.auth_spec.credential, credential)
@@ -1026,9 +1037,10 @@ class RuntimeConfigTests(unittest.TestCase):
             authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
         )
         self.assertTrue(config.stream)
-        self.assertTrue(config.responses_lite)
+        self.assertTrue(config.chat_provider.responses_lite)
         self.assertEqual(
-            config.headers[protocols.RESPONSES_LITE_HEADER], "true")
+            config.chat_provider.headers[
+                protocols.RESPONSES_LITE_HEADER], "true")
 
     def test_saved_subscription_cannot_redirect_access_token(self):
         credential = (
@@ -1093,9 +1105,9 @@ class RuntimeConfigTests(unittest.TestCase):
             descriptor, CredentialStore({}))
 
         self.assertIsNone(config.auth_spec)
-        self.assertIsNone(config.credential_env)
-        self.assertNotIn("Authorization", config.headers)
-        self.assertNotIn("x-api-key", config.headers)
+        self.assertNotIn(
+            "Authorization", config.chat_provider.headers)
+        self.assertNotIn("x-api-key", config.chat_provider.headers)
         self.assertTrue(config.stream)
 
     def test_saved_prompt_cache_setting_restores_without_reinference(self):
@@ -1115,8 +1127,8 @@ class RuntimeConfigTests(unittest.TestCase):
         overridden = loki.config_from_connection_descriptor(
             descriptor, CredentialStore({"LOKI_PROMPT_CACHE": "0"}))
 
-        self.assertTrue(restored.prompt_cache)
-        self.assertFalse(overridden.prompt_cache)
+        self.assertTrue(restored.chat_provider.prompt_cache)
+        self.assertFalse(overridden.chat_provider.prompt_cache)
 
     def test_modelsdev_selection_builds_fresh_provider_auth(self):
         provider_entry = {
@@ -1139,9 +1151,11 @@ class RuntimeConfigTests(unittest.TestCase):
             config.auth_spec.credential,
             authentications.CredentialRef.environment(
                 "OPENROUTER_API_KEY"))
-        self.assertNotIn("Authorization", config.headers)
-        self.assertEqual(config.auth_header, None)
-        self.assertEqual(config.provider_id, "openrouter")
+        self.assertNotIn(
+            "Authorization", config.chat_provider.headers)
+        self.assertIsNone(config.auth_spec.header_name)
+        self.assertEqual(
+            config.chat_provider.provider_id, "openrouter")
         self.assertEqual(config.model, "z-ai/glm")
         self.assertEqual(config.model_status, "deprecated")
         self.assertTrue(config.stream)
@@ -1165,7 +1179,7 @@ class RuntimeConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            config.provider_name,
+            config.chat_provider.provider_name,
             "OpenAI Platform API [endpoint supplied by Loki]",
         )
         self.assertEqual(
@@ -1176,7 +1190,10 @@ class RuntimeConfigTests(unittest.TestCase):
             config.chat_provider.models_url,
             "https://api.openai.com/v1/models",
         )
-        self.assertEqual(config.credential_env, "OPENAI_API_KEY")
+        self.assertEqual(
+            config.auth_spec.credential,
+            authentications.CredentialRef.environment(
+                "OPENAI_API_KEY"))
 
 
 class ModelLoadingTests(unittest.TestCase):
@@ -1262,7 +1279,9 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(loki.current_model(), "chosen-model")
         self.assertIsNone(loki.current_config().auth_spec)
-        self.assertNotIn("Authorization", loki.current_config().headers)
+        self.assertNotIn(
+            "Authorization",
+            loki.current_config().chat_provider.headers)
 
     def test_headless_startup_requires_an_explicit_model(self):
         loki.CREDENTIALS = CredentialStore({
@@ -1307,7 +1326,9 @@ class ModelLoadingTests(unittest.TestCase):
         runner.assert_awaited_once()
         self.assertEqual(status, 0)
         self.assertIsNone(loki.current_config().auth_spec)
-        self.assertNotIn("Authorization", loki.current_config().headers)
+        self.assertNotIn(
+            "Authorization",
+            loki.current_config().chat_provider.headers)
 
     def test_headless_configuration_failure_returns_usage_error(self):
         loki.CREDENTIALS = CredentialStore({})
@@ -1428,9 +1449,10 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertTrue(rendered.endswith("----\n"))
         self.assertEqual(loki.current_model(), "local-model")
         self.assertIsNone(loki.current_config().auth_spec)
-        self.assertIsNone(loki.current_config().credential_env)
         self.assertTrue(loki.current_config().stream)
-        self.assertNotIn("Authorization", loki.current_config().headers)
+        self.assertNotIn(
+            "Authorization",
+            loki.current_config().chat_provider.headers)
 
     def test_chat_request_without_a_model_is_not_sent(self):
         loki.CREDENTIALS = CredentialStore({
@@ -1651,10 +1673,11 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertTrue(all(
             isinstance(option, modelsdev.ExplicitConnectionOption)
             for option in seen_explicit))
-        self.assertEqual(loki.current_config().url, explicit_url)
+        self.assertEqual(
+            loki.current_config().chat_provider.input_url, explicit_url)
         self.assertEqual(loki.current_config().model, "private-model")
         self.assertEqual(
-            loki.current_config().provider_name,
+            loki.current_config().chat_provider.provider_name,
             "Explicit LOKI_* connection",
         )
         connection = saved["session_state"]["connection"]
@@ -1665,7 +1688,9 @@ class ModelLoadingTests(unittest.TestCase):
         )
         self.assertIsNone(connection["credential_env"])
         self.assertIsNone(loki.current_config().auth_spec)
-        self.assertNotIn("Authorization", loki.current_config().headers)
+        self.assertNotIn(
+            "Authorization",
+            loki.current_config().chat_provider.headers)
 
     def test_explicit_connection_is_selectable_when_modelsdev_is_offline(self):
         explicit_url = "http://localhost:8000/v1"
@@ -1708,7 +1733,8 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(len(seen_explicit), 1)
         self.assertIsInstance(
             seen_explicit[0], modelsdev.ExplicitConnectionOption)
-        self.assertEqual(loki.current_config().url, explicit_url)
+        self.assertEqual(
+            loki.current_config().chat_provider.input_url, explicit_url)
         self.assertEqual(loki.current_config().model, "private-model")
 
 
@@ -1894,11 +1920,7 @@ class StatusTextTests(unittest.TestCase):
                 max_tokens=4096,
             )
             loki.current_session().runtime_config = loki.RuntimeConfig(
-                url=chat_provider.input_url,
-                provider_kind=chat_provider.kind,
-                netloc="example.test:8443",
                 chat_provider=chat_provider,
-                headers={},
                 model="model-x"
             )
             # model is derived from runtime_config set above
@@ -4886,8 +4908,7 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertNotIn("LOKI_OPENAI_MODEL_METADATA", child_env)
         self.assertNotIn("LOKI_RESPONSES_LITE", child_env)
         self.assertEqual(child_env["LOKI_MAX_TOKENS"], "12345")
-        self.assertEqual(
-            child_env["LOKI_ANTHROPIC_VERSION"], "2026-01-02")
+        self.assertNotIn("LOKI_ANTHROPIC_VERSION", child_env)
         self.assertEqual(child_env["LOKI_AUTH_HEADER"], "X-Custom-Key")
         self.assertEqual(
             child_env["LOKI_CREDENTIAL_REF"], "env:EXAMPLE_API_KEY")
@@ -4982,7 +5003,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         with mock.patch.object(
                 loki.http_client, "async_http_request", new=request):
             result = asyncio.run(loki.async_chat_request(
-                loki.current_config().url, {"input": []}))
+                loki.current_config().chat_provider.input_url,
+                {"input": []}))
 
         self.assertEqual(result, {})
         self.assertEqual(len(calls), 2)
@@ -5016,7 +5038,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 loki, "_async_chat_stream_request_once",
                 new=request_once):
             result = asyncio.run(loki.async_chat_stream_request(
-                loki.current_config().url, {"input": []}))
+                loki.current_config().chat_provider.input_url,
+                {"input": []}))
 
         self.assertEqual(result, {})
         self.assertEqual(
@@ -5052,7 +5075,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 mock.patch.object(
                     loki, "HTTP_RETRY_MAX_JITTER_S", 0):
             result = asyncio.run(loki.async_chat_stream_request(
-                loki.current_config().url, {"input": []}))
+                loki.current_config().chat_provider.input_url,
+                {"input": []}))
 
         self.assertEqual(result, {"id": "response"})
         self.assertEqual(len(calls), 3)
@@ -5131,7 +5155,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
             with self.assertRaises(
                     protocols.ResponseApiError) as raised:
                 asyncio.run(loki.async_chat_stream_request(
-                    loki.current_config().url, {"input": []}))
+                    loki.current_config().chat_provider.input_url,
+                    {"input": []}))
 
         self.assertEqual(raised.exception.code, "server_error")
         self.assertEqual(len(calls), 3)
@@ -5279,7 +5304,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 loki, "_async_chat_stream_request_once",
                 new=request_once):
             asyncio.run(loki.async_chat_stream_request(
-                loki.current_config().url,
+                loki.current_config().chat_provider.input_url,
                 {"input": []},
                 request_headers={
                     "X-Codex-Turn-State": "caller-forged",
@@ -5400,7 +5425,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 loki.http_client, "async_http_request", new=request):
             with self.assertRaises(loki.ApiError):
                 asyncio.run(loki.async_chat_request(
-                    loki.current_config().url, {"input": []}))
+                    loki.current_config().chat_provider.input_url,
+                    {"input": []}))
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(
@@ -5551,7 +5577,7 @@ class StreamingCompletionTests(unittest.TestCase):
                 loki, "_async_chat_stream_request_once",
                 new=request_once):
             asyncio.run(loki.async_chat_stream_request(
-                loki.current_config().url,
+                loki.current_config().chat_provider.input_url,
                 {"input": []},
                 codex_turn_state=loki.CodexTurnState(
                     "must-not-leave-subscription"),

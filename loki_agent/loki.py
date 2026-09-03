@@ -253,36 +253,13 @@ class StreamCancelled(Exception):
 
 @dataclass
 class RuntimeConfig:
-    url: str
-    provider_kind: str
-    netloc: str
     chat_provider: protocols.Provider
-    headers: dict
     model: str
     # Authentication is intentionally a non-secret request-time recipe.
     # Neither RuntimeConfig nor Provider retains a credential value.
     auth_spec: authentications.AuthSpec | None = None
-    # Retained from startup env so a mid-session Provider reinstall
-    # (e.g. /model choosing a model on a different provider) can reproduce
-    # the exact same Provider settings instead of falling back to defaults.
-    anthropic_version: str = "2023-06-01"
-    auth_header: str | None = None
-    auth_scheme: str | None = None
-    provider_id: str | None = None
-    provider_name: str | None = None
-    credential_env: str | None = None
     model_status: str | None = None
     stream: bool = False
-    prompt_cache: bool = False
-    openai_request_profile: (
-        openai_models.CodexModelRequestProfile | None) = None
-
-    @property
-    def responses_lite(self):
-        return (
-            self.openai_request_profile is not None
-            and self.openai_request_profile.use_responses_lite
-        )
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
@@ -382,26 +359,11 @@ def make_runtime_config(
     authentications.validate_authorization_target(
         auth_spec, chat_provider.chat_url)
     return RuntimeConfig(
-        url=url,
-        provider_kind=provider_kind,
-        netloc=urllib.parse.urlparse(url).netloc,
         chat_provider=chat_provider,
-        headers=chat_provider.headers,
         model=model,
         auth_spec=auth_spec,
-        anthropic_version=anthropic_version,
-        auth_header=auth_header,
-        auth_scheme=auth_spec.scheme if auth_spec is not None else None,
-        provider_id=provider_id,
-        provider_name=provider_name,
-        credential_env=(
-            credential_ref.name
-            if (credential_ref is not None
-                and credential_ref.kind == "env") else None),
         model_status=model_status,
         stream=stream,
-        prompt_cache=prompt_cache,
-        openai_request_profile=openai_request_profile,
     )
 
 
@@ -535,8 +497,8 @@ def explicit_connection_option(
         return None
     return modelsdev.ExplicitConnectionOption(
         model=config.model,
-        api_url=config.url,
-        protocol=config.provider_kind,
+        api_url=config.chat_provider.input_url,
+        protocol=config.chat_provider.kind,
     )
 
 
@@ -705,28 +667,37 @@ def config_from_modelsdev_selection(
 
 
 def active_connection_descriptor() -> ConnectionDescriptor | None:
-    if not current_config() or current_config().provider_kind == protocols.DUMMY:
+    if (not current_config()
+            or current_config().chat_provider.kind == protocols.DUMMY):
         return None
-    credential_env = current_config().credential_env
+    auth_spec = current_config().auth_spec
+    credential_ref = (
+        auth_spec.credential if auth_spec is not None else None)
+    credential_env = (
+        credential_ref.name
+        if (credential_ref is not None
+            and credential_ref.kind == "env") else None)
     provider = current_config().chat_provider
     return ConnectionDescriptor(
-        provider_id=current_config().provider_id,
-        provider_name=current_config().provider_name,
+        provider_id=provider.provider_id,
+        provider_name=provider.provider_name,
         model=current_model(),
         chat_url=provider.chat_url,
         models_url=provider.models_url,
-        protocol=current_config().provider_kind,
+        protocol=provider.kind,
         credential_env=credential_env,
-        credential_ref=(
-            current_config().auth_spec.credential
-            if current_config().auth_spec is not None else None),
+        credential_ref=credential_ref,
         max_tokens=provider.max_tokens,
-        anthropic_version=current_config().anthropic_version,
-        auth_header=current_config().auth_header,
-        auth_scheme=current_config().auth_scheme,
+        anthropic_version=provider.headers.get(
+            "anthropic-version", "2023-06-01"),
+        auth_header=(
+            auth_spec.header_name
+            if auth_spec is not None
+            and auth_spec.scheme == "custom" else None),
+        auth_scheme=auth_spec.scheme if auth_spec is not None else None,
         model_status=current_config().model_status,
         stream=current_config().stream,
-        prompt_cache=current_config().prompt_cache,
+        prompt_cache=provider.prompt_cache,
         openai_request_profile=provider.openai_request_profile,
     )
 
@@ -754,44 +725,60 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
     current = current_config()
     if current is None:
         raise RuntimeError("cannot reinstall provider before startup config is applied")
-    new_url = url if url is not None else current.url
-    new_kind = provider_kind if provider_kind is not None else current.provider_kind
+    current_provider = current.chat_provider
+    current_auth = current.auth_spec
+    new_url = (
+        url if url is not None else current_provider.input_url)
+    new_kind = (
+        provider_kind if provider_kind is not None else current_provider.kind)
     new_model = model if model is not None else current.model
-    new_anthropic_version = anthropic_version if anthropic_version is not None else current.anthropic_version
+    new_anthropic_version = (
+        anthropic_version
+        if anthropic_version is not None
+        else current_provider.headers.get(
+            "anthropic-version", "2023-06-01"))
     new_provider_id = (
-        provider_id if provider_id is not None else current.provider_id)
+        provider_id
+        if provider_id is not None else current_provider.provider_id)
     provider_connection_changed = (
         (provider_kind is not None
-         and provider_kind != current.provider_kind)
-        or (url is not None and url != current.url)
+         and provider_kind != current_provider.kind)
+        or (url is not None and url != current_provider.input_url)
         or (provider_id is not None
-            and provider_id != current.provider_id))
+            and provider_id != current_provider.provider_id))
     auth_identity_changed = (
         provider_connection_changed
         or credential_ref is not _UNSET)
     if auth_header is _UNSET:
         new_auth_header = (
-            None if auth_identity_changed else current.auth_header)
+            None
+            if auth_identity_changed
+            else (
+                current_auth.header_name
+                if current_auth is not None
+                and current_auth.scheme == "custom" else None))
     else:
         new_auth_header = auth_header
     new_credential_ref = (
         (None
          if provider_connection_changed
-         else (current.auth_spec.credential
-               if current.auth_spec is not None else None))
+         else (current_auth.credential
+               if current_auth is not None else None))
         if credential_ref is _UNSET else credential_ref)
     if auth_scheme is _UNSET:
         new_auth_scheme = (
             None
             if auth_identity_changed or auth_header is not _UNSET
-            else current.auth_scheme)
+            else (
+                current_auth.scheme
+                if current_auth is not None else None))
     else:
         new_auth_scheme = auth_scheme
     same_catalog_entry = (
         new_model == current.model
-        and new_url == current.url
-        and new_kind == current.provider_kind
-        and new_provider_id == current.provider_id)
+        and new_url == current_provider.input_url
+        and new_kind == current_provider.kind
+        and new_provider_id == current_provider.provider_id)
     if model_status is _UNSET:
         new_model_status = (
             current.model_status if same_catalog_entry else None)
@@ -803,7 +790,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
         # Preserve it only for the same catalog leaf; carrying even part of it
         # across a model/provider change would manufacture capabilities.
         new_openai_request_profile = (
-            current.openai_request_profile
+            current_provider.openai_request_profile
             if same_catalog_entry else None)
     else:
         new_openai_request_profile = openai_request_profile
@@ -815,20 +802,22 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
         # never carry the previous provider's models URL across a provider
         # switch.
         models_url=models_url,
-        max_tokens=max_tokens if max_tokens is not None else current.chat_provider.max_tokens,
+        max_tokens=(
+            max_tokens
+            if max_tokens is not None else current_provider.max_tokens),
         anthropic_version=new_anthropic_version,
         auth_header=new_auth_header,
         auth_scheme=new_auth_scheme,
         provider_id=new_provider_id,
         provider_name=(provider_name if provider_name is not None
-                       else current.provider_name),
+                       else current_provider.provider_name),
         credential_ref=new_credential_ref,
         model_status=new_model_status,
         stream=stream if stream is not None else current.stream,
         prompt_cache=(
             prompt_cache
             if prompt_cache is not None
-            else current.prompt_cache),
+            else current_provider.prompt_cache),
         openai_request_profile=new_openai_request_profile,
     ))
 
@@ -2395,10 +2384,11 @@ def _raw_tool_arguments(call):
 def _runtime_provider_label():
     if current_config() is None:
         return None
+    provider = current_config().chat_provider
     return (
-        current_config().provider_id
-        or current_config().provider_name
-        or current_config().netloc
+        provider.provider_id
+        or provider.provider_name
+        or urllib.parse.urlparse(provider.input_url).netloc
     )
 
 
@@ -3137,20 +3127,23 @@ def _subagent_env() -> dict:
     # credential travels through a fresh capability socket, never through
     # argv or the process environment.
     if current_config():
-        env['LOKI_PROVIDER'] = current_config().chat_provider.kind
-        env['LOKI_API_BASE'] = current_config().chat_provider.input_url
+        config = current_config()
+        provider = config.chat_provider
+        auth_spec = config.auth_spec
+        env['LOKI_PROVIDER'] = provider.kind
+        env['LOKI_API_BASE'] = provider.input_url
         env['LOKI_MODEL'] = current_model()
         env.pop('LOKI_API_KEY', None)
-        env['LOKI_STREAM'] = '1' if current_config().stream else '0'
+        env['LOKI_STREAM'] = '1' if config.stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
-            '1' if current_config().prompt_cache else '0')
-        if current_config().openai_request_profile is not None:
+            '1' if provider.prompt_cache else '0')
+        if provider.openai_request_profile is not None:
             # This compact, non-secret request profile is process
             # configuration. Credentials still cross only the anonymous
             # capability socket. The full authenticated catalog record,
             # including application prompts, never enters the environment.
             env['LOKI_OPENAI_REQUEST_PROFILE'] = json.dumps(
-                current_config().openai_request_profile.to_dict(),
+                provider.openai_request_profile.to_dict(),
                 ensure_ascii=True,
                 allow_nan=False,
                 separators=(",", ":"),
@@ -3159,21 +3152,24 @@ def _subagent_env() -> dict:
         else:
             env.pop('LOKI_OPENAI_REQUEST_PROFILE', None)
         env.pop('LOKI_RESPONSES_LITE', None)
-        provider = current_config().chat_provider
         env['LOKI_MAX_TOKENS'] = str(provider.max_tokens)
-        env['LOKI_ANTHROPIC_VERSION'] = (
-            current_config().anthropic_version)
-        if current_config().auth_header:
-            env['LOKI_AUTH_HEADER'] = current_config().auth_header
+        if provider.kind == protocols.ANTHROPIC_MESSAGES:
+            env['LOKI_ANTHROPIC_VERSION'] = provider.headers[
+                "anthropic-version"]
+        else:
+            env.pop('LOKI_ANTHROPIC_VERSION', None)
+        if (auth_spec is not None
+                and auth_spec.scheme == "custom"):
+            env['LOKI_AUTH_HEADER'] = auth_spec.header_name
         else:
             env.pop('LOKI_AUTH_HEADER', None)
-        if current_config().auth_spec is not None:
+        if auth_spec is not None:
             # This is an identifier and policy, not a token. The child uses
             # it to request precisely this credential from its delegated
             # capability instead of inferring identity from absent env data.
             env['LOKI_CREDENTIAL_REF'] = (
-                current_config().auth_spec.credential.encode())
-            env['LOKI_AUTH_SCHEME'] = current_config().auth_spec.scheme
+                auth_spec.credential.encode())
+            env['LOKI_AUTH_SCHEME'] = auth_spec.scheme
         else:
             env.pop('LOKI_CREDENTIAL_REF', None)
             env.pop('LOKI_AUTH_SCHEME', None)
@@ -4092,7 +4088,7 @@ def _codex_turn_state_for_request(
         config, request_url, supplied_state=None):
     """Return routing state only for the authenticated Codex Responses URL."""
     if (config is None
-            or config.provider_kind != protocols.OPENAI_RESPONSES
+            or config.chat_provider.kind != protocols.OPENAI_RESPONSES
             or config.auth_spec is None
             or config.auth_spec.scheme != "openai-subscription"
             or request_url != config.chat_provider.chat_url):
@@ -4140,7 +4136,8 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
 
     base_headers = request_headers
     if base_headers is None:
-        base_headers = config.headers if config else {}
+        base_headers = (
+            config.chat_provider.headers if config else {})
     # Copy so the per-call idempotency key below does not mutate the cached
     # provider headers shared across requests.
     base_headers = dict(base_headers)
@@ -4150,7 +4147,7 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     if method == 'POST':
         # Best-effort server-side dedup; Anthropic honors this header on
         # /v1/messages. OpenAI-compat servers may ignore it.
-        kind = config.provider_kind if config else None
+        kind = config.chat_provider.kind if config else None
         header = (LLM_IDEMPOTENCY_HEADER_ANTHROPIC
                   if kind == protocols.ANTHROPIC_MESSAGES
                   else LLM_IDEMPOTENCY_HEADER_OPENAI)
@@ -4426,9 +4423,9 @@ async def async_chat_stream_request(
         config, request_url, codex_turn_state)
     base_headers = dict(
         request_headers if request_headers is not None
-        else (config.headers if config else {}))
+        else (config.chat_provider.headers if config else {}))
     base_headers.setdefault("Accept", "text/event-stream")
-    kind = config.provider_kind if config else None
+    kind = config.chat_provider.kind if config else None
     idempotency_header = (
         LLM_IDEMPOTENCY_HEADER_ANTHROPIC
         if kind == protocols.ANTHROPIC_MESSAGES
@@ -4623,10 +4620,11 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             f"invalid {current_config().chat_provider.kind} response: {e}",
             payload=data,
         ) from e
-    turn.metadata["provider_id"] = current_config().provider_id
-    turn.metadata["provider_name"] = current_config().provider_name
+    provider = current_config().chat_provider
+    turn.metadata["provider_id"] = provider.provider_id
+    turn.metadata["provider_name"] = provider.provider_name
     turn.metadata["endpoint"] = (
-        current_config().chat_provider.chat_url)
+        provider.chat_url)
     turn.metadata["model"] = current_model()
     turn.metadata["protocol"] = current_config().chat_provider.kind
     return turn
@@ -4635,7 +4633,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
 def _status_api_base() -> str:
     configured_url = ""
     if current_config():
-        configured_url = current_config().chat_provider.input_url if current_config().chat_provider else current_config().url
+        configured_url = current_config().chat_provider.input_url
 
     if not configured_url:
         return "not configured"

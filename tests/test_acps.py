@@ -1383,8 +1383,9 @@ class WorkerSessionContractTests(unittest.TestCase):
                         "configId": "model",
                         "value": value,
                     })
-                    first_profile = (
-                        loki.current_config().openai_request_profile)
+                    first_provider = (
+                        loki.current_config().chat_provider)
+                    first_profile = first_provider.openai_request_profile
                     first_payload = (
                         loki.current_config().chat_provider.chat_payload(
                             [formats.message_item("user", "hello")],
@@ -1398,7 +1399,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                             "async_http_request",
                             new=request):
                         await loki.async_chat_request(
-                            loki.current_config().url, {})
+                            loki.current_config().chat_provider.input_url,
+                            {})
                     saved_name = os.path.basename(
                         first_session.chat_log_path)
                     with open(
@@ -1432,8 +1434,10 @@ class WorkerSessionContractTests(unittest.TestCase):
                         resumed["configOptions"][0]["currentValue"],
                         "loki-saved",
                     )
+                    resumed_provider = (
+                        loki.current_config().chat_provider)
                     resumed_profile = (
-                        loki.current_config().openai_request_profile)
+                        resumed_provider.openai_request_profile)
                     resumed_payload = (
                         loki.current_config().chat_provider.chat_payload(
                             [formats.message_item("user", "hello")],
@@ -1447,7 +1451,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                             "async_http_request",
                             new=request):
                         await loki.async_chat_request(
-                            loki.current_config().url, {})
+                            loki.current_config().chat_provider.input_url,
+                            {})
                     await resumed_worker.close()
                     return (
                         first_profile,
