@@ -1310,6 +1310,8 @@ def openai_responses_response_to_items(response):
             "tool_choice", "tools", "top_logprobs", "top_p",
             "truncation", "usage", "user", "metadata", "conversation",
             "background", "_loki_stream_extensions",
+            "frequency_penalty", "moderation", "presence_penalty",
+            "tool_usage",
         }
     }
     if unknown_envelope:

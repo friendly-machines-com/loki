@@ -605,8 +605,7 @@ class OpenAIResponsesStreamAccumulator:
         self.failed_response = None
         self.stream_error = None
         self.stream_extensions = []
-        self.output_items = {}
-        self.unindexed_output_items = []
+        self.output_items = []
 
     def _preserve_extension(self, context, value):
         formats.report_unknown(OPENAI_RESPONSES, context, value)
@@ -634,30 +633,33 @@ class OpenAIResponsesStreamAccumulator:
             if not isinstance(item, dict):
                 raise StreamProtocolError(
                     "response.output_item.done is missing its item")
-            output_index = data.get("output_index")
-            if (isinstance(output_index, int)
-                    and not isinstance(output_index, bool)
-                    and output_index >= 0):
-                self.output_items[output_index] = copy.deepcopy(item)
-            else:
-                self.unindexed_output_items.append(
-                    copy.deepcopy(item))
+            self.output_items.append(copy.deepcopy(item))
         elif event_type == "response.completed":
             response = data.get("response")
             if not isinstance(response, dict):
                 raise StreamProtocolError(
                     "response.completed is missing its response")
             self.completed_response = copy.deepcopy(response)
+            self.completed_response.setdefault("object", "response")
+            self.completed_response.setdefault("status", "completed")
         elif event_type == "response.incomplete":
             response = data.get("response")
             if not isinstance(response, dict):
                 raise StreamProtocolError(
                     "response.incomplete is missing its response")
             self.incomplete_response = copy.deepcopy(response)
+            self.incomplete_response.setdefault("object", "response")
+            self.incomplete_response.setdefault("status", "incomplete")
         elif event_type in ("response.failed", "response.cancelled"):
             response = data.get("response")
             if isinstance(response, dict):
                 self.failed_response = copy.deepcopy(response)
+                self.failed_response.setdefault("object", "response")
+                self.failed_response.setdefault(
+                    "status",
+                    "cancelled"
+                    if event_type == "response.cancelled" else "failed",
+                )
             else:
                 self.stream_error = copy.deepcopy(data)
         elif event_type == "error":
@@ -666,18 +668,16 @@ class OpenAIResponsesStreamAccumulator:
             self._preserve_extension("stream event", data)
 
     def _finish_response(self, response):
-        # The ordinary Responses stream repeats all output in the terminal
-        # envelope. ChatGPT's Responses-Lite stream currently sends completed
-        # items in response.output_item.done events but leaves that envelope's
-        # output array empty. Recover only an absent/empty array; a populated
-        # terminal envelope remains authoritative.
-        if not response.get("output"):
-            streamed = [
-                item for _index, item in sorted(self.output_items.items())
-            ]
-            streamed.extend(self.unindexed_output_items)
-            if streamed:
-                response["output"] = streamed
+        # In the Responses streaming protocol, output_item.done carries each
+        # completed conversational item. response.completed is the terminal
+        # event and carries response metadata such as id and usage; Codex's
+        # own decoder does not read output items from it. Preserve a populated
+        # terminal output only as a compatibility fallback for implementations
+        # that omit the standard item events.
+        if self.output_items:
+            response["output"] = copy.deepcopy(self.output_items)
+        else:
+            response.setdefault("output", [])
         if self.stream_extensions:
             response["_loki_stream_extensions"] = (
                 self.stream_extensions)

@@ -1543,7 +1543,7 @@ class StreamAccumulatorTests(unittest.TestCase):
             {"query": "already complete"},
         )
 
-    def test_openai_responses_uses_completed_response_as_authority(self):
+    def test_openai_responses_uses_output_item_done_as_authority(self):
         deltas = []
         accumulator = protocols.OpenAIResponsesStreamAccumulator(
             deltas.append)
@@ -1554,35 +1554,41 @@ class StreamAccumulatorTests(unittest.TestCase):
         accumulator.feed(self.event(
             '{"type":"response.output_item.done","output_index":0,'
             '"item":{"type":"message","role":"assistant","content":'
-            '[{"type":"output_text","text":"non-authoritative"}]}}'))
+            '[{"type":"output_text","text":"hello"}]}}'))
         accumulator.feed(self.event(
             '{"type":"response.completed","response":'
             '{"id":"resp_1","object":"response","status":"completed",'
+            '"frequency_penalty":0.0,"presence_penalty":0.0,'
+            '"moderation":null,"tool_usage":{"web_search":'
+            '{"num_requests":0}},'
             '"output":[{"id":"msg_1","type":"message",'
             '"status":"completed","role":"assistant","content":'
-            '[{"type":"output_text","text":"hello"}]}]}}'))
+            '[{"type":"output_text","text":"compatibility fallback"}]}]}}'))
 
         response = accumulator.finish()
-        items = formats.openai_responses_response_to_items(response)
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            items = formats.openai_responses_response_to_items(response)
 
         self.assertEqual(deltas, ["hel", "lo"])
         self.assertEqual(formats.item_text(items[0]), "hello")
+        self.assertEqual(diagnostics.getvalue(), "")
 
-    def test_openai_responses_recovers_stream_items_from_empty_envelope(self):
+    def test_openai_responses_collects_items_with_metadata_only_completion(
+            self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(
             lambda text: None)
+        accumulator.feed(self.event(
+            '{"type":"response.output_item.done","output_index":0,'
+            '"item":{"type":"reasoning","encrypted_content":"opaque"}}'))
         accumulator.feed(self.event(
             '{"type":"response.output_item.done","output_index":1,'
             '"item":{"type":"function_call","call_id":"call_1",'
             '"name":"Read","arguments":"{\\"file_path\\":\\"README.md\\"}",'
             '"status":"completed"}}'))
         accumulator.feed(self.event(
-            '{"type":"response.output_item.done","output_index":0,'
-            '"item":{"type":"reasoning","encrypted_content":"opaque"}}'))
-        accumulator.feed(self.event(
             '{"type":"response.completed","response":'
-            '{"id":"resp_1","object":"response","status":"completed",'
-            '"output":[]}}'))
+            '{"id":"resp_1"}}'))
 
         response = accumulator.finish()
         turn = formats.openai_responses_response_to_items(response)
