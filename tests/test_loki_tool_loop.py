@@ -5050,6 +5050,104 @@ class RequestTimeCredentialTests(unittest.TestCase):
             second_headers[loki.LLM_IDEMPOTENCY_HEADER_OPENAI],
         )
 
+    def test_buffered_completion_records_only_header_selected_model(self):
+        response_body = json.dumps({
+            "object": "response",
+            "status": "completed",
+            "model": "untrusted-envelope-model",
+            "output": [],
+        }).encode("utf-8")
+        for headers, expected in [
+                ({"oPeNaI-MoDeL": "server-selected-model"},
+                 "server-selected-model"),
+                ({}, "gpt-5-codex"),
+        ]:
+            with self.subTest(headers=headers):
+                self._install_subscription()
+                response = loki.http_client.HttpResponse(
+                    authentications.OPENAI_CHATGPT_RESPONSES_URL,
+                    200,
+                    "OK",
+                    headers,
+                    response_body,
+                )
+                with mock.patch.object(
+                        loki.http_client,
+                        "async_http_request",
+                        new=mock.AsyncMock(return_value=response)):
+                    turn = asyncio.run(loki.async_chat_completion(
+                        [formats.message_item("user", "hello")],
+                        tools=[],
+                    ))
+
+                self.assertEqual(turn.metadata["model"], expected)
+
+    def test_streaming_model_header_precedence(self):
+        for http_model, expected in [
+                ("http-model", "http-model"),
+                (None, "nested-model"),
+        ]:
+            with self.subTest(http_model=http_model):
+                self._install_subscription(stream=True)
+
+                async def response_body():
+                    yield (
+                        b'data: {"type":"response.completed",'
+                        b'"headers":{"OpenAI-Model":"top-level-model"},'
+                        b'"response":{"id":"response_1",'
+                        b'"headers":{"openai-model":"nested-model"},'
+                        b'"status":"completed","output":[]}}\n\n'
+                    )
+
+                @contextlib.asynccontextmanager
+                async def stream(method, request_url, **kwargs):
+                    headers = {
+                        "content-type": "text/event-stream",
+                    }
+                    if http_model is not None:
+                        headers["OPENAI-MODEL"] = http_model
+                    yield loki.http_client.HttpStreamResponse(
+                        request_url,
+                        200,
+                        "OK",
+                        headers,
+                        response_body(),
+                    )
+
+                with mock.patch.object(
+                        loki.http_client,
+                        "async_http_stream",
+                        new=stream):
+                    turn = asyncio.run(loki.async_chat_completion(
+                        [formats.message_item("user", "hello")],
+                        tools=[],
+                    ))
+
+                self.assertEqual(turn.metadata["model"], expected)
+
+    def test_public_responses_ignore_subscription_model_header(self):
+        loki.apply_runtime_config(loki.make_runtime_config(
+            "https://api.example.test/v1/responses",
+            protocols.OPENAI_RESPONSES,
+            model="public-model",
+        ))
+        response = loki.http_client.HttpResponse(
+            "https://api.example.test/v1/responses",
+            200,
+            "OK",
+            {"OpenAI-Model": "must-not-be-trusted"},
+            b"{}",
+        )
+
+        with mock.patch.object(
+                loki.http_client,
+                "async_http_request",
+                new=mock.AsyncMock(return_value=response)):
+            result = asyncio.run(loki.async_provider_request(
+                "POST", response.url, {}))
+
+        self.assertIsNone(result.effective_model)
+
     def test_streaming_401_refreshes_once_with_same_idempotency_key(self):
         self._install_subscription(stream=True)
         calls = []

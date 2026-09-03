@@ -4228,7 +4228,12 @@ async def async_provider_request(
     elapsed = time.perf_counter() - start
     if show_timing:
         print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]", file=sys.stderr)
-    return protocols.ProviderResponse(data)
+    return protocols.ProviderResponse(
+        data,
+        effective_model=(
+            protocols.openai_response_model_header(response.headers)
+            if turn_state is not None else None),
+    )
 
 
 async def _next_stream_chunk(iterator, cancel_check):
@@ -4341,6 +4346,9 @@ async def _async_chat_stream_request_once(
             timeout=LLM_STREAM_IDLE_TIMEOUT_S,
             max_bytes=HTTP_MAX_RESPONSE_BYTES,
             cancel_check=cancel_check) as response:
+        effective_model = (
+            protocols.openai_response_model_header(response.headers)
+            if codex_turn_state is not None else None)
         if 200 <= response.status < 300:
             # Capture as soon as the HTTP headers arrive. If the body then
             # fails before yielding an SSE event, the transport retry must
@@ -4375,9 +4383,11 @@ async def _async_chat_stream_request_once(
                         f"stream interrupted after output began: {e}") from e
                 raise
             try:
-                return protocols.ProviderResponse(json.loads(
-                    _decode_http_text(
-                        response_body, response.headers)))
+                return protocols.ProviderResponse(
+                    json.loads(_decode_http_text(
+                        response_body, response.headers)),
+                    effective_model=effective_model,
+                )
             except json.JSONDecodeError as e:
                 raise protocols.StreamProtocolError(
                     "streaming response was neither valid SSE nor JSON: "
@@ -4385,13 +4395,21 @@ async def _async_chat_stream_request_once(
 
         accumulator = current_config().chat_provider.stream_accumulator(
             on_text_delta)
+
+        def observed_model():
+            return (
+                effective_model
+                or getattr(accumulator, "effective_model", None))
+
         decoder = sse.SseDecoder()
         received_body = bool(first_chunk)
         try:
             for event in decoder.feed(first_chunk):
                 if accumulator.feed(event):
                     return protocols.ProviderResponse(
-                        accumulator.finish())
+                        accumulator.finish(),
+                        effective_model=observed_model(),
+                    )
             while True:
                 try:
                     chunk = await _next_stream_chunk(
@@ -4402,11 +4420,15 @@ async def _async_chat_stream_request_once(
                 for event in decoder.feed(chunk):
                     if accumulator.feed(event):
                         return protocols.ProviderResponse(
-                            accumulator.finish())
+                            accumulator.finish(),
+                            effective_model=observed_model(),
+                        )
             for event in decoder.finish():
                 if accumulator.feed(event):
                     return protocols.ProviderResponse(
-                        accumulator.finish())
+                        accumulator.finish(),
+                        effective_model=observed_model(),
+                    )
         except StreamCancelled:
             raise
         except protocols.ResponseApiError:
@@ -4421,7 +4443,10 @@ async def _async_chat_stream_request_once(
                 raise protocols.StreamProtocolError(
                     f"stream interrupted after output began: {e}") from e
             raise
-        return protocols.ProviderResponse(accumulator.finish())
+        return protocols.ProviderResponse(
+            accumulator.finish(),
+            effective_model=observed_model(),
+        )
 
 
 async def async_chat_stream_request(
@@ -4522,6 +4547,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         raise StreamCancelled()
     if not current_config():
         return formats.DecodedTurn([])
+    effective_model = current_model()
 
     if current_config().chat_provider.kind == protocols.DUMMY:
         # No-op LLM for testing: never touches the network.  The reply is a
@@ -4590,6 +4616,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             **request_kwargs,
         )
         data = response.payload
+        effective_model = response.effective_model or effective_model
     else:
         payload = current_config().chat_provider.chat_payload(
             transcript_items,
@@ -4615,6 +4642,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                 **request_kwargs,
             )
             data = response.payload
+            effective_model = response.effective_model or effective_model
         except http_client.HttpRequestCancelled:
             raise StreamCancelled()
     if not isinstance(data, dict):
@@ -4642,7 +4670,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     turn.metadata["provider_name"] = provider.provider_name
     turn.metadata["endpoint"] = (
         provider.chat_url)
-    turn.metadata["model"] = current_model()
+    turn.metadata["model"] = effective_model
     turn.metadata["protocol"] = current_config().chat_provider.kind
     return turn
 

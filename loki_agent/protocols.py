@@ -79,6 +79,24 @@ class ProviderResponse:
     notice_codes: tuple[str, ...] = ()
 
 
+def _header_string(headers, name):
+    if not isinstance(headers, dict):
+        return None
+    expected = name.lower()
+    for header_name, value in headers.items():
+        if (isinstance(header_name, str)
+                and header_name.lower() == expected
+                and isinstance(value, str)
+                and value.strip()):
+            return value.strip()
+    return None
+
+
+def openai_response_model_header(headers):
+    """Read OpenAI's effective-model header case-insensitively."""
+    return _header_string(headers, "openai-model")
+
+
 def _codex_reasoning_parameter(profile):
     if not profile.supports_reasoning_summaries:
         return None
@@ -768,6 +786,30 @@ class OpenAIResponsesStreamAccumulator:
         self.stream_error = None
         self.stream_extensions = []
         self.output_items = []
+        self._nested_effective_model = None
+        self._top_level_effective_model = None
+
+    @property
+    def effective_model(self):
+        return (
+            self._nested_effective_model
+            or self._top_level_effective_model)
+
+    def _observe_effective_model(self, data):
+        # Codex reports the model selected by the private backend in headers,
+        # not in the ordinary Responses envelope's requested-model field.
+        # Keep the two SSE locations separate so nested response headers have
+        # deterministic precedence regardless of event order.
+        response = data.get("response")
+        nested = (
+            openai_response_model_header(response.get("headers"))
+            if isinstance(response, dict) else None)
+        top_level = openai_response_model_header(data.get("headers"))
+        if nested is not None and self._nested_effective_model is None:
+            self._nested_effective_model = nested
+        if (top_level is not None
+                and self._top_level_effective_model is None):
+            self._top_level_effective_model = top_level
 
     def _preserve_extension(self, context, value):
         formats.report_unknown(OPENAI_RESPONSES, context, value)
@@ -785,6 +827,7 @@ class OpenAIResponsesStreamAccumulator:
         if not isinstance(data, dict):
             raise StreamProtocolError(
                 "OpenAI Responses stream event must be an object")
+        self._observe_effective_model(data)
         event_type = data.get("type") or event.event
         if event_type == "response.output_text.delta":
             delta = data.get("delta")
@@ -802,6 +845,7 @@ class OpenAIResponsesStreamAccumulator:
                 raise StreamProtocolError(
                     "response.completed is missing its response")
             self.completed_response = copy.deepcopy(response)
+            self.completed_response.pop("headers", None)
             self.completed_response.setdefault("object", "response")
             self.completed_response.setdefault("status", "completed")
             return True
@@ -811,6 +855,7 @@ class OpenAIResponsesStreamAccumulator:
                 raise StreamProtocolError(
                     "response.incomplete is missing its response")
             self.incomplete_response = copy.deepcopy(response)
+            self.incomplete_response.pop("headers", None)
             self.incomplete_response.setdefault("object", "response")
             self.incomplete_response.setdefault("status", "incomplete")
         elif event_type == "response.failed":
@@ -819,6 +864,7 @@ class OpenAIResponsesStreamAccumulator:
             response = data.get("response")
             if isinstance(response, dict):
                 self.failed_response = copy.deepcopy(response)
+                self.failed_response.pop("headers", None)
                 self.failed_response.setdefault("object", "response")
                 self.failed_response.setdefault(
                     "status",

@@ -1690,6 +1690,27 @@ class StreamAccumulatorTests(unittest.TestCase):
         self.assertEqual(formats.item_text(items[0]), "hello")
         self.assertEqual(diagnostics.getvalue(), "")
 
+    def test_responses_effective_model_prefers_nested_event_headers(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        accumulator.feed(self.event(json.dumps({
+            "type": "response.created",
+            "headers": {"OPENAI-MODEL": "top-level-model"},
+        })))
+        accumulator.feed(self.event(json.dumps({
+            "type": "response.completed",
+            "headers": {"openai-model": "later-top-level-model"},
+            "response": {
+                "id": "response_1",
+                "headers": {"OpenAI-Model": "nested-model"},
+            },
+        })))
+
+        response = accumulator.finish()
+
+        self.assertEqual(accumulator.effective_model, "nested-model")
+        self.assertNotIn("headers", response)
+
     def test_openai_responses_collects_items_with_metadata_only_completion(
             self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(
