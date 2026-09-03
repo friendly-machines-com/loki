@@ -21,6 +21,37 @@ export LOKI_MODEL="glm-5.2"
 ./loki.py
 ```
 
+To use an OpenAI ChatGPT subscription instead of Platform API billing, log in
+before starting a Loki session:
+
+```
+./loki.py auth login openai
+```
+
+The default authorization-code flow prints a URL, attempts to open it in a
+browser, and listens only on localhost ports 1455 or 1457 for the PKCE
+callback. On a headless or remote machine, use OpenAI's device-code flow:
+
+```
+./loki.py auth login openai --device-code
+```
+
+Device-code login must be enabled for the ChatGPT account or workspace.
+`./loki.py auth status openai` reports the stored login without displaying
+tokens, and `./loki.py auth logout openai` removes it locally. Logout prevents
+new supervisors from loading the credential. A supervisor that was already
+running can continue using its cached access token until it next needs a
+refresh; neither that cached token nor a token already leased to a request can
+be recalled locally, and both remain subject to server-side expiry.
+
+Loki stores subscription tokens in
+`$XDG_CONFIG_HOME/loki/credentials/tokens.json` (normally
+`~/.config/loki/credentials/tokens.json`). The directory is private to the
+user and token files are created with mode 0600. Writes use same-directory
+atomic replacement and filesystem synchronization. A separate lock
+serializes login, logout, and token rotation among independently running
+terminal and ACP supervisors.
+
 Use `/image PATH` to attach a local PNG, JPEG, GIF, or WebP image to
 the next prompt. Relative paths use Loki's current `/pwd`; quote paths
 containing spaces. Several `/image` commands may be used before the prompt,
@@ -49,15 +80,23 @@ descriptor. Rotating refresh tokens stay in the top-level broker; delegated
 processes can lease an access token but cannot obtain the refresh token.
 
 The supervisor/runtime split also gives persistent credentials a pathname
-boundary. On Linux, if Loki's dedicated
-`$XDG_CONFIG_HOME/loki/credentials` directory exists, each runtime enters a
-private user and mount namespace before importing the agent core and covers
-that directory with an empty read-only filesystem. Tools and nested subagents
-inherit the covered view; only the supervisor retains the original view
-needed to load and later update credentials. Runtimes then discard their
-namespace capabilities and enable `NO_NEW_PRIVS`, so they cannot remove the
-cover mount. This is not a general sandbox: Loki still expects the surrounding
-VM or container described above to confine arbitrary tool activity.
+boundary. Every supervisor creates Loki's dedicated
+`$XDG_CONFIG_HOME/loki/credentials` directory before starting a runtime. On
+Linux, each runtime enters a private user and mount namespace before importing
+the agent core and covers that directory with an empty read-only filesystem.
+Tools and nested subagents inherit the covered view; only the supervisor
+retains the original view needed to load and later update credentials.
+Runtimes then discard their namespace capabilities and enable
+`NO_NEW_PRIVS`, so they cannot remove the cover mount. This is not a general
+sandbox: Loki still expects the surrounding VM or container described above
+to confine arbitrary tool activity.
+
+OpenAI refresh tokens may rotate. Before sending one, the supervisor
+atomically changes its stored record to a refresh-in-progress tombstone that
+does not contain the refresh token. A crash, cancellation after possible
+delivery, or ambiguous HTTP result therefore requires a new login instead of
+allowing another Loki process to replay the old token. Only a provably
+pre-delivery transport failure restores the old active record.
 
 Ordinary commands and hooks are started with other descriptors closed.
 Credential-owning supervisors and credential-consuming runtimes also make
@@ -75,6 +114,12 @@ the canonical OpenAI provider signature, Loki supplies
 `https://api.openai.com/v1` and labels the provider
 `OpenAI Platform API [endpoint supplied by Loki]`. A changed signature or
 non-OpenAI endpoint is rejected rather than receiving `OPENAI_API_KEY`.
+For a stored ChatGPT login, Loki also synthesizes the separate provider
+`OpenAI ChatGPT subscription [endpoint supplied by Loki]`, using the private
+ChatGPT Codex Responses endpoint and the brokered subscription credential.
+Subscription authorization is permitted only for the exact ChatGPT Codex
+Responses and model-list URLs; it is never attached to the models.dev
+catalog request or to the OpenAI Platform API.
 
 Loki does not select a built-in provider connection at startup. Without an
 explicit `LOKI_API_BASE` or a saved session connection, it starts disconnected

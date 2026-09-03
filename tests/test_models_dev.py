@@ -7,8 +7,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import http_client, models, protocols, terminals
-from loki_agent.credentials import CredentialStore
+from loki_agent import (
+    authentications,
+    http_client,
+    models,
+    protocols,
+    terminals,
+)
+from loki_agent.credentials import CredentialInventory, CredentialStore
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
 DATA = {
@@ -325,7 +331,11 @@ class CatalogNormalizationTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(access)
-        self.assertEqual(access.credential_env, "OPENAI_API_KEY")
+        self.assertEqual(
+            access.credential_ref,
+            authentications.CredentialRef.environment(
+                "OPENAI_API_KEY"),
+        )
         self.assertEqual(access.protocol, protocols.OPENAI_RESPONSES)
         provider = protocols.make_provider(
             access.api_url,
@@ -339,6 +349,58 @@ class CatalogNormalizationTests(unittest.TestCase):
             provider.models_url,
             "https://api.openai.com/v1/models",
         )
+
+    def test_openai_subscription_is_distinct_and_uses_credential_ref(self):
+        normalized = models.normalize_catalog({
+            "openai": self.openai_provider(),
+        })
+        provider = normalized["openai-subscription"]
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+
+        unavailable = models.provider_access(
+            provider, CredentialInventory({}))
+        access = models.provider_access(
+            provider, CredentialInventory({}, {credential}))
+
+        self.assertIsNone(unavailable)
+        self.assertEqual(access.credential_ref, credential)
+        self.assertEqual(
+            access.api_url,
+            authentications.OPENAI_CHATGPT_RESPONSES_URL,
+        )
+        self.assertEqual(
+            access.protocol, protocols.OPENAI_RESPONSES)
+        self.assertEqual(
+            models.provider_display_name(
+                "openai-subscription", provider),
+            "OpenAI ChatGPT subscription [endpoint supplied by Loki]",
+        )
+        self.assertNotIn(
+            "cost", provider["models"]["gpt-test"])
+
+    def test_subscription_is_not_synthesized_from_changed_signature(self):
+        normalized = models.normalize_catalog({
+            "openai": self.openai_provider(
+                env=["OTHER_API_KEY"]),
+        })
+
+        self.assertNotIn("openai-subscription", normalized)
+
+    def test_downloaded_private_credential_marker_is_not_authority(self):
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        provider = {
+            "id": "forged",
+            "api": authentications.OPENAI_CHATGPT_RESPONSES_URL,
+            "npm": "@ai-sdk/openai",
+            "_loki_credential_ref": credential.encode(),
+        }
+
+        access = models.provider_access(
+            provider, CredentialInventory({}, {credential}))
+
+        self.assertIsNone(access)
 
     def test_acp_choice_marks_loki_supplied_openai_endpoint(self):
         normalized = models.normalize_catalog({
@@ -378,7 +440,7 @@ class CatalogNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(
             [provider_id for provider_id, _, _ in groups["GPT Test"]],
-            ["openai"],
+            ["openai", "openai-subscription"],
         )
 
 
@@ -529,7 +591,10 @@ class ProtocolAndKeyTests(unittest.TestCase):
         }
         access = models.provider_access(
             entry, CredentialStore({"EXAMPLE_PAT": "pat"}))
-        self.assertEqual(access.credential_env, "EXAMPLE_PAT")
+        self.assertEqual(
+            access.credential_ref,
+            authentications.CredentialRef.environment("EXAMPLE_PAT"),
+        )
 
     def test_protocol_label_detects_from_api_url(self):
         openai_chat = {"api": "https://x.test/v1/chat/completions", "npm": "@ai-sdk/openai"}
@@ -550,7 +615,11 @@ class ProtocolAndKeyTests(unittest.TestCase):
     def test_provider_access_resolves_declared_credential(self):
         access = models.provider_access(
             DATA["zhipuai"], CredentialStore({"ZHIPU_API_KEY": "zk"}))
-        self.assertEqual(access.credential_env, "ZHIPU_API_KEY")
+        self.assertEqual(
+            access.credential_ref,
+            authentications.CredentialRef.environment(
+                "ZHIPU_API_KEY"),
+        )
         self.assertEqual(access.api_url, "https://open.bigmodel.cn/api/paas/v4")
         self.assertEqual(access.protocol, "openai_chat")
 
@@ -839,6 +908,42 @@ class PickerTests(unittest.TestCase):
             rendered.index("\nUsable models:\n"),
             rendered.index("\nUsable providers:\n"),
         )
+
+    def test_run_model_picker_selects_subscription_credential(self):
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        data = models.normalize_catalog({
+            "openai": {
+                "id": "openai",
+                "name": "OpenAI",
+                "npm": "@ai-sdk/openai",
+                "env": ["OPENAI_API_KEY"],
+                "models": {
+                    "gpt-test": {
+                        "id": "gpt-test",
+                        "name": "GPT Test",
+                    },
+                },
+            },
+        })
+        saved = models._index_cache
+        models._index_cache = (data, models.build_groups(data))
+        try:
+            result = asyncio.run(models.run_model_picker_async(
+                _input_script(["1", "1"]),
+                CredentialInventory({}, {credential}),
+                text_writer=_write_text,
+            ))
+        finally:
+            models._index_cache = saved
+
+        provider_id, provider, model = result
+        self.assertEqual(provider_id, "openai-subscription")
+        self.assertEqual(
+            provider["api"],
+            authentications.OPENAI_CHATGPT_RESPONSES_URL,
+        )
+        self.assertEqual(model["id"], "gpt-test")
 
     def test_run_model_picker_cancel_returns_none(self):
         saved = models._index_cache

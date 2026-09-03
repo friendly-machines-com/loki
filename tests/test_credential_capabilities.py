@@ -70,6 +70,10 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 refresh_token="refresh-new",
             )
 
+        async def rotate(tokens):
+            return authentications.refreshed_openai_tokens(
+                tokens, await refresh(tokens.refresh_token))
+
         credential = (
             authentications.CredentialRef.openai_subscription())
         self.broker.install_openai_subscription(
@@ -78,7 +82,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 refresh_token="refresh-old",
                 expires_at=10**12,
             ),
-            refresh=refresh,
+            rotate=rotate,
         )
         await self.connect({credential})
 

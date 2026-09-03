@@ -110,6 +110,47 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         self.assertNotIn("tools", payload)
         self.assertEqual(payload["input"][0]["content"][0]["text"], "hi")
 
+    def test_subscription_payload_uses_codex_backend_contract(self):
+        provider = protocols.make_provider(
+            "https://chatgpt.com/backend-api/codex/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="openai-subscription",
+            max_tokens=1234,
+        )
+
+        payload = provider.streaming_chat_payload(
+            [formats.message_item("user", "hi")],
+            [],
+            "gpt-test",
+        )
+
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertTrue(payload["parallel_tool_calls"])
+        self.assertFalse(payload["store"])
+        self.assertTrue(payload["stream"])
+        self.assertEqual(
+            payload["include"], ["reasoning.encrypted_content"])
+        self.assertNotIn("max_output_tokens", payload)
+
+    def test_generic_responses_payload_omits_codex_backend_controls(self):
+        provider = protocols.make_provider(
+            "https://example.test/v1/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="compatible-provider",
+            max_tokens=1234,
+        )
+
+        payload = provider.chat_payload(
+            [formats.message_item("user", "hi")],
+            [],
+            "gpt-test",
+        )
+
+        self.assertEqual(payload["max_output_tokens"], 1234)
+        for field in [
+                "tool_choice", "parallel_tool_calls", "store", "include"]:
+            self.assertNotIn(field, payload)
+
     def test_responses_parse_response_separates_items_from_envelope(self):
         provider = protocols.make_provider(
             "https://api.openai.com/v1/responses",

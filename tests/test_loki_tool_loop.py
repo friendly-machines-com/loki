@@ -842,6 +842,65 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_spec.scheme, "openai-subscription")
         self.assertEqual(config.auth_scheme, "openai-subscription")
 
+    def test_synthesized_subscription_selection_is_streaming_and_confined(
+            self):
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        catalog = modelsdev.normalize_catalog({
+            "openai": {
+                "id": "openai",
+                "name": "OpenAI",
+                "npm": "@ai-sdk/openai",
+                "env": ["OPENAI_API_KEY"],
+                "models": {
+                    "gpt-test": {
+                        "id": "gpt-test",
+                        "name": "GPT Test",
+                    },
+                },
+            },
+        })
+        provider = catalog["openai-subscription"]
+        model = provider["models"]["gpt-test"]
+
+        config = loki.config_from_modelsdev_selection(
+            "openai-subscription",
+            provider,
+            model,
+            CredentialInventory({}, {credential}),
+        )
+
+        self.assertEqual(
+            config.url,
+            authentications.OPENAI_CHATGPT_RESPONSES_URL,
+        )
+        self.assertEqual(config.auth_spec.credential, credential)
+        self.assertEqual(
+            config.auth_spec.scheme, "openai-subscription")
+        self.assertTrue(config.stream)
+
+    def test_saved_subscription_cannot_redirect_access_token(self):
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        descriptor = ConnectionDescriptor(
+            provider_id="openai-subscription",
+            provider_name="OpenAI ChatGPT subscription",
+            model="gpt-test",
+            chat_url="https://attacker.example/v1/responses",
+            models_url=None,
+            protocol=protocols.OPENAI_RESPONSES,
+            credential_env=None,
+            credential_ref=credential,
+            auth_scheme="openai-subscription",
+        )
+
+        with self.assertRaises(
+                authentications.CredentialUnavailable):
+            loki.config_from_connection_descriptor(
+                descriptor,
+                CredentialInventory({}, {credential}),
+            )
+
     def test_saved_connection_allows_explicit_custom_header_override(self):
         descriptor = ConnectionDescriptor(
             provider_id="provider",
@@ -4541,6 +4600,10 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 refresh_token="refresh-new",
             )
 
+        async def rotate(tokens):
+            return authentications.refreshed_openai_tokens(
+                tokens, await refresh(tokens.refresh_token))
+
         broker = authentications.CredentialBroker()
         broker.install_openai_subscription(
             authentications.OpenAITokenSet(
@@ -4549,7 +4612,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 account_id="account",
                 expires_at=10**12,
             ),
-            refresh=refresh,
+            rotate=rotate,
         )
         loki.current_session().credential_authority = broker
         loki.apply_runtime_config(loki.make_runtime_config(

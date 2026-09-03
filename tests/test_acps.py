@@ -1262,6 +1262,140 @@ class WorkerSessionContractTests(unittest.TestCase):
             "config_option_update",
         )
 
+    def test_subscription_option_and_resume_use_brokered_credential(self):
+        from loki_agent import http_client, loki, models
+        from loki_agent.acp_worker import Worker
+        from loki_agent.credentials import CredentialInventory
+        from loki_agent.sessions import Session
+
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        catalog = models.normalize_catalog({
+            "openai": {
+                "id": "openai",
+                "name": "OpenAI",
+                "npm": "@ai-sdk/openai",
+                "env": ["OPENAI_API_KEY"],
+                "models": {
+                    "gpt-test": {
+                        "id": "gpt-test",
+                        "name": "GPT Test",
+                    },
+                },
+            },
+        })
+        groups = models.build_groups(catalog)
+        broker = authentications.CredentialBroker()
+        broker.install_openai_subscription(
+            authentications.OpenAITokenSet(
+                access_token="access-secret",
+                refresh_token="refresh-secret",
+                expires_at=10**12,
+            ))
+        old_session = loki._DEFAULT_SESSION
+        old_credentials = loki.CREDENTIALS
+        old_chat_dir = loki.CHAT_LOG_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                loki.CHAT_LOG_DIR = os.path.join(tmpdir, "chats")
+                loki.CREDENTIALS = CredentialInventory(
+                    {}, {credential})
+                requests = []
+
+                async def request(method, url, **kwargs):
+                    requests.append((
+                        method,
+                        url,
+                        dict(kwargs["headers_in"]),
+                    ))
+                    return http_client.HttpResponse(
+                        url, 200, "OK", {}, b"{}")
+
+                async def scenario():
+                    first_session = Session(shell_cwd=tmpdir)
+                    first_session.credential_authority = broker
+                    loki._DEFAULT_SESSION = first_session
+                    first_worker = Worker(
+                        first_session,
+                        lambda _message: None,
+                        "first",
+                    )
+                    with mock.patch.object(
+                            models,
+                            "ensure_index",
+                            new=mock.AsyncMock(
+                                return_value=(catalog, groups))):
+                        opened = await first_worker.open({
+                            "sessionId": "first",
+                            "cwd": tmpdir,
+                        })
+                    options = opened["configOptions"][0]["options"]
+                    value = "openai-subscription/gpt-test"
+                    self.assertIn(
+                        value,
+                        [option["value"] for option in options],
+                    )
+                    first_worker.set_config_option({
+                        "configId": "model",
+                        "value": value,
+                    })
+                    with mock.patch.object(
+                            http_client,
+                            "async_http_request",
+                            new=request):
+                        await loki.async_chat_request(
+                            loki.current_config().url, {})
+                    saved_name = os.path.basename(
+                        first_session.chat_log_path)
+                    await first_worker.close()
+
+                    resumed_session = Session(shell_cwd=tmpdir)
+                    resumed_session.credential_authority = broker
+                    loki._DEFAULT_SESSION = resumed_session
+                    resumed_worker = Worker(
+                        resumed_session,
+                        lambda _message: None,
+                        "resumed",
+                    )
+                    with mock.patch.object(
+                            models,
+                            "ensure_index",
+                            new=mock.AsyncMock(
+                                return_value=({}, {}))):
+                        resumed = await resumed_worker.open({
+                            "sessionId": "resumed",
+                            "cwd": tmpdir,
+                            "resume": saved_name,
+                        })
+                    self.assertEqual(
+                        resumed["configOptions"][0]["currentValue"],
+                        "loki-saved",
+                    )
+                    with mock.patch.object(
+                            http_client,
+                            "async_http_request",
+                            new=request):
+                        await loki.async_chat_request(
+                            loki.current_config().url, {})
+                    await resumed_worker.close()
+
+                asyncio.run(scenario())
+
+                self.assertEqual(len(requests), 2)
+                for _method, url, headers in requests:
+                    self.assertEqual(
+                        url,
+                        authentications.OPENAI_CHATGPT_RESPONSES_URL,
+                    )
+                    self.assertEqual(
+                        headers["Authorization"],
+                        "Bearer access-secret",
+                    )
+        finally:
+            loki._DEFAULT_SESSION = old_session
+            loki.CREDENTIALS = old_credentials
+            loki.CHAT_LOG_DIR = old_chat_dir
+
     def test_worker_close_cancels_catalog_discovery(self):
         from unittest import mock
         from loki_agent import loki, models

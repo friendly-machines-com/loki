@@ -11,6 +11,15 @@ from loki_agent import http_client
 auth = authentications
 
 
+def rotation(refresh, now=None):
+    async def rotate(tokens):
+        result = await refresh(tokens.refresh_token)
+        return auth.refreshed_openai_tokens(
+            tokens, result, now)
+
+    return rotate
+
+
 def jwt(payload):
     def encode(value):
         raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
@@ -44,6 +53,25 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(lease.refreshable)
         self.assertEqual(broker.available(), frozenset({ref}))
 
+    async def test_subscription_target_is_confined_to_chatgpt_codex(self):
+        spec = auth.AuthSpec(
+            auth.CredentialRef.openai_subscription(),
+            "openai-subscription",
+        )
+
+        for url in auth.OPENAI_CHATGPT_AUTHORIZED_URLS:
+            auth.validate_authorization_target(spec, url)
+        for url in [
+                "http://chatgpt.com/backend-api/codex/responses",
+                "https://chatgpt.com:443/backend-api/codex/responses",
+                "https://chatgpt.com/backend-api/codex/responses?x=1",
+                "https://chatgpt.com.evil.test/backend-api/codex/responses",
+                "https://evil.test/backend-api/codex/responses",
+        ]:
+            with self.subTest(url=url):
+                with self.assertRaises(auth.CredentialUnavailable):
+                    auth.validate_authorization_target(spec, url)
+
     async def test_concurrent_proactive_refresh_is_single_flight(self):
         now = 10_000.0
         calls = []
@@ -64,7 +92,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 access_token=jwt({"exp": now + 10}),
                 refresh_token="refresh-a",
             ),
-            refresh=refresh,
+            rotate=rotation(refresh, now),
             clock=lambda: now,
         )
 
@@ -96,7 +124,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 access_token=jwt({"exp": now + 3600}),
                 refresh_token="refresh-a",
             ),
-            refresh=refresh,
+            rotate=rotation(refresh, now),
             clock=lambda: now,
         )
 
@@ -122,7 +150,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 access_token=jwt({"exp": now + 30}),
                 refresh_token="refresh-a",
             ),
-            refresh=refresh,
+            rotate=rotation(refresh, now),
             clock=lambda: now,
         )
 
@@ -145,7 +173,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 access_token=jwt({"exp": now - 1}),
                 refresh_token="refresh-a",
             ),
-            refresh=refresh,
+            rotate=rotation(refresh, now),
             clock=lambda: now,
         )
 
@@ -172,7 +200,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 access_token=jwt({"exp": now - 1}),
                 refresh_token="refresh-a",
             ),
-            refresh=refresh,
+            rotate=rotation(refresh, now),
             clock=lambda: now,
         )
         pending = asyncio.create_task(record.lease())
@@ -206,7 +234,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 refresh_token="refresh-a",
                 account_id="expected",
             ),
-            refresh=refresh,
+            rotate=rotation(refresh, now),
             clock=lambda: now,
         )
 
@@ -231,7 +259,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 access_token=jwt({"exp": now - 1}),
                 refresh_token="old-refresh",
             ),
-            refresh=refresh,
+            rotate=rotation(refresh, now),
             clock=lambda: now,
         )
         pending = asyncio.create_task(record.lease())

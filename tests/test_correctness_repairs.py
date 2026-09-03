@@ -417,6 +417,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 class TerminalEntrypointContractTests(unittest.TestCase):
     def test_public_entrypoint_protects_credential_supervisor(self):
         credentials = CredentialStore({})
+        storage = mock.Mock()
         supervisor = mock.Mock()
         supervisor.run_terminal_runtime = mock.AsyncMock(
             return_value=17)
@@ -429,6 +430,10 @@ class TerminalEntrypointContractTests(unittest.TestCase):
                             "loki_agent.credential_supervisors."
                             "CredentialSupervisor",
                             return_value=supervisor) as supervisor_class, \
+                mock.patch(
+                    "loki_agent.credential_storages."
+                    "JsonCredentialStorage",
+                    return_value=storage) as storage_class, \
                 mock.patch.object(
                     sys, "argv", ["/checkout/loki.py", "--headless"]):
             status = terminal_entrypoint.main()
@@ -436,7 +441,9 @@ class TerminalEntrypointContractTests(unittest.TestCase):
         self.assertEqual(status, 17)
         capture.assert_called_once_with()
         protect.assert_called_once_with()
-        supervisor_class.assert_called_once_with(credentials)
+        storage_class.assert_called_once_with()
+        supervisor_class.assert_called_once_with(
+            credentials, storage)
         supervisor.run_terminal_runtime.assert_awaited_once_with(
             "/checkout/loki.py", ["--headless"])
 
