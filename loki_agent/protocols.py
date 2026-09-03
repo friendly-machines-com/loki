@@ -788,6 +788,7 @@ class OpenAIResponsesStreamAccumulator:
         self.output_items = []
         self._nested_effective_model = None
         self._top_level_effective_model = None
+        self.notice_codes = []
 
     @property
     def effective_model(self):
@@ -810,6 +811,47 @@ class OpenAIResponsesStreamAccumulator:
         if (top_level is not None
                 and self._top_level_effective_model is None):
             self._top_level_effective_model = top_level
+
+    def _observe_metadata(self, data):
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            if metadata is not None:
+                formats.report_unknown(
+                    OPENAI_RESPONSES, "response metadata", metadata)
+            return
+        # Safety buffering and moderation are known private-backend metadata,
+        # but Loki has no buffering policy or moderation UI that can consume
+        # them. Recognize and discard them instead of persisting opaque data.
+        if metadata.get("type") == "safety_buffering":
+            return
+        remaining = copy.deepcopy(metadata)
+        recommendations = remaining.pop(
+            "openai_verification_recommendation", None)
+        remaining.pop("openai_chatgpt_moderation_metadata", None)
+        if isinstance(recommendations, list):
+            unknown_recommendations = []
+            for recommendation in recommendations:
+                if (recommendation
+                        == formats.TRUSTED_ACCESS_FOR_CYBER):
+                    if recommendation not in self.notice_codes:
+                        self.notice_codes.append(recommendation)
+                else:
+                    unknown_recommendations.append(recommendation)
+            if unknown_recommendations:
+                formats.report_unknown(
+                    OPENAI_RESPONSES,
+                    "verification recommendation",
+                    unknown_recommendations,
+                )
+        elif recommendations is not None:
+            formats.report_unknown(
+                OPENAI_RESPONSES,
+                "verification recommendation",
+                recommendations,
+            )
+        if remaining:
+            formats.report_unknown(
+                OPENAI_RESPONSES, "response metadata", remaining)
 
     def _preserve_extension(self, context, value):
         formats.report_unknown(OPENAI_RESPONSES, context, value)
@@ -875,8 +917,15 @@ class OpenAIResponsesStreamAccumulator:
                 self.stream_error = copy.deepcopy(data)
         elif event_type == "error":
             self.stream_error = copy.deepcopy(data)
+        elif event_type == "response.metadata":
+            self._observe_metadata(data)
         elif not _known_responses_stream_event(event_type):
-            self._preserve_extension("stream event", data)
+            extension = copy.deepcopy(data)
+            # Codex can attach this typed payload to events other than
+            # response.metadata. Loki deliberately has no consumer for it.
+            extension.pop("safety_buffering", None)
+            if extension and set(extension) != {"type"}:
+                self._preserve_extension("stream event", extension)
         return False
 
     def _finish_response(self, response):

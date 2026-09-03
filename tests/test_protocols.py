@@ -1711,6 +1711,60 @@ class StreamAccumulatorTests(unittest.TestCase):
         self.assertEqual(accumulator.effective_model, "nested-model")
         self.assertNotIn("headers", response)
 
+    def test_responses_metadata_retains_only_known_notice_codes(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            accumulator.feed(self.event(json.dumps({
+                "type": "response.metadata",
+                "metadata": {
+                    "openai_verification_recommendation": [
+                        formats.TRUSTED_ACCESS_FOR_CYBER,
+                        formats.TRUSTED_ACCESS_FOR_CYBER,
+                    ],
+                    "openai_chatgpt_moderation_metadata": {
+                        "opaque": True,
+                    },
+                },
+            })))
+            accumulator.feed(self.event(json.dumps({
+                "type": "response.metadata",
+                "metadata": {
+                    "type": "safety_buffering",
+                    "retry_model": "opaque",
+                },
+                "safety_buffering": {"opaque": True},
+            })))
+            accumulator.feed(self.event(json.dumps({
+                "type": "response.safety_buffering",
+                "safety_buffering": {"opaque": True},
+            })))
+            accumulator.feed(self.event(
+                '{"type":"response.completed","response":'
+                '{"id":"response_1"}}'))
+
+        self.assertEqual(
+            accumulator.notice_codes,
+            [formats.TRUSTED_ACCESS_FOR_CYBER],
+        )
+        self.assertEqual(diagnostics.getvalue(), "")
+        self.assertNotIn(
+            "metadata", json.dumps(accumulator.finish()))
+
+    def test_unknown_responses_metadata_is_still_diagnosed(self):
+        accumulator = protocols.OpenAIResponsesStreamAccumulator(
+            lambda text: None)
+        diagnostics = io.StringIO()
+
+        with contextlib.redirect_stderr(diagnostics):
+            accumulator.feed(self.event(json.dumps({
+                "type": "response.metadata",
+                "metadata": {"future_metadata": {"value": 1}},
+            })))
+
+        self.assertIn("future_metadata", diagnostics.getvalue())
+
     def test_openai_responses_collects_items_with_metadata_only_completion(
             self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(

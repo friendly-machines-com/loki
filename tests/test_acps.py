@@ -800,7 +800,7 @@ class EventMapperTests(unittest.TestCase):
     def test_ignored_events_map_to_nothing(self):
         from loki_agent import acp_events
         for kind in ("assistant_end", "response_timing", "max_loops",
-                     "assistant_start"):
+                     "assistant_start", "provider_notice"):
             self.assertEqual(
                 acp_events.map_event("s", {"type": kind}, {}), [])
 

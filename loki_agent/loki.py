@@ -2928,6 +2928,11 @@ async def run_tool_loop_async(
                 "elapsed": time.perf_counter() - request_start,
             })
         append_turn(turn)
+        for notice_code in formats.provider_notice_codes(turn):
+            on_event({
+                "type": "provider_notice",
+                "code": notice_code,
+            })
 
         tool_calls = formats.response_tool_calls(turn.items)
         assistant_items = [
@@ -4409,6 +4414,8 @@ async def _async_chat_stream_request_once(
                     return protocols.ProviderResponse(
                         accumulator.finish(),
                         effective_model=observed_model(),
+                        notice_codes=tuple(
+                            getattr(accumulator, "notice_codes", ())),
                     )
             while True:
                 try:
@@ -4422,12 +4429,17 @@ async def _async_chat_stream_request_once(
                         return protocols.ProviderResponse(
                             accumulator.finish(),
                             effective_model=observed_model(),
+                            notice_codes=tuple(
+                                getattr(
+                                    accumulator, "notice_codes", ())),
                         )
             for event in decoder.finish():
                 if accumulator.feed(event):
                     return protocols.ProviderResponse(
                         accumulator.finish(),
                         effective_model=observed_model(),
+                        notice_codes=tuple(
+                            getattr(accumulator, "notice_codes", ())),
                     )
         except StreamCancelled:
             raise
@@ -4446,6 +4458,8 @@ async def _async_chat_stream_request_once(
         return protocols.ProviderResponse(
             accumulator.finish(),
             effective_model=observed_model(),
+            notice_codes=tuple(
+                getattr(accumulator, "notice_codes", ())),
         )
 
 
@@ -4548,6 +4562,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     if not current_config():
         return formats.DecodedTurn([])
     effective_model = current_model()
+    notice_codes = ()
 
     if current_config().chat_provider.kind == protocols.DUMMY:
         # No-op LLM for testing: never touches the network.  The reply is a
@@ -4617,6 +4632,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         )
         data = response.payload
         effective_model = response.effective_model or effective_model
+        notice_codes = response.notice_codes
     else:
         payload = current_config().chat_provider.chat_payload(
             transcript_items,
@@ -4643,6 +4659,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             )
             data = response.payload
             effective_model = response.effective_model or effective_model
+            notice_codes = response.notice_codes
         except http_client.HttpRequestCancelled:
             raise StreamCancelled()
     if not isinstance(data, dict):
@@ -4672,6 +4689,13 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         provider.chat_url)
     turn.metadata["model"] = effective_model
     turn.metadata["protocol"] = current_config().chat_provider.kind
+    if notice_codes:
+        protocol_data = copy.deepcopy(
+            turn.metadata.get("protocol_data") or {})
+        protocol_data["loki"] = {
+            "provider_notices": list(notice_codes),
+        }
+        turn.metadata["protocol_data"] = protocol_data
     return turn
 
 

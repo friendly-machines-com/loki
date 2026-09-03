@@ -361,6 +361,13 @@ class ResumeTranscriptRenderer:
     def _response_blocks(self, event: dict):
         label = event.get("model") or self.assistant_label
         blocks = []
+        for code in formats.provider_notice_codes(event):
+            text = formats.provider_notice_text(code)
+            if text is not None:
+                blocks.append([
+                    ("literal", "\u24d8 "),
+                    ("text", text),
+                ])
         status = event.get("status", "completed")
         if status != "completed":
             block = [

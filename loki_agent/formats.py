@@ -9,6 +9,16 @@ TRANSCRIPT_SCHEMA = "day-agent.session.v4"
 OPENAI_CHAT = "openai_chat"
 ANTHROPIC_MESSAGES = "anthropic_messages"
 OPENAI_RESPONSES = "openai_responses"
+TRUSTED_ACCESS_FOR_CYBER = "trusted_access_for_cyber"
+_PROVIDER_NOTICE_MESSAGES = {
+    TRUSTED_ACCESS_FOR_CYBER: (
+        "OpenAI recommends Trusted Access for cybersecurity requests.\n"
+        "Trusted Access: "
+        "https://openai.com/form/enterprise-trusted-access-for-cyber/\n"
+        "Learn more: "
+        "https://help.openai.com/en/articles/20001326"
+    ),
+}
 OPENAI_CHAT_REASONING_FIELDS = (
     "reasoning_content",
     "reasoning",
@@ -42,6 +52,32 @@ def report_unknown(protocol, context, value):
         file=sys.stderr,
     )
     sys.stderr.flush()
+
+
+def provider_notice_codes(value) -> tuple[str, ...]:
+    """Read known, non-model-visible provider notices from a response."""
+    metadata = (
+        value.metadata if isinstance(value, DecodedTurn) else value)
+    if not isinstance(metadata, dict):
+        return ()
+    protocol_data = metadata.get("protocol_data")
+    if not isinstance(protocol_data, dict):
+        return ()
+    loki_data = protocol_data.get("loki")
+    if not isinstance(loki_data, dict):
+        return ()
+    raw_codes = loki_data.get("provider_notices")
+    if not isinstance(raw_codes, list):
+        return ()
+    codes = []
+    for code in raw_codes:
+        if code in _PROVIDER_NOTICE_MESSAGES and code not in codes:
+            codes.append(code)
+    return tuple(codes)
+
+
+def provider_notice_text(code: str) -> str | None:
+    return _PROVIDER_NOTICE_MESSAGES.get(code)
 
 
 def _protocol_data(target, protocol, value):

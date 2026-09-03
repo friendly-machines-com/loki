@@ -126,7 +126,9 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
     if kind == "response_cancelled":
         return [agent_message_chunk(
             session_id, "[turn cancelled by user]")]
-    # assistant_end, response_timing, max_loops, stream_error,
+    # provider_notice has no ACP session/update representation; presenting it
+    # as agent_message_chunk would falsely make provider metadata assistant
+    # speech. assistant_end, response_timing, max_loops, stream_error,
     # transcript_error, response_incomplete/failed: no per-event update;
     # the stopReason or an error response carries them.
     return []

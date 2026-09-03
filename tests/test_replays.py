@@ -80,6 +80,21 @@ class ReplayFidelityTests(unittest.TestCase):
         classified = replays.classify_transcript(events)
         self.assertEqual([b[1] for b in classified], ["answer"])
 
+    def test_provider_notice_is_not_fabricated_as_acp_agent_text(self):
+        event = formats.model_response_event(
+            formats.OPENAI_RESPONSES,
+            [],
+            protocol_data={
+                "loki": {
+                    "provider_notices": [
+                        formats.TRUSTED_ACCESS_FOR_CYBER,
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(replays.classify_transcript([event]), [])
+
     def test_incomplete_response_status_is_visible(self):
         events = [{
             "type": "model_response",

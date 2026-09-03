@@ -73,6 +73,8 @@ def classify_response_item(item: dict, response: dict):
 def classify_response(event: dict):
     """Classify a `model_response` event into replay tuples."""
     blocks = []
+    # Provider notices are persisted for terminal replay but ACP has no
+    # metadata update for them. Do not fabricate assistant speech.
     status = event.get("status", "completed")
     if status != "completed":
         blocks.append((

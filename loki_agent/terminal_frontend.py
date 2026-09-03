@@ -362,6 +362,12 @@ def _terminal_agent_event(event: dict):
             f"\n[T]  [LLM Response Time: {event['elapsed']:.3f}s]",
             file=sys.stderr)
         sys.stderr.flush()
+    elif kind == "provider_notice":
+        text = formats.provider_notice_text(event.get("code"))
+        if text is not None:
+            print("\n\u24d8 ", end="")
+            terminal.write_text(text, multiline=True)
+            print()
     elif kind == "response_cancelled":
         sys.stdout.flush()
         detail = ""

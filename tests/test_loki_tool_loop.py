@@ -2142,6 +2142,26 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         self.assertIn("model-a: from first", text)
         self.assertIn("model-b: from second", text)
 
+    def test_resume_renderer_shows_provider_notice_without_assistant_text(
+            self):
+        event = formats.model_response_event(
+            formats.OPENAI_RESPONSES,
+            [],
+            protocol_data={
+                "loki": {
+                    "provider_notices": [
+                        formats.TRUSTED_ACCESS_FOR_CYBER,
+                    ],
+                },
+            },
+        )
+
+        text = loki.ResumeTranscriptRenderer(
+            assistant_label="Assistant").render([event])
+
+        self.assertIn("Trusted Access", text)
+        self.assertNotIn("Assistant:", text)
+
     def test_resume_renderer_shows_provider_result_content_and_failures(self):
         items = [
             formats.model_response_event(
@@ -5092,6 +5112,10 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
                 async def response_body():
                     yield (
+                        b'data: {"type":"response.metadata","metadata":{'
+                        b'"openai_verification_recommendation":['
+                        b'"trusted_access_for_cyber",'
+                        b'"trusted_access_for_cyber"]}}\n\n'
                         b'data: {"type":"response.completed",'
                         b'"headers":{"OpenAI-Model":"top-level-model"},'
                         b'"response":{"id":"response_1",'
@@ -5124,6 +5148,10 @@ class RequestTimeCredentialTests(unittest.TestCase):
                     ))
 
                 self.assertEqual(turn.metadata["model"], expected)
+                self.assertEqual(
+                    formats.provider_notice_codes(turn),
+                    (formats.TRUSTED_ACCESS_FOR_CYBER,),
+                )
 
     def test_public_responses_ignore_subscription_model_header(self):
         loki.apply_runtime_config(loki.make_runtime_config(
@@ -6167,6 +6195,60 @@ class StreamingToolLoopTests(unittest.TestCase):
 
 
 class ResponsesToolLoopTests(unittest.TestCase):
+    def test_provider_notice_is_saved_and_emitted_but_not_model_input(self):
+        transcript = [formats.message_item("user", "hello")]
+        events = []
+        turn = formats.DecodedTurn(
+            [formats.message_item("assistant", "answer")],
+            {
+                "protocol": formats.OPENAI_RESPONSES,
+                "protocol_data": {
+                    "loki": {
+                        "provider_notices": [
+                            formats.TRUSTED_ACCESS_FOR_CYBER,
+                        ],
+                    },
+                },
+            },
+        )
+
+        async def chat_fn(items, *, codex_turn_state):
+            return turn
+
+        result = asyncio.run(loki.run_tool_loop_async(
+            transcript,
+            chat_fn=chat_fn,
+            on_event=events.append,
+        ))
+
+        self.assertEqual(result, "answer")
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["provider_notice", "assistant_message"],
+        )
+        self.assertEqual(
+            formats.provider_notice_codes(transcript[1]),
+            (formats.TRUSTED_ACCESS_FOR_CYBER,),
+        )
+        _instructions, projected = (
+            formats.items_to_openai_responses_parts(transcript))
+        self.assertNotIn(
+            formats.TRUSTED_ACCESS_FOR_CYBER,
+            json.dumps(projected),
+        )
+
+    def test_terminal_provider_notice_is_not_labeled_as_assistant(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            terminal_frontend._terminal_agent_event({
+                "type": "provider_notice",
+                "code": formats.TRUSTED_ACCESS_FOR_CYBER,
+            })
+
+        rendered = output.getvalue()
+        self.assertIn("Trusted Access", rendered)
+        self.assertNotIn("Assistant:", rendered)
+
     def test_toolless_helper_receives_distinct_explicit_turn_state(self):
         outer_states = []
         inner_states = []
