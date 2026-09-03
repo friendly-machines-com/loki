@@ -10,15 +10,22 @@
              ((guix licenses) #:prefix license:)
              (gnu packages python-build))
 
+(define %source-directory
+  (dirname (current-filename)))
+
+(define %git-file?
+  (git-predicate %source-directory))
+
 (package
   (name "loki")
   (version "0.1.0")
-  (source (local-file (dirname (current-filename))
+  (source (local-file %source-directory
                       "loki-checkout"
                        #:recursive? #t 
                        #:select?
                        (lambda (file stat)
-                         (and ((git-predicate (dirname (current-filename))) file stat)
+                         (and (or (not %git-file?)
+                                  (%git-file? file stat))
                               (not (string-suffix? ".scm" file))))))
   (build-system pyproject-build-system)
   (arguments
