@@ -436,6 +436,8 @@ class FrontWorkerTests(unittest.TestCase):
                 self.assertEqual(reply["result"]["protocolVersion"], 1)
                 self.assertEqual(
                     reply["result"]["agentInfo"]["name"], "loki")
+                self.assertEqual(
+                    reply["result"]["agentInfo"]["version"], "0.1.0")
                 capabilities = reply["result"]["agentCapabilities"]
                 self.assertEqual(
                     capabilities["sessionCapabilities"]["close"], {})

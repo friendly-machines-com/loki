@@ -16,7 +16,7 @@ import os
 import sys
 import uuid
 
-from . import acps, credential_supervisors, savefiles
+from . import __version__, acps, credential_supervisors, savefiles
 from .connections import (
     ConnectionDescriptor,
     ConnectionDescriptorError,
@@ -26,7 +26,11 @@ from .credentials import CredentialStore
 from .loki import CHAT_LOG_DIR
 
 PROTOCOL_VERSION = 1
-AGENT_INFO = {"name": "loki", "title": "Loki", "version": "0.1"}
+AGENT_INFO = {
+    "name": "loki",
+    "title": "Loki",
+    "version": __version__,
+}
 
 SESSION_METHODS = (
     "session/prompt",
