@@ -211,8 +211,22 @@ def _openai_subscription_model_entries(response):
 
         # Codex distinguishes picker-visible models from hidden compatibility
         # entries. Loki likewise offers only "list" entries, and only models
-        # that explicitly support text (or omit the legacy modality field).
+        # that use the regular Responses contract. Responses-Lite and special
+        # tool modes require different request/tool framing; advertising them
+        # before Loki implements that framing would make selection succeed but
+        # the first model request fail or silently lose its tools.
         if model.get("visibility") != "list":
+            continue
+        responses_lite = model.get("use_responses_lite", False)
+        if not isinstance(responses_lite, bool):
+            raise ValueError(
+                f"OpenAI subscription model {slug!r} has invalid "
+                "Responses-Lite metadata")
+        tool_mode = model.get("tool_mode")
+        if tool_mode is not None and not isinstance(tool_mode, str):
+            raise ValueError(
+                f"OpenAI subscription model {slug!r} has invalid tool mode")
+        if responses_lite or tool_mode is not None:
             continue
         modalities = model.get("input_modalities")
         if modalities is not None:

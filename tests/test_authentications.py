@@ -62,7 +62,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             auth.OPENAI_CHATGPT_MODELS_REQUEST_URL,
             "https://chatgpt.com/backend-api/codex/models"
-            "?client_version=0.1.0",
+            "?client_version=0.124.0",
         )
         for url in auth.OPENAI_CHATGPT_AUTHORIZED_URLS:
             auth.validate_authorization_target(spec, url)

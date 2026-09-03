@@ -576,6 +576,20 @@ class CatalogNormalizationTests(unittest.TestCase):
                     "visibility": "list",
                     "input_modalities": ["audio"],
                 },
+                {
+                    "slug": "responses-lite",
+                    "display_name": "Responses Lite",
+                    "visibility": "list",
+                    "input_modalities": ["text"],
+                    "use_responses_lite": True,
+                },
+                {
+                    "slug": "special-tool-mode",
+                    "display_name": "Special Tool Mode",
+                    "visibility": "list",
+                    "input_modalities": ["text"],
+                    "tool_mode": "code_mode_only",
+                },
             ],
         }
 
