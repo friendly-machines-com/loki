@@ -30,8 +30,7 @@ class PendingSessionOpen:
 
     runtime_config: loki.RuntimeConfig | None
     connection_update: object
-    replay: bool
-    resumed: bool
+    open_method: str
 
 
 class TurnFailure(Exception):
@@ -278,21 +277,26 @@ class Worker:
             )
         self.session_id = session_id
 
-        resume = params.get("resume")
+        open_method = params.get("openMethod")
+        if open_method not in (
+                "session/new", "session/load", "session/resume"):
+            raise acps.TransportError(
+                f"unsupported session opening method {open_method!r}",
+                code=acps.INVALID_PARAMS,
+            )
         saved_descriptor = None
         connection_update = _UNCHANGED
-        if resume:
-            if (not isinstance(resume, str)
-                    or os.path.basename(resume) != resume):
+        if open_method != "session/new":
+            if os.path.basename(session_id) != session_id:
                 raise acps.TransportError(
                     "saved session id must be a local chat-log name",
                     code=acps.INVALID_PARAMS,
                 )
             path = os.path.join(
-                loki.CHAT_LOG_DIR, loki.chat_log_filename(resume))
+                loki.CHAT_LOG_DIR, loki.chat_log_filename(session_id))
             if not os.path.isfile(path):
                 raise acps.TransportError(
-                    f"no saved session named {resume!r}",
+                    f"no saved session named {session_id!r}",
                     code=acps.INVALID_PARAMS,
                 )
             try:
@@ -302,9 +306,26 @@ class Worker:
             except (OSError, ValueError, formats.TranscriptFormatError,
                     ConnectionDescriptorError) as error:
                 raise acps.TransportError(
-                    f"could not load saved session {resume!r}: {error}",
+                    f"could not load saved session {session_id!r}: {error}",
                     code=acps.INVALID_PARAMS,
                 ) from error
+            saved_cwd = self.session.session_state.get("shell_cwd")
+            try:
+                same_cwd = (
+                    isinstance(saved_cwd, str)
+                    and os.path.isabs(saved_cwd)
+                    and os.path.samefile(saved_cwd, cwd)
+                )
+            except (OSError, ValueError):
+                same_cwd = False
+            if not same_cwd:
+                # Loading and resuming continue one conversation; cwd is part
+                # of that identity, not permission to relocate it. Directory
+                # identity accepts equivalent symlink spellings safely.
+                raise acps.TransportError(
+                    "restored session cwd does not match its saved cwd",
+                    code=acps.INVALID_PARAMS,
+                )
             self.session.shell_cwd = cwd
         else:
             self.session.shell_cwd = cwd
@@ -364,8 +385,9 @@ class Worker:
         self._pending_open = PendingSessionOpen(
             runtime_config=runtime_config,
             connection_update=connection_update,
-            replay=bool(params.get("replay")),
-            resumed=bool(resume),
+            # Authorization separates prepare from commit, so the exact ACP
+            # method must remain explicit until replay can safely occur.
+            open_method=open_method,
         )
         result = {}
         if authorization_descriptor is not None:
@@ -389,7 +411,9 @@ class Worker:
             else:
                 loki.set_session_connection(pending.connection_update)
             loki.save_chat_log()
-        if pending.replay and pending.resumed:
+        # ACP load reconstructs the client's view; resume reconstructs only
+        # the agent's context and must not emit historical session updates.
+        if pending.open_method == "session/load":
             self._replay_transcript()
         return {"configOptions": self.config_options()}
 

@@ -38,6 +38,11 @@ SESSION_METHODS = (
     "session/set_config_option",
 )
 
+RESTORE_METHODS = (
+    "session/load",
+    "session/resume",
+)
+
 WORKER_COMMAND = [sys.argv[0], "--worker"]
 
 
@@ -188,7 +193,6 @@ class Front:
         self.credential_broker = self.credential_supervisor.broker
         self.workers: dict[str, WorkerChannel] = {}
         self._opening_sessions: set[str] = set()
-        self._next_worker_id = 0
         self._tasks: set[asyncio.Task] = set()
         self._client_requests: dict[str, asyncio.Future] = {}
         self._next_client_request_id = 0
@@ -232,7 +236,7 @@ class Front:
         if request_id is None and method not in (
                 "session/cancel", "session/close"):
             return
-        if method in ("session/prompt", "session/load"):
+        if method == "session/prompt" or method in RESTORE_METHODS:
             # The transport loop must remain free to route cancellation and
             # responses to reverse requests such as elicitation/create.
             self._start_task(
@@ -286,9 +290,9 @@ class Front:
             return self.initialize(params)
         if method == "session/new":
             return await self.new_session(params)
-        if method == "session/load":
-            return await self.load_session(
-                params, request_id=request_id)
+        if method in RESTORE_METHODS:
+            return await self.restore_session(
+                method, params, request_id=request_id)
         if method == "session/list":
             return self.list_sessions(params)
         if method == "session/close":
@@ -324,6 +328,7 @@ class Front:
                 },
                 "sessionCapabilities": {
                     "list": {},
+                    "resume": {},
                     "close": {},
                 },
             },
@@ -361,10 +366,10 @@ class Front:
 
     async def _authorize_saved_connection(
             self, descriptor: ConnectionDescriptor,
-            load_request_id) -> None:
+            restore_request_id) -> None:
         if not self._client_supports_form_elicitation:
             raise acps.TransportError(
-                "loading a saved network connection requires an ACP "
+                "restoring a saved network connection requires an ACP "
                 "client with form elicitation support",
                 code=acps.INVALID_PARAMS,
             )
@@ -373,9 +378,9 @@ class Front:
             for label, value in connection_display_fields(descriptor)
         )
         result = await self._request_client("elicitation/create", {
-            # session/load has not committed a session yet, so ACP requires
-            # request scope rather than a fabricated active session scope.
-            "requestId": load_request_id,
+            # A restore has not committed a session yet, so ACP requires
+            # request scope rather than a fabricated active-session scope.
+            "requestId": restore_request_id,
             "mode": "form",
             "message": (
                 "Authorize Loki to use this saved connection?\n" + facts),
@@ -410,7 +415,7 @@ class Front:
 
     @staticmethod
     def _working_directory(params: dict) -> str:
-        cwd = params.get("cwd") or os.getcwd()
+        cwd = params.get("cwd")
         if not isinstance(cwd, str) or not os.path.isabs(cwd):
             raise acps.TransportError(
                 "session cwd must be an absolute path",
@@ -449,12 +454,10 @@ class Front:
                 code=acps.INVALID_PARAMS,
             )
 
-    async def _open_worker(self, *, cwd: str, resume=None,
+    async def _open_worker(self, *, cwd: str, open_method: str,
                            session_id: str | None = None,
-                           replay: bool = False,
-                           load_request_id=None) -> tuple[str, dict]:
+                           restore_request_id=None) -> tuple[str, dict]:
         if session_id is None:
-            self._next_worker_id += 1
             session_id = f"loki-{uuid.uuid4()}"
         if (session_id in self.workers
                 or session_id in self._opening_sessions):
@@ -494,8 +497,7 @@ class Front:
                 {
                     "sessionId": session_id,
                     "cwd": cwd,
-                    "resume": resume,
-                    "replay": replay,
+                    "openMethod": open_method,
                 },
             )
             raw_descriptor = (prepared or {}).get(
@@ -509,7 +511,7 @@ class Front:
                         f"worker returned an invalid connection: {error}"
                     ) from error
                 await self._authorize_saved_connection(
-                    descriptor, load_request_id)
+                    descriptor, restore_request_id)
             reply = await channel.request("session/commit_open", {})
             # Publication is the commit point. Before this assignment no
             # prompt, config change, or close request can reach the worker.
@@ -523,31 +525,34 @@ class Front:
             self._opening_sessions.discard(session_id)
 
     async def new_session(self, params: dict) -> dict:
-        # session/new is intentionally fresh.  Resumption has its own
-        # session/load operation and cannot accidentally alias an old log.
+        # session/new is intentionally fresh. Restoration has separate
+        # session/load and session/resume operations and cannot alias this.
         self._validate_session_setup(params)
         session_id, worker_reply = await self._open_worker(
-            cwd=self._working_directory(params))
+            cwd=self._working_directory(params),
+            open_method="session/new",
+        )
         result = {"sessionId": session_id}
         config_options = worker_reply.get("configOptions")
         if config_options:
             result["configOptions"] = config_options
         return result
 
-    async def load_session(self, params: dict, request_id=None) -> dict:
+    async def restore_session(
+            self, method: str, params: dict, request_id=None) -> dict:
+        """Restore one saved session with the method's ACP replay semantics."""
         saved_id = params.get("sessionId")
         if not isinstance(saved_id, str) or not saved_id:
             raise acps.TransportError(
-                "session/load requires sessionId",
+                f"{method} requires sessionId",
                 code=acps.INVALID_PARAMS,
             )
         self._validate_session_setup(params)
         _, worker_reply = await self._open_worker(
             cwd=self._working_directory(params),
-            resume=saved_id,
+            open_method=method,
             session_id=saved_id,
-            replay=params.get("replay", True) is not False,
-            load_request_id=request_id,
+            restore_request_id=request_id,
         )
         result = {}
         config_options = worker_reply.get("configOptions")
