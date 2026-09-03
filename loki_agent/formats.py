@@ -309,6 +309,12 @@ def tool_call_name(item):
 
 
 def tool_call_input(item):
+    if item.get("tool_kind", "function") == "custom":
+        raw = item.get("arguments", "")
+        if not isinstance(raw, str):
+            raise TranscriptFormatError(
+                "custom tool input must be a string")
+        return raw
     if "input" in item:
         return _copy(item["input"])
     raw = item.get("arguments", "{}")
@@ -324,7 +330,7 @@ def is_app_tool_call(item):
         isinstance(item, dict)
         and item.get("type") == "function_call"
         and item.get("execution", "client") == "client"
-        and item.get("tool_kind", "function") == "function"
+        and item.get("tool_kind", "function") in ["function", "custom"]
     )
 
 
@@ -1176,12 +1182,23 @@ def _responses_message_item(item):
 
 
 def _responses_call(item):
-    raw = item.get("arguments", "{}")
-    _, parse_error = _parse_json_arguments(raw)
+    custom = item.get("type") == "custom_tool_call"
+    if custom:
+        raw = item.get("input", "")
+        if not isinstance(raw, str):
+            raise TranscriptFormatError(
+                "OpenAI Responses custom tool input must be a string")
+        parse_error = None
+    else:
+        raw = item.get("arguments", "{}")
+        _, parse_error = _parse_json_arguments(raw)
+    known = {
+        "type", "call_id", "name", "status",
+        "input" if custom else "arguments",
+    }
     native = {
         key: value for key, value in item.items()
-        if key not in [
-            "type", "call_id", "name", "arguments", "status"]
+        if key not in known
     }
     native["native_type"] = item.get("type")
     return tool_call_item(
@@ -1191,9 +1208,7 @@ def _responses_call(item):
             raw if isinstance(raw, str) else _json_arguments(raw)),
         parse_error=parse_error,
         status=item.get("status"),
-        tool_kind=(
-            "custom" if item.get("type") == "custom_tool_call"
-            else "function"),
+        tool_kind="custom" if custom else "function",
         protocol_data={OPENAI_RESPONSES: native},
     )
 

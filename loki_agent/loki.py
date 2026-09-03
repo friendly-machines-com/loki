@@ -886,9 +886,19 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
     registry = {}
     seen = set()
     for tool in tools:
-        function = tool.get("function", {})
-        name = function.get("name")
-        parameters = function.get("parameters")
+        tool_kind = tool.get("type")
+        if tool_kind == "function":
+            function = tool.get("function", {})
+            name = function.get("name")
+            parameters = function.get("parameters")
+        elif tool_kind == "custom":
+            name = tool.get("name")
+            # A Responses custom tool receives one opaque freeform string.
+            # Its optional wire-level grammar constrains model generation,
+            # while Loki's runtime boundary only needs to enforce that type.
+            parameters = {"type": "string"}
+        else:
+            continue
         if not name or parameters is None:
             continue
         if name in seen:
@@ -905,6 +915,7 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
             raise ToolSchemaError(f"tool {name} has neither handler nor async_handler")
         registry[name] = {
             "definition": tool,
+            "tool_kind": tool_kind,
             "schema": parameters,
             "semantics": copy.deepcopy(
                 handler.get("semantics", {})),
@@ -2392,6 +2403,20 @@ async def execute_tool_call_async(
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
         result = _tool_result(False, f"Unknown function: {fn_name}")
+        on_event({
+            "type": "tool_rejected",
+            "name": fn_name,
+            "call_id": call_id,
+            "args": _raw_tool_arguments(call),
+        })
+        return result, None
+    call_kind = call.get("tool_kind", "function")
+    if call_kind != spec.get("tool_kind", "function"):
+        result = _tool_result(
+            False,
+            f"Tool {fn_name} was called as {call_kind}, but it is "
+            f"registered as {spec.get('tool_kind', 'function')}.",
+        )
         on_event({
             "type": "tool_rejected",
             "name": fn_name,

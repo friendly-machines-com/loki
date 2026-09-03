@@ -611,6 +611,60 @@ class SameProtocolReplayTests(unittest.TestCase):
                 "output": [],
             })
 
+    def test_responses_custom_tool_call_preserves_freeform_input(self):
+        output = {
+            "type": "custom_tool_call",
+            "id": "custom_1",
+            "call_id": "call_1",
+            "name": "exec",
+            "input": "echo one && echo two",
+            "status": "completed",
+        }
+        turn = formats.openai_responses_response_to_items({
+            "object": "response",
+            "status": "completed",
+            "output": [output],
+        })
+
+        calls = formats.response_tool_calls(turn)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool_kind"], "custom")
+        self.assertEqual(
+            formats.tool_call_input(calls[0]),
+            "echo one && echo two",
+        )
+        result = formats.tool_result_for_call(
+            calls[0], "command output")
+        _instructions, replay = (
+            formats.items_to_openai_responses_parts([
+                turn.to_event(),
+                result,
+            ]))
+        self.assertEqual(replay, [
+            output,
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": "command output",
+            },
+        ])
+
+    def test_responses_custom_tool_call_rejects_non_string_input(self):
+        with self.assertRaisesRegex(
+                formats.TranscriptFormatError,
+                "custom tool input must be a string"):
+            formats.openai_responses_response_to_items({
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "exec",
+                    "input": {"command": "echo wrong wire type"},
+                }],
+            })
+
     def test_native_replay_requires_the_originating_connection(self):
         event = formats.model_response_event(
             formats.OPENAI_RESPONSES,

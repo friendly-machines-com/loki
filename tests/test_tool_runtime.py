@@ -591,6 +591,61 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
                 ))
         return result, execution, dispatched, events
 
+    def test_custom_tool_executes_with_opaque_string_input(self):
+        received = []
+
+        def execute(input_text):
+            received.append(input_text)
+            return "custom result"
+
+        registry = loki._build_tool_registry(
+            [{
+                "type": "custom",
+                "name": "exec",
+                "description": "Execute freeform input.",
+            }],
+            {"exec": {"handler": execute}},
+        )
+        call = formats.openai_responses_response_to_items({
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "exec",
+                "input": "echo custom",
+            }],
+        }).items[0]
+
+        with mock.patch.object(loki, "TOOL_REGISTRY", registry):
+            result, _execution = asyncio.run(
+                loki.execute_tool_call_async(
+                    call,
+                    hook_pipeline=tool_runtime.ToolHookPipeline(),
+                ))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content"], "custom result")
+        self.assertEqual(received, ["echo custom"])
+
+    def test_custom_call_cannot_enter_function_handler(self):
+        call = formats.tool_call_item(
+            "call_1",
+            "Bash",
+            raw_arguments="id",
+            tool_kind="custom",
+        )
+
+        result, execution = asyncio.run(
+            loki.execute_tool_call_async(
+                call,
+                hook_pipeline=tool_runtime.ToolHookPipeline(),
+            ))
+
+        self.assertFalse(result["ok"])
+        self.assertIsNone(execution)
+        self.assertIn("registered as function", result["content"])
+
     def test_repaired_call_executes_effective_args_but_keeps_original(self):
         call = formats.tool_call_item(
             "call_repair",
