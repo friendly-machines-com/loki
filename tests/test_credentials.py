@@ -5,7 +5,10 @@ import sys
 import unittest
 
 from loki_agent import openai_models
-from loki_agent.authentications import CredentialRef
+from loki_agent.authentications import (
+    CredentialRef,
+    OPENAI_CHATGPT_MODELS_REQUEST_URL,
+)
 from loki_agent.connections import (
     ConnectionDescriptor,
     ConnectionDescriptorError,
@@ -357,7 +360,8 @@ class ConnectionDescriptorTests(unittest.TestCase):
             chat_url="https://openrouter.ai/api/v1/chat/completions",
             models_url="https://openrouter.ai/api/v1/models",
             protocol="openai_chat",
-            credential_env="OPENROUTER_API_KEY",
+            credential_ref=CredentialRef.environment(
+                "OPENROUTER_API_KEY"),
             model_status="deprecated",
             prompt_cache=True,
         )
@@ -389,7 +393,12 @@ class ConnectionDescriptorTests(unittest.TestCase):
             descriptor.chat_url,
             "https://openrouter.ai/api/v1/chat/completions",
         )
+        self.assertEqual(
+            descriptor.credential_ref,
+            CredentialRef.environment("OPENROUTER_API_KEY"),
+        )
         self.assertNotIn("api_url", descriptor.to_dict())
+        self.assertNotIn("credential_env", descriptor.to_dict())
         self.assertIsNone(descriptor.model_status)
 
     def test_credentialless_connection_round_trips_explicit_null(self):
@@ -400,16 +409,30 @@ class ConnectionDescriptorTests(unittest.TestCase):
             chat_url="http://localhost:8000/v1/chat/completions",
             models_url="http://localhost:8000/v1/models",
             protocol="openai_chat",
-            credential_env=None,
             stream=True,
         )
 
         encoded = descriptor.to_dict()
 
-        self.assertIn("credential_env", encoded)
-        self.assertIsNone(encoded["credential_env"])
+        self.assertNotIn("credential_env", encoded)
+        self.assertIsNone(encoded["credential"])
         self.assertIs(encoded["stream"], True)
         self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
+
+    def test_legacy_and_current_credential_identities_must_agree(self):
+        with self.assertRaisesRegex(
+                ConnectionDescriptorError, "credential.*disagree"):
+            ConnectionDescriptor.from_dict({
+                "model": "model",
+                "chat_url": "https://example.test/v1/chat/completions",
+                "models_url": "https://example.test/v1/models",
+                "protocol": "openai_chat",
+                "credential_env": "OLD_API_KEY",
+                "credential": {
+                    "kind": "env",
+                    "name": "NEW_API_KEY",
+                },
+            })
 
     def test_subscription_connection_preserves_authentication_policy(self):
         descriptor = ConnectionDescriptor(
@@ -417,9 +440,8 @@ class ConnectionDescriptorTests(unittest.TestCase):
             provider_name="OpenAI ChatGPT subscription",
             model="gpt-5-codex",
             chat_url="https://chatgpt.com/backend-api/codex/responses",
-            models_url=None,
+            models_url=OPENAI_CHATGPT_MODELS_REQUEST_URL,
             protocol="openai_responses",
-            credential_env=None,
             credential_ref=CredentialRef.openai_subscription(),
             auth_scheme="openai-subscription",
             stream=True,
@@ -461,12 +483,6 @@ class ConnectionDescriptorTests(unittest.TestCase):
                 "protocol": "openai_chat",
                 "credential_env": "EXAMPLE_API_KEY",
                 "model_status": False,
-            })
-        with self.assertRaises(ConnectionDescriptorError):
-            ConnectionDescriptor.from_dict({
-                "model": "x",
-                "chat_url": "https://example.test/v1/chat/completions",
-                "protocol": "openai_chat",
             })
         with self.assertRaises(ConnectionDescriptorError):
             ConnectionDescriptor.from_dict({

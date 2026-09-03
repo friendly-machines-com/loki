@@ -850,7 +850,9 @@ class RuntimeConfigTests(unittest.TestCase):
             chat_url="https://openrouter.ai/api/v1/chat/completions",
             models_url="https://openrouter.ai/api/v1/models",
             protocol=protocols.OPENAI_CHAT,
-            credential_env="OPENROUTER_API_KEY",
+            credential_ref=(
+                authentications.CredentialRef.environment(
+                    "OPENROUTER_API_KEY")),
             model_status="deprecated",
         )
         with self.assertRaisesRegex(
@@ -893,9 +895,9 @@ class RuntimeConfigTests(unittest.TestCase):
             provider_name="OpenAI ChatGPT subscription",
             model="gpt-5-codex",
             chat_url="https://chatgpt.com/backend-api/codex/responses",
-            models_url=None,
+            models_url=(
+                authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL),
             protocol=protocols.OPENAI_RESPONSES,
-            credential_env=None,
             credential_ref=credential,
             auth_scheme="openai-subscription",
             stream=True,
@@ -928,7 +930,6 @@ class RuntimeConfigTests(unittest.TestCase):
             chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
             models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
             protocol=protocols.OPENAI_RESPONSES,
-            credential_env=None,
             credential_ref=credential,
             auth_scheme="openai-subscription",
             openai_request_profile=_codex_model(
@@ -968,7 +969,6 @@ class RuntimeConfigTests(unittest.TestCase):
             chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
             models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
             protocol=protocols.OPENAI_RESPONSES,
-            credential_env=None,
             credential_ref=credential,
             auth_scheme="openai-subscription",
             openai_request_profile=_codex_model(),
@@ -1052,7 +1052,6 @@ class RuntimeConfigTests(unittest.TestCase):
             chat_url="https://attacker.example/v1/responses",
             models_url=None,
             protocol=protocols.OPENAI_RESPONSES,
-            credential_env=None,
             credential_ref=credential,
             auth_scheme="openai-subscription",
             openai_request_profile=_codex_model("gpt-test"),
@@ -1073,7 +1072,9 @@ class RuntimeConfigTests(unittest.TestCase):
             chat_url="https://provider.example.test/v1/responses",
             models_url=None,
             protocol=protocols.OPENAI_RESPONSES,
-            credential_env="PROVIDER_API_KEY",
+            credential_ref=(
+                authentications.CredentialRef.environment(
+                    "PROVIDER_API_KEY")),
             auth_scheme="bearer",
         )
 
@@ -1097,7 +1098,6 @@ class RuntimeConfigTests(unittest.TestCase):
             chat_url="http://localhost:8000/v1/chat/completions",
             models_url="http://localhost:8000/v1/models",
             protocol=protocols.OPENAI_CHAT,
-            credential_env=None,
             stream=True,
         )
 
@@ -1118,7 +1118,6 @@ class RuntimeConfigTests(unittest.TestCase):
             chat_url="https://compatible.example/v1/messages",
             models_url="https://compatible.example/v1/models",
             protocol=protocols.ANTHROPIC_MESSAGES,
-            credential_env=None,
             prompt_cache=True,
         )
 
@@ -1383,7 +1382,6 @@ class ModelLoadingTests(unittest.TestCase):
             chat_url="http://localhost:8000/v1/chat/completions",
             models_url="http://localhost:8000/v1/models",
             protocol=protocols.OPENAI_CHAT,
-            credential_env=None,
             stream=True,
         )
 
@@ -1686,7 +1684,7 @@ class ModelLoadingTests(unittest.TestCase):
             connection["chat_url"],
             "http://localhost:8000/v1/chat/completions",
         )
-        self.assertIsNone(connection["credential_env"])
+        self.assertIsNone(connection["credential"])
         self.assertIsNone(loki.current_config().auth_spec)
         self.assertNotIn(
             "Authorization",
@@ -1770,7 +1768,6 @@ class SubscriptionResumeTests(unittest.TestCase):
             chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
             models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
             protocol=protocols.OPENAI_RESPONSES,
-            credential_env=None,
             credential_ref=credential,
             auth_scheme="openai-subscription",
             stream=True,
@@ -4012,7 +4009,10 @@ class ShellCwdTests(unittest.TestCase):
 
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["provider_id"], "openrouter")
-        self.assertEqual(connection["credential_env"], "OPENROUTER_API_KEY")
+        self.assertEqual(
+            connection["credential"],
+            {"kind": "env", "name": "OPENROUTER_API_KEY"},
+        )
         self.assertEqual(connection["model_status"], "deprecated")
         self.assertNotIn("api_url", connection)
         self.assertEqual(
@@ -4047,7 +4047,7 @@ class ShellCwdTests(unittest.TestCase):
 
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["model"], "local-model")
-        self.assertIsNone(connection["credential_env"])
+        self.assertIsNone(connection["credential"])
         self.assertTrue(connection["stream"])
         self.assertEqual(
             connection["chat_url"],
@@ -4072,7 +4072,9 @@ class ShellCwdTests(unittest.TestCase):
                     chat_url="https://openrouter.ai/api/v1/chat/completions",
                     models_url="https://openrouter.ai/api/v1/models",
                     protocol=protocols.OPENAI_CHAT,
-                    credential_env="OPENROUTER_API_KEY",
+                    credential_ref=(
+                        authentications.CredentialRef.environment(
+                            "OPENROUTER_API_KEY")),
                 )
                 blob = formats.new_log_blob(
                     loki.initial_transcript_items(), [])
@@ -4117,7 +4119,9 @@ class ShellCwdTests(unittest.TestCase):
                     chat_url="https://openrouter.ai/api/v1/chat/completions",
                     models_url="https://openrouter.ai/api/v1/models",
                     protocol=protocols.OPENAI_CHAT,
-                    credential_env="OPENROUTER_API_KEY",
+                    credential_ref=(
+                        authentications.CredentialRef.environment(
+                            "OPENROUTER_API_KEY")),
                 )
                 blob = formats.new_log_blob(
                     loki.initial_transcript_items(), [])
@@ -4164,7 +4168,9 @@ class ShellCwdTests(unittest.TestCase):
                     chat_url="https://saved.example/v1/chat/completions",
                     models_url="https://saved.example/v1/models",
                     protocol=protocols.OPENAI_CHAT,
-                    credential_env="SAVED_API_KEY",
+                    credential_ref=(
+                        authentications.CredentialRef.environment(
+                            "SAVED_API_KEY")),
                 )
                 blob = formats.new_log_blob(
                     loki.initial_transcript_items(), [])
@@ -4274,7 +4280,9 @@ class ShellCwdTests(unittest.TestCase):
                     chat_url="https://old.example/v1/chat/completions",
                     models_url="https://old.example/v1/models",
                     protocol=protocols.OPENAI_CHAT,
-                    credential_env="OLD_API_KEY",
+                    credential_ref=(
+                        authentications.CredentialRef.environment(
+                            "OLD_API_KEY")),
                 )
                 blob = formats.new_log_blob(
                     loki.initial_transcript_items(), [])
@@ -4329,7 +4337,9 @@ class ShellCwdTests(unittest.TestCase):
             chat_url="https://openrouter.ai/api/v1/chat/completions",
             models_url="https://openrouter.ai/api/v1/models",
             protocol=protocols.OPENAI_CHAT,
-            credential_env="OPENROUTER_API_KEY",
+            credential_ref=(
+                authentications.CredentialRef.environment(
+                    "OPENROUTER_API_KEY")),
         )
 
         class FakeSession:
@@ -4390,7 +4400,6 @@ class ShellCwdTests(unittest.TestCase):
             chat_url="http://localhost:8000/v1/chat/completions",
             models_url="http://localhost:8000/v1/models",
             protocol=protocols.OPENAI_CHAT,
-            credential_env=None,
             stream=True,
         )
 

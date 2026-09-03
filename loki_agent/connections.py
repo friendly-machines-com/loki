@@ -35,7 +35,6 @@ class ConnectionDescriptor:
     chat_url: str
     models_url: str | None
     protocol: str
-    credential_env: str | None
     credential_ref: CredentialRef | None = None
     max_tokens: int = 4096
     anthropic_version: str = "2023-06-01"
@@ -48,15 +47,6 @@ class ConnectionDescriptor:
         openai_models.CodexModelRequestProfile | None) = None
 
     def __post_init__(self):
-        environment_ref = (
-            CredentialRef.environment(self.credential_env)
-            if self.credential_env is not None else None)
-        if self.credential_ref is None and environment_ref is not None:
-            object.__setattr__(self, "credential_ref", environment_ref)
-        elif (environment_ref is not None
-              and self.credential_ref != environment_ref):
-            raise ConnectionDescriptorError(
-                "connection credential and credential_env disagree")
         subscription = (
             self.provider_id == "openai-subscription"
             and self.protocol == "openai_responses"
@@ -82,7 +72,6 @@ class ConnectionDescriptor:
             "chat_url": self.chat_url,
             "models_url": self.models_url,
             "protocol": self.protocol,
-            "credential_env": self.credential_env,
             "credential": (
                 self.credential_ref.to_dict()
                 if self.credential_ref is not None else None),
@@ -114,9 +103,9 @@ class ConnectionDescriptor:
         if not isinstance(prompt_cache, bool):
             raise ConnectionDescriptorError(
                 "connection prompt_cache must be a boolean")
-        if "credential_env" not in value:
-            raise ConnectionDescriptorError(
-                "connection credential_env must be present")
+        # credential_env was the original on-disk representation. Read it so
+        # existing chat logs remain resumable, but never write it again: a
+        # CredentialRef is the sole in-memory and current on-disk identity.
         credential_env = _optional_string(
             value.get("credential_env"), "credential_env")
         if credential_env is not None and not is_credential_name(
@@ -156,7 +145,6 @@ class ConnectionDescriptor:
             chat_url=_required_string(value.get("chat_url"), "chat_url"),
             models_url=_optional_string(value.get("models_url"), "models_url"),
             protocol=_required_string(value.get("protocol"), "protocol"),
-            credential_env=credential_env,
             credential_ref=credential_ref,
             max_tokens=max_tokens,
             anthropic_version=_required_string(

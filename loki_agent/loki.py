@@ -548,24 +548,13 @@ def config_from_connection_descriptor(
             "LOKI_PROMPT_CACHE", descriptor.prompt_cache, credentials)
         if credentials.get("LOKI_PROMPT_CACHE")
         else descriptor.prompt_cache)
-    models_url = descriptor.models_url
-    if (credential_ref
-            == authentications.CredentialRef.openai_subscription()
-            and models_url in {
-                None,
-                authentications.OPENAI_CHATGPT_MODELS_URL,
-            }):
-        # Early subscription builds persisted the derived URL without Codex's
-        # required client_version query. Normalize those saved descriptors to
-        # the canonical, authorization-allowlisted catalog request.
-        models_url = authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL
     return make_runtime_config(
         # Restore the concrete endpoint that was actually used, rather than
         # deriving it again from a catalog base URL.
         descriptor.chat_url,
         provider_kind,
         model=config_model,
-        models_url=models_url,
+        models_url=descriptor.models_url,
         max_tokens=max_tokens,
         anthropic_version=anthropic_version,
         auth_header=auth_header,
@@ -673,10 +662,6 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
     auth_spec = current_config().auth_spec
     credential_ref = (
         auth_spec.credential if auth_spec is not None else None)
-    credential_env = (
-        credential_ref.name
-        if (credential_ref is not None
-            and credential_ref.kind == "env") else None)
     provider = current_config().chat_provider
     return ConnectionDescriptor(
         provider_id=provider.provider_id,
@@ -685,7 +670,6 @@ def active_connection_descriptor() -> ConnectionDescriptor | None:
         chat_url=provider.chat_url,
         models_url=provider.models_url,
         protocol=provider.kind,
-        credential_env=credential_env,
         credential_ref=credential_ref,
         max_tokens=provider.max_tokens,
         anthropic_version=provider.headers.get(

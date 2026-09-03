@@ -1468,7 +1468,9 @@ class WorkerSessionContractTests(unittest.TestCase):
                         "https://saved.example/v1/chat/completions"),
                     models_url="https://saved.example/v1/models",
                     protocol=protocols.OPENAI_CHAT,
-                    credential_env="SAVED_API_KEY",
+                    credential_ref=(
+                        authentications.CredentialRef.environment(
+                            "SAVED_API_KEY")),
                     max_tokens=777,
                 )
                 blob = formats.new_log_blob(
