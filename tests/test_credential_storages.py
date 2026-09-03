@@ -171,6 +171,21 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                 "duplicate key"):
             self.storage.load_document()
 
+    async def test_rejects_excessively_long_json_integer(self):
+        self.storage.ensure_directory()
+        with open(
+                self.storage.file_path, "w", encoding="ascii") as stream:
+            stream.write(
+                '{"version":1,"revision":'
+                + "9" * 5000
+                + ',"credentials":{}}')
+        os.chmod(self.storage.file_path, 0o600)
+
+        with self.assertRaisesRegex(
+                credential_storages.CredentialStorageError,
+                "credential JSON is invalid"):
+            self.storage.load_document()
+
     async def test_rejects_unsupported_schema_version(self):
         self.storage.ensure_directory()
         with open(

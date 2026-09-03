@@ -289,7 +289,7 @@ class JsonCredentialStorage:
             text = data.decode("utf-8")
             value = json.loads(
                 text, object_pairs_hook=_no_duplicate_object)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (UnicodeDecodeError, ValueError) as error:
             raise CredentialStorageError(
                 f"credential JSON is invalid: {error}") from error
         return _validate_document(value)
