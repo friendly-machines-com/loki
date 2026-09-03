@@ -371,7 +371,8 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict = None,
 async def _async_http_request_once(method: str, request_url: str, *, headers_in: dict = None,
                                    body: bytes = b'', timeout: int = 30,
                                    max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
-                                   cancel_check=None) -> HttpResponse:
+                                   cancel_check=None,
+                                   on_response_headers=None) -> HttpResponse:
     # Validate and format caller-controlled URL/header data before entering
     # transport delivery tracking. A local ValueError is not a failed network
     # delivery and must remain distinguishable to callers.
@@ -403,6 +404,12 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
                 raise OSError(f"invalid HTTP status line: {status_line!r}")
             status = int(parts[1])
             reason = parts[2] if len(parts) > 2 else ''
+            if on_response_headers is not None:
+                # Some protocols mint routing state in response headers that
+                # must be used if reading this response fails and the request
+                # is retried. Report headers before consuming the body so the
+                # caller can update its per-attempt state in time.
+                on_response_headers(status, response_headers)
             transfer_encoding = response_headers.get('transfer-encoding', '').lower()
             if 'chunked' in transfer_encoding:
                 response_body, truncated = await _read_chunked_body(reader, max_bytes)
@@ -503,7 +510,9 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
                              retry_base_delay_s: float = 0.5,
                              retry_max_jitter_s: float = 0.5,
                              retry_backoff_factor: float = 2.0,
-                             cancel_check=None) -> HttpResponse:
+                             cancel_check=None,
+                             prepare_attempt_headers=None,
+                             on_response_headers=None) -> HttpResponse:
     cancel = cancel_check or (lambda: False)
     attempt = 0
     while True:
@@ -511,11 +520,18 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
             raise HttpRequestCancelled()
         attempt += 1
         try:
+            attempt_headers = dict(headers_in or {})
+            if prepare_attempt_headers is not None:
+                # Rebuild headers for every transport attempt. A response-
+                # header callback from the previous attempt may have acquired
+                # protocol state that must be replayed on this retry.
+                prepare_attempt_headers(attempt_headers)
             return await _async_http_request_once(
                 method, request_url,
-                headers_in=headers_in, body=body,
+                headers_in=attempt_headers, body=body,
                 timeout=timeout, max_bytes=max_bytes,
                 cancel_check=cancel,
+                on_response_headers=on_response_headers,
             )
         except Exception as exc:
             if attempt >= retry_max_attempts or not _is_transient(exc):

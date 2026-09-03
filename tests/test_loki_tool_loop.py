@@ -2116,7 +2116,8 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 
         async def request(
                 request_url, payload, request_headers=None,
-                report_errors=False, show_timing=False):
+                report_errors=False, show_timing=False,
+                codex_turn_state=None):
             if not queued:
                 raise AssertionError("unexpected provider request")
             captured.append({
@@ -3251,7 +3252,8 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 
                 async def fake_request(
                         request_url, payload, request_headers=None,
-                        report_errors=False, show_timing=False):
+                        report_errors=False, show_timing=False,
+                        codex_turn_state=None):
                     captured.append(copy.deepcopy(payload))
                     return {
                         "object": "response",
@@ -4721,7 +4723,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         calls = []
 
         async def request_once(
-                url, payload, headers, on_text_delta, cancel_check):
+                url, payload, headers, on_text_delta, cancel_check,
+                codex_turn_state=None):
             calls.append(dict(headers))
             if len(calls) == 1:
                 raise loki.StreamingApiError(
@@ -4749,7 +4752,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         calls = []
 
         async def request_once(
-                url, payload, headers, on_text_delta, cancel_check):
+                url, payload, headers, on_text_delta, cancel_check,
+                codex_turn_state=None):
             calls.append(dict(headers))
             if len(calls) < 3:
                 raise protocols.ResponseApiError(
@@ -4783,7 +4787,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         transcript = [formats.message_item("user", "hello")]
         events = []
 
-        async def chat_fn(items, on_text_delta):
+        async def chat_fn(
+                items, on_text_delta, *, codex_turn_state):
             raise protocols.ResponseApiError(
                 "quota exhausted",
                 code="insufficient_quota",
@@ -4826,7 +4831,12 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 request_url,
                 200,
                 "OK",
-                {"content-type": "text/event-stream"},
+                {
+                    "content-type": "text/event-stream",
+                    loki.CODEX_TURN_STATE_HEADER: (
+                        "first-state"
+                        if len(calls) == 1 else "ignored-later-state"),
+                },
                 response_body(),
             )
 
@@ -4844,6 +4854,247 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "server_error")
         self.assertEqual(len(calls), 3)
+        self.assertNotIn(
+            loki.CODEX_TURN_STATE_HEADER,
+            calls[0]["headers_in"],
+        )
+        self.assertEqual(
+            calls[1]["headers_in"][loki.CODEX_TURN_STATE_HEADER],
+            "first-state",
+        )
+        self.assertEqual(
+            calls[2]["headers_in"][loki.CODEX_TURN_STATE_HEADER],
+            "first-state",
+        )
+
+    def test_codex_turn_state_spans_followups_and_resets_next_turn(self):
+        self._install_subscription(stream=True)
+        requests = []
+        responses = [
+            (
+                "first-state",
+                [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "continuing",
+                    }],
+                }],
+                False,
+            ),
+            (
+                "ignored-later-state",
+                [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "TodoRead",
+                    "arguments": "{}",
+                }],
+                None,
+            ),
+            (
+                None,
+                [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "first turn done",
+                    }],
+                }],
+                None,
+            ),
+            (
+                "second-turn-state",
+                [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "second turn done",
+                    }],
+                }],
+                None,
+            ),
+        ]
+
+        @contextlib.asynccontextmanager
+        async def fake_http_stream(method, request_url, **kwargs):
+            requests.append(dict(kwargs["headers_in"]))
+            state, output, end_turn = responses.pop(0)
+
+            async def response_body():
+                chunks = []
+                for item in output:
+                    chunks.append(
+                        "data: "
+                        + json.dumps({
+                            "type": "response.output_item.done",
+                            "item": item,
+                        })
+                        + "\n\n"
+                    )
+                response = {
+                    "id": f"response_{len(requests)}",
+                    "status": "completed",
+                    "output": [],
+                }
+                if end_turn is not None:
+                    response["end_turn"] = end_turn
+                chunks.append(
+                    "data: "
+                    + json.dumps({
+                        "type": "response.completed",
+                        "response": response,
+                    })
+                    + "\n\n"
+                )
+                yield "".join(chunks).encode("utf-8")
+
+            headers = {"content-type": "text/event-stream"}
+            if state is not None:
+                headers[loki.CODEX_TURN_STATE_HEADER] = state
+            yield loki.http_client.HttpStreamResponse(
+                request_url, 200, "OK", headers, response_body())
+
+        transcript = [formats.message_item("user", "run tools")]
+        with mock.patch.object(
+                loki.http_client, "async_http_stream",
+                side_effect=fake_http_stream):
+            first = asyncio.run(loki.run_tool_loop_async(
+                transcript, max_loops=4))
+            transcript.append(formats.message_item(
+                "user", "start another turn"))
+            second = asyncio.run(loki.run_tool_loop_async(
+                transcript, max_loops=2))
+
+        self.assertEqual(first, "first turn done")
+        self.assertEqual(second, "second turn done")
+        self.assertEqual(responses, [])
+        self.assertEqual(
+            [
+                headers.get(loki.CODEX_TURN_STATE_HEADER)
+                for headers in requests
+            ],
+            [None, "first-state", "first-state", None],
+        )
+
+    def test_caller_cannot_supply_codex_turn_state(self):
+        self._install_subscription(stream=True)
+        observed = []
+
+        async def request_once(
+                url, payload, headers, on_text_delta, cancel_check,
+                codex_turn_state=None):
+            observed.append(dict(headers))
+            return {
+                "object": "response",
+                "status": "completed",
+                "output": [],
+            }
+
+        with mock.patch.object(
+                loki, "_async_chat_stream_request_once",
+                new=request_once):
+            asyncio.run(loki.async_chat_stream_request(
+                loki.current_config().url,
+                {"input": []},
+                request_headers={
+                    "X-Codex-Turn-State": "caller-forged",
+                },
+            ))
+
+        self.assertNotIn("X-Codex-Turn-State", observed[0])
+        self.assertNotIn(
+            loki.CODEX_TURN_STATE_HEADER, observed[0])
+
+    def test_buffered_codex_turn_state_is_replayed_then_reset(self):
+        self._install_subscription(stream=False)
+        requests = []
+        responses = [
+            (
+                "buffered-state",
+                {
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "TodoRead",
+                        "arguments": "{}",
+                    }],
+                },
+            ),
+            (
+                None,
+                {
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "buffered first done",
+                        }],
+                    }],
+                },
+            ),
+            (
+                "new-buffered-state",
+                {
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "buffered second done",
+                        }],
+                    }],
+                },
+            ),
+        ]
+
+        async def request(method, url, **kwargs):
+            attempt_headers = dict(kwargs["headers_in"])
+            kwargs["prepare_attempt_headers"](attempt_headers)
+            requests.append(attempt_headers)
+            state, response = responses.pop(0)
+            response_headers = {}
+            if state is not None:
+                response_headers[loki.CODEX_TURN_STATE_HEADER] = state
+            kwargs["on_response_headers"](200, response_headers)
+            return loki.http_client.HttpResponse(
+                url,
+                200,
+                "OK",
+                response_headers,
+                json.dumps(response).encode("utf-8"),
+            )
+
+        transcript = [formats.message_item("user", "run buffered")]
+        with mock.patch.object(
+                loki.http_client, "async_http_request", new=request):
+            first = asyncio.run(loki.run_tool_loop_async(
+                transcript, max_loops=3))
+            transcript.append(formats.message_item(
+                "user", "new buffered turn"))
+            second = asyncio.run(loki.run_tool_loop_async(
+                transcript, max_loops=2))
+
+        self.assertEqual(first, "buffered first done")
+        self.assertEqual(second, "buffered second done")
+        self.assertEqual(responses, [])
+        self.assertEqual(
+            [
+                headers.get(loki.CODEX_TURN_STATE_HEADER)
+                for headers in requests
+            ],
+            [None, "buffered-state", None],
+        )
 
     def test_static_credential_does_not_retry_a_401(self):
         credential = authentications.CredentialRef.environment(
@@ -4995,6 +5246,39 @@ class StreamingCompletionTests(unittest.TestCase):
 
         self.assertTrue(turn.complete)
         self.assertEqual(turn.items, [])
+
+    def test_public_responses_never_receive_codex_turn_state(self):
+        loki.apply_runtime_config(loki.make_runtime_config(
+            "https://api.openai.com/v1/responses",
+            protocols.OPENAI_RESPONSES,
+            model="local-model",
+            stream=True,
+        ))
+        observed = []
+
+        async def request_once(
+                url, payload, headers, on_text_delta, cancel_check,
+                codex_turn_state=None):
+            observed.append((dict(headers), codex_turn_state))
+            return {
+                "object": "response",
+                "status": "completed",
+                "output": [],
+            }
+
+        with mock.patch.object(
+                loki, "_async_chat_stream_request_once",
+                new=request_once):
+            asyncio.run(loki.async_chat_stream_request(
+                loki.current_config().url,
+                {"input": []},
+                codex_turn_state=loki.CodexTurnState(
+                    "must-not-leave-subscription"),
+            ))
+
+        self.assertIsNone(observed[0][1])
+        self.assertNotIn(
+            loki.CODEX_TURN_STATE_HEADER, observed[0][0])
 
     def test_reasoning_deltas_are_silent_and_replay_only_at_origin(self):
         deltas = []
@@ -5359,7 +5643,8 @@ class StreamingToolLoopTests(unittest.TestCase):
         transcript = [formats.message_item("user", "hello")]
         events = []
 
-        async def chat_fn(items, on_text_delta):
+        async def chat_fn(
+                items, on_text_delta, *, codex_turn_state):
             on_text_delta("hel")
             on_text_delta("lo")
             return [formats.message_item("assistant", "hello")]
@@ -5390,7 +5675,8 @@ class StreamingToolLoopTests(unittest.TestCase):
         transcript = [formats.message_item("user", "hello")]
         events = []
 
-        async def chat_fn(items, on_text_delta):
+        async def chat_fn(
+                items, on_text_delta, *, codex_turn_state):
             on_text_delta("partial")
             raise protocols.StreamProtocolError("broken stream")
 
@@ -5419,7 +5705,8 @@ class StreamingToolLoopTests(unittest.TestCase):
         transcript = [formats.message_item("user", "hello")]
         events = []
 
-        async def chat_fn(items, on_text_delta):
+        async def chat_fn(
+                items, on_text_delta, *, codex_turn_state):
             on_text_delta("partial")
             raise loki.StreamCancelled()
 
@@ -5445,12 +5732,48 @@ class StreamingToolLoopTests(unittest.TestCase):
 
 
 class ResponsesToolLoopTests(unittest.TestCase):
+    def test_toolless_helper_receives_distinct_explicit_turn_state(self):
+        outer_states = []
+        inner_states = []
+
+        async def completion(
+                items, tools=None, *, codex_turn_state, **kwargs):
+            inner_states.append(codex_turn_state)
+            codex_turn_state.capture("inner-state")
+            return formats.DecodedTurn([
+                formats.message_item("assistant", "helper result"),
+            ])
+
+        async def outer_chat(items, *, codex_turn_state):
+            outer_states.append(codex_turn_state)
+            codex_turn_state.capture("outer-state")
+            helper = await loki.run_toolless_completion_async([
+                formats.message_item("user", "helper prompt"),
+            ])
+            return formats.DecodedTurn([
+                formats.message_item("assistant", helper),
+            ])
+
+        with mock.patch.object(
+                loki, "async_chat_completion", new=completion):
+            result = asyncio.run(loki.run_tool_loop_async(
+                [formats.message_item("user", "outer prompt")],
+                chat_fn=outer_chat,
+            ))
+
+        self.assertEqual(result, "helper result")
+        self.assertEqual(len(outer_states), 1)
+        self.assertEqual(len(inner_states), 1)
+        self.assertIsNot(inner_states[0], outer_states[0])
+        self.assertEqual(inner_states[0].value, "inner-state")
+        self.assertEqual(outer_states[0].value, "outer-state")
+
     def test_function_call_only_response_executes_tool_and_continues(self):
         transcript = [formats.message_item("user", "read README")]
         seen_inputs = []
         events = []
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             seen_inputs.append([item.get("type") for item in items])
             if len(seen_inputs) == 1:
                 return formats.DecodedTurn(
@@ -5508,7 +5831,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
         dispatched = []
         response_number = 0
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             nonlocal response_number
             response_number += 1
             return formats.DecodedTurn([
@@ -5558,7 +5881,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
         records = []
         events = []
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             return formats.DecodedTurn(
                 [],
                 {
@@ -5592,7 +5915,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
         transcript = [formats.message_item("user", "hello")]
         events = []
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             return formats.DecodedTurn(
                 [],
                 {
@@ -5632,7 +5955,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
         transcript = [formats.message_item("user", "read it")]
         events = []
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             return formats.DecodedTurn(
                 [formats.tool_call_item(
                     "call_incomplete",
@@ -5682,7 +6005,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
         transcript = [formats.message_item("user", "search")]
         requests = []
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             requests.append(copy.deepcopy(items))
             if len(requests) == 1:
                 return formats.DecodedTurn(
@@ -5732,7 +6055,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
         transcript = [formats.message_item("user", "continue")]
         requests = []
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             requests.append(copy.deepcopy(items))
             if len(requests) == 1:
                 return formats.DecodedTurn(
@@ -5769,7 +6092,8 @@ class HarnessProjectionTests(unittest.TestCase):
     def test_allowed_tool_subset_is_the_only_schema_advertised(self):
         seen_tools = []
 
-        async def fake_completion(items, tools, model=None):
+        async def fake_completion(
+                items, tools, model=None, *, codex_turn_state):
             seen_tools.extend(tools)
             return formats.DecodedTurn([
                 formats.message_item("assistant", "done"),
@@ -5795,7 +6119,8 @@ class HarnessProjectionTests(unittest.TestCase):
         )
 
     def test_toolless_completion_returns_all_assistant_phases(self):
-        async def fake_completion(items, tools):
+        async def fake_completion(
+                items, tools, *, codex_turn_state):
             self.assertEqual(tools, [])
             return formats.DecodedTurn([
                 formats.message_item("assistant", "commentary"),
@@ -5817,7 +6142,7 @@ class HarnessProjectionTests(unittest.TestCase):
         records = []
         body = {"error": {"message": "full marker"}}
 
-        async def chat_fn(items):
+        async def chat_fn(items, *, codex_turn_state):
             raise loki.ApiError(
                 "https://provider.test/v1/responses",
                 429,
@@ -5895,7 +6220,7 @@ class QuestionGuardTests(unittest.TestCase):
             [formats.message_item("assistant", "because dependencies")],
         ]
 
-        async def scripted_chat(items):
+        async def scripted_chat(items, *, codex_turn_state):
             return first_calls.pop(0)
 
         asyncio.run(loki.run_tool_loop_async(
@@ -5910,7 +6235,7 @@ class QuestionGuardTests(unittest.TestCase):
             [formats.message_item("assistant", "done")],
         ]
 
-        async def scripted_chat2(items):
+        async def scripted_chat2(items, *, codex_turn_state):
             return second_calls.pop(0)
 
         before = len(transcript)

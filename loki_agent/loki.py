@@ -182,6 +182,25 @@ HTTP_RETRY_BACKOFF_FACTOR = 2.0
 # if your provider does not honor the header.
 LLM_IDEMPOTENCY_HEADER_ANTHROPIC = "anthropic-idempotency-key"
 LLM_IDEMPOTENCY_HEADER_OPENAI = "Idempotency-Key"
+CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
+
+
+@dataclass
+class CodexTurnState:
+    """Opaque sticky-routing state for one logical Codex turn.
+
+    The ChatGPT backend mints this value on the first successful response.
+    Every later sampling request in the same user turn must echo that exact
+    first value. It is deliberately neither interpreted nor persisted.
+    """
+
+    value: str | None = None
+
+    def capture(self, value):
+        # Match Codex's OnceLock semantics: absence does nothing and the first
+        # actual header value wins, even if a later response supplies another.
+        if self.value is None and isinstance(value, str):
+            self.value = value
 
 
 class ApiError(Exception):
@@ -2637,17 +2656,20 @@ def _turn_is_refusal(turn: formats.DecodedTurn) -> bool:
     return False
 
 
-async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
-                              chat_fn=None, on_event=None, cancel_check=None,
-                              stream_chat=False, report_timing=False,
-                              on_response=None,
-                              hook_pipeline=None,
-                              cancel_event: asyncio.Event | None = None) -> str:
+async def run_tool_loop_async(
+        transcript_items: list, allowed=None, max_loops=MAX_LOOP_LIMIT,
+        chat_fn=None, on_event=None, cancel_check=None,
+        stream_chat=False, report_timing=False,
+        on_response=None, hook_pipeline=None,
+        cancel_event: asyncio.Event | None = None) -> str:
     """Run the model/tool loop over canonical session events.
 
     Mutates ``transcript_items`` by appending one ``model_response`` for each
-    actual provider response and one event for each local tool result.
+    actual provider response and one event for each local tool result. The
+    callback receives ``codex_turn_state`` explicitly because it changes the
+    routing semantics of every provider request in this logical user turn.
     """
+    codex_turn_state = CodexTurnState()
     completion_cancel_check = cancel_check
     if chat_fn is None:
         advertised_tools = (
@@ -2657,12 +2679,18 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
                 if name in allowed
             ])
         if completion_cancel_check is None:
-            chat_fn = lambda items: async_chat_completion(
-                items, tools=advertised_tools)
+            chat_fn = lambda items, *, codex_turn_state: (
+                async_chat_completion(
+                    items,
+                    tools=advertised_tools,
+                    codex_turn_state=codex_turn_state))
         else:
-            chat_fn = lambda items: async_chat_completion(
-                items, tools=advertised_tools,
-                cancel_check=completion_cancel_check)
+            chat_fn = lambda items, *, codex_turn_state: (
+                async_chat_completion(
+                    items,
+                    tools=advertised_tools,
+                    cancel_check=completion_cancel_check,
+                    codex_turn_state=codex_turn_state))
     if on_event is None:
         on_event = lambda event: None
     if cancel_check is None:
@@ -2721,9 +2749,13 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
         try:
             if stream_chat:
                 response_items = await chat_fn(
-                    transcript_items, on_text_delta)
+                    transcript_items,
+                    on_text_delta,
+                    codex_turn_state=codex_turn_state)
             else:
-                response_items = await chat_fn(transcript_items)
+                response_items = await chat_fn(
+                    transcript_items,
+                    codex_turn_state=codex_turn_state)
         except StreamCancelled:
             finish_live_text(False, "cancelled")
             on_event({
@@ -2953,13 +2985,22 @@ async def run_tool_loop_async(transcript_items: list, allowed=None, max_loops=MA
 
 async def run_toolless_completion_async(
         transcript_items: list, cancel_check=None) -> str:
+    # Tool helpers such as WebFetch may run inside an outer user turn, but
+    # this completion is a distinct logical turn and therefore owns a
+    # distinct routing token passed explicitly to the request path.
+    codex_turn_state = CodexTurnState()
     try:
         if cancel_check is None:
             response_items = await async_chat_completion(
-                transcript_items, tools=[])
+                transcript_items,
+                tools=[],
+                codex_turn_state=codex_turn_state)
         else:
             response_items = await async_chat_completion(
-                transcript_items, tools=[], cancel_check=cancel_check)
+                transcript_items,
+                tools=[],
+                cancel_check=cancel_check,
+                codex_turn_state=codex_turn_state)
     except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
         return f"Transcript render error: {e}"
     except ApiError as e:
@@ -3976,13 +4017,55 @@ async def _authorized_request_headers(
     return headers, lease
 
 
+def _codex_turn_state_for_request(
+        config, request_url, supplied_state=None):
+    """Return routing state only for the authenticated Codex Responses URL."""
+    if (config is None
+            or config.provider_kind != protocols.OPENAI_RESPONSES
+            or config.auth_spec is None
+            or config.auth_spec.scheme != "openai-subscription"
+            or request_url != config.chat_provider.chat_url):
+        return None
+    if supplied_state is not None:
+        return supplied_state
+    # A direct one-off request still needs stable state across its own
+    # transport retries, even though it has no enclosing tool loop.
+    return CodexTurnState()
+
+
+def _prepare_codex_turn_headers(headers, turn_state):
+    if turn_state is None:
+        return
+    # Do not accept a caller-supplied or differently-cased stale value. The
+    # only valid token is the first value captured in this logical turn.
+    for name in list(headers):
+        if str(name).lower() == CODEX_TURN_STATE_HEADER:
+            del headers[name]
+    if turn_state.value is not None:
+        headers[CODEX_TURN_STATE_HEADER] = turn_state.value
+
+
+def _capture_codex_turn_state(headers, turn_state):
+    if turn_state is None or not isinstance(headers, dict):
+        return
+    for name, value in headers.items():
+        if str(name).lower() == CODEX_TURN_STATE_HEADER:
+            turn_state.capture(value)
+            return
+
+
 async def async_chat_request(request_url: str, payload, request_headers: dict = None,
                              report_errors: bool = False, show_timing: bool = False,
-                             cancel_check=None) -> dict:
+                             cancel_check=None,
+                             codex_turn_state=None) -> dict:
     start = time.perf_counter()
     config = current_config()
     body = json.dumps(payload).encode('utf-8') if payload is not None else b''
     method = 'POST' if payload is not None else 'GET'
+    turn_state = (
+        _codex_turn_state_for_request(
+            config, request_url, codex_turn_state)
+        if method == 'POST' else None)
 
     base_headers = request_headers
     if base_headers is None:
@@ -4009,18 +4092,31 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     while True:
         headers_to_use, lease = await _authorized_request_headers(
             base_headers, config, request_url, rejected_generation)
+        transport_options = {
+            "body": body,
+            "headers_in": headers_to_use,
+            "timeout": request_timeout,
+            "max_bytes": HTTP_MAX_RESPONSE_BYTES,
+            "retry_max_attempts": retry_attempts,
+            "retry_base_delay_s": HTTP_RETRY_BASE_DELAY_S,
+            "retry_max_jitter_s": HTTP_RETRY_MAX_JITTER_S,
+            "retry_backoff_factor": HTTP_RETRY_BACKOFF_FACTOR,
+            "cancel_check": cancel_check,
+        }
+        if turn_state is not None:
+            transport_options.update({
+                "prepare_attempt_headers": (
+                    lambda headers: _prepare_codex_turn_headers(
+                        headers, turn_state)),
+                "on_response_headers": (
+                    lambda status, headers: _capture_codex_turn_state(
+                        headers, turn_state)
+                    if 200 <= status < 300 else None),
+            })
         response = await http_client.async_http_request(
             method,
             request_url,
-            body=body,
-            headers_in=headers_to_use,
-            timeout=request_timeout,
-            max_bytes=HTTP_MAX_RESPONSE_BYTES,
-            retry_max_attempts=retry_attempts,
-            retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
-            retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
-            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
-            cancel_check=cancel_check,
+            **transport_options,
         )
         if (response.status == 401
                 and lease is not None
@@ -4150,7 +4246,8 @@ async def _first_body_chunk(iterator, cancel_check):
 
 
 async def _async_chat_stream_request_once(
-        request_url, payload, request_headers, on_text_delta, cancel_check):
+        request_url, payload, request_headers, on_text_delta, cancel_check,
+        codex_turn_state=None):
     body = json.dumps(payload).encode("utf-8")
     async with http_client.async_http_stream(
             "POST",
@@ -4160,6 +4257,12 @@ async def _async_chat_stream_request_once(
             timeout=LLM_STREAM_IDLE_TIMEOUT_S,
             max_bytes=HTTP_MAX_RESPONSE_BYTES,
             cancel_check=cancel_check) as response:
+        if 200 <= response.status < 300:
+            # Capture as soon as the HTTP headers arrive. If the body then
+            # fails before yielding an SSE event, the transport retry must
+            # already be able to replay the routing token.
+            _capture_codex_turn_state(
+                response.headers, codex_turn_state)
         iterator = response.body.__aiter__()
         first_chunk = await _first_body_chunk(iterator, cancel_check)
 
@@ -4236,11 +4339,14 @@ async def _async_chat_stream_request_once(
 async def async_chat_stream_request(
         request_url: str, payload, request_headers: dict = None,
         on_text_delta=None, cancel_check=None,
-        report_errors: bool = False, show_timing: bool = False) -> dict:
+        report_errors: bool = False, show_timing: bool = False,
+        codex_turn_state=None) -> dict:
     start = time.perf_counter()
     config = current_config()
     callback = on_text_delta or (lambda text: None)
     cancel = cancel_check or (lambda: False)
+    turn_state = _codex_turn_state_for_request(
+        config, request_url, codex_turn_state)
     base_headers = dict(
         request_headers if request_headers is not None
         else (config.headers if config else {}))
@@ -4258,10 +4364,12 @@ async def async_chat_stream_request(
     while True:
         headers_to_use, lease = await _authorized_request_headers(
             base_headers, config, request_url, rejected_generation)
+        _prepare_codex_turn_headers(headers_to_use, turn_state)
         transport_attempt += 1
         try:
             data = await _async_chat_stream_request_once(
-                request_url, payload, headers_to_use, callback, cancel)
+                request_url, payload, headers_to_use, callback, cancel,
+                codex_turn_state=turn_state)
             break
         except http_client.HttpRequestCancelled:
             raise StreamCancelled()
@@ -4314,7 +4422,8 @@ async def async_chat_stream_request(
 async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
                                 show_timing: bool = False,
                                 on_text_delta=None,
-                                cancel_check=None) -> formats.DecodedTurn:
+                                cancel_check=None,
+                                codex_turn_state=None) -> formats.DecodedTurn:
     if cancel_check and cancel_check():
         raise StreamCancelled()
     if not current_config():
@@ -4367,14 +4476,20 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     if current_config().stream:
         payload = current_config().chat_provider.streaming_chat_payload(
             transcript_items, tools, current_model())
+        request_kwargs = {
+            "request_headers":
+                current_config().chat_provider.headers,
+            "on_text_delta": on_text_delta,
+            "cancel_check": cancel_check,
+            "report_errors": report_errors,
+            "show_timing": False,
+        }
+        if codex_turn_state is not None:
+            request_kwargs["codex_turn_state"] = codex_turn_state
         data = await async_chat_stream_request(
             current_config().chat_provider.chat_url,
             payload,
-            request_headers=current_config().chat_provider.headers,
-            on_text_delta=on_text_delta,
-            cancel_check=cancel_check,
-            report_errors=report_errors,
-            show_timing=False,
+            **request_kwargs,
         )
     else:
         payload = current_config().chat_provider.chat_payload(
@@ -4388,6 +4503,8 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             }
             if cancel_check is not None:
                 request_kwargs["cancel_check"] = cancel_check
+            if codex_turn_state is not None:
+                request_kwargs["codex_turn_state"] = codex_turn_state
             data = await async_chat_request(
                 current_config().chat_provider.chat_url,
                 payload,

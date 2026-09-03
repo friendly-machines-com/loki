@@ -548,11 +548,13 @@ class Worker:
                 return
             cancel_check = self.cancel_event.is_set
 
-            async def chat_fn(items, on_text_delta):
+            async def chat_fn(
+                    items, on_text_delta, *, codex_turn_state):
                 return await loki.async_chat_completion(
                     items, loki.TOOLS, True, False,
                     on_text_delta=on_text_delta,
                     cancel_check=cancel_check,
+                    codex_turn_state=codex_turn_state,
                 )
 
             await loki.run_tool_loop_async(

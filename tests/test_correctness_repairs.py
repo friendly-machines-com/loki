@@ -67,7 +67,7 @@ class ProviderResponseContractTests(unittest.TestCase):
             loki.formats.message_item("user", "hello"),
         ]
 
-        async def broken_chat(_items):
+        async def broken_chat(_items, *, codex_turn_state):
             raise protocols.ProtocolError("malformed provider JSON")
 
         answer = asyncio.run(loki.run_tool_loop_async(

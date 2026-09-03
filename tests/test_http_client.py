@@ -1,6 +1,7 @@
 import asyncio
 import time
 import unittest
+from unittest import mock
 
 from loki_agent import http_client
 
@@ -455,6 +456,78 @@ class HttpClientRedirectTests(unittest.TestCase):
 
 
 class HttpClientRetryTests(unittest.TestCase):
+    def test_retry_preparation_sees_state_from_prior_response_headers(self):
+        state = {"value": None}
+        attempts = []
+
+        def prepare(headers):
+            if state["value"] is not None:
+                headers["X-Routing-State"] = state["value"]
+
+        def capture(status, headers):
+            self.assertEqual(status, 200)
+            state["value"] = headers.get("x-routing-state")
+
+        async def request_once(
+                method, request_url, *, headers_in=None, body=b"",
+                timeout=30, max_bytes=http_client.HTTP_MAX_RESPONSE_BYTES,
+                cancel_check=None, on_response_headers=None):
+            attempts.append(dict(headers_in))
+            if len(attempts) == 1:
+                on_response_headers(
+                    200, {"x-routing-state": "server-state"})
+                raise ConnectionResetError("body read reset")
+            return http_client.HttpResponse(
+                request_url, 200, "OK", {}, b"done")
+
+        with mock.patch.object(
+                http_client, "_async_http_request_once",
+                new=request_once):
+            response = asyncio.run(http_client.async_http_request(
+                "POST",
+                "https://example.test/responses",
+                retry_max_attempts=2,
+                retry_base_delay_s=0,
+                retry_max_jitter_s=0,
+                prepare_attempt_headers=prepare,
+                on_response_headers=capture,
+            ))
+
+        self.assertEqual(response.body, b"done")
+        self.assertNotIn("X-Routing-State", attempts[0])
+        self.assertEqual(
+            attempts[1]["X-Routing-State"], "server-state")
+
+    def test_response_headers_are_reported_before_body_read_failure(self):
+        connector = FakeConnector([
+            b"HTTP/1.1 200 OK\r\n"
+            b"X-Routing-State: server-state\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n"
+            b"no"
+        ])
+        observed = []
+
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(
+                    http_client.HttpRequestDeliveryError):
+                asyncio.run(http_client.async_http_request(
+                    "POST",
+                    "https://example.test/responses",
+                    retry_max_attempts=1,
+                    on_response_headers=(
+                        lambda status, headers: observed.append(
+                            (status, dict(headers)))),
+                ))
+
+        self.assertEqual(observed, [(
+            200,
+            {
+                "x-routing-state": "server-state",
+                "content-length": "5",
+            },
+        )])
+
     def test_retries_once_on_connection_reset_then_succeeds(self):
         # First open_connection raises a transient transport error; the second
         # returns a valid response. The wrapper should retry and succeed.

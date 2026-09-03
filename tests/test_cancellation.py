@@ -38,7 +38,8 @@ class _ScriptedChat:
         self.responses = list(responses)
         self.calls = 0
 
-    async def __call__(self, items, on_text_delta=None):
+    async def __call__(
+            self, items, on_text_delta=None, *, codex_turn_state):
         self.calls += 1
         return self.responses.pop(0)
 
@@ -199,7 +200,8 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
         events = []
         transcript = [formats.message_item("user", "go")]
 
-        async def response_and_cancel(_items):
+        async def response_and_cancel(
+                _items, *, codex_turn_state):
             cancel.cancelled = True
             return [
                 formats.message_item(
@@ -225,7 +227,8 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
         cancel = _CancelAfter()
         events = []
 
-        async def failure_and_cancel(_items):
+        async def failure_and_cancel(
+                _items, *, codex_turn_state):
             cancel.cancelled = True
             raise ConnectionResetError("socket closed during cancellation")
 
@@ -245,7 +248,7 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
     def test_provider_refusal_has_distinct_terminal_event(self):
         events = []
 
-        async def refusal(_items):
+        async def refusal(_items, *, codex_turn_state):
             return formats.DecodedTurn([
                 formats.message_item(
                     "assistant",

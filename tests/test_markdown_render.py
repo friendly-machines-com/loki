@@ -659,7 +659,8 @@ class ToolLoopWiringTests(unittest.TestCase):
         events = []
         reply = "prefix **hello** `world`"
 
-        async def chat_fn(items, on_text_delta):
+        async def chat_fn(
+                items, on_text_delta, *, codex_turn_state):
             for chunk in ["prefix **hel", "lo** `wor", "ld`"]:
                 on_text_delta(chunk)
             return [formats.message_item("assistant", reply)]

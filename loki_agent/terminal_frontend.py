@@ -466,11 +466,13 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         if read_only else TOOLS
     )
 
-    async def chat_fn(items, on_text_delta):
+    async def chat_fn(
+            items, on_text_delta, *, codex_turn_state):
         return await async_chat_completion(
             items, active_tools, True, False,
             on_text_delta=on_text_delta,
-            cancel_check=cancel_check)
+            cancel_check=cancel_check,
+            codex_turn_state=codex_turn_state)
 
     return await run_tool_loop_async(
         transcript_items,

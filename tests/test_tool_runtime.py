@@ -925,7 +925,7 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
                 calls = 0
                 dispatched = []
 
-                async def chat_fn(items):
+                async def chat_fn(items, *, codex_turn_state):
                     nonlocal calls
                     calls += 1
                     if calls == 1:
