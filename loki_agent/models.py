@@ -390,13 +390,13 @@ async def fetch_openai_subscription_models(
     rejected_generation = None
     recovered = False
     while True:
-        lease = await credential_authority.lease(
-            credential, rejected_generation=rejected_generation)
-        headers = {
-            "Accept": "application/json",
-        }
-        headers.update(authentications.authorization_headers(
-            auth_spec, lease))
+        headers, lease = await authentications.authorized_request_headers(
+            credential_authority,
+            auth_spec,
+            request_url,
+            {"Accept": "application/json"},
+            rejected_generation,
+        )
         response = await request_function(
             "GET",
             request_url,

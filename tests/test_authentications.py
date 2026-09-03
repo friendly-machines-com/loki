@@ -401,5 +401,66 @@ class AuthorizationHeaderTests(unittest.TestCase):
         self.assertNotIn("do-not-print", repr(lease))
 
 
+class AuthorizedRequestHeaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unauthenticated_request_copies_base_headers(self):
+        base = {"Accept": "application/json"}
+
+        headers, lease = await auth.authorized_request_headers(
+            None, None, "https://example.test/data", base)
+
+        self.assertEqual(headers, base)
+        self.assertIsNot(headers, base)
+        self.assertIsNone(lease)
+
+    async def test_authorizes_subscription_target_as_one_operation(self):
+        broker = auth.CredentialBroker()
+        ref = auth.CredentialRef.openai_subscription()
+        broker.install_openai_subscription(auth.OpenAITokenSet(
+            "access", "refresh",
+            account_id="account",
+            expires_at=10**12,
+        ))
+
+        headers, lease = await auth.authorized_request_headers(
+            broker,
+            auth.AuthSpec(ref, "openai-subscription"),
+            auth.OPENAI_CHATGPT_RESPONSES_URL,
+            {"Accept": "text/event-stream"},
+        )
+
+        self.assertEqual(headers["Accept"], "text/event-stream")
+        self.assertEqual(headers["Authorization"], "Bearer access")
+        self.assertEqual(headers["ChatGPT-Account-ID"], "account")
+        self.assertEqual(lease.credential, ref)
+
+    async def test_rejects_authentication_owned_base_header(self):
+        broker = auth.CredentialBroker()
+        ref = auth.CredentialRef.environment("EXAMPLE_API_KEY")
+        broker.install_static(ref, "secret")
+
+        with self.assertRaisesRegex(
+                auth.CredentialError, "authentication-owned"):
+            await auth.authorized_request_headers(
+                broker,
+                auth.AuthSpec(ref, "bearer"),
+                "https://example.test/v1/responses",
+                {"authorization": "Bearer stale"},
+            )
+
+    async def test_validates_target_before_leasing(self):
+        authority = mock.Mock()
+        authority.lease = mock.AsyncMock()
+        ref = auth.CredentialRef.openai_subscription()
+
+        with self.assertRaises(auth.CredentialUnavailable):
+            await auth.authorized_request_headers(
+                authority,
+                auth.AuthSpec(ref, "openai-subscription"),
+                "https://example.test/v1/responses",
+            )
+
+        authority.lease.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

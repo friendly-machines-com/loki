@@ -523,6 +523,50 @@ def validate_authorization_target(
             "the canonical ChatGPT Codex endpoints")
 
 
+async def authorized_request_headers(
+        authority: CredentialAuthority | None,
+        spec: AuthSpec | None,
+        request_url: str,
+        base_headers: dict | None = None,
+        rejected_generation: int | None = None,
+) -> tuple[dict, CredentialLease | None]:
+    """Authorize one HTTP attempt and return its complete request headers.
+
+    Target validation, credential leasing, and header construction form one
+    security operation: separating them lets a caller validate one URL and
+    accidentally attach the resulting credential to another.  Keep that
+    operation here so inference and model discovery cannot drift apart.
+    """
+    headers = dict(base_headers or {})
+    if spec is None or spec.credential is None:
+        return headers, None
+    validate_authorization_target(spec, request_url)
+    if authority is None:
+        raise CredentialUnavailable(
+            "no credential authority is installed")
+    lease = await authority.lease(
+        spec.credential,
+        rejected_generation=rejected_generation,
+    )
+    generated = authorization_headers(spec, lease)
+    existing_names = {
+        str(name).lower(): name
+        for name in headers
+    }
+    collisions = [
+        existing_names[str(name).lower()]
+        for name in generated
+        if str(name).lower() in existing_names
+    ]
+    if collisions:
+        labels = ", ".join(repr(str(name)) for name in collisions)
+        raise CredentialError(
+            "request headers contain authentication-owned "
+            f"header(s): {labels}")
+    headers.update(generated)
+    return headers, lease
+
+
 def _decode_jwt_payload(token: str) -> dict | None:
     try:
         parts = token.split(".")

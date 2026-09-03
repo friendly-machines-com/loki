@@ -4088,30 +4088,6 @@ def configure_tool_hook_pipeline(environ=os.environ, stderr_reporter=None):
     return path
 
 
-async def _authorized_request_headers(
-        base_headers: dict, config: RuntimeConfig | None,
-        request_url: str,
-        rejected_generation: int | None = None
-) -> tuple[dict, authentications.CredentialLease | None]:
-    """Resolve authentication immediately before an HTTP attempt."""
-    headers = dict(base_headers)
-    if config is None or config.auth_spec is None:
-        return headers, None
-    authentications.validate_authorization_target(
-        config.auth_spec, request_url)
-    authority = current_session().credential_authority
-    if authority is None:
-        raise authentications.CredentialUnavailable(
-            "no credential authority is installed")
-    lease = await authority.lease(
-        config.auth_spec.credential,
-        rejected_generation=rejected_generation,
-    )
-    headers.update(authentications.authorization_headers(
-        config.auth_spec, lease))
-    return headers, lease
-
-
 def _codex_turn_state_for_request(
         config, request_url, supplied_state=None):
     """Return routing state only for the authenticated Codex Responses URL."""
@@ -4185,8 +4161,14 @@ async def async_chat_request(request_url: str, payload, request_headers: dict = 
     rejected_generation = None
     recovered = False
     while True:
-        headers_to_use, lease = await _authorized_request_headers(
-            base_headers, config, request_url, rejected_generation)
+        headers_to_use, lease = (
+            await authentications.authorized_request_headers(
+                current_session().credential_authority,
+                config.auth_spec if config is not None else None,
+                request_url,
+                base_headers,
+                rejected_generation,
+            ))
         transport_options = {
             "body": body,
             "headers_in": headers_to_use,
@@ -4457,8 +4439,14 @@ async def async_chat_stream_request(
     rejected_generation = None
     recovered = False
     while True:
-        headers_to_use, lease = await _authorized_request_headers(
-            base_headers, config, request_url, rejected_generation)
+        headers_to_use, lease = (
+            await authentications.authorized_request_headers(
+                current_session().credential_authority,
+                config.auth_spec if config is not None else None,
+                request_url,
+                base_headers,
+                rejected_generation,
+            ))
         _prepare_codex_turn_headers(headers_to_use, turn_state)
         transport_attempt += 1
         try:
