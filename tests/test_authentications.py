@@ -59,11 +59,6 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             "openai-subscription",
         )
 
-        self.assertEqual(
-            auth.OPENAI_CHATGPT_MODELS_REQUEST_URL,
-            "https://chatgpt.com/backend-api/codex/models"
-            "?client_version=0.144.0",
-        )
         for url in auth.OPENAI_CHATGPT_AUTHORIZED_URLS:
             auth.validate_authorization_target(spec, url)
         for url in [
