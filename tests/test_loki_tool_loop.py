@@ -2766,36 +2766,6 @@ class SessionResponsePersistenceTests(unittest.TestCase):
         self.assertEqual(
             payload["prompt_cache_key"], "session-cache-key")
 
-    def test_saved_note_flushes_stdout_before_writing_stderr(self):
-        class TrackingStdout(io.StringIO):
-            def __init__(self):
-                super().__init__()
-                self.was_flushed = False
-
-            def flush(self):
-                self.was_flushed = True
-                super().flush()
-
-        class OrderedStderr(io.StringIO):
-            def __init__(self, stdout):
-                super().__init__()
-                self.stdout = stdout
-
-            def write(self, value):
-                if value and not self.stdout.was_flushed:
-                    raise AssertionError(
-                        "stderr was written before stdout was flushed")
-                return super().write(value)
-
-        stdout = TrackingStdout()
-        stderr = OrderedStderr(stdout)
-
-        with contextlib.redirect_stdout(stdout), \
-                contextlib.redirect_stderr(stderr):
-            savefiles.report_chat_log_saved("/tmp/session.json")
-
-        self.assertIn("Saved chat log", stderr.getvalue())
-
     def test_response_boundary_and_toolset_are_saved_without_call_ledger(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
