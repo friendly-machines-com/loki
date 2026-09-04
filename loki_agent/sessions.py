@@ -42,6 +42,11 @@ class Session:
 
     # RuntimeConfig, or None before startup config is applied.
     runtime_config: Any = None
+    # A conversation preference, distinct from the selected model's
+    # capabilities. None follows each model's own default. An unsupported
+    # concrete value remains dormant so it can become active again after a
+    # later model change.
+    reasoning_effort_preference: str | None = None
 
     # Async request-time credential authority. Top-level processes install a
     # local broker; workers and subagents install a delegated client.

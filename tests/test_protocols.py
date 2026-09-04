@@ -249,6 +249,29 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
 
         self.assertEqual(payload["reasoning"]["effort"], "max")
 
+    def test_subscription_explicit_effort_replaces_catalog_default(self):
+        provider = protocols.make_provider(
+            "https://chatgpt.com/backend-api/codex/responses",
+            provider=protocols.OPENAI_RESPONSES,
+            provider_id="openai-subscription",
+            openai_request_profile=_codex_model(
+                default_reasoning_level="high"),
+        )
+
+        payload = provider.chat_payload(
+            [formats.message_item("user", "hi")],
+            [],
+            "gpt-test",
+            reasoning_effort="low",
+        )
+
+        self.assertEqual(payload["reasoning"], {
+            "effort": "low",
+            "summary": "detailed",
+        })
+        self.assertEqual(
+            payload["include"], ["reasoning.encrypted_content"])
+
     def test_responses_lite_uses_input_items_for_instructions_and_tools(self):
         provider = protocols.make_provider(
             "https://chatgpt.com/backend-api/codex/responses",
@@ -360,6 +383,25 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
                 "prompt_cache_key"]:
             self.assertNotIn(field, payload)
 
+    def test_generic_responses_sends_only_explicit_reasoning_effort(self):
+        provider = protocols.make_provider(
+            "https://api.openai.com/v1/responses",
+            provider=protocols.OPENAI_RESPONSES,
+        )
+
+        default_payload = provider.chat_payload(
+            [formats.message_item("user", "hi")], [], "gpt-test")
+        explicit_payload = provider.chat_payload(
+            [formats.message_item("user", "hi")],
+            [],
+            "gpt-test",
+            reasoning_effort="high",
+        )
+
+        self.assertNotIn("reasoning", default_payload)
+        self.assertEqual(
+            explicit_payload["reasoning"], {"effort": "high"})
+
     def test_responses_parse_response_separates_items_from_envelope(self):
         provider = protocols.make_provider(
             "https://api.openai.com/v1/responses",
@@ -400,6 +442,106 @@ class OpenAIResponsesProviderTests(unittest.TestCase):
         self.assertEqual(event["protocol"], protocols.OPENAI_RESPONSES)
         self.assertEqual(event["items"], turn.items)
         self.assertNotIn("response", turn.metadata)
+
+
+class OpenAIChatReasoningTests(unittest.TestCase):
+    def test_openrouter_payload_uses_nested_reasoning_effort(self):
+        provider = protocols.make_provider(
+            "https://openrouter.ai/api/v1/chat/completions",
+            provider=protocols.OPENAI_CHAT,
+            provider_id="openrouter",
+        )
+
+        default_payload = provider.chat_payload(
+            [formats.message_item("user", "hello")], [], "model")
+        explicit_payload = provider.streaming_chat_payload(
+            [formats.message_item("user", "hello")],
+            [],
+            "model",
+            reasoning_effort="max",
+        )
+
+        self.assertNotIn("reasoning_effort", default_payload)
+        self.assertEqual(
+            explicit_payload["reasoning"], {"effort": "max"})
+        self.assertTrue(explicit_payload["stream"])
+
+    def test_generic_chat_completions_uses_openai_reasoning_effort(self):
+        provider = protocols.make_provider(
+            "https://api.openai.com/v1/chat/completions",
+            provider=protocols.OPENAI_CHAT,
+        )
+
+        payload = provider.chat_payload(
+            [formats.message_item("user", "hello")],
+            [],
+            "model",
+            reasoning_effort="low",
+        )
+
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertNotIn("reasoning", payload)
+
+    def test_zai_effort_explicitly_enables_thinking(self):
+        for provider_id, url in [
+                ("zai", "https://api.z.ai/api/paas/v4/chat/completions"),
+                (
+                    "zai-coding-plan",
+                    "https://api.z.ai/api/coding/paas/v4/chat/completions",
+                ),
+                (
+                    "zhipuai",
+                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                ),
+                (
+                    "zhipuai-coding-plan",
+                    "https://open.bigmodel.cn/api/coding/paas/v4/"
+                    "chat/completions",
+                ),
+        ]:
+            with self.subTest(provider_id=provider_id):
+                provider = protocols.make_provider(
+                    url,
+                    provider=protocols.OPENAI_CHAT,
+                    provider_id=provider_id,
+                )
+
+                default_payload = provider.chat_payload(
+                    [formats.message_item("user", "hello")],
+                    [],
+                    "glm",
+                )
+                explicit_payload = provider.chat_payload(
+                    [formats.message_item("user", "hello")],
+                    [],
+                    "glm",
+                    reasoning_effort="max",
+                )
+
+                self.assertNotIn("reasoning_effort", default_payload)
+                self.assertNotIn("thinking", default_payload)
+                self.assertEqual(
+                    explicit_payload["reasoning_effort"], "max")
+                self.assertEqual(
+                    explicit_payload["thinking"], {"type": "enabled"})
+
+    def test_zai_none_disables_thinking_and_omits_effort(self):
+        provider = protocols.make_provider(
+            "https://api.z.ai/api/paas/v4/chat/completions",
+            provider=protocols.OPENAI_CHAT,
+            provider_id="zai",
+        )
+
+        payload = provider.chat_payload(
+            [formats.message_item("user", "hello")],
+            [],
+            "glm",
+            reasoning_effort="none",
+        )
+
+        self.assertEqual(
+            payload["thinking"], {"type": "disabled"})
+        self.assertNotIn("reasoning_effort", payload)
 
 
 class AnthropicMessagesProviderTests(unittest.TestCase):
@@ -449,6 +591,28 @@ class AnthropicMessagesProviderTests(unittest.TestCase):
         )
 
         self.assertNotIn("cache_control", payload)
+
+    def test_payload_uses_output_config_for_explicit_effort(self):
+        provider = protocols.make_provider(
+            "https://api.anthropic.com/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES,
+        )
+
+        default_payload = provider.chat_payload(
+            [formats.message_item("user", "hello")],
+            [],
+            "claude-test",
+        )
+        explicit_payload = provider.chat_payload(
+            [formats.message_item("user", "hello")],
+            [],
+            "claude-test",
+            reasoning_effort="medium",
+        )
+
+        self.assertNotIn("output_config", default_payload)
+        self.assertEqual(
+            explicit_payload["output_config"], {"effort": "medium"})
 
 
 class StreamAccumulatorTests(unittest.TestCase):

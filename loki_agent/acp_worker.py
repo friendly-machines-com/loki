@@ -9,13 +9,22 @@ import os
 import sys
 from dataclasses import dataclass
 
-from . import acps, acp_events, formats, loki, models as modelsdev, replays
+from . import (
+    acps,
+    acp_events,
+    formats,
+    loki,
+    models as modelsdev,
+    reasonings,
+    replays,
+)
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
 from .sessions import Session
 
 
 _DISCONNECTED = object()
 _UNCHANGED = object()
+_PROMPT_EFFORT_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,7 @@ class Worker:
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
         self._pending_open: PendingSessionOpen | None = None
+        self._active_prompt_reasoning_effort: str | None = None
 
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
@@ -67,14 +77,22 @@ class Worker:
                     },
                 ))
                 return
+            # Snapshot before scheduling so a following configuration request
+            # cannot race the logical turn's first provider request.
+            reasoning_effort = loki.effective_reasoning_effort()
             self._prompt_task = asyncio.create_task(
-                self._answer(message),
+                self._answer(
+                    message,
+                    prompt_reasoning_effort=reasoning_effort,
+                ),
                 name=f"acp-worker-prompt-{request_id}",
             )
             return
         if (method == "session/set_config_option"
                 and self._prompt_task is not None
-                and not self._prompt_task.done()):
+                and not self._prompt_task.done()
+                and (message.get("params") or {}).get("configId")
+                != "reasoning_effort"):
             self.write(acps.response(
                 request_id,
                 error={
@@ -103,11 +121,16 @@ class Worker:
             if manager is not None:
                 await manager.close_session_owned()
 
-    async def _answer(self, message: dict):
+    async def _answer(
+            self, message: dict,
+            prompt_reasoning_effort=_PROMPT_EFFORT_UNSET):
         request_id = message.get("id")
         try:
             result = await self.dispatch(
-                message.get("method"), message.get("params") or {})
+                message.get("method"),
+                message.get("params") or {},
+                prompt_reasoning_effort=prompt_reasoning_effort,
+            )
         except acps.TransportError as error:
             self.write(acps.response(
                 request_id,
@@ -122,9 +145,14 @@ class Worker:
             return
         self.write(acps.response(request_id, result=result))
 
-    async def dispatch(self, method: str, params: dict):
+    async def dispatch(
+            self, method: str, params: dict,
+            prompt_reasoning_effort=_PROMPT_EFFORT_UNSET):
         if method == "session/prompt":
-            return await self.prompt(params)
+            return await self.prompt(
+                params,
+                reasoning_effort=prompt_reasoning_effort,
+            )
         if method == "session/cancel":
             self.cancel_event.set()
             return {}
@@ -148,7 +176,7 @@ class Worker:
         if self._current_option_value not in values:
             raise RuntimeError(
                 "ACP model config has no valid current value")
-        return [{
+        options = [{
             "id": "model",
             "name": "Model",
             "category": "model",
@@ -156,6 +184,47 @@ class Worker:
             "currentValue": self._current_option_value,
             "options": copy.deepcopy(self._model_options),
         }]
+        reasoning_option = self._reasoning_config_option()
+        if reasoning_option is not None:
+            options.append(reasoning_option)
+        return options
+
+    def _reasoning_config_option(self):
+        profile = loki.current_reasoning_effort_profile()
+        if profile is None:
+            return None
+        preference = loki.current_reasoning_effort_preference()
+        current_value = (
+            preference
+            if profile.supports(preference)
+            else reasonings.DEFAULT_OPTION_VALUE
+        )
+        values = [{
+            "value": reasonings.DEFAULT_OPTION_VALUE,
+            "name": reasonings.default_option_name(profile, preference),
+            "description": (
+                "Use the selected model or provider's own reasoning "
+                "effort default."),
+        }]
+        for option in profile.options:
+            encoded = {
+                "value": option.value,
+                "name": reasonings.display_name(option.value),
+            }
+            if option.description is not None:
+                encoded["description"] = option.description
+            values.append(encoded)
+        return {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "description": (
+                "Controls the selected model's reasoning depth, latency, "
+                "and token use."),
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": current_value,
+            "options": values,
+        }
 
     @staticmethod
     def _explicit_choice():
@@ -430,9 +499,18 @@ class Worker:
         )
 
     def set_config_option(self, params: dict) -> dict:
-        if params.get("configId") != "model":
+        config_id = params.get("configId")
+        if config_id == "reasoning_effort":
+            value = params.get("value")
+            try:
+                loki.set_reasoning_effort(value)
+            except (reasonings.ReasoningEffortError, ValueError) as error:
+                raise acps.TransportError(
+                    str(error), code=acps.INVALID_PARAMS) from error
+            return {"configOptions": self.config_options()}
+        if config_id != "model":
             raise acps.TransportError(
-                f"unknown config option {params.get('configId')!r}",
+                f"unknown config option {config_id!r}",
                 code=acps.INVALID_PARAMS,
             )
         value = params.get("value")
@@ -501,7 +579,11 @@ class Worker:
 
     # -- prompting --------------------------------------------------------
 
-    async def prompt(self, params: dict) -> dict:
+    async def prompt(
+            self, params: dict,
+            reasoning_effort=_PROMPT_EFFORT_UNSET) -> dict:
+        if reasoning_effort is _PROMPT_EFFORT_UNSET:
+            reasoning_effort = loki.effective_reasoning_effort()
         blocks = params.get("prompt")
         if not isinstance(blocks, list):
             raise acps.TransportError(
@@ -567,19 +649,23 @@ class Worker:
                     self.session_id, event, mapper_state):
                 self.write(acps.notification("session/update", update))
 
+        self._active_prompt_reasoning_effort = reasoning_effort
         try:
-            await self._run_turn(on_event)
-        except BaseException:
-            if not self.cancel_event.is_set():
-                raise
-            if not any(
-                    event.get("type") == "response_cancelled"
-                    for event in events):
-                on_event({
-                    "type": "response_cancelled",
-                    "partial": False,
-                    "saved": False,
-                })
+            try:
+                await self._run_turn(on_event)
+            except BaseException:
+                if not self.cancel_event.is_set():
+                    raise
+                if not any(
+                        event.get("type") == "response_cancelled"
+                        for event in events):
+                    on_event({
+                        "type": "response_cancelled",
+                        "partial": False,
+                        "saved": False,
+                    })
+        finally:
+            self._active_prompt_reasoning_effort = None
         failure = self._turn_failure(events)
         if failure:
             raise TurnFailure(failure)
@@ -600,12 +686,15 @@ class Worker:
 
             async def chat_fn(
                     items, on_text_delta, *, codex_turn_state):
+                kwargs = {
+                    "on_text_delta": on_text_delta,
+                    "cancel_check": cancel_check,
+                    "codex_turn_state": codex_turn_state,
+                    "reasoning_effort":
+                        self._active_prompt_reasoning_effort,
+                }
                 return await loki.async_chat_completion(
-                    items, loki.TOOLS, True, False,
-                    on_text_delta=on_text_delta,
-                    cancel_check=cancel_check,
-                    codex_turn_state=codex_turn_state,
-                )
+                    items, loki.TOOLS, True, False, **kwargs)
 
             await loki.run_tool_loop_async(
                 self.session.transcript_items,
@@ -615,6 +704,7 @@ class Worker:
                 cancel_event=self.cancel_event,
                 stream_chat=True,
                 on_response=lambda turn, event: loki.mark_chat_log_dirty(),
+                reasoning_effort=self._active_prompt_reasoning_effort,
             )
         finally:
             loki.save_chat_log()

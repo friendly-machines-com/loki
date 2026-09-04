@@ -37,6 +37,7 @@ from . import models as modelsdev
 from . import openai_models
 from . import paths
 from . import protocols
+from . import reasonings
 from . import authentications
 from . import credential_capabilities
 from . import savefiles
@@ -88,6 +89,35 @@ def current_model() -> str:
     return current_session().model
 
 
+def current_reasoning_effort_preference() -> str | None:
+    return current_session().reasoning_effort_preference
+
+
+def current_reasoning_effort_profile():
+    config = current_config()
+    return (
+        getattr(config, "reasoning_effort_profile", None)
+        if config is not None else None
+    )
+
+
+def effective_reasoning_effort() -> str | None:
+    return reasonings.effective_effort(
+        current_reasoning_effort_profile(),
+        current_reasoning_effort_preference(),
+    )
+
+
+def reasoning_effort_status_text() -> str | None:
+    profile = current_reasoning_effort_profile()
+    if profile is None:
+        return None
+    preference = current_reasoning_effort_preference()
+    if profile.supports(preference):
+        return reasonings.display_name(preference)
+    return reasonings.default_option_name(profile, preference)
+
+
 def current_transcript() -> list:
     return current_session().transcript_items
 
@@ -114,6 +144,54 @@ def current_dirty() -> bool:
 
 def current_agent_mode() -> str:
     return current_session().agent_mode
+
+
+def install_reasoning_effort_preference(
+        preference: str | None, *, persist=False):
+    """Install validated conversation state, optionally saving atomically."""
+    preference = reasonings.preference_from_value(preference)
+    session = current_session()
+    old_preference = session.reasoning_effort_preference
+    had_state = "reasoning_effort" in session.session_state
+    old_state = session.session_state.get("reasoning_effort")
+
+    session.reasoning_effort_preference = preference
+    if preference is None:
+        session.session_state.pop("reasoning_effort", None)
+    else:
+        session.session_state["reasoning_effort"] = preference
+    mark_chat_log_dirty()
+    if not persist:
+        return
+    try:
+        save_chat_log()
+    except Exception:
+        session.reasoning_effort_preference = old_preference
+        if had_state:
+            session.session_state["reasoning_effort"] = old_state
+        else:
+            session.session_state.pop("reasoning_effort", None)
+        # A failed write may also have included unrelated transcript changes.
+        # Keep the log dirty so a later successful save cannot lose them.
+        mark_chat_log_dirty()
+        raise
+
+
+def set_reasoning_effort(value: str):
+    """Apply one advertised terminal/ACP effort value to the conversation."""
+    profile = current_reasoning_effort_profile()
+    if profile is None:
+        raise ValueError(
+            "the selected model does not advertise reasoning effort choices")
+    if value == reasonings.DEFAULT_OPTION_VALUE:
+        preference = None
+    else:
+        preference = reasonings.preference_from_value(value)
+        if not profile.supports(preference):
+            raise ValueError(
+                f"reasoning effort {value!r} is not available for the "
+                "selected model")
+    install_reasoning_effort_preference(preference, persist=True)
 
 
 def current_job_manager():
@@ -266,6 +344,8 @@ class RuntimeConfig:
     auth_spec: authentications.AuthSpec | None = None
     model_status: str | None = None
     stream: bool = False
+    reasoning_effort_profile: (
+        reasonings.ReasoningEffortProfile | None) = None
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
@@ -339,7 +419,8 @@ def make_runtime_config(
         max_tokens=4096, anthropic_version="2023-06-01",
         auth_header=None, auth_scheme=None, provider_id=None,
         provider_name=None, credential_ref=None, model_status=None,
-        stream=False, prompt_cache=False, openai_request_profile=None):
+        stream=False, prompt_cache=False, openai_request_profile=None,
+        reasoning_effort_profile=None):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -347,6 +428,12 @@ def make_runtime_config(
     reinstall_provider() which reuses this to rebuild the Provider from the
     current config plus per-model overrides.
     """
+    if (reasoning_effort_profile is not None
+            and not isinstance(
+                reasoning_effort_profile,
+                reasonings.ReasoningEffortProfile)):
+        raise ValueError(
+            "reasoning_effort_profile must be ReasoningEffortProfile or null")
     chat_provider = protocols.make_provider(
         url,
         provider=provider_kind,
@@ -358,6 +445,12 @@ def make_runtime_config(
         prompt_cache=prompt_cache,
         openai_request_profile=openai_request_profile,
     )
+    if (reasoning_effort_profile is not None
+            and not reasonings.wire_protocol_supported(
+                provider_id, chat_provider.kind)):
+        raise ValueError(
+            "reasoning effort profile is not valid for this provider "
+            "protocol")
     auth_spec = _auth_spec(
         provider_kind,
         credential_ref,
@@ -380,6 +473,7 @@ def make_runtime_config(
         auth_spec=auth_spec,
         model_status=model_status,
         stream=stream,
+        reasoning_effort_profile=reasoning_effort_profile,
     )
 
 
@@ -426,6 +520,28 @@ def _openai_request_profile_setting(credentials, subscription):
             f"invalid LOKI_OPENAI_REQUEST_PROFILE: {error}") from error
 
 
+def _reasoning_effort_profile_setting(credentials):
+    encoded = credentials.get("LOKI_REASONING_EFFORT_PROFILE")
+    if not encoded:
+        return None
+    try:
+        value = json.loads(encoded)
+        return reasonings.ReasoningEffortProfile.from_dict(value)
+    except ValueError as error:
+        raise ValueError(
+            f"invalid LOKI_REASONING_EFFORT_PROFILE: {error}") from error
+
+
+def reasoning_effort_preference_setting(credentials):
+    value = credentials.get("LOKI_REASONING_EFFORT")
+    if not value:
+        return None
+    try:
+        return reasonings.preference_from_value(value)
+    except reasonings.ReasoningEffortError as error:
+        raise ValueError(f"invalid LOKI_REASONING_EFFORT: {error}") from error
+
+
 def build_config_from_env(
         environ=os.environ,
         credentials: CredentialStore | CredentialInventory | None = None):
@@ -467,6 +583,14 @@ def build_config_from_env(
         and credential_ref.kind == "openai-subscription")
     openai_request_profile = _openai_request_profile_setting(
         credentials, subscription)
+    reasoning_effort_profile = _reasoning_effort_profile_setting(
+        credentials)
+    delegated_provider_id = (
+        credentials.get("LOKI_PROVIDER_ID")
+        if reasoning_effort_profile is not None else None)
+    config_provider_id = (
+        modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
+        if subscription else delegated_provider_id)
 
     config_model = credentials.get("LOKI_MODEL") or ""
     return make_runtime_config(
@@ -479,9 +603,7 @@ def build_config_from_env(
             "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
         auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
         auth_scheme=credentials.get("LOKI_AUTH_SCHEME") or None,
-        provider_id=(
-            modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
-            if subscription else None),
+        provider_id=config_provider_id,
         provider_name=(
             "OpenAI ChatGPT subscription"
             if subscription else "Explicit LOKI_* connection"),
@@ -494,6 +616,7 @@ def build_config_from_env(
             credentials,
         ),
         openai_request_profile=openai_request_profile,
+        reasoning_effort_profile=reasoning_effort_profile,
     )
 
 
@@ -529,6 +652,8 @@ def config_from_connection_descriptor(
             f"{credential_ref.encode()}")
 
     provider_kind = credentials.get("LOKI_PROVIDER") or descriptor.protocol
+    resolved_provider_kind = protocols.resolve_protocol(
+        descriptor.chat_url, provider_kind)
     configured_model = credentials.get("LOKI_MODEL")
     config_model = configured_model or descriptor.model
     model_status = (
@@ -538,6 +663,12 @@ def config_from_connection_descriptor(
     openai_request_profile = (
         descriptor.openai_request_profile
         if not configured_model or configured_model == descriptor.model
+        else None)
+    reasoning_effort_profile = (
+        descriptor.reasoning_effort_profile
+        if ((not configured_model or configured_model == descriptor.model)
+            and reasonings.wire_protocol_supported(
+                descriptor.provider_id, resolved_provider_kind))
         else None)
     max_tokens = (
         _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)
@@ -582,6 +713,7 @@ def config_from_connection_descriptor(
         stream=stream,
         prompt_cache=prompt_cache,
         openai_request_profile=openai_request_profile,
+        reasoning_effort_profile=reasoning_effort_profile,
     )
 
 
@@ -596,7 +728,7 @@ def _is_openai_subscription_connection(descriptor):
 
 
 def reconcile_connection_descriptor(descriptor, catalog):
-    """Replace saved subscription request data with fresh exact-slug data."""
+    """Replace saved subscription model data with fresh exact-slug data."""
     if not _is_openai_subscription_connection(descriptor):
         return descriptor
     profile = modelsdev.reconcile_openai_subscription_profile(
@@ -604,7 +736,17 @@ def reconcile_connection_descriptor(descriptor, catalog):
         descriptor.openai_request_profile,
         catalog,
     )
-    return replace(descriptor, openai_request_profile=profile)
+    reasoning_effort_profile = (
+        modelsdev.reconcile_openai_subscription_reasoning_effort_profile(
+            descriptor.model,
+            descriptor.reasoning_effort_profile,
+            catalog,
+        ))
+    return replace(
+        descriptor,
+        openai_request_profile=profile,
+        reasoning_effort_profile=reasoning_effort_profile,
+    )
 
 
 async def refresh_connection_descriptor_async(
@@ -668,6 +810,8 @@ def config_from_modelsdev_selection(
         ),
         openai_request_profile=modelsdev.openai_request_profile(
             provider_entry, model_entry),
+        reasoning_effort_profile=modelsdev.reasoning_effort_profile(
+            provider_id, provider_entry, model_entry),
     )
 
 
@@ -699,6 +843,7 @@ def connection_descriptor_from_config(
         stream=config.stream,
         prompt_cache=provider.prompt_cache,
         openai_request_profile=provider.openai_request_profile,
+        reasoning_effort_profile=config.reasoning_effort_profile,
     )
 
 
@@ -723,7 +868,8 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
                        auth_header=_UNSET, provider_id=None, provider_name=None,
                        credential_ref=_UNSET, auth_scheme=_UNSET,
                        model_status=_UNSET, stream=None, prompt_cache=None,
-                       openai_request_profile=_UNSET):
+                       openai_request_profile=_UNSET,
+                       reasoning_effort_profile=_UNSET):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -801,6 +947,12 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             if same_catalog_entry else None)
     else:
         new_openai_request_profile = openai_request_profile
+    if reasoning_effort_profile is _UNSET:
+        new_reasoning_effort_profile = (
+            current.reasoning_effort_profile
+            if same_catalog_entry else None)
+    else:
+        new_reasoning_effort_profile = reasoning_effort_profile
     apply_runtime_config(make_runtime_config(
         new_url,
         new_kind,
@@ -826,6 +978,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             if prompt_cache is not None
             else current_provider.prompt_cache),
         openai_request_profile=new_openai_request_profile,
+        reasoning_effort_profile=new_reasoning_effort_profile,
     ))
 
 
@@ -2329,12 +2482,17 @@ def _handle_agent(args: dict) -> str:
 
 
 async def _handle_agent_async(args: dict, extra_context=None) -> str:
-    cancel_event = (extra_context or {}).get("cancel_event")
+    context = extra_context or {}
+    cancel_event = context.get("cancel_event")
+    reasoning_effort = (
+        context["reasoning_effort"]
+        if "reasoning_effort" in context else _UNSET)
     return await run_agent_async(args.get("description", ""),
                                  args["prompt"],
                                  args.get("run_in_background", False),
                                  args.get("subagent_type", "Explore"),
-                                 cancel_event=cancel_event)
+                                 cancel_event=cancel_event,
+                                 reasoning_effort=reasoning_effort)
 
 
 def _handle_skill(args: dict) -> str:
@@ -2342,9 +2500,13 @@ def _handle_skill(args: dict) -> str:
 
 
 async def _handle_webfetch_async(args: dict, extra_context=None) -> str:
+    context = extra_context or {}
     return await run_webfetch_async(
         args["url"], args["prompt"],
-        cancel_event=(extra_context or {}).get("cancel_event"))
+        cancel_event=context.get("cancel_event"),
+        reasoning_effort=(
+            context["reasoning_effort"]
+            if "reasoning_effort" in context else _UNSET))
 
 
 async def _handle_websearch_async(args: dict, extra_context=None) -> str:
@@ -2789,7 +2951,8 @@ async def run_tool_loop_async(
         chat_fn=None, on_event=None, cancel_check=None,
         stream_chat=False, report_timing=False,
         on_response=None, hook_pipeline=None,
-        cancel_event: asyncio.Event | None = None) -> str:
+        cancel_event: asyncio.Event | None = None,
+        reasoning_effort=_UNSET) -> str:
     """Run the model/tool loop over canonical session events.
 
     Mutates ``transcript_items`` by appending one ``model_response`` for each
@@ -2798,6 +2961,11 @@ async def run_tool_loop_async(
     routing semantics of every provider request in this logical user turn.
     """
     codex_turn_state = CodexTurnState()
+    if reasoning_effort is _UNSET:
+        reasoning_effort = effective_reasoning_effort()
+    else:
+        reasoning_effort = reasonings.preference_from_value(
+            reasoning_effort)
     completion_cancel_check = cancel_check
     if chat_fn is None:
         advertised_tools = (
@@ -2806,19 +2974,16 @@ async def run_tool_loop_async(
                 for name, spec in TOOL_REGISTRY.items()
                 if name in allowed
             ])
-        if completion_cancel_check is None:
-            chat_fn = lambda items, *, codex_turn_state: (
-                async_chat_completion(
-                    items,
-                    tools=advertised_tools,
-                    codex_turn_state=codex_turn_state))
-        else:
-            chat_fn = lambda items, *, codex_turn_state: (
-                async_chat_completion(
-                    items,
-                    tools=advertised_tools,
-                    cancel_check=completion_cancel_check,
-                    codex_turn_state=codex_turn_state))
+
+        def chat_fn(items, *, codex_turn_state):
+            kwargs = {
+                "tools": advertised_tools,
+                "codex_turn_state": codex_turn_state,
+                "reasoning_effort": reasoning_effort,
+            }
+            if completion_cancel_check is not None:
+                kwargs["cancel_check"] = completion_cancel_check
+            return async_chat_completion(items, **kwargs)
     if on_event is None:
         on_event = lambda event: None
     if cancel_check is None:
@@ -2829,6 +2994,7 @@ async def run_tool_loop_async(
         raise ValueError("max_loops must be at least 1")
 
     tool_loop_extra_context = get_tool_loop_extra_context(transcript_items)
+    tool_loop_extra_context["reasoning_effort"] = reasoning_effort
     if cancel_event is not None:
         tool_loop_extra_context["cancel_event"] = cancel_event
 
@@ -3117,23 +3283,30 @@ async def run_tool_loop_async(
 
 
 async def run_toolless_completion_async(
-        transcript_items: list, cancel_check=None) -> str:
+        transcript_items: list, cancel_check=None,
+        reasoning_effort=_UNSET) -> str:
     # Tool helpers such as WebFetch may run inside an outer user turn, but
     # this completion is a distinct logical turn and therefore owns a
     # distinct routing token passed explicitly to the request path.
     codex_turn_state = CodexTurnState()
     try:
+        kwargs = {
+            "tools": [],
+            "codex_turn_state": codex_turn_state,
+            "reasoning_effort": (
+                reasoning_effort
+                if reasoning_effort is not _UNSET
+                else effective_reasoning_effort()),
+        }
         if cancel_check is None:
             response_items = await async_chat_completion(
                 transcript_items,
-                tools=[],
-                codex_turn_state=codex_turn_state)
+                **kwargs)
         else:
+            kwargs["cancel_check"] = cancel_check
             response_items = await async_chat_completion(
                 transcript_items,
-                tools=[],
-                cancel_check=cancel_check,
-                codex_turn_state=codex_turn_state)
+                **kwargs)
     except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
         return f"Transcript render error: {e}"
     except ApiError as e:
@@ -3177,7 +3350,7 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
     return "\n".join(parts)
 
 
-def _subagent_env() -> dict:
+def _subagent_env(reasoning_effort=_UNSET) -> dict:
     env = {
         name: value for name, value in os.environ.items()
         if not is_credential_name(name)
@@ -3196,6 +3369,30 @@ def _subagent_env() -> dict:
         env['LOKI_STREAM'] = '1' if config.stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
             '1' if provider.prompt_cache else '0')
+        profile = config.reasoning_effort_profile
+        if profile is not None:
+            env['LOKI_PROVIDER_ID'] = provider.provider_id
+            env['LOKI_REASONING_EFFORT_PROFILE'] = json.dumps(
+                profile.to_dict(),
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        else:
+            env.pop('LOKI_PROVIDER_ID', None)
+            env.pop('LOKI_REASONING_EFFORT_PROFILE', None)
+        if reasoning_effort is _UNSET:
+            reasoning_effort = effective_reasoning_effort()
+        if reasoning_effort is not None:
+            reasoning_effort = reasonings.preference_from_value(
+                reasoning_effort)
+            if profile is None or not profile.supports(reasoning_effort):
+                raise ValueError(
+                    "cannot delegate an unsupported reasoning effort")
+            env['LOKI_REASONING_EFFORT'] = reasoning_effort
+        else:
+            env.pop('LOKI_REASONING_EFFORT', None)
         if provider.openai_request_profile is not None:
             # This compact, non-secret request profile is process
             # configuration. Credentials still cross only the anonymous
@@ -3276,13 +3473,21 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
 
 
 def run_agent(description: str, prompt: str, run_in_background: bool = False,
-              subagent_type: str = "Explore") -> str:
-    return asyncio.run(run_agent_async(description, prompt, run_in_background, subagent_type))
+              subagent_type: str = "Explore",
+              reasoning_effort=_UNSET) -> str:
+    return asyncio.run(run_agent_async(
+        description,
+        prompt,
+        run_in_background,
+        subagent_type,
+        reasoning_effort=reasoning_effort,
+    ))
 
 
 async def run_agent_async(description: str, prompt: str, run_in_background: bool = False,
                           subagent_type: str = "Explore",
-                          cancel_event: asyncio.Event | None = None) -> str:
+                          cancel_event: asyncio.Event | None = None,
+                          reasoning_effort=_UNSET) -> str:
     agent_type = subagent_type or "Explore"
     if not prompt:
         return "Error: prompt is required"
@@ -3298,7 +3503,7 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
             job = await manager.run_background_exec(
                 argv,
                 description=description or "subagent task",
-                env=_subagent_env(),
+                env=_subagent_env(reasoning_effort),
                 cwd=os.getcwd(),
                 session_owned=True,
                 credential_refs=_subagent_credential_refs(),
@@ -3311,7 +3516,8 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         job, status, stdout, stderr = await manager.run_exec(
             argv, SUBAGENT_TIMEOUT_S * 1000,
             description=description or "subagent task",
-            env=_subagent_env(), cwd=os.getcwd(), cancel_event=cancel_event,
+            env=_subagent_env(reasoning_effort), cwd=os.getcwd(),
+            cancel_event=cancel_event,
             session_owned=True,
             credential_refs=_subagent_credential_refs(),
             subagent=True)
@@ -3547,7 +3753,8 @@ async def _fetch_url_async(url: str, cancel_check=None) -> dict:
 
 async def run_webfetch_async(
         url: str, prompt: str,
-        cancel_event: asyncio.Event | None = None) -> str:
+        cancel_event: asyncio.Event | None = None,
+        reasoning_effort=_UNSET) -> str:
     if not url:
         return "Error: url is required"
     if not prompt:
@@ -3600,6 +3807,7 @@ async def run_webfetch_async(
         msgs,
         cancel_check=(
             cancel_event.is_set if cancel_event is not None else None),
+        reasoning_effort=reasoning_effort,
     ) or "(no answer returned)"
     header = f"[WebFetch status={status} cache_hit={cache_hit} bytes~={len(content_text)} url={final_url}]"
     return f"{header}\n{answer}"
@@ -4685,11 +4893,23 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                                 show_timing: bool = False,
                                 on_text_delta=None,
                                 cancel_check=None,
-                                codex_turn_state=None) -> formats.DecodedTurn:
+                                codex_turn_state=None,
+                                reasoning_effort=_UNSET) -> formats.DecodedTurn:
     if cancel_check and cancel_check():
         raise StreamCancelled()
     if not current_config():
         return formats.DecodedTurn([])
+    if reasoning_effort is _UNSET:
+        reasoning_effort = effective_reasoning_effort()
+    else:
+        reasoning_effort = reasonings.preference_from_value(
+            reasoning_effort)
+    if (reasoning_effort is not None
+            and (current_config().reasoning_effort_profile is None
+                 or not current_config().reasoning_effort_profile.supports(
+                     reasoning_effort))):
+        raise protocols.ProtocolError(
+            "reasoning effort is not supported by the selected model")
     effective_model = current_model()
     notice_codes = ()
 
@@ -4748,6 +4968,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             tools,
             current_model(),
             prompt_cache_key=current_session().conversation_id,
+            reasoning_effort=reasoning_effort,
         )
         request_kwargs = {
             "request_headers":
@@ -4775,6 +4996,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             tools,
             current_model(),
             prompt_cache_key=current_session().conversation_id,
+            reasoning_effort=reasoning_effort,
         )
         try:
             request_kwargs = {
@@ -5029,6 +5251,7 @@ def new_chat_log(filename):
     session.session_todos = []
     session.session_toolsets = []
     session.last_instructed_agent_mode = None
+    session.reasoning_effort_preference = None
     dirname = os.path.dirname(filename)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -5055,6 +5278,11 @@ def save_chat_log():
         saved_connection.pop("api_url")
         state["connection"] = saved_connection
     state["shell_cwd"] = session.shell_cwd
+    if session.reasoning_effort_preference is None:
+        state.pop("reasoning_effort", None)
+    else:
+        state["reasoning_effort"] = (
+            session.reasoning_effort_preference)
     content = savefiles.serialize_chat_log(
         session.transcript_items,
         session.session_todos,
@@ -5093,6 +5321,8 @@ def load_chat_log(filename, loaded=None):
 def load_session_state(state: dict):
     if not isinstance(state, dict):
         return
+    current_session().reasoning_effort_preference = (
+        reasoning_effort_from_session_state(state))
     loaded_shell_cwd = state.get("shell_cwd")
     if not isinstance(loaded_shell_cwd, str) or not loaded_shell_cwd:
         return
@@ -5103,6 +5333,15 @@ def load_session_state(state: dict):
             f"Warning: saved cwd no longer exists: {loaded_shell_cwd!r}",
             file=sys.stderr,
         )
+
+
+def reasoning_effort_from_session_state(state: dict) -> str | None:
+    if not isinstance(state, dict) or "reasoning_effort" not in state:
+        return None
+    try:
+        return reasonings.preference_from_value(state["reasoning_effort"])
+    except reasonings.ReasoningEffortError as error:
+        raise ValueError(f"invalid saved reasoning effort: {error}") from error
 
 
 def connection_from_session_state(state: dict) -> ConnectionDescriptor | None:

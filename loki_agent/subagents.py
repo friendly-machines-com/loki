@@ -256,6 +256,16 @@ async def async_main(args) -> int:
         try:
             _core.apply_runtime_config(_core.build_config_from_env(
                 credentials=_core.CREDENTIALS))
+            preference = _core.reasoning_effort_preference_setting(
+                _core.CREDENTIALS)
+            profile = _core.current_reasoning_effort_profile()
+            if (preference is not None
+                    and (profile is None
+                         or not profile.supports(preference))):
+                raise ValueError(
+                    "delegated reasoning effort is not supported by the "
+                    "delegated model profile")
+            _core.install_reasoning_effort_preference(preference)
         except (protocols.ProtocolError, ValueError) as error:
             _print_text_line(
                 "Configuration error: ", error, file=sys.stderr)

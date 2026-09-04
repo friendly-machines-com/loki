@@ -13,6 +13,7 @@ from loki_agent import (
     models,
     openai_models,
     protocols,
+    reasonings,
     terminals,
 )
 from loki_agent.credentials import CredentialInventory, CredentialStore
@@ -643,6 +644,83 @@ class CatalogNormalizationTests(unittest.TestCase):
                 "_loki_openai_request_profile": profile,
             },
         ))
+
+    def test_subscription_retains_compact_reasoning_effort_profile(self):
+        normalized = models.add_openai_subscription_catalog(
+            {},
+            {"models": [_subscription_model(
+                "gpt-test",
+                supported_reasoning_levels=[
+                    {"effort": "low", "description": "Fast"},
+                    {"effort": "high", "description": "Deep"},
+                ],
+                default_reasoning_level="high",
+            )]},
+        )
+        provider = normalized["openai-subscription"]
+        profile = models.reasoning_effort_profile(
+            "openai-subscription",
+            provider,
+            provider["models"]["gpt-test"],
+        )
+
+        self.assertEqual(profile.values, ("low", "high"))
+        self.assertEqual(profile.default_value, "high")
+        self.assertEqual(profile.option("low").description, "Fast")
+
+    def test_reasoning_effort_requires_registered_wire_surface(self):
+        model = {
+            "reasoning_options": [{
+                "type": "effort",
+                "values": ["low", "high"],
+            }],
+        }
+        openrouter = {
+            "id": "openrouter",
+            "npm": "@openrouter/ai-sdk-provider",
+            "api": "https://openrouter.ai/api/v1",
+        }
+        unknown = {
+            "id": "unknown",
+            "npm": "@ai-sdk/openai-compatible",
+            "api": "https://unknown.example/v1",
+        }
+        zhipuai = {
+            "id": "zhipuai",
+            "npm": "@ai-sdk/openai-compatible",
+            "api": "https://open.bigmodel.cn/api/paas/v4",
+        }
+
+        self.assertEqual(
+            models.reasoning_effort_profile(
+                "openrouter", openrouter, model).values,
+            ("low", "high"),
+        )
+        self.assertIsNone(models.reasoning_effort_profile(
+            "unknown", unknown, model))
+        self.assertEqual(
+            models.reasoning_effort_profile(
+                "zhipuai", zhipuai, model).values,
+            ("low", "high"),
+        )
+
+    def test_malformed_optional_effort_does_not_drop_model(self):
+        provider = {
+            "id": "openrouter",
+            "npm": "@openrouter/ai-sdk-provider",
+            "api": "https://openrouter.ai/api/v1",
+        }
+        model = {
+            "reasoning_options": [{
+                "type": "effort",
+                "values": ["high", None],
+            }],
+        }
+
+        self.assertIsNone(models.reasoning_effort_profile(
+            "openrouter", provider, model))
+        with self.assertRaises(reasonings.ReasoningEffortError):
+            reasonings.from_modelsdev_model(model)
 
     def test_bad_request_fields_drop_only_the_affected_model(self):
         diagnostics = []

@@ -15,7 +15,13 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import acp, acp_main, acps, authentications
+from loki_agent import (
+    acp,
+    acp_main,
+    acps,
+    authentications,
+    reasonings,
+)
 from loki_agent.credentials import CredentialStore, is_credential_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1334,6 +1340,238 @@ class ConfigOptionTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     front.kill()
                     front.wait()
+
+
+class WorkerReasoningConfigTests(unittest.TestCase):
+    @staticmethod
+    def _profile(*values, default=None):
+        return reasonings.ReasoningEffortProfile(
+            options=tuple(
+                reasonings.ReasoningEffortOption(value)
+                for value in values
+            ),
+            default_value=default,
+        )
+
+    def test_model_changes_return_dependent_agent_shell_option(self):
+        from loki_agent import loki
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        old_credentials = loki.CREDENTIALS
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                session = Session(shell_cwd=tmpdir)
+                loki._DEFAULT_SESSION = session
+                loki.CREDENTIALS = CredentialStore({
+                    "OPENROUTER_API_KEY": "secret",
+                })
+                provider = {
+                    "id": "openrouter",
+                    "name": "OpenRouter",
+                    "npm": "@openrouter/ai-sdk-provider",
+                    "env": ["OPENROUTER_API_KEY"],
+                    "api": "https://openrouter.ai/api/v1",
+                }
+                high_model = {
+                    "id": "high-model",
+                    "name": "High model",
+                    "reasoning_options": [{
+                        "type": "effort",
+                        "values": ["low", "high"],
+                    }],
+                }
+                low_model = {
+                    "id": "low-model",
+                    "name": "Low model",
+                    "reasoning_options": [{
+                        "type": "effort",
+                        "values": ["low"],
+                    }],
+                }
+                no_effort_model = {
+                    "id": "plain-model",
+                    "name": "Plain model",
+                }
+                loki.apply_runtime_config(
+                    loki.config_from_modelsdev_selection(
+                        "openrouter",
+                        provider,
+                        high_model,
+                        loki.CREDENTIALS,
+                    ))
+                loki.new_chat_log(
+                    os.path.join(tmpdir, "chat-reasoning.json"))
+                worker = Worker(session, lambda _message: None, "session")
+                worker._set_choices([
+                    ({
+                        "value": "openrouter/high-model",
+                        "name": "High model",
+                    }, ("openrouter", provider, high_model)),
+                    ({
+                        "value": "openrouter/low-model",
+                        "name": "Low model",
+                    }, ("openrouter", provider, low_model)),
+                    ({
+                        "value": "openrouter/plain-model",
+                        "name": "Plain model",
+                    }, ("openrouter", provider, no_effort_model)),
+                ], "openrouter/high-model")
+
+                initial = worker.config_options()
+                thought = initial[1]
+                self.assertEqual(
+                    [option["category"] for option in initial],
+                    ["model", "thought_level"],
+                )
+                self.assertEqual(thought["id"], "reasoning_effort")
+                self.assertEqual(thought["currentValue"], "default")
+                self.assertEqual(
+                    [value["value"] for value in thought["options"]],
+                    ["default", "low", "high"],
+                )
+
+                selected = worker.set_config_option({
+                    "configId": "reasoning_effort",
+                    "value": "high",
+                })
+                self.assertEqual(
+                    selected["configOptions"][1]["currentValue"], "high")
+
+                plain = worker.set_config_option({
+                    "configId": "model",
+                    "value": "openrouter/plain-model",
+                })
+                self.assertEqual(len(plain["configOptions"]), 1)
+                self.assertEqual(
+                    loki.current_reasoning_effort_preference(), "high")
+                restored = worker.set_config_option({
+                    "configId": "model",
+                    "value": "openrouter/high-model",
+                })
+                self.assertEqual(
+                    restored["configOptions"][1]["currentValue"], "high")
+
+                narrowed = worker.set_config_option({
+                    "configId": "model",
+                    "value": "openrouter/low-model",
+                })
+                narrowed_thought = narrowed["configOptions"][1]
+                self.assertEqual(
+                    narrowed_thought["currentValue"], "default")
+                self.assertEqual(
+                    [value["value"]
+                     for value in narrowed_thought["options"]],
+                    ["default", "low"],
+                )
+                self.assertIn(
+                    "preferred High is unavailable",
+                    narrowed_thought["options"][0]["name"],
+                )
+                self.assertEqual(
+                    loki.current_reasoning_effort_preference(), "high")
+                self.assertIsNone(loki.effective_reasoning_effort())
+                with self.assertRaises(acps.TransportError) as caught:
+                    worker.set_config_option({
+                        "configId": "reasoning_effort",
+                        "value": "max",
+                    })
+                self.assertEqual(
+                    caught.exception.code, acps.INVALID_PARAMS)
+                self.assertEqual(
+                    loki.current_reasoning_effort_preference(), "high")
+
+                restored = worker.set_config_option({
+                    "configId": "model",
+                    "value": "openrouter/high-model",
+                })
+                self.assertEqual(
+                    restored["configOptions"][1]["currentValue"], "high")
+                self.assertEqual(loki.effective_reasoning_effort(), "high")
+        finally:
+            loki._DEFAULT_SESSION = old_session
+            loki.CREDENTIALS = old_credentials
+
+    def test_effort_change_during_prompt_applies_to_next_turn(self):
+        from loki_agent import loki, protocols
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        old_session = loki._DEFAULT_SESSION
+        try:
+            session = Session(shell_cwd=ROOT)
+            session.runtime_config = loki.make_runtime_config(
+                "https://api.openai.com/v1/responses",
+                protocols.OPENAI_RESPONSES,
+                model="gpt-test",
+                provider_id="openai",
+                reasoning_effort_profile=self._profile("low", "high"),
+            )
+            session.reasoning_effort_preference = "high"
+            session.session_state = {"reasoning_effort": "high"}
+            loki._DEFAULT_SESSION = session
+            written = []
+            worker = Worker(session, written.append, "session")
+            worker._set_choices([
+                ({
+                    "value": "model",
+                    "name": "Model",
+                }, object()),
+            ], "model")
+            started = asyncio.Event()
+            release = asyncio.Event()
+            snapshots = []
+
+            async def run_turn(_on_event):
+                snapshots.append(
+                    worker._active_prompt_reasoning_effort)
+                started.set()
+                await release.wait()
+
+            worker._run_turn = run_turn
+
+            async def scenario():
+                await worker.handle({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": "session",
+                        "prompt": [{
+                            "type": "text",
+                            "text": "hello",
+                        }],
+                    },
+                }, concurrent=True)
+                await started.wait()
+                await worker.handle({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/set_config_option",
+                    "params": {
+                        "sessionId": "session",
+                        "configId": "reasoning_effort",
+                        "value": "low",
+                    },
+                }, concurrent=True)
+                release.set()
+                await worker._prompt_task
+
+            asyncio.run(scenario())
+
+            self.assertEqual(snapshots, ["high"])
+            self.assertEqual(
+                loki.current_reasoning_effort_preference(), "low")
+            response = next(
+                message for message in written
+                if message.get("id") == 2)
+            self.assertEqual(
+                response["result"]["configOptions"][1]["currentValue"],
+                "low",
+            )
+        finally:
+            loki._DEFAULT_SESSION = old_session
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")

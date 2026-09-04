@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from . import openai_models
+from . import reasonings
 from .authentications import CredentialRef
 from .credentials import is_credential_name
 
@@ -75,6 +76,8 @@ class ConnectionDescriptor:
     prompt_cache: bool = False
     openai_request_profile: (
         openai_models.CodexModelRequestProfile | None) = None
+    reasoning_effort_profile: (
+        reasonings.ReasoningEffortProfile | None) = None
 
     def __post_init__(self):
         subscription = (
@@ -93,6 +96,18 @@ class ConnectionDescriptor:
                 "OpenAI ChatGPT subscription connections require "
                 "an authenticated request profile, and other connections must "
                 "not contain it")
+        if (self.reasoning_effort_profile is not None
+                and not isinstance(
+                    self.reasoning_effort_profile,
+                    reasonings.ReasoningEffortProfile)):
+            raise ConnectionDescriptorError(
+                "connection reasoning effort profile has the wrong type")
+        if (self.reasoning_effort_profile is not None
+                and not reasonings.wire_protocol_supported(
+                    self.provider_id, self.protocol)):
+            raise ConnectionDescriptorError(
+                "connection reasoning effort profile is not valid for this "
+                "provider protocol")
 
     def to_dict(self) -> dict:
         return {
@@ -115,6 +130,9 @@ class ConnectionDescriptor:
             "openai_request_profile": (
                 self.openai_request_profile.to_dict()
                 if self.openai_request_profile is not None else None),
+            "reasoning_effort_profile": (
+                self.reasoning_effort_profile.to_dict()
+                if self.reasoning_effort_profile is not None else None),
         }
 
     @classmethod
@@ -168,6 +186,17 @@ class ConnectionDescriptor:
                         raw_openai_request_profile))
             except openai_models.OpenAIModelProfileError as error:
                 raise ConnectionDescriptorError(str(error)) from error
+        raw_reasoning_effort_profile = value.get(
+            "reasoning_effort_profile")
+        if raw_reasoning_effort_profile is None:
+            reasoning_effort_profile = None
+        else:
+            try:
+                reasoning_effort_profile = (
+                    reasonings.ReasoningEffortProfile.from_dict(
+                        raw_reasoning_effort_profile))
+            except reasonings.ReasoningEffortError as error:
+                raise ConnectionDescriptorError(str(error)) from error
         return cls(
             provider_id=_optional_string(value.get("provider_id"), "provider_id"),
             provider_name=_optional_string(value.get("provider_name"), "provider_name"),
@@ -188,4 +217,5 @@ class ConnectionDescriptor:
             stream=stream,
             prompt_cache=prompt_cache,
             openai_request_profile=openai_request_profile,
+            reasoning_effort_profile=reasoning_effort_profile,
         )

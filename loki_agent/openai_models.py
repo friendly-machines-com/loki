@@ -9,8 +9,8 @@ the fields Loki currently consumes while constructing a Responses request.
 The field inventory below is from ``ModelInfo`` in
 ``codex-rs/protocol/src/openai_models.rs`` at ``rust-v0.144.1``:
 
-* discovery-only in Loki: ``slug``, ``display_name``, ``visibility``,
-  ``supported_reasoning_levels``, and ``input_modalities``;
+* discovery-only in this request profile: ``slug``, ``display_name``,
+  ``visibility``, ``supported_reasoning_levels``, and ``input_modalities``;
 * retained in the request profile: ``use_responses_lite``,
   ``supports_parallel_tool_calls``, ``supports_reasoning_summaries``,
   ``default_reasoning_level``, ``default_reasoning_summary``,
@@ -28,12 +28,14 @@ The field inventory below is from ``ModelInfo`` in
   and ``multi_agent_version``. ``used_fallback_model_metadata`` is an
   internal Codex field and is not received from the service.
 
-The unused fields describe Codex UI, prompts, compaction, or Codex's own tool
-implementations.  In particular, ``tool_mode`` is not a Responses parameter:
-Loki always exposes its own direct function tools.  If Loki implements a
-corresponding feature later, the same change must add the field's parser,
-consumer, persistence semantics, and request tests.  Merely receiving a field
-from the catalog is not a reason to retain it.
+The supported reasoning levels now cross the model-selection boundary in a
+separate, generic reasoning-effort profile; they remain outside this private
+request-contract type. The other unused fields describe Codex UI, prompts,
+compaction, or Codex's own tool implementations. In particular, ``tool_mode``
+is not a Responses parameter: Loki always exposes its own direct function
+tools. If Loki implements a corresponding feature later, the same change must
+add the field's parser, consumer, persistence semantics, and request tests.
+Merely receiving a field from the catalog is not a reason to retain it.
 """
 
 from dataclasses import dataclass

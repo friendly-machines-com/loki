@@ -32,6 +32,7 @@ from . import authentications
 from . import http_client
 from . import openai_models
 from . import protocols
+from . import reasonings
 from .credentials import (
     CredentialInventory,
     CredentialStore,
@@ -58,6 +59,7 @@ _OPENAI_SUBSCRIPTION_API_SOURCE = (
 _LOKI_CREDENTIAL_REF_KEY = "_loki_credential_ref"
 _LOKI_MODELS_URL_KEY = "_loki_models_url"
 _LOKI_OPENAI_REQUEST_PROFILE_KEY = "_loki_openai_request_profile"
+_LOKI_REASONING_EFFORT_PROFILE_KEY = "_loki_reasoning_effort_profile"
 _LOKI_SYNTHETIC_KEY = "_loki_synthetic"
 _OPENAI_SUBSCRIPTION_SENTINEL = object()
 OPENAI_SUBSCRIPTION_PROVIDER_ID = "openai-subscription"
@@ -224,8 +226,6 @@ def _openai_subscription_model_entries(
         if model.get("visibility") != "list":
             continue
 
-        # These fields are used only to construct the picker entry. They do
-        # not cross into saved connections or request construction.
         modalities = model.get("input_modalities", ["text", "image"])
         reasoning_levels = model.get("supported_reasoning_levels", [])
         if (not isinstance(modalities, list)
@@ -247,7 +247,12 @@ def _openai_subscription_model_entries(
             request_profile = (
                 openai_models.CodexModelRequestProfile.from_catalog_model(
                     model))
-        except openai_models.OpenAIModelProfileError as error:
+            reasoning_effort_profile = (
+                reasonings.from_codex_catalog_model(model))
+        except (
+                openai_models.OpenAIModelProfileError,
+                reasonings.ReasoningEffortError,
+        ) as error:
             if diagnostic_writer is not None:
                 diagnostic_writer(
                     "Ignoring OpenAI subscription model "
@@ -269,6 +274,8 @@ def _openai_subscription_model_entries(
             # The full catalog entry stops here. Only request-relevant fields
             # may cross selection, resume, ACP, and subagent boundaries.
             _LOKI_OPENAI_REQUEST_PROFILE_KEY: request_profile,
+            _LOKI_REASONING_EFFORT_PROFILE_KEY:
+                reasoning_effort_profile,
         }
     return result
 
@@ -317,6 +324,28 @@ def openai_request_profile(provider_entry, model_entry):
     )
 
 
+def reasoning_effort_profile(
+        provider_id, provider_entry, model_entry):
+    """Return validated effort choices for one usable provider/model leaf."""
+    protocol = provider_protocol(provider_entry)
+    if not reasonings.wire_protocol_supported(provider_id, protocol):
+        return None
+    if provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
+            _OPENAI_SUBSCRIPTION_SENTINEL):
+        profile = model_entry.get(_LOKI_REASONING_EFFORT_PROFILE_KEY)
+        return (
+            profile
+            if isinstance(profile, reasonings.ReasoningEffortProfile)
+            else None
+        )
+    try:
+        return reasonings.from_modelsdev_model(model_entry)
+    except reasonings.ReasoningEffortError:
+        # Malformed optional metadata must not make an otherwise usable model
+        # disappear. It merely cannot authorize an effort selector/request.
+        return None
+
+
 def reconcile_openai_subscription_profile(
         model, saved_profile, catalog):
     """Use fresh exact-slug data, or a saved profile only while offline.
@@ -342,6 +371,24 @@ def reconcile_openai_subscription_profile(
             f"OpenAI subscription model {model!r} has no trusted request "
             "profile")
     return profile
+
+
+def reconcile_openai_subscription_reasoning_effort_profile(
+        model, saved_profile, catalog):
+    """Refresh exact-slug effort choices, or retain saved choices offline."""
+    provider = catalog.get(OPENAI_SUBSCRIPTION_PROVIDER_ID)
+    if provider is None:
+        return saved_profile
+    model_entry = (provider.get("models") or {}).get(model)
+    if model_entry is None:
+        raise ValueError(
+            f"OpenAI subscription model {model!r} is not present in the "
+            "authenticated catalog")
+    return reasoning_effort_profile(
+        OPENAI_SUBSCRIPTION_PROVIDER_ID,
+        provider,
+        model_entry,
+    )
 
 
 async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):

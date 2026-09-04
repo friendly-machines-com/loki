@@ -150,6 +150,23 @@ appears in `/model` as `Explicit LOKI_* connection`, so it can be selected
 again after switching to a catalog provider or while models.dev is
 unavailable.
 
+For catalog models whose exact provider/model entry exposes a verified
+reasoning-effort control, `/effort` selects `none`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, or `max` only when that entry advertises the
+value. `Model default` is the initial setting and omits an effort override
+for ordinary providers; ChatGPT subscription requests retain their
+authenticated catalog default. An explicit selection is a conversation
+preference: after switching to a model which does not support it, Loki uses
+that model's default without coercion and restores the selection if a later
+model supports it. The selected value is fixed for every provider request in
+one logical tool turn.
+
+ACP sessions expose the same selector as a `thought_level` session config
+option. The complete option list is returned after model or effort changes,
+so clients such as emacs-agent-shell can add, remove, or refresh their
+reasoning selector as the model changes. An ACP effort change accepted while
+a response is running applies to the next logical turn.
+
 Streaming is disabled by default because compatible servers are not required
 to implement it. Set `LOKI_STREAM=1` to request streaming for the selected
 connection. Loki streams assistant text as it arrives but waits for a

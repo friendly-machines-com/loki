@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from . import formats
 from . import openai_models
+from . import reasonings
 
 
 OPENAI_CHAT = "openai_chat"
@@ -97,17 +98,22 @@ def openai_response_model_header(headers):
     return _header_string(headers, "openai-model")
 
 
-def _codex_reasoning_parameter(profile):
+def _codex_reasoning_parameter(profile, reasoning_effort=None):
     if not profile.supports_reasoning_summaries:
         return None
     reasoning = {}
-    if profile.default_reasoning_level is not None:
+    effort = (
+        reasoning_effort
+        if reasoning_effort is not None
+        else profile.default_reasoning_level
+    )
+    if effort is not None:
         # Codex accepts "ultra" in model/config metadata but the Responses
         # request contract currently represents it as "max".
         reasoning["effort"] = (
             "max"
-            if profile.default_reasoning_level == "ultra"
-            else profile.default_reasoning_level)
+            if effort == "ultra"
+            else effort)
     if profile.default_reasoning_summary != "none":
         reasoning["summary"] = profile.default_reasoning_summary
     if profile.use_responses_lite:
@@ -206,7 +212,10 @@ class Provider:
         )
 
     def chat_payload(
-            self, items, tools, model, *, prompt_cache_key=None):
+            self, items, tools, model, *, prompt_cache_key=None,
+            reasoning_effort=None):
+        reasoning_effort = reasonings.preference_from_value(
+            reasoning_effort)
         target = self.projection_target(model)
         if self.kind == OPENAI_CHAT:
             payload = {
@@ -216,6 +225,21 @@ class Provider:
             }
             if tools is not None:
                 payload["tools"] = tools
+            if reasoning_effort is not None:
+                if self.provider_id == "openrouter":
+                    payload["reasoning"] = {
+                        "effort": reasoning_effort,
+                    }
+                elif reasonings.is_zai_provider(self.provider_id):
+                    payload["thinking"] = {
+                        "type": (
+                            "disabled"
+                            if reasoning_effort == "none" else "enabled"),
+                    }
+                    if reasoning_effort != "none":
+                        payload["reasoning_effort"] = reasoning_effort
+                else:
+                    payload["reasoning_effort"] = reasoning_effort
             return payload
         if self.kind == ANTHROPIC_MESSAGES:
             system, messages = formats.items_to_anthropic_parts(
@@ -235,6 +259,10 @@ class Provider:
             anthropic_tools = formats.openai_tools_to_anthropic_tools(tools)
             if anthropic_tools:
                 payload["tools"] = anthropic_tools
+            if reasoning_effort is not None:
+                payload["output_config"] = {
+                    "effort": reasoning_effort,
+                }
             return payload
         if self.kind == OPENAI_RESPONSES:
             instructions, input_items = (
@@ -270,7 +298,8 @@ class Provider:
                         and not profile.use_responses_lite),
                     "store": False,
                 })
-                reasoning = _codex_reasoning_parameter(profile)
+                reasoning = _codex_reasoning_parameter(
+                    profile, reasoning_effort)
                 if reasoning is not None:
                     payload["reasoning"] = reasoning
                     # Loki sends full history rather than provider-side
@@ -290,6 +319,10 @@ class Provider:
                 # the backend for its ordinary default; Codex likewise does
                 # not copy default_service_tier into a request unless a tier
                 # was selected by client configuration.
+            elif reasoning_effort is not None:
+                payload["reasoning"] = {
+                    "effort": reasoning_effort,
+                }
             if self.responses_lite:
                 # Responses-Lite is a distinct ChatGPT Codex request
                 # contract. Its header requires all-turn reasoning context,
@@ -329,12 +362,14 @@ class Provider:
         raise ProtocolError(f"unknown protocol {self.kind!r}")
 
     def streaming_chat_payload(
-            self, items, tools, model, *, prompt_cache_key=None):
+            self, items, tools, model, *, prompt_cache_key=None,
+            reasoning_effort=None):
         payload = self.chat_payload(
             items,
             tools,
             model,
             prompt_cache_key=prompt_cache_key,
+            reasoning_effort=reasoning_effort,
         )
         if self.kind != DUMMY:
             payload["stream"] = True

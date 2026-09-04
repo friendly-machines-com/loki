@@ -25,6 +25,7 @@ from . import credential_capabilities
 from . import credential_runtimes
 from . import models as modelsdev
 from . import protocols
+from . import reasonings
 from . import savefiles
 from . import subagents
 from . import terminals
@@ -466,6 +467,7 @@ def _terminal_agent_event(event: dict):
 
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None) -> str:
+    reasoning_effort = _core.effective_reasoning_effort()
     read_only = current_agent_mode() in ("explore", "plan")
     mode_tools = (
         PLAN_TOOLS if current_agent_mode() == "plan" else EXPLORE_TOOLS)
@@ -479,11 +481,14 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
 
     async def chat_fn(
             items, on_text_delta, *, codex_turn_state):
+        kwargs = {
+            "on_text_delta": on_text_delta,
+            "cancel_check": cancel_check,
+            "codex_turn_state": codex_turn_state,
+            "reasoning_effort": reasoning_effort,
+        }
         return await async_chat_completion(
-            items, active_tools, True, False,
-            on_text_delta=on_text_delta,
-            cancel_check=cancel_check,
-            codex_turn_state=codex_turn_state)
+            items, active_tools, True, False, **kwargs)
 
     return await run_tool_loop_async(
         transcript_items,
@@ -494,6 +499,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         stream_chat=True,
         report_timing=True,
         cancel_event=cancel_event,
+        reasoning_effort=reasoning_effort,
         on_response=lambda turn, event: _remember_session_toolset(
             active_tools),
     )
@@ -508,6 +514,7 @@ def _status_fields(activity):
     return {
         "api": _status_api_base(),
         "model": displayed_model,
+        "effort": _core.reasoning_effort_status_text(),
         "turn": "running" if activity.turn_running else "idle",
         "queued_messages": activity.queued_messages,
         "queued_images": activity.queued_images,
@@ -518,14 +525,19 @@ def _status_fields(activity):
 
 def status_text(activity: TerminalActivityStatus | None = None) -> str:
     fields = _status_fields(activity)
+    remote = 'Remote: API: {}; Model: {}'.format(
+        fields["api"], fields["model"])
+    if fields["effort"] is not None:
+        remote += '; Effort: {}; /model, /effort'.format(
+            fields["effort"])
+    else:
+        remote += '; /model'
     return (
-        'Remote: API: {}; Model: {}; /model\n'
+        remote + '\n'
         'Local: turn: {}, queued messages: {}, queued images: {}, '
         'mode: {}, CWD: {}; '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
-        fields["api"],
-        fields["model"],
         fields["turn"],
         fields["queued_messages"],
         fields["queued_images"],
@@ -539,7 +551,12 @@ def _write_status_text():
     terminal.write_text(fields["api"])
     print("; Model: ", end="")
     terminal.write_text(fields["model"])
-    print("; /model\nLocal: turn: ", end="")
+    if fields["effort"] is not None:
+        print("; Effort: ", end="")
+        terminal.write_text(fields["effort"])
+        print("; /model, /effort\nLocal: turn: ", end="")
+    else:
+        print("; /model\nLocal: turn: ", end="")
     terminal.write_text(fields["turn"])
     print(", queued messages: ", end="")
     terminal.write_text(str(fields["queued_messages"]))
@@ -553,6 +570,61 @@ def _write_status_text():
 
 
 terminals.set_status_text_provider(_write_status_text)
+
+
+def _reasoning_effort_rows():
+    profile = _core.current_reasoning_effort_profile()
+    if profile is None:
+        return []
+    preference = _core.current_reasoning_effort_preference()
+    rows = [(
+        reasonings.DEFAULT_OPTION_VALUE,
+        reasonings.default_option_name(profile, preference),
+    )]
+    for option in profile.options:
+        label = reasonings.display_name(option.value)
+        if option.description:
+            label += f" - {option.description}"
+        rows.append((option.value, label))
+    return rows
+
+
+async def run_reasoning_effort_picker_async(session):
+    rows = _reasoning_effort_rows()
+    if not rows:
+        return None
+    async with session.modal() as modal:
+        print()
+        print("Reasoning effort:")
+        for index, (_value, label) in enumerate(rows, start=1):
+            terminal.write_text(f"{index}. {label}", multiline=True)
+            print()
+        while True:
+            choice = await modal.prompt(
+                "Effort choice (number selects, empty cancels): ")
+            if not choice:
+                return None
+            try:
+                index = int(choice)
+            except ValueError:
+                continue
+            if 1 <= index <= len(rows):
+                return rows[index - 1][0]
+
+
+def _report_unavailable_reasoning_preference():
+    preference = _core.current_reasoning_effort_preference()
+    profile = _core.current_reasoning_effort_profile()
+    if preference is None or (
+            profile is not None and profile.supports(preference)):
+        return
+    print("Reasoning effort ", end="", file=sys.stderr)
+    terminal.write_text(
+        repr(preference), file=sys.stderr)
+    print(
+        " is unavailable for the selected model; using the model default.",
+        file=sys.stderr,
+    )
 
 
 async def run_session_picker_async(session):
@@ -723,7 +795,8 @@ async def async_main(args) -> int:
                 with open(resolved_log_filename, "r", encoding="utf-8") as f:
                     loaded_chat = savefiles.read_chat_log(f)
                     _, _, saved_state, _ = loaded_chat
-            except (OSError, json.JSONDecodeError,
+                    _core.reasoning_effort_from_session_state(saved_state)
+            except (OSError, ValueError, json.JSONDecodeError,
                     formats.TranscriptFormatError) as e:
                 _print_text_line(
                     "Could not resume chat: ", e, file=sys.stderr,
@@ -876,6 +949,7 @@ async def async_main(args) -> int:
                                 terminal.write_text(
                                     selected_via, file=sys.stderr)
                                 print(file=sys.stderr)
+                                _report_unavailable_reasoning_preference()
                                 sys.stderr.flush()
                                 continue
                             print("Model selection cancelled.",
@@ -920,6 +994,45 @@ async def async_main(args) -> int:
                     terminal.write_text(
                         repr(current_model()), file=sys.stderr)
                     terminal.write_text(via, file=sys.stderr)
+                    print(file=sys.stderr)
+                    _report_unavailable_reasoning_preference()
+                    sys.stderr.flush()
+                    continue
+                case '/effort':
+                    if _core.current_reasoning_effort_profile() is None:
+                        print(
+                            "The selected model does not advertise reasoning "
+                            "effort choices.",
+                            file=sys.stderr,
+                        )
+                        sys.stderr.flush()
+                        continue
+                    picked = await run_reasoning_effort_picker_async(session)
+                    if picked is None:
+                        print(
+                            "Reasoning effort selection cancelled.",
+                            file=sys.stderr,
+                        )
+                        sys.stderr.flush()
+                        continue
+                    try:
+                        _core.set_reasoning_effort(picked)
+                    except (OSError, ValueError) as error:
+                        _print_text_line(
+                            "Could not change reasoning effort: ",
+                            error,
+                            file=sys.stderr,
+                            multiline=True,
+                        )
+                        sys.stderr.flush()
+                        continue
+                    print("Selected reasoning effort: ", end="",
+                          file=sys.stderr)
+                    terminal.write_text(
+                        _core.reasoning_effort_status_text() or
+                        "Model default",
+                        file=sys.stderr,
+                    )
                     print(file=sys.stderr)
                     sys.stderr.flush()
                     continue

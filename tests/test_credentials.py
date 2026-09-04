@@ -4,7 +4,7 @@ import subprocess
 import sys
 import unittest
 
-from loki_agent import openai_models
+from loki_agent import openai_models, reasonings
 from loki_agent.authentications import (
     CredentialRef,
     OPENAI_CHATGPT_MODELS_REQUEST_URL,
@@ -353,6 +353,12 @@ raise OSError(ctypes.get_errno(), "execve failed")
 
 class ConnectionDescriptorTests(unittest.TestCase):
     def test_round_trip_contains_names_but_no_values(self):
+        effort_profile = reasonings.ReasoningEffortProfile(
+            options=(
+                reasonings.ReasoningEffortOption("low"),
+                reasonings.ReasoningEffortOption("high"),
+            ),
+        )
         descriptor = ConnectionDescriptor(
             provider_id="openrouter",
             provider_name="OpenRouter",
@@ -364,6 +370,7 @@ class ConnectionDescriptorTests(unittest.TestCase):
                 "OPENROUTER_API_KEY"),
             model_status="deprecated",
             prompt_cache=True,
+            reasoning_effort_profile=effort_profile,
         )
 
         encoded = descriptor.to_dict()
@@ -371,6 +378,10 @@ class ConnectionDescriptorTests(unittest.TestCase):
         self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
         self.assertEqual(encoded["model_status"], "deprecated")
         self.assertIs(encoded["prompt_cache"], True)
+        self.assertEqual(
+            encoded["reasoning_effort_profile"],
+            effort_profile.to_dict(),
+        )
         self.assertNotIn("api_url", encoded)
         self.assertNotIn("secret", repr(encoded))
 
