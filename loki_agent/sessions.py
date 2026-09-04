@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-def prompt_cache_key_for_path(path: str) -> str:
-    """Return a stable, non-secret cache partition for one persistent chat."""
+def conversation_id_for_path(path: str) -> str:
+    """Return a stable, non-secret identity for one persistent conversation."""
     real_path = os.path.realpath(path)
     name = os.path.basename(real_path)
     if name.startswith("chat-") and name.endswith(".json"):
@@ -54,14 +54,15 @@ class Session:
     session_state: dict = field(default_factory=dict)
     chat_log_path: str | None = None
     chat_log_dirty: bool = False
-    # One cache partition belongs to one conversation. It is derived again
+    # One opaque identity belongs to one conversation. It is derived again
     # from persistent chat identity on resume rather than trusting an
     # arbitrary value in the chat log. A nonpersistent runtime keeps this
-    # fresh in-memory value for its own lifetime.
+    # fresh in-memory value for its own lifetime. Provider request builders
+    # may use it only where their protocol defines conversation-scoped state.
     #
     # This is not x-codex-turn-state: that routing token is created afresh for
     # every logical user turn.
-    prompt_cache_key: str = field(
+    conversation_id: str = field(
         default_factory=lambda: str(uuid.uuid4()))
 
     # "normal" / "explore" / "plan" / "edit"
@@ -93,7 +94,7 @@ class Session:
         self.session_todos = todos
         self.session_toolsets = toolsets
         self.session_state = dict(state)
-        self.prompt_cache_key = prompt_cache_key_for_path(path)
+        self.conversation_id = conversation_id_for_path(path)
         # Write through the real path, not a symlink naming it.
         self.chat_log_path = os.path.realpath(path) if path else None
         self.chat_log_dirty = False

@@ -50,8 +50,8 @@ from .credentials import (
 )
 from .sessions import (
     Session,
+    conversation_id_for_path,
     default_session,
-    prompt_cache_key_for_path,
 )
 
 # Backwards-compatible public name; the implementation belongs to savefiles.
@@ -193,6 +193,7 @@ HTTP_RETRY_BACKOFF_FACTOR = 2.0
 LLM_IDEMPOTENCY_HEADER_ANTHROPIC = "anthropic-idempotency-key"
 LLM_IDEMPOTENCY_HEADER_OPENAI = "Idempotency-Key"
 CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
+OPENCODE_SESSION_HEADER = "x-opencode-session"
 
 
 @dataclass
@@ -4197,11 +4198,58 @@ def _capture_codex_turn_state(headers, turn_state):
             return
 
 
+_OPENCODE_GO_INFERENCE_PATHS = frozenset({
+    "/zen/go/v1/chat/completions",
+    "/zen/go/v1/messages",
+    "/zen/go/v1/responses",
+})
+
+
+def _opencode_session_id_for_request(
+        config, request_url, supplied_session_id=None):
+    """Return conversation state only for canonical OpenCode Go inference."""
+    if (config is None
+            or request_url != config.chat_provider.chat_url):
+        return None
+    parsed = urllib.parse.urlparse(request_url)
+    try:
+        canonical_target = (
+            parsed.scheme.lower() == "https"
+            and parsed.hostname == "opencode.ai"
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path.rstrip("/") in _OPENCODE_GO_INFERENCE_PATHS
+        )
+    except ValueError:
+        canonical_target = False
+    if not canonical_target:
+        return None
+    if (not isinstance(supplied_session_id, str)
+            or not supplied_session_id):
+        raise ValueError(
+            "OpenCode Go requests require a conversation identity")
+    return supplied_session_id
+
+
+def _prepare_opencode_session_headers(headers, session_id):
+    if session_id is None:
+        return
+    # Provider headers and saved connection data are not authority to choose
+    # conversation identity. Remove any casing variant before installing the
+    # value owned by the current Session.
+    for name in list(headers):
+        if str(name).lower() == OPENCODE_SESSION_HEADER:
+            del headers[name]
+    headers[OPENCODE_SESSION_HEADER] = session_id
+
+
 async def async_provider_request(
         method: str, request_url: str, payload=None,
         request_headers: dict = None, report_errors: bool = False,
         show_timing: bool = False, cancel_check=None,
-        codex_turn_state=None) -> protocols.ProviderResponse:
+        codex_turn_state=None,
+        opencode_session_id=None) -> protocols.ProviderResponse:
     start = time.perf_counter()
     config = current_config()
     method = method.upper()
@@ -4217,6 +4265,10 @@ async def async_provider_request(
     turn_state = (
         _codex_turn_state_for_request(
             config, request_url, codex_turn_state)
+        if method == 'POST' else None)
+    opencode_session_id = (
+        _opencode_session_id_for_request(
+            config, request_url, opencode_session_id)
         if method == 'POST' else None)
 
     base_headers = request_headers
@@ -4251,6 +4303,8 @@ async def async_provider_request(
                 base_headers,
                 rejected_generation,
             ))
+        _prepare_opencode_session_headers(
+            headers_to_use, opencode_session_id)
         transport_options = {
             "body": body,
             "headers_in": headers_to_use,
@@ -4537,13 +4591,16 @@ async def async_chat_stream_request(
         request_url: str, payload, request_headers: dict = None,
         on_text_delta=None, cancel_check=None,
         report_errors: bool = False, show_timing: bool = False,
-        codex_turn_state=None) -> protocols.ProviderResponse:
+        codex_turn_state=None,
+        opencode_session_id=None) -> protocols.ProviderResponse:
     start = time.perf_counter()
     config = current_config()
     callback = on_text_delta or (lambda text: None)
     cancel = cancel_check or (lambda: False)
     turn_state = _codex_turn_state_for_request(
         config, request_url, codex_turn_state)
+    opencode_session_id = _opencode_session_id_for_request(
+        config, request_url, opencode_session_id)
     base_headers = dict(
         request_headers if request_headers is not None
         else (config.chat_provider.headers if config else {}))
@@ -4567,6 +4624,8 @@ async def async_chat_stream_request(
                 base_headers,
                 rejected_generation,
             ))
+        _prepare_opencode_session_headers(
+            headers_to_use, opencode_session_id)
         _prepare_codex_turn_headers(headers_to_use, turn_state)
         transport_attempt += 1
         try:
@@ -4678,12 +4737,17 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             },
         )
 
+    opencode_session_id = _opencode_session_id_for_request(
+        current_config(),
+        current_config().chat_provider.chat_url,
+        current_session().conversation_id,
+    )
     if current_config().stream:
         payload = current_config().chat_provider.streaming_chat_payload(
             transcript_items,
             tools,
             current_model(),
-            prompt_cache_key=current_session().prompt_cache_key,
+            prompt_cache_key=current_session().conversation_id,
         )
         request_kwargs = {
             "request_headers":
@@ -4695,6 +4759,8 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         }
         if codex_turn_state is not None:
             request_kwargs["codex_turn_state"] = codex_turn_state
+        if opencode_session_id is not None:
+            request_kwargs["opencode_session_id"] = opencode_session_id
         response = await async_chat_stream_request(
             current_config().chat_provider.chat_url,
             payload,
@@ -4708,7 +4774,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             transcript_items,
             tools,
             current_model(),
-            prompt_cache_key=current_session().prompt_cache_key,
+            prompt_cache_key=current_session().conversation_id,
         )
         try:
             request_kwargs = {
@@ -4721,6 +4787,8 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                 request_kwargs["cancel_check"] = cancel_check
             if codex_turn_state is not None:
                 request_kwargs["codex_turn_state"] = codex_turn_state
+            if opencode_session_id is not None:
+                request_kwargs["opencode_session_id"] = opencode_session_id
             response = await async_provider_request(
                 "POST",
                 current_config().chat_provider.chat_url,
@@ -4956,7 +5024,7 @@ def resolve_chat_log_path(resume_arg: str) -> str:
 
 def new_chat_log(filename):
     session = current_session()
-    session.prompt_cache_key = prompt_cache_key_for_path(filename)
+    session.conversation_id = conversation_id_for_path(filename)
     session.transcript_items = initial_transcript_items()
     session.session_todos = []
     session.session_toolsets = []

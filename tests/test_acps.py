@@ -1662,7 +1662,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                             [],
                             "gpt-test",
                             prompt_cache_key=(
-                                first_session.prompt_cache_key),
+                                first_session.conversation_id),
                         ))
                     with mock.patch.object(
                             http_client,
@@ -1729,7 +1729,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                             [],
                             "gpt-test",
                             prompt_cache_key=(
-                                resumed_session.prompt_cache_key),
+                                resumed_session.conversation_id),
                         ))
                     with mock.patch.object(
                             http_client,
