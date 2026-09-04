@@ -44,7 +44,7 @@ OPENAI_CHATGPT_MODELS_URL = (
 # claiming that Loki's unrelated package version is a Codex protocol level.
 # Because the complete URL is authorization-allowlisted below, advancing this
 # boundary requires an explicit protocol review and a live model request.
-OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION = "0.144.0"
+OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION = "0.153.0"
 OPENAI_CHATGPT_MODELS_REQUEST_URL = (
     f"{OPENAI_CHATGPT_MODELS_URL}?client_version="
     f"{OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION}")
