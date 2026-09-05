@@ -189,9 +189,9 @@ def serialize_chat_log(events: list, todos: list,
 
 
 def report_chat_log_saved(path: str) -> None:
-    #sys.stdout.flush()
-    #print('Note: Saved chat log in {!r}'.format(path), file=sys.stderr)
-    #sys.stderr.flush()
+    # sys.stdout.flush()
+    # print('Note: Saved chat log in {!r}'.format(path), file=sys.stderr)
+    # sys.stderr.flush()
     pass
 
 
