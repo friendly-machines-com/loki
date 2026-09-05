@@ -1824,8 +1824,8 @@ class ModelLoadingTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 status = asyncio.run(terminal_frontend.async_main([]))
             self.assertEqual(status, 0)
-            self.assertFalse(store.dirty)
-            self.assertTrue(os.path.exists(store.path))
+            saved = Store(store.path).snapshot()["endpoints"]
+            self.assertEqual(saved[0]["headers"]["x-remaining"]["value"], "8")
             current_output, all_output = output.getvalue().split("User: /status all", 1)
             self.assertIn("No active HTTP chat connection", current_output)
             self.assertNotIn("x-remaining", current_output)

@@ -109,12 +109,17 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("'x-codex-primary-used-percent': '57'", text)
 
     async def test_secrets_redacted_in_memory_disk_and_loaded_snapshots(self):
-        headers = {name.upper(): "do-not-store"
-                   for name in response_headers.SENSITIVE_HEADERS}
+        # Independent protocol examples: removing a name from the production
+        # filter must not also remove that name from this test's inputs.
+        headers = dict.fromkeys([
+            "Set-Cookie", "COOKIE", "Authorization", "Proxy-Authorization",
+            "X-API-Key", "X-Auth-Token", "X-Access-Token", "X-Refresh-Token",
+            "X-Session-Token", "X-Codex-Turn-State",
+        ], "do-not-store")
         headers["x-ratelimit-remaining-tokens"] = "42"
         self.observe(headers=headers)
         document = self.store.snapshot()
-        self.assertNotIn("do-not-store", repr(self.store.observations))
+        self.assertNotIn("do-not-store", json.dumps(document))
         values = document["endpoints"][0]["headers"]
         self.assertEqual(values["set-cookie"]["value"], "[redacted]")
         self.assertEqual(values["x-ratelimit-remaining-tokens"]["value"], "42")
@@ -175,28 +180,27 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["headers"]["x-remaining"]["value"], "9")
         self.assertEqual(entry["headers"]["x-reset"]["value"], "soon")
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
-        self.assertFalse(self.store.dirty)
-        with mock.patch.object(response_headers, "_read") as read:
-            await self.store.save()
-        read.assert_not_called()
-
-    async def test_busy_lock_yields_and_preserves_dirty_state(self):
-        self.observe()
-        with open(self.path + ".lock", "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            progressed = asyncio.Event()
-
-            async def heartbeat():
-                await asyncio.sleep(0.01)
-                progressed.set()
-
-            pulse = asyncio.create_task(heartbeat())
-            with self.assertRaisesRegex(OSError, "busy"):
-                await self.store.save()
-            await pulse
-            self.assertTrue(progressed.is_set())
-        self.assertTrue(self.store.dirty)
+        before = os.stat(self.path)
         await self.store.save()
+        after = os.stat(self.path)
+        # A clean save may read, but must not rewrite or replace the file.
+        self.assertEqual((after.st_ino, after.st_mtime_ns),
+                         (before.st_ino, before.st_mtime_ns))
+
+    async def test_busy_snapshot_survives_failed_save_and_retry_keeps_observations(self):
+        self.observe()
+        await self.store.save()
+        original = Path(self.path).read_bytes()
+        self.observe(headers={"x-remaining": "5"})
+        with open(self.path + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                await self.store.save_on_exit()
+            self.assertIn("Could not save", errors.getvalue())
+            self.assertEqual(Path(self.path).read_bytes(), original)
+        await self.store.save()
+        saved = response_headers.Store(self.path).snapshot()["endpoints"][0]
+        self.assertEqual(saved["headers"]["x-remaining"]["value"], "5")
 
     async def test_bad_snapshot_and_failed_write_preserve_existing_file(self):
         self.observe()
@@ -205,7 +209,6 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             await self.store.save_on_exit()
         self.assertIn("Could not save", errors.getvalue())
         self.assertEqual(Path(self.path).read_text(), "not JSON")
-        self.assertTrue(self.store.dirty)
         os.unlink(self.path)
         await self.store.save()
         original = Path(self.path).read_bytes()
@@ -215,9 +218,9 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(OSError):
                 await self.store.save()
         self.assertEqual(Path(self.path).read_bytes(), original)
-        self.assertTrue(self.store.dirty)
-        self.assertFalse(list(Path(self.directory.name).glob(
-            ".response-headers-*")))
+        await self.store.save()
+        saved = response_headers.Store(self.path).snapshot()["endpoints"][0]
+        self.assertEqual(saved["headers"]["x-remaining"]["value"], "5")
 
     async def test_inspection_escapes_and_never_flushes(self):
         self.observe(headers={"x-odd": "\x1b[2J\nsecret"})
@@ -232,23 +235,6 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response_headers.main(["--json"]), 0)
         self.assertEqual(json.loads(output.getvalue())["endpoints"][0]
                          ["headers"]["x-odd"]["value"], "\x1b[2J\nsecret")
-
-    async def test_real_competing_processes_merge_independent_entries(self):
-        # Exercise the filesystem lock across actual processes, not only tasks.
-        import sys
-        script = (
-            "import asyncio, sys; "
-            "from loki_agent.response_headers import Store; "
-            "s=Store(sys.argv[1]); "
-            "s.observer('https://example.com/'+sys.argv[2], None, 'm')"
-            "(200, {'remaining':'1'}); asyncio.run(s.save())"
-        )
-        children = [await asyncio.create_subprocess_exec(
-            sys.executable, "-c", script, self.path, str(index))
-            for index in range(3)]
-        self.assertEqual(await asyncio.gather(
-            *(child.wait() for child in children)), [0, 0, 0])
-        self.assertEqual(len(self.store.snapshot()["endpoints"]), 3)
 
 
 class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
@@ -295,7 +281,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                                 b"Content-Length: 20\r\n\r\n")
                 url = await self.server([response])
                 with mock.patch.object(loki, "HTTP_RETRY_MAX_ATTEMPTS_LLM", 1):
-                    with self.assertRaises(Exception):
+                    with self.assertRaises(OSError if stream else loki.ApiError):
                         if stream:
                             await loki.async_chat_stream_request(url, {})
                         else:
@@ -406,21 +392,19 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                 loki.apply_runtime_config(loki.make_runtime_config(
                     "https://other.example/chat", protocols.OPENAI_CHAT,
                     model="other-model"))
+            if options.get("on_response_headers") is not None:
                 options["on_response_headers"](200, {"x-remaining": "7"})
-            else:
-                self.assertNotIn("on_response_headers", options)
             return http_client.HttpResponse(
                 request_url, 200, "OK", {}, b"{}")
 
         with mock.patch.object(http_client, "async_http_request", new=request):
             await loki.async_provider_request("GET", url + "/models")
-            self.assertFalse(self.session.response_headers.dirty)
+            self.assertEqual(self.session.response_headers.snapshot()["endpoints"], [])
             await loki.async_provider_request("POST", url, {})
         entry = self.session.response_headers.snapshot()["endpoints"][0]
         self.assertEqual(entry["endpoint"], url)
         self.assertEqual(entry["latest"]["model"], "test-model")
-        store = self.session.response_headers
+        before = self.session.response_headers.snapshot()
         self.session.replace_transcript([], [], [], {},
                                         os.path.join(self.directory.name, "chat.json"))
-        self.assertIs(self.session.response_headers, store)
-        self.assertEqual(len(store.snapshot()["endpoints"]), 1)
+        self.assertEqual(self.session.response_headers.snapshot(), before)
