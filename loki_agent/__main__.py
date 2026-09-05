@@ -93,6 +93,9 @@ def main() -> int:
         protect_credential_process()
     except ProcessProtectionError as error:
         return _report_security_error(error)
+    if sys.argv[1:2] == ["status"]:
+        from .response_headers import main as status_main
+        return status_main(sys.argv[2:])
     if sys.argv[1:2] == ["auth"]:
         from .authentication_commands import main as authentication_main
         return authentication_main(

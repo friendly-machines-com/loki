@@ -283,8 +283,11 @@ async def async_main(args) -> int:
         return 0 if completed else 1
     finally:
         session.subagent_depth = previous_depth
-        if runtime is not None:
-            await runtime.close()
+        try:
+            await session.response_headers.save_on_exit()
+        finally:
+            if runtime is not None:
+                await runtime.close()
 
 
 def main(args) -> int:

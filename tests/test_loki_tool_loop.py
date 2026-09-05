@@ -1803,6 +1803,34 @@ class ModelLoadingTests(unittest.TestCase):
             "Authorization",
             loki.current_config().chat_provider.headers)
 
+    def test_status_commands_inspect_and_save_without_sending_chat(self):
+        from loki_agent.response_headers import Store
+        loki.CREDENTIALS = CredentialStore({})
+        session = ScriptedInputSession([
+            "/status", "/status --json", "/status save", "/quit"])
+        runner = mock.AsyncMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Store(os.path.join(tmpdir, "status.json"))
+            store.observer("https://example.test/chat", None, "test")(
+                200, {"x-remaining": "8"})
+            with mock.patch.object(loki.current_session(), "response_headers", store), \
+                    mock.patch.object(terminal_frontend, "input_session",
+                                      return_value=session), \
+                    mock.patch.object(terminal_frontend, "new_chat_log_path",
+                                      return_value=os.path.join(tmpdir, "chat.json")), \
+                    mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                    mock.patch.object(terminal_frontend, "run_terminal_turn_async", runner), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                status = asyncio.run(terminal_frontend.async_main([]))
+            self.assertEqual(status, 0)
+            self.assertFalse(store.dirty)
+            self.assertTrue(os.path.exists(store.path))
+            self.assertIn("x-remaining", output.getvalue())
+            self.assertIn("Response status saved", output.getvalue())
+        runner.assert_not_awaited()
+        self.assertFalse(any(formats.item_text(item).startswith("/status")
+                             for item in loki.current_transcript()))
+
     def test_chat_request_without_a_model_is_not_sent(self):
         loki.CREDENTIALS = CredentialStore({
             "LOKI_API_BASE":
@@ -5704,7 +5732,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None):
+                codex_turn_state=None, observe=None):
             calls.append(dict(headers))
             if len(calls) == 1:
                 raise loki.StreamingApiError(
@@ -5734,7 +5762,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None):
+                codex_turn_state=None, observe=None):
             calls.append(dict(headers))
             if len(calls) < 3:
                 raise protocols.ResponseApiError(
@@ -5969,7 +5997,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None):
+                codex_turn_state=None, observe=None):
             observed.append(dict(headers))
             return protocols.ProviderResponse({
                 "object": "response",
@@ -6243,7 +6271,7 @@ class StreamingCompletionTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None):
+                codex_turn_state=None, observe=None):
             observed.append((dict(headers), codex_turn_state))
             return protocols.ProviderResponse({
                 "object": "response",

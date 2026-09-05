@@ -4440,6 +4440,16 @@ def _prepare_opencode_session_headers(headers, session_id):
     headers[OPENCODE_SESSION_HEADER] = session_id
 
 
+def _chat_response_observer(config, request_url):
+    if config is None or request_url != config.chat_provider.chat_url:
+        return None
+    provider = config.chat_provider
+    credential = config.auth_spec.credential if config.auth_spec else None
+    return current_session().response_headers.observer(
+        request_url, credential.encode() if credential else None,
+        config.model, provider.provider_id, provider.provider_name)
+
+
 async def async_provider_request(
         method: str, request_url: str, payload=None,
         request_headers: dict = None, report_errors: bool = False,
@@ -4449,6 +4459,8 @@ async def async_provider_request(
     start = time.perf_counter()
     config = current_config()
     method = method.upper()
+    observe = (_chat_response_observer(config, request_url)
+               if method == "POST" else None)
     if method not in {"GET", "POST"}:
         raise ValueError("provider request method must be GET or POST")
     if method == "GET" and payload is not None:
@@ -4512,16 +4524,18 @@ async def async_provider_request(
             "retry_backoff_factor": HTTP_RETRY_BACKOFF_FACTOR,
             "cancel_check": cancel_check,
         }
+
+        def on_response_headers(status, headers):
+            if observe is not None:
+                observe(status, headers)
+            if 200 <= status < 300:
+                _capture_codex_turn_state(headers, turn_state)
+
+        if observe is not None or turn_state is not None:
+            transport_options["on_response_headers"] = on_response_headers
         if turn_state is not None:
-            transport_options.update({
-                "prepare_attempt_headers": (
-                    lambda headers: _prepare_codex_turn_headers(
-                        headers, turn_state)),
-                "on_response_headers": (
-                    lambda status, headers: _capture_codex_turn_state(
-                        headers, turn_state)
-                    if 200 <= status < 300 else None),
-            })
+            transport_options["prepare_attempt_headers"] = (
+                lambda headers: _prepare_codex_turn_headers(headers, turn_state))
         response = await http_client.async_http_request(
             method,
             request_url,
@@ -4661,7 +4675,7 @@ async def _first_body_chunk(iterator, cancel_check):
 
 async def _async_chat_stream_request_once(
         request_url, payload, request_headers, on_text_delta, cancel_check,
-        codex_turn_state=None) -> protocols.ProviderResponse:
+        codex_turn_state=None, observe=None) -> protocols.ProviderResponse:
     body = json.dumps(payload).encode("utf-8")
     async with http_client.async_http_stream(
             "POST",
@@ -4671,6 +4685,8 @@ async def _async_chat_stream_request_once(
             timeout=LLM_STREAM_IDLE_TIMEOUT_S,
             max_bytes=HTTP_MAX_RESPONSE_BYTES,
             cancel_check=cancel_check) as response:
+        if observe is not None:
+            observe(response.status, response.headers)
         effective_model = (
             protocols.openai_response_model_header(response.headers)
             if codex_turn_state is not None else None)
@@ -4791,6 +4807,7 @@ async def async_chat_stream_request(
         opencode_session_id=None) -> protocols.ProviderResponse:
     start = time.perf_counter()
     config = current_config()
+    observe = _chat_response_observer(config, request_url)
     callback = on_text_delta or (lambda text: None)
     cancel = cancel_check or (lambda: False)
     turn_state = _codex_turn_state_for_request(
@@ -4827,7 +4844,7 @@ async def async_chat_stream_request(
         try:
             response = await _async_chat_stream_request_once(
                 request_url, payload, headers_to_use, callback, cancel,
-                codex_turn_state=turn_state)
+                codex_turn_state=turn_state, observe=observe)
             break
         except http_client.HttpRequestCancelled:
             raise StreamCancelled()

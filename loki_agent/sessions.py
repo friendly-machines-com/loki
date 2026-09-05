@@ -13,6 +13,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from .response_headers import Store
+
 
 def conversation_id_for_path(path: str) -> str:
     """Return a stable, non-secret identity for one persistent conversation."""
@@ -42,6 +44,9 @@ class Session:
 
     # RuntimeConfig, or None before startup config is applied.
     runtime_config: Any = None
+    # The single-session inference runtime owns this diagnostic store. It is
+    # deliberately not serialized or replaced when switching conversations.
+    response_headers: Store = field(default_factory=Store)
     # A conversation preference, distinct from the selected model's
     # capabilities. None follows each model's own default. An unsupported
     # concrete value remains dormant so it can become active again after a

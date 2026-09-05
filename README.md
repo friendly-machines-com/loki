@@ -10,6 +10,50 @@ Runs on ECMA-48 console (tested with "foot" terminal on Linux).
 
 Supports Anthropic and OpenAI protocols.
 
+## HTTP response status
+
+`/status` in the terminal shows the latest observed HTTP chat response headers,
+merged with saved observations. `/status --json` shows the same data as JSON.
+`/status save` explicitly saves this runtime's observations. These commands do
+not make provider requests or send the observations to a model.
+
+Outside a session, use `./loki.py status`, `./loki.py status --json`, or
+`./loki.py status --endpoint https://example.com/v1/chat/completions` to inspect
+saved observations without starting an inference runtime. To try a provider,
+select it normally and send a short prompt; both successful and error responses
+are collected automatically. Header values are raw observations, not interpreted
+quota, billing, or token-usage counters.
+
+Identity is the inference endpoint URL plus the existing non-secret credential
+reference. Provider IDs/names are optional informational labels, independent of
+models.dev. URL userinfo, queries, and fragments are discarded; query-selected
+endpoints therefore share observations. Scheme/host casing and default ports are
+normalized, but endpoint paths remain distinct. A credential reference identifies
+a configured credential slot, not a verified account: replacing its credential
+continues the same observations.
+
+Each header name has one last-observed value, timestamp, HTTP status, and model.
+Headers absent from a later response are retained and marked as such. There is
+no history. Each terminal/headless runtime, ACP worker, and subagent keeps its own
+in-memory observations and saves on orderly exit, with no periodic or per-request
+writes. Independent writers merge by observation time under a bounded file lock.
+An older process exiting later cannot replace newer observations. Wall-clock
+accuracy affects ordering between processes. Crashes or forced termination can
+lose pending observations. Other live workers' unsaved memory is not visible to
+`/status` or the standalone command; `/status save` only flushes this runtime.
+
+The snapshot is `$XDG_STATE_HOME/loki/response-headers.json` (normally
+`~/.local/state/loki/response-headers.json`), written by atomic replacement with
+mode 0600. Only response headers are observed, never request headers. Known
+secret-bearing fields (cookies, authorization/API keys, session tokens, and
+Codex routing state) retain their names but have values replaced by `[redacted]`
+before entering diagnostic memory. Token-budget and rate-limit fields remain
+intact. This is a name-based filter, not a guarantee that arbitrary provider
+headers contain no secrets; do not publish the snapshot unreviewed. Values are
+escaped for terminal display and never replayed as request headers. Invalid snapshots
+are reported rather than overwritten; remove the file manually to start over.
+This is best-effort diagnostic state, not credential storage or durable accounting.
+
 ## How to run
 
 Run it in a VM or container.

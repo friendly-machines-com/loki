@@ -105,7 +105,10 @@ async def amain(owner_fd: int, capability_fd: int) -> int:
         completed, result = await runtime.run(serve())
         return result if completed else 1
     finally:
-        await runtime.close()
+        try:
+            await session.response_headers.save_on_exit()
+        finally:
+            await runtime.close()
 
 
 def _descriptor(value: str, description: str) -> int:

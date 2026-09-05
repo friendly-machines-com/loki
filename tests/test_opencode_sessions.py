@@ -110,7 +110,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None):
+                codex_turn_state=None, observe=None):
             requests.append(dict(headers))
             return protocols.ProviderResponse({})
 

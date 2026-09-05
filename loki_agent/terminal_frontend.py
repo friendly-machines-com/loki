@@ -677,6 +677,8 @@ Options:
   -h, --help              show this help and exit
 
 Without options, loki starts the interactive TUI.
+Use /status, /status --json, or /status save to inspect/save response headers.
+Use loki status [--json] [--endpoint URL] to inspect saved response headers.
 """
 
 
@@ -890,6 +892,27 @@ async def async_main(args) -> int:
             match command_text:
                 case '/quit':
                     break
+                case '/status' | '/status --json':
+                    from . import response_headers
+                    try:
+                        document = current_session().response_headers.snapshot()
+                        text = (json.dumps(document, indent=2, ensure_ascii=True)
+                                if command_text.endswith('--json')
+                                else response_headers.render(document))
+                        terminal.write_text(text, multiline=True)
+                        print()
+                    except (OSError, ValueError, OverflowError) as error:
+                        _print_text_line("Could not read response status: ",
+                                         error, file=sys.stderr)
+                    continue
+                case '/status save':
+                    try:
+                        await current_session().response_headers.save()
+                        print("Response status saved (this runtime only).")
+                    except (OSError, ValueError) as error:
+                        _print_text_line("Could not save response status: ",
+                                         error, file=sys.stderr)
+                    continue
                 case '/model':
                     explicit_option = explicit_connection_option(_core.CREDENTIALS)
                     async with session.modal() as modal:
@@ -1296,8 +1319,11 @@ async def _run_credential_runtime(
         completed, result = await runtime.run(_run_frontend(args))
         return result if completed else 1
     finally:
-        if runtime is not None:
-            await runtime.close()
+        try:
+            await current_session().response_headers.save_on_exit()
+        finally:
+            if runtime is not None:
+                await runtime.close()
 
 
 def main(args, owner_fd: int, capability_fd: int) -> int:
