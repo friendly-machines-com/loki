@@ -7,6 +7,7 @@ import random
 import types
 import unittest
 from unittest import mock
+from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 
 from loki_agent import formats

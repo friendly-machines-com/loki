@@ -8,6 +8,8 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from response_header_fixtures import isolated_response_headers
+from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import http_client, loki, protocols, response_headers
 from loki_agent.sessions import Session
@@ -25,6 +27,28 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         (store or self.store).observer(
             "https://example.com/chat", credential, model, provider)(
                 status, headers or {"x-remaining": "10"})
+
+    async def test_runtime_cleanup_uses_fixture_storage_not_preexisting_user_state(self):
+        protected = Path(self.path)
+        protected.write_bytes(b"user-owned status must not be read or changed")
+        original = protected.read_bytes()
+        existing_session = Session(response_headers=response_headers.Store(self.path))
+        with mock.patch.object(response_headers, "snapshot_path", return_value=self.path), \
+                mock.patch.object(loki, "_DEFAULT_SESSION", existing_session):
+            with isolated_response_headers() as isolated_path:
+                # Cover both the session created before fixture setup and new
+                # sessions created by worker/subagent tests after setup.
+                for index, session in enumerate((loki.current_session(), Session())):
+                    session.response_headers.observer(
+                        f"https://test.example/{index}", None, "test-model")(
+                            200, {"content-type": "application/json"})
+                    await session.response_headers.save_on_exit()
+                saved = response_headers.Store(isolated_path).snapshot()["endpoints"]
+                self.assertEqual({entry["endpoint"] for entry in saved}, {
+                    "https://test.example/0", "https://test.example/1"})
+                self.assertEqual(protected.read_bytes(), original)
+        self.assertFalse(Path(isolated_path).exists())
+        self.assertEqual(protected.read_bytes(), original)
 
     async def test_updates_keys_retains_absent_and_does_not_write(self):
         with mock.patch.object(response_headers.time, "time_ns", return_value=1):
