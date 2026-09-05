@@ -296,10 +296,7 @@ def render(document):
         lines.append(f"Provider (informational): {ascii(latest['provider_id'])}")
         lines.append(f"Latest response: HTTP {latest['status']}; "
                      f"model {ascii(latest['model'])}")
-        summary = _codex_quota_summary(entry)
-        if summary:
-            lines.extend(summary)
-            lines.append("Response headers:")
+        lines.append("Response headers:")
         for name, observation in sorted(entry["headers"].items()):
             stamp = datetime.fromtimestamp(
                 observation["observed_at_ns"] / 1e9, timezone.utc).isoformat()
@@ -308,6 +305,10 @@ def render(document):
                 f"  {ascii(name)}: {ascii(observation['value'])} "
                 f"[{stamp}; HTTP {observation['status']}; "
                 f"model {ascii(observation['model'])}{retained}]")
+        lines.append("")
+        summary = _codex_quota_summary(entry)
+        if summary:
+            lines.extend(summary)
         lines.append("")
     return "\n".join(lines).rstrip()
 
