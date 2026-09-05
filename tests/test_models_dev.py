@@ -827,6 +827,7 @@ class GroupingTests(unittest.TestCase):
         # attachment is on openrouter but not zhipuai, so the union includes it.
         self.assertEqual(bits, (True, True, True, True, True, False))
 
+
 class ProtocolAndKeyTests(unittest.TestCase):
     def test_provider_supported_accepts_endpoint_and_v1_base(self):
         self.assertTrue(models.provider_supported({"api": "https://x.test/v1/chat/completions"}))

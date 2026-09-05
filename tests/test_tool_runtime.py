@@ -400,10 +400,16 @@ class ExternalHookTests(unittest.TestCase):
                         "command": [sys.executable, "-c", script],
                     }],
                 }, stream)
-            with mock.patch.dict(os.environ, {
-                    "LOKI_API_KEY": "secret",
-                    "UNRELATED_SECRET": "secret",
-            }, clear=False):
+            source_environ = dict(os.environ)
+            source_environ.update({
+                "LOKI_API_KEY": "secret",
+                "UNRELATED_SECRET": "secret",
+            })
+            with mock.patch.object(
+                    tool_runtime,
+                    "_hook_environment",
+                    return_value=tool_runtime._hook_environment(
+                        source_environ)):
                 pipeline = tool_runtime.load_hook_pipeline(config_path)
                 invocation = tool_runtime.ToolInvocation(
                     call_id="call_external",

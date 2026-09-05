@@ -758,13 +758,14 @@ async def _read_stream_limited(stream, limit):
         chunks.append(chunk)
 
 
-def _hook_environment():
+def _hook_environment(environ=None):
+    source_environ = os.environ if environ is None else environ
     allowed = {
         "HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "SHELL",
         "TERM", "TMPDIR", "USER",
     }
     return {
-        key: value for key, value in os.environ.items()
+        key: value for key, value in source_environ.items()
         if key in allowed or key.startswith("LC_")
     }
 

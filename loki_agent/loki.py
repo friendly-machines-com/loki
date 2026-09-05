@@ -3350,9 +3350,10 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
     return "\n".join(parts)
 
 
-def _subagent_env(reasoning_effort=_UNSET) -> dict:
+def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
+    source_environ = os.environ if environ is None else environ
     env = {
-        name: value for name, value in os.environ.items()
+        name: value for name, value in source_environ.items()
         if not is_credential_name(name)
     }
     # Subagents receive only non-secret provider configuration. The request

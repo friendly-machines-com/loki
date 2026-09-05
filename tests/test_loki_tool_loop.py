@@ -5442,26 +5442,25 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_environment_contains_no_request_secret(self):
         names = ["runtime_config"]
         old_values = save_loki_state(names)
-        env = {
+        source_env = {
             "PATH": os.environ.get("PATH", ""),
             "OPENROUTER_API_KEY": "unrelated-key",
         }
-        CredentialStore.capture(env)
+        CredentialStore.capture(dict(source_env))
         try:
-            with mock.patch.dict(os.environ, env, clear=True):
-                loki.apply_runtime_config(loki.make_runtime_config(
-                    "https://example.test/v1",
-                    protocols.OPENAI_CHAT,
-                    model="active-model",
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "EXAMPLE_API_KEY")),
-                    models_url="https://example.test/custom-models",
-                    max_tokens=12345,
-                    anthropic_version="2026-01-02",
-                    auth_header="X-Custom-Key",
-                ))
-                child_env = loki._subagent_env()
+            loki.apply_runtime_config(loki.make_runtime_config(
+                "https://example.test/v1",
+                protocols.OPENAI_CHAT,
+                model="active-model",
+                credential_ref=(
+                    authentications.CredentialRef.environment(
+                        "EXAMPLE_API_KEY")),
+                models_url="https://example.test/custom-models",
+                max_tokens=12345,
+                anthropic_version="2026-01-02",
+                auth_header="X-Custom-Key",
+            ))
+            child_env = loki._subagent_env(environ=source_env)
         finally:
             restore_loki_state(old_values)
 
@@ -5486,16 +5485,14 @@ class SubagentLaunchTests(unittest.TestCase):
         names = ["runtime_config"]
         old_values = save_loki_state(names)
         try:
-            with mock.patch.dict(
-                    os.environ, {"LOKI_API_KEY": "must-not-leak"},
-                    clear=True):
-                loki.apply_runtime_config(loki.make_runtime_config(
-                    "http://localhost:8000/v1",
-                    protocols.OPENAI_CHAT,
-                    model="local-model",
-                    stream=True,
-                ))
-                child_env = loki._subagent_env()
+            loki.apply_runtime_config(loki.make_runtime_config(
+                "http://localhost:8000/v1",
+                protocols.OPENAI_CHAT,
+                model="local-model",
+                stream=True,
+            ))
+            child_env = loki._subagent_env(
+                environ={"LOKI_API_KEY": "must-not-leak"})
         finally:
             restore_loki_state(old_values)
 

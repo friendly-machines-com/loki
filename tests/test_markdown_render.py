@@ -3,7 +3,6 @@
 import asyncio
 import contextlib
 import io
-import os
 import random
 import types
 import unittest
