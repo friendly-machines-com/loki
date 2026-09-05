@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import pty
+import re
 import select
 import shutil
 import signal
@@ -374,6 +375,9 @@ class PtyUiTests(unittest.TestCase):
             queued_inputs=["second", "third"],
         )
 
+        # These assertions concern queue transitions, independently of styling.
+        before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
+        output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
         self.assertIn(b"queued messages: 1, queued images: 0", before_release)
         self.assertIn(b"queued messages: 2, queued images: 0", before_release)
         self.assertIn(
@@ -394,6 +398,9 @@ class PtyUiTests(unittest.TestCase):
             create_image=True,
         )
 
+        # These assertions concern queue transitions, independently of styling.
+        before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
+        output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
         self.assertIn(b"queued messages: 1, queued images: 0", before_release)
         self.assertIn(b"queued messages: 0, queued images: 1", output)
 

@@ -2415,6 +2415,28 @@ class ExitStatusTests(unittest.TestCase):
 
 
 class StatusTextTests(unittest.TestCase):
+    def test_status_bar_bolds_only_nonidle_and_nonzero_activity_values(self):
+        for running, messages, images in (
+                (True, 0, 0), (False, 2, 0), (False, 0, 3),
+                (True, 2, 3), (False, 0, 0)):
+            with self.subTest(running=running, messages=messages, images=images):
+                activity = terminal_frontend.TerminalActivityStatus(
+                    turn_running=running, queued_messages=messages, queued_images=images)
+                with mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    terminal_frontend._write_status_text()
+                rendered = output.getvalue()
+                for label, value, bold in (
+                        ("turn", "running" if running else "idle", running),
+                        ("queued messages", str(messages), messages != 0),
+                        ("queued images", str(images), images != 0)):
+                    expected = f"\033[1m{value}\033[22m" if bold else value
+                    self.assertIn(f"{label}: {expected},", rendered)
+                self.assertEqual(rendered.count("\033[1m"),
+                                 sum((running, messages != 0, images != 0)))
+                self.assertNotIn("\033[0m", rendered)
+                self.assertNotIn("\033[", terminal_frontend.status_text(activity))
+
     def test_remote_side_advertises_status_with_and_without_effort(self):
         for effort in (None, "high"):
             with self.subTest(effort=effort), mock.patch.object(

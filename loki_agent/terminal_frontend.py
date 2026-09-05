@@ -556,11 +556,17 @@ def _write_status_text():
         print("; /model, /effort, /status\nLocal: turn: ", end="")
     else:
         print("; /model, /status\nLocal: turn: ", end="")
-    terminal.write_text(fields["turn"])
-    print(", queued messages: ", end="")
-    terminal.write_text(str(fields["queued_messages"]))
-    print(", queued images: ", end="")
-    terminal.write_text(str(fields["queued_images"]))
+    for label, value, active in (
+            ("", fields["turn"], fields["turn"] != "idle"),
+            (", queued messages: ", fields["queued_messages"], fields["queued_messages"] != 0),
+            (", queued images: ", fields["queued_images"], fields["queued_images"] != 0)):
+        print(label, end="")
+        if active:
+            print(terminals.BOLD, end="")
+        terminal.write_text(str(value))
+        if active:
+            # End only bold, preserving the status area's background color.
+            print(terminals.BOLD_OFF, end="")
     print(", mode: ", end="")
     terminal.write_text(fields["mode"])
     print(", CWD: ", end="")
