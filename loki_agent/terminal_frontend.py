@@ -527,10 +527,10 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
     remote = 'Remote: API: {}; Model: {}'.format(
         fields["api"], fields["model"])
     if fields["effort"] is not None:
-        remote += '; Effort: {}; /model, /effort'.format(
+        remote += '; Effort: {}; /model, /effort, /status'.format(
             fields["effort"])
     else:
-        remote += '; /model'
+        remote += '; /model, /status'
     return (
         remote + '\n'
         'Local: turn: {}, queued messages: {}, queued images: {}, '
@@ -553,9 +553,9 @@ def _write_status_text():
     if fields["effort"] is not None:
         print("; Effort: ", end="")
         terminal.write_text(fields["effort"])
-        print("; /model, /effort\nLocal: turn: ", end="")
+        print("; /model, /effort, /status\nLocal: turn: ", end="")
     else:
-        print("; /model\nLocal: turn: ", end="")
+        print("; /model, /status\nLocal: turn: ", end="")
     terminal.write_text(fields["turn"])
     print(", queued messages: ", end="")
     terminal.write_text(str(fields["queued_messages"]))
@@ -677,7 +677,8 @@ Options:
   -h, --help              show this help and exit
 
 Without options, loki starts the interactive TUI.
-Use /status, /status --json, or /status save to inspect/save response headers.
+Use /status for the current connection, /status all for all known connections.
+Add --json for JSON; /status save saves this runtime's response observations.
 Use loki status [--json] [--endpoint URL] to inspect saved response headers.
 """
 
@@ -892,13 +893,41 @@ async def async_main(args) -> int:
             match command_text:
                 case '/quit':
                     break
-                case '/status' | '/status --json':
+                case ('/status' | '/status --json' | '/status all'
+                      | '/status all --json' | '/status --json all'):
                     from . import response_headers
                     try:
-                        document = current_session().response_headers.snapshot()
-                        text = (json.dumps(document, indent=2, ensure_ascii=True)
-                                if command_text.endswith('--json')
-                                else response_headers.render(document))
+                        show_all = 'all' in command_text.split()
+                        as_json = '--json' in command_text.split()
+                        config = current_config()
+                        connected = (config is not None
+                                     and config.chat_provider.kind != protocols.DUMMY)
+                        store = current_session().response_headers
+                        if show_all:
+                            document = store.snapshot()
+                        elif connected:
+                            credential = (config.auth_spec.credential
+                                          if config.auth_spec else None)
+                            document = store.snapshot(
+                                config.chat_provider.chat_url,
+                                credential=credential.encode() if credential else None)
+                        else:
+                            document = {"version": 1, "endpoints": []}
+                        if as_json:
+                            text = json.dumps(document, indent=2, ensure_ascii=True)
+                        else:
+                            scope = ("All known connections" if show_all
+                                     else "Current endpoint and credential")
+                            text = (
+                                f"{scope} (last observed, not live balances).\n"
+                                "Saved observations plus this runtime's memory; other "
+                                "runtimes' unsaved observations are not visible.\n")
+                            if not show_all and not connected:
+                                text += "No active HTTP chat connection. Use /status all."
+                            elif not show_all and not document["endpoints"]:
+                                text += "No observations for the current connection."
+                            else:
+                                text += response_headers.render(document)
                         terminal.write_text(text, multiline=True)
                         print()
                     except (OSError, ValueError, OverflowError) as error:

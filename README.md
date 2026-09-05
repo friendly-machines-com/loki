@@ -12,17 +12,28 @@ Supports Anthropic and OpenAI protocols.
 
 ## HTTP response status
 
-`/status` in the terminal shows the latest observed HTTP chat response headers,
-merged with saved observations. `/status --json` shows the same data as JSON.
-`/status save` explicitly saves this runtime's observations. These commands do
-not make provider requests or send the observations to a model.
+`/status` in the terminal shows last-observed HTTP chat response headers for the
+current endpoint and credential reference only, merged with saved observations.
+`/status all` explicitly shows all known connections. Add `--json` to either
+command for JSON output. With no active HTTP connection, `/status` reports that
+rather than falling back to all connections. Neither view is globally live:
+other runtimes' unsaved observations are not visible, even for the same endpoint.
+`/status save` explicitly saves all this runtime's pending observations. These
+commands do not make provider requests or send the observations to a model.
 
 Outside a session, use `./loki.py status`, `./loki.py status --json`, or
 `./loki.py status --endpoint https://example.com/v1/chat/completions` to inspect
-saved observations without starting an inference runtime. To try a provider,
+saved observations without starting an inference runtime. The standalone command
+has no active connection and shows all saved connections unless filtered by URL.
+To try a provider,
 select it normally and send a short prompt; both successful and error responses
-are collected automatically. Header values are raw observations, not interpreted
-quota, billing, or token-usage counters.
+are collected automatically. For the ChatGPT Codex endpoint, readable status also
+shows a plain-text subscription summary above the raw headers: used/remaining
+percentages and the reported window duration for each bucket. Zero-length or
+invalid windows are omitted, retained observations are marked, and usage/window
+values from different responses are not combined. These are reported quota
+percentages, not token counts or billing balances. JSON and saved observations
+remain unchanged; the summary is derived only for display.
 
 Identity is the inference endpoint URL plus the existing non-secret credential
 reference. Provider IDs/names are optional informational labels, independent of

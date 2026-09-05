@@ -1807,7 +1807,8 @@ class ModelLoadingTests(unittest.TestCase):
         from loki_agent.response_headers import Store
         loki.CREDENTIALS = CredentialStore({})
         session = ScriptedInputSession([
-            "/status", "/status --json", "/status save", "/quit"])
+            "/status", "/status --json", "/status all", "/status all --json",
+            "/status save", "/quit"])
         runner = mock.AsyncMock()
         with tempfile.TemporaryDirectory() as tmpdir:
             store = Store(os.path.join(tmpdir, "status.json"))
@@ -1825,11 +1826,58 @@ class ModelLoadingTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertFalse(store.dirty)
             self.assertTrue(os.path.exists(store.path))
-            self.assertIn("x-remaining", output.getvalue())
+            current_output, all_output = output.getvalue().split("User: /status all", 1)
+            self.assertIn("No active HTTP chat connection", current_output)
+            self.assertNotIn("x-remaining", current_output)
+            self.assertIn('"endpoints": []', current_output)
+            self.assertIn("x-remaining", all_output)
+            self.assertIn("All known connections", all_output)
+            self.assertIn("unsaved observations are not visible", all_output)
             self.assertIn("Response status saved", output.getvalue())
         runner.assert_not_awaited()
         self.assertFalse(any(formats.item_text(item).startswith("/status")
                              for item in loki.current_transcript()))
+
+    def test_status_defaults_to_current_endpoint_and_credential(self):
+        from loki_agent.response_headers import Store
+        endpoint = "https://example.test/v1/chat/completions"
+        for authenticated in (False, True):
+            with self.subTest(authenticated=authenticated), \
+                    tempfile.TemporaryDirectory() as tmpdir:
+                environment = {"LOKI_API_BASE": endpoint, "LOKI_MODEL": "model"}
+                credential = None
+                if authenticated:
+                    environment["LOKI_API_KEY"] = "test-key"
+                    credential = "env:LOKI_API_KEY"
+                loki.CREDENTIALS = CredentialStore(environment)
+                store = Store(os.path.join(tmpdir, "status.json"))
+                store.observer(endpoint, credential, "model")(
+                    200, {"selected-only": "1"})
+                store.observer(endpoint, "env:OTHER", "model")(
+                    200, {"other-credential-only": "2"})
+                store.observer("https://other.example/chat", credential, "model")(
+                    200, {"other-endpoint-only": "3"})
+                session = ScriptedInputSession([
+                    "/status", "/status --json", "/status all", "/quit"])
+                runner = mock.AsyncMock()
+                with mock.patch.object(loki.current_session(), "response_headers", store), \
+                        mock.patch.object(terminal_frontend, "input_session",
+                                          return_value=session), \
+                        mock.patch.object(terminal_frontend, "new_chat_log_path",
+                                          return_value=os.path.join(tmpdir, "chat.json")), \
+                        mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                        mock.patch.object(terminal_frontend, "run_terminal_turn_async", runner), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+                current_output, all_output = output.getvalue().split("User: /status all", 1)
+                self.assertIn("selected-only", current_output)
+                self.assertNotIn("other-credential-only", current_output)
+                self.assertNotIn("other-endpoint-only", current_output)
+                self.assertIn("Current endpoint and credential", current_output)
+                self.assertIn("last observed, not live balances", current_output)
+                self.assertIn("other-credential-only", all_output)
+                self.assertIn("other-endpoint-only", all_output)
+                runner.assert_not_awaited()
 
     def test_chat_request_without_a_model_is_not_sent(self):
         loki.CREDENTIALS = CredentialStore({
@@ -2366,6 +2414,19 @@ class ExitStatusTests(unittest.TestCase):
 
 
 class StatusTextTests(unittest.TestCase):
+    def test_remote_side_advertises_status_with_and_without_effort(self):
+        for effort in (None, "high"):
+            with self.subTest(effort=effort), mock.patch.object(
+                    loki, "reasoning_effort_status_text", return_value=effort):
+                text = terminal_frontend.status_text()
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    terminal_frontend._write_status_text()
+            for rendered in (text, output.getvalue()):
+                remote, local = rendered.split("\n", 1)
+                self.assertIn("/status", remote)
+                self.assertNotIn("/status", local)
+                self.assertEqual("/effort" in remote, effort is not None)
+
     def test_activity_status_redraws_only_for_changed_counts(self):
         activity = terminal_frontend.TerminalActivityStatus()
 
@@ -2415,7 +2476,7 @@ class StatusTextTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "Remote: API: example.test:8443/base/path; Model: model-x; /model\n"
+            "Remote: API: example.test:8443/base/path; Model: model-x; /model, /status\n"
             "Local: turn: running, queued messages: 2, queued images: 1, "
             f"mode: {loki.current_agent_mode()}, CWD: {loki.STARTUP_CWD}; "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
