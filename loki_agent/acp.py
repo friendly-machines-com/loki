@@ -64,9 +64,9 @@ class WorkerChannel:
             name=f"acp-worker-reader-{session_id}",
         )
 
-    async def start_request(
-            self, method: str, params: dict) -> asyncio.Future:
-        """Write a request before returning its independently awaited reply."""
+    async def request(
+            self, method: str, params: dict,
+            forwarded: asyncio.Event | None = None):
         if self._closed or self.process.returncode is not None:
             raise acps.TransportError(
                 f"worker for {self.session_id} is not running")
@@ -75,8 +75,6 @@ class WorkerChannel:
             f"front-{self.session_id}-{self._next_request_id}")
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        future.add_done_callback(
-            lambda _future: self._pending.pop(request_id, None))
         try:
             message = acps.request(request_id, method, params)
             encoded = (
@@ -88,16 +86,11 @@ class WorkerChannel:
                         f"worker for {self.session_id} is closed")
                 self.process.stdin.write(encoded)
                 await self.process.stdin.drain()
-        except BaseException:
+            if forwarded is not None:
+                forwarded.set()
+            return await future
+        finally:
             self._pending.pop(request_id, None)
-            if not future.done():
-                future.cancel()
-            raise
-        return future
-
-    async def request(self, method: str, params: dict):
-        future = await self.start_request(method, params)
-        return await future
 
     async def _read_messages(self):
         failure = None
@@ -248,19 +241,14 @@ class Front:
                 "session/cancel", "session/close"):
             return
         if method == "session/prompt":
-            # Commit the prompt to the worker pipe before reading another
-            # client message. Waiting for its reply remains concurrent, so
-            # cancellation and next-turn configuration stay routable.
-            try:
-                future = await self.start_forward_to_worker(
-                    method, message.get("params") or {})
-            except Exception as error:
-                self._write_answer_error(request_id, error)
-                return
+            forwarded = asyncio.Event()
             self._start_task(
-                self._answer_pending(request_id, future),
+                self._answer(message, forwarded=forwarded),
                 name=f"acp-client-request-{request_id}",
             )
+            # Preserve client order only until the request reaches the worker;
+            # its long-running reply remains concurrent with cancellation.
+            await forwarded.wait()
             return
         if method in RESTORE_METHODS:
             # The transport loop must remain free to route cancellation and
@@ -279,28 +267,6 @@ class Front:
             return
         await self._answer(message)
 
-    async def _answer_pending(
-            self, request_id, future: asyncio.Future):
-        try:
-            result = await future
-        except Exception as error:
-            self._write_answer_error(request_id, error)
-            return
-        self.write(acps.response(request_id, result=result))
-
-    def _write_answer_error(self, request_id, error: Exception) -> None:
-        code = (
-            error.code
-            if isinstance(error, acps.TransportError)
-            else acps.INTERNAL_ERROR)
-        self.write(acps.response(
-            request_id,
-            error={
-                "code": code,
-                "message": str(error),
-            },
-        ))
-
     async def _dispatch_notification(self, method: str, params: dict):
         try:
             await self.dispatch(method, params)
@@ -310,7 +276,8 @@ class Front:
                 file=sys.stderr,
             )
 
-    async def _answer(self, message: dict):
+    async def _answer(
+            self, message: dict, forwarded: asyncio.Event | None = None):
         method = message.get("method")
         request_id = message.get("id")
         try:
@@ -318,14 +285,26 @@ class Front:
                 method,
                 message.get("params") or {},
                 request_id=request_id,
+                forwarded=forwarded,
             )
-        except Exception as error:
-            self._write_answer_error(request_id, error)
+        except acps.TransportError as error:
+            self.write(acps.response(
+                request_id,
+                error={"code": error.code, "message": str(error)}))
             return
+        except Exception as error:
+            self.write(acps.response(
+                request_id,
+                error={"code": acps.INTERNAL_ERROR, "message": str(error)}))
+            return
+        finally:
+            if forwarded is not None:
+                forwarded.set()
         self.write(acps.response(request_id, result=result))
 
     async def dispatch(
-            self, method: str, params: dict, request_id=None):
+            self, method: str, params: dict, request_id=None,
+            forwarded: asyncio.Event | None = None):
         if method == "initialize":
             return self.initialize(params)
         if method == "session/new":
@@ -338,7 +317,8 @@ class Front:
         if method == "session/close":
             return await self.close_session(params)
         if method in SESSION_METHODS:
-            return await self.forward_to_worker(method, params)
+            return await self.forward_to_worker(
+                method, params, forwarded=forwarded)
         raise acps.TransportError(
             f"method not found: {method}", code=acps.METHOD_NOT_FOUND)
 
@@ -645,12 +625,9 @@ class Front:
         await channel.close()
         return {}
 
-    async def forward_to_worker(self, method: str, params: dict):
-        future = await self.start_forward_to_worker(method, params)
-        return await future
-
-    async def start_forward_to_worker(
-            self, method: str, params: dict) -> asyncio.Future:
+    async def forward_to_worker(
+            self, method: str, params: dict,
+            forwarded: asyncio.Event | None = None):
         session_id = params.get("sessionId")
         channel = self.workers.get(session_id)
         if channel is None:
@@ -658,4 +635,5 @@ class Front:
                 f"unknown session {session_id!r}",
                 code=acps.INVALID_PARAMS,
             )
-        return await channel.start_request(method, params)
+        return await channel.request(
+            method, params, forwarded=forwarded)

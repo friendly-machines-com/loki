@@ -26,7 +26,6 @@ from loki_agent import terminal_frontend
 from loki_agent import models as modelsdev
 from loki_agent import openai_models
 from loki_agent import protocols
-from loki_agent import reasonings
 from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
 from loki_agent import savefiles
@@ -53,14 +52,8 @@ def _codex_model(slug="gpt-5-codex", **overrides):
     return openai_models.CodexModelRequestProfile.from_catalog_model(value)
 
 
-def _effort_profile(*values, default=None):
-    return reasonings.ReasoningEffortProfile(
-        options=tuple(
-            reasonings.ReasoningEffortOption(value)
-            for value in values
-        ),
-        default_value=default,
-    )
+def _effort_profile(*values):
+    return modelsdev.ReasoningEffortProfile(tuple(values))
 
 
 def save_loki_state(names):
@@ -705,16 +698,14 @@ class RuntimeConfigTests(unittest.TestCase):
             protocols.OPENAI_RESPONSES,
             model="first",
             provider_id="openai",
-            reasoning_effort_profile=_effort_profile(
-                "low", "high", default="low"),
+            reasoning_effort_profile=_effort_profile("low", "high"),
         )
         narrower = loki.make_runtime_config(
             "https://api.openai.com/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="narrower",
             provider_id="openai",
-            reasoning_effort_profile=_effort_profile(
-                "low", "medium", default="medium"),
+            reasoning_effort_profile=_effort_profile("low", "medium"),
         )
         unsupported = loki.make_runtime_config(
             "https://api.openai.com/v1/responses",
@@ -733,7 +724,7 @@ class RuntimeConfigTests(unittest.TestCase):
             self.assertEqual(
                 loki.current_reasoning_effort_preference(), "high")
             self.assertIn(
-                "preferred High is unavailable",
+                "preferred high is unavailable",
                 loki.reasoning_effort_status_text(),
             )
 
@@ -750,13 +741,13 @@ class RuntimeConfigTests(unittest.TestCase):
             self.assertIsNone(loki.effective_reasoning_effort())
             self.assertEqual(
                 loki.reasoning_effort_status_text(),
-                "Model default (Low)",
+                "Model default",
             )
         finally:
             restore_loki_state(saved)
 
     def test_delegated_config_reconstructs_reasoning_profile(self):
-        profile = _effort_profile("low", "high", default="low")
+        profile = _effort_profile("low", "high")
         inventory = CredentialInventory({
             "LOKI_API_BASE": "https://api.openai.com/v1/responses",
             "LOKI_PROVIDER": "openai_responses",
@@ -810,13 +801,6 @@ class RuntimeConfigTests(unittest.TestCase):
                     loki.effective_reasoning_effort(), "high")
         finally:
             restore_loki_state(saved)
-
-    def test_invalid_saved_reasoning_preference_is_rejected(self):
-        with self.assertRaisesRegex(
-                ValueError, "invalid saved reasoning effort"):
-            loki.reasoning_effort_from_session_state({
-                "reasoning_effort": 42,
-            })
 
     def test_tool_loop_snapshots_reasoning_effort_for_all_requests(self):
         saved = save_loki_state([
@@ -912,36 +896,6 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(result, "done")
         self.assertEqual(seen, [None])
-
-    def test_failed_preference_save_rolls_back_without_clearing_dirty(self):
-        saved = save_loki_state([
-            "reasoning_effort_preference",
-            "session_state",
-            "chat_log_path",
-            "chat_log_dirty",
-        ])
-        try:
-            session = loki.current_session()
-            session.reasoning_effort_preference = "high"
-            session.session_state = {"reasoning_effort": "high"}
-            session.chat_log_path = "/tmp/not-written.json"
-            session.chat_log_dirty = False
-            with (
-                    mock.patch.object(
-                        loki,
-                        "save_chat_log",
-                        side_effect=OSError("disk full")),
-                    self.assertRaisesRegex(OSError, "disk full")):
-                loki.install_reasoning_effort_preference(
-                    "low", persist=True)
-
-            self.assertEqual(
-                session.reasoning_effort_preference, "high")
-            self.assertEqual(
-                session.session_state["reasoning_effort"], "high")
-            self.assertTrue(session.chat_log_dirty)
-        finally:
-            restore_loki_state(saved)
 
     def test_delegated_config_reconstructs_subscription_authentication(self):
         credential = authentications.CredentialRef.openai_subscription()
@@ -1238,8 +1192,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 supports_parallel_tool_calls=False,
                 supports_reasoning_summaries=True,
                 default_reasoning_level="low"),
-            reasoning_effort_profile=_effort_profile(
-                "low", default="low"),
+            reasoning_effort_profile=_effort_profile("low"),
         )
         response = {
             "models": [{
@@ -1272,7 +1225,8 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(
             refreshed.reasoning_effort_profile.values, ("high",))
         self.assertEqual(
-            refreshed.reasoning_effort_profile.default_value, "high")
+            refreshed.openai_request_profile.default_reasoning_level,
+            "high")
 
     def test_subscription_refresh_keeps_connection_without_valid_selector(
             self):
@@ -1290,8 +1244,7 @@ class RuntimeConfigTests(unittest.TestCase):
             openai_request_profile=_codex_model(
                 supports_reasoning_summaries=True,
                 default_reasoning_level="max"),
-            reasoning_effort_profile=_effort_profile(
-                "max", default="max"),
+            reasoning_effort_profile=_effort_profile("max"),
         )
         response = {
             "models": [{
@@ -2208,7 +2161,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         self.assertEqual(
             saved["session_state"]["reasoning_effort"], "high")
         self.assertIn(
-            "Effort: High; /model, /effort",
+            "Effort: high; /model, /effort",
             terminal_frontend.status_text(),
         )
 
@@ -2218,8 +2171,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
             protocols.OPENAI_RESPONSES,
             model="gpt-test",
             provider_id="openai",
-            reasoning_effort_profile=_effort_profile(
-                "minimal", "high", default="minimal"),
+            reasoning_effort_profile=_effort_profile("minimal", "high"),
         ))
         loki.current_session().session_state = {}
         loki.current_session().chat_log_path = None
@@ -2228,9 +2180,9 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         self.assertEqual(
             terminal_frontend._reasoning_effort_rows(),
             [
-                (None, "Model default (Minimal)"),
-                ("minimal", "Minimal"),
-                ("high", "High"),
+                (None, "Model default"),
+                ("minimal", "minimal"),
+                ("high", "high"),
             ],
         )
 
@@ -5071,8 +5023,7 @@ class SubagentLaunchTests(unittest.TestCase):
             context_window=200000,
             base_instructions="must not enter the child environment",
         )
-        effort_profile = _effort_profile(
-            "low", "high", default="high")
+        effort_profile = _effort_profile("low", "high")
         manager = mock.Mock()
         manager.run_exec = mock.AsyncMock(return_value=(
             types.SimpleNamespace(exit_code=0),

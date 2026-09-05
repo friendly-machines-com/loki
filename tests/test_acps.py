@@ -21,7 +21,7 @@ from loki_agent import (
     acp_main,
     acps,
     authentications,
-    reasonings,
+    models,
 )
 from loki_agent.credentials import CredentialStore, is_credential_name
 
@@ -162,13 +162,13 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
         prompt_reply = asyncio.get_running_loop().create_future()
 
         class Channel:
-            async def start_request(self, method, params):
+            async def request(self, method, params, forwarded=None):
                 order.append(method)
+                if forwarded is not None:
+                    forwarded.set()
                 if method == "session/prompt":
-                    return prompt_reply
-                reply = asyncio.get_running_loop().create_future()
-                reply.set_result({"configOptions": []})
-                return reply
+                    return await prompt_reply
+                return {"configOptions": []}
 
         front = acp.Front(
             lambda: None, responses.append, CredentialStore({}))
@@ -1377,14 +1377,8 @@ class ConfigOptionTests(unittest.TestCase):
 
 class WorkerReasoningConfigTests(unittest.TestCase):
     @staticmethod
-    def _profile(*values, default=None):
-        return reasonings.ReasoningEffortProfile(
-            options=tuple(
-                reasonings.ReasoningEffortOption(value)
-                for value in values
-            ),
-            default_value=default,
-        )
+    def _profile(*values):
+        return models.ReasoningEffortProfile(tuple(values))
 
     def test_model_changes_return_dependent_agent_shell_option(self):
         from loki_agent import loki
@@ -1501,7 +1495,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                     ["default", "effort:low"],
                 )
                 self.assertIn(
-                    "preferred High is unavailable",
+                    "preferred high is unavailable",
                     narrowed_thought["options"][0]["name"],
                 )
                 self.assertEqual(
@@ -1559,9 +1553,8 @@ class WorkerReasoningConfigTests(unittest.TestCase):
             release = asyncio.Event()
             snapshots = []
 
-            async def run_turn(_on_event):
-                snapshots.append(
-                    worker._active_prompt_reasoning_effort)
+            async def run_turn(_on_event, reasoning_effort):
+                snapshots.append(reasoning_effort)
                 started.set()
                 await release.wait()
 
@@ -2205,7 +2198,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 loki._DEFAULT_SESSION = session
                 worker = Worker(session, lambda message: None, "s")
 
-                async def failed_turn(on_event):
+                async def failed_turn(on_event, _reasoning_effort):
                     on_event({
                         "type": "provider_error",
                         "error": protocols.ProtocolError(
@@ -2254,7 +2247,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                 loki._DEFAULT_SESSION = session
                 worker = Worker(session, lambda message: None, "s")
 
-                async def cancelled_failure(on_event):
+                async def cancelled_failure(
+                        on_event, _reasoning_effort):
                     worker.cancel_event.set()
                     raise RuntimeError("underlying close race")
 
@@ -2279,7 +2273,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 loki._DEFAULT_SESSION = session
                 worker = Worker(session, lambda message: None, "s")
 
-                async def no_turn(on_event):
+                async def no_turn(on_event, _reasoning_effort):
                     return None
 
                 worker._run_turn = no_turn
@@ -2427,7 +2421,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                     "arguments": {"file_path": "source.py"},
                 }
 
-                async def refused_after_tool(on_event):
+                async def refused_after_tool(
+                        on_event, _reasoning_effort):
                     session.transcript_items.append(
                         formats.DecodedTurn([call]).to_event())
                     session.transcript_items.append(

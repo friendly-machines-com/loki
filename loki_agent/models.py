@@ -32,7 +32,6 @@ from . import authentications
 from . import http_client
 from . import openai_models
 from . import protocols
-from . import reasonings
 from .credentials import (
     CredentialInventory,
     CredentialStore,
@@ -103,6 +102,63 @@ class ExplicitConnectionOption:
     model: str
     api_url: str
     protocol: str
+
+
+@dataclass(frozen=True)
+class ReasoningEffortProfile:
+    """Exact selectable effort values for one provider/model leaf."""
+
+    values: tuple[str, ...]
+
+    def __post_init__(self):
+        if (not isinstance(self.values, tuple)
+                or not self.values
+                or any(
+                    not isinstance(value, str) or not value
+                    for value in self.values
+                )):
+            raise ValueError(
+                "reasoning effort profile requires non-empty string values")
+        if len(set(self.values)) != len(self.values):
+            raise ValueError(
+                "reasoning effort profile contains duplicate values")
+
+    def supports(self, value) -> bool:
+        return isinstance(value, str) and value in self.values
+
+    def to_dict(self):
+        # Read and write the encoding already emitted by the original
+        # reasoning feature, but do not retain its duplicated default or
+        # presentation descriptions as runtime state.
+        return {
+            "options": [
+                {"value": value, "description": None}
+                for value in self.values
+            ],
+            "default_value": None,
+        }
+
+    @classmethod
+    def from_dict(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError("reasoning effort profile must be an object")
+        options = value.get("options")
+        if not isinstance(options, list):
+            raise ValueError(
+                "reasoning effort profile options must be an array")
+        values = []
+        for option in options:
+            if not isinstance(option, dict):
+                raise ValueError(
+                    "reasoning effort option must be an object")
+            values.append(option.get("value"))
+        return cls(tuple(values))
+
+
+def validate_reasoning_effort(value, field_name="reasoning effort") -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -189,6 +245,54 @@ def normalize_catalog(data):
     return normalized
 
 
+def _codex_reasoning_effort_profile(model, request_profile):
+    if not request_profile.supports_reasoning_summaries:
+        return None
+    levels = model.get("supported_reasoning_levels", [])
+    if not isinstance(levels, list):
+        raise ValueError(
+            "OpenAI Codex supported_reasoning_levels must be an array")
+    values = []
+    for level in levels:
+        if not isinstance(level, dict):
+            raise ValueError(
+                "OpenAI Codex reasoning level must be an object")
+        values.append(validate_reasoning_effort(
+            level.get("effort"), "OpenAI Codex reasoning effort"))
+    return (
+        ReasoningEffortProfile(tuple(values))
+        if values else None
+    )
+
+
+def _modelsdev_reasoning_effort_profile(model):
+    if not isinstance(model, dict):
+        raise ValueError("models.dev model must be an object")
+    controls = model.get("reasoning_options")
+    if controls is None:
+        return None
+    if not isinstance(controls, list):
+        raise ValueError("models.dev reasoning_options must be an array")
+    effort_controls = [
+        control for control in controls
+        if isinstance(control, dict) and control.get("type") == "effort"
+    ]
+    if not effort_controls:
+        return None
+    if len(effort_controls) != 1:
+        raise ValueError(
+            "models.dev model has multiple reasoning effort entries")
+    values = effort_controls[0].get("values")
+    if not isinstance(values, list) or not values:
+        raise ValueError(
+            "models.dev reasoning effort values must be a non-empty array")
+    return ReasoningEffortProfile(tuple(
+        validate_reasoning_effort(
+            value, "models.dev reasoning effort value")
+        for value in values
+    ))
+
+
 def _openai_subscription_model_entries(
         response, *, diagnostic_writer=None):
     """Translate the authenticated Codex catalog into picker metadata."""
@@ -248,14 +352,8 @@ def _openai_subscription_model_entries(
             continue
         try:
             reasoning_effort_profile = (
-                reasonings.from_codex_catalog_model(model))
-            reasonings.validate_codex_effort_profile(
-                reasoning_effort_profile,
-                supports_reasoning=(
-                    request_profile.supports_reasoning_summaries),
-                request_default=request_profile.default_reasoning_level,
-            )
-        except reasonings.ReasoningEffortError as error:
+                _codex_reasoning_effort_profile(model, request_profile))
+        except ValueError as error:
             reasoning_effort_profile = None
             if diagnostic_writer is not None:
                 diagnostic_writer(
@@ -331,19 +429,19 @@ def reasoning_effort_profile(
         provider_id, provider_entry, model_entry):
     """Return validated effort choices for one usable provider/model leaf."""
     protocol = provider_protocol(provider_entry)
-    if not reasonings.wire_protocol_supported(provider_id, protocol):
+    if not protocols.reasoning_effort_supported(provider_id, protocol):
         return None
     if provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
             _OPENAI_SUBSCRIPTION_SENTINEL):
         profile = model_entry.get(_LOKI_REASONING_EFFORT_PROFILE_KEY)
         return (
             profile
-            if isinstance(profile, reasonings.ReasoningEffortProfile)
+            if isinstance(profile, ReasoningEffortProfile)
             else None
         )
     try:
-        return reasonings.from_modelsdev_model(model_entry)
-    except reasonings.ReasoningEffortError:
+        return _modelsdev_reasoning_effort_profile(model_entry)
+    except ValueError:
         # Malformed optional metadata must not make an otherwise usable model
         # disappear. It merely cannot authorize an effort selector/request.
         return None

@@ -25,7 +25,6 @@ from . import credential_capabilities
 from . import credential_runtimes
 from . import models as modelsdev
 from . import protocols
-from . import reasonings
 from . import savefiles
 from . import subagents
 from . import terminals
@@ -578,16 +577,14 @@ def _reasoning_effort_rows():
     profile = _core.current_reasoning_effort_profile()
     if profile is None:
         return []
-    preference = _core.current_reasoning_effort_preference()
     rows = [(
         None,
-        reasonings.default_option_name(profile, preference),
+        _core.reasoning_effort_default_text() or "Model default",
     )]
-    for option in profile.options:
-        label = reasonings.display_name(option.value)
-        if option.description:
-            label += f" - {option.description}"
-        rows.append((option.value, label))
+    rows.extend(
+        (value, value)
+        for value in profile.values
+    )
     return rows
 
 

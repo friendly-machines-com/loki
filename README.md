@@ -151,9 +151,9 @@ again after switching to a catalog provider or while models.dev is
 unavailable.
 
 For catalog models whose exact provider/model entry exposes a verified
-reasoning-effort control, `/effort` selects `none`, `minimal`, `low`,
-`medium`, `high`, `xhigh`, or `max` only when that entry advertises the
-value. `Model default` is the initial setting and omits an effort override
+reasoning-effort control, `/effort` displays and selects the provider's exact
+advertised values. `Model default` is the initial setting and omits an effort
+override
 for ordinary providers; ChatGPT subscription requests retain their
 authenticated catalog default. An explicit selection is a conversation
 preference: after switching to a model which does not support it, Loki uses

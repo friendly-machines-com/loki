@@ -15,7 +15,6 @@ from . import (
     formats,
     loki,
     models as modelsdev,
-    reasonings,
     replays,
 )
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
@@ -60,7 +59,6 @@ class Worker:
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
         self._pending_open: PendingSessionOpen | None = None
-        self._active_prompt_reasoning_effort: str | None = None
 
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
@@ -203,19 +201,17 @@ class Worker:
         )
         values = [{
             "value": _MODEL_DEFAULT_CONFIG_VALUE,
-            "name": reasonings.default_option_name(profile, preference),
+            "name": (
+                loki.reasoning_effort_default_text()
+                or "Model default"),
             "description": (
                 "Use the selected model or provider's own reasoning "
                 "effort default."),
         }]
-        for option in profile.options:
-            encoded = {
-                "value": _EFFORT_CONFIG_VALUE_PREFIX + option.value,
-                "name": reasonings.display_name(option.value),
-            }
-            if option.description is not None:
-                encoded["description"] = option.description
-            values.append(encoded)
+        values.extend({
+            "value": _EFFORT_CONFIG_VALUE_PREFIX + value,
+            "name": value,
+        } for value in profile.values)
         return {
             "id": "reasoning_effort",
             "name": "Reasoning effort",
@@ -516,7 +512,7 @@ class Worker:
                 )
             try:
                 loki.set_reasoning_effort(effort)
-            except (reasonings.ReasoningEffortError, ValueError) as error:
+            except ValueError as error:
                 raise acps.TransportError(
                     str(error), code=acps.INVALID_PARAMS) from error
             return {"configOptions": self.config_options()}
@@ -661,30 +657,26 @@ class Worker:
                     self.session_id, event, mapper_state):
                 self.write(acps.notification("session/update", update))
 
-        self._active_prompt_reasoning_effort = reasoning_effort
         try:
-            try:
-                await self._run_turn(on_event)
-            except BaseException:
-                if not self.cancel_event.is_set():
-                    raise
-                if not any(
-                        event.get("type") == "response_cancelled"
-                        for event in events):
-                    on_event({
-                        "type": "response_cancelled",
-                        "partial": False,
-                        "saved": False,
-                    })
-        finally:
-            self._active_prompt_reasoning_effort = None
+            await self._run_turn(on_event, reasoning_effort)
+        except BaseException:
+            if not self.cancel_event.is_set():
+                raise
+            if not any(
+                    event.get("type") == "response_cancelled"
+                    for event in events):
+                on_event({
+                    "type": "response_cancelled",
+                    "partial": False,
+                    "saved": False,
+                })
         failure = self._turn_failure(events)
         if failure:
             raise TurnFailure(failure)
         stop_reason = self._stop_reason(events)
         return {"stopReason": stop_reason}
 
-    async def _run_turn(self, on_event):
+    async def _run_turn(self, on_event, reasoning_effort):
         try:
             if not loki.current_model():
                 detail = self._configuration_error or (
@@ -702,8 +694,7 @@ class Worker:
                     "on_text_delta": on_text_delta,
                     "cancel_check": cancel_check,
                     "codex_turn_state": codex_turn_state,
-                    "reasoning_effort":
-                        self._active_prompt_reasoning_effort,
+                    "reasoning_effort": reasoning_effort,
                 }
                 return await loki.async_chat_completion(
                     items, loki.TOOLS, True, False, **kwargs)
@@ -716,7 +707,7 @@ class Worker:
                 cancel_event=self.cancel_event,
                 stream_chat=True,
                 on_response=lambda turn, event: loki.mark_chat_log_dirty(),
-                reasoning_effort=self._active_prompt_reasoning_effort,
+                reasoning_effort=reasoning_effort,
             )
         finally:
             loki.save_chat_log()

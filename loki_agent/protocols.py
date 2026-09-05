@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from . import formats
 from . import openai_models
-from . import reasonings
 
 
 OPENAI_CHAT = "openai_chat"
@@ -14,6 +13,23 @@ ANTHROPIC_MESSAGES = "anthropic_messages"
 OPENAI_RESPONSES = "openai_responses"
 DUMMY = "dummy"
 AUTO = "auto"
+
+_REASONING_PROTOCOLS = {
+    "anthropic": ANTHROPIC_MESSAGES,
+    "openai": OPENAI_RESPONSES,
+    "openai-subscription": OPENAI_RESPONSES,
+    "openrouter": OPENAI_CHAT,
+    "zai": OPENAI_CHAT,
+    "zai-coding-plan": OPENAI_CHAT,
+    "zhipuai": OPENAI_CHAT,
+    "zhipuai-coding-plan": OPENAI_CHAT,
+}
+_ZAI_PROVIDERS = frozenset({
+    "zai",
+    "zai-coding-plan",
+    "zhipuai",
+    "zhipuai-coding-plan",
+})
 
 # Wire protocols this client can actually speak. Single source of truth:
 # consumers reference this instead of re-listing the constants, so adding a
@@ -96,6 +112,11 @@ def _header_string(headers, name):
 def openai_response_model_header(headers):
     """Read OpenAI's effective-model header case-insensitively."""
     return _header_string(headers, "openai-model")
+
+
+def reasoning_effort_supported(provider_id, protocol) -> bool:
+    """Whether Loki implements this provider's effort request contract."""
+    return _REASONING_PROTOCOLS.get(provider_id) == protocol
 
 
 def _codex_reasoning_parameter(profile, reasoning_effort=None):
@@ -214,8 +235,10 @@ class Provider:
     def chat_payload(
             self, items, tools, model, *, prompt_cache_key=None,
             reasoning_effort=None):
-        reasoning_effort = reasonings.preference_from_value(
-            reasoning_effort)
+        if reasoning_effort is not None:
+            if not isinstance(reasoning_effort, str) or not reasoning_effort:
+                raise ProtocolError(
+                    "reasoning effort must be a non-empty string")
         target = self.projection_target(model)
         if self.kind == OPENAI_CHAT:
             payload = {
@@ -230,7 +253,7 @@ class Provider:
                     payload["reasoning"] = {
                         "effort": reasoning_effort,
                     }
-                elif reasonings.is_zai_provider(self.provider_id):
+                elif self.provider_id in _ZAI_PROVIDERS:
                     payload["thinking"] = {
                         "type": (
                             "disabled"

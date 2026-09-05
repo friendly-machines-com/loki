@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 
+from . import models
 from . import openai_models
-from . import reasonings
+from . import protocols
 from .authentications import CredentialRef
 from .credentials import is_credential_name
 
@@ -77,7 +78,7 @@ class ConnectionDescriptor:
     openai_request_profile: (
         openai_models.CodexModelRequestProfile | None) = None
     reasoning_effort_profile: (
-        reasonings.ReasoningEffortProfile | None) = None
+        models.ReasoningEffortProfile | None) = None
 
     def __post_init__(self):
         subscription = (
@@ -99,28 +100,15 @@ class ConnectionDescriptor:
         if (self.reasoning_effort_profile is not None
                 and not isinstance(
                     self.reasoning_effort_profile,
-                    reasonings.ReasoningEffortProfile)):
+                    models.ReasoningEffortProfile)):
             raise ConnectionDescriptorError(
                 "connection reasoning effort profile has the wrong type")
         if (self.reasoning_effort_profile is not None
-                and not reasonings.wire_protocol_supported(
+                and not protocols.reasoning_effort_supported(
                     self.provider_id, self.protocol)):
             raise ConnectionDescriptorError(
                 "connection reasoning effort profile is not valid for this "
                 "provider protocol")
-        if subscription:
-            try:
-                reasonings.validate_codex_effort_profile(
-                    self.reasoning_effort_profile,
-                    supports_reasoning=(
-                        self.openai_request_profile
-                        .supports_reasoning_summaries),
-                    request_default=(
-                        self.openai_request_profile
-                        .default_reasoning_level),
-                )
-            except reasonings.ReasoningEffortError as error:
-                raise ConnectionDescriptorError(str(error)) from error
 
     def to_dict(self) -> dict:
         return {
@@ -206,9 +194,9 @@ class ConnectionDescriptor:
         else:
             try:
                 reasoning_effort_profile = (
-                    reasonings.ReasoningEffortProfile.from_dict(
+                    models.ReasoningEffortProfile.from_dict(
                         raw_reasoning_effort_profile))
-            except reasonings.ReasoningEffortError as error:
+            except ValueError as error:
                 raise ConnectionDescriptorError(str(error)) from error
         return cls(
             provider_id=_optional_string(value.get("provider_id"), "provider_id"),

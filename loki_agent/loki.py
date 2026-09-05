@@ -37,7 +37,6 @@ from . import models as modelsdev
 from . import openai_models
 from . import paths
 from . import protocols
-from . import reasonings
 from . import authentications
 from . import credential_capabilities
 from . import savefiles
@@ -102,20 +101,39 @@ def current_reasoning_effort_profile():
 
 
 def effective_reasoning_effort() -> str | None:
-    return reasonings.effective_effort(
-        current_reasoning_effort_profile(),
-        current_reasoning_effort_preference(),
+    profile = current_reasoning_effort_profile()
+    preference = current_reasoning_effort_preference()
+    return (
+        preference
+        if profile is not None and profile.supports(preference)
+        else None
     )
 
 
-def reasoning_effort_status_text() -> str | None:
+def reasoning_effort_default_text() -> str | None:
     profile = current_reasoning_effort_profile()
     if profile is None:
         return None
     preference = current_reasoning_effort_preference()
-    if profile.supports(preference):
-        return reasonings.display_name(preference)
-    return reasonings.default_option_name(profile, preference)
+    name = "Model default"
+    provider = current_config().chat_provider
+    if provider.provider_id == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID:
+        default = provider.openai_request_profile.default_reasoning_level
+        if default is not None:
+            name += f" ({default})"
+    if preference is not None and not profile.supports(preference):
+        name += f" - preferred {preference} is unavailable"
+    return name
+
+
+def reasoning_effort_status_text() -> str | None:
+    profile = current_reasoning_effort_profile()
+    preference = current_reasoning_effort_preference()
+    return (
+        preference
+        if profile is not None and profile.supports(preference)
+        else reasoning_effort_default_text()
+    )
 
 
 def current_transcript() -> list:
@@ -148,33 +166,14 @@ def current_agent_mode() -> str:
 
 def install_reasoning_effort_preference(
         preference: str | None, *, persist=False):
-    """Install validated conversation state, optionally saving atomically."""
-    preference = reasonings.preference_from_value(preference)
+    """Install validated conversation state and optionally save it."""
+    if preference is not None:
+        preference = modelsdev.validate_reasoning_effort(preference)
     session = current_session()
-    old_preference = session.reasoning_effort_preference
-    had_state = "reasoning_effort" in session.session_state
-    old_state = session.session_state.get("reasoning_effort")
-
     session.reasoning_effort_preference = preference
-    if preference is None:
-        session.session_state.pop("reasoning_effort", None)
-    else:
-        session.session_state["reasoning_effort"] = preference
     mark_chat_log_dirty()
-    if not persist:
-        return
-    try:
+    if persist:
         save_chat_log()
-    except Exception:
-        session.reasoning_effort_preference = old_preference
-        if had_state:
-            session.session_state["reasoning_effort"] = old_state
-        else:
-            session.session_state.pop("reasoning_effort", None)
-        # A failed write may also have included unrelated transcript changes.
-        # Keep the log dirty so a later successful save cannot lose them.
-        mark_chat_log_dirty()
-        raise
 
 
 def set_reasoning_effort(value: str | None):
@@ -186,7 +185,7 @@ def set_reasoning_effort(value: str | None):
     if value is None:
         preference = None
     else:
-        preference = reasonings.preference_from_value(value)
+        preference = modelsdev.validate_reasoning_effort(value)
         if not profile.supports(preference):
             raise ValueError(
                 f"reasoning effort {value!r} is not available for the "
@@ -345,7 +344,7 @@ class RuntimeConfig:
     model_status: str | None = None
     stream: bool = False
     reasoning_effort_profile: (
-        reasonings.ReasoningEffortProfile | None) = None
+        modelsdev.ReasoningEffortProfile | None) = None
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
@@ -431,7 +430,7 @@ def make_runtime_config(
     if (reasoning_effort_profile is not None
             and not isinstance(
                 reasoning_effort_profile,
-                reasonings.ReasoningEffortProfile)):
+                modelsdev.ReasoningEffortProfile)):
         raise ValueError(
             "reasoning_effort_profile must be ReasoningEffortProfile or null")
     chat_provider = protocols.make_provider(
@@ -446,24 +445,11 @@ def make_runtime_config(
         openai_request_profile=openai_request_profile,
     )
     if (reasoning_effort_profile is not None
-            and not reasonings.wire_protocol_supported(
+            and not protocols.reasoning_effort_supported(
                 provider_id, chat_provider.kind)):
         raise ValueError(
             "reasoning effort profile is not valid for this provider "
             "protocol")
-    if provider_id == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID:
-        try:
-            reasonings.validate_codex_effort_profile(
-                reasoning_effort_profile,
-                supports_reasoning=(
-                    chat_provider.openai_request_profile
-                    .supports_reasoning_summaries),
-                request_default=(
-                    chat_provider.openai_request_profile
-                    .default_reasoning_level),
-            )
-        except reasonings.ReasoningEffortError as error:
-            raise ValueError(str(error)) from error
     auth_spec = _auth_spec(
         provider_kind,
         credential_ref,
@@ -539,7 +525,7 @@ def _reasoning_effort_profile_setting(credentials):
         return None
     try:
         value = json.loads(encoded)
-        return reasonings.ReasoningEffortProfile.from_dict(value)
+        return modelsdev.ReasoningEffortProfile.from_dict(value)
     except ValueError as error:
         raise ValueError(
             f"invalid LOKI_REASONING_EFFORT_PROFILE: {error}") from error
@@ -550,8 +536,8 @@ def reasoning_effort_preference_setting(credentials):
     if not value:
         return None
     try:
-        return reasonings.preference_from_value(value)
-    except reasonings.ReasoningEffortError as error:
+        return modelsdev.validate_reasoning_effort(value)
+    except ValueError as error:
         raise ValueError(f"invalid LOKI_REASONING_EFFORT: {error}") from error
 
 
@@ -680,7 +666,7 @@ def config_from_connection_descriptor(
     reasoning_effort_profile = (
         descriptor.reasoning_effort_profile
         if ((not configured_model or configured_model == descriptor.model)
-            and reasonings.wire_protocol_supported(
+            and protocols.reasoning_effort_supported(
                 descriptor.provider_id, resolved_provider_kind))
         else None)
     max_tokens = (
@@ -2496,16 +2482,13 @@ def _handle_agent(args: dict) -> str:
 
 async def _handle_agent_async(args: dict, extra_context=None) -> str:
     context = extra_context or {}
-    cancel_event = context.get("cancel_event")
-    reasoning_effort = (
-        context["reasoning_effort"]
-        if "reasoning_effort" in context else _UNSET)
     return await run_agent_async(args.get("description", ""),
                                  args["prompt"],
                                  args.get("run_in_background", False),
                                  args.get("subagent_type", "Explore"),
-                                 cancel_event=cancel_event,
-                                 reasoning_effort=reasoning_effort)
+                                 cancel_event=context.get("cancel_event"),
+                                 reasoning_effort=context.get(
+                                     "reasoning_effort", _UNSET))
 
 
 def _handle_skill(args: dict) -> str:
@@ -2517,9 +2500,7 @@ async def _handle_webfetch_async(args: dict, extra_context=None) -> str:
     return await run_webfetch_async(
         args["url"], args["prompt"],
         cancel_event=context.get("cancel_event"),
-        reasoning_effort=(
-            context["reasoning_effort"]
-            if "reasoning_effort" in context else _UNSET))
+        reasoning_effort=context.get("reasoning_effort", _UNSET))
 
 
 async def _handle_websearch_async(args: dict, extra_context=None) -> str:
@@ -2976,8 +2957,8 @@ async def run_tool_loop_async(
     codex_turn_state = CodexTurnState()
     if reasoning_effort is _UNSET:
         reasoning_effort = effective_reasoning_effort()
-    else:
-        reasoning_effort = reasonings.preference_from_value(
+    elif reasoning_effort is not None:
+        reasoning_effort = modelsdev.validate_reasoning_effort(
             reasoning_effort)
     completion_cancel_check = cancel_check
     if chat_fn is None:
@@ -3303,23 +3284,16 @@ async def run_toolless_completion_async(
     # distinct routing token passed explicitly to the request path.
     codex_turn_state = CodexTurnState()
     try:
-        kwargs = {
-            "tools": [],
-            "codex_turn_state": codex_turn_state,
-            "reasoning_effort": (
-                reasoning_effort
-                if reasoning_effort is not _UNSET
-                else effective_reasoning_effort()),
-        }
-        if cancel_check is None:
-            response_items = await async_chat_completion(
-                transcript_items,
-                **kwargs)
-        else:
+        kwargs = {}
+        if cancel_check is not None:
             kwargs["cancel_check"] = cancel_check
-            response_items = await async_chat_completion(
-                transcript_items,
-                **kwargs)
+        response_items = await async_chat_completion(
+            transcript_items,
+            tools=[],
+            codex_turn_state=codex_turn_state,
+            reasoning_effort=reasoning_effort,
+            **kwargs,
+        )
     except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
         return f"Transcript render error: {e}"
     except ApiError as e:
@@ -3399,7 +3373,7 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
         if reasoning_effort is _UNSET:
             reasoning_effort = effective_reasoning_effort()
         if reasoning_effort is not None:
-            reasoning_effort = reasonings.preference_from_value(
+            reasoning_effort = modelsdev.validate_reasoning_effort(
                 reasoning_effort)
             if profile is None or not profile.supports(reasoning_effort):
                 raise ValueError(
@@ -4915,8 +4889,8 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         return formats.DecodedTurn([])
     if reasoning_effort is _UNSET:
         reasoning_effort = effective_reasoning_effort()
-    else:
-        reasoning_effort = reasonings.preference_from_value(
+    elif reasoning_effort is not None:
+        reasoning_effort = modelsdev.validate_reasoning_effort(
             reasoning_effort)
     if (reasoning_effort is not None
             and (current_config().reasoning_effort_profile is None
@@ -5353,8 +5327,9 @@ def reasoning_effort_from_session_state(state: dict) -> str | None:
     if not isinstance(state, dict) or "reasoning_effort" not in state:
         return None
     try:
-        return reasonings.preference_from_value(state["reasoning_effort"])
-    except reasonings.ReasoningEffortError as error:
+        return modelsdev.validate_reasoning_effort(
+            state["reasoning_effort"], "saved reasoning effort")
+    except ValueError as error:
         raise ValueError(f"invalid saved reasoning effort: {error}") from error
 
 

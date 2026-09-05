@@ -13,7 +13,6 @@ from loki_agent import (
     models,
     openai_models,
     protocols,
-    reasonings,
     terminals,
 )
 from loki_agent.credentials import CredentialInventory, CredentialStore
@@ -637,8 +636,12 @@ class CatalogNormalizationTests(unittest.TestCase):
         )
 
         self.assertEqual(profile.values, ("low", "high"))
-        self.assertEqual(profile.default_value, "high")
-        self.assertEqual(profile.option("low").description, "Fast")
+        self.assertEqual(
+            models.openai_request_profile(
+                provider, provider["models"]["gpt-test"])
+            .default_reasoning_level,
+            "high",
+        )
 
     def test_subscription_max_and_ultra_keeps_model(self):
         diagnostics = []
@@ -662,8 +665,13 @@ class CatalogNormalizationTests(unittest.TestCase):
             provider,
             provider["models"]["gpt-test"],
         )
-        self.assertEqual(profile.values, ("max",))
-        self.assertEqual(profile.default_value, "ultra")
+        self.assertEqual(profile.values, ("max", "ultra"))
+        self.assertEqual(
+            models.openai_request_profile(
+                provider, provider["models"]["gpt-test"])
+            .default_reasoning_level,
+            "ultra",
+        )
         self.assertEqual(diagnostics, [])
 
     def test_bad_subscription_effort_metadata_keeps_model(self):
@@ -694,10 +702,15 @@ class CatalogNormalizationTests(unittest.TestCase):
 
     def test_reasoning_effort_requires_registered_wire_surface(self):
         model = {
-            "reasoning_options": [{
-                "type": "effort",
-                "values": ["low", "high"],
-            }],
+            "reasoning_options": [
+                None,
+                {"type": "toggle"},
+                {
+                    "type": "effort",
+                    "values": ["low", "provider-deep"],
+                },
+                {"type": "budget_tokens", "min": 1024},
+            ],
         }
         openrouter = {
             "id": "openrouter",
@@ -718,14 +731,14 @@ class CatalogNormalizationTests(unittest.TestCase):
         self.assertEqual(
             models.reasoning_effort_profile(
                 "openrouter", openrouter, model).values,
-            ("low", "high"),
+            ("low", "provider-deep"),
         )
         self.assertIsNone(models.reasoning_effort_profile(
             "unknown", unknown, model))
         self.assertEqual(
             models.reasoning_effort_profile(
                 "zhipuai", zhipuai, model).values,
-            ("low", "high"),
+            ("low", "provider-deep"),
         )
 
     def test_malformed_optional_effort_does_not_drop_model(self):
@@ -743,8 +756,6 @@ class CatalogNormalizationTests(unittest.TestCase):
 
         self.assertIsNone(models.reasoning_effort_profile(
             "openrouter", provider, model))
-        with self.assertRaises(reasonings.ReasoningEffortError):
-            reasonings.from_modelsdev_model(model)
 
     def test_bad_request_fields_drop_only_the_affected_model(self):
         diagnostics = []

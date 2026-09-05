@@ -4,7 +4,7 @@ import subprocess
 import sys
 import unittest
 
-from loki_agent import openai_models, reasonings
+from loki_agent import models, openai_models
 from loki_agent.authentications import (
     CredentialRef,
     OPENAI_CHATGPT_MODELS_REQUEST_URL,
@@ -353,12 +353,8 @@ raise OSError(ctypes.get_errno(), "execve failed")
 
 class ConnectionDescriptorTests(unittest.TestCase):
     def test_round_trip_contains_names_but_no_values(self):
-        effort_profile = reasonings.ReasoningEffortProfile(
-            options=(
-                reasonings.ReasoningEffortOption("low"),
-                reasonings.ReasoningEffortOption("high"),
-            ),
-        )
+        effort_profile = models.ReasoningEffortProfile(
+            ("low", "high"))
         descriptor = ConnectionDescriptor(
             provider_id="openrouter",
             provider_name="OpenRouter",
@@ -374,12 +370,17 @@ class ConnectionDescriptorTests(unittest.TestCase):
         )
 
         encoded = descriptor.to_dict()
+        encoded["reasoning_effort_profile"]["default_value"] = {
+            "ignored": True}
+        encoded["reasoning_effort_profile"]["options"][0][
+            "description"] = {"ignored": True}
+        restored = ConnectionDescriptor.from_dict(encoded)
 
-        self.assertEqual(ConnectionDescriptor.from_dict(encoded), descriptor)
+        self.assertEqual(restored, descriptor)
         self.assertEqual(encoded["model_status"], "deprecated")
         self.assertIs(encoded["prompt_cache"], True)
         self.assertEqual(
-            encoded["reasoning_effort_profile"],
+            restored.to_dict()["reasoning_effort_profile"],
             effort_profile.to_dict(),
         )
         self.assertNotIn("api_url", encoded)
@@ -475,30 +476,6 @@ class ConnectionDescriptorTests(unittest.TestCase):
             encoded["openai_request_profile"]["use_responses_lite"], True)
         self.assertNotIn(
             "context_window", encoded["openai_request_profile"])
-
-    def test_subscription_selector_and_request_defaults_must_agree(self):
-        effort_profile = reasonings.ReasoningEffortProfile(
-            options=(reasonings.ReasoningEffortOption("low"),),
-            default_value="low",
-        )
-
-        with self.assertRaisesRegex(
-                ConnectionDescriptorError, "defaults disagree"):
-            ConnectionDescriptor(
-                provider_id="openai-subscription",
-                provider_name="OpenAI ChatGPT subscription",
-                model="gpt-5-codex",
-                chat_url=(
-                    "https://chatgpt.com/backend-api/codex/responses"),
-                models_url=OPENAI_CHATGPT_MODELS_REQUEST_URL,
-                protocol="openai_responses",
-                credential_ref=CredentialRef.openai_subscription(),
-                auth_scheme="openai-subscription",
-                openai_request_profile=_codex_model(
-                    supports_reasoning_summaries=True,
-                    default_reasoning_level="high"),
-                reasoning_effort_profile=effort_profile,
-            )
 
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):
