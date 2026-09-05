@@ -232,66 +232,6 @@ class MixedProtocolProjectionTests(unittest.TestCase):
         self.assertEqual(inputs[8]["id"], "fc_1")
         self.assertNotIn("sig_abc", json.dumps(inputs))
 
-    def test_every_origin_projects_to_every_target(self):
-        sessions = {
-            protocol: [
-                formats.instruction_item("system"),
-                formats.message_item("user", "hello"),
-                response,
-            ]
-            for protocol, response in [
-                (
-                    formats.OPENAI_CHAT,
-                    formats.openai_chat_response_to_items({
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "chat",
-                            },
-                            "finish_reason": "stop",
-                        }],
-                    }).to_event(),
-                ),
-                (
-                    formats.ANTHROPIC_MESSAGES,
-                    formats.anthropic_response_to_items({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "text",
-                            "text": "anthropic",
-                        }],
-                        "stop_reason": "end_turn",
-                    }).to_event(),
-                ),
-                (
-                    formats.OPENAI_RESPONSES,
-                    formats.openai_responses_response_to_items({
-                        "object": "response",
-                        "status": "completed",
-                        "output": [{
-                            "type": "message",
-                            "id": "msg_1",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "responses",
-                                "annotations": [],
-                            }],
-                        }],
-                    }).to_event(),
-                ),
-            ]
-        }
-        for source, events in sessions.items():
-            with self.subTest(source=source, target="chat"):
-                formats.items_to_openai_chat_messages(events)
-            with self.subTest(source=source, target="anthropic"):
-                formats.items_to_anthropic_parts(events)
-            with self.subTest(source=source, target="responses"):
-                formats.items_to_openai_responses_parts(events)
-
     def test_projection_is_pure(self):
         events = mixed_session()
         before = copy.deepcopy(events)

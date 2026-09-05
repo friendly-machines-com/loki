@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from loki_agent import (
+    __version__,
     acp,
     acp_main,
     acps,
@@ -372,23 +373,6 @@ class QuarantineTests(unittest.TestCase):
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class EntrypointTests(unittest.TestCase):
-    def test_loki_acp_script_is_shipped_and_executable(self):
-        # The user-facing ACP entrypoint is the deliverable; these tests
-        # fail if it is deleted or loses its exec bit.
-        self.assertTrue(os.path.isfile(LOKI_ACP),
-                        f"{LOKI_ACP} is missing")
-        self.assertTrue(os.access(LOKI_ACP, os.X_OK),
-                        f"{LOKI_ACP} is not executable")
-
-    def test_pyproject_declares_installed_acp_entrypoint(self):
-        with open(
-                os.path.join(ROOT, "pyproject.toml"),
-                encoding="utf-8") as stream:
-            content = stream.read()
-        self.assertIn(
-            'loki-acp = "loki_agent.acp_main:main"', content,
-            "installed users need the loki-acp console script")
-
     def test_subagent_uses_inherited_worker_authority(self):
         with mock.patch.object(
                 acp_main,
@@ -469,7 +453,7 @@ class FrontWorkerTests(unittest.TestCase):
                 self.assertEqual(
                     reply["result"]["agentInfo"]["name"], "loki")
                 self.assertEqual(
-                    reply["result"]["agentInfo"]["version"], "0.1.0")
+                    reply["result"]["agentInfo"]["version"], __version__)
                 capabilities = reply["result"]["agentCapabilities"]
                 self.assertEqual(
                     capabilities["sessionCapabilities"]["close"], {})

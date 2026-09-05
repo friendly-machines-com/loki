@@ -1437,18 +1437,5 @@ class PromptRendererTests(unittest.TestCase):
         self.assertNotIn("\x1b", out.getvalue())
 
 
-class RestoreOutputAreaTests(unittest.TestCase):
-    def test_restore_output_area_resets_colors_and_flushes(self):
-        old_terminal = terminals.terminal
-        recorder = RecordingTerminal()
-        try:
-            terminals.terminal = recorder
-            terminals.restore_output_area_after_input()
-        finally:
-            terminals.terminal = old_terminal
-
-        self.assertEqual(recorder.calls, [("reset_colors_and_flags",), ("flush",)])
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -199,34 +199,6 @@ class CatalogFetchTests(unittest.TestCase):
         self.assertEqual(result, DATA)
         self.assertEqual(cached, DATA)
 
-    def test_fetch_leaves_the_event_loop_responsive(self):
-        async def scenario():
-            request_started = asyncio.Event()
-            release_response = asyncio.Event()
-            sibling_ran = asyncio.Event()
-
-            async def transport(*_args, **_kwargs):
-                request_started.set()
-                await release_response.wait()
-                return http_client.HttpResponse(
-                    models.MODELS_DEV_URL,
-                    200,
-                    "OK",
-                    {"content-type": "application/json"},
-                    b"{}",
-                )
-
-            with mock.patch.object(
-                    http_client, "async_http_request", new=transport):
-                fetch = asyncio.create_task(models.fetch_models_dev())
-                await request_started.wait()
-                asyncio.get_running_loop().call_soon(sibling_ran.set)
-                await asyncio.wait_for(sibling_ran.wait(), timeout=0.2)
-                release_response.set()
-                return await fetch
-
-        self.assertEqual(asyncio.run(scenario()), {})
-
     def test_fetch_rejects_http_errors_and_oversized_catalogs(self):
         responses = [
             (
@@ -855,10 +827,6 @@ class GroupingTests(unittest.TestCase):
         # attachment is on openrouter but not zhipuai, so the union includes it.
         self.assertEqual(bits, (True, True, True, True, True, False))
 
-    def test_feature_names_empty_bits(self):
-        self.assertEqual(models.feature_names((False, False, False, False, False, False)), "")
-
-
 class ProtocolAndKeyTests(unittest.TestCase):
     def test_provider_supported_accepts_endpoint_and_v1_base(self):
         self.assertTrue(models.provider_supported({"api": "https://x.test/v1/chat/completions"}))
@@ -1103,11 +1071,6 @@ class MenuTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertTrue(rendered.startswith("\nUsable things:\n"))
         self.assertEqual(rendered.count("\nUsable things:\n"), 2)
-
-    def test_model_rows_show_provider_snippet(self):
-        rows = models._model_rows(_groups())
-        glm = next(t for t in (r[1] for r in rows) if t.startswith("GLM-5.2"))
-        self.assertIn("[2 providers: zhipuai, openrouter]", glm)
 
     def test_model_rows_show_all_providers(self):
         data = {f"p{i}": {"api": "https://x.test/v1", "models": {

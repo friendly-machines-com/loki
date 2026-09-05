@@ -162,8 +162,9 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         with open(
                 self.storage.file_path, "w", encoding="utf-8") as stream:
             stream.write(
-                '{"version":1,"version":1,"revision":0,'
-                '"credentials":{}}')
+                f'{{"version":{credential_storages.FORMAT_VERSION},'
+                f'"version":{credential_storages.FORMAT_VERSION},'
+                '"revision":0,"credentials":{}}')
         os.chmod(self.storage.file_path, 0o600)
 
         with self.assertRaisesRegex(
@@ -176,7 +177,8 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         with open(
                 self.storage.file_path, "w", encoding="ascii") as stream:
             stream.write(
-                '{"version":1,"revision":'
+                f'{{"version":{credential_storages.FORMAT_VERSION},'
+                '"revision":'
                 + "9" * 5000
                 + ',"credentials":{}}')
         os.chmod(self.storage.file_path, 0o600)
@@ -192,7 +194,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                 self.storage.file_path, "w",
                 encoding="ascii") as stream:
             json.dump({
-                "version": 2,
+                "version": credential_storages.FORMAT_VERSION + 1,
                 "revision": 0,
                 "credentials": {},
             }, stream)
@@ -529,7 +531,7 @@ class CredentialDocumentTests(unittest.TestCase):
                 os.path.join(temporary, "credentials"))
             storage.ensure_directory()
             document = {
-                "version": 1,
+                "version": credential_storages.FORMAT_VERSION,
                 "revision": 3,
                 "credentials": {
                     "future:value": {"type": "future"},

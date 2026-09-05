@@ -10,10 +10,6 @@ import unittest
 from unittest import mock
 
 
-os.environ.setdefault("LOKI_API_KEY", "test-key")
-os.environ.setdefault("LOKI_API_BASE", "https://api.openai.com/v1/responses")
-os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
-
 from loki_agent import formats
 from loki_agent import loki
 from loki_agent import terminal_frontend

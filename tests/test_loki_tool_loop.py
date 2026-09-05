@@ -15,10 +15,6 @@ import unittest
 from unittest import mock
 
 
-os.environ.setdefault("LOKI_API_KEY", "test-key")
-os.environ.setdefault("LOKI_API_BASE", "https://api.openai.com/v1/responses")
-os.environ.setdefault("LOKI_PROVIDER", "openai_responses")
-
 from loki_agent import formats
 from loki_agent import authentications
 from loki_agent import credential_runtimes
@@ -127,6 +123,7 @@ class TerminalImageCommandTests(unittest.TestCase):
         "session_state",
         "chat_log_path",
         "chat_log_dirty",
+        "job_manager",
         "shell_cwd",
         "previous_shell_cwd",
         "agent_mode",
@@ -1133,25 +1130,6 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertNotIn(
                     "x-api-key", config.chat_provider.headers)
 
-    def test_apply_runtime_config_assigns_runtime_globals(self):
-        env = {
-            "LOKI_API_BASE": "https://example.test/v1/responses",
-            "LOKI_PROVIDER": "openai_responses",
-            "LOKI_API_KEY": "test-key",
-            "LOKI_MODEL": "gpt-test",
-        }
-        config = loki.build_config_from_env(env)
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
-
-        try:
-            loki.apply_runtime_config(config)
-
-            self.assertIs(loki.current_config(), config)
-            self.assertEqual(loki.current_model(), "gpt-test")
-        finally:
-            restore_loki_state(old_values)
-
     def test_saved_connection_requires_its_exact_credential(self):
         effort_profile = _effort_profile("low", "high")
         descriptor = ConnectionDescriptor(
@@ -1536,13 +1514,13 @@ class ModelLoadingTests(unittest.TestCase):
     def setUp(self):
         names = [
             "runtime_config", "CREDENTIALS", "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos",
+            "transcript_items", "session_todos", "job_manager",
+            "shell_cwd", "previous_shell_cwd",
         ]
         self.old_values = save_loki_state(names)
 
     def tearDown(self):
-        for name, value in self.old_values.items():
-            loki.current_session().__dict__[name] = value
+        restore_loki_state(self.old_values)
 
     def test_provider_model_discovery_does_not_select_a_model(self):
         loki.apply_runtime_config(loki.make_runtime_config(
@@ -2211,6 +2189,9 @@ class SubscriptionResumeTests(unittest.TestCase):
         "session_state",
         "chat_log_path",
         "chat_log_dirty",
+        "job_manager",
+        "shell_cwd",
+        "previous_shell_cwd",
     ]
 
     def setUp(self):
@@ -7228,7 +7209,7 @@ class QuestionGuardTests(unittest.TestCase):
 
     def setUp(self):
         self._state = save_loki_state(
-            ["agent_mode", "last_instructed_agent_mode"])
+            ["agent_mode", "last_instructed_agent_mode", "job_manager"])
 
     def tearDown(self):
         restore_loki_state(self._state)

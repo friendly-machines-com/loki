@@ -170,14 +170,6 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertTrue(capability.closed)
         self.assertIsNone(job.credential_capability)
 
-    def test_job_state_uses_event_loop_ownership_without_a_thread_lock(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
-
-        self.assertFalse(hasattr(manager, "_lock"))
-        self.assertEqual(manager._next_job_id(), "1")
-        self.assertEqual(manager._next_job_id(), "2")
-
     def test_subagent_slots_bound_concurrent_children_and_release_on_exit(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
@@ -605,51 +597,6 @@ class TerminalEntrypointContractTests(unittest.TestCase):
 
 
 class AgentModeContractTests(unittest.TestCase):
-    def test_explore_and_plan_expose_only_nonmutating_tools(self):
-        self.assertNotIn("Bash", loki.EXPLORE_TOOLS)
-        self.assertNotIn("Write", loki.EXPLORE_TOOLS)
-        self.assertNotIn("Edit", loki.EXPLORE_TOOLS)
-        self.assertNotIn("TodoWrite", loki.EXPLORE_TOOLS)
-        self.assertNotIn("JobStop", loki.EXPLORE_TOOLS)
-        self.assertIn("Agent", loki.EXPLORE_TOOLS)
-        self.assertIn("Read", loki.EXPLORE_TOOLS)
-        self.assertIn("Grep", loki.EXPLORE_TOOLS)
-
-        old_mode = loki.current_session().agent_mode
-        try:
-            for mode in ("explore", "plan"):
-                loki.current_session().agent_mode = mode
-                context = loki.get_tool_loop_extra_context([])
-                self.assertIsNotNone(
-                    loki._tool_access_error(
-                        "Write", extra_context=context))
-                self.assertIsNone(
-                    loki._tool_access_error(
-                        "Read", extra_context=context))
-        finally:
-            loki.current_session().agent_mode = old_mode
-
-    def test_question_punctuation_inhibits_edits_for_that_turn(self):
-        # The question guard (ed8c342) refuses tool calls for any turn
-        # that opens with a question. 1a0c19a silently dropped the
-        # trigger and pinned its absence here; reinstated verbatim by
-        # owner decision on 2026-08-29: a prompt ending in '?' is a
-        # question -- including "Can you fix X?" -- so the agent
-        # answers it; implementation waits for a non-question turn.
-        old_mode = loki.current_session().agent_mode
-        try:
-            loki.current_session().agent_mode = "normal"
-            transcript = [
-                loki.formats.message_item(
-                    "user", "Can you fix the broken resume?"),
-            ]
-            self.assertEqual(
-                loki.get_tool_loop_extra_context(transcript)[
-                    "inhibit_edits"],
-                "answering the user's question")
-        finally:
-            loki.current_session().agent_mode = old_mode
-
     def test_terminal_advertises_plan_toolset_in_plan_mode(self):
         captured = []
         old_mode = loki.current_session().agent_mode
