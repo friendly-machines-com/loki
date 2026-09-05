@@ -15,17 +15,6 @@ class ReasoningEffortError(ValueError):
     pass
 
 
-DEFAULT_OPTION_VALUE = "default"
-EFFORT_VALUES = (
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-)
-_EFFORT_VALUE_SET = frozenset(EFFORT_VALUES)
 _DISPLAY_NAMES = {
     "none": "None",
     "minimal": "Minimal",
@@ -34,8 +23,9 @@ _DISPLAY_NAMES = {
     "high": "High",
     "xhigh": "Extra high",
     "max": "Maximum",
+    "ultra": "Ultra",
 }
-_MAX_DESCRIPTION_LENGTH = 512
+_CODEX_APPLICATION_EFFORTS = frozenset({"ultra"})
 
 # Catalog values do not carry their raw HTTP field path. Register only
 # provider/protocol surfaces whose effort request contract Loki implements.
@@ -59,13 +49,10 @@ _ZAI_PROVIDER_IDS = frozenset({
 })
 
 
-def _effort_value(value, field_name, *, codex_alias=False):
-    if codex_alias and value == "ultra":
-        return "max"
-    if not isinstance(value, str) or value not in _EFFORT_VALUE_SET:
-        expected = ", ".join(EFFORT_VALUES)
+def _effort_value(value, field_name):
+    if not isinstance(value, str) or not value:
         raise ReasoningEffortError(
-            f"{field_name} must be one of {expected}")
+            f"{field_name} must be a non-empty string")
     return value
 
 
@@ -80,7 +67,8 @@ def preference_from_value(value):
 
 
 def display_name(value: str) -> str:
-    return _DISPLAY_NAMES[_effort_value(value, "reasoning effort")]
+    value = _effort_value(value, "reasoning effort")
+    return _DISPLAY_NAMES.get(value, value)
 
 
 def wire_protocol_supported(provider_id, protocol) -> bool:
@@ -100,13 +88,10 @@ class ReasoningEffortOption:
     def __post_init__(self):
         _effort_value(self.value, "reasoning effort option")
         if self.description is not None:
-            if (not isinstance(self.description, str)
-                    or not self.description
-                    or len(self.description) > _MAX_DESCRIPTION_LENGTH):
+            if not isinstance(self.description, str) or not self.description:
                 raise ReasoningEffortError(
                     "reasoning effort description must be a non-empty "
-                    f"string of at most {_MAX_DESCRIPTION_LENGTH} characters "
-                    "or null")
+                    "string or null")
 
     def to_dict(self):
         return {
@@ -152,9 +137,6 @@ class ReasoningEffortProfile:
         if self.default_value is not None:
             _effort_value(
                 self.default_value, "reasoning effort profile default")
-            if self.default_value not in values:
-                raise ReasoningEffortError(
-                    "reasoning effort profile default is not an option")
 
     @property
     def values(self) -> tuple[str, ...]:
@@ -206,15 +188,9 @@ def from_modelsdev_model(model_entry) -> ReasoningEffortProfile | None:
     if not isinstance(raw_options, list):
         raise ReasoningEffortError(
             "models.dev reasoning_options must be an array")
-    for option in raw_options:
-        if (not isinstance(option, dict)
-                or not isinstance(option.get("type"), str)):
-            raise ReasoningEffortError(
-                "models.dev reasoning option must be an object with a "
-                "string type")
     effort_entries = [
         option for option in raw_options
-        if option.get("type") == "effort"
+        if isinstance(option, dict) and option.get("type") == "effort"
     ]
     if not effort_entries:
         return None
@@ -228,8 +204,7 @@ def from_modelsdev_model(model_entry) -> ReasoningEffortProfile | None:
     return ReasoningEffortProfile(
         options=tuple(
             ReasoningEffortOption(
-                _effort_value(
-                    value, "models.dev reasoning effort value"))
+                _effort_value(value, "models.dev reasoning effort value"))
             for value in values
         ),
     )
@@ -260,10 +235,13 @@ def from_codex_catalog_model(value) -> ReasoningEffortProfile | None:
             raise ReasoningEffortError(
                 "OpenAI Codex reasoning effort must be a string")
         effort = _effort_value(
-            raw_effort,
-            "OpenAI Codex reasoning effort",
-            codex_alias=True,
-        )
+            raw_effort, "OpenAI Codex reasoning effort")
+        # Codex's ``ultra`` is an application mode: it selects proactive
+        # multi-agent behavior in addition to sending ``max`` to inference.
+        # Loki does not implement that mode, so it must not advertise
+        # ``ultra`` as an ordinary LLM effort or silently rename it.
+        if effort in _CODEX_APPLICATION_EFFORTS:
+            continue
         description = level.get("description")
         if description is not None and (
                 not isinstance(description, str) or not description):
@@ -273,12 +251,37 @@ def from_codex_catalog_model(value) -> ReasoningEffortProfile | None:
     raw_default = value.get("default_reasoning_level")
     default = (
         None if raw_default is None else _effort_value(
-            raw_default,
-            "OpenAI Codex default reasoning level",
-            codex_alias=True,
+            raw_default, "OpenAI Codex default reasoning level",
         )
     )
+    if not options:
+        return None
     return ReasoningEffortProfile(tuple(options), default)
+
+
+def validate_codex_effort_profile(
+        profile: ReasoningEffortProfile | None, *,
+        supports_reasoning: bool,
+        request_default: str | None,
+) -> None:
+    """Validate a saved/delegated selector against its request contract."""
+    if profile is None:
+        return
+    if not supports_reasoning:
+        raise ReasoningEffortError(
+            "OpenAI Codex reasoning effort profile requires reasoning "
+            "support")
+    if profile.default_value != request_default:
+        raise ReasoningEffortError(
+            "OpenAI Codex reasoning effort and request profile defaults "
+            "disagree")
+    if any(
+            option.value in _CODEX_APPLICATION_EFFORTS
+            for option in profile.options
+    ):
+        raise ReasoningEffortError(
+            "OpenAI Codex reasoning effort profile contains an unsupported "
+            "application mode")
 
 
 def effective_effort(

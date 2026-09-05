@@ -108,6 +108,19 @@ class ConnectionDescriptor:
             raise ConnectionDescriptorError(
                 "connection reasoning effort profile is not valid for this "
                 "provider protocol")
+        if subscription:
+            try:
+                reasonings.validate_codex_effort_profile(
+                    self.reasoning_effort_profile,
+                    supports_reasoning=(
+                        self.openai_request_profile
+                        .supports_reasoning_summaries),
+                    request_default=(
+                        self.openai_request_profile
+                        .default_reasoning_level),
+                )
+            except reasonings.ReasoningEffortError as error:
+                raise ConnectionDescriptorError(str(error)) from error
 
     def to_dict(self) -> dict:
         return {

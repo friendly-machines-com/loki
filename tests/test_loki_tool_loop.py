@@ -744,8 +744,7 @@ class RuntimeConfigTests(unittest.TestCase):
             loki.apply_runtime_config(first)
             self.assertEqual(loki.effective_reasoning_effort(), "high")
 
-            loki.set_reasoning_effort(
-                reasonings.DEFAULT_OPTION_VALUE)
+            loki.set_reasoning_effort(None)
             self.assertIsNone(
                 loki.current_reasoning_effort_preference())
             self.assertIsNone(loki.effective_reasoning_effort())
@@ -816,7 +815,7 @@ class RuntimeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 ValueError, "invalid saved reasoning effort"):
             loki.reasoning_effort_from_session_state({
-                "reasoning_effort": "surprise",
+                "reasoning_effort": 42,
             })
 
     def test_tool_loop_snapshots_reasoning_effort_for_all_requests(self):
@@ -1236,7 +1235,9 @@ class RuntimeConfigTests(unittest.TestCase):
             credential_ref=credential,
             auth_scheme="openai-subscription",
             openai_request_profile=_codex_model(
-                supports_parallel_tool_calls=False),
+                supports_parallel_tool_calls=False,
+                supports_reasoning_summaries=True,
+                default_reasoning_level="low"),
             reasoning_effort_profile=_effort_profile(
                 "low", default="low"),
         )
@@ -1272,6 +1273,62 @@ class RuntimeConfigTests(unittest.TestCase):
             refreshed.reasoning_effort_profile.values, ("high",))
         self.assertEqual(
             refreshed.reasoning_effort_profile.default_value, "high")
+
+    def test_subscription_refresh_keeps_connection_without_valid_selector(
+            self):
+        credential = (
+            authentications.CredentialRef.openai_subscription())
+        descriptor = ConnectionDescriptor(
+            provider_id="openai-subscription",
+            provider_name="OpenAI ChatGPT subscription",
+            model="gpt-test",
+            chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
+            models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+            protocol=protocols.OPENAI_RESPONSES,
+            credential_ref=credential,
+            auth_scheme="openai-subscription",
+            openai_request_profile=_codex_model(
+                supports_reasoning_summaries=True,
+                default_reasoning_level="max"),
+            reasoning_effort_profile=_effort_profile(
+                "max", default="max"),
+        )
+        response = {
+            "models": [{
+                "slug": "gpt-test",
+                "display_name": "GPT Test",
+                "visibility": "list",
+                "input_modalities": ["text"],
+                "supported_reasoning_levels": [
+                    {"effort": "max"},
+                    {"effort": "max"},
+                ],
+                "default_reasoning_level": "max",
+                "supports_reasoning_summaries": True,
+                "default_reasoning_summary": "auto",
+                "supports_parallel_tool_calls": True,
+            }],
+        }
+        diagnostics = []
+
+        with mock.patch.object(
+                modelsdev,
+                "fetch_openai_subscription_models",
+                new=mock.AsyncMock(return_value=response)):
+            refreshed = asyncio.run(
+                loki.refresh_connection_descriptor_async(
+                    descriptor,
+                    object(),
+                    diagnostic_writer=diagnostics.append,
+                ))
+
+        self.assertEqual(refreshed.model, "gpt-test")
+        self.assertIsNotNone(refreshed.openai_request_profile)
+        self.assertIsNone(refreshed.reasoning_effort_profile)
+        self.assertTrue(any(
+            "Ignoring reasoning effort choices" in item
+            for item in diagnostics
+        ))
 
     def test_subscription_descriptor_uses_saved_profile_only_when_offline(
             self):
@@ -1689,7 +1746,7 @@ class ModelLoadingTests(unittest.TestCase):
                 stream.write(savefiles.serialize_chat_log(
                     [],
                     [],
-                    {"reasoning_effort": "future-value"},
+                    {"reasoning_effort": 42},
                 ))
             with mock.patch(
                     "loki_agent.terminal_frontend.input_session",
@@ -2171,7 +2228,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         self.assertEqual(
             terminal_frontend._reasoning_effort_rows(),
             [
-                ("default", "Model default (Minimal)"),
+                (None, "Model default (Minimal)"),
                 ("minimal", "Minimal"),
                 ("high", "High"),
             ],
@@ -5014,6 +5071,8 @@ class SubagentLaunchTests(unittest.TestCase):
             context_window=200000,
             base_instructions="must not enter the child environment",
         )
+        effort_profile = _effort_profile(
+            "low", "high", default="high")
         manager = mock.Mock()
         manager.run_exec = mock.AsyncMock(return_value=(
             types.SimpleNamespace(exit_code=0),
@@ -5030,7 +5089,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 credential_ref=credential,
                 auth_scheme="openai-subscription",
                 openai_request_profile=profile,
-                reasoning_effort_profile=_effort_profile("low", "high"),
+                reasoning_effort_profile=effort_profile,
             ))
             loki.current_session().session_state = {}
             loki.current_session().chat_log_path = None
@@ -5064,7 +5123,7 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertEqual(
             json.loads(
                 kwargs["env"]["LOKI_REASONING_EFFORT_PROFILE"]),
-            _effort_profile("low", "high").to_dict(),
+            effort_profile.to_dict(),
         )
         self.assertEqual(
             kwargs["env"]["LOKI_REASONING_EFFORT"], "high")

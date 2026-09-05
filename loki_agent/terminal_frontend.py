@@ -571,6 +571,8 @@ def _write_status_text():
 
 terminals.set_status_text_provider(_write_status_text)
 
+_REASONING_EFFORT_PICKER_CANCELLED = object()
+
 
 def _reasoning_effort_rows():
     profile = _core.current_reasoning_effort_profile()
@@ -578,7 +580,7 @@ def _reasoning_effort_rows():
         return []
     preference = _core.current_reasoning_effort_preference()
     rows = [(
-        reasonings.DEFAULT_OPTION_VALUE,
+        None,
         reasonings.default_option_name(profile, preference),
     )]
     for option in profile.options:
@@ -603,7 +605,7 @@ async def run_reasoning_effort_picker_async(session):
             choice = await modal.prompt(
                 "Effort choice (number selects, empty cancels): ")
             if not choice:
-                return None
+                return _REASONING_EFFORT_PICKER_CANCELLED
             try:
                 index = int(choice)
             except ValueError:
@@ -1008,7 +1010,7 @@ async def async_main(args) -> int:
                         sys.stderr.flush()
                         continue
                     picked = await run_reasoning_effort_picker_async(session)
-                    if picked is None:
+                    if picked is _REASONING_EFFORT_PICKER_CANCELLED:
                         print(
                             "Reasoning effort selection cancelled.",
                             file=sys.stderr,

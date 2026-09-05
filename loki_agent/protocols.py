@@ -239,7 +239,9 @@ class Provider:
                     if reasoning_effort != "none":
                         payload["reasoning_effort"] = reasoning_effort
                 else:
-                    payload["reasoning_effort"] = reasoning_effort
+                    raise ProtocolError(
+                        "reasoning effort is not implemented for this "
+                        "OpenAI Chat provider")
             return payload
         if self.kind == ANTHROPIC_MESSAGES:
             system, messages = formats.items_to_anthropic_parts(

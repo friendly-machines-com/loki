@@ -155,6 +155,55 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(channel.credential_delegation)
 
 
+class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_buffered_config_cannot_overtake_prompt(self):
+        order = []
+        responses = []
+        prompt_reply = asyncio.get_running_loop().create_future()
+
+        class Channel:
+            async def start_request(self, method, params):
+                order.append(method)
+                if method == "session/prompt":
+                    return prompt_reply
+                reply = asyncio.get_running_loop().create_future()
+                reply.set_result({"configOptions": []})
+                return reply
+
+        front = acp.Front(
+            lambda: None, responses.append, CredentialStore({}))
+        front.workers["session"] = Channel()
+
+        await front.handle({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "session",
+                "prompt": [{"type": "text", "text": "hello"}],
+            },
+        })
+        await front.handle({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/set_config_option",
+            "params": {
+                "sessionId": "session",
+                "configId": "reasoning_effort",
+                "value": "effort:low",
+            },
+        })
+
+        self.assertEqual(order, [
+            "session/prompt",
+            "session/set_config_option",
+        ])
+        prompt_reply.set_result({"stopReason": "end_turn"})
+        await asyncio.gather(*front._tasks)
+        self.assertEqual(
+            {message["id"] for message in responses}, {1, 2})
+
+
 class SavedConnectionAuthorizationTests(
         unittest.IsolatedAsyncioTestCase):
     def _descriptor(self):
@@ -1413,15 +1462,16 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                 self.assertEqual(thought["currentValue"], "default")
                 self.assertEqual(
                     [value["value"] for value in thought["options"]],
-                    ["default", "low", "high"],
+                    ["default", "effort:low", "effort:high"],
                 )
 
                 selected = worker.set_config_option({
                     "configId": "reasoning_effort",
-                    "value": "high",
+                    "value": "effort:high",
                 })
                 self.assertEqual(
-                    selected["configOptions"][1]["currentValue"], "high")
+                    selected["configOptions"][1]["currentValue"],
+                    "effort:high")
 
                 plain = worker.set_config_option({
                     "configId": "model",
@@ -1435,7 +1485,8 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                     "value": "openrouter/high-model",
                 })
                 self.assertEqual(
-                    restored["configOptions"][1]["currentValue"], "high")
+                    restored["configOptions"][1]["currentValue"],
+                    "effort:high")
 
                 narrowed = worker.set_config_option({
                     "configId": "model",
@@ -1447,7 +1498,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                 self.assertEqual(
                     [value["value"]
                      for value in narrowed_thought["options"]],
-                    ["default", "low"],
+                    ["default", "effort:low"],
                 )
                 self.assertIn(
                     "preferred High is unavailable",
@@ -1459,7 +1510,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                 with self.assertRaises(acps.TransportError) as caught:
                     worker.set_config_option({
                         "configId": "reasoning_effort",
-                        "value": "max",
+                        "value": "effort:max",
                     })
                 self.assertEqual(
                     caught.exception.code, acps.INVALID_PARAMS)
@@ -1471,7 +1522,8 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                     "value": "openrouter/high-model",
                 })
                 self.assertEqual(
-                    restored["configOptions"][1]["currentValue"], "high")
+                    restored["configOptions"][1]["currentValue"],
+                    "effort:high")
                 self.assertEqual(loki.effective_reasoning_effort(), "high")
         finally:
             loki._DEFAULT_SESSION = old_session
@@ -1536,7 +1588,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                     "params": {
                         "sessionId": "session",
                         "configId": "reasoning_effort",
-                        "value": "low",
+                        "value": "effort:low",
                     },
                 }, concurrent=True)
                 release.set()
@@ -1552,7 +1604,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                 if message.get("id") == 2)
             self.assertEqual(
                 response["result"]["configOptions"][1]["currentValue"],
-                "low",
+                "effort:low",
             )
         finally:
             loki._DEFAULT_SESSION = old_session

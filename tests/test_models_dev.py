@@ -640,6 +640,58 @@ class CatalogNormalizationTests(unittest.TestCase):
         self.assertEqual(profile.default_value, "high")
         self.assertEqual(profile.option("low").description, "Fast")
 
+    def test_subscription_max_and_ultra_keeps_model(self):
+        diagnostics = []
+        normalized = models.add_openai_subscription_catalog(
+            {},
+            {"models": [_subscription_model(
+                "gpt-test",
+                supported_reasoning_levels=[
+                    {"effort": "max", "description": "Deep"},
+                    {"effort": "ultra", "description": "Application mode"},
+                ],
+                default_reasoning_level="ultra",
+            )]},
+            diagnostic_writer=diagnostics.append,
+        )
+        provider = normalized["openai-subscription"]
+
+        self.assertIn("gpt-test", provider["models"])
+        profile = models.reasoning_effort_profile(
+            "openai-subscription",
+            provider,
+            provider["models"]["gpt-test"],
+        )
+        self.assertEqual(profile.values, ("max",))
+        self.assertEqual(profile.default_value, "ultra")
+        self.assertEqual(diagnostics, [])
+
+    def test_bad_subscription_effort_metadata_keeps_model(self):
+        diagnostics = []
+        normalized = models.add_openai_subscription_catalog(
+            {},
+            {"models": [_subscription_model(
+                "gpt-test",
+                supported_reasoning_levels=[
+                    {"effort": "max"},
+                    {"effort": "max"},
+                ],
+                default_reasoning_level="max",
+            )]},
+            diagnostic_writer=diagnostics.append,
+        )
+        provider = normalized["openai-subscription"]
+        model = provider["models"]["gpt-test"]
+
+        self.assertIsNotNone(
+            models.openai_request_profile(provider, model))
+        self.assertIsNone(models.reasoning_effort_profile(
+            "openai-subscription", provider, model))
+        self.assertTrue(any(
+            "Ignoring reasoning effort choices" in item
+            for item in diagnostics
+        ))
+
     def test_reasoning_effort_requires_registered_wire_surface(self):
         model = {
             "reasoning_options": [{

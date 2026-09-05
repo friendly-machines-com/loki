@@ -466,22 +466,6 @@ class OpenAIChatReasoningTests(unittest.TestCase):
             explicit_payload["reasoning"], {"effort": "max"})
         self.assertTrue(explicit_payload["stream"])
 
-    def test_generic_chat_completions_uses_openai_reasoning_effort(self):
-        provider = protocols.make_provider(
-            "https://api.openai.com/v1/chat/completions",
-            provider=protocols.OPENAI_CHAT,
-        )
-
-        payload = provider.chat_payload(
-            [formats.message_item("user", "hello")],
-            [],
-            "model",
-            reasoning_effort="low",
-        )
-
-        self.assertEqual(payload["reasoning_effort"], "low")
-        self.assertNotIn("reasoning", payload)
-
     def test_zai_effort_explicitly_enables_thinking(self):
         for provider_id, url in [
                 ("zai", "https://api.z.ai/api/paas/v4/chat/completions"),

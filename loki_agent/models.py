@@ -227,15 +227,8 @@ def _openai_subscription_model_entries(
             continue
 
         modalities = model.get("input_modalities", ["text", "image"])
-        reasoning_levels = model.get("supported_reasoning_levels", [])
         if (not isinstance(modalities, list)
-                or not all(isinstance(item, str) for item in modalities)
-                or not isinstance(reasoning_levels, list)
-                or not all(
-                    isinstance(item, dict)
-                    and isinstance(item.get("effort"), str)
-                    and bool(item["effort"])
-                    for item in reasoning_levels)):
+                or not all(isinstance(item, str) for item in modalities)):
             if diagnostic_writer is not None:
                 diagnostic_writer(
                     "Ignoring OpenAI subscription model "
@@ -247,17 +240,27 @@ def _openai_subscription_model_entries(
             request_profile = (
                 openai_models.CodexModelRequestProfile.from_catalog_model(
                     model))
-            reasoning_effort_profile = (
-                reasonings.from_codex_catalog_model(model))
-        except (
-                openai_models.OpenAIModelProfileError,
-                reasonings.ReasoningEffortError,
-        ) as error:
+        except openai_models.OpenAIModelProfileError as error:
             if diagnostic_writer is not None:
                 diagnostic_writer(
                     "Ignoring OpenAI subscription model "
                     f"{slug!r}: {error}")
             continue
+        try:
+            reasoning_effort_profile = (
+                reasonings.from_codex_catalog_model(model))
+            reasonings.validate_codex_effort_profile(
+                reasoning_effort_profile,
+                supports_reasoning=(
+                    request_profile.supports_reasoning_summaries),
+                request_default=request_profile.default_reasoning_level,
+            )
+        except reasonings.ReasoningEffortError as error:
+            reasoning_effort_profile = None
+            if diagnostic_writer is not None:
+                diagnostic_writer(
+                    "Ignoring reasoning effort choices for OpenAI "
+                    f"subscription model {slug!r}: {error}")
 
         display_name = model.get("display_name")
         if not isinstance(display_name, str) or not display_name:
@@ -265,7 +268,7 @@ def _openai_subscription_model_entries(
         result[slug] = {
             "id": slug,
             "name": display_name,
-            "reasoning": bool(reasoning_levels),
+            "reasoning": request_profile.supports_reasoning_summaries,
             "tool_call": True,
             "temperature": False,
             "attachment": "image" in modalities,

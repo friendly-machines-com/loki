@@ -25,6 +25,8 @@ from .sessions import Session
 _DISCONNECTED = object()
 _UNCHANGED = object()
 _PROMPT_EFFORT_UNSET = object()
+_MODEL_DEFAULT_CONFIG_VALUE = "default"
+_EFFORT_CONFIG_VALUE_PREFIX = "effort:"
 
 
 @dataclass(frozen=True)
@@ -195,12 +197,12 @@ class Worker:
             return None
         preference = loki.current_reasoning_effort_preference()
         current_value = (
-            preference
+            _EFFORT_CONFIG_VALUE_PREFIX + preference
             if profile.supports(preference)
-            else reasonings.DEFAULT_OPTION_VALUE
+            else _MODEL_DEFAULT_CONFIG_VALUE
         )
         values = [{
-            "value": reasonings.DEFAULT_OPTION_VALUE,
+            "value": _MODEL_DEFAULT_CONFIG_VALUE,
             "name": reasonings.default_option_name(profile, preference),
             "description": (
                 "Use the selected model or provider's own reasoning "
@@ -208,7 +210,7 @@ class Worker:
         }]
         for option in profile.options:
             encoded = {
-                "value": option.value,
+                "value": _EFFORT_CONFIG_VALUE_PREFIX + option.value,
                 "name": reasonings.display_name(option.value),
             }
             if option.description is not None:
@@ -502,8 +504,18 @@ class Worker:
         config_id = params.get("configId")
         if config_id == "reasoning_effort":
             value = params.get("value")
+            if value == _MODEL_DEFAULT_CONFIG_VALUE:
+                effort = None
+            elif (isinstance(value, str)
+                    and value.startswith(_EFFORT_CONFIG_VALUE_PREFIX)):
+                effort = value[len(_EFFORT_CONFIG_VALUE_PREFIX):]
+            else:
+                raise acps.TransportError(
+                    f"unknown reasoning effort value {value!r}",
+                    code=acps.INVALID_PARAMS,
+                )
             try:
-                loki.set_reasoning_effort(value)
+                loki.set_reasoning_effort(effort)
             except (reasonings.ReasoningEffortError, ValueError) as error:
                 raise acps.TransportError(
                     str(error), code=acps.INVALID_PARAMS) from error

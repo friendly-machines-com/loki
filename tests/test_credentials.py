@@ -476,6 +476,30 @@ class ConnectionDescriptorTests(unittest.TestCase):
         self.assertNotIn(
             "context_window", encoded["openai_request_profile"])
 
+    def test_subscription_selector_and_request_defaults_must_agree(self):
+        effort_profile = reasonings.ReasoningEffortProfile(
+            options=(reasonings.ReasoningEffortOption("low"),),
+            default_value="low",
+        )
+
+        with self.assertRaisesRegex(
+                ConnectionDescriptorError, "defaults disagree"):
+            ConnectionDescriptor(
+                provider_id="openai-subscription",
+                provider_name="OpenAI ChatGPT subscription",
+                model="gpt-5-codex",
+                chat_url=(
+                    "https://chatgpt.com/backend-api/codex/responses"),
+                models_url=OPENAI_CHATGPT_MODELS_REQUEST_URL,
+                protocol="openai_responses",
+                credential_ref=CredentialRef.openai_subscription(),
+                auth_scheme="openai-subscription",
+                openai_request_profile=_codex_model(
+                    supports_reasoning_summaries=True,
+                    default_reasoning_level="high"),
+                reasoning_effort_profile=effort_profile,
+            )
+
     def test_rejects_invalid_persisted_shapes(self):
         with self.assertRaises(ConnectionDescriptorError):
             ConnectionDescriptor.from_dict({"model": "x"})

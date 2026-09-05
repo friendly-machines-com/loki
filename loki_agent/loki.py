@@ -177,13 +177,13 @@ def install_reasoning_effort_preference(
         raise
 
 
-def set_reasoning_effort(value: str):
+def set_reasoning_effort(value: str | None):
     """Apply one advertised terminal/ACP effort value to the conversation."""
     profile = current_reasoning_effort_profile()
     if profile is None:
         raise ValueError(
             "the selected model does not advertise reasoning effort choices")
-    if value == reasonings.DEFAULT_OPTION_VALUE:
+    if value is None:
         preference = None
     else:
         preference = reasonings.preference_from_value(value)
@@ -451,6 +451,19 @@ def make_runtime_config(
         raise ValueError(
             "reasoning effort profile is not valid for this provider "
             "protocol")
+    if provider_id == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID:
+        try:
+            reasonings.validate_codex_effort_profile(
+                reasoning_effort_profile,
+                supports_reasoning=(
+                    chat_provider.openai_request_profile
+                    .supports_reasoning_summaries),
+                request_default=(
+                    chat_provider.openai_request_profile
+                    .default_reasoning_level),
+            )
+        except reasonings.ReasoningEffortError as error:
+            raise ValueError(str(error)) from error
     auth_spec = _auth_spec(
         provider_kind,
         credential_ref,

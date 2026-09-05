@@ -31,8 +31,7 @@ class ReasoningEffortProfileTests(unittest.TestCase):
         for values in (
                 [],
                 ["low", "low"],
-                ["low", None],
-                ["low", "future-value"]):
+                ["low", None]):
             with self.subTest(values=values), self.assertRaises(
                     reasonings.ReasoningEffortError):
                 reasonings.from_modelsdev_model({
@@ -42,29 +41,46 @@ class ReasoningEffortProfileTests(unittest.TestCase):
                     }],
                 })
 
-    def test_malformed_non_effort_option_is_rejected(self):
-        with self.assertRaises(reasonings.ReasoningEffortError):
-            reasonings.from_modelsdev_model({
-                "reasoning_options": [
-                    {"type": "effort", "values": ["low"]},
-                    None,
-                ],
-            })
+    def test_provider_specific_value_is_preserved_exactly(self):
+        profile = reasonings.from_modelsdev_model({
+            "reasoning_options": [{
+                "type": "effort",
+                "values": ["low", "provider-deep"],
+            }],
+        })
 
-    def test_codex_profile_normalizes_ultra_and_preserves_descriptions(self):
+        self.assertEqual(profile.values, ("low", "provider-deep"))
+        self.assertEqual(
+            reasonings.display_name("provider-deep"), "provider-deep")
+
+    def test_malformed_unrelated_control_is_ignored(self):
+        profile = reasonings.from_modelsdev_model({
+            "reasoning_options": [
+                {"type": "effort", "values": ["low"]},
+                None,
+            ],
+        })
+
+        self.assertEqual(profile.values, ("low",))
+
+    def test_codex_profile_keeps_max_and_omits_ultra(self):
         profile = reasonings.from_codex_catalog_model({
             "supports_reasoning_summaries": True,
             "supported_reasoning_levels": [
-                {"effort": "high", "description": "Deep reasoning"},
-                {"effort": "ultra", "description": "Maximum reasoning"},
+                {"effort": "max", "description": "Deep reasoning"},
+                {"effort": "ultra", "description": "Application mode"},
+                {
+                    "effort": "provider-deep",
+                    "description": "Provider-specific reasoning",
+                },
             ],
             "default_reasoning_level": "ultra",
         })
 
-        self.assertEqual(profile.values, ("high", "max"))
-        self.assertEqual(profile.default_value, "max")
+        self.assertEqual(profile.values, ("max", "provider-deep"))
+        self.assertEqual(profile.default_value, "ultra")
         self.assertEqual(
-            profile.option("high").description, "Deep reasoning")
+            profile.option("max").description, "Deep reasoning")
 
     def test_codex_request_gate_disables_effort_profile(self):
         self.assertIsNone(reasonings.from_codex_catalog_model({
