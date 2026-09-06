@@ -25,7 +25,7 @@ import subprocess
 import signal
 import socket
 import stat
-import errno
+import tempfile
 import uuid
 import shutil
 import shlex
@@ -1038,25 +1038,37 @@ def _resolve_path(path: str, base_dir: str = None) -> str:
     return os.path.join(base_dir or current_cwd(), path)
 
 
-def _file_state_key(file_path: str) -> str:
-    # Preserve read-state sharing between symlink aliases. This spelling is
-    # ONLY a cache key: never open, create or replace a file using it.
+def _file_state_key(file_path: str, expected_stat=None) -> str | None:
+    # A Read supplies the stat obtained for that read, not a later observation
+    # of the link. This name is a cache key, never a replacement destination.
+    recording_read = expected_stat is not None
     key = os.path.realpath(file_path)
+    if expected_stat is None:
+        try:
+            expected_stat = os.stat(file_path)
+        except FileNotFoundError:
+            return key
+        except OSError:
+            return file_path
     try:
-        original = os.stat(file_path)
-    except FileNotFoundError:
-        # Retain the old key so deletion after Read still blocks recreation.
-        return key
-    except OSError:
-        return file_path
-    try:
-        if os.path.samestat(original, os.stat(key)):
+        if os.path.samestat(expected_stat, os.stat(key)):
             return key
     except OSError:
         pass
-    # For example, /proc/self/fd can name an unlinked inode whose realpath
-    # spelling is not a pathname for that inode. Do not alias an unrelated file.
-    return file_path
+    # Magic fd links can describe an inode with no corresponding pathname.
+    # An unverified alias must not authorize replacing a later entry at that
+    # name. Hook invalidation may still discard its literal key conservatively.
+    return None if recording_read else file_path
+
+
+def _existing_target(file_path: str, observed_stat) -> str:
+    # The caller must first validate the complete operand with a kernel lookup.
+    # Only then obtain a spelling for the selected target, checking that the
+    # spelling still refers to the observed object. Never normalize first.
+    target = os.path.realpath(file_path, strict=True)
+    if not os.path.samestat(observed_stat, os.stat(target)):
+        raise OSError("path changed during target selection")
+    return target
 
 
 def _path_under(path: str, parent: str) -> bool:
@@ -1078,8 +1090,10 @@ def change_shell_cwd(path: str = None) -> str:
     elif target == "-":
         target = session.previous_shell_cwd
     resolved = _resolve_path(os.path.expanduser(target))
-    if not stat.S_ISDIR(os.stat(resolved).st_mode):
+    observed = os.stat(resolved)
+    if not stat.S_ISDIR(observed.st_mode):
         raise FileNotFoundError(resolved)
+    resolved = _existing_target(resolved, observed)
     old_cwd = session.shell_cwd
     session.shell_cwd = resolved
     session.previous_shell_cwd = old_cwd
@@ -1241,39 +1255,44 @@ def _format_bash_result(stdout: str, stderr: str, exit_code: int | None,
 
 
 def _write_destination(file_path: str) -> str:
-    """Keep atomic writes through final symlinks without rewriting traversal.
+    """Select once, without mutation, before the Read-before-overwrite checks.
 
-    Parent components are looked up by the kernel. Only the final link needs
-    explicit handling: replace() would otherwise unlink it, unlike open().
-    Creating missing parent directories remains the Write/save policy.
+    Existing operands must pass kernel lookup before target selection. Missing
+    parents may be created later, but a failed traversal of '.' or '..' is not
+    permission to discard components. A dangling link is expanded only so its
+    missing target, including missing parent directories, can be selected.
     """
-    seen = set()
-    while True:
-        directory = os.path.dirname(file_path) or '.'
-        os.makedirs(directory, exist_ok=True)
+    try:
+        observed = os.stat(file_path)
+    except FileNotFoundError:
+        directory, name = os.path.split(file_path)
+        if name in ('', '.', '..'):
+            raise
+        parent = _write_destination(directory or '.')
         try:
-            # Have the kernel reject loops and invalid intermediate components
-            # before resolving a final link for directory-entry replacement.
-            os.stat(file_path)
+            parent_stat = os.stat(parent)
         except FileNotFoundError:
             pass
+        else:
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise NotADirectoryError(parent)
+            parent = _existing_target(parent, parent_stat)
+        target = os.path.join(parent, name)
         try:
-            entry = os.lstat(file_path)
+            entry = os.lstat(target)
         except FileNotFoundError:
-            return file_path
-        if not stat.S_ISLNK(entry.st_mode):
-            return file_path
-        parent = os.stat(directory)
-        identity = (parent.st_dev, parent.st_ino, os.path.basename(file_path))
-        if identity in seen:
-            raise OSError(errno.ELOOP, "symbolic link loop", file_path)
-        seen.add(identity)
-        target = os.readlink(file_path)
-        file_path = os.path.join(directory, target)
+            return target
+        if stat.S_ISLNK(entry.st_mode):
+            return _write_destination(os.path.join(parent, os.readlink(target)))
+        # An entry appeared during selection. Recheck it rather than assume
+        # this is still a new-file write. The caller checks the selected name.
+        return _write_destination(target)
+    return _existing_target(file_path, observed)
 
 
 def _atomic_write_text(file_path: str, content: str):
-    file_path = _write_destination(file_path)
+    # file_path is the already-selected replacement name. Resolving it here
+    # would choose a target again after the caller's read/staleness checks.
     directory = os.path.dirname(file_path) or '.'
     # Capture the desired final mode BEFORE writing so a write/replace failure
     # can never leave the public path's mode corrupted. For an existing file we
@@ -1284,19 +1303,13 @@ def _atomic_write_text(file_path: str, content: str):
         target_mode = os.stat(file_path).st_mode & 0o7777
     except FileNotFoundError:
         target_mode = 0o666 & ~_UMASK
-    # tempfile.mkstemp() applies abspath() to dir, which would collapse '..'
-    # before kernel lookup. Create exclusively using the literal parent path.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
-    for _ in range(100):
-        tmp_path = os.path.join(
-            directory, f".{os.path.basename(file_path)}.{uuid.uuid4().hex}.tmp")
-        try:
-            fd = os.open(tmp_path, flags, 0o600)
-            break
-        except FileExistsError:
-            continue
-    else:
-        raise FileExistsError("could not create a unique temporary file")
+    os.makedirs(directory, exist_ok=True)
+    # Selection produced an absolute target spelling with no unresolved '..'.
+    # The standard allocator is therefore no longer given a literal operand
+    # whose traversal its internal abspath() could change.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(file_path)}.", suffix=".tmp",
+        dir=directory, text=True)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -1318,9 +1331,8 @@ def _atomic_write_text(file_path: str, content: str):
 
 
 def _stale_file_error(file_path: str, action: str) -> str | None:
-    state_key = _file_state_key(file_path)
-    observed = file_state.get(state_key)
-    if state_key not in file_state:
+    observed = file_state.get(file_path)
+    if file_path not in file_state:
         return (
             f"Error: {file_path} has not been read. Read it before "
             f"{action}.")
@@ -2093,6 +2105,7 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
         return f"Error: {file_path} is a directory, not a file"
     try:
         st = os.stat(file_path)
+        state_key = _file_state_key(file_path, expected_stat=st)
     except FileNotFoundError:
         return f"Error: File not found: {file_path}"
     except IsADirectoryError:
@@ -2100,27 +2113,35 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+    def remember(observation):
+        if state_key is not None:
+            file_state[state_key] = observation
+
     ext = os.path.splitext(file_path)[1].lower()
     if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
         try:
-            file_state[_file_state_key(file_path)] = _file_observation(
-                file_path, expected_stat=st)
+            remember(_file_observation(
+                file_path, expected_stat=st))
         except OSError as error:
             return f"Error reading file: {error}"
         return f"File {file_path} is an image ({st.st_size} bytes). Visual content rendering not supported in this environment; reading the file is acknowledged."
 
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
+            if _stat_identity(os.fstat(f.fileno())) != _stat_identity(st):
+                raise OSError("file changed while it was being read")
             # Read one character past the cap so the response can say whether
             # the file was actually truncated.
             content = f.read(READ_CHAR_CAP + 1)
+            if _stat_identity(os.fstat(f.fileno())) != _stat_identity(st):
+                raise OSError("file changed while it was being read")
         truncated_chars = len(content) > READ_CHAR_CAP
         if truncated_chars:
             content = content[:READ_CHAR_CAP]
     except UnicodeDecodeError:
         try:
-            file_state[_file_state_key(file_path)] = _file_observation(
-                file_path, expected_stat=st)
+            remember(_file_observation(
+                file_path, expected_stat=st))
         except OSError as error:
             return f"Error reading file: {error}"
         return f"File {file_path} is binary ({st.st_size} bytes); cannot display as text."
@@ -2129,8 +2150,8 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
 
     if "\x00" in content:
         try:
-            file_state[_file_state_key(file_path)] = _file_observation(
-                file_path, expected_stat=st)
+            remember(_file_observation(
+                file_path, expected_stat=st))
         except OSError as error:
             return f"Error reading file: {error}"
         return (
@@ -2138,7 +2159,7 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
             "cannot display as text.")
 
     if not content:
-        file_state[_file_state_key(file_path)] = _content_observation("")
+        remember(_content_observation(""))
         return f"File {file_path} is empty."
 
     if truncated_chars:
@@ -2160,8 +2181,8 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
     if start + lim < total_lines:
         rendered += f"\n... ({total_lines - start - lim} more lines not shown)"
     try:
-        file_state[_file_state_key(file_path)] = _file_observation(
-            file_path, expected_stat=st)
+        remember(_file_observation(
+            file_path, expected_stat=st))
     except OSError as error:
         return f"Error reading file snapshot: {error}"
     return rendered
@@ -2172,28 +2193,20 @@ def run_write(file_path: str, content: str) -> str:
         return "Error: file_path is required"
     if content is None:
         return "Error: content is required"
-    file_path = _resolve_path(file_path)
     try:
-        state_key = _file_state_key(file_path)
-    except (OSError, ValueError) as error:
+        file_path = _write_destination(_resolve_path(file_path))
+    except Exception as error:
         return f"Error: {error}"
-    if state_key in file_state:
+    if os.path.exists(file_path) and file_path not in file_state:
+        return (f"Error: You must Read {file_path} before overwriting it. "
+                "Read it first, then retry the Write.")
+    if file_path in file_state:
         stale_error = _stale_file_error(file_path, "overwriting it")
         if stale_error:
             return stale_error
-    else:
-        # Parent creation can make a missing/../name traversal reach an
-        # existing file. Check for that before authorizing a new-file write.
-        try:
-            _write_destination(file_path)
-        except (OSError, ValueError) as error:
-            return f"Error: {error}"
-        if os.path.exists(file_path):
-            return (f"Error: You must Read {file_path} before overwriting it. "
-                    "Read it first, then retry the Write.")
     try:
         _atomic_write_text(file_path, content)
-        file_state[_file_state_key(file_path)] = _content_observation(content)
+        file_state[file_path] = _content_observation(content)
         return f"Successfully wrote to {file_path}"
     except Exception as e:
         return f"Error: {e}"
@@ -2204,8 +2217,11 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
         return "Error: file_path is required"
     if old_string == new_string:
         return "Error: new_string must be different from old_string"
-    file_path = _resolve_path(file_path)
-    if _file_state_key(file_path) not in file_state:
+    try:
+        file_path = _write_destination(_resolve_path(file_path))
+    except Exception as error:
+        return f"Error: {error}"
+    if file_path not in file_state:
         return f"Error: You must Read {file_path} before editing it."
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -2235,7 +2251,7 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
 
     try:
         _atomic_write_text(file_path, new_data)
-        file_state[_file_state_key(file_path)] = _content_observation(new_data)
+        file_state[file_path] = _content_observation(new_data)
         return f"Successfully edited {file_path} ({count} replacement{'s' if count != 1 else ''})."
     except Exception as e:
         return f"Error: {e}"
@@ -5313,6 +5329,7 @@ def resolve_chat_log_path(resume_arg: str) -> str:
 
 
 def new_chat_log(filename):
+    filename = _write_destination(filename)
     session = current_session()
     session.conversation_id = conversation_id_for_path(filename)
     session.transcript_items = initial_transcript_items()
