@@ -58,12 +58,9 @@ jobs:
         include:
           - runtime: cpython-3.10
             python: "3.10"
-            shell: bash
           - runtime: cpython-3.13
             python: "3.13"
-            shell: bash
           - runtime: msys2-ucrt
-            shell: 'msys2 {0}'
     steps:
     - uses: actions/checkout@v4
     - name: Set up official CPython
@@ -79,8 +76,19 @@ jobs:
         msystem: UCRT64
         update: true
         install: mingw-w64-ucrt-x86_64-python
-    - name: Probe Windows storage primitives
-      shell: ${{ matrix.shell }}
+    - name: Probe Windows storage primitives (CPython)
+      if: matrix.runtime != 'msys2-ucrt'
+      shell: bash
+      run: |
+        set -o pipefail
+        mkdir -p windows-diagnostics
+        {
+          python -c "import os, sys; print(sys.executable, sys.version, flush=True); assert os.name == 'nt', 'native Windows Python required'" &&
+          python -u tests/test_windows_primitives.py
+        } 2>&1 | tee windows-diagnostics/primitives.log
+    - name: Probe Windows storage primitives (MSYS2 UCRT)
+      if: matrix.runtime == 'msys2-ucrt'
+      shell: 'msys2 {0}'
       run: |
         set -o pipefail
         mkdir -p windows-diagnostics
