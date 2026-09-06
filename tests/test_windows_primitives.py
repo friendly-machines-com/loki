@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 # Exact Windows ABI types (not ctypes.c_long, which is 64 bits on Unix).
@@ -72,6 +73,9 @@ class NativeCalls:
             self.ntdll, 'NtCreateFile', LONG, C.POINTER(HANDLE), ULONG,
             C.POINTER(ObjectAttributes), C.POINTER(IoStatuses), HANDLE,
             ULONG, ULONG, ULONG, ULONG, HANDLE, ULONG)
+        self.ntset = self.bind(
+            self.ntdll, 'NtSetInformationFile', LONG, HANDLE,
+            C.POINTER(IoStatuses), HANDLE, ULONG, C.c_int)
         self.get_security = self.bind(
             self.advapi, 'GetSecurityInfo', ULONG, HANDLE, C.c_int, ULONG,
             C.POINTER(HANDLE), HANDLE, HANDLE, HANDLE, C.POINTER(HANDLE))
@@ -125,18 +129,45 @@ class NativeCalls:
             raise OSError('NtCreateFile NTSTATUS=0x%08x' % (status & 0xffffffff))
         return result.value
 
-    def rename(self, source, directory, name):
+    @staticmethod
+    def rename_buffer(directory, name):
         encoded = name.encode('utf-16-le')
-        size = max(C.sizeof(RenameInfos),
-                   RenameInfos.FileName.offset + len(encoded))
-        buffer = C.create_string_buffer(size)
+        # The Win32 documentation describes FileName as NUL-terminated even
+        # though FileNameLength excludes the terminator. Provide both, with
+        # room for structure padding and the complete UTF-16 string.
+        buffer = C.create_string_buffer(C.sizeof(RenameInfos) + len(encoded)
+                                        + 2)
         info = RenameInfos.from_buffer(buffer)
         info.ReplaceIfExists = 1
         info.RootDirectory = directory
         info.FileNameLength = len(encoded)
         C.memmove(C.addressof(buffer) + RenameInfos.FileName.offset,
                   encoded, len(encoded))
-        self.check(self.set_info(source, 3, buffer, size))
+        return buffer
+
+    def rename(self, source, directory, name, *, native=False):
+        buffer = self.rename_buffer(directory, name)
+        size = C.sizeof(buffer)
+        diagnostic = {'operation': ('NtSetInformationFile' if native else
+                                    'SetFileInformationByHandle'),
+                      'root_relative': directory is not None,
+                      'name': name, 'buffer_size': size,
+                      'name_offset': RenameInfos.FileName.offset}
+        if native:
+            io = IoStatuses()
+            status = self.ntset(source, C.byref(io), buffer, size, 10)
+            diagnostic['ntstatus'] = '0x%08x' % (status & 0xffffffff)
+            print(json.dumps(diagnostic), flush=True)
+            if status < 0:
+                raise OSError('NtSetInformationFile NTSTATUS=0x%08x' %
+                              (status & 0xffffffff))
+        else:
+            result = self.set_info(source, 3, buffer, size)
+            error = 0 if result else C.get_last_error()
+            diagnostic['winerror'] = error
+            print(json.dumps(diagnostic), flush=True)
+            if not result:
+                raise C.WinError(error)
 
     def delete(self, source):
         disposition = C.c_ubyte(1)
@@ -166,18 +197,28 @@ class NativeCalls:
         self.check(self.open_token(self.current_process(), 8, C.byref(token)))
         try:
             result = {}
-            for label, kind in [('user', 1), ('default_owner', 4),
-                                ('elevation', 20)]:
+            for label, kind in [('user', 1), ('default_owner', 4)]:
                 size = ULONG()
-                self.token_info(token, kind, None, 0, C.byref(size))
-                if C.get_last_error() != 122:  # ERROR_INSUFFICIENT_BUFFER
-                    raise C.WinError(C.get_last_error())
+                succeeded = self.token_info(token, kind, None, 0,
+                                            C.byref(size))
+                error = 0 if succeeded else C.get_last_error()
+                print(json.dumps({'token_query': label, 'size': size.value,
+                                  'succeeded': bool(succeeded),
+                                  'winerror': error}), flush=True)
+                if succeeded or error != 122 or not size.value:
+                    raise OSError('unexpected token sizing result: %s, %s, %s'
+                                  % (label, error, size.value))
                 buffer = C.create_string_buffer(size.value)
-                self.check(self.token_info(token, kind, buffer, size,
+                self.check(self.token_info(token, kind, buffer, size.value,
                                            C.byref(size)))
-                result[label] = (ULONG.from_buffer(buffer).value
-                                 if kind == 20 else
-                                 self.sid(HANDLE.from_buffer(buffer)))
+                result[label] = self.sid(HANDLE.from_buffer(buffer))
+            # TOKEN_ELEVATION is a single DWORD. A zero-length sizing query
+            # can return ERROR_BAD_LENGTH rather than INSUFFICIENT_BUFFER.
+            elevation = ULONG()
+            size = ULONG()
+            self.check(self.token_info(token, 20, C.byref(elevation),
+                                       C.sizeof(elevation), C.byref(size)))
+            result['elevation'] = elevation.value
             return result
         finally:
             self.check(self.close(token))
@@ -222,6 +263,73 @@ def child(mode, root, stage):
     os.replace(root / 'temporary', root / 'target')
     checkpoint('replace')
     return 0
+
+
+class WindowsProbeMarshallingTests(unittest.TestCase):
+    """Portable boundary regressions; mocks are not native Windows evidence."""
+
+    def test_rename_buffer_has_utf16_terminator_outside_counted_name(self):
+        for name in ('published', 'long-name-\U0001f600', 'C:\\dir\\published'):
+            with self.subTest(name=name):
+                buffer = NativeCalls.rename_buffer(123, name)
+                info = RenameInfos.from_buffer(buffer)
+                encoded = name.encode('utf-16-le')
+                self.assertEqual(info.FileNameLength, len(encoded))
+                self.assertEqual(info.RootDirectory, 123)
+                self.assertEqual(info.ReplaceIfExists, 1)
+                start = RenameInfos.FileName.offset
+                self.assertEqual(buffer.raw[start:start + len(encoded) + 2],
+                                 encoded + b'\0\0')
+
+    def exercise_token_queries(self, *, fail_elevation=False):
+        native = NativeCalls.__new__(NativeCalls)
+        native.current_process = lambda: 1
+        native.close = mock.Mock(return_value=1)
+        native.sid = lambda pointer: 'SID-%s' % pointer.value
+        queries = []
+
+        def open_token(process, access, result):
+            C.cast(result, C.POINTER(HANDLE)).contents.value = 42
+            return 1
+
+        def token_info(token, kind, buffer, length, returned):
+            queries.append((kind, buffer is None))
+            size = C.cast(returned, C.POINTER(ULONG)).contents
+            if kind == 20:
+                self.assertIsNotNone(buffer, 'fixed-size query must not probe')
+                self.assertEqual(length, 4)
+                if fail_elevation:
+                    raise OSError('elevation query failed')
+                C.cast(buffer, C.POINTER(ULONG)).contents.value = 1
+                size.value = 4
+                return 1
+            size.value = C.sizeof(HANDLE) * 2
+            if buffer is None:
+                return 0  # mock get_last_error supplies INSUFFICIENT_BUFFER
+            C.cast(buffer, C.POINTER(HANDLE)).contents.value = kind
+            return 1
+
+        native.open_token = open_token
+        native.token_info = token_info
+        with mock.patch.object(C, 'get_last_error', return_value=122,
+                               create=True):
+            if fail_elevation:
+                with self.assertRaisesRegex(OSError, 'elevation query failed'):
+                    native.token_details()
+            else:
+                self.assertEqual(native.token_details(),
+                                 {'user': 'SID-1', 'default_owner': 'SID-4',
+                                  'elevation': 1})
+        native.close.assert_called_once()
+        self.assertEqual(native.close.call_args.args[0].value, 42)
+        self.assertEqual(queries, [(1, True), (1, False), (4, True),
+                                   (4, False), (20, False)])
+
+    def test_token_elevation_uses_fixed_size_buffer(self):
+        self.exercise_token_queries()
+
+    def test_failed_token_elevation_still_closes_token(self):
+        self.exercise_token_queries(fail_elevation=True)
 
 
 @unittest.skipUnless(os.name == 'nt', 'requires native Windows Python')
@@ -289,10 +397,11 @@ class WindowsPrimitiveTests(unittest.TestCase):
         directory.mkdir(mode=0o700)
         handle = self.handle(directory, access=READ_CONTROL, flags=BACKUP)
         owner = self.native.owner(handle)
-        details = self.native.token_details()
         print(json.dumps({'python': sys.version, 'executable': sys.executable,
                           'platform': platform.platform(),
-                          'owner': owner, 'token': details}), flush=True)
+                          'owner': owner}), flush=True)
+        details = self.native.token_details()
+        print(json.dumps({'token': details}), flush=True)
         self.assertTrue(owner.startswith('S-1-'))
         # Observe rather than invent a TokenUser == owner policy. This does
         # not audit the DACL or exercise another/elevation-restricted token.
@@ -415,8 +524,12 @@ class WindowsPrimitiveTests(unittest.TestCase):
         outside.mkdir()
         (outside / 'child').write_bytes(b'outside')
         junction = directory / 'junction'
+        # Native MinGW pathlib emits forward slashes; cmd's mklink parser
+        # treats them as switches. Only convert separators for this command,
+        # without normalizing components or changing any runtime operands.
         result = subprocess.run(
-            ['cmd.exe', '/d', '/c', 'mklink', '/J', str(junction), str(outside)],
+            ['cmd.exe', '/d', '/c', 'mklink', '/J',
+             str(junction).replace('/', '\\'), str(outside).replace('/', '\\')],
             capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.addCleanup(lambda: os.rmdir(junction))
@@ -437,14 +550,12 @@ class WindowsPrimitiveTests(unittest.TestCase):
         finally:
             self.native.check(self.native.close(leaf))
 
-    def test_source_handle_rename_and_delete_ignore_replaced_name(self):
+    def check_source_handle_rename(self, *, native=False, absolute=False):
         source = self.root / 'temporary'
         source.write_bytes(b'selected')
-        # Check deletion after source closure but before directory/temp cleanup.
-        selected = self.root / 'retained' / 'selected'
-        self.addCleanup(lambda: self.assertFalse(selected.exists()))
         handle = self.handle(source, access=GENERIC_READ | DELETE)
-        os.rename(source, self.root / 'moved')
+        moved = self.root / 'moved'
+        os.rename(source, moved)
         source.write_bytes(b'decoy')
         destination = self.root / 'destination'
         destination.mkdir()
@@ -452,21 +563,41 @@ class WindowsPrimitiveTests(unittest.TestCase):
         retained = self.root / 'retained'
         os.rename(destination, retained)
         destination.mkdir()
-        (retained / 'published').write_bytes(b'old')
-        self.native.rename(handle, directory, 'published')
+        published = retained / 'published'
+        published.write_bytes(b'old')
+        # The absolute-path Win32 control only tests source identity; the
+        # relative cases additionally test retained destination identity.
+        name = str(published).replace('/', '\\') if absolute else 'published'
+        self.native.rename(handle, None if absolute else directory, name,
+                           native=native)
         # A CRT read would itself refuse delete sharing against our existing
         # DELETE-access source handle; this reader deliberately shares delete.
-        self.assertEqual(self.read_handle(
-            self.native.open(retained / 'published')), b'selected')
+        self.assertEqual(self.read_handle(self.native.open(published)),
+                         b'selected')
         self.assertEqual(source.read_bytes(), b'decoy')
+        self.assertFalse(moved.exists())
         self.assertFalse((destination / 'published').exists())
-        # Move again and replace the published name before handle deletion.
-        selected = retained / 'selected'
-        os.rename(retained / 'published', selected)
-        (retained / 'published').write_bytes(b'another decoy')
+
+    def test_win32_absolute_rename_retains_source_identity(self):
+        self.check_source_handle_rename(absolute=True)
+
+    def test_win32_relative_rename_retains_both_identities(self):
+        self.check_source_handle_rename()
+
+    def test_native_relative_rename_retains_both_identities(self):
+        # An independent experiment, not a fallback which hides Win32 failure.
+        self.check_source_handle_rename(native=True)
+
+    def test_source_handle_delete_ignores_replaced_name(self):
+        source = self.root / 'temporary'
+        source.write_bytes(b'selected')
+        selected = self.root / 'selected'
+        # LIFO cleanup: close source, then check deletion, then remove tempdir.
+        self.addCleanup(lambda: self.assertFalse(selected.exists()))
+        handle = self.handle(source, access=GENERIC_READ | DELETE)
+        os.rename(source, selected)
+        source.write_bytes(b'decoy')
         self.native.delete(handle)
-        # Deletion completes at final handle close (registered cleanup).
-        self.assertEqual((retained / 'published').read_bytes(), b'another decoy')
         self.assertEqual(source.read_bytes(), b'decoy')
 
     def test_kill_at_write_checkpoints_preserves_complete_target(self):
@@ -493,11 +624,19 @@ class WindowsPrimitiveTests(unittest.TestCase):
         with open(target, 'rb'):
             with self.assertRaises(OSError) as caught:
                 os.replace(temporary, target)
-            self.assertEqual(caught.exception.winerror, 32)
+            print(json.dumps({'operation': 'replace_open_destination',
+                              'winerror': caught.exception.winerror}),
+                  flush=True)
+            # MoveFileExW reported ACCESS_DENIED (5) for an open destination
+            # on all three CI runtimes; moving an open source reported 32.
+            self.assertIn(caught.exception.winerror, (5, 32))
         self.assertEqual(target.read_bytes(), b'old')
         self.assertEqual(temporary.read_bytes(), b'new')
-        temporary.unlink()
-        self.assertEqual(target.read_bytes(), b'old')
+        # Closing the reader must remove the obstruction, not merely happen
+        # to coincide with some unrelated permission failure.
+        os.replace(temporary, target)
+        self.assertEqual(target.read_bytes(), b'new')
+        self.assertFalse(temporary.exists())
 
 
 if __name__ == '__main__':
