@@ -77,25 +77,38 @@ jobs:
         update: true
         install: mingw-w64-ucrt-x86_64-python
     - name: Probe Windows storage primitives (CPython)
+      id: cpython-probes
       if: matrix.runtime != 'msys2-ucrt'
       shell: bash
       run: |
-        set -o pipefail
+        set -e -o pipefail
         mkdir -p windows-diagnostics
+        python -c "import sys; print('python=' + sys.executable)" >> "$GITHUB_OUTPUT"
         {
           python -c "import os, sys; print(sys.executable, sys.version, flush=True); assert os.name == 'nt', 'native Windows Python required'" &&
           python -u tests/test_windows_primitives.py
         } 2>&1 | tee windows-diagnostics/primitives.log
     - name: Probe Windows storage primitives (MSYS2 UCRT)
+      id: msys2-probes
       if: matrix.runtime == 'msys2-ucrt'
       shell: 'msys2 {0}'
       run: |
-        set -o pipefail
+        set -e -o pipefail
         mkdir -p windows-diagnostics
+        python -c "import sys; print('python=' + sys.executable)" >> "$GITHUB_OUTPUT"
         {
           python -c "import os, sys; print(sys.executable, sys.version, flush=True); assert os.name == 'nt', 'native Windows Python required'" &&
           python -u tests/test_windows_primitives.py
         } 2>&1 | tee windows-diagnostics/primitives.log
+    - name: Probe storage as a separate standard user
+      # Run even when an elevated control probe fails (currently relative
+      # Win32 rename); never substitute an elevated run if account setup fails.
+      if: always()
+      shell: pwsh
+      env:
+        PROBE_PYTHON: ${{ steps.cpython-probes.outputs.python || steps.msys2-probes.outputs.python }}
+      run: |
+        & ./.github/scripts/windows_storage_probes.ps1 -PythonPath $env:PROBE_PYTHON
     - name: Upload investigation diagnostics
       if: always()
       uses: actions/upload-artifact@v4

@@ -1,0 +1,155 @@
+# CI supervisor only. Administrator privileges prepare the sandbox; Python and
+# all probe children run as a newly created, non-administrator local account.
+param(
+    [Parameter(Mandatory = $true)][string]$PythonPath
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$diagnostics = Join-Path $env:GITHUB_WORKSPACE 'windows-diagnostics'
+New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
+Start-Transcript -Path (Join-Path $diagnostics 'standard-user-supervisor.log') | Out-Null
+$user = $null
+$process = $null
+$started = $false
+$password = $null
+$exitCode = 1
+$root = Join-Path $env:ProgramData ('LokiStorageProbes-' + [guid]::NewGuid().ToString('N'))
+
+function Set-ProbeDirectoryAcl([string]$Path, [string]$UserSid, [string]$Rights) {
+    # Only new disposable CI directories are changed, never user installations.
+    $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($entry in @(@('S-1-5-18', 'FullControl'),
+                         @('S-1-5-32-544', 'FullControl'),
+                         @($UserSid, $Rights))) {
+        $sid = [System.Security.Principal.SecurityIdentifier]::new($entry[0])
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, $entry[1], 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+try {
+    # Query only the selected interpreter, not an ambient Python after switching.
+    $layout = & $PythonPath -I -c 'import json, os, sys; assert os.name == "nt"; print(json.dumps({"prefix": sys.base_prefix, "executable": os.path.relpath(sys.executable, sys.base_prefix)}))'
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot query the selected native interpreter' }
+    $layout = $layout | ConvertFrom-Json
+    if ([IO.Path]::IsPathRooted($layout.executable) -or $layout.executable.StartsWith('..')) {
+        throw 'Selected executable is outside its interpreter prefix'
+    }
+
+    $name = 'loki_' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $random = [byte[]]::new(32)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($random)
+    $plain = 'Aa1!' + [Convert]::ToBase64String($random)
+    # Never pass the password via argv, environment, a file, or workflow outputs.
+    $password = ConvertTo-SecureString $plain -AsPlainText -Force
+    $plain = $null
+    $user = New-LocalUser -Name $name -Password $password -Description 'Disposable Loki CI probes'
+    $sid = $user.SID.Value
+    $users = Get-LocalGroup -SID 'S-1-5-32-545'
+    if ($sid -notin @(Get-LocalGroupMember -Group $users | ForEach-Object { $_.SID.Value })) {
+        Add-LocalGroupMember -Group $users -Member $user
+    }
+    Write-Host "Standard-user account: $name; expected SID: $sid"
+
+    New-Item -ItemType Directory -Path $root | Out-Null
+    Set-ProbeDirectoryAcl $root $sid 'ReadAndExecute'
+    $runtime = Join-Path $root 'runtime'
+    # Copying avoids granting this user access to the administrator's toolcache
+    # or MSYS2 installation. Reset only the copies to the sandbox's RX ACL.
+    Copy-Item -LiteralPath $layout.prefix -Destination $runtime -Recurse
+    $script = Join-Path $root 'test_windows_primitives.py'
+    Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tests/test_windows_primitives.py') -Destination $script
+    foreach ($copy in @($runtime, $script)) {
+        & "$env:SystemRoot/System32/icacls.exe" $copy /reset /T /Q
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot set read/execute ACLs on probe copies' }
+    }
+    $work = Join-Path $root 'work'
+    New-Item -ItemType Directory -Path $work | Out-Null
+    Set-ProbeDirectoryAcl $work $sid 'FullControl'
+    $temporary = Join-Path $work 'tmp'
+    New-Item -ItemType Directory -Path $temporary | Out-Null
+    $executable = Join-Path $runtime $layout.executable
+
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $executable
+    $start.WorkingDirectory = $work
+    $start.UseShellExecute = $false
+    $start.UserName = $name
+    $start.Domain = $env:COMPUTERNAME
+    $start.Password = $password
+    $start.LoadUserProfile = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @('-I', '-u', $script, '--standard-user', $sid)) {
+        $start.ArgumentList.Add($argument)
+    }
+    # Do not give the child the runner's credentials, Python configuration,
+    # user-home paths, or arbitrary inherited PATH entries.
+    $start.Environment.Clear()
+    $start.Environment['SystemRoot'] = $env:SystemRoot
+    $start.Environment['WINDIR'] = $env:SystemRoot
+    $start.Environment['COMSPEC'] = Join-Path $env:SystemRoot 'System32/cmd.exe'
+    $start.Environment['PATH'] = (Split-Path $executable) + ';' + (Join-Path $env:SystemRoot 'System32')
+    $start.Environment['TEMP'] = $temporary
+    $start.Environment['TMP'] = $temporary
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    if (-not $process.Start()) { throw 'Standard-user Python did not start' }
+    $started = $true
+    $process.StandardInput.Close()
+    # Drain both streams concurrently, so verbose failures cannot fill a pipe.
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $timedOut = -not $process.WaitForExit(180000)
+    if ($timedOut) {
+        $process.Kill($true)
+        if (-not $process.WaitForExit(10000)) { throw 'Timed-out probe tree did not exit' }
+    }
+    foreach ($entry in @(@($stdout, 'standard-user-stdout.log'),
+                         @($stderr, 'standard-user-stderr.log'))) {
+        if (-not $entry[0].Wait(10000)) { throw 'Probe output pipe did not close' }
+        $text = $entry[0].GetAwaiter().GetResult()
+        [IO.File]::WriteAllText((Join-Path $diagnostics $entry[1]), $text)
+        Write-Host $text
+    }
+    $exitCode = $process.ExitCode
+    Write-Host "Standard-user probe exit: $exitCode; timed out: $timedOut"
+    if ($timedOut) { throw 'Standard-user probes exceeded 180 seconds' }
+}
+finally {
+    # Attempt every cleanup even if an earlier one fails. Hard job termination
+    # may bypass finally; the hosted VM is disposable and no account is reused.
+    $cleanupFailed = $false
+    if ($null -ne $process) {
+        try {
+            if ($started -and -not $process.HasExited) {
+                $process.Kill($true)
+                if (-not $process.WaitForExit(10000)) { throw 'Probe process did not exit' }
+            }
+        }
+        catch { Write-Warning $_; $cleanupFailed = $true }
+        finally { $process.Dispose() }
+    }
+    if ($null -ne $user) {
+        try {
+            Get-CimInstance Win32_UserProfile | Where-Object SID -EQ $user.SID.Value | Remove-CimInstance
+        }
+        catch { Write-Warning $_; $cleanupFailed = $true }
+        try { Remove-LocalUser -SID $user.SID }
+        catch { Write-Warning $_; $cleanupFailed = $true }
+    }
+    try {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+    catch { Write-Warning $_; $cleanupFailed = $true }
+    if ($null -ne $password) { $password.Dispose() }
+    Stop-Transcript | Out-Null
+    if ($cleanupFailed) { throw 'Standard-user supervisor cleanup failed; see transcript' }
+}
+exit $exitCode

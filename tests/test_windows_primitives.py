@@ -55,6 +55,25 @@ class RenameInfos(C.Structure):
                 ('FileNameLength', ULONG), ('FileName', C.c_uint16 * 1)]
 
 
+class SidAttributes(C.Structure):
+    _fields_ = [('Sid', HANDLE), ('Attributes', ULONG)]
+
+
+class TokenGroups(C.Structure):
+    _fields_ = [('GroupCount', ULONG), ('Groups', SidAttributes * 1)]
+
+
+def require_standard_user(details, expected_sid):
+    """Reject elevated and filtered administrator tokens, not just elevation."""
+    if details['user'] != expected_sid:
+        raise RuntimeError('probe is not running as the requested account')
+    if details['elevation'] != 0:
+        raise RuntimeError('probe token is elevated')
+    # Check every group, regardless of SE_GROUP_ENABLED or USE_FOR_DENY_ONLY.
+    if any(group['sid'] == 'S-1-5-32-544' for group in details['groups']):
+        raise RuntimeError('probe token contains the Administrators SID')
+
+
 class NativeCalls:
     """Test-only declarations; no runtime adapter or compatibility fallback."""
 
@@ -192,12 +211,15 @@ class NativeCalls:
         finally:
             self.local_free(descriptor)
 
-    def token_details(self):
+    def token_details(self, *, include_groups=False):
         token = HANDLE()
         self.check(self.open_token(self.current_process(), 8, C.byref(token)))
         try:
             result = {}
-            for label, kind in [('user', 1), ('default_owner', 4)]:
+            queries = [('user', 1), ('default_owner', 4)]
+            if include_groups:
+                queries.append(('groups', 2))
+            for label, kind in queries:
                 size = ULONG()
                 succeeded = self.token_info(token, kind, None, 0,
                                             C.byref(size))
@@ -211,7 +233,17 @@ class NativeCalls:
                 buffer = C.create_string_buffer(size.value)
                 self.check(self.token_info(token, kind, buffer, size.value,
                                            C.byref(size)))
-                result[label] = self.sid(HANDLE.from_buffer(buffer))
+                if kind == 2:
+                    count = ULONG.from_buffer(buffer).value
+                    offset = TokenGroups.Groups.offset
+                    if offset + count * C.sizeof(SidAttributes) > len(buffer):
+                        raise OSError('TOKEN_GROUPS exceeds query buffer')
+                    groups = (SidAttributes * count).from_buffer(buffer, offset)
+                    result[label] = [{'sid': self.sid(group.Sid),
+                                      'attributes': group.Attributes}
+                                     for group in groups]
+                else:
+                    result[label] = self.sid(HANDLE.from_buffer(buffer))
             # TOKEN_ELEVATION is a single DWORD. A zero-length sizing query
             # can return ERROR_BAD_LENGTH rather than INSUFFICIENT_BUFFER.
             elevation = ULONG()
@@ -281,11 +313,13 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
                 self.assertEqual(buffer.raw[start:start + len(encoded) + 2],
                                  encoded + b'\0\0')
 
-    def exercise_token_queries(self, *, fail_elevation=False):
+    def exercise_token_queries(self, *, fail_elevation=False,
+                               include_groups=False):
         native = NativeCalls.__new__(NativeCalls)
         native.current_process = lambda: 1
         native.close = mock.Mock(return_value=1)
-        native.sid = lambda pointer: 'SID-%s' % pointer.value
+        native.sid = lambda pointer: 'SID-%s' % (
+            pointer.value if isinstance(pointer, HANDLE) else pointer)
         queries = []
 
         def open_token(process, access, result):
@@ -303,6 +337,16 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
                 C.cast(buffer, C.POINTER(ULONG)).contents.value = 1
                 size.value = 4
                 return 1
+            if kind == 2:
+                size.value = TokenGroups.Groups.offset + C.sizeof(SidAttributes)
+                if buffer is None:
+                    return 0
+                ULONG.from_buffer(buffer).value = 1
+                group = SidAttributes.from_buffer(buffer,
+                                                  TokenGroups.Groups.offset)
+                group.Sid = 200
+                group.Attributes = 16  # deny-only must remain visible
+                return 1
             size.value = C.sizeof(HANDLE) * 2
             if buffer is None:
                 return 0  # mock get_last_error supplies INSUFFICIENT_BUFFER
@@ -317,13 +361,47 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, 'elevation query failed'):
                     native.token_details()
             else:
-                self.assertEqual(native.token_details(),
-                                 {'user': 'SID-1', 'default_owner': 'SID-4',
-                                  'elevation': 1})
+                expected = {'user': 'SID-1', 'default_owner': 'SID-4',
+                            'elevation': 1}
+                if include_groups:
+                    expected['groups'] = [{'sid': 'SID-200', 'attributes': 16}]
+                self.assertEqual(native.token_details(
+                    include_groups=include_groups), expected)
         native.close.assert_called_once()
         self.assertEqual(native.close.call_args.args[0].value, 42)
-        self.assertEqual(queries, [(1, True), (1, False), (4, True),
-                                   (4, False), (20, False)])
+        expected_queries = [(1, True), (1, False), (4, True), (4, False)]
+        if include_groups:
+            expected_queries.extend([(2, True), (2, False)])
+        self.assertEqual(queries, expected_queries + [(20, False)])
+
+    def test_token_groups_preserve_deny_only_membership(self):
+        self.exercise_token_queries(include_groups=True)
+
+    def test_standard_user_guard_accepts_expected_unelevated_user(self):
+        require_standard_user({'user': 'expected', 'elevation': 0,
+                               'groups': [{'sid': 'S-1-5-32-545',
+                                           'attributes': 7}]}, 'expected')
+
+    def test_standard_user_guard_rejects_wrong_user_and_elevation(self):
+        for user, elevation in [('other', 0), ('expected', 1)]:
+            with self.subTest(user=user, elevation=elevation):
+                with self.assertRaises(RuntimeError):
+                    require_standard_user({'user': user, 'elevation': elevation,
+                                           'groups': []}, 'expected')
+
+    def test_standard_user_guard_rejects_admin_sid_with_any_attributes(self):
+        for attributes in (0, 4, 16):
+            with self.subTest(attributes=attributes):
+                with self.assertRaisesRegex(RuntimeError, 'Administrators'):
+                    require_standard_user(
+                        {'user': 'expected', 'elevation': 0,
+                         'groups': [{'sid': 'S-1-5-32-544',
+                                     'attributes': attributes}]}, 'expected')
+
+    def test_standard_user_guard_requires_group_evidence(self):
+        with self.assertRaises(KeyError):
+            require_standard_user({'user': 'expected', 'elevation': 0},
+                                  'expected')
 
     def test_token_elevation_uses_fixed_size_buffer(self):
         self.exercise_token_queries()
@@ -642,4 +720,12 @@ class WindowsPrimitiveTests(unittest.TestCase):
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '--child':
         sys.exit(child(*sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == '--standard-user':
+        if len(sys.argv) != 3 or os.name != 'nt':
+            raise RuntimeError('--standard-user requires native Windows and a SID')
+        details = NativeCalls().token_details(include_groups=True)
+        print(json.dumps({'standard_user_token': details}), flush=True)
+        require_standard_user(details, sys.argv[2])
+        print('Standard-user token verified before running probes.', flush=True)
+        del sys.argv[1:]
     unittest.main(verbosity=2)
