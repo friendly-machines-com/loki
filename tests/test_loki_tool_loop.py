@@ -2423,9 +2423,16 @@ class StatusTextTests(unittest.TestCase):
                 activity = terminal_frontend.TerminalActivityStatus(
                     turn_running=running, queued_messages=messages, queued_images=images)
                 with mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
+                        mock.patch.object(terminal_frontend, "current_cwd",
+                                          return_value="/status/cwd"), \
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     terminal_frontend._write_status_text()
+                    plain = terminal_frontend.status_text(activity)
                 rendered = output.getvalue()
+                self.assertTrue(rendered.split("\n", 1)[1].startswith(
+                    "Local: CWD: /status/cwd, turn: "))
+                self.assertEqual(
+                    rendered.replace("\033[1m", "").replace("\033[22m", ""), plain)
                 for label, value, bold in (
                         ("turn", "running" if running else "idle", running),
                         ("queued messages", str(messages), messages != 0),
@@ -2500,8 +2507,9 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             text,
             "Remote: API: example.test:8443/base/path; Model: model-x; /model, /status\n"
-            "Local: turn: running, queued messages: 2, queued images: 1, "
-            f"mode: {loki.current_agent_mode()}, CWD: {loki.STARTUP_CWD}; "
+            f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
+            "queued messages: 2, queued images: 1, "
+            f"mode: {loki.current_agent_mode()}; "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)
@@ -2525,7 +2533,7 @@ class StatusTextTests(unittest.TestCase):
             restore_loki_state(old_values)
 
         self.assertIn(
-            "CWD: /tmp/unsafe^[[2J^Jnext;", displayed)
+            "Local: CWD: /tmp/unsafe^[[2J^Jnext, turn: ", displayed)
         self.assertNotIn("\x1b", displayed)
         self.assertEqual(displayed.count("\n"), 1)
 

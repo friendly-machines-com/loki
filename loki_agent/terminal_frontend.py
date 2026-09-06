@@ -500,15 +500,15 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
         remote += '; /model, /status'
     return (
         remote + '\n'
-        'Local: turn: {}, queued messages: {}, queued images: {}, '
-        'mode: {}, CWD: {}; '
+        'Local: CWD: {}, turn: {}, queued messages: {}, queued images: {}, '
+        'mode: {}; '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
+        fields["cwd"],
         fields["turn"],
         fields["queued_messages"],
         fields["queued_images"],
-        fields["mode"],
-        fields["cwd"])
+        fields["mode"])
 
 
 def _write_status_text():
@@ -520,9 +520,11 @@ def _write_status_text():
     if fields["effort"] is not None:
         print("; Effort: ", end="")
         terminal.write_text(fields["effort"])
-        print("; /model, /effort, /status\nLocal: turn: ", end="")
+        print("; /model, /effort, /status\nLocal: CWD: ", end="")
     else:
-        print("; /model, /status\nLocal: turn: ", end="")
+        print("; /model, /status\nLocal: CWD: ", end="")
+    terminal.write_text(fields["cwd"])
+    print(", turn: ", end="")
     for label, value, active in (
             ("", fields["turn"], fields["turn"] != "idle"),
             (", queued messages: ", fields["queued_messages"], fields["queued_messages"] != 0),
@@ -536,8 +538,6 @@ def _write_status_text():
             print(terminals.BOLD_OFF, end="")
     print(", mode: ", end="")
     terminal.write_text(fields["mode"])
-    print(", CWD: ", end="")
-    terminal.write_text(fields["cwd"])
     print("; /pwd, /cd DIR, /ps, /image PATH, !foo, /quit", end="")
 
 

@@ -349,10 +349,10 @@ class PtyUiTests(unittest.TestCase):
         # registration: the bar must carry text, not just background color.
         output, _before_release = run_loki_pty_reply(stream=False)
         self.assertIn(b"Remote: API: dummy.invalid", output)
-        self.assertIn(
-            b"Local: turn: idle, queued messages: 0, "
-            b"queued images: 0, mode: normal",
+        self.assertRegex(
             output,
+            rb"Local: CWD: [^\r\n]*, turn: idle, queued messages: 0, "
+            rb"queued images: 0, mode: normal;",
         )
 
     def test_streamed_plain_prefix_is_visible_before_completion(self):
