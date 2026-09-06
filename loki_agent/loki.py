@@ -5367,6 +5367,10 @@ def save_chat_log():
         saved_connection.pop("api_url")
         state["connection"] = saved_connection
     state["shell_cwd"] = session.shell_cwd
+    if session.last_instructed_agent_mode is None:
+        state.pop("last_instructed_agent_mode", None)
+    else:
+        state["last_instructed_agent_mode"] = session.last_instructed_agent_mode
     if session.reasoning_effort_preference is None:
         state.pop("reasoning_effort", None)
     else:
@@ -5410,7 +5414,21 @@ def load_chat_log(filename, loaded=None):
 def load_session_state(state: dict):
     if not isinstance(state, dict):
         return
-    current_session().reasoning_effort_preference = (
+    session = current_session()
+    # This describes an instruction already recorded in the transcript, not
+    # the operating mode to activate or a server acknowledgement.
+    session.last_instructed_agent_mode = None
+    if "last_instructed_agent_mode" in state:
+        mode = state["last_instructed_agent_mode"]
+        if isinstance(mode, str) and mode in MODE_CYCLE_ORDER:
+            session.last_instructed_agent_mode = mode
+        else:
+            print(
+                "Warning: invalid saved last_instructed_agent_mode; "
+                "the next user turn will announce the current mode.",
+                file=sys.stderr,
+            )
+    session.reasoning_effort_preference = (
         reasoning_effort_from_session_state(state))
     loaded_shell_cwd = state.get("shell_cwd")
     if not isinstance(loaded_shell_cwd, str) or not loaded_shell_cwd:
