@@ -774,6 +774,7 @@ def config_from_modelsdev_selection(
         provider_entry: dict,
         model_entry: dict,
         credentials) -> RuntimeConfig:
+    provider_entry = modelsdev.effective_provider(provider_entry, model_entry)
     access = modelsdev.provider_access(provider_entry, credentials)
     if access is None:
         raise ValueError(

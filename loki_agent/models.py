@@ -428,7 +428,7 @@ def openai_request_profile(provider_entry, model_entry):
 def reasoning_effort_profile(
         provider_id, provider_entry, model_entry):
     """Return validated effort choices for one usable provider/model leaf."""
-    protocol = provider_protocol(provider_entry)
+    protocol = provider_protocol(effective_provider(provider_entry, model_entry))
     if not protocols.reasoning_effort_supported(provider_id, protocol):
         return None
     if provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
@@ -580,8 +580,41 @@ async def fetch_openai_subscription_models(
     return data
 
 
+def effective_provider(provider_entry, model_entry):
+    """Resolve a model's transport overrides without changing catalog data.
+
+    Credentials and Loki's authenticated subscription metadata remain owned by
+    the provider. Catalog model overrides cannot supply either, or request
+    headers. Only the transport-selection fields are projected here.
+    """
+    override = model_entry.get("provider")
+    if override is None or provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
+            _OPENAI_SUBSCRIPTION_SENTINEL):
+        return provider_entry
+    resolved = dict(provider_entry)
+    if not isinstance(override, dict):
+        resolved[_LOKI_API_REJECTION_KEY] = "invalid model provider override"
+        return resolved
+    for key in ("npm", "api", "shape"):
+        if key not in override:
+            continue
+        value = override[key]
+        if not isinstance(value, str) or not value.strip():
+            resolved[_LOKI_API_REJECTION_KEY] = f"invalid model provider {key}"
+            return resolved
+        resolved[key] = value
+    if "shape" in override and override["shape"] not in (
+            "responses", "completions"):
+        resolved[_LOKI_API_REJECTION_KEY] = "invalid model provider shape"
+    # A model override must not bypass the canonical OpenAI endpoint checks
+    # applied to the provider during catalog normalization.
+    if provider_entry.get("id") == "openai":
+        resolved = normalize_catalog({"openai": resolved})["openai"]
+    return resolved
+
+
 def build_groups(data):
-    """Group (provider_id, provider_entry, model_entry) by model name.
+    """Group (provider_id, effective_provider, model_entry) by model name.
 
     Name is the "conflated" key: it is the human label providers share, where
     per-provider model *ids* diverge (zai-org/GLM-5.2 vs glm-5.2 vs glm-5-2)
@@ -593,7 +626,7 @@ def build_groups(data):
             if not isinstance(m, dict):
                 continue
             key = m.get("name") or mid
-            groups[key].append((pid, prov, m))
+            groups[key].append((pid, effective_provider(prov, m), m))
     return dict(groups)
 
 
@@ -741,7 +774,15 @@ def protocol_label(provider_entry):
 
 
 def provider_protocol(provider_entry):
-    """Implemented wire protocol for a catalog provider, or None."""
+    """Implemented wire protocol for an effective catalog provider, or None."""
+    if provider_entry.get(_LOKI_API_REJECTION_KEY):
+        return None
+    shape = provider_entry.get("shape")
+    if shape is not None:
+        return {
+            "responses": protocols.OPENAI_RESPONSES,
+            "completions": protocols.OPENAI_CHAT,
+        }.get(shape)
     api = provider_entry.get("api") or ""
     detected = protocols.detect_protocol_from_url(api)
     if detected in protocols.SUPPORTED_PROTOCOLS:
@@ -757,13 +798,14 @@ def provider_protocol(provider_entry):
 def provider_supported(provider_entry):
     """True if Loki can actually use this provider.
 
-    A provider needs a concrete API URL and one of:
-      1. Its ``api`` URL names one of the supported wire protocols via its
+    An effective provider needs a concrete API URL and one of:
+      1. An explicit model ``shape`` selects Responses or Chat Completions.
+      2. Its ``api`` URL names one of the supported wire protocols via its
          endpoint path (.../chat/completions, .../messages, .../responses).
-      2. Its ``npm`` package is one of the three that names a protocol
+      3. Its ``npm`` package is one of the three that names a protocol
          directly (@ai-sdk/openai-compatible -> chat, @ai-sdk/anthropic ->
          messages, @ai-sdk/openai -> responses).
-      3. Its ``api`` URL follows the OpenAI-compatible bare ``/v1`` base
+      4. Its ``api`` URL follows the OpenAI-compatible bare ``/v1`` base
          convention, which reinstall_provider treats as openai_chat.
 
     Providers with no API URL or usable protocol signal are dropped.
