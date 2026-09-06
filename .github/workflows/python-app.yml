@@ -47,6 +47,55 @@ jobs:
       run: |
         python -m unittest discover -s tests -v
 
+  windows-storage-investigation:
+    # Independent of build/lint: failures there must not suppress these probes.
+    name: Windows storage primitives (${{ matrix.runtime }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: cpython-3.10
+            python: "3.10"
+            shell: bash
+          - runtime: cpython-3.13
+            python: "3.13"
+            shell: bash
+          - runtime: msys2-ucrt
+            shell: 'msys2 {0}'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up official CPython
+      if: matrix.runtime != 'msys2-ucrt'
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python }}
+        architecture: x64
+    - name: Set up native MSYS2 UCRT Python
+      if: matrix.runtime == 'msys2-ucrt'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: mingw-w64-ucrt-x86_64-python
+    - name: Probe Windows storage primitives
+      shell: ${{ matrix.shell }}
+      run: |
+        set -o pipefail
+        mkdir -p windows-diagnostics
+        {
+          python -c "import os, sys; print(sys.executable, sys.version, flush=True); assert os.name == 'nt', 'native Windows Python required'" &&
+          python -u tests/test_windows_primitives.py
+        } 2>&1 | tee windows-diagnostics/primitives.log
+    - name: Upload investigation diagnostics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-storage-${{ matrix.runtime }}
+        path: windows-diagnostics/
+        if-no-files-found: warn
+
   windows-portable:
     needs: build
     name: Windows portable ZIP
