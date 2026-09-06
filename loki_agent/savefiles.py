@@ -43,7 +43,7 @@ def resolve_chat_log_path(resume_arg: str, startup_cwd: str,
     # absolute path or a path with a directory part is treated as a literal
     # path; a bare name is resolved inside the chat log directory.
     if os.path.isabs(resume_arg):
-        return os.path.normpath(resume_arg)
+        return resume_arg
     if os.path.dirname(resume_arg):
         return resolve_path_fn(resume_arg, startup_cwd)
     ensure_chat_log_dir(chat_log_dir)

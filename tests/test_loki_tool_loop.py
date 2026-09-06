@@ -4226,7 +4226,7 @@ class ChatLogPathTests(unittest.TestCase):
     def test_path_like_resume_arguments_stay_explicit(self):
         self.assertEqual(
             loki.resolve_chat_log_path("./chat-abc.json"),
-            os.path.join(loki.STARTUP_CWD, "chat-abc.json"),
+            os.path.join(loki.STARTUP_CWD, "./chat-abc.json"),
         )
         self.assertEqual(
             loki.resolve_chat_log_path("logs/chat-abc.json"),

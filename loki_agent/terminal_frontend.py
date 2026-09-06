@@ -183,10 +183,9 @@ def load_image_attachment(path_text: str, *,
     if limit < 1:
         raise ValueError("image attachment limit must be positive")
 
-    expanded = os.path.expanduser(path_text)
-    if not os.path.isabs(expanded):
-        expanded = os.path.join(base_dir or current_cwd(), expanded)
-    path = os.path.realpath(os.path.normpath(expanded))
+    path = path_text
+    if not os.path.isabs(path):
+        path = os.path.join(base_dir or current_cwd(), path)
 
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
