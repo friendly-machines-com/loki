@@ -37,6 +37,40 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         self.storage = credential_storages.JsonCredentialStorage(
             self.directory)
 
+    async def test_directory_creation_requests_private_mode_without_chmod(self):
+        mkdir = os.mkdir
+        with mock.patch.object(os, 'mkdir', wraps=mkdir) as create, \
+                mock.patch.object(os, 'chmod', side_effect=AssertionError(
+                    'directory permissions must not be repaired')):
+            self.storage.ensure_directory()
+        create.assert_any_call(self.directory, 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
+
+    async def test_existing_private_directory_is_not_changed(self):
+        self.storage.ensure_directory()
+        before = os.stat(self.directory)
+        with mock.patch.object(os, 'chmod', side_effect=AssertionError(
+                'existing permissions must not be changed')):
+            self.storage.ensure_directory()
+        after = os.stat(self.directory)
+        self.assertTrue(os.path.samestat(before, after))
+        self.assertEqual(stat.S_IMODE(after.st_mode), stat.S_IMODE(before.st_mode))
+
+    async def test_existing_shared_directory_is_rejected_without_repair(self):
+        os.makedirs(self.directory)
+        for mode in (0o755, 0o750, 0o770):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.directory, mode)
+                with mock.patch.object(os, 'chmod', side_effect=AssertionError(
+                        'existing permissions must not be changed')):
+                    with self.assertRaisesRegex(
+                            credential_storages.CredentialStorageError,
+                            'adjust its permissions.*Loki will not change'):
+                        await self.storage.store_openai_login(tokens())
+                self.assertEqual(stat.S_IMODE(os.stat(self.directory).st_mode), mode)
+                self.assertFalse(os.path.exists(self.storage.file_path))
+                self.assertFalse(os.path.exists(self.storage.lock_path))
+
     async def test_login_is_atomic_private_and_loadable(self):
         stored = await self.storage.store_openai_login(tokens())
 

@@ -220,12 +220,10 @@ class JsonCredentialStorage:
                 f"credential directory is not owned by this user: "
                 f"{self.directory}")
         if stat.S_IMODE(directory_stat.st_mode) & 0o077:
-            try:
-                os.chmod(self.directory, 0o700)
-            except OSError as error:
-                raise CredentialStorageError(
-                    f"could not make credential directory private: "
-                    f"{error}") from error
+            raise CredentialStorageError(
+                f"credential directory has group or other permission bits "
+                f"set: {self.directory!r}; adjust its permissions before "
+                "retrying (Loki will not change them)")
 
     def _open_directory(self):
         self.ensure_directory()

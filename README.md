@@ -149,6 +149,12 @@ This is best-effort diagnostic state, not credential storage or durable accounti
 
 ## How to run
 
+Requires Python 3.10.15 or later; on the 3.11 branch use 3.11.10 or later,
+and on the 3.12 branch use 3.12.4 or later. Earlier releases in those branches
+are excluded because Windows did not yet honor `mkdir(..., mode=0o700)`.
+These are package version requirements, not a Windows port: the current
+credential store still uses Unix locking and directory-descriptor APIs.
+
 Run it in a VM or container.
 
 ```
@@ -183,11 +189,21 @@ be recalled locally, and both remain subject to server-side expiry.
 
 Loki stores subscription tokens in
 `$XDG_CONFIG_HOME/loki/credentials/tokens.json` (normally
-`~/.config/loki/credentials/tokens.json`). The directory is private to the
-user and token files are created with mode 0600. Writes use same-directory
-atomic replacement and filesystem synchronization. A separate lock
-serializes login, logout, and token rotation among independently running
-terminal and ACP supervisors.
+`~/.config/loki/credentials/tokens.json`). Loki requests mode 0700 when
+creating the credential directory and mode 0600 for token files. It does not
+change existing directory permissions. Existing directories must be owned by
+the current user and have no group or other POSIX permission bits set;
+otherwise Loki reports an error and asks the user to adjust the permissions.
+
+These are ownership/mode checks, not an ACL or filesystem-configuration audit.
+Use an appropriately controlled parent directory. User-managed ACLs, including
+inherited ACLs and later permission changes, remain the user's responsibility;
+mode bits alone do not establish private access on every platform/filesystem.
+No desktop credential service or message bus is required.
+
+Writes use same-directory atomic replacement and filesystem synchronization.
+A separate lock serializes login, logout, and token rotation among independently
+running terminal and ACP supervisors.
 
 Use `/image PATH` to attach a local PNG, JPEG, GIF, or WebP image to
 the next prompt. Relative paths use Loki's current `/pwd`; quote paths
