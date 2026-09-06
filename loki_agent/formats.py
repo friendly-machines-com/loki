@@ -1,8 +1,14 @@
 import copy
 import json
-import sys
+import logging
 import uuid
 from dataclasses import dataclass, field
+
+
+from .diagnostics import debug_json
+
+
+logger = logging.getLogger(__name__)
 
 
 TRANSCRIPT_SCHEMA = "day-agent.session.v4"
@@ -44,14 +50,7 @@ def _put_optional(target, key, value):
 
 
 def report_unknown(protocol, context, value):
-    rendered = json.dumps(
-        value, ensure_ascii=True, sort_keys=True, default=str)
-    sys.stdout.flush()
-    print(
-        f"Unknown {protocol} {context}:\n{rendered}",
-        file=sys.stderr,
-    )
-    sys.stderr.flush()
+    debug_json(logger, f"Unknown {protocol} {context}:", value)
 
 
 def provider_notice_codes(value) -> tuple[str, ...]:

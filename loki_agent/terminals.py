@@ -2094,17 +2094,19 @@ class InputSession:
                 # producer task silently and leave the main loop blocked on
                 # user_messages.get() forever. Log and treat it as session EOF
                 # so the main loop breaks and main()'s clean_up runs.
+                import logging
                 import traceback
-                formatted_traceback = "".join(
-                    traceback.TracebackException.from_exception(e).format())
+                from .diagnostics import debug_json
+
                 terminal.write_text(
-                    "input session error:\n" + formatted_traceback,
-                    multiline=True,
-                    file=sys.stderr,
-                )
-                if not formatted_traceback.endswith("\n"):
-                    print(file=sys.stderr)
+                    f"input session error: {e}", multiline=True,
+                    file=sys.stderr)
+                print(file=sys.stderr)
                 sys.stderr.flush()
+                logger = logging.getLogger(__name__)
+                if logger.isEnabledFor(logging.DEBUG):
+                    debug_json(logger, "Input session traceback:", "".join(
+                        traceback.TracebackException.from_exception(e).format()))
                 self.user_messages.put_nowait(None)
                 return
             self.user_messages.put_nowait(text)

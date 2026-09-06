@@ -11,6 +11,7 @@
 # TODO: make this an actual shell; pipeable and so on like always; history search etc
 
 import sys
+import logging
 import os
 import asyncio
 import collections
@@ -4566,7 +4567,8 @@ async def async_provider_request(
 
     elapsed = time.perf_counter() - start
     if show_timing:
-        print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]", file=sys.stderr)
+        logging.getLogger(__name__).debug(
+            "LLM Response Time: %.3fs", elapsed)
     return protocols.ProviderResponse(
         data,
         effective_model=(
@@ -4889,8 +4891,8 @@ async def async_chat_stream_request(
 
     elapsed = time.perf_counter() - start
     if show_timing:
-        print(f"\n[T]  [LLM Response Time: {elapsed:.3f}s]",
-              file=sys.stderr)
+        logging.getLogger(__name__).debug(
+            "LLM Response Time: %.3fs", elapsed)
     return response
 
 

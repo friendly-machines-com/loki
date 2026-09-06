@@ -11,6 +11,7 @@ import os
 import sys
 
 from .credentials import capture_process_credentials
+from .diagnostics import configure_logging
 from .runtime_isolations import (
     RuntimeIsolationError,
     isolate_credential_directory,
@@ -69,6 +70,8 @@ def main() -> int:
         except (ProcessProtectionError, RuntimeIsolationError,
                 ValueError) as error:
             return _report_security_error(error)
+        if not configure_logging():
+            return 2
         from .terminal_frontend import main as terminal_main
         return terminal_main(args, owner_fd, capability_fd)
 
@@ -82,6 +85,8 @@ def main() -> int:
             protect_credential_process()
         except ProcessProtectionError as error:
             return _report_security_error(error)
+        if not configure_logging():
+            return 2
         from .subagents import main as subagent_main
         return subagent_main(sys.argv[2:])
 
@@ -93,6 +98,8 @@ def main() -> int:
         protect_credential_process()
     except ProcessProtectionError as error:
         return _report_security_error(error)
+    if not configure_logging():
+        return 2
     if sys.argv[1:2] == ["status"]:
         from .response_headers import main as status_main
         return status_main(sys.argv[2:])

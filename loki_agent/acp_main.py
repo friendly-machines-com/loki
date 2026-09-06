@@ -11,6 +11,7 @@ import os
 import sys
 
 from .credentials import CredentialStore, capture_process_credentials
+from .diagnostics import configure_logging
 from .process_protections import (
     ProcessProtectionError,
     protect_credential_process,
@@ -69,6 +70,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if not configure_logging():
+            return 2
         from .subagents import main as subagent_main
         return subagent_main(sys.argv[2:])
 
@@ -77,6 +80,8 @@ def main() -> int:
         protect_credential_process()
     except ProcessProtectionError as error:
         print(f"Security initialization error: {error}", file=sys.stderr)
+        return 2
+    if not configure_logging():
         return 2
     from .credential_storages import CredentialStorageError
     try:

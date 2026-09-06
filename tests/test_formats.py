@@ -820,20 +820,19 @@ class SameProtocolReplayTests(unittest.TestCase):
         serialized = json.dumps(turn.to_event())
         self.assertEqual(serialized.count(marker), 1)
 
-    def test_unknown_output_is_printed_retained_and_not_sent_foreign(self):
+    def test_unknown_output_is_logged_retained_and_not_sent_foreign(self):
         output = {
             "type": "future_output",
             "payload": {"marker": True},
         }
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        with self.assertLogs("loki_agent.formats", level="DEBUG") as logs:
             turn = formats.openai_responses_response_to_items({
                 "object": "response",
                 "status": "completed",
                 "output": [output],
             })
         event = turn.to_event()
-        self.assertIn(json.dumps({"marker": True}), stderr.getvalue())
+        self.assertIn(json.dumps({"marker": True}), "\n".join(logs.output))
         self.assertEqual(
             formats.items_to_openai_responses_parts([event])[1],
             [output],
@@ -851,8 +850,7 @@ class SameProtocolReplayTests(unittest.TestCase):
             "status": "completed",
             "action": {"type": "screenshot"},
         }
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        with self.assertLogs("loki_agent.formats", level="DEBUG") as logs:
             turn = formats.openai_responses_response_to_items({
                 "object": "response",
                 "status": "completed",
@@ -861,7 +859,7 @@ class SameProtocolReplayTests(unittest.TestCase):
         event = turn.to_event()
 
         self.assertIn(
-            "unsupported provider output", stderr.getvalue())
+            "unsupported provider output", "\n".join(logs.output))
         self.assertEqual(
             formats.items_to_openai_responses_parts([event])[1],
             [output],

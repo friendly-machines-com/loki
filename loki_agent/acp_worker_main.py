@@ -152,6 +152,8 @@ def _runtime_descriptors(args) -> tuple[int, int]:
 
 
 def main() -> int:
+    from .diagnostics import configure_logging
+
     args = sys.argv[2:] if sys.argv[1:2] == ["--worker"] else sys.argv[1:]
     try:
         owner_fd, capability_fd = _runtime_descriptors(args)
@@ -165,6 +167,8 @@ def main() -> int:
         return 2
     except (ProcessProtectionError, RuntimeIsolationError) as error:
         print(f"Security initialization error: {error}", file=sys.stderr)
+        return 2
+    if not configure_logging():
         return 2
     return asyncio.run(amain(owner_fd, capability_fd))
 

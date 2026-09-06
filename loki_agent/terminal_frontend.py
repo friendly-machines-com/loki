@@ -12,6 +12,7 @@ import asyncio
 import base64
 import getopt
 import json
+import logging
 import os
 import shlex
 import signal
@@ -20,6 +21,7 @@ import sys
 from dataclasses import dataclass
 from pprint import pformat
 
+from .diagnostics import debug_json
 from . import formats
 from . import credential_capabilities
 from . import credential_runtimes
@@ -83,6 +85,9 @@ from .loki import (
 )
 from .terminals import (
     input_session, restore_output_area_after_input, terminal)
+
+
+logger = logging.getLogger(__name__)
 
 
 IMAGE_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
@@ -245,17 +250,6 @@ def _print_repr_line(prefix, value, *, file=None):
     _print_text_line(prefix, repr(value), file=file)
 
 
-def _print_json_diagnostic(prefix, payload, *, file):
-    print(prefix, end="", file=file)
-    terminal.write_text(
-        json.dumps(
-            payload, ensure_ascii=False, sort_keys=True, default=str),
-        multiline=True,
-        file=file,
-    )
-    print(file=file)
-
-
 def _report_model_list_errors(text):
     print("Model list failed:", file=sys.stderr)
     terminal.write_text(text, multiline=True, file=sys.stderr)
@@ -328,9 +322,7 @@ def _terminal_agent_event(event: dict):
         sys.stdout.flush()
         payload = getattr(error, "payload", None)
         if payload is not None:
-            _print_json_diagnostic(
-                "Provider payload:\n", payload, file=sys.stderr)
-            sys.stderr.flush()
+            debug_json(logger, "Provider payload:", payload)
     elif kind == "provider_error":
         terminal.set_background_color(ERROR_COLOR)
         error = event["error"]
@@ -358,10 +350,7 @@ def _terminal_agent_event(event: dict):
         sys.stdout.flush()
     elif kind == "response_timing":
         sys.stdout.flush()
-        print(
-            f"\n[T]  [LLM Response Time: {event['elapsed']:.3f}s]",
-            file=sys.stderr)
-        sys.stderr.flush()
+        logger.debug("LLM Response Time: %.3fs", event["elapsed"])
     elif kind == "provider_notice":
         text = formats.provider_notice_text(event.get("code"))
         if text is not None:
@@ -378,44 +367,25 @@ def _terminal_agent_event(event: dict):
                 else "; partial transport output was not added to history")
         print(f"[model response cancelled{detail}]", file=sys.stderr)
         sys.stderr.flush()
-    elif kind == "response_incomplete":
+    elif kind in ("response_incomplete", "response_failed"):
         sys.stdout.flush()
+        status = "incomplete" if kind == "response_incomplete" else "failed"
+        print(f"[model response {status}; provider output saved]",
+              file=sys.stderr)
         detail = event.get("protocol_data")
-        print(
-            "[model response incomplete; provider output saved]",
-            end="",
-            file=sys.stderr,
-        )
-        if detail:
-            print(file=sys.stderr)
-            terminal.write_text(
-                json.dumps(
-                    detail, ensure_ascii=False, sort_keys=True,
-                    default=str),
-                multiline=True,
-                file=sys.stderr,
-            )
-        print(file=sys.stderr)
+        if isinstance(detail, dict):
+            response = detail.get(formats.OPENAI_RESPONSES)
+            if isinstance(response, dict):
+                reason = (response.get("incomplete_details")
+                          or response.get("error"))
+                if isinstance(reason, dict):
+                    text = reason.get("reason") or reason.get("message")
+                    if isinstance(text, str) and text:
+                        _print_text_line(
+                            "Reason: ", text, file=sys.stderr, multiline=True)
         sys.stderr.flush()
-    elif kind == "response_failed":
-        sys.stdout.flush()
-        detail = event.get("protocol_data")
-        print(
-            "[model response failed; provider output saved]",
-            end="",
-            file=sys.stderr,
-        )
         if detail:
-            print(file=sys.stderr)
-            terminal.write_text(
-                json.dumps(
-                    detail, ensure_ascii=False, sort_keys=True,
-                    default=str),
-                multiline=True,
-                file=sys.stderr,
-            )
-        print(file=sys.stderr)
-        sys.stderr.flush()
+            debug_json(logger, "Provider response details:", detail)
     elif kind == "stream_error":
         error = event["error"]
         terminal.set_background_color(ERROR_COLOR)
@@ -429,9 +399,7 @@ def _terminal_agent_event(event: dict):
         sys.stdout.flush()
         payload = getattr(error, "payload", None)
         if payload is not None:
-            _print_json_diagnostic(
-                "Provider payload:\n", payload, file=sys.stderr)
-            sys.stderr.flush()
+            debug_json(logger, "Provider payload:", payload)
     elif kind == "tool_input_repaired":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
         _print_repr_line(

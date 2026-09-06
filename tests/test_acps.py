@@ -472,6 +472,39 @@ class FrontWorkerTests(unittest.TestCase):
         })
         return env
 
+    def test_ini_logging_reaches_real_front_and_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = os.path.join(directory, "logging.ini")
+            with open(config, "w") as stream:
+                stream.write("""[loggers]
+keys=root
+[handlers]
+keys=trace
+[formatters]
+keys=
+[logger_root]
+level=DEBUG
+handlers=trace
+[handler_trace]
+class=FileHandler
+args=('%s/trace-' + str(__import__('os').getpid()), 'a')
+""" % directory)
+            front_env = self._front_env
+
+            def relative_config_env(cwd):
+                env = front_env(cwd)
+                env["LOKI_LOG_CONFIG"] = os.path.relpath(config, cwd)
+                return env
+
+            with mock.patch.object(
+                    self, "_front_env", side_effect=relative_config_env):
+                self.test_initialize_new_session_prompt_roundtrip()
+            # File handlers open during configuration, even without a record.
+            # The front and separately execed worker must both load the INI.
+            traces = [name for name in os.listdir(directory)
+                      if name.startswith("trace-")]
+            self.assertGreaterEqual(len(traces), 2)
+
     def test_initialize_new_session_prompt_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._front_env(tmpdir)

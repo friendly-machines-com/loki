@@ -696,6 +696,39 @@ class ToolLoopWiringTests(unittest.TestCase):
 
 
 class TerminalDiagnosticTests(unittest.TestCase):
+    def test_response_failure_reason_visible_but_raw_details_are_debug(self):
+        event = {
+            "type": "response_failed",
+            "protocol_data": {formats.OPENAI_RESPONSES: {
+                "error": {"message": "Try again", "opaque": "trace-only"},
+            }},
+        }
+        stderr = io.StringIO()
+        with mock.patch.object(
+                terminal_frontend, "terminal", StyledTerminal()), \
+                contextlib.redirect_stderr(stderr), \
+                self.assertNoLogs("loki_agent.terminal_frontend", "WARNING"):
+            terminal_frontend._terminal_agent_event(event)
+        self.assertIn("model response failed", stderr.getvalue())
+        self.assertIn("Reason: Try again", stderr.getvalue())
+        self.assertNotIn("trace-only", stderr.getvalue())
+        with mock.patch.object(
+                terminal_frontend, "terminal", StyledTerminal()), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                self.assertLogs("loki_agent.terminal_frontend", "DEBUG") as logs:
+            terminal_frontend._terminal_agent_event(event)
+        self.assertIn("trace-only", "\n".join(logs.output))
+
+    def test_timing_is_debug_only(self):
+        stderr = io.StringIO()
+        event = {"type": "response_timing", "elapsed": 1.25}
+        with contextlib.redirect_stderr(stderr):
+            terminal_frontend._terminal_agent_event(event)
+        self.assertEqual(stderr.getvalue(), "")
+        with self.assertLogs("loki_agent.terminal_frontend", "DEBUG") as logs:
+            terminal_frontend._terminal_agent_event(event)
+        self.assertIn("1.250s", "\n".join(logs.output))
+
     def test_hook_stderr_stays_multiline_but_neutralizes_controls(self):
         stderr = io.StringIO()
         stdout = io.StringIO()

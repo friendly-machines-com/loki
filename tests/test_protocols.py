@@ -1603,8 +1603,7 @@ class StreamAccumulatorTests(unittest.TestCase):
             self):
         accumulator = protocols.OpenAIChatStreamAccumulator(
             lambda text: None)
-        diagnostics = io.StringIO()
-        with contextlib.redirect_stderr(diagnostics):
+        with self.assertLogs("loki_agent.formats", level="DEBUG") as logs:
             for value in ["one", " two", " three"]:
                 accumulator.feed(self.event(json.dumps({
                     "choices": [{
@@ -1629,7 +1628,7 @@ class StreamAccumulatorTests(unittest.TestCase):
             "one two three",
         )
         self.assertEqual(
-            diagnostics.getvalue().count(
+            "\n".join(logs.output).count(
                 "Unknown openai_chat message fields"),
             1,
         )
@@ -1903,15 +1902,14 @@ class StreamAccumulatorTests(unittest.TestCase):
     def test_unknown_responses_metadata_is_still_diagnosed(self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(
             lambda text: None)
-        diagnostics = io.StringIO()
 
-        with contextlib.redirect_stderr(diagnostics):
+        with self.assertLogs("loki_agent.formats", level="DEBUG") as logs:
             accumulator.feed(self.event(json.dumps({
                 "type": "response.metadata",
                 "metadata": {"future_metadata": {"value": 1}},
             })))
 
-        self.assertIn("future_metadata", diagnostics.getvalue())
+        self.assertIn("future_metadata", "\n".join(logs.output))
 
     def test_openai_responses_collects_items_with_metadata_only_completion(
             self):
@@ -2045,8 +2043,7 @@ class StreamAccumulatorTests(unittest.TestCase):
     def test_unknown_stream_event_is_diagnosed_not_in_conversation(self):
         accumulator = protocols.OpenAIResponsesStreamAccumulator(
             lambda text: None)
-        diagnostics = io.StringIO()
-        with contextlib.redirect_stderr(diagnostics):
+        with self.assertLogs("loki_agent.formats", level="DEBUG") as logs:
             accumulator.feed(self.event(
                 '{"type":"future.event","payload":{"marker":true}}'))
             accumulator.feed(self.event(
@@ -2056,7 +2053,7 @@ class StreamAccumulatorTests(unittest.TestCase):
             response = accumulator.finish()
             turn = formats.openai_responses_response_to_items(response)
 
-        self.assertIn('"marker": true', diagnostics.getvalue())
+        self.assertIn('"marker": true', "\n".join(logs.output))
         self.assertEqual(turn.items, [])
         self.assertNotIn("response", turn.metadata)
         self.assertNotIn(
