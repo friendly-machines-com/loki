@@ -381,28 +381,32 @@ class JsonCredentialStorage:
     @asynccontextmanager
     async def _locked_document(self):
         directory_fd = self._open_directory()
-        lock_fd = self._open_lock_at(directory_fd)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + LOCK_TIMEOUT_S
-        acquired = False
         try:
-            while True:
+            lock_fd = self._open_lock_at(directory_fd)
+            try:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + LOCK_TIMEOUT_S
+                acquired = False
                 try:
-                    fcntl.flock(
-                        lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except BlockingIOError:
-                    if loop.time() >= deadline:
-                        raise CredentialStorageError(
-                            "timed out waiting for credential lock")
-                    await asyncio.sleep(LOCK_RETRY_DELAY_S)
-            yield directory_fd, self._read_document_at(directory_fd)
+                    while True:
+                        try:
+                            fcntl.flock(
+                                lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            acquired = True
+                            break
+                        except BlockingIOError:
+                            if loop.time() >= deadline:
+                                raise CredentialStorageError(
+                                    "timed out waiting for credential lock")
+                            await asyncio.sleep(LOCK_RETRY_DELAY_S)
+                    yield directory_fd, self._read_document_at(directory_fd)
+                finally:
+                    if acquired:
+                        with contextlib.suppress(OSError):
+                            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
         finally:
-            if acquired:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
             os.close(directory_fd)
 
     @staticmethod

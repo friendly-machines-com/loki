@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import json
 import os
 import stat
@@ -129,6 +130,102 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                 credential_storages.CredentialStorageError,
                 "could not open credential lock"):
             await self.storage.store_openai_login(tokens())
+
+    def assert_descriptor_closed(self, fd):
+        try:
+            os.fstat(fd)
+        except OSError as error:
+            self.assertEqual(error.errno, errno.EBADF)
+        else:
+            # Keep a failing regression test from leaking its real descriptor.
+            os.close(fd)
+            self.fail(f"descriptor {fd} was left open")
+
+    async def test_failed_lock_open_closes_directory_descriptor(self):
+        self.storage.ensure_directory()
+        os.symlink('unused-target', self.storage.lock_path)
+        open_directory = self.storage._open_directory
+        opened = []
+
+        def record_directory():
+            fd = open_directory()
+            opened.append(fd)
+            return fd
+
+        with mock.patch.object(self.storage, '_open_directory',
+                               side_effect=record_directory):
+            for _ in range(3):
+                with self.assertRaisesRegex(
+                        credential_storages.CredentialStorageError,
+                        'could not open credential lock'):
+                    await self.storage.store_openai_login(tokens())
+                self.assert_descriptor_closed(opened[-1])
+
+    async def test_setup_failure_after_lock_open_closes_both_descriptors(self):
+        directory_fd = self.storage._open_directory()
+        lock_fd = self.storage._open_lock_at(directory_fd)
+        try:
+            with mock.patch.object(self.storage, '_open_directory',
+                                   return_value=directory_fd), \
+                    mock.patch.object(self.storage, '_open_lock_at',
+                                      return_value=lock_fd), \
+                    mock.patch.object(asyncio, 'get_running_loop',
+                                      side_effect=RuntimeError('setup failed')):
+                with self.assertRaisesRegex(RuntimeError, 'setup failed'):
+                    await self.storage.store_openai_login(tokens())
+        finally:
+            # Check both even if one assertion fails.
+            try:
+                self.assert_descriptor_closed(lock_fd)
+            finally:
+                self.assert_descriptor_closed(directory_fd)
+
+    async def test_lock_close_error_still_closes_directory_descriptor(self):
+        directory_fd = self.storage._open_directory()
+        lock_fd = self.storage._open_lock_at(directory_fd)
+        close = os.close
+
+        def close_then_report_error(fd):
+            close(fd)
+            if fd == lock_fd:
+                raise OSError('lock close failed')
+
+        try:
+            with mock.patch.object(self.storage, '_open_directory',
+                                   return_value=directory_fd), \
+                    mock.patch.object(self.storage, '_open_lock_at',
+                                      return_value=lock_fd), \
+                    mock.patch.object(os, 'close', side_effect=close_then_report_error):
+                with self.assertRaisesRegex(OSError, 'lock close failed'):
+                    async with self.storage._locked_document():
+                        pass
+        finally:
+            try:
+                self.assert_descriptor_closed(lock_fd)
+            finally:
+                self.assert_descriptor_closed(directory_fd)
+
+    async def test_cancellation_while_waiting_closes_both_descriptors(self):
+        directory_fd = self.storage._open_directory()
+        lock_fd = self.storage._open_lock_at(directory_fd)
+        with mock.patch.object(self.storage, '_open_directory',
+                               return_value=directory_fd), \
+                mock.patch.object(self.storage, '_open_lock_at',
+                                  return_value=lock_fd), \
+                mock.patch.object(credential_storages.fcntl, 'flock',
+                                  side_effect=BlockingIOError):
+            task = asyncio.create_task(self.storage.store_openai_login(tokens()))
+            try:
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                try:
+                    self.assert_descriptor_closed(lock_fd)
+                finally:
+                    self.assert_descriptor_closed(directory_fd)
 
     async def test_rejects_wrong_file_owner(self):
         file_stat = mock.Mock(
