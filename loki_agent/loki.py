@@ -1315,10 +1315,14 @@ def _atomic_write_text(file_path: str, content: str):
             f.write(content)
             f.flush()
             # os.fsync(f.fileno())
-        # Preserve the target mode before publishing the replacement inode.
-        # This remains pathname-based; concurrent directory-entry substitution
-        # is a separate issue, not prevented by exclusive temporary creation.
-        os.chmod(tmp_path, target_mode)
+            # Apply permissions to the still-open inode, after buffered writes.
+            fchmod = getattr(os, 'fchmod', None)
+            if fchmod is not None:
+                fchmod(f.fileno(), target_mode)
+            else:
+                # This legacy fallback lacks the descriptor branch's protection
+                # against replacement of the temporary directory entry.
+                os.chmod(tmp_path, target_mode)
         os.replace(tmp_path, file_path)
     except Exception:
         try:
