@@ -329,6 +329,21 @@ def cleanup_tree(directory, depth):
     raise TimeoutError('cleanup witness exceeded its safety deadline')
 
 
+def peer_readiness_failure(peer, log):
+    wait_error = None
+    try:
+        code = peer.wait(timeout=5)
+        detail = 'exit code %s' % code
+    except (OSError, subprocess.SubprocessError) as error:
+        wait_error = error
+        detail = '%s: %s' % (type(error).__name__, error)
+    log.flush()
+    log.seek(0)
+    output = log.read().decode(errors='replace')
+    raise RuntimeError('unrestricted peer did not become ready; wait: %s; log: %s'
+                       % (detail, output)) from wait_error
+
+
 def private_dacl(owner):
     return 'D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)' % owner
 
@@ -573,6 +588,247 @@ class EscapeResultTests(unittest.TestCase):
         with mock.patch.object(C, 'get_last_error', return_value=5, create=True):
             with self.assertRaisesRegex(RuntimeError, 'CloseHandle failed'):
                 api.close(77)
+
+    def impersonation_free_api(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.created = 0
+        api.startup_type = ExtendedStartups
+        api.process_type = ProcessInfos
+        api.n = mock.Mock()
+        api.n.check.side_effect = lambda value: value
+        api.n.current_process.return_value = 1
+        api.n.close.return_value = True
+        api.token = mock.Mock(return_value=7)
+
+        def duplicate(source, rights, attributes, level, kind, out):
+            C.cast(out, C.POINTER(HANDLE)).contents.value = 9
+            return 1
+        api.duplicate = duplicate
+        return api
+
+    def test_token_launch_denial_is_reported_at_create_stage(self):
+        api = self.impersonation_free_api()
+        creator = mock.Mock(return_value=0)
+        for error, outcome in [(1314, 'access-denied'), (5, 'access-denied'),
+                               (87, 'unexpected-launch-result')]:
+            with self.subTest(winerror=error), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(C, 'get_last_error', return_value=error,
+                                      create=True):
+                result = api.token_launch(creator, 0xB, 'python.exe', 'user',
+                                          'pkg')
+            self.assertEqual(result['phase'], 'create')
+            self.assertEqual(result['winerror'], error)
+            self.assertEqual(result['outcome'], outcome)
+            self.assertEqual(api.created, 0)
+            passed = escape_helpers['finalize_result'](
+                result, 0, ('access-denied',))['passed']
+            self.assertEqual(passed, outcome == 'access-denied')
+        self.assertEqual(creator.call_count, 3)
+
+    def test_token_api_binding_signatures(self):
+        native = mock.Mock()
+        bindings = {}
+
+        def bind(library, name, result, *arguments):
+            bindings[name] = (result, arguments)
+            return mock.Mock()
+        native.bind = bind
+        with mock.patch.object(C, 'WinDLL', create=True):
+            escape_helpers['Escapes'](native, primitives, ExtendedStartups, ProcessInfos)
+        startup, process = C.POINTER(ExtendedStartups), C.POINTER(ProcessInfos)
+        self.assertEqual(bindings['CreateProcessWithTokenW'],
+                         (W.BOOL, (HANDLE, ULONG, W.LPCWSTR, W.LPWSTR, ULONG,
+                                   HANDLE, W.LPCWSTR, startup, process)))
+        self.assertEqual(bindings['CreateProcessAsUserW'],
+                         (W.BOOL, (HANDLE, W.LPCWSTR, W.LPWSTR, HANDLE, HANDLE,
+                                   W.BOOL, ULONG, HANDLE, W.LPCWSTR, startup, process)))
+        self.assertEqual(bindings['GetCurrentThread'], (HANDLE, ()))
+        self.assertEqual(bindings['OpenThreadToken'],
+                         (W.BOOL, (HANDLE, ULONG, W.BOOL, C.POINTER(HANDLE))))
+
+    def test_token_creators_use_documented_call_shapes(self):
+        api = self.impersonation_free_api()
+        api.create_as_user = mock.Mock(return_value=0)
+        api.create_with_token = mock.Mock(return_value=0)
+        startup, child = ExtendedStartups(), ProcessInfos()
+        with mock.patch('builtins.print'):
+            api.launch_as_user(9, 'exe', 'cmd', startup, child)
+            api.launch_with_token(9, 'exe', 'cmd', startup, child)
+        user_args = api.create_as_user.call_args.args
+        self.assertEqual(len(user_args), 11)
+        self.assertEqual(user_args[:3], (9, 'exe', 'cmd'))
+        self.assertIsNone(user_args[3])
+        self.assertIsNone(user_args[4])
+        self.assertIs(user_args[5], False)
+        self.assertEqual(user_args[6], 0x80000 | 4)
+        token_args = api.create_with_token.call_args.args
+        self.assertEqual(len(token_args), 9)
+        self.assertEqual(token_args[:4], (9, 0, 'exe', 'cmd'))
+        self.assertEqual(token_args[4], 0x80000 | 4)
+
+    def test_token_launch_success_requires_inspected_containment(self):
+        api = self.impersonation_free_api()
+        api.snapshot = mock.Mock(return_value={'user': 'user', 'app': 1,
+                                               'package': 'pkg'})
+        api.retire = mock.Mock()
+        creator = mock.Mock(return_value=1)
+        with mock.patch('builtins.print'):
+            result = api.token_launch(creator, 0xB, 'python.exe', 'user', 'pkg')
+        self.assertEqual(result['outcome'], 'contained')
+        self.assertEqual(api.created, 1)
+        api.retire.assert_called_once()
+        # Source and primary duplicate handles are both released.
+        closed = [getattr(call.args[0], 'value', call.args[0])
+                  for call in api.n.close.call_args_list]
+        self.assertIn(7, closed)
+        self.assertIn(9, closed)
+
+    def impersonation_child_api(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = mock.Mock()
+        api.n.check.side_effect = lambda value: value
+        api.n.current_process.return_value = 1
+        api.n.close.return_value = True
+        api.token = mock.Mock(return_value=7)
+
+        def duplicate(source, rights, attributes, level, kind, out):
+            C.cast(out, C.POINTER(HANDLE)).contents.value = 9
+            return 1
+        api.duplicate = duplicate
+        api.snapshot = mock.Mock(return_value={'user': 'u', 'app': 1,
+                                               'package': 'p'})
+        api.current_thread = mock.Mock(return_value=11)
+        api.open_thread_token = mock.Mock(return_value=False)
+        api.revert = mock.Mock(return_value=True)
+        return api
+
+    def test_set_thread_token_failures_are_gated_by_error_code(self):
+        classify = mock.Mock(return_value={'outcome': 'access-denied'})
+        manifest = {'secret': 'unused'}
+        for error, outcome in [(5, 'access-denied'),
+                               (87, 'unexpected-set-thread-token-result'),
+                               (6, 'unexpected-set-thread-token-result')]:
+            api = self.impersonation_child_api()
+            api.set_thread_token = mock.Mock(return_value=False)
+            with self.subTest(winerror=error), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(C, 'set_last_error', create=True), \
+                    mock.patch.object(C, 'get_last_error', return_value=error,
+                                      create=True):
+                result = escape_helpers['impersonation'](api, manifest,
+                                                         classify)
+            self.assertEqual(result['outcome'], outcome)
+            self.assertEqual(result.get('winerror'), error)
+            # A failed assignment must never leave the revert path unchecked.
+            api.revert.assert_not_called()
+            api.set_thread_token.assert_called_once()
+
+    def test_failed_reversion_exits_without_retry_or_cleanup(self):
+        # Exercise real process termination, not a mocked _exit that unwinds
+        # Python finally blocks and thereby tests a different failure path.
+        script = r'''
+import atexit
+import ctypes as C
+import runpy
+import sys
+from unittest import mock
+module = runpy.run_path(sys.argv[1])
+api = module['EscapeResultTests']().impersonation_child_api()
+api.set_thread_token = mock.Mock(return_value=True)
+api.n.close.side_effect = lambda handle: print('CLEANUP', flush=True) or True
+atexit.register(lambda: print('ATEXIT', flush=True))
+def open_thread(thread, rights, self_flag, out):
+    if thread != 11:
+        raise AssertionError('wrong thread handle')
+    C.cast(out, C.POINTER(C.c_void_p)).contents.value = 13
+    return True
+api.open_thread_token = open_thread
+calls = []
+def revert():
+    calls.append(1)
+    print('REVERT', flush=True)
+    return len(calls) > 1  # A retry would succeed; it must never happen.
+api.revert = revert
+if sys.argv[2] == 'query-error':
+    api.snapshot.side_effect = [api.snapshot.return_value, RuntimeError('query failed')]
+with mock.patch.object(C, 'set_last_error', create=True), \
+     mock.patch.object(C, 'get_last_error', return_value=0, create=True):
+    module['escape_helpers']['impersonation'](
+        api, {'secret': 'unused'}, lambda *args: {'outcome': 'access-denied'})
+print('RETURNED', flush=True)
+'''
+        for mode in ('success', 'query-error'):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [sys.executable, '-I', '-u', '-c', script, __file__, mode],
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 70, result.stderr)
+                self.assertEqual(result.stdout, 'REVERT\n')
+                self.assertEqual(result.stderr, '')
+
+    def test_successful_reversion_precedes_cleanup_and_residual_query(self):
+        api = self.impersonation_child_api()
+        api.set_thread_token = mock.Mock(return_value=True)
+        events = []
+
+        def open_thread(thread, rights, self_flag, out):
+            self.assertEqual(thread, 11)
+            if not events:
+                events.append('open')
+                C.cast(out, C.POINTER(HANDLE)).contents.value = 13
+                return True
+            self.assertEqual(events, ['open', 'revert', 'close-13'])
+            events.append('residual')
+            return False
+        api.open_thread_token = open_thread
+        api.revert.side_effect = lambda: events.append('revert') or True
+        api.n.close.side_effect = lambda h: events.append(
+            'close-%s' % getattr(h, 'value', h)) or True
+        with mock.patch.object(C, 'set_last_error', create=True), \
+                mock.patch.object(C, 'get_last_error', return_value=1008, create=True):
+            result = escape_helpers['impersonation'](
+                api, {'secret': 'unused'}, lambda *args: {'outcome': 'access-denied'})
+        self.assertEqual(result['outcome'], 'impersonated-contained')
+        api.revert.assert_called_once_with()
+        self.assertEqual(events, ['open', 'revert', 'close-13', 'residual',
+                                  'close-9', 'close-7'])
+
+    def test_peer_readiness_failure_preserves_log_and_wait_error(self):
+        for failure in (None, subprocess.TimeoutExpired(['peer'], 5), OSError('wait failed')):
+            with self.subTest(failure=failure), tempfile.TemporaryFile('w+b') as log:
+                log.write(b'peer startup diagnostics')
+                peer = mock.Mock()
+                peer.wait.return_value = 9
+                peer.wait.side_effect = failure
+                with self.assertRaisesRegex(RuntimeError, 'peer startup diagnostics') as caught:
+                    peer_readiness_failure(peer, log)
+                self.assertIs(caught.exception.__cause__, failure)
+                detail = 'exit code 9' if failure is None else type(failure).__name__
+                self.assertIn(detail, str(caught.exception))
+
+    def test_impersonation_launch_relays_child_report(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        report = '{"outcome": "impersonated-contained"}'
+        replies = [subprocess.CompletedProcess([], 0, 'noise\n' + report, ''),
+                   subprocess.CompletedProcess([], 1, report, 'boom'),
+                   subprocess.CompletedProcess([], 0, '', ''),
+                   subprocess.TimeoutExpired(['child'], 20)]
+        outcomes = [{'outcome': 'impersonated-contained'}, RuntimeError,
+                    RuntimeError, RuntimeError]
+        for reply, outcome in zip(replies, outcomes):
+            expired = isinstance(reply, subprocess.TimeoutExpired)
+            with self.subTest(exit=getattr(reply, 'returncode', 'timeout')), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(
+                        subprocess, 'run',
+                        side_effect=[reply] if expired else None,
+                        return_value=None if expired else reply):
+                if isinstance(outcome, dict):
+                    self.assertEqual(api.impersonation_launch('s', 'm'), outcome)
+                else:
+                    with self.assertRaises(outcome):
+                        api.impersonation_launch('s', 'm')
 
     def test_wmi_operands_are_quoted_without_json_cmdlets(self):
         import base64
@@ -878,7 +1134,7 @@ class AppContainerTests(unittest.TestCase):
         # Readiness and diagnostics live outside worker-writable storage. Only
         # identifiers are copied into the contained manifest, never live handles.
         peer_report = root / 'peer.json'
-        peer_log = open(root / 'peer.log', 'wb')
+        peer_log = open(root / 'peer.log', 'w+b')
         self.addCleanup(peer_log.close)
         peer = subprocess.Popen(
             [sys.executable, '-I', '-u', __file__, '--peer', str(secret / 'read'),
@@ -893,7 +1149,7 @@ class AppContainerTests(unittest.TestCase):
         deadline = time.monotonic() + 15
         while not peer_report.exists():
             if peer.poll() is not None or time.monotonic() >= deadline:
-                self.fail('unrestricted peer did not become ready')
+                peer_readiness_failure(peer, peer_log)
             time.sleep(0.02)
         target = json.loads(peer_report.read_text())
         self.assertEqual(target['pid'], peer.pid)
@@ -1009,6 +1265,15 @@ if __name__ == '__main__':
         escape_helpers['witness'](api, json.loads(Path(sys.argv[2]).read_text()),
                                   Path(sys.argv[3]), access_outcome)
         sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == '--token-impersonation':
+        native = AppContainers()
+        api = escape_helpers['Escapes'](
+            native, primitives, ExtendedStartups, ProcessInfos)
+        report = escape_helpers['impersonation'](
+            api, json.loads(Path(sys.argv[2]).read_text()), access_outcome)
+        print(json.dumps(report), flush=True)
+        sys.exit(0 if report['outcome'] in ('impersonated-contained',
+                                            'access-denied') else 1)
     if len(sys.argv) == 3 and sys.argv[1] in ('--contained', '--descendant'):
         sys.exit(contained(sys.argv[2], sys.argv[1] == '--descendant'))
     if len(sys.argv) == 3 and sys.argv[1] == '--standard-user':

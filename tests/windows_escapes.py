@@ -33,6 +33,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 import uuid
 
@@ -140,6 +141,26 @@ class Escapes:
         self.duplicate_handle = bind(native.kernel, 'DuplicateHandle', W.BOOL,
                                      HANDLE, HANDLE, HANDLE, C.POINTER(HANDLE),
                                      ULONG, W.BOOL, ULONG)
+        # SetThreadToken needs TOKEN_IMPERSONATE on the supplied token.
+        # CreateProcessAsUserW (advapi32) and CreateProcessWithTokenW have
+        # DIFFERENT shapes: 11 args including inheritable-handles, versus 9
+        # args with dwLogonFlags. Their absence of worker privileges
+        # (SeAssignPrimaryTokenPrivilege / SeImpersonatePrivilege) is the
+        # expected denial stage.
+        self.set_thread_token = bind(native.advapi, 'SetThreadToken', W.BOOL,
+                                     HANDLE, HANDLE)
+        self.open_thread_token = bind(native.advapi, 'OpenThreadToken', W.BOOL,
+                                      HANDLE, ULONG, W.BOOL, C.POINTER(HANDLE))
+        self.revert = bind(native.advapi, 'RevertToSelf', W.BOOL)
+        self.current_thread = bind(native.kernel, 'GetCurrentThread', HANDLE)
+        self.create_as_user = bind(
+            native.advapi, 'CreateProcessAsUserW', W.BOOL, HANDLE, W.LPCWSTR,
+            W.LPWSTR, HANDLE, HANDLE, W.BOOL, ULONG, HANDLE, W.LPCWSTR,
+            C.POINTER(startup_type), C.POINTER(process_type))
+        self.create_with_token = bind(
+            native.advapi, 'CreateProcessWithTokenW', W.BOOL, HANDLE, ULONG,
+            W.LPCWSTR, W.LPWSTR, ULONG, HANDLE, W.LPCWSTR,
+            C.POINTER(startup_type), C.POINTER(process_type))
 
     def token(self, process, rights):
         token = HANDLE()
@@ -415,6 +436,88 @@ try {
                                (reply['pid'], error))
         return self.inspect_witness(process, report, owner, package)
 
+    def launch_as_user(self, primary, executable, command, startup, child):
+        return self.create_as_user(primary, executable, command, None, None,
+                                   False, 0x80000 | 4, None, None,
+                                   C.byref(startup), C.byref(child))
+
+    def launch_with_token(self, primary, executable, command, startup, child):
+        # Nine-argument contract; dwLogonFlags 0 loads no profile for the
+        # bounded suspended witness.
+        return self.create_with_token(primary, 0, executable, command,
+                                      0x80000 | 4, None, None,
+                                      C.byref(startup), C.byref(child))
+
+    def token_launch(self, launcher, rights, executable, owner, package):
+        """Launch through a token-based creator using a fresh primary duplicate.
+
+        Duplication and creation denial are reported at their named stage and
+        only for documented denial errors; other failures are probe errors.
+        An unexpected success stays suspended until its token is inspected, so
+        no uninspected code runs under a possibly widened identity.
+        """
+        print(json.dumps({'probe': 'token-launch', 'phase': 'duplicate'}),
+              flush=True)
+        source = self.token(self.n.current_process(), 8 | 2)
+        try:
+            primary = HANDLE()
+            self.n.check(self.duplicate(source, rights, None, 2, 1,
+                                        C.byref(primary)))
+        finally:
+            self.close(source)
+        try:
+            startup = self.startup_type()
+            startup.startup.cb = C.sizeof(startup)
+            child = self.process_type()
+            command = C.create_unicode_buffer(subprocess.list2cmdline(
+                [executable, '-I', '-c', 'pass']))
+            print(json.dumps({'probe': 'token-launch', 'phase': 'create'}),
+                  flush=True)
+            success = launcher(primary, executable, command, startup, child)
+            if not success:
+                error = C.get_last_error()
+                if error in (5, 1314):  # ACCESS_DENIED, PRIVILEGE_NOT_HELD
+                    return {'outcome': 'access-denied', 'phase': 'create',
+                            'winerror': error}
+                # Invalid parameters and unknown failures are probe errors,
+                # never containment evidence.
+                return {'outcome': 'unexpected-launch-result',
+                        'phase': 'create', 'winerror': error}
+            self.created += 1  # Conservatively treat success as a launch.
+            with ExitStack() as cleanup:
+                cleanup.callback(self.close, child.thread)
+                cleanup.callback(self.retire, child.process)
+                token = self.token(child.process, 8)
+                cleanup.callback(self.close, token)
+                snapshot = self.snapshot(token)
+                return {'outcome': ('contained' if identity_matches(
+                    snapshot, owner, package) else 'escaped'), 'token': snapshot}
+        finally:
+            self.close(primary)
+
+    def impersonation_launch(self, script, manifest):
+        """Run the thread-token experiment in a disposable contained child.
+
+        Installing a thread token contaminates the calling thread, so this
+        never runs in the probe worker itself; the child inherits the same
+        AppContainer identity and reports its own classification.
+        """
+        try:
+            result = subprocess.run(
+                [sys.executable, '-I', '-u', script, '--token-impersonation',
+                 str(manifest)], capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError('impersonation child timed out') from error
+        print(json.dumps({'impersonation_child_exit': result.returncode,
+                          'stdout': result.stdout, 'stderr': result.stderr}),
+              flush=True)
+        if result.returncode:
+            raise RuntimeError('impersonation child failed')
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise RuntimeError('impersonation child produced no report')
+        return json.loads(lines[-1])
+
 
 def peer(native, secret, report):
     """Fixed unrestricted target; no worker-controlled commands or IPC service."""
@@ -431,6 +534,80 @@ def peer(native, secret, report):
         time.sleep(180)
     finally:
         native.check(native.close(handle))
+
+
+def impersonation(api, manifest, classify):
+    """Thread-token experiment for the disposable child; never the worker.
+
+    SetThreadToken/RevertToSelf contracts:
+    https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadtoken
+    Microsoft directs shutting the process down if RevertToSelf fails; this
+    child exits nonzero so the parent reports a protocol error, never denial.
+    """
+    source = api.token(api.n.current_process(), 8 | 2)
+    try:
+        duplicate = HANDLE()
+        # SecurityImpersonation level, impersonation type, TOKEN_QUERY|IMPERSONATE.
+        api.n.check(api.duplicate(source, 8 | 4, None, 2, 2, C.byref(duplicate)))
+        try:
+            before = api.snapshot(duplicate)
+            baseline = classify('impersonation-baseline-read',
+                                lambda: (Path(manifest['secret']) /
+                                         'read').read_bytes())
+            if baseline['outcome'] != 'access-denied':
+                raise RuntimeError('pre-impersonation credential read not denied')
+            C.set_last_error(0)
+            success = api.set_thread_token(None, duplicate)
+            error = C.get_last_error()
+            if not success:
+                if error == 5:  # ERROR_ACCESS_DENIED
+                    return {'outcome': 'access-denied',
+                            'phase': 'set-thread-token', 'winerror': error}
+                # Parameter/handle failures are probe errors, never denial.
+                return {'outcome': 'unexpected-set-thread-token-result',
+                        'winerror': error}
+            thread = HANDLE()
+            try:
+                # NULL is not a documented current-thread selector here; use
+                # the GetCurrentThread pseudo-handle.
+                if not api.open_thread_token(api.current_thread(), 8, False,
+                                             C.byref(thread)):
+                    raise RuntimeError('impersonation installed but thread '
+                                       'token cannot be opened: %s' %
+                                       C.get_last_error())
+                current = api.snapshot(thread)
+                preserved = all(current[key] == before[key]
+                                for key in ('user', 'app', 'package'))
+                under = classify(
+                    'impersonated-credential-read',
+                    lambda: (Path(manifest['secret']) / 'read').read_bytes())
+            finally:
+                # This mode runs only in a disposable child. On restore failure
+                # do not inspect, retry, print, unwind cleanup, or run atexit
+                # callbacks under an identity we could not restore. Exit 70 is
+                # reported by the parent as a hard probe failure, never denial.
+                if not api.revert():
+                    os._exit(70)
+                if thread.value:
+                    api.close(thread)
+            residual = HANDLE()
+            leftover = api.open_thread_token(api.current_thread(), 8,
+                                             False, C.byref(residual))
+            residual_error = 0 if leftover else C.get_last_error()
+            if leftover:
+                api.close(residual)
+            clean = not leftover and residual_error == 1008
+            contained = (preserved and
+                         under['outcome'] == 'access-denied' and clean)
+            return {'outcome': ('impersonated-contained' if contained
+                                else 'unexpected-impersonation-result'),
+                    'identity_preserved': preserved,
+                    'access_under_impersonation': under,
+                    'residual_thread_token': not clean}
+        finally:
+            api.close(duplicate)
+    finally:
+        api.close(source)
 
 
 def witness(api, manifest, report, classify):
@@ -653,6 +830,18 @@ def probe(api, manifest, script, manifest_path, classify):
             ('read-only-rejection', 'access-denied'))
     finally:
         api.close(source)
+
+    # Thread-token installation runs only in a disposable contained child.
+    run('thread-token-impersonation',
+        lambda: api.impersonation_launch(script, manifest_path),
+        ('impersonated-contained', 'access-denied'))
+    primary_rights = 8 | 2 | 1  # TOKEN_QUERY|DUPLICATE|ASSIGN_PRIMARY
+    for name, launcher in [('create-process-as-user', api.launch_as_user),
+                           ('create-process-with-token', api.launch_with_token)]:
+        def token_launcher(launcher=launcher):
+            return api.token_launch(launcher, primary_rights, sys.executable,
+                                    owner, package)
+        run(name, token_launcher, ('access-denied', 'contained'))
 
     # A failed startup control is diagnostic failure, not denial. run() records
     # it without suppressing the independent WMI attempt below.
