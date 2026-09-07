@@ -88,7 +88,12 @@ class ExtendedLimits(C.Structure):
 class AppContainers(NativeCalls):
     def __init__(self):
         super().__init__()
-        self.userenv = C.WinDLL('userenv')
+        self.userenv = C.WinDLL('userenv', use_last_error=True)
+        self.create_environment = self.bind(
+            self.userenv, 'CreateEnvironmentBlock', W.BOOL,
+            C.POINTER(HANDLE), HANDLE, W.BOOL)
+        self.destroy_environment = self.bind(
+            self.userenv, 'DestroyEnvironmentBlock', W.BOOL, HANDLE)
         self.profile = self.bind(self.userenv, 'CreateAppContainerProfile',
                                  C.c_int32, W.LPCWSTR, W.LPCWSTR, W.LPCWSTR,
                                  HANDLE, ULONG, C.POINTER(HANDLE))
@@ -131,6 +136,50 @@ class AppContainers(NativeCalls):
                                    HANDLE, ULONG)
         self.open_process = self.bind(self.kernel, 'OpenProcess', HANDLE,
                                       ULONG, W.BOOL, ULONG)
+
+    def profile_paths(self):
+        """Restore only account/OS paths, never inherited runner configuration.
+
+        https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createenvironmentblock
+        specifies TOKEN_QUERY | TOKEN_DUPLICATE for a primary token, FALSE to
+        avoid inheriting the caller's environment, and DestroyEnvironmentBlock
+        for cleanup. User-profile variables require a loaded profile; our CI
+        supervisor already launches this account with LoadUserProfile=True.
+        That contract does not identify the cause of AppContainer error 203.
+        """
+        allowed = {'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'HOMEDRIVE',
+                   'HOMEPATH', 'SYSTEMDRIVE', 'PROGRAMDATA', 'PROGRAMFILES',
+                   'PROGRAMFILES(X86)', 'PROGRAMW6432', 'COMMONPROGRAMFILES',
+                   'COMMONPROGRAMFILES(X86)', 'COMMONPROGRAMW6432'}
+        token, block = HANDLE(), HANDLE()
+        self.check(self.open_token(self.current_process(), 8 | 2,
+                                   C.byref(token)))
+        with ExitStack() as cleanup:
+            cleanup.callback(lambda: self.check(self.close(token)))
+            self.check(self.create_environment(C.byref(block), token, False))
+            cleanup.callback(lambda: self.check(self.destroy_environment(block)))
+            if not block.value:
+                raise OSError('CreateEnvironmentBlock returned a null block')
+            selected = {}
+            address = block.value
+            while True:
+                entry = C.wstring_at(address)
+                if not entry:
+                    break
+                name, separator, value = entry.partition('=')
+                if separator and name.upper() in allowed and value:
+                    selected[name.upper()] = value
+                # wchar_t is UTF-16 on Windows: non-BMP characters occupy two
+                # code units even when Python len() counts a single character.
+                if C.sizeof(C.c_wchar) == 2:
+                    address += len(entry.encode('utf-16-le', 'surrogatepass')) + 2
+                else:
+                    address += (len(entry) + 1) * C.sizeof(C.c_wchar)
+            missing = {'USERPROFILE', 'LOCALAPPDATA', 'APPDATA'} - selected.keys()
+            if missing:
+                raise OSError('loaded profile environment missing: %s' %
+                              ', '.join(sorted(missing)))
+            return selected
 
     @staticmethod
     def hresult(result):
@@ -332,6 +381,62 @@ def contained(manifest_path, descendant=False):
 
 
 class AppContainerMarshallingTests(unittest.TestCase):
+    def exercise_profile_paths(self, entries, *, create_fails=False):
+        native = AppContainers.__new__(AppContainers)
+        native.current_process = lambda: 1
+        native.close = mock.Mock(return_value=1)
+        native.destroy_environment = mock.Mock(return_value=1)
+        buffer = C.create_unicode_buffer('\0'.join(entries) + '\0\0')
+
+        def open_token(process, rights, result):
+            self.assertEqual(rights, 8 | 2)
+            C.cast(result, C.POINTER(HANDLE)).contents.value = 42
+            return 1
+
+        def create_environment(result, token, inherit):
+            self.assertEqual(token.value, 42)
+            self.assertFalse(inherit)
+            if create_fails:
+                raise OSError('environment creation failed')
+            C.cast(result, C.POINTER(HANDLE)).contents.value = C.addressof(buffer)
+            return 1
+
+        native.open_token = open_token
+        native.create_environment = create_environment
+        try:
+            return native.profile_paths()
+        finally:
+            native.close.assert_called_once()
+            self.assertEqual(native.close.call_args.args[0].value, 42)
+            if create_fails:
+                native.destroy_environment.assert_not_called()
+            else:
+                native.destroy_environment.assert_called_once()
+                self.assertEqual(
+                    native.destroy_environment.call_args.args[0].value,
+                    C.addressof(buffer))
+
+    def test_profile_paths_exclude_secrets_and_controlled_launch_settings(self):
+        result = self.exercise_profile_paths([
+            'UserProfile=C:\\Users\\probe-\U0001f600',
+            'LocalAppData=C:\\Users\\probe\\AppData\\Local',
+            'AppData=C:\\Users\\probe\\AppData\\Roaming',
+            'SystemDrive=C:', 'PATH=unwanted-path', 'TEMP=unwanted-temp',
+            'TMP=unwanted-temp', 'PYTHONPATH=unwanted-modules',
+            'GITHUB_TOKEN=sentinel', 'OTHER_SECRET=sentinel', '=C:=C:\\other'])
+        self.assertEqual(result, {
+            'USERPROFILE': 'C:\\Users\\probe-\U0001f600',
+            'LOCALAPPDATA': 'C:\\Users\\probe\\AppData\\Local',
+            'APPDATA': 'C:\\Users\\probe\\AppData\\Roaming', 'SYSTEMDRIVE': 'C:'})
+
+    def test_missing_profile_paths_free_block_and_close_token(self):
+        with self.assertRaisesRegex(OSError, 'loaded profile environment missing'):
+            self.exercise_profile_paths(['USERPROFILE=C:\\Users\\probe'])
+
+    def test_environment_creation_error_still_closes_token(self):
+        with self.assertRaisesRegex(OSError, 'environment creation failed'):
+            self.exercise_profile_paths([], create_fails=True)
+
     def test_package_sid_uses_sized_buffer_and_closes_token(self):
         native = AppContainers.__new__(AppContainers)
         native.current_process = lambda: 1
@@ -455,9 +560,19 @@ if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] in ('--contained', '--descendant'):
         sys.exit(contained(sys.argv[2], sys.argv[1] == '--descendant'))
     if len(sys.argv) == 3 and sys.argv[1] == '--standard-user':
-        details = AppContainers().token_details(include_groups=True)
+        native = AppContainers()
+        details = native.token_details(include_groups=True)
         primitives['require_standard_user'](details, sys.argv[2])
         print('Standard-user AppContainer broker verified.', flush=True)
+        paths = native.profile_paths()
+        print(json.dumps({'profile_paths_restored': sorted(paths),
+                          'previously_present': sorted(
+                              name for name in paths if name in os.environ)}),
+              flush=True)
+        # Only the single-purpose, verified broker changes its environment.
+        # CreateProcessW(NULL environment) then inherits these selected paths,
+        # plus the CI supervisor's controlled PATH/TEMP/TMP and OS bootstrap.
+        os.environ.update(paths)
         del sys.argv[1:]
         AppContainerTests.__unittest_skip__ = False
     unittest.main(verbosity=2)
