@@ -6,7 +6,7 @@ You need to use your own VM (do) or container (don't) to isolate it.
 
 It doesn't ask you every 2 seconds whether it is allowed to do some command.
 
-Runs on ECMA-48 console (tested with "foot" terminal on Linux).
+Runs on ECMA-48 console (tested with "foot" terminal on Linux) and via many editors (emacs, zed, ...) via ACP.
 
 Supports Anthropic and OpenAI protocols.
 
