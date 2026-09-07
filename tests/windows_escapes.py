@@ -134,6 +134,12 @@ class Escapes:
                                   C.POINTER(ShellInfos))
         self.co_initialize = bind(self.ole, 'CoInitializeEx', LONG, HANDLE, ULONG)
         self.co_uninitialize = bind(self.ole, 'CoUninitialize', None)
+        self.read_memory = bind(native.kernel, 'ReadProcessMemory', W.BOOL,
+                                HANDLE, HANDLE, HANDLE, C.c_size_t,
+                                C.POINTER(C.c_size_t))
+        self.duplicate_handle = bind(native.kernel, 'DuplicateHandle', W.BOOL,
+                                     HANDLE, HANDLE, HANDLE, C.POINTER(HANDLE),
+                                     ULONG, W.BOOL, ULONG)
 
     def token(self, process, rights):
         token = HANDLE()
@@ -207,7 +213,9 @@ class Escapes:
         return token
 
     def close(self, handle):
-        self.n.check(self.n.close(handle))
+        # Cleanup failure is never evidence that the attempted access was denied.
+        if not self.n.close(handle):
+            raise RuntimeError('escape probe CloseHandle failed: %s' % C.get_last_error())
 
     def retire(self, process):
         # For Shell/WMI, token inspection may itself be denied. Still attempt
@@ -219,6 +227,44 @@ class Escapes:
                     raise TimeoutError('escape-probe child did not exit')
         finally:
             self.close(process)
+
+    def peer_memory(self, target):
+        print(json.dumps({'probe': 'peer-memory', 'phase': 'open-process'}), flush=True)
+        process = self.n.check(self.n.open_process(0x10, False, target['pid']))
+        try:
+            # Acquiring this protected right already violates the fixture's
+            # expected boundary. Later read errors must not become denial passes.
+            buffer = C.create_string_buffer(len(b'FAKE-PEER-MEMORY'))
+            size = C.c_size_t()
+            success = self.read_memory(process, target['address'], buffer,
+                                       len(buffer), C.byref(size))
+            return {'outcome': 'process-access-granted', 'read_succeeded': bool(success),
+                    'bytes_read': size.value,
+                    'marker_matches': buffer.raw == b'FAKE-PEER-MEMORY',
+                    'winerror': 0 if success else C.get_last_error()}
+        except OSError as error:
+            raise RuntimeError('peer process opened but memory probe failed') from error
+        finally:
+            self.close(process)
+
+    def peer_handle(self, target):
+        print(json.dumps({'probe': 'peer-handle', 'phase': 'open-process'}), flush=True)
+        process = self.n.check(self.n.open_process(0x40, False, target['pid']))
+        handle = HANDLE()
+        try:
+            success = self.duplicate_handle(process, target['file_handle'],
+                                            self.n.current_process(), C.byref(handle),
+                                            0, False, 2)  # DUPLICATE_SAME_ACCESS
+            return {'outcome': 'process-access-granted',
+                    'duplicated': bool(success),
+                    'winerror': 0 if success else C.get_last_error()}
+        except OSError as error:
+            raise RuntimeError('peer process opened but handle probe failed') from error
+        finally:
+            with ExitStack() as cleanup:
+                cleanup.callback(self.close, process)
+                if handle.value:
+                    cleanup.callback(self.close, handle)
 
     def alternate_parent(self, parent, executable, owner, package):
         size = C.c_size_t()
@@ -370,6 +416,23 @@ try {
         return self.inspect_witness(process, report, owner, package)
 
 
+def peer(native, secret, report):
+    """Fixed unrestricted target; no worker-controlled commands or IPC service."""
+    marker = C.create_string_buffer(b'FAKE-PEER-MEMORY')
+    handle = native.open(secret)
+    try:
+        payload = {'pid': os.getpid(), 'address': C.addressof(marker),
+                   'file_handle': handle}
+        temporary = report.with_suffix('.tmp')
+        temporary.write_text(json.dumps(payload))
+        os.replace(temporary, report)
+        # The owning fixture also retains the process and terminates it in
+        # finally; this lifetime bound is not the observer's cleanup evidence.
+        time.sleep(180)
+    finally:
+        native.check(native.close(handle))
+
+
 def witness(api, manifest, report, classify):
     import os
     token = api.token(api.n.current_process(), 8)
@@ -443,6 +506,42 @@ def probe(api, manifest, script, manifest_path, classify):
             api.close(process)
     run('broker-token-acquisition', broker_token)
 
+    target = manifest['peer']
+    run('peer-memory-read', lambda: api.peer_memory(target))
+    run('peer-handle-duplication', lambda: api.peer_handle(target))
+    for name, rights in [('memory-write', 0x20 | 8), ('dacl-write', 0x40000)]:
+        def peer_access(rights=rights):
+            process = api.n.check(api.n.open_process(rights, False, target['pid']))
+            api.close(process)
+        run('peer-' + name, peer_access)
+
+    def peer_parent():
+        print(json.dumps({'probe': 'alternate-peer-parent', 'phase': 'open-parent'}),
+              flush=True)
+        parent = api.n.check(api.n.open_process(0x80, False, target['pid']))
+        try:
+            return api.alternate_parent(parent, sys.executable, owner, package)
+        finally:
+            api.close(parent)
+    run('alternate-peer-parent', peer_parent, ('access-denied', 'contained'))
+
+    def peer_token():
+        print(json.dumps({'probe': 'peer-token', 'phase': 'open-process'}), flush=True)
+        process = api.n.check(api.n.open_process(0x1000, False, target['pid']))
+        try:
+            print(json.dumps({'probe': 'peer-token', 'phase': 'open-token'}), flush=True)
+            token = api.token(process, 8 | 2 | 1)
+            try:
+                snapshot = api.snapshot(token)
+                return {'outcome': 'token-acquired', 'token': snapshot}
+            except OSError as error:
+                raise RuntimeError('peer token acquired but inspection failed') from error
+            finally:
+                api.close(token)
+        finally:
+            api.close(process)
+    run('peer-token-acquisition', peer_token)
+
     # A fresh duplicate for every mutation: failed experiments cannot alter the
     # token used by later filesystem checks or the ordinary descendant control.
     source = api.token(api.n.current_process(), 8 | 2)
@@ -493,6 +592,41 @@ def probe(api, manifest, script, manifest_path, classify):
                 finally:
                     api.close(clone)
             run('enable-' + privilege, enable, ('not-assigned', 'access-denied'))
+
+        def enable_working_set():
+            privilege = 'SeIncreaseWorkingSetPrivilege'
+            if before['privileges'].get(privilege) != 0:
+                raise RuntimeError('present-disabled privilege control unavailable')
+            clone = api.clone(source, 8 | 0x20)
+            try:
+                request = TokenPrivileges()
+                request.count = 1
+                api.n.check(api.lookup_value(None, privilege,
+                                             C.byref(request.entries[0].luid)))
+                request.entries[0].attributes = 2
+                C.set_last_error(0)
+                success = api.adjust(clone, False, C.byref(request), 0, None, None)
+                error = C.get_last_error()
+                if not success:
+                    raise C.WinError(error)
+                try:
+                    after = api.snapshot(clone)
+                except OSError as query_error:
+                    raise RuntimeError('cannot inspect adjusted working-set token') from query_error
+                # Enabling this present privilege is not itself an escape. No
+                # duplicate is installed; identity, package and groups must stay.
+                expected = dict(before, privileges=dict(before['privileges']))
+                expected['privileges'][privilege] = after['privileges'].get(privilege)
+                attrs = after['privileges'].get(privilege)
+                valid = (after == expected and
+                         ((error == 0 and attrs in (2, 10)) or
+                          (error == 1300 and attrs == 0)))
+                return {'outcome': 'contained-adjustment' if valid else 'unexpected-adjustment',
+                        'winerror': error, 'before': before, 'after': after}
+            finally:
+                api.close(clone)
+        run('enable-present-working-set-privilege', enable_working_set,
+            ('contained-adjustment', 'access-denied'))
 
         def change_user():
             with ExitStack() as cleanup:

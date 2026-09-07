@@ -38,6 +38,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import uuid
@@ -131,6 +132,8 @@ class AppContainers(NativeCalls):
                                  HANDLE, C.c_int, HANDLE, ULONG)
         self.assign_job = self.bind(self.kernel, 'AssignProcessToJobObject',
                                     W.BOOL, HANDLE, HANDLE)
+        self.in_job = self.bind(self.kernel, 'IsProcessInJob', W.BOOL,
+                                HANDLE, HANDLE, C.POINTER(W.BOOL))
         self.resume = self.bind(self.kernel, 'ResumeThread', ULONG, HANDLE)
         self.wait = self.bind(self.kernel, 'WaitForSingleObject', ULONG,
                               HANDLE, ULONG)
@@ -229,7 +232,7 @@ class AppContainers(NativeCalls):
         finally:
             self.check(self.close(token))
 
-    def launch(self, command, sid, workspace, output):
+    def launch(self, command, sid, workspace, output, observe=None):
         import msvcrt
         size = C.c_size_t()
         self.initialize(None, 2, 0, C.byref(size))
@@ -281,6 +284,8 @@ class AppContainers(NativeCalls):
                 self.check(self.assign_job(job, process.process))
                 if self.resume(process.thread) == 0xffffffff:
                     raise C.WinError(C.get_last_error())
+                if observe is not None:
+                    observe(process.process, job)
                 wait = self.wait(process.process, 90000)
                 if wait != 0:
                     raise TimeoutError('AppContainer wait returned 0x%x' % wait)
@@ -303,6 +308,25 @@ class AppContainers(NativeCalls):
                         if handle:
                             cleanup.callback(
                                 lambda handle=handle: self.check(self.close(handle)))
+
+
+def cleanup_tree(directory, depth):
+    """Disposable tree, with no inherited observer/job handles or service IPC."""
+    if depth < 2:
+        subprocess.Popen([sys.executable, '-I', '-u', __file__, '--cleanup-tree',
+                          str(directory), str(depth + 1)], close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    report = directory / ('ready-%d' % depth)
+    temporary = report.with_suffix('.tmp')
+    temporary.write_text(str(os.getpid()))
+    os.replace(temporary, report)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if depth == 0 and (directory / 'release').exists():
+            return
+        time.sleep(0.02)
+    raise TimeoutError('cleanup witness exceeded its safety deadline')
 
 
 def private_dacl(owner):
@@ -487,6 +511,68 @@ class EscapeResultTests(unittest.TestCase):
                     errno.EACCES, 'cannot launch PowerShell')):
                 with self.assertRaisesRegex(RuntimeError, 'wrapper did not complete'):
                     api.wmi_launch(*arguments)
+
+    def test_peer_access_denial_stops_before_secondary_operation(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = mock.Mock()
+        api.n.check.side_effect = PermissionError(errno.EACCES, 'open denied')
+        api.read_memory = mock.Mock()
+        api.duplicate_handle = mock.Mock()
+        target = {'pid': 42, 'address': 123, 'file_handle': 456}
+        with mock.patch('builtins.print'):
+            for operation in (api.peer_memory, api.peer_handle):
+                with self.assertRaises(PermissionError):
+                    operation(target)
+        api.read_memory.assert_not_called()
+        api.duplicate_handle.assert_not_called()
+        api.n.close.assert_not_called()
+
+    def test_peer_secondary_denial_does_not_hide_process_access(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = mock.Mock()
+        api.n.check.side_effect = lambda value: value
+        api.n.open_process.return_value = 77
+        api.n.close.return_value = True
+        api.read_memory = mock.Mock(return_value=False)
+        api.duplicate_handle = mock.Mock(return_value=False)
+        target = {'pid': 42, 'address': 123, 'file_handle': 456}
+        with mock.patch('builtins.print'), \
+                mock.patch.object(C, 'get_last_error', return_value=5, create=True):
+            for operation in (api.peer_memory, api.peer_handle):
+                result = operation(target)
+                self.assertEqual(result['outcome'], 'process-access-granted')
+                self.assertEqual(result['winerror'], 5)
+                self.assertFalse(escape_helpers['finalize_result'](
+                    result, 0, ('access-denied',))['passed'])
+        self.assertEqual(api.n.close.call_args_list, [mock.call(77), mock.call(77)])
+
+    def test_duplicate_peer_handle_is_closed_on_success(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = mock.Mock()
+        api.n.check.side_effect = lambda value: value
+        api.n.open_process.return_value = 77
+        api.n.close.return_value = True
+
+        def duplicate(source, handle, destination, result, rights, inherit, options):
+            C.cast(result, C.POINTER(HANDLE)).contents.value = 88
+            self.assertFalse(inherit)
+            self.assertEqual(options, 2)
+            return True
+        api.duplicate_handle = duplicate
+        with mock.patch('builtins.print'):
+            result = api.peer_handle({'pid': 42, 'file_handle': 456})
+        self.assertTrue(result['duplicated'])
+        closed = [getattr(call.args[0], 'value', call.args[0])
+                  for call in api.n.close.call_args_list]
+        self.assertEqual(closed, [88, 77])
+
+    def test_escape_close_failure_is_not_access_denial(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = mock.Mock()
+        api.n.close.return_value = False
+        with mock.patch.object(C, 'get_last_error', return_value=5, create=True):
+            with self.assertRaisesRegex(RuntimeError, 'CloseHandle failed'):
+                api.close(77)
 
     def test_wmi_operands_are_quoted_without_json_cmdlets(self):
         import base64
@@ -789,12 +875,112 @@ class AppContainerTests(unittest.TestCase):
             capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.addCleanup(lambda: os.rmdir(junction))
+        # Readiness and diagnostics live outside worker-writable storage. Only
+        # identifiers are copied into the contained manifest, never live handles.
+        peer_report = root / 'peer.json'
+        peer_log = open(root / 'peer.log', 'wb')
+        self.addCleanup(peer_log.close)
+        peer = subprocess.Popen(
+            [sys.executable, '-I', '-u', __file__, '--peer', str(secret / 'read'),
+             str(peer_report)], stdin=subprocess.DEVNULL, stdout=peer_log,
+            stderr=subprocess.STDOUT, close_fds=True)
+
+        def retire_peer():
+            if peer.poll() is None:
+                peer.terminate()
+            peer.wait(timeout=10)
+        self.addCleanup(retire_peer)
+        deadline = time.monotonic() + 15
+        while not peer_report.exists():
+            if peer.poll() is not None or time.monotonic() >= deadline:
+                self.fail('unrestricted peer did not become ready')
+            time.sleep(0.02)
+        target = json.loads(peer_report.read_text())
+        self.assertEqual(target['pid'], peer.pid)
+        api = escape_helpers['Escapes'](native, primitives, ExtendedStartups, ProcessInfos)
+        # Kernel identity plus real memory/handle controls prove the target and
+        # helpers work for the unrestricted same-user broker before denial tests.
+        process = native.check(native.open_process(0x1000, False, peer.pid))
+        try:
+            token = api.token(process, 8)
+            try:
+                snapshot = api.snapshot(token)
+                self.assertEqual(snapshot['user'], owner)
+                self.assertEqual(snapshot['app'], 0)
+            finally:
+                api.close(token)
+        finally:
+            api.close(process)
+        memory_control = api.peer_memory(target)
+        handle_control = api.peer_handle(target)
+        self.assertTrue(memory_control['read_succeeded'])
+        self.assertTrue(memory_control['marker_matches'])
+        self.assertTrue(handle_control['duplicated'])
+        print(json.dumps({'unrestricted_peer_controls': {
+            'memory': memory_control, 'handle': handle_control}}), flush=True)
         manifest = workspace / 'manifest.json'
         manifest.write_text(json.dumps({'secret': str(secret),
                                         'workspace': str(workspace),
                                         'owner': owner, 'package': package,
-                                        'broker_pid': os.getpid()}))
+                                        'broker_pid': os.getpid(), 'peer': target}))
+        for mode in ('normal-root-exit', 'terminated-root'):
+            with self.subTest(cleanup=mode):
+                directory = workspace / mode
+                directory.mkdir()
+                retained = []
+
+                def observe(root_process, job):
+                    deadline = time.monotonic() + 20
+                    reports = [directory / ('ready-%d' % i) for i in range(3)]
+                    while not all(path.exists() for path in reports):
+                        if native.wait(root_process, 0) != 258:
+                            raise RuntimeError('cleanup root exited before readiness')
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('cleanup tree readiness timed out')
+                        time.sleep(0.02)
+                    for path in reports[1:]:
+                        pid = int(path.read_text())
+                        handle = native.check(native.open_process(
+                            0x1000 | 0x100000 | 1, False, pid))
+                        member = W.BOOL()
+                        try:
+                            native.check(native.in_job(handle, job, C.byref(member)))
+                            if not member.value:
+                                raise RuntimeError('reported process outside fixture job')
+                            self.assertEqual(native.app_identity(handle), (1, package))
+                        except BaseException:
+                            api.close(handle)
+                            raise
+                        retained.append(handle)
+                        self.assertEqual(native.wait(handle, 0), 258)
+                    if mode == 'terminated-root':
+                        native.check(native.terminate(root_process, 1))
+                    else:
+                        (directory / 'release').write_text('release')
+
+                try:
+                    code = native.launch(
+                        [sys.executable, '-I', '-u', __file__, '--cleanup-tree',
+                         str(directory), '0'], sid, directory, root / (mode + '.log'),
+                        observe=observe)
+                    self.assertEqual(code, 1 if mode == 'terminated-root' else 0)
+                    # launch() has closed its job. Observe death before fallback
+                    # retirement or the administrative account-wide sweep.
+                    states = [native.wait(handle, 5000) for handle in retained]
+                    print(json.dumps({'cleanup': mode, 'descendant_waits': states}),
+                          flush=True)
+                    self.assertEqual(states, [0, 0])
+                finally:
+                    try:
+                        diagnostic = root / (mode + '.log')
+                        if diagnostic.exists():
+                            print(diagnostic.read_text(errors='replace'), flush=True)
+                    finally:
+                        with ExitStack() as cleanup:
+                            for handle in retained:
+                                cleanup.callback(api.retire, handle)
         log = root / 'contained.log'
+        self.assertIsNone(peer.poll(), 'unrestricted target exited before attacks')
         try:
             code = native.launch([sys.executable, '-I', '-u', __file__,
                                   '--contained', str(manifest)],
@@ -802,6 +988,7 @@ class AppContainerTests(unittest.TestCase):
         finally:
             if log.exists():
                 print(log.read_text(errors='replace'), flush=True)
+        self.assertIsNone(peer.poll(), 'unrestricted target died during attacks')
         # Check integrity independently of the child-reported operation results.
         for leaf in names:
             self.assertEqual((secret / leaf).read_bytes(), b'FAKE-CREDENTIAL')
@@ -809,6 +996,12 @@ class AppContainerTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 4 and sys.argv[1] == '--cleanup-tree':
+        cleanup_tree(Path(sys.argv[2]), int(sys.argv[3]))
+        sys.exit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == '--peer':
+        escape_helpers['peer'](AppContainers(), sys.argv[2], Path(sys.argv[3]))
+        sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] == '--launch-witness':
         native = AppContainers()
         api = escape_helpers['Escapes'](
