@@ -22,7 +22,9 @@ Documentation contracts used by these probes:
   WMI/breakaway exceptions. No all-launch-path containment claim is made.
 
 All files are disposable. No network capabilities, real tokens, runtime Loki
-imports, elevation requests, COM/WMI broker tests, or durability claims.
+imports, elevation requests, or durability claims. The companion
+windows_escapes.py probes selected token and ShellExecute/WMI launch routes;
+its documented limits remain distinct from complete escape resistance.
 """
 
 from contextlib import ExitStack
@@ -44,6 +46,7 @@ import uuid
 # only the existing standalone probe declarations, never the Loki runtime.
 primitives = runpy.run_path(str(Path(__file__).with_name(
     'test_windows_primitives.py')))
+escape_helpers = runpy.run_path(str(Path(__file__).with_name('windows_escapes.py')))
 NativeCalls = primitives['NativeCalls']
 HANDLE = C.c_void_p
 ULONG = C.c_uint32
@@ -278,7 +281,7 @@ class AppContainers(NativeCalls):
                 self.check(self.assign_job(job, process.process))
                 if self.resume(process.thread) == 0xffffffff:
                     raise C.WinError(C.get_last_error())
-                wait = self.wait(process.process, 45000)
+                wait = self.wait(process.process, 90000)
                 if wait != 0:
                     raise TimeoutError('AppContainer wait returned 0x%x' % wait)
                 code = ULONG()
@@ -412,6 +415,17 @@ def contained(manifest_path, descendant=False):
     failed = any(result['outcome'] != result.get('expected', 'access-denied')
                  for result in outcomes)
     if not descendant:
+        try:
+            api = escape_helpers['Escapes'](
+                native, primitives, ExtendedStartups, ProcessInfos)
+            failed |= not escape_helpers['probe'](
+                api, manifest, __file__, manifest_path, access_outcome)
+        except Exception as error:
+            print(json.dumps({'operation': 'escape-probe-setup',
+                              'outcome': 'unexpected-error',
+                              'exception': type(error).__name__,
+                              'message': str(error)}), flush=True)
+            failed = True
         result = subprocess.run([sys.executable, '-I', '-u', __file__,
                                  '--descendant', manifest_path],
                                 capture_output=True, timeout=20, text=True)
@@ -419,6 +433,59 @@ def contained(manifest_path, descendant=False):
         print(result.stderr, file=sys.stderr, flush=True)
         failed |= result.returncode != 0
     return 1 if failed else 0
+
+
+class EscapeResultTests(unittest.TestCase):
+    def test_denial_after_creation_is_not_successful_containment(self):
+        result = escape_helpers['finalize_result'](
+            {'outcome': 'access-denied', 'denied': True}, 1,
+            ('access-denied', 'contained'))
+        self.assertEqual(result['outcome'], 'uninspectable-launch')
+        self.assertFalse(result['passed'])
+        self.assertFalse(result['denied'])
+        result = escape_helpers['finalize_result'](
+            {'outcome': 'access-denied', 'denied': True}, 0, ('access-denied',))
+        self.assertTrue(result['passed'])
+
+    def test_privilege_adjustment_requires_not_assigned_and_disabled_state(self):
+        check = escape_helpers['privilege_rejected']
+        self.assertTrue(check(True, 1300, False))
+        for succeeded, error, enabled in [(True, 0, True), (True, 0, False),
+                                          (True, 1300, True), (False, 5, False),
+                                          (True, 87, False)]:
+            with self.subTest(succeeded=succeeded, error=error, enabled=enabled):
+                self.assertFalse(check(succeeded, error, enabled))
+
+    def test_witness_identity_requires_user_and_container(self):
+        check = escape_helpers['identity_matches']
+        self.assertTrue(check({'user': 'user', 'app': 1, 'package': 'pkg'},
+                              'user', 'pkg'))
+        for user, app, package in [('other', 1, 'pkg'), ('user', 0, None),
+                                   ('user', 1, 'other')]:
+            self.assertFalse(check({'user': user, 'app': app, 'package': package},
+                                   'user', 'pkg'))
+
+    def test_wmi_wrapper_failures_are_not_wmi_denial(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.created = 0
+        arguments = ('python.exe', 'probe.py', Path('manifest.json'),
+                     Path('report.json'), 'user', 'package')
+        with mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}):
+            for code in (2, 3):
+                reply = subprocess.CompletedProcess([], 0, json.dumps(
+                    {'kind': 'return', 'code': code, 'pid': 0}), '')
+                with mock.patch.object(subprocess, 'run', return_value=reply):
+                    self.assertEqual(api.wmi_launch(*arguments)['outcome'],
+                                     'access-denied')
+            reply = subprocess.CompletedProcess([], 0, json.dumps(
+                {'kind': 'return', 'code': 8, 'pid': 0}), '')
+            with mock.patch.object(subprocess, 'run', return_value=reply):
+                with self.assertRaisesRegex(RuntimeError, 'unexpected WMI'):
+                    api.wmi_launch(*arguments)
+            with mock.patch.object(subprocess, 'run', side_effect=PermissionError(
+                    errno.EACCES, 'cannot launch PowerShell')):
+                with self.assertRaisesRegex(RuntimeError, 'wrapper did not complete'):
+                    api.wmi_launch(*arguments)
 
 
 class AccessOutcomeTests(unittest.TestCase):
@@ -638,6 +705,13 @@ class AppContainerTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 4 and sys.argv[1] == '--launch-witness':
+        native = AppContainers()
+        api = escape_helpers['Escapes'](
+            native, primitives, ExtendedStartups, ProcessInfos)
+        escape_helpers['witness'](api, json.loads(Path(sys.argv[2]).read_text()),
+                                  Path(sys.argv[3]), access_outcome)
+        sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] in ('--contained', '--descendant'):
         sys.exit(contained(sys.argv[2], sys.argv[1] == '--descendant'))
     if len(sys.argv) == 3 and sys.argv[1] == '--standard-user':

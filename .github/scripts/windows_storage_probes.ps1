@@ -74,9 +74,12 @@ try {
     }
     if ($Probe -eq 'appcontainer') {
         $script = Join-Path $root 'test_windows_appcontainers.py'
-        Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tests/test_windows_appcontainers.py') -Destination $script
-        & "$env:SystemRoot/System32/icacls.exe" $script /reset /Q
-        if ($LASTEXITCODE -ne 0) { throw 'Cannot set ACL on AppContainer probe copy' }
+        foreach ($probeFile in @('test_windows_appcontainers.py', 'windows_escapes.py')) {
+            $copy = Join-Path $root $probeFile
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "tests/$probeFile") -Destination $copy
+            & "$env:SystemRoot/System32/icacls.exe" $copy /reset /Q
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot set ACL on AppContainer probe copy' }
+        }
     }
     $work = Join-Path $root 'work'
     New-Item -ItemType Directory -Path $work | Out-Null
@@ -148,6 +151,16 @@ finally {
         finally { $process.Dispose() }
     }
     if ($null -ne $user) {
+        if ($Probe -eq 'appcontainer') {
+            # Broker-created witnesses may be outside the root's process tree.
+            # Filter by this fresh, unique account; never kill by global image
+            # name. This administrative cleanup is not containment evidence.
+            try {
+                & "$env:SystemRoot/System32/taskkill.exe" /F /FI "USERNAME eq $env:COMPUTERNAME\$($user.Name)"
+                if ($LASTEXITCODE -ne 0) { throw 'Account-scoped process cleanup failed' }
+            }
+            catch { Write-Warning $_; $cleanupFailed = $true }
+        }
         try {
             Get-CimInstance Win32_UserProfile | Where-Object SID -EQ $user.SID.Value | Remove-CimInstance
         }
