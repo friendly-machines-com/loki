@@ -470,7 +470,8 @@ class EscapeResultTests(unittest.TestCase):
         api.created = 0
         arguments = ('python.exe', 'probe.py', Path('manifest.json'),
                      Path('report.json'), 'user', 'package')
-        with mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}):
+        with mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                mock.patch('builtins.print'):
             for code in (2, 3):
                 reply = subprocess.CompletedProcess([], 0, json.dumps(
                     {'kind': 'return', 'code': code, 'pid': 0}), '')
@@ -486,6 +487,62 @@ class EscapeResultTests(unittest.TestCase):
                     errno.EACCES, 'cannot launch PowerShell')):
                 with self.assertRaisesRegex(RuntimeError, 'wrapper did not complete'):
                     api.wmi_launch(*arguments)
+
+    def test_powershell_timeout_preserves_partial_diagnostics(self):
+        run = escape_helpers['run_powershell']
+        for stdout, stderr in [(b'partial reply', b'wmi: before-class'),
+                               ('partial reply', 'wmi: before-class'),
+                               (None, None)]:
+            with self.subTest(stdout=stdout), \
+                    mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                    mock.patch('builtins.print') as printed, \
+                    mock.patch.object(subprocess, 'run', side_effect=(
+                        subprocess.TimeoutExpired(['encoded-command'], 15,
+                                                  output=stdout, stderr=stderr))):
+                with self.assertRaisesRegex(RuntimeError, 'timed out after 15'):
+                    run('script', 'wmi')
+                diagnostic = json.loads(printed.call_args.args[0])
+                self.assertTrue(diagnostic['timed_out'])
+                self.assertEqual(diagnostic['probe'], 'wmi')
+                self.assertEqual(diagnostic['stdout'],
+                                 None if stdout is None else 'partial reply')
+                self.assertEqual(diagnostic['stderr'],
+                                 None if stderr is None else 'wmi: before-class')
+                self.assertTrue(printed.call_args.kwargs['flush'])
+
+    def test_powershell_startup_requires_successful_reply(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        for code, output, valid in [(0, 'startup-control: ready\n', True),
+                                    (1, 'startup-control: ready\n', False),
+                                    (0, '', False), (0, 'unexpected', False)]:
+            with self.subTest(code=code, output=output), \
+                    mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(subprocess, 'run', return_value=(
+                        subprocess.CompletedProcess([], code, output, ''))) as launch:
+                if valid:
+                    self.assertEqual(api.powershell_startup(), {'outcome': 'ready'})
+                else:
+                    with self.assertRaises(RuntimeError):
+                        api.powershell_startup()
+                self.assertEqual(launch.call_args.kwargs['timeout'], 15)
+                self.assertNotIn('env', launch.call_args.kwargs)
+
+    def test_wmi_wrapper_protocol_failures_remain_errors(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.created = 0
+        arguments = ('python.exe', 'probe.py', Path('manifest.json'),
+                     Path('report.json'), 'user', 'package')
+        for code, output in [(0, ''), (0, 'not json'),
+                             (1, '{"kind":"return","code":2,"pid":0}')]:
+            with self.subTest(code=code, output=output), \
+                    mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(subprocess, 'run', return_value=(
+                        subprocess.CompletedProcess([], code, output, ''))):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    api.wmi_launch(*arguments)
+                self.assertEqual(api.created, 0)
 
 
 class AccessOutcomeTests(unittest.TestCase):

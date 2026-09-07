@@ -81,6 +81,31 @@ def identity_matches(snapshot, owner, package):
             snapshot['package'] == package)
 
 
+def run_powershell(script, probe):
+    shell = Path(os.environ['SystemRoot']) / (
+        'System32/WindowsPowerShell/v1.0/powershell.exe')
+    command = [str(shell), '-NoLogo', '-NoProfile', '-NonInteractive',
+               '-EncodedCommand',
+               base64.b64encode(script.encode('utf-16-le')).decode()]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as error:
+        # TimeoutExpired can contain bytes even when text=True was requested.
+        def text(value):
+            return value.decode(errors='replace') if isinstance(value, bytes) else value
+        print(json.dumps({'probe': probe, 'timed_out': True,
+                          'stdout': text(error.stdout),
+                          'stderr': text(error.stderr)}), flush=True)
+        raise RuntimeError('%s wrapper timed out after 15 seconds' % probe) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError('%s wrapper did not complete: %s' % (probe, error)) from error
+    print(json.dumps({'probe': probe, 'wrapper_exit': result.returncode,
+                      'stdout': result.stdout, 'stderr': result.stderr}), flush=True)
+    if result.returncode:
+        raise RuntimeError('%s PowerShell wrapper failed' % probe)
+    return result.stdout
+
+
 class Escapes:
     def __init__(self, native, primitives, startup_type, process_type):
         self.n = native
@@ -268,6 +293,19 @@ class Escapes:
         finally:
             self.co_uninitialize()
 
+    def powershell_startup(self):
+        # Same direct-descendant launch, environment and deadline as WMI; no
+        # broker access or process creation inside this control script.
+        output = run_powershell("""
+[Console]::Error.WriteLine('startup-control: entered')
+[Console]::Error.Flush()
+[Console]::Out.WriteLine('startup-control: ready')
+[Console]::Out.Flush()
+""", 'powershell-startup')
+        if output.strip() != 'startup-control: ready':
+            raise RuntimeError('PowerShell startup control returned an invalid reply')
+        return {'outcome': 'ready'}
+
     def wmi_launch(self, executable, script, manifest, report, owner, package):
         command = subprocess.list2cmdline(
             [executable, '-I', '-u', script, '--launch-witness', str(manifest),
@@ -277,30 +315,27 @@ class Escapes:
         request = json.dumps({'command': command, 'cwd': str(report.parent)})
         ps = r"""
 $ErrorActionPreference = 'Stop'
+function Mark-Phase($phase) {
+    [Console]::Error.WriteLine($phase)
+    [Console]::Error.Flush()
+}
 try {
+    Mark-Phase 'wmi: before-parse'
     $request = ConvertFrom-Json '__REQUEST__'
+    Mark-Phase 'wmi: after-parse'
+    Mark-Phase 'wmi: before-class'
     $class = [wmiclass]'\\.\root\cimv2:Win32_Process'
+    Mark-Phase 'wmi: after-class'
+    Mark-Phase 'wmi: before-create'
     $result = $class.Create($request.command, $request.cwd, $null)
+    Mark-Phase 'wmi: after-create'
     @{ kind='return'; code=[int]$result.ReturnValue; pid=[int]$result.ProcessId } | ConvertTo-Json -Compress
 } catch {
     $errorObject = $_.Exception.GetBaseException()
     @{ kind='exception'; hresult=$errorObject.HResult; message=$errorObject.Message } | ConvertTo-Json -Compress
 }
 """.replace('__REQUEST__', request.replace("'", "''"))
-        shell = Path(os.environ['SystemRoot']) / (
-            'System32/WindowsPowerShell/v1.0/powershell.exe')
-        try:
-            result = subprocess.run(
-                [str(shell), '-NoLogo', '-NoProfile', '-NonInteractive',
-                 '-EncodedCommand', base64.b64encode(ps.encode('utf-16-le')).decode()],
-                capture_output=True, text=True, timeout=15)
-        except (OSError, subprocess.SubprocessError) as error:
-            raise RuntimeError('WMI wrapper did not complete: %s' % error) from error
-        print(json.dumps({'wmi_wrapper_exit': result.returncode,
-                          'stdout': result.stdout, 'stderr': result.stderr}), flush=True)
-        if result.returncode:
-            raise RuntimeError('PowerShell WMI wrapper failed')
-        reply = json.loads(result.stdout)
+        reply = json.loads(run_powershell(ps, 'wmi'))
         if reply['kind'] == 'exception':
             status = reply['hresult'] & 0xffffffff
             if status not in (0x80070005, 0x80041003):
@@ -474,6 +509,10 @@ def probe(api, manifest, script, manifest_path, classify):
             ('read-only-rejection', 'access-denied'))
     finally:
         api.close(source)
+
+    # A failed startup control is diagnostic failure, not denial. run() records
+    # it without suppressing the independent WMI attempt below.
+    run('powershell-startup', api.powershell_startup, ('ready',))
 
     for name, launcher in [('shell-execute', api.shell_launch),
                            ('wmi-create', api.wmi_launch)]:
