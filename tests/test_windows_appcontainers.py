@@ -311,12 +311,24 @@ class AppContainers(NativeCalls):
 
 
 def cleanup_tree(directory, depth):
-    """Disposable tree, with no inherited observer/job handles or service IPC."""
+    """Disposable tree, with no inherited observer/job handles or service IPC.
+
+    Child stdio uses files under the package-writable workspace: the contained
+    witness cannot open the NUL device (native errno 13 at cea20fa), so the
+    devnull constant is not an option inside the sandbox.
+    """
     if depth < 2:
-        subprocess.Popen([sys.executable, '-I', '-u', __file__, '--cleanup-tree',
-                          str(directory), str(depth + 1)], close_fds=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+        child_stdin = open(directory / ('stdio-%d.in' % depth), 'wb')
+        child_stdin.close()
+        with ExitStack() as files:
+            stdin = files.enter_context(
+                open(directory / ('stdio-%d.in' % depth), 'rb'))
+            stdout = files.enter_context(
+                open(directory / ('stdio-%d.out' % depth), 'wb'))
+            subprocess.Popen([sys.executable, '-I', '-u', __file__,
+                              '--cleanup-tree', str(directory), str(depth + 1)],
+                             close_fds=True, stdin=stdin, stdout=stdout,
+                             stderr=subprocess.STDOUT)
     report = directory / ('ready-%d' % depth)
     temporary = report.with_suffix('.tmp')
     temporary.write_text(str(os.getpid()))
@@ -610,7 +622,8 @@ class EscapeResultTests(unittest.TestCase):
         api = self.impersonation_free_api()
         creator = mock.Mock(return_value=0)
         for error, outcome in [(1314, 'access-denied'), (5, 'access-denied'),
-                               (87, 'unexpected-launch-result')]:
+                               (87, 'parameter-rejected-inconclusive'),
+                               (6, 'unexpected-launch-result')]:
             with self.subTest(winerror=error), \
                     mock.patch('builtins.print'), \
                     mock.patch.object(C, 'get_last_error', return_value=error,
@@ -624,7 +637,27 @@ class EscapeResultTests(unittest.TestCase):
             passed = escape_helpers['finalize_result'](
                 result, 0, ('access-denied',))['passed']
             self.assertEqual(passed, outcome == 'access-denied')
-        self.assertEqual(creator.call_count, 3)
+        self.assertEqual(creator.call_count, 4)
+
+    def test_cleanup_tree_children_use_workspace_files(self):
+        # Contained witnesses cannot open 'nul' (native errno 13), so the
+        # functional assertions below require real workspace files for child
+        # stdio; the devnull constant would fail them (it is an int sentinel).
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            clock = iter([0, 10, 200])  # readiness wait expires immediately
+            with mock.patch.object(time, 'monotonic',
+                                   side_effect=lambda: next(clock)), \
+                    mock.patch.object(time, 'sleep'), \
+                    mock.patch.object(subprocess, 'Popen') as popen:
+                with self.assertRaises(TimeoutError):
+                    cleanup_tree(directory, 0)
+            self.assertEqual(popen.call_count, 1)
+            kwargs = popen.call_args.kwargs
+            self.assertTrue(kwargs['close_fds'])
+            self.assertEqual(Path(kwargs['stdin'].name).name, 'stdio-0.in')
+            self.assertEqual(Path(kwargs['stdout'].name).name, 'stdio-0.out')
+            self.assertIs(kwargs['stderr'], subprocess.STDOUT)
 
     def test_token_api_binding_signatures(self):
         native = mock.Mock()

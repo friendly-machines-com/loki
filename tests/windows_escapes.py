@@ -479,6 +479,12 @@ try {
                 if error in (5, 1314):  # ACCESS_DENIED, PRIVILEGE_NOT_HELD
                     return {'outcome': 'access-denied', 'phase': 'create',
                             'winerror': error}
+                if error == 87:  # ERROR_INVALID_PARAMETER: native cea20fa
+                    # showed the DuplicateTokenEx primary does not meet this
+                    # API's undocumented logon-session requirement. Inconclusive
+                    # for this route; never denial and never an escape claim.
+                    return {'outcome': 'parameter-rejected-inconclusive',
+                            'phase': 'create', 'winerror': error}
                 # Invalid parameters and unknown failures are probe errors,
                 # never containment evidence.
                 return {'outcome': 'unexpected-launch-result',
