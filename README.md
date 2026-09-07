@@ -65,20 +65,9 @@ be recalled locally, and both remain subject to server-side expiry.
 Loki stores subscription tokens in
 `$XDG_CONFIG_HOME/loki/credentials/tokens.json` (normally
 `~/.config/loki/credentials/tokens.json`). Loki requests mode 0700 when
-creating the credential directory and mode 0600 for token files. It does not
-change existing directory permissions. Existing directories must be owned by
-the current user and have no group or other POSIX permission bits set;
-otherwise Loki reports an error and asks the user to adjust the permissions.
+creating the credential directory and mode 0600 for token files.
 
-These are ownership/mode checks, not an ACL or filesystem-configuration audit.
-Use an appropriately controlled parent directory. User-managed ACLs, including
-inherited ACLs and later permission changes, remain the user's responsibility;
-mode bits alone do not establish private access on every platform/filesystem.
 No desktop credential service or message bus is required.
-
-Writes use same-directory atomic replacement and filesystem synchronization.
-A separate lock serializes login, logout, and token rotation among independently
-running terminal and ACP supervisors.
 
 Use `/image PATH` to attach a local PNG, JPEG, GIF, or WebP image to
 the next prompt. Relative paths use Loki's current `/pwd`; quote paths
