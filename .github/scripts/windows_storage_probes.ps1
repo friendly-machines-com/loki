@@ -1,14 +1,16 @@
 # CI supervisor only. Administrator privileges prepare the sandbox; Python and
 # all probe children run as a newly created, non-administrator local account.
 param(
-    [Parameter(Mandatory = $true)][string]$PythonPath
+    [Parameter(Mandatory = $true)][string]$PythonPath,
+    [ValidateSet('storage', 'appcontainer')][string]$Probe = 'storage'
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $diagnostics = Join-Path $env:GITHUB_WORKSPACE 'windows-diagnostics'
 New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
-Start-Transcript -Path (Join-Path $diagnostics 'standard-user-supervisor.log') | Out-Null
+$logPrefix = if ($Probe -eq 'storage') { 'standard-user' } else { 'appcontainer' }
+Start-Transcript -Path (Join-Path $diagnostics "$logPrefix-supervisor.log") | Out-Null
 $user = $null
 $process = $null
 $started = $false
@@ -56,16 +58,25 @@ try {
     Write-Host "Standard-user account: $name; expected SID: $sid"
 
     New-Item -ItemType Directory -Path $root | Out-Null
-    Set-ProbeDirectoryAcl $root $sid 'ReadAndExecute'
+    # The AppContainer broker must configure ACLs on these fresh copies as a
+    # standard user. Its contained child receives only separately granted RX.
+    $stageRights = if ($Probe -eq 'appcontainer') { 'FullControl' } else { 'ReadAndExecute' }
+    Set-ProbeDirectoryAcl $root $sid $stageRights
     $runtime = Join-Path $root 'runtime'
     # Copying avoids granting this user access to the administrator's toolcache
-    # or MSYS2 installation. Reset only the copies to the sandbox's RX ACL.
+    # or MSYS2 installation. Reset only the copies to the CI stage's ACL.
     Copy-Item -LiteralPath $layout.prefix -Destination $runtime -Recurse
     $script = Join-Path $root 'test_windows_primitives.py'
     Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tests/test_windows_primitives.py') -Destination $script
     foreach ($copy in @($runtime, $script)) {
         & "$env:SystemRoot/System32/icacls.exe" $copy /reset /T /Q
-        if ($LASTEXITCODE -ne 0) { throw 'Cannot set read/execute ACLs on probe copies' }
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot set stage ACLs on probe copies' }
+    }
+    if ($Probe -eq 'appcontainer') {
+        $script = Join-Path $root 'test_windows_appcontainers.py'
+        Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tests/test_windows_appcontainers.py') -Destination $script
+        & "$env:SystemRoot/System32/icacls.exe" $script /reset /Q
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot set ACL on AppContainer probe copy' }
     }
     $work = Join-Path $root 'work'
     New-Item -ItemType Directory -Path $work | Out-Null
@@ -111,8 +122,8 @@ try {
         $process.Kill($true)
         if (-not $process.WaitForExit(10000)) { throw 'Timed-out probe tree did not exit' }
     }
-    foreach ($entry in @(@($stdout, 'standard-user-stdout.log'),
-                         @($stderr, 'standard-user-stderr.log'))) {
+    foreach ($entry in @(@($stdout, "$logPrefix-stdout.log"),
+                         @($stderr, "$logPrefix-stderr.log"))) {
         if (-not $entry[0].Wait(10000)) { throw 'Probe output pipe did not close' }
         $text = $entry[0].GetAwaiter().GetResult()
         [IO.File]::WriteAllText((Join-Path $diagnostics $entry[1]), $text)
