@@ -109,6 +109,13 @@ jobs:
         PROBE_PYTHON: ${{ steps.cpython-probes.outputs.python || steps.msys2-probes.outputs.python }}
       run: |
         & ./.github/scripts/windows_storage_probes.ps1 -PythonPath $env:PROBE_PYTHON
+    - name: Probe AppContainer containment from a standard-user broker
+      if: always()
+      shell: pwsh
+      env:
+        PROBE_PYTHON: ${{ steps.cpython-probes.outputs.python || steps.msys2-probes.outputs.python }}
+      run: |
+        & ./.github/scripts/windows_storage_probes.ps1 -PythonPath $env:PROBE_PYTHON -Probe appcontainer
     - name: Upload investigation diagnostics
       if: always()
       uses: actions/upload-artifact@v4
