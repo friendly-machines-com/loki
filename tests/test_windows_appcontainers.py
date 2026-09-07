@@ -356,6 +356,58 @@ def peer_readiness_failure(peer, log):
                        % (detail, output)) from wait_error
 
 
+def scheduled_task_witness_arguments(manifest_path, report_path):
+    return subprocess.list2cmdline(
+        ['-I', '-u', __file__, '--launch-witness',
+         str(manifest_path), str(report_path)])
+
+
+def scheduled_task_xml(execute, arguments, owner_sid):
+    """Task definition via XML: schtasks /TR rejects values over 261
+    characters (native run at 2d5260c), which the staged witness command
+    exceeds; the XML action has no such limit."""
+    def escape(value):
+        return (value.replace('&', '&amp;').replace('<', '&lt;')
+                .replace('>', '&gt;'))
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" '
+        'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <Principals>\n'
+        '    <Principal id="Author">\n'
+        '      <UserId>%s</UserId>\n'
+        '      <LogonType>S4U</LogonType>\n'
+        '      <RunLevel>LeastPrivilege</RunLevel>\n'
+        '    </Principal>\n'
+        '  </Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>\n'
+        '    <Enabled>true</Enabled>\n'
+        '    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>\n'
+        '  </Settings>\n'
+        '  <Actions>\n'
+        '    <Exec>\n'
+        '      <Command>%s</Command>\n'
+        '      <Arguments>%s</Arguments>\n'
+        '    </Exec>\n'
+        '  </Actions>\n'
+        '</Task>\n') % (escape(owner_sid), escape(execute), escape(arguments))
+
+
+def verify_task_route(report_path, owner):
+    """The control must prove the prearranged route is live and dangerous."""
+    payload = json.loads(report_path.read_text())
+    if payload['token']['user'] != owner or payload['token']['app'] != 0:
+        raise RuntimeError('control task witness did not run unrestricted: %r'
+                           % payload['token'])
+    if payload['credential_access']['outcome'] == 'access-denied':
+        raise RuntimeError('control task witness could not read credentials')
+    return payload
+
+
 def private_dacl(owner):
     return 'D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)' % owner
 
@@ -863,6 +915,62 @@ print('RETURNED', flush=True)
                     with self.assertRaises(outcome):
                         api.impersonation_launch('s', 'm')
 
+    def test_scheduled_task_invoke_outcomes(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        for code, outcome in [(1, 'invoke-rejected'), (0, 'invoke-accepted')]:
+            reply = subprocess.CompletedProcess([], code, '', 'ERROR: Access is denied.')
+            with self.subTest(exit=code), \
+                    mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(subprocess, 'run', return_value=reply):
+                result = api.task_invoke('LokiProbe-x')
+            self.assertEqual(result['outcome'], outcome)
+            self.assertTrue(escape_helpers['finalize_result'](
+                result, 0, ('invoke-rejected',))['passed'] ==
+                (outcome == 'invoke-rejected'))
+        with mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                mock.patch('builtins.print'), \
+                mock.patch.object(subprocess, 'run', side_effect=(
+                    subprocess.TimeoutExpired(['schtasks'], 15))):
+            with self.assertRaisesRegex(RuntimeError, 'timed out'):
+                api.task_invoke('LokiProbe-x')
+
+    def test_task_route_control_requires_live_dangerous_route(self):
+        with tempfile.TemporaryDirectory() as name:
+            report = Path(name) / 'r.json'
+            live = {'token': {'user': 'u', 'app': 0},
+                    'credential_access': {'outcome': 'allowed'}}
+            report.write_text(json.dumps(live))
+            self.assertEqual(verify_task_route(report, 'u'), live)
+            for token, access in [
+                    ({'user': 'u', 'app': 1}, 'allowed'),
+                    ({'user': 'other', 'app': 0}, 'allowed'),
+                    ({'user': 'u', 'app': 0}, 'access-denied')]:
+                report.write_text(json.dumps(
+                    {'token': token, 'credential_access': {'outcome': access}}))
+                with self.subTest(token=token, access=access):
+                    with self.assertRaisesRegex(RuntimeError, 'control task'):
+                        verify_task_route(report, 'u')
+
+    def test_scheduled_task_xml_fixture(self):
+        import xml.etree.ElementTree as ET
+        arguments = ('-I -u probe.py --launch-witness m.json '
+                     'r&<>".json')
+        definition = scheduled_task_xml(r'C:\py\python.exe', arguments,
+                                        'S-1-5-21-x-1004')
+        namespace = '{http://schemas.microsoft.com/windows/2004/02/mit/task}'
+        root = ET.fromstring(definition)
+        self.assertEqual(root.tag, namespace + 'Task')
+        fields = {element.tag[len(namespace):]: element.text
+                  for element in root.iter() if element.text}
+        self.assertEqual(fields['Command'], r'C:\py\python.exe')
+        self.assertEqual(fields['Arguments'], arguments)  # escaped round-trip
+        self.assertEqual(fields['UserId'], 'S-1-5-21-x-1004')
+        self.assertEqual(fields['LogonType'], 'S4U')
+        self.assertEqual(fields['RunLevel'], 'LeastPrivilege')
+        self.assertEqual(fields['AllowStartOnDemand'], 'true')
+        self.assertEqual(fields['ExecutionTimeLimit'], 'PT5M')
+
     def test_wmi_operands_are_quoted_without_json_cmdlets(self):
         import base64
         api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
@@ -1208,10 +1316,56 @@ class AppContainerTests(unittest.TestCase):
         print(json.dumps({'unrestricted_peer_controls': {
             'memory': memory_control, 'handle': handle_control}}), flush=True)
         manifest = workspace / 'manifest.json'
+        # Prearranged own-account scheduled task (design B): the broker
+        # registers a disposable demand-start S4U task with a fixed witness,
+        # proves the route is live and dangerous for unrestricted code, then
+        # lets the contained worker attempt to invoke the same task.
+        task_name = 'LokiProbe-' + uuid.uuid4().hex
+        control_report = root / ('task-control-' + uuid.uuid4().hex + '.json')
+        task_report = root / ('task-report-' + uuid.uuid4().hex + '.json')
         manifest.write_text(json.dumps({'secret': str(secret),
                                         'workspace': str(workspace),
                                         'owner': owner, 'package': package,
-                                        'broker_pid': os.getpid(), 'peer': target}))
+                                        'broker_pid': os.getpid(), 'peer': target,
+                                        'scheduled_task': task_name}))
+        schtasks = str(Path(os.environ['SystemRoot']) / 'System32/schtasks.exe')
+
+        def run_schtasks(*arguments):
+            result = subprocess.run([schtasks, *arguments], capture_output=True,
+                                    text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, '%s: %s%s' % (
+                ' '.join(arguments), result.stdout, result.stderr))
+            return result
+
+        def retire_task():
+            for arguments in (['/End', '/TN', task_name],
+                              ['/Delete', '/TN', task_name, '/F']):
+                result = subprocess.run([schtasks, *arguments], capture_output=True,
+                                        text=True, timeout=15)
+                if result.returncode:
+                    print(json.dumps({'task_cleanup': arguments[0],
+                                      'exit': result.returncode,
+                                      'output': (result.stderr or result.stdout).strip()}),
+                          flush=True)
+        self.addCleanup(retire_task)
+        definition = root / ('task-' + uuid.uuid4().hex + '.xml')
+        definition.write_text(scheduled_task_xml(
+            sys.executable,
+            scheduled_task_witness_arguments(manifest, control_report),
+            owner), encoding='utf-16')
+        run_schtasks('/Create', '/TN', task_name, '/XML', str(definition),
+                     '/F')
+        run_schtasks('/Run', '/TN', task_name)
+        deadline = time.monotonic() + 20
+        while not control_report.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError('scheduled-task control witness did not report')
+            time.sleep(0.05)
+        control = verify_task_route(control_report, owner)
+        print(json.dumps({'scheduled_task_control': control}), flush=True)
+        # The witness self-exits ten seconds after publishing; wait it out so a
+        # still-running instance cannot mask the worker attempt as rejection.
+        time.sleep(12)
         for mode in ('normal-root-exit', 'terminated-root'):
             with self.subTest(cleanup=mode):
                 directory = workspace / mode
@@ -1278,6 +1432,14 @@ class AppContainerTests(unittest.TestCase):
             if log.exists():
                 print(log.read_text(errors='replace'), flush=True)
         self.assertIsNone(peer.poll(), 'unrestricted target died during attacks')
+        # Worker-side evidence is invoke-only; this protected report decides.
+        if task_report.exists():
+            payload = json.loads(task_report.read_text())
+            print(json.dumps({'scheduled_task_witness': payload}), flush=True)
+            unrestricted = payload['token']['user'] == owner and payload['token']['app'] == 0
+            read_credentials = payload['credential_access']['outcome'] != 'access-denied'
+            self.assertFalse(unrestricted and read_credentials,
+                             'contained worker invoked an unrestricted task')
         # Check integrity independently of the child-reported operation results.
         for leaf in names:
             self.assertEqual((secret / leaf).read_bytes(), b'FAKE-CREDENTIAL')

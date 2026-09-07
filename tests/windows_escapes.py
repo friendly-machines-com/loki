@@ -501,6 +501,32 @@ try {
         finally:
             self.close(primary)
 
+    def task_invoke(self, name):
+        """Invoke a prearranged, test-owned scheduled task from the worker.
+
+        The scheduler service, not this process, would launch the witness, so
+        a rejected invocation is the denial signal; whether a launch actually
+        happened is decided by the broker from the witness report, which this
+        worker cannot read or forge (protected root).
+        """
+        schtasks = Path(os.environ['SystemRoot']) / 'System32/schtasks.exe'
+        print(json.dumps({'probe': 'scheduled-task', 'phase': 'invoke'}), flush=True)
+        try:
+            result = subprocess.run([str(schtasks), '/Run', '/TN', name],
+                                    capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError('scheduled-task wrapper timed out') from error
+        print(json.dumps({'probe': 'scheduled-task',
+                          'wrapper_exit': result.returncode,
+                          'stdout': result.stdout, 'stderr': result.stderr}),
+              flush=True)
+        if result.returncode:
+            return {'outcome': 'invoke-rejected', 'exit': result.returncode,
+                    'output': (result.stderr or result.stdout).strip()}
+        # Accepted launch requests still need broker-side witness evidence;
+        # never classify acceptance as containment or denial.
+        return {'outcome': 'invoke-accepted'}
+
     def impersonation_launch(self, script, manifest):
         """Run the thread-token experiment in a disposable contained child.
 
@@ -848,6 +874,13 @@ def probe(api, manifest, script, manifest_path, classify):
             return api.token_launch(launcher, primary_rights, sys.executable,
                                     owner, package)
         run(name, token_launcher, ('access-denied', 'contained'))
+
+    # Prearranged own-account task registered by the broker. Only a rejected
+    # invocation passes; acceptance is resolved by the broker's witness check.
+    if manifest.get('scheduled_task'):
+        run('scheduled-task',
+            lambda: api.task_invoke(manifest['scheduled_task']),
+            ('invoke-rejected',))
 
     # A failed startup control is diagnostic failure, not denial. run() records
     # it without suppressing the independent WMI attempt below.
