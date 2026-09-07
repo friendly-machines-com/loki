@@ -29,8 +29,6 @@ Supports Anthropic and OpenAI protocols.
 Requires Python 3.10.15 or later; on the 3.11 branch use 3.11.10 or later,
 and on the 3.12 branch use 3.12.4 or later. Earlier releases in those branches
 are excluded because Windows did not yet honor `mkdir(..., mode=0o700)`.
-These are package version requirements, not a Windows port: the current
-credential store still uses Unix locking and directory-descriptor APIs.
 
 Run it in a VM or container.
 
