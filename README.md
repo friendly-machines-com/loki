@@ -10,142 +10,19 @@ Runs on ECMA-48 console (tested with "foot" terminal on Linux).
 
 Supports Anthropic and OpenAI protocols.
 
-## Diagnostic logging
+## Features
 
-By default, developer traces (unknown provider fields, response timing, raw error
-payloads and tracebacks) are hidden. User-facing errors and hook stderr remain
-visible. Enable Loki DEBUG logging to stderr with `LOKI_TRACE=1 ./loki.py` or
-`LOKI_TRACE=1 ./loki-acp`.
-
-For standard Python logging configuration, set
-`LOKI_LOG_CONFIG=/absolute/path/to/logging.ini`. Loki loads it with stdlib
-`logging.config.fileConfig(..., disable_existing_loggers=False)`. This takes
-precedence over `LOKI_TRACE`; an unreadable or invalid file fails startup. There
-is no implicit file discovery or filename rewriting: Loki passes the environment
-value unchanged to `fileConfig()`, without expanding `~` or collapsing `..`.
-Each supervisor, runtime, ACP worker and subagent loads it after security
-initialization and before session cwd changes. Relative filenames rely on the
-launch paths preserving the invoker's process cwd. The file must remain
-accessible in each process's isolated filesystem view.
-
-The following standard INI configuration sends warnings to stderr and only
-provider-format DEBUG diagnostics to a file. Change `loki_agent.formats` to
-`loki_agent` to enable all Loki diagnostics, or name another module such as
-`loki_agent.terminal_frontend` for terminal timing and error details.
-
-```ini
-[loggers]
-keys=root,loki,formats
-
-[handlers]
-keys=console,trace
-
-[formatters]
-keys=diagnostic
-
-[logger_root]
-level=WARNING
-handlers=console
-
-[logger_loki]
-qualname=loki_agent
-level=WARNING
-handlers=console,trace
-propagate=0
-
-[logger_formats]
-qualname=loki_agent.formats
-level=DEBUG
-handlers=
-propagate=1
-
-[handler_console]
-class=StreamHandler
-level=WARNING
-formatter=diagnostic
-args=(sys.stderr,)
-
-[handler_trace]
-class=FileHandler
-level=DEBUG
-formatter=diagnostic
-# Choose an absolute, private path; each process gets its own file.
-args=('/tmp/loki-trace-' + str(__import__('os').getpid()) + '.log', 'a', 'utf-8')
-
-[formatter_diagnostic]
-format=%(asctime)s %(levelname)s %(name)s[%(process)d]: %(message)s
-```
-
-In agent-shell, stderr is displayed in Notices even when the client's ACP
-logging toggle is off. Use a file destination to collect verbose traces without
-those notices. Never configure ACP logging to stdout: it is reserved for the
-protocol and ordinary stdout is discarded after initialization. Subagent stderr
-is captured by its job rather than necessarily appearing in ACP Notices.
-
-Logging configuration is **trusted executable configuration**: `fileConfig`
-evaluates handler constructors and arguments. Do not accept it from a model or
-remote client. Handler file paths are relative to each process's working
-directory, not to the INI file. Use absolute paths and private directories for
-trace files; payload traces may contain conversation content and unrecognized
-provider secrets. Logging does not redact arbitrary payloads. Standard file
-handlers do not coordinate multiple processes; do not share a rotating file
-handler across workers. Normal UI, hook output, and frontend-rendered errors
-are not controlled by logger levels.
-
-## HTTP response status
-
-`/status` in the terminal shows last-observed HTTP chat response headers for the
-current endpoint and credential reference only, merged with saved observations.
-`/status all` explicitly shows all known connections. Add `--json` to either
-command for JSON output. With no active HTTP connection, `/status` reports that
-rather than falling back to all connections. Neither view is globally live:
-other runtimes' unsaved observations are not visible, even for the same endpoint.
-`/status save` explicitly saves all this runtime's pending observations. These
-commands do not make provider requests or send the observations to a model.
-
-Outside a session, use `./loki.py status`, `./loki.py status --json`, or
-`./loki.py status --endpoint https://example.com/v1/chat/completions` to inspect
-saved observations without starting an inference runtime. The standalone command
-has no active connection and shows all saved connections unless filtered by URL.
-To try a provider,
-select it normally and send a short prompt; both successful and error responses
-are collected automatically. For the ChatGPT Codex endpoint, readable status also
-shows a plain-text subscription summary above the raw headers: used/remaining
-percentages and the reported window duration for each bucket. Zero-length or
-invalid windows are omitted, retained observations are marked, and usage/window
-values from different responses are not combined. These are reported quota
-percentages, not token counts or billing balances. JSON and saved observations
-remain unchanged; the summary is derived only for display.
-
-Identity is the inference endpoint URL plus the existing non-secret credential
-reference. Provider IDs/names are optional informational labels, independent of
-models.dev. URL userinfo, queries, and fragments are discarded; query-selected
-endpoints therefore share observations. Scheme/host casing and default ports are
-normalized, but endpoint paths remain distinct. A credential reference identifies
-a configured credential slot, not a verified account: replacing its credential
-continues the same observations.
-
-Each header name has one last-observed value, timestamp, HTTP status, and model.
-Headers absent from a later response are retained and marked as such. There is
-no history. Each terminal/headless runtime, ACP worker, and subagent keeps its own
-in-memory observations and saves on orderly exit, with no periodic or per-request
-writes. Independent writers merge by observation time under a bounded file lock.
-An older process exiting later cannot replace newer observations. Wall-clock
-accuracy affects ordering between processes. Crashes or forced termination can
-lose pending observations. Other live workers' unsaved memory is not visible to
-`/status` or the standalone command; `/status save` only flushes this runtime.
-
-The snapshot is `$XDG_STATE_HOME/loki/response-headers.json` (normally
-`~/.local/state/loki/response-headers.json`), written by atomic replacement with
-mode 0600. Only response headers are observed, never request headers. Known
-secret-bearing fields (cookies, authorization/API keys, session tokens, and
-Codex routing state) retain their names but have values replaced by `[redacted]`
-before entering diagnostic memory. Token-budget and rate-limit fields remain
-intact. This is a name-based filter, not a guarantee that arbitrary provider
-headers contain no secrets; do not publish the snapshot unreviewed. Values are
-escaped for terminal display and never replayed as request headers. Invalid snapshots
-are reported rather than overwritten; remove the file manually to start over.
-This is best-effort diagnostic state, not credential storage or durable accounting.
+* Glob
+* Grep
+* (ephemeral) Bash
+* File editing
+* Subagent
+* History (stored on disk, in cwd)
+* Web Search
+* Web Fetch
+* Background jobs
+* Task planning
+* Skills
 
 ## How to run
 
@@ -446,16 +323,140 @@ apply their own automatic prefix cache to the same stable tools, instructions,
 and history. A later operator instruction, such as the context update produced
 by `/cd`, can still invalidate the instruction-and-history portion of a cache.
 
-## Features
+## Diagnostic logging
 
-* Glob
-* Grep
-* (ephemeral) Bash
-* File editing
-* Subagent
-* History (stored on disk, in cwd)
-* Web Search
-* Web Fetch
-* Background jobs
-* Task planning
-* Skills
+By default, developer traces (unknown provider fields, response timing, raw error
+payloads and tracebacks) are hidden. User-facing errors and hook stderr remain
+visible. Enable Loki DEBUG logging to stderr with `LOKI_TRACE=1 ./loki.py` or
+`LOKI_TRACE=1 ./loki-acp`.
+
+For standard Python logging configuration, set
+`LOKI_LOG_CONFIG=/absolute/path/to/logging.ini`. Loki loads it with stdlib
+`logging.config.fileConfig(..., disable_existing_loggers=False)`. This takes
+precedence over `LOKI_TRACE`; an unreadable or invalid file fails startup. There
+is no implicit file discovery or filename rewriting: Loki passes the environment
+value unchanged to `fileConfig()`, without expanding `~` or collapsing `..`.
+Each supervisor, runtime, ACP worker and subagent loads it after security
+initialization and before session cwd changes. Relative filenames rely on the
+launch paths preserving the invoker's process cwd. The file must remain
+accessible in each process's isolated filesystem view.
+
+The following standard INI configuration sends warnings to stderr and only
+provider-format DEBUG diagnostics to a file. Change `loki_agent.formats` to
+`loki_agent` to enable all Loki diagnostics, or name another module such as
+`loki_agent.terminal_frontend` for terminal timing and error details.
+
+```ini
+[loggers]
+keys=root,loki,formats
+
+[handlers]
+keys=console,trace
+
+[formatters]
+keys=diagnostic
+
+[logger_root]
+level=WARNING
+handlers=console
+
+[logger_loki]
+qualname=loki_agent
+level=WARNING
+handlers=console,trace
+propagate=0
+
+[logger_formats]
+qualname=loki_agent.formats
+level=DEBUG
+handlers=
+propagate=1
+
+[handler_console]
+class=StreamHandler
+level=WARNING
+formatter=diagnostic
+args=(sys.stderr,)
+
+[handler_trace]
+class=FileHandler
+level=DEBUG
+formatter=diagnostic
+# Choose an absolute, private path; each process gets its own file.
+args=('/tmp/loki-trace-' + str(__import__('os').getpid()) + '.log', 'a', 'utf-8')
+
+[formatter_diagnostic]
+format=%(asctime)s %(levelname)s %(name)s[%(process)d]: %(message)s
+```
+
+In agent-shell, stderr is displayed in Notices even when the client's ACP
+logging toggle is off. Use a file destination to collect verbose traces without
+those notices. Never configure ACP logging to stdout: it is reserved for the
+protocol and ordinary stdout is discarded after initialization. Subagent stderr
+is captured by its job rather than necessarily appearing in ACP Notices.
+
+Logging configuration is **trusted executable configuration**: `fileConfig`
+evaluates handler constructors and arguments. Do not accept it from a model or
+remote client. Handler file paths are relative to each process's working
+directory, not to the INI file. Use absolute paths and private directories for
+trace files; payload traces may contain conversation content and unrecognized
+provider secrets. Logging does not redact arbitrary payloads. Standard file
+handlers do not coordinate multiple processes; do not share a rotating file
+handler across workers. Normal UI, hook output, and frontend-rendered errors
+are not controlled by logger levels.
+
+## HTTP response status
+
+`/status` in the terminal shows last-observed HTTP chat response headers for the
+current endpoint and credential reference only, merged with saved observations.
+`/status all` explicitly shows all known connections. Add `--json` to either
+command for JSON output. With no active HTTP connection, `/status` reports that
+rather than falling back to all connections. Neither view is globally live:
+other runtimes' unsaved observations are not visible, even for the same endpoint.
+`/status save` explicitly saves all this runtime's pending observations. These
+commands do not make provider requests or send the observations to a model.
+
+Outside a session, use `./loki.py status`, `./loki.py status --json`, or
+`./loki.py status --endpoint https://example.com/v1/chat/completions` to inspect
+saved observations without starting an inference runtime. The standalone command
+has no active connection and shows all saved connections unless filtered by URL.
+To try a provider,
+select it normally and send a short prompt; both successful and error responses
+are collected automatically. For the ChatGPT Codex endpoint, readable status also
+shows a plain-text subscription summary above the raw headers: used/remaining
+percentages and the reported window duration for each bucket. Zero-length or
+invalid windows are omitted, retained observations are marked, and usage/window
+values from different responses are not combined. These are reported quota
+percentages, not token counts or billing balances. JSON and saved observations
+remain unchanged; the summary is derived only for display.
+
+Identity is the inference endpoint URL plus the existing non-secret credential
+reference. Provider IDs/names are optional informational labels, independent of
+models.dev. URL userinfo, queries, and fragments are discarded; query-selected
+endpoints therefore share observations. Scheme/host casing and default ports are
+normalized, but endpoint paths remain distinct. A credential reference identifies
+a configured credential slot, not a verified account: replacing its credential
+continues the same observations.
+
+Each header name has one last-observed value, timestamp, HTTP status, and model.
+Headers absent from a later response are retained and marked as such. There is
+no history. Each terminal/headless runtime, ACP worker, and subagent keeps its own
+in-memory observations and saves on orderly exit, with no periodic or per-request
+writes. Independent writers merge by observation time under a bounded file lock.
+An older process exiting later cannot replace newer observations. Wall-clock
+accuracy affects ordering between processes. Crashes or forced termination can
+lose pending observations. Other live workers' unsaved memory is not visible to
+`/status` or the standalone command; `/status save` only flushes this runtime.
+
+The snapshot is `$XDG_STATE_HOME/loki/response-headers.json` (normally
+`~/.local/state/loki/response-headers.json`), written by atomic replacement with
+mode 0600. Only response headers are observed, never request headers. Known
+secret-bearing fields (cookies, authorization/API keys, session tokens, and
+Codex routing state) retain their names but have values replaced by `[redacted]`
+before entering diagnostic memory. Token-budget and rate-limit fields remain
+intact. This is a name-based filter, not a guarantee that arbitrary provider
+headers contain no secrets; do not publish the snapshot unreviewed. Values are
+escaped for terminal display and never replayed as request headers. Invalid snapshots
+are reported rather than overwritten; remove the file manually to start over.
+This is best-effort diagnostic state, not credential storage or durable accounting.
+
