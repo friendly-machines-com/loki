@@ -312,29 +312,39 @@ class Escapes:
              str(report)])
         # The PowerShell process is itself a direct sandbox descendant. Failure
         # to start PowerShell or produce this protocol is NOT WMI denial evidence.
-        request = json.dumps({'command': command, 'cwd': str(report.parent)})
-        ps = r"""
+        # Single-quoted literals prevent interpolation of paths/arguments. Build
+        # assignments separately so operand text is never a template placeholder.
+
+        def literal(value):
+            value = value.replace("'", "''")
+            # Keep typographic quotes out of PowerShell's string tokenizer.
+            for quote in '\u2018\u2019\u201a\u201b':
+                value = value.replace(quote, "' + [char]%d + '" % ord(quote))
+            return "('" + value + "')"
+        ps = ('$command = ' + literal(command) + '\n$directory = ' +
+              literal(str(report.parent)) + '\n') + r"""
 $ErrorActionPreference = 'Stop'
 function Mark-Phase($phase) {
     [Console]::Error.WriteLine($phase)
     [Console]::Error.Flush()
 }
 try {
-    Mark-Phase 'wmi: before-parse'
-    $request = ConvertFrom-Json '__REQUEST__'
-    Mark-Phase 'wmi: after-parse'
     Mark-Phase 'wmi: before-class'
     $class = [wmiclass]'\\.\root\cimv2:Win32_Process'
     Mark-Phase 'wmi: after-class'
     Mark-Phase 'wmi: before-create'
-    $result = $class.Create($request.command, $request.cwd, $null)
+    $result = $class.Create($command, $directory, $null)
     Mark-Phase 'wmi: after-create'
-    @{ kind='return'; code=[int]$result.ReturnValue; pid=[int]$result.ProcessId } | ConvertTo-Json -Compress
+    [Console]::Out.WriteLine(('{{"kind":"return","code":{0},"pid":{1}}}' -f [int]$result.ReturnValue, [int]$result.ProcessId))
+    [Console]::Out.Flush()
 } catch {
     $errorObject = $_.Exception.GetBaseException()
-    @{ kind='exception'; hresult=$errorObject.HResult; message=$errorObject.Message } | ConvertTo-Json -Compress
+    [Console]::Error.WriteLine($errorObject.Message)
+    [Console]::Error.Flush()
+    [Console]::Out.WriteLine(('{{"kind":"exception","hresult":{0}}}' -f [int]$errorObject.HResult))
+    [Console]::Out.Flush()
 }
-""".replace('__REQUEST__', request.replace("'", "''"))
+"""
         reply = json.loads(run_powershell(ps, 'wmi'))
         if reply['kind'] == 'exception':
             status = reply['hresult'] & 0xffffffff

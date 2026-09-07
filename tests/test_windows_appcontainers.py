@@ -488,6 +488,53 @@ class EscapeResultTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'wrapper did not complete'):
                     api.wmi_launch(*arguments)
 
+    def test_wmi_operands_are_quoted_without_json_cmdlets(self):
+        import base64
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.created = 0
+        report = Path("work's $name `tick __REQUEST__") / 'report.json'
+        arguments = ('python.exe', "probe's.py", Path('manifest.json'),
+                     report, 'user', 'package')
+        reply = subprocess.CompletedProcess(
+            [], 0, '{"kind":"return","code":2,"pid":0}', '')
+        with mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                mock.patch('builtins.print'), \
+                mock.patch.object(subprocess, 'run', return_value=reply) as launch:
+            api.wmi_launch(*arguments)
+        script = base64.b64decode(launch.call_args.args[0][-1]).decode('utf-16-le')
+        command = subprocess.list2cmdline(
+            ['python.exe', '-I', '-u', "probe's.py", '--launch-witness',
+             'manifest.json', str(report)])
+        assignments = ("$command = ('" + command.replace("'", "''") + "')\n" +
+                       "$directory = ('" + str(report.parent).replace("'", "''") +
+                       "')\n")
+        self.assertTrue(script.startswith(assignments))
+        self.assertNotIn('ConvertFrom-Json', script)
+        self.assertNotIn('ConvertTo-Json', script)
+
+    def test_wmi_numeric_exception_reply_preserves_denial_classification(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.created = 0
+        arguments = ('python.exe', 'probe.py', Path('manifest.json'),
+                     Path('report.json'), 'user', 'package')
+        for hresult, denied in [(-2147024891, True), (-2147217405, True),
+                                (-2147024809, False)]:
+            reply = subprocess.CompletedProcess([], 0, json.dumps(
+                {'kind': 'exception', 'hresult': hresult}), 'native exception message')
+            with self.subTest(hresult=hresult), \
+                    mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                    mock.patch('builtins.print') as printed, \
+                    mock.patch.object(subprocess, 'run', return_value=reply):
+                if denied:
+                    self.assertEqual(api.wmi_launch(*arguments)['outcome'],
+                                     'access-denied')
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'unexpected WMI'):
+                        api.wmi_launch(*arguments)
+                self.assertEqual(json.loads(printed.call_args.args[0])['stderr'],
+                                 'native exception message')
+                self.assertEqual(api.created, 0)
+
     def test_powershell_timeout_preserves_partial_diagnostics(self):
         run = escape_helpers['run_powershell']
         for stdout, stderr in [(b'partial reply', b'wmi: before-class'),
