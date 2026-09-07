@@ -28,6 +28,7 @@ imports, elevation requests, COM/WMI broker tests, or durability claims.
 from contextlib import ExitStack
 import ctypes as C
 from ctypes import wintypes as W
+import errno
 import json
 import os
 from pathlib import Path
@@ -305,6 +306,26 @@ def private_dacl(owner):
     return 'D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)' % owner
 
 
+def access_outcome(name, operation):
+    try:
+        operation()
+    except OSError as error:
+        # https://docs.python.org/3/library/exceptions.html#OSError documents
+        # both C errno and native winerror; unspecified attributes can be None.
+        # Accept only explicit ACCESS_DENIED, or errno-based PermissionError
+        # with EACCES when no native code exists. A sharing violation, missing
+        # path, invalid parameter, or other failure must not certify denial.
+        winerror = getattr(error, 'winerror', None)
+        denied = (winerror == 5 or
+                  (winerror is None and isinstance(error, PermissionError)
+                   and error.errno == errno.EACCES))
+        return {'operation': name, 'denied': denied,
+                'outcome': 'access-denied' if denied else 'unexpected-error',
+                'exception': type(error).__name__, 'errno': error.errno,
+                'winerror': winerror, 'message': str(error)}
+    return {'operation': name, 'denied': False, 'outcome': 'allowed'}
+
+
 def attempts(native, manifest):
     """Each attempt operates on a distinct disposable target."""
     secret = Path(manifest['secret'])
@@ -314,20 +335,42 @@ def attempts(native, manifest):
     outcomes = []
 
     def denied(name, operation):
-        try:
-            operation()
-        except OSError as error:
-            outcomes.append({'operation': name, 'winerror': error.winerror,
-                             'denied': error.winerror == 5})
-        else:
-            outcomes.append({'operation': name, 'denied': False})
-
-    denied('read', lambda: (secret / 'read').read_bytes())
-    denied('truncate', lambda: (secret / 'truncate').write_bytes(b'changed'))
+        result = access_outcome(name, operation)
+        outcomes.append(result)
+        print(json.dumps(result), flush=True)
 
     def open_rights(path, rights):
         handle = native.open(path, access=rights)
         native.check(native.close(handle))
+
+    # Positive controls: the same APIs and DACL descriptor must actually work
+    # on a permitted object. A universally broken reader/ACL setter is not
+    # evidence that only credential access was denied.
+    grant = private_dacl(owner) + '(A;OICI;FA;;;%s)' % package
+
+    def workspace_control():
+        control = workspace / 'allowed-control'
+        control.write_bytes(b'allowed')
+        native.acl(control, grant)
+        open_rights(control, 0x80000000)  # GENERIC_READ
+        open_rights(control, 2)  # FILE_WRITE_DATA
+        if control.read_bytes() != b'allowed':
+            raise AssertionError('workspace read/write control failed')
+        control.unlink()
+
+    control_result = access_outcome('workspace-controls', workspace_control)
+    control_result['expected'] = 'allowed'
+    outcomes.append(control_result)
+    print(json.dumps(control_result), flush=True)
+
+    denied('read', lambda: (secret / 'read').read_bytes())
+    denied('truncate', lambda: (secret / 'truncate').write_bytes(b'changed'))
+    denied('native-read-right', lambda: open_rights(secret / 'read', 0x80000000))
+    denied('native-write-right', lambda: open_rights(secret / 'truncate', 2))
+    denied('native-hardlink-read', lambda: open_rights(
+        workspace / 'alias', 0x80000000))
+    denied('native-junction-read', lambda: open_rights(
+        workspace / 'junction' / 'read', 0x80000000))
 
     denied('append-right', lambda: open_rights(secret / 'read', 4))
     denied('write-dacl-right', lambda: open_rights(secret / 'regrant', 0x40000))
@@ -339,7 +382,6 @@ def attempts(native, manifest):
     denied('replace', lambda: os.replace(replacement, secret / 'replace'))
     denied('hardlink-read', lambda: (workspace / 'alias').read_bytes())
     denied('junction-read', lambda: (workspace / 'junction' / 'read').read_bytes())
-    grant = private_dacl(owner) + '(A;OICI;FA;;;%s)' % package
     denied('regrant-file-dacl', lambda: native.acl(secret / 'regrant', grant))
     denied('regrant-directory-dacl', lambda: native.acl(secret, grant))
     denied('rename-directory', lambda: os.rename(secret, workspace / 'stolen'))
@@ -367,9 +409,8 @@ def contained(manifest_path, descendant=False):
     print(json.dumps({'appcontainer_identity': identity, 'user': details['user'],
                       'descendant': descendant}), flush=True)
     outcomes = attempts(native, manifest)
-    for result in outcomes:
-        print(json.dumps(result), flush=True)
-    failed = any(not result['denied'] for result in outcomes)
+    failed = any(result['outcome'] != result.get('expected', 'access-denied')
+                 for result in outcomes)
     if not descendant:
         result = subprocess.run([sys.executable, '-I', '-u', __file__,
                                  '--descendant', manifest_path],
@@ -378,6 +419,46 @@ def contained(manifest_path, descendant=False):
         print(result.stderr, file=sys.stderr, flush=True)
         failed |= result.returncode != 0
     return 1 if failed else 0
+
+
+class AccessOutcomeTests(unittest.TestCase):
+    def test_errno_permission_denial_keeps_diagnostics(self):
+        error = PermissionError(errno.EACCES, 'permission denied')
+        result = access_outcome('read', mock.Mock(side_effect=error))
+        self.assertEqual(result['outcome'], 'access-denied')
+        self.assertTrue(result['denied'])
+        self.assertEqual(result['errno'], errno.EACCES)
+        self.assertIsNone(result['winerror'])
+        self.assertEqual(result['exception'], 'PermissionError')
+        self.assertEqual(result['message'], str(error))
+
+    def test_native_error_takes_precedence_over_errno(self):
+        for code, expected in [(5, True), (32, False), (87, False), (0, False)]:
+            with self.subTest(winerror=code):
+                error = PermissionError(errno.EACCES, 'native result')
+                error.winerror = code
+                result = access_outcome('native', mock.Mock(side_effect=error))
+                self.assertEqual(result['denied'], expected)
+                self.assertEqual(result['winerror'], code)
+
+    def test_other_errors_do_not_certify_denial(self):
+        for error in (FileNotFoundError(errno.ENOENT, 'missing'),
+                      IsADirectoryError(errno.EISDIR, 'directory'),
+                      PermissionError(errno.EPERM, 'not the expected EACCES'),
+                      OSError(errno.EINVAL, 'invalid'), OSError('unknown')):
+            with self.subTest(error=error):
+                result = access_outcome('read', mock.Mock(side_effect=error))
+                self.assertFalse(result['denied'])
+                self.assertEqual(result['outcome'], 'unexpected-error')
+
+    def test_success_is_distinct_from_an_error(self):
+        self.assertEqual(access_outcome('read', lambda: b''),
+                         {'operation': 'read', 'denied': False,
+                          'outcome': 'allowed'})
+
+    def test_programming_errors_propagate(self):
+        with self.assertRaises(ValueError):
+            access_outcome('read', mock.Mock(side_effect=ValueError('bug')))
 
 
 class AppContainerMarshallingTests(unittest.TestCase):
