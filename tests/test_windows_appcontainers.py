@@ -341,6 +341,80 @@ def cleanup_tree(directory, depth):
     raise TimeoutError('cleanup witness exceeded its safety deadline')
 
 
+def broker_death(directory, package, report):
+    """Disposable sub-broker owning a job, killed without running any code.
+
+    The parent observes the tree through handles it opened itself, so the
+    dying broker's kill-on-close job is exercised with no finally path, no
+    graceful termination, and no administrative sweep involved."""
+    native = AppContainers()
+    api = escape_helpers['Escapes'](native, primitives, ExtendedStartups, ProcessInfos)
+    sid = HANDLE()
+    native.check(api.parse_sid(package, C.byref(sid)))
+    try:
+        def observe(root_process, job):
+            deadline = time.monotonic() + 20
+            reports = [directory / ('ready-%d' % i) for i in range(3)]
+            while not all(path.exists() for path in reports):
+                if native.wait(root_process, 0) != 258:
+                    raise RuntimeError('broker-death root exited before readiness')
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('broker-death tree readiness timed out')
+                time.sleep(0.02)
+            payload = {'broker_pid': os.getpid(),
+                       'tree_pids': [int(path.read_text()) for path in reports]}
+            temporary = report.with_suffix('.tmp')
+            temporary.write_text(json.dumps(payload))
+            os.replace(temporary, report)
+            # Stay alive holding the job until the parent kills this broker.
+            deadline = time.monotonic() + 60
+            while not (directory / 'release').exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('broker-death witness exceeded deadline')
+                time.sleep(0.05)
+        native.launch([sys.executable, '-I', '-u', __file__, '--cleanup-tree',
+                       str(directory), '0'], sid, directory,
+                      directory / 'broker-death.log', observe=observe)
+    finally:
+        native.free_sid(sid)
+
+
+def race_tree(directory, depth):
+    """Spawn bounded short-lived children continuously until stopped.
+
+    Every child appends its own pid to the shared track file and then sleeps,
+    so the parent can enumerate the exact set of processes that existed while
+    shutdown raced creation. Child stdio uses workspace files (the contained
+    witness cannot open the NUL device)."""
+    report = directory / ('ready-%d' % depth)
+    temporary = report.with_suffix('.tmp')
+    temporary.write_text(str(os.getpid()))
+    os.replace(temporary, report)
+    track = directory / 'race-pids'
+    marker = ('import os, sys, time;'
+              ' stream = open(sys.argv[1], "a");'
+              ' stream.write(str(os.getpid()) + chr(10)); stream.close();'
+              ' time.sleep(30)')
+    for index in range(40):
+        with ExitStack() as files:
+            stdin = files.enter_context(
+                open(directory / ('race-stdio-%d.in' % index), 'wb'))
+            stdin.close()
+            stdin = files.enter_context(
+                open(directory / ('race-stdio-%d.in' % index), 'rb'))
+            stdout = files.enter_context(
+                open(directory / ('race-stdio-%d.out' % index), 'wb'))
+            subprocess.Popen([sys.executable, '-I', '-c', marker, str(track)],
+                             close_fds=True, stdin=stdin, stdout=stdout,
+                             stderr=subprocess.STDOUT)
+        time.sleep(0.05)
+    deadline = time.monotonic() + 20
+    while not (directory / 'stop').exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('race witness exceeded its safety deadline')
+        time.sleep(0.02)
+
+
 def peer_readiness_failure(peer, log):
     wait_error = None
     try:
@@ -1386,6 +1460,118 @@ class AppContainerTests(unittest.TestCase):
                         with ExitStack() as cleanup:
                             for handle in retained:
                                 cleanup.callback(api.retire, handle)
+        with self.subTest(cleanup='broker-death'):
+            directory = workspace / 'broker-death'
+            directory.mkdir()
+            report = root / 'broker-death.json'
+            broker_log = open(root / 'broker-death-broker.log', 'w+b')
+            sub_broker = subprocess.Popen(
+                [sys.executable, '-I', '-u', __file__, '--broker-death',
+                 str(directory), package, str(report)],
+                stdin=subprocess.DEVNULL, stdout=broker_log,
+                stderr=subprocess.STDOUT, close_fds=True)
+            retained = []
+            try:
+                deadline = time.monotonic() + 30
+                while not report.exists():
+                    if sub_broker.poll() is not None or time.monotonic() >= deadline:
+                        broker_log.flush()
+                        broker_log.seek(0)
+                        self.fail('broker-death sub-broker did not report; log: %s'
+                                  % broker_log.read().decode(errors='replace'))
+                    time.sleep(0.05)
+                payload = json.loads(report.read_text())
+                self.assertEqual(payload['broker_pid'], sub_broker.pid)
+                for pid in payload['tree_pids']:
+                    handle = native.check(native.open_process(
+                        0x1000 | 0x100000 | 1, False, pid))
+                    member = W.BOOL()
+                    try:
+                        # No job handle crosses the process boundary: membership
+                        # is verified against any job plus AppContainer identity.
+                        native.check(native.in_job(handle, None, C.byref(member)))
+                        self.assertTrue(member.value)
+                        self.assertEqual(native.app_identity(handle), (1, package))
+                    except BaseException:
+                        api.close(handle)
+                        raise
+                    retained.append(handle)
+                    self.assertEqual(native.wait(handle, 0), 258)
+                # Kill the disposable broker without executing any of its code.
+                broker_handle = native.check(native.open_process(
+                    0x1000 | 0x100000 | 1, False, sub_broker.pid))
+                try:
+                    native.check(native.terminate(broker_handle, 1))
+                    sub_broker.wait(timeout=10)
+                finally:
+                    api.close(broker_handle)
+                # Every broker handle, including its job, is gone now: the tree
+                # must die with no finally path and before any fallback sweep.
+                states = [native.wait(handle, 10000) for handle in retained]
+                print(json.dumps({'cleanup': 'broker-death',
+                                  'descendant_waits': states}), flush=True)
+                self.assertEqual(states, [0, 0, 0])
+            finally:
+                if sub_broker.poll() is None:
+                    sub_broker.terminate()
+                sub_broker.wait(timeout=10)
+                broker_log.close()
+                with ExitStack() as cleanup:
+                    for handle in retained:
+                        cleanup.callback(api.retire, handle)
+        with self.subTest(cleanup='shutdown-race'):
+            directory = workspace / 'shutdown-race'
+            directory.mkdir()
+            retained = []
+
+            def observe(root_process, job):
+                # Let creation and shutdown genuinely overlap: only require the
+                # root plus a handful of recorded children before terminating.
+                deadline = time.monotonic() + 20
+                ready = directory / 'ready-0'
+                track = directory / 'race-pids'
+                while (not ready.exists() or not track.exists() or
+                       len(track.read_text().splitlines()) < 5):
+                    if native.wait(root_process, 0) != 258:
+                        raise RuntimeError('race root exited before children')
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('race tree readiness timed out')
+                    time.sleep(0.01)
+                native.check(native.terminate(root_process, 1))
+
+            try:
+                code = native.launch(
+                    [sys.executable, '-I', '-u', __file__, '--race-tree',
+                     str(directory), '0'], sid, directory,
+                    root / 'shutdown-race.log', observe=observe)
+                self.assertEqual(code, 1)
+                # launch() has returned, so its job is closed. Any recorded
+                # child that is still alive survived creation racing shutdown.
+                pids = [int(value) for value in
+                        (directory / 'race-pids').read_text().split()]
+                survivors = []
+                for pid in pids:
+                    handle = native.open_process(0x1000 | 0x100000 | 1, False, pid)
+                    if not handle:
+                        continue
+                    try:
+                        if native.wait(handle, 3000) != 0:
+                            survivors.append(pid)
+                    finally:
+                        api.close(handle)
+                print(json.dumps({'cleanup': 'shutdown-race',
+                                  'children': len(pids),
+                                  'survivors': survivors}), flush=True)
+                self.assertEqual(survivors, [])
+            finally:
+                try:
+                    diagnostic = root / 'shutdown-race.log'
+                    if diagnostic.exists():
+                        print(diagnostic.read_text(errors='replace'), flush=True)
+                finally:
+                    with ExitStack() as cleanup:
+                        for handle in retained:
+                            cleanup.callback(api.retire, handle)
         log = root / 'contained.log'
         self.assertIsNone(peer.poll(), 'unrestricted target exited before attacks')
         try:
@@ -1411,6 +1597,12 @@ class AppContainerTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 5 and sys.argv[1] == '--broker-death':
+        broker_death(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]))
+        sys.exit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == '--race-tree':
+        race_tree(Path(sys.argv[2]), int(sys.argv[3]))
+        sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] == '--cleanup-tree':
         cleanup_tree(Path(sys.argv[2]), int(sys.argv[3]))
         sys.exit(0)
