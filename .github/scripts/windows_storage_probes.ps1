@@ -16,6 +16,8 @@ $process = $null
 $started = $false
 $password = $null
 $taskName = $null
+$comClsid = $null
+$comAppid = $null
 $setupError = $null
 $exitCode = 1
 $root = Join-Path $env:ProgramData ('LokiStorageProbes-' + [guid]::NewGuid().ToString('N'))
@@ -148,6 +150,54 @@ try {
         }
     }
 
+    if ($Probe -eq 'appcontainer') {
+        # Machine-wide local COM server (arm 2): the administrator registers
+        # one disposable machine class whose fixed bootstrap reads its witness
+        # target from the broker-owned request file. LaunchPermission grants
+        # only the temp user, SYSTEM and Administrators -- never ALL
+        # APPLICATION PACKAGES, which is the denial the worker attempt is
+        # meant to exercise. COM requires LaunchPermission as REG_BINARY
+        # (a self-relative SECURITY_DESCRIPTOR); an SDDL string is not
+        # accepted. Best effort: a failure prints and leaves no fixture
+        # file; probes still run.
+        $comClsid = '{' + [guid]::NewGuid().ToString() + '}'
+        $comAppid = '{' + [guid]::NewGuid().ToString() + '}'
+        $comRequest = Join-Path $root 'com-request.json'
+        $comCommand = '"{0}" -I -u "{1}" --com-witness "{2}"' -f $executable, $script, $comRequest
+        $comClsidPath = 'HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid
+        $comAppidPath = 'HKLM:\SOFTWARE\Classes\AppID\' + $comAppid
+        try {
+            if (-not ('Loki.ComSd' -as [type])) {
+                Add-Type -Namespace Loki -Name ComSd -MemberDefinition @'
+[DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+    string sddl, uint revision, out IntPtr descriptor, out uint length);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern IntPtr LocalFree(IntPtr memory);
+'@
+            }
+            $descriptor = [IntPtr]::Zero
+            $descriptorSize = [uint32]0
+            $launchSddl = 'O:SYD:P(A;;GA;;;' + $sid + ')(A;;GA;;;SY)(A;;GA;;;BA)'
+            $converted = [Loki.ComSd]::ConvertStringSecurityDescriptorToSecurityDescriptor(
+                $launchSddl, 1, [ref]$descriptor, [ref]$descriptorSize)
+            if (-not $converted) { throw 'Cannot build COM launch permission descriptor' }
+            $launchBytes = [byte[]]::new([int]$descriptorSize)
+            [Runtime.InteropServices.Marshal]::Copy(
+                $descriptor, $launchBytes, 0, [int]$descriptorSize)
+            [void][Loki.ComSd]::LocalFree($descriptor)
+            New-Item -Path ($comClsidPath + '\LocalServer32') -Force | Out-Null
+            Set-ItemProperty -Path ($comClsidPath + '\LocalServer32') -Name '(default)' -Value $comCommand
+            Set-ItemProperty -Path $comClsidPath -Name 'AppID' -Value $comAppid
+            New-Item -Path $comAppidPath -Force | Out-Null
+            Set-ItemProperty -Path $comAppidPath -Name 'LaunchPermission' `
+                -Type Binary -Value $launchBytes
+            @{ clsid = $comClsid; request = $comRequest } | ConvertTo-Json |
+                Set-Content -LiteralPath (Join-Path $root 'com-fixture.json')
+        }
+        catch { Write-Host "COM fixture blocked: $_" }
+    }
+
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $executable
     $start.WorkingDirectory = $work
@@ -226,6 +276,19 @@ finally {
             }
             catch { Write-Warning $_; $cleanupFailed = $true }
         }
+    }
+    if ($comClsid -or $comAppid) {
+        # Quiet removal for keys a blocked registration never wrote; real
+        # failures are warnings.
+        try {
+            if ($comClsid -and (Test-Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid))) {
+                Remove-Item -Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid) -Recurse -Force
+            }
+            if ($comAppid -and (Test-Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid))) {
+                Remove-Item -Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid) -Recurse -Force
+            }
+        }
+        catch { Write-Warning $_; $cleanupFailed = $true }
     }
     if ($null -ne $user) {
         if ($Probe -eq 'appcontainer') {

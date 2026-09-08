@@ -47,6 +47,11 @@ class Luids(C.Structure):
     _fields_ = [('low', ULONG), ('high', LONG)]
 
 
+class Guids(C.Structure):
+    _fields_ = [('data1', ULONG), ('data2', W.WORD),
+                ('data3', W.WORD), ('data4', C.c_ubyte * 8)]
+
+
 class PrivilegeEntries(C.Structure):
     _fields_ = [('luid', Luids), ('attributes', ULONG)]
 
@@ -594,6 +599,24 @@ try {
         return json.loads(lines[-1])
 
 
+def guid_from_text(text):
+    """GUID structure filled from canonical text.
+
+    Textual groups are big-endian hex of the field VALUES while the struct
+    stores those values in little-endian memory, so each group parses
+    big-endian and the struct performs the encoding. A little-endian parse
+    byte-swaps the first three fields and activates a different CLSID than
+    the one registered (defect at 9757654: CLASSNOTREG proved nothing).
+    """
+    value = Guids()
+    raw = bytes.fromhex(text.strip('{}').replace('-', ''))
+    value.data1 = int.from_bytes(raw[0:4], 'big')
+    value.data2 = int.from_bytes(raw[4:6], 'big')
+    value.data3 = int.from_bytes(raw[6:8], 'big')
+    C.memmove(value.data4, raw[8:16], 8)
+    return value
+
+
 def com_activation(clsid):
     """Local-server COM activation wrapper; prints one JSON hresult reply.
 
@@ -603,20 +626,6 @@ def com_activation(clsid):
     or hang rather than S_OK; the witness report is the real evidence.
     """
     from ctypes import wintypes as W
-
-    class Guids(C.Structure):
-        _fields_ = [('data1', W.DWORD), ('data2', W.WORD),
-                    ('data3', W.WORD), ('data4', C.c_ubyte * 8)]
-
-    def guid(text):
-        value = Guids()
-        raw = bytes.fromhex(text.strip('{}').replace('-', ''))
-        # The GUID structure stores the first three fields little-endian.
-        value.data1 = int.from_bytes(raw[0:4], 'little')
-        value.data2 = int.from_bytes(raw[4:6], 'little')
-        value.data3 = int.from_bytes(raw[6:8], 'little')
-        C.memmove(value.data4, raw[8:16], 8)
-        return value
 
     ole = C.WinDLL('ole32')
     ole.CoInitializeEx.restype = C.c_long  # HRESULT
@@ -629,8 +638,8 @@ def com_activation(clsid):
         return
     instance = C.c_void_p()
     hr = ole.CoCreateInstance(
-        C.byref(guid(clsid)), None, 0x4,  # CLSCTX_LOCAL_SERVER
-        C.byref(guid('{00000000-0000-0000-C000-000000000046}')),
+        C.byref(guid_from_text(clsid)), None, 0x4,  # CLSCTX_LOCAL_SERVER
+        C.byref(guid_from_text('{00000000-0000-0000-C000-000000000046}')),
         C.byref(instance))
     print(json.dumps({'hresult': hr, 'phase': 'co-create'}), flush=True)
 

@@ -49,6 +49,7 @@ primitives = runpy.run_path(str(Path(__file__).with_name(
     'test_windows_primitives.py')))
 escape_helpers = runpy.run_path(str(Path(__file__).with_name('windows_escapes.py')))
 NativeCalls = primitives['NativeCalls']
+Guids = escape_helpers['Guids']
 HANDLE = C.c_void_p
 ULONG = C.c_uint32
 
@@ -441,14 +442,36 @@ def task_witness(request_path):
     return json.loads(Path(request['manifest']).read_text()), Path(request['report'])
 
 
-def verify_task_route(report_path, owner):
-    """The control must prove the prearranged route is live and dangerous."""
+def verify_task_route(report_path, owner, native=None, api=None):
+    """The control must prove the route live, dangerous, and honestly reported.
+
+    With kernel access provided, the witness process is independently
+    inspected: its token must match both the owner and its own report, so a
+    forged or mismatched self-report fails the control. The credential read
+    must be 'allowed'; any other outcome (denial or error) means the route is
+    not proven dangerous and the control fails.
+    """
     payload = json.loads(report_path.read_text())
     if payload['token']['user'] != owner or payload['token']['app'] != 0:
-        raise RuntimeError('control task witness did not run unrestricted: %r'
+        raise RuntimeError('control witness did not run unrestricted: %r'
                            % payload['token'])
-    if payload['credential_access']['outcome'] == 'access-denied':
-        raise RuntimeError('control task witness could not read credentials')
+    if payload['credential_access'].get('outcome') != 'allowed':
+        raise RuntimeError('control witness could not read credentials: %r'
+                           % payload['credential_access'])
+    if native is not None and api is not None:
+        handle = native.check(native.open_process(
+            0x1000 | 0x100000 | 1, False, payload['pid']))
+        try:
+            token = api.token(handle, 8)
+            try:
+                snapshot = api.snapshot(token)
+            finally:
+                api.close(token)
+        finally:
+            api.close(handle)
+        if snapshot != payload['token']:
+            raise RuntimeError('kernel token disagrees with witness report: '
+                               '%r vs %r' % (snapshot, payload['token']))
     return payload
 
 
@@ -471,7 +494,9 @@ def unregister_user_com_server(clsid):
                  r'Software\Classes\CLSID\%s' % clsid):
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
-        except OSError:
+        except FileNotFoundError:
+            # A blocked registration never wrote this key; anything else is a
+            # real cleanup failure and must stay visible.
             pass
 
 
@@ -1005,19 +1030,60 @@ print('RETURNED', flush=True)
     def test_task_route_control_requires_live_dangerous_route(self):
         with tempfile.TemporaryDirectory() as name:
             report = Path(name) / 'r.json'
-            live = {'token': {'user': 'u', 'app': 0},
+            live = {'pid': 42, 'token': {'user': 'u', 'app': 0},
                     'credential_access': {'outcome': 'allowed'}}
             report.write_text(json.dumps(live))
             self.assertEqual(verify_task_route(report, 'u'), live)
             for token, access in [
                     ({'user': 'u', 'app': 1}, 'allowed'),
                     ({'user': 'other', 'app': 0}, 'allowed'),
-                    ({'user': 'u', 'app': 0}, 'access-denied')]:
+                    ({'user': 'u', 'app': 0}, 'access-denied'),
+                    ({'user': 'u', 'app': 0}, 'unexpected-error')]:
                 report.write_text(json.dumps(
-                    {'token': token, 'credential_access': {'outcome': access}}))
+                    {'pid': 42, 'token': token,
+                     'credential_access': {'outcome': access}}))
                 with self.subTest(token=token, access=access):
-                    with self.assertRaisesRegex(RuntimeError, 'control task'):
+                    with self.assertRaisesRegex(RuntimeError, 'control witness'):
                         verify_task_route(report, 'u')
+
+    def test_task_control_kernel_token_must_match_witness(self):
+        with tempfile.TemporaryDirectory() as name:
+            report = Path(name) / 'r.json'
+            report.write_text(json.dumps(
+                {'pid': 42, 'token': {'user': 'u', 'app': 0},
+                 'credential_access': {'outcome': 'allowed'}}))
+            native, api = mock.Mock(), mock.Mock()
+            native.check.side_effect = lambda value: value
+            native.open_process.return_value = 7
+            api.token.return_value = 8
+            api.close.return_value = True
+
+            def snapshot(token):
+                return {'user': 'u', 'app': 0}
+            for kernel, matches in [(snapshot, True),
+                                    (lambda token: {'user': 'other', 'app': 0},
+                                     False),
+                                    (lambda token: {'user': 'u', 'app': 1},
+                                     False)]:
+                api.snapshot.side_effect = kernel
+                with self.subTest(matches=matches):
+                    if matches:
+                        verify_task_route(report, 'u', native, api)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'kernel'):
+                            verify_task_route(report, 'u', native, api)
+
+    def test_guid_from_text_matches_memory_layout(self):
+        guid = escape_helpers['guid_from_text']
+        # IID_IUnknown has a canonical little-endian memory layout.
+        raw = C.string_at(C.byref(guid('{00000000-0000-0000-C000-000000000046}')),
+                          C.sizeof(Guids))
+        self.assertEqual(raw, bytes.fromhex('0000000000000000C000000000000046'))
+        # Field values parse big-endian from text; memory is little-endian.
+        raw = C.string_at(
+            C.byref(guid('{11223344-5566-7788-99AA-BBCCDDEEFF00}')),
+            C.sizeof(Guids))
+        self.assertEqual(raw, bytes.fromhex('443322116655887799AABBCCDDEEFF00'))
 
     def test_com_activation_outcomes(self):
         api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
@@ -1443,7 +1509,7 @@ class AppContainerTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     raise RuntimeError('scheduled-task control witness did not report')
                 time.sleep(0.05)
-            control = verify_task_route(control_report, owner)
+            control = verify_task_route(control_report, owner, native, api)
             print(json.dumps({'scheduled_task_control': control}), flush=True)
             # The witness self-exits ten seconds after publishing; wait it out
             # so a still-running instance cannot mask the worker attempt.
@@ -1479,8 +1545,9 @@ class AppContainerTests(unittest.TestCase):
         while not com_control_report.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         if com_control_report.exists():
-            payload = verify_task_route(com_control_report, owner)
-            print(json.dumps({'com_control': payload}), flush=True)
+            payload = verify_task_route(com_control_report, owner, native, api)
+            print(json.dumps({'com_control': payload, 'scope': 'user'}),
+                  flush=True)
             # Wait out the control witness so a live instance cannot mask the
             # worker attempt, then retarget the registration.
             time.sleep(12)
@@ -1488,7 +1555,51 @@ class AppContainerTests(unittest.TestCase):
             com_cls = clsid
         else:
             print(json.dumps({'com_setup': 'control-failed',
+                              'scope': 'user',
                               'activation': control_detail}), flush=True)
+        # Machine-wide registration (arm 2): the supervisor registered a
+        # disposable local server whose fixed bootstrap reads this request
+        # file. A separate control report path is mandatory: a late arm-1
+        # witness must never be counted as this arm's evidence. (Arm 1's
+        # 9757654 CLASSNOTREG is retracted: the activation used a mis-built
+        # GUID, so per-user session-0 visibility is unmeasured, not denied.)
+        com_fixture_path = Path(__file__).parent / 'com-fixture.json'
+        if com_cls is None and com_fixture_path.exists():
+            machine = json.loads(com_fixture_path.read_text())
+            machine_cls = machine['clsid']
+            com_request = Path(machine['request'])
+            machine_control_report = root / ('com-machine-control-'
+                                             + uuid.uuid4().hex + '.json')
+            com_request.write_text(json.dumps(
+                {'manifest': str(manifest),
+                 'report': str(machine_control_report)}))
+            try:
+                control = subprocess.run(
+                    [sys.executable, '-I', '-u', str(escapes), '--com-activate',
+                     machine_cls], capture_output=True, text=True, timeout=25)
+                control_detail = {'exit': control.returncode,
+                                  'stdout': control.stdout,
+                                  'stderr': control.stderr}
+            except subprocess.TimeoutExpired as error:
+                control_detail = {'timed_out': True, 'detail': str(error)}
+            deadline = time.monotonic() + 15
+            while not machine_control_report.exists() and \
+                    time.monotonic() < deadline:
+                time.sleep(0.05)
+            if machine_control_report.exists():
+                payload = verify_task_route(machine_control_report, owner,
+                                            native, api)
+                print(json.dumps({'com_control': payload, 'scope': 'machine'}),
+                      flush=True)
+                # Wait out the control witness, then retarget the bootstrap.
+                time.sleep(12)
+                com_request.write_text(json.dumps(
+                    {'manifest': str(manifest), 'report': str(com_report)}))
+                com_cls = machine_cls
+            else:
+                print(json.dumps({'com_setup': 'control-failed',
+                                  'scope': 'machine',
+                                  'activation': control_detail}), flush=True)
         manifest.write_text(json.dumps({'secret': str(secret),
                                         'workspace': str(workspace),
                                         'owner': owner, 'package': package,
@@ -1727,7 +1838,7 @@ if __name__ == '__main__':
         print(json.dumps(report), flush=True)
         sys.exit(0 if report['outcome'] in ('impersonated-contained',
                                             'access-denied') else 1)
-    if len(sys.argv) == 3 and sys.argv[1] == '--task-witness':
+    if len(sys.argv) == 3 and sys.argv[1] in ('--task-witness', '--com-witness'):
         manifest, report = task_witness(Path(sys.argv[2]))
         native = AppContainers()
         api = escape_helpers['Escapes'](
