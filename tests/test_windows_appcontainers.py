@@ -452,6 +452,29 @@ def verify_task_route(report_path, owner):
     return payload
 
 
+def register_user_com_server(clsid, command):
+    """Per-user local COM server registration (arm 1): no admin, no
+    capabilities, disposable, broker-owned hive."""
+    import winreg
+    path = r'Software\Classes\CLSID\%s\LocalServer32' % clsid
+    key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0,
+                             winreg.KEY_SET_VALUE)
+    try:
+        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, command)
+    finally:
+        key.Close()
+
+
+def unregister_user_com_server(clsid):
+    import winreg
+    for path in (r'Software\Classes\CLSID\%s\LocalServer32' % clsid,
+                 r'Software\Classes\CLSID\%s' % clsid):
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+        except OSError:
+            pass
+
+
 def private_dacl(owner):
     return 'D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)' % owner
 
@@ -996,6 +1019,30 @@ print('RETURNED', flush=True)
                     with self.assertRaisesRegex(RuntimeError, 'control task'):
                         verify_task_route(report, 'u')
 
+    def test_com_activation_outcomes(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        cases = [(-2147024891, 'activation-denied'),   # E_ACCESS_DENIED
+                 (-2147221164, 'class-not-registered'),  # REGDB_E_CLASSNOTREG
+                 (0, 'unexpected-activation-result'),
+                 (-2147467259, 'unexpected-activation-result')]
+        for hresult, outcome in cases:
+            reply = subprocess.CompletedProcess(
+                [], 0, json.dumps({'hresult': hresult, 'phase': 'co-create'}), '')
+            with self.subTest(hresult=hresult), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(subprocess, 'run', return_value=reply):
+                result = api.com_launch('{00000000-0000-0000-0000-000000000000}')
+            self.assertEqual(result['outcome'], outcome)
+            passed = escape_helpers['finalize_result'](
+                result, 0, ('activation-denied', 'class-not-registered'))['passed']
+            self.assertEqual(passed, outcome in ('activation-denied',
+                                                 'class-not-registered'))
+        with mock.patch('builtins.print'), \
+                mock.patch.object(subprocess, 'run', side_effect=(
+                    subprocess.TimeoutExpired(['com'], 20))):
+            with self.assertRaisesRegex(RuntimeError, 'timed out'):
+                api.com_launch('{00000000-0000-0000-0000-000000000000}')
+
     def test_task_witness_reads_request_and_manifest(self):
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
@@ -1404,6 +1451,50 @@ class AppContainerTests(unittest.TestCase):
             # Retarget the fixed bootstrap at the worker-attempt report.
             request_path.write_text(json.dumps({'manifest': str(manifest),
                                                 'report': str(task_report)}))
+        # Per-user local COM server (arm 1, no admin): register, prove the
+        # route is live and dangerous via an unrestricted control activation,
+        # then retarget the registration at the worker-attempt report. If the
+        # control cannot launch, the route stays explicitly untested.
+        com_cls = None
+        com_control_report = root / ('com-control-' + uuid.uuid4().hex + '.json')
+        com_report = root / ('com-report-' + uuid.uuid4().hex + '.json')
+        clsid = '{%s}' % uuid.uuid4()
+
+        def com_witness(report):
+            return subprocess.list2cmdline(
+                [sys.executable, '-I', '-u', __file__, '--launch-witness',
+                 str(manifest), str(report)])
+        register_user_com_server(clsid, com_witness(com_control_report))
+        self.addCleanup(unregister_user_com_server, clsid)
+        escapes = Path(__file__).with_name('windows_escapes.py')
+        try:
+            control = subprocess.run(
+                [sys.executable, '-I', '-u', str(escapes), '--com-activate',
+                 clsid], capture_output=True, text=True, timeout=25)
+            control_detail = {'exit': control.returncode, 'stdout': control.stdout,
+                              'stderr': control.stderr}
+        except subprocess.TimeoutExpired as error:
+            control_detail = {'timed_out': True, 'detail': str(error)}
+        deadline = time.monotonic() + 15
+        while not com_control_report.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if com_control_report.exists():
+            payload = verify_task_route(com_control_report, owner)
+            print(json.dumps({'com_control': payload}), flush=True)
+            # Wait out the control witness so a live instance cannot mask the
+            # worker attempt, then retarget the registration.
+            time.sleep(12)
+            register_user_com_server(clsid, com_witness(com_report))
+            com_cls = clsid
+        else:
+            print(json.dumps({'com_setup': 'control-failed',
+                              'activation': control_detail}), flush=True)
+        manifest.write_text(json.dumps({'secret': str(secret),
+                                        'workspace': str(workspace),
+                                        'owner': owner, 'package': package,
+                                        'broker_pid': os.getpid(), 'peer': target,
+                                        'scheduled_task': task_name,
+                                        'com': {'clsid': com_cls} if com_cls else None}))
         for mode in ('normal-root-exit', 'terminated-root'):
             with self.subTest(cleanup=mode):
                 directory = workspace / mode
@@ -1590,6 +1681,13 @@ class AppContainerTests(unittest.TestCase):
             read_credentials = payload['credential_access']['outcome'] != 'access-denied'
             self.assertFalse(unrestricted and read_credentials,
                              'contained worker invoked an unrestricted task')
+        if com_report.exists():
+            payload = json.loads(com_report.read_text())
+            print(json.dumps({'com_witness': payload}), flush=True)
+            unrestricted = payload['token']['user'] == owner and payload['token']['app'] == 0
+            read_credentials = payload['credential_access']['outcome'] != 'access-denied'
+            self.assertFalse(unrestricted and read_credentials,
+                             'contained worker launched an unrestricted COM server')
         # Check integrity independently of the child-reported operation results.
         for leaf in names:
             self.assertEqual((secret / leaf).read_bytes(), b'FAKE-CREDENTIAL')
@@ -1597,6 +1695,10 @@ class AppContainerTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    if '-Embedding' in sys.argv:
+        # COM appends this flag to local-server command lines; the witness
+        # dispatch must not be confused by it.
+        sys.argv.remove('-Embedding')
     if len(sys.argv) == 5 and sys.argv[1] == '--broker-death':
         broker_death(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]))
         sys.exit(0)

@@ -527,6 +527,49 @@ try {
         # never classify acceptance as containment or denial.
         return {'outcome': 'invoke-accepted'}
 
+    def com_launch(self, clsid):
+        """Activate a registered local COM server from the worker.
+
+        The wrapper is bounded at 20 seconds because a launched server that
+        never registers a class object hangs the activation handshake; a
+        timeout fails the scenario, and whether a launch actually happened is
+        decided by the broker from the witness report, which this worker
+        cannot read or forge (protected root).
+        """
+        print(json.dumps({'probe': 'com', 'phase': 'activate'}), flush=True)
+        command = [sys.executable, '-I', '-u', os.path.abspath(__file__),
+                   '--com-activate', clsid]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=20)
+        except subprocess.TimeoutExpired as error:
+            def text(value):
+                if isinstance(value, bytes):
+                    return value.decode(errors='replace')
+                return value
+            print(json.dumps({'probe': 'com', 'timed_out': True,
+                              'stdout': text(error.stdout),
+                              'stderr': text(error.stderr)}), flush=True)
+            raise RuntimeError('com activation wrapper timed out') from error
+        print(json.dumps({'probe': 'com', 'wrapper_exit': result.returncode,
+                          'stdout': result.stdout, 'stderr': result.stderr}),
+              flush=True)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if result.returncode or not lines:
+            raise RuntimeError('com activation wrapper failed')
+        reply = json.loads(lines[-1])
+        status = reply['hresult'] & 0xffffffff
+        if status == 0x80070005:  # E_ACCESSDENIED
+            return {'outcome': 'activation-denied', 'phase': 'co-create',
+                    'hresult': status}
+        if status == 0x80040154:  # REGDB_E_CLASSNOTREG
+            return {'outcome': 'class-not-registered', 'phase': 'co-create',
+                    'hresult': status}
+        # Success or unknown failures never count as containment; the broker
+        # witness decides violations.
+        return {'outcome': 'unexpected-activation-result', 'phase': 'co-create',
+                'hresult': status}
+
     def impersonation_launch(self, script, manifest):
         """Run the thread-token experiment in a disposable contained child.
 
@@ -549,6 +592,47 @@ try {
         if not lines:
             raise RuntimeError('impersonation child produced no report')
         return json.loads(lines[-1])
+
+
+def com_activation(clsid):
+    """Local-server COM activation wrapper; prints one JSON hresult reply.
+
+    Runs in a disposable process so a hung handshake can be killed without
+    contaminating the caller. The launched witness never registers a class
+    object, so a successful OS launch typically ends in a handshake failure
+    or hang rather than S_OK; the witness report is the real evidence.
+    """
+    from ctypes import wintypes as W
+
+    class Guids(C.Structure):
+        _fields_ = [('data1', W.DWORD), ('data2', W.WORD),
+                    ('data3', W.WORD), ('data4', C.c_ubyte * 8)]
+
+    def guid(text):
+        value = Guids()
+        raw = bytes.fromhex(text.strip('{}').replace('-', ''))
+        # The GUID structure stores the first three fields little-endian.
+        value.data1 = int.from_bytes(raw[0:4], 'little')
+        value.data2 = int.from_bytes(raw[4:6], 'little')
+        value.data3 = int.from_bytes(raw[6:8], 'little')
+        C.memmove(value.data4, raw[8:16], 8)
+        return value
+
+    ole = C.WinDLL('ole32')
+    ole.CoInitializeEx.restype = C.c_long  # HRESULT
+    ole.CoCreateInstance.restype = C.c_long
+    ole.CoCreateInstance.argtypes = [C.POINTER(Guids), C.c_void_p, W.DWORD,
+                                     C.POINTER(Guids), C.POINTER(C.c_void_p)]
+    hr = ole.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+    if hr != 0:
+        print(json.dumps({'hresult': hr, 'phase': 'co-initialize'}), flush=True)
+        return
+    instance = C.c_void_p()
+    hr = ole.CoCreateInstance(
+        C.byref(guid(clsid)), None, 0x4,  # CLSCTX_LOCAL_SERVER
+        C.byref(guid('{00000000-0000-0000-C000-000000000046}')),
+        C.byref(instance))
+    print(json.dumps({'hresult': hr, 'phase': 'co-create'}), flush=True)
 
 
 def peer(native, secret, report):
@@ -901,4 +985,14 @@ def probe(api, manifest, script, manifest_path, classify):
                       'passed': False}
             results.append(result)
             print(json.dumps(result), flush=True)
+    com = manifest.get('com') or {}
+    if com.get('clsid'):
+        run('com-activation', lambda: api.com_launch(com['clsid']),
+            ('activation-denied', 'class-not-registered'))
+
     return all(result['passed'] for result in results)
+
+
+if __name__ == '__main__' and len(sys.argv) == 3 \
+        and sys.argv[1] == '--com-activate':
+    com_activation(sys.argv[2])
