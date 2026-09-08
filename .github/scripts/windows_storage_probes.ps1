@@ -62,6 +62,13 @@ function Grant-BatchLogonRight([string]$UserSid) {
     Set-Content -LiteralPath $policy -Value $updated
     & "$env:SystemRoot/System32/secedit.exe" /configure /db $database /cfg $policy /quiet
     if ($LASTEXITCODE -ne 0) { throw 'Cannot apply local security policy' }
+    # secedit is silent under /quiet; show the effective entry so the log
+    # proves whether the grant actually landed in the policy database.
+    $verify = Join-Path $env:TEMP ('loki-secpolicy-' + [guid]::NewGuid().ToString('N') + '.inf')
+    & "$env:SystemRoot/System32/secedit.exe" /export /cfg $verify /quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot re-export local security policy' }
+    $effective = Get-Content -LiteralPath $verify | Where-Object { $_ -match '^SeBatchLogonRight\s*=' }
+    Write-Host "Effective policy: $effective"
 }
 
 try {
@@ -124,13 +131,44 @@ try {
         # this Server image (native run 1670996), so the administrator
         # registers this one disposable prearranged task. No password is
         # stored: the broker only writes the request file and invokes it.
+        # The Register-ScheduledTask cmdlet stayed denied even after the
+        # batch-right grant (native run cd5802c), so registration goes
+        # through the schtasks CLI as a distinct code path.
         Grant-BatchLogonRight $sid
         $taskName = 'LokiProbe-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
         $request = Join-Path $root 'task-request.json'
-        $action = New-ScheduledTaskAction -Execute $executable -Argument ('-I -u "{0}" --task-witness "{1}"' -f $script, $request)
-        $principal = New-ScheduledTaskPrincipal -UserId $name -LogonType S4U -RunLevel Limited
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        $witnessArguments = '-I -u "{0}" --task-witness "{1}"' -f $script, $request
+        $template = @'
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals>
+    <Principal id="Author">
+      <UserId>{0}</UserId>
+      <LogonType>S4U</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+  </Settings>
+  <Actions>
+    <Exec>
+      <Command>{1}</Command>
+      <Arguments>{2}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+'@
+        $definition = Join-Path $root 'task-definition.xml'
+        [IO.File]::WriteAllText($definition, $template -f $sid, $executable, $witnessArguments,
+            [Text.Encoding]::Unicode)
+        & "$env:SystemRoot/System32/schtasks.exe" /Create /TN $taskName /XML $definition /F
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot register the prearranged scheduled task' }
         try {
             # The admin-created default descriptor may omit the run-as user;
             # grant this disposable account read-and-execute on the task.
