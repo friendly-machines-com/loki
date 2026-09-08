@@ -16,6 +16,7 @@ $process = $null
 $started = $false
 $password = $null
 $taskName = $null
+$setupError = $null
 $exitCode = 1
 $root = Join-Path $env:ProgramData ('LokiStorageProbes-' + [guid]::NewGuid().ToString('N'))
 
@@ -32,6 +33,35 @@ function Set-ProbeDirectoryAcl([string]$Path, [string]$UserSid, [string]$Rights)
         $acl.AddAccessRule($rule)
     }
     Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Grant-BatchLogonRight([string]$UserSid) {
+    # S4U task registration is denied even for an administrator when the
+    # task's principal user lacks SeBatchLogonRight (native runs 1670996 and
+    # 77615b0). Grant it to this one disposable CI account; nothing is
+    # revoked and the hosted VM is discarded after the job.
+    $policy = Join-Path $env:TEMP ('loki-secpolicy-' + [guid]::NewGuid().ToString('N') + '.inf')
+    $database = [IO.Path]::ChangeExtension($policy, '.sdb')
+    & "$env:SystemRoot/System32/secedit.exe" /export /cfg $policy /quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot export local security policy' }
+    $content = Get-Content -LiteralPath $policy
+    $found = $false
+    $updated = foreach ($line in $content) {
+        if ($line -match '^(SeBatchLogonRight\s*=\s*)(.*)$') {
+            $found = $true
+            $existing = $Matches[2]
+            if ($existing -split ',' -notcontains "*$UserSid") {
+                if ($existing.Trim()) { $existing = $existing.Trim() + ",*$UserSid" }
+                else { $existing = "*$UserSid" }
+            }
+            $Matches[1] + $existing
+        }
+        else { $line }
+    }
+    if (-not $found) { throw 'SeBatchLogonRight entry missing from exported policy' }
+    Set-Content -LiteralPath $policy -Value $updated
+    & "$env:SystemRoot/System32/secedit.exe" /configure /db $database /cfg $policy /quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot apply local security policy' }
 }
 
 try {
@@ -94,6 +124,7 @@ try {
         # this Server image (native run 1670996), so the administrator
         # registers this one disposable prearranged task. No password is
         # stored: the broker only writes the request file and invokes it.
+        Grant-BatchLogonRight $sid
         $taskName = 'LokiProbe-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
         $request = Join-Path $root 'task-request.json'
         $action = New-ScheduledTaskAction -Execute $executable -Argument ('-I -u "{0}" --task-witness "{1}"' -f $script, $request)
@@ -160,6 +191,11 @@ try {
     Write-Host "Standard-user probe exit: $exitCode; timed out: $timedOut"
     if ($timedOut) { throw 'Standard-user probes exceeded 180 seconds' }
 }
+catch {
+    # Preserve the original failure; a finally throw would otherwise mask it
+    # (demonstrated at 77615b0, where the cleanup error hid the real one).
+    $setupError = $_
+}
 finally {
     # Attempt every cleanup even if an earlier one fails. Hard job termination
     # may bypass finally; the hosted VM is disposable and no account is reused.
@@ -175,11 +211,16 @@ finally {
         finally { $process.Dispose() }
     }
     if ($taskName) {
-        try {
-            Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        # A setup failure before registration leaves no task; that is quiet,
+        # not a cleanup failure.
+        $registered = Get-ScheduledTask -TaskName $taskName -ErrorAction Ignore -WarningAction Ignore
+        if ($registered) {
+            try {
+                Stop-ScheduledTask -TaskName $taskName -ErrorAction Ignore -WarningAction Ignore
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+            }
+            catch { Write-Warning $_; $cleanupFailed = $true }
         }
-        catch { Write-Warning $_; $cleanupFailed = $true }
     }
     if ($null -ne $user) {
         if ($Probe -eq 'appcontainer') {
@@ -205,6 +246,9 @@ finally {
     catch { Write-Warning $_; $cleanupFailed = $true }
     if ($null -ne $password) { $password.Dispose() }
     Stop-Transcript | Out-Null
-    if ($cleanupFailed) { throw 'Standard-user supervisor cleanup failed; see transcript' }
 }
+# Rethrow the original failure after cleanup; only report cleanup problems
+# when nothing earlier failed, so the first error is always the visible one.
+if ($null -ne $setupError) { throw $setupError }
+if ($cleanupFailed) { throw 'Standard-user supervisor cleanup failed; see transcript' }
 exit $exitCode
