@@ -15,6 +15,7 @@ $user = $null
 $process = $null
 $started = $false
 $password = $null
+$taskName = $null
 $exitCode = 1
 $root = Join-Path $env:ProgramData ('LokiStorageProbes-' + [guid]::NewGuid().ToString('N'))
 
@@ -88,6 +89,29 @@ try {
     New-Item -ItemType Directory -Path $temporary | Out-Null
     $executable = Join-Path $runtime $layout.executable
 
+    if ($Probe -eq 'appcontainer') {
+        # Standard-user S4U self-registration is denied by the scheduler on
+        # this Server image (native run 1670996), so the administrator
+        # registers this one disposable prearranged task. No password is
+        # stored: the broker only writes the request file and invokes it.
+        $taskName = 'LokiProbe-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+        $request = Join-Path $root 'task-request.json'
+        $action = New-ScheduledTaskAction -Execute $executable -Argument ('-I -u "{0}" --task-witness "{1}"' -f $script, $request)
+        $principal = New-ScheduledTaskPrincipal -UserId $name -LogonType S4U -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        try {
+            # The admin-created default descriptor may omit the run-as user;
+            # grant this disposable account read-and-execute on the task.
+            $task = Get-ScheduledTask -TaskName $taskName
+            $task.SecurityDescriptorSddl = 'D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;' + $sid + ')'
+            $task | Set-ScheduledTask | Out-Null
+        }
+        catch { Write-Warning "Task security descriptor update failed: $_" }
+        @{ task = $taskName; request = $request } | ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $root 'task-fixture.json')
+    }
+
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $executable
     $start.WorkingDirectory = $work
@@ -149,6 +173,13 @@ finally {
         }
         catch { Write-Warning $_; $cleanupFailed = $true }
         finally { $process.Dispose() }
+    }
+    if ($taskName) {
+        try {
+            Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        }
+        catch { Write-Warning $_; $cleanupFailed = $true }
     }
     if ($null -ne $user) {
         if ($Probe -eq 'appcontainer') {
