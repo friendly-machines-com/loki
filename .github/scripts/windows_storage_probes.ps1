@@ -165,8 +165,10 @@ try {
 </Task>
 '@
         $definition = Join-Path $root 'task-definition.xml'
-        [IO.File]::WriteAllText($definition, $template -f $sid, $executable, $witnessArguments,
-            [Text.Encoding]::Unicode)
+        # Parenthesized: bare -f in argument mode binds only the first item,
+        # which failed the three-placeholder template (native run 098ddb7).
+        $taskXml = $template -f $sid, $executable, $witnessArguments
+        [IO.File]::WriteAllText($definition, $taskXml, [Text.Encoding]::Unicode)
         & "$env:SystemRoot/System32/schtasks.exe" /Create /TN $taskName /XML $definition /F
         if ($LASTEXITCODE -ne 0) { throw 'Cannot register the prearranged scheduled task' }
         try {
