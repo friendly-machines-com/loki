@@ -1280,46 +1280,56 @@ class AppContainerTests(unittest.TestCase):
             'memory': memory_control, 'handle': handle_control}}), flush=True)
         manifest = workspace / 'manifest.json'
         # Prearranged own-account scheduled task (design B): the supervisor
-        # registered a disposable demand-start S4U task whose fixed bootstrap
+        # registers a disposable demand-start S4U task whose fixed bootstrap
         # reads its witness target from the request file this broker owns.
-        # Prove the route is live and dangerous for unrestricted code, then
-        # let the contained worker attempt to invoke the same task.
-        fixture = json.loads((Path(__file__).parent / 'task-fixture.json').read_text())
-        task_name = fixture['task']
-        request_path = Path(fixture['request'])
+        # Registration is denied on this runner image; without the fixture the
+        # route stays explicitly untested (setup-blocked), never silently
+        # passing, and the containment probes below still run.
+        task_name = None
         control_report = root / ('task-control-' + uuid.uuid4().hex + '.json')
         task_report = root / ('task-report-' + uuid.uuid4().hex + '.json')
+        fixture_path = Path(__file__).parent / 'task-fixture.json'
+        if fixture_path.exists():
+            fixture = json.loads(fixture_path.read_text())
+            task_name = fixture['task']
+        # The witness reads the manifest at run time, so it must exist before
+        # any task invocation; a blocked fixture records null and the worker
+        # probe skips itself.
         manifest.write_text(json.dumps({'secret': str(secret),
                                         'workspace': str(workspace),
                                         'owner': owner, 'package': package,
                                         'broker_pid': os.getpid(), 'peer': target,
                                         'scheduled_task': task_name}))
-        schtasks = str(Path(os.environ['SystemRoot']) / 'System32/schtasks.exe')
+        if task_name is None:
+            print(json.dumps({'scheduled_task_setup': 'blocked; route untested'}),
+                  flush=True)
+        else:
+            request_path = Path(fixture['request'])
+            schtasks = str(Path(os.environ['SystemRoot']) / 'System32/schtasks.exe')
 
-        def run_schtasks(*arguments):
-            result = subprocess.run([schtasks, *arguments], capture_output=True,
-                                    text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, '%s: %s%s' % (
-                ' '.join(arguments), result.stdout, result.stderr))
-            return result
+            def run_schtasks(*arguments):
+                result = subprocess.run([schtasks, *arguments], capture_output=True,
+                                        text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, '%s: %s%s' % (
+                    ' '.join(arguments), result.stdout, result.stderr))
+                return result
 
-        request_path.write_text(json.dumps({'manifest': str(manifest),
-                                            'report': str(control_report)}))
-        run_schtasks('/Run', '/TN', task_name)
-        deadline = time.monotonic() + 20
-        while not control_report.exists():
-            if time.monotonic() >= deadline:
-                raise RuntimeError('scheduled-task control witness did not report')
-            time.sleep(0.05)
-        control = verify_task_route(control_report, owner)
-        print(json.dumps({'scheduled_task_control': control}), flush=True)
-        # The witness self-exits ten seconds after publishing; wait it out so a
-        # still-running instance cannot mask the worker attempt as rejection.
-        time.sleep(12)
-        # Retarget the fixed bootstrap at the worker-attempt report before
-        # launching the contained scenario.
-        request_path.write_text(json.dumps({'manifest': str(manifest),
-                                            'report': str(task_report)}))
+            request_path.write_text(json.dumps({'manifest': str(manifest),
+                                                'report': str(control_report)}))
+            run_schtasks('/Run', '/TN', task_name)
+            deadline = time.monotonic() + 20
+            while not control_report.exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('scheduled-task control witness did not report')
+                time.sleep(0.05)
+            control = verify_task_route(control_report, owner)
+            print(json.dumps({'scheduled_task_control': control}), flush=True)
+            # The witness self-exits ten seconds after publishing; wait it out
+            # so a still-running instance cannot mask the worker attempt.
+            time.sleep(12)
+            # Retarget the fixed bootstrap at the worker-attempt report.
+            request_path.write_text(json.dumps({'manifest': str(manifest),
+                                                'report': str(task_report)}))
         for mode in ('normal-root-exit', 'terminated-root'):
             with self.subTest(cleanup=mode):
                 directory = workspace / mode

@@ -35,42 +35,6 @@ function Set-ProbeDirectoryAcl([string]$Path, [string]$UserSid, [string]$Rights)
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
-function Grant-BatchLogonRight([string]$UserSid) {
-    # S4U task registration is denied even for an administrator when the
-    # task's principal user lacks SeBatchLogonRight (native runs 1670996 and
-    # 77615b0). Grant it to this one disposable CI account; nothing is
-    # revoked and the hosted VM is discarded after the job.
-    $policy = Join-Path $env:TEMP ('loki-secpolicy-' + [guid]::NewGuid().ToString('N') + '.inf')
-    $database = [IO.Path]::ChangeExtension($policy, '.sdb')
-    & "$env:SystemRoot/System32/secedit.exe" /export /cfg $policy /quiet
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot export local security policy' }
-    $content = Get-Content -LiteralPath $policy
-    $found = $false
-    $updated = foreach ($line in $content) {
-        if ($line -match '^(SeBatchLogonRight\s*=\s*)(.*)$') {
-            $found = $true
-            $existing = $Matches[2]
-            if ($existing -split ',' -notcontains "*$UserSid") {
-                if ($existing.Trim()) { $existing = $existing.Trim() + ",*$UserSid" }
-                else { $existing = "*$UserSid" }
-            }
-            $Matches[1] + $existing
-        }
-        else { $line }
-    }
-    if (-not $found) { throw 'SeBatchLogonRight entry missing from exported policy' }
-    Set-Content -LiteralPath $policy -Value $updated
-    & "$env:SystemRoot/System32/secedit.exe" /configure /db $database /cfg $policy /quiet
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot apply local security policy' }
-    # secedit is silent under /quiet; show the effective entry so the log
-    # proves whether the grant actually landed in the policy database.
-    $verify = Join-Path $env:TEMP ('loki-secpolicy-' + [guid]::NewGuid().ToString('N') + '.inf')
-    & "$env:SystemRoot/System32/secedit.exe" /export /cfg $verify /quiet
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot re-export local security policy' }
-    $effective = Get-Content -LiteralPath $verify | Where-Object { $_ -match '^SeBatchLogonRight\s*=' }
-    Write-Host "Effective policy: $effective"
-}
-
 try {
     # Query only the selected interpreter, not an ambient Python after switching.
     $layout = & $PythonPath -I -c 'import json, os, sys; assert os.name == "nt"; print(json.dumps({"prefix": sys.base_prefix, "executable": os.path.relpath(sys.executable, sys.base_prefix)}))'
@@ -127,14 +91,11 @@ try {
     $executable = Join-Path $runtime $layout.executable
 
     if ($Probe -eq 'appcontainer') {
-        # Standard-user S4U self-registration is denied by the scheduler on
-        # this Server image (native run 1670996), so the administrator
-        # registers this one disposable prearranged task. No password is
-        # stored: the broker only writes the request file and invokes it.
-        # The Register-ScheduledTask cmdlet stayed denied even after the
-        # batch-right grant (native run cd5802c), so registration goes
-        # through the schtasks CLI as a distinct code path.
-        Grant-BatchLogonRight $sid
+        # Decoupled, best-effort task fixture: every registration path was
+        # denied on this image even with SeBatchLogonRight granted (native
+        # runs 1670996, cd5802c, 8a7f800); the cause is unverified. A denial
+        # must not abort the containment probes: it leaves no fixture file,
+        # and the broker records the route as setup-blocked instead.
         $taskName = 'LokiProbe-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
         $request = Join-Path $root 'task-request.json'
         $witnessArguments = '-I -u "{0}" --task-witness "{1}"' -f $script, $request
@@ -169,18 +130,22 @@ try {
         # which failed the three-placeholder template (native run 098ddb7).
         $taskXml = $template -f $sid, $executable, $witnessArguments
         [IO.File]::WriteAllText($definition, $taskXml, [Text.Encoding]::Unicode)
-        & "$env:SystemRoot/System32/schtasks.exe" /Create /TN $taskName /XML $definition /F
-        if ($LASTEXITCODE -ne 0) { throw 'Cannot register the prearranged scheduled task' }
-        try {
-            # The admin-created default descriptor may omit the run-as user;
-            # grant this disposable account read-and-execute on the task.
-            $task = Get-ScheduledTask -TaskName $taskName
-            $task.SecurityDescriptorSddl = 'D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;' + $sid + ')'
-            $task | Set-ScheduledTask | Out-Null
+        $registration = & "$env:SystemRoot/System32/schtasks.exe" /Create /TN $taskName /XML $definition /F 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Scheduled-task fixture blocked: $registration"
         }
-        catch { Write-Warning "Task security descriptor update failed: $_" }
-        @{ task = $taskName; request = $request } | ConvertTo-Json |
-            Set-Content -LiteralPath (Join-Path $root 'task-fixture.json')
+        else {
+            try {
+                # The admin-created default descriptor may omit the run-as
+                # user; grant this disposable account read-and-execute.
+                $task = Get-ScheduledTask -TaskName $taskName
+                $task.SecurityDescriptorSddl = 'D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;' + $sid + ')'
+                $task | Set-ScheduledTask | Out-Null
+            }
+            catch { Write-Warning "Task security descriptor update failed: $_" }
+            @{ task = $taskName; request = $request } | ConvertTo-Json |
+                Set-Content -LiteralPath (Join-Path $root 'task-fixture.json')
+        }
     }
 
     $start = [Diagnostics.ProcessStartInfo]::new()
