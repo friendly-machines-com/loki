@@ -564,6 +564,11 @@ try {
             raise RuntimeError('com activation wrapper failed')
         reply = json.loads(lines[-1])
         status = reply['hresult'] & 0xffffffff
+        if reply.get('phase') != 'co-create':
+            # Initialization or protocol failures are never classified as
+            # activation outcomes.
+            return {'outcome': 'unexpected-activation-result',
+                    'phase': reply.get('phase'), 'hresult': status}
         if status == 0x80070005:  # E_ACCESSDENIED
             return {'outcome': 'activation-denied', 'phase': 'co-create',
                     'hresult': status}
@@ -632,16 +637,27 @@ def com_activation(clsid):
     ole.CoCreateInstance.restype = C.c_long
     ole.CoCreateInstance.argtypes = [C.POINTER(Guids), C.c_void_p, W.DWORD,
                                      C.POINTER(Guids), C.POINTER(C.c_void_p)]
+    ole.CoUninitialize.restype = None
     hr = ole.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
-    if hr != 0:
+    if hr not in (0, 1):  # S_OK or S_FALSE; both require CoUninitialize
         print(json.dumps({'hresult': hr, 'phase': 'co-initialize'}), flush=True)
         return
-    instance = C.c_void_p()
-    hr = ole.CoCreateInstance(
-        C.byref(guid_from_text(clsid)), None, 0x4,  # CLSCTX_LOCAL_SERVER
-        C.byref(guid_from_text('{00000000-0000-0000-C000-000000000046}')),
-        C.byref(instance))
-    print(json.dumps({'hresult': hr, 'phase': 'co-create'}), flush=True)
+    try:
+        instance = C.c_void_p()
+        hr = ole.CoCreateInstance(
+            C.byref(guid_from_text(clsid)), None, 0x4,  # CLSCTX_LOCAL_SERVER
+            C.byref(guid_from_text('{00000000-0000-0000-C000-000000000046}')),
+            C.byref(instance))
+        if hr == 0 and instance.value:
+            # IUnknown::Release is the third vtable slot; every interface the
+            # call returned must be released before uninitializing.
+            vtable = C.cast(instance, C.POINTER(C.c_void_p)).contents
+            slots = C.cast(vtable, C.POINTER(C.c_void_p))
+            release = C.WINFUNCTYPE(C.c_ulong, C.c_void_p)(slots[2])
+            release(instance)
+        print(json.dumps({'hresult': hr, 'phase': 'co-create'}), flush=True)
+    finally:
+        ole.CoUninitialize()
 
 
 def peer(native, secret, report):
@@ -994,9 +1010,12 @@ def probe(api, manifest, script, manifest_path, classify):
                       'passed': False}
             results.append(result)
             print(json.dumps(result), flush=True)
-    com = manifest.get('com') or {}
-    if com.get('clsid'):
-        run('com-activation', lambda: api.com_launch(com['clsid']),
+    com_targets = manifest.get('com') or []
+    for target in com_targets:
+        # Each armed route gets its own contained activation attempt; one
+        # arm's outcome never substitutes for another's.
+        run('com-activation-' + target['name'],
+            lambda target=target: api.com_launch(target['clsid']),
             ('activation-denied', 'class-not-registered'))
 
     return all(result['passed'] for result in results)

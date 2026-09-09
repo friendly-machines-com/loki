@@ -233,7 +233,14 @@ class AppContainers(NativeCalls):
         finally:
             self.check(self.close(token))
 
-    def launch(self, command, sid, workspace, output, observe=None):
+    def launch(self, command, sid, workspace, output, observe=None,
+               deadline=None):
+        """Run one contained child under one monotonic budget.
+
+        The deadline is fixed before the observer runs--an explicit one, or
+        now + 90 s when none is given--and the final wait spends only what
+        remains, so observation time can never extend the total budget for
+        any caller."""
         import msvcrt
         size = C.c_size_t()
         self.initialize(None, 2, 0, C.byref(size))
@@ -286,8 +293,12 @@ class AppContainers(NativeCalls):
                 if self.resume(process.thread) == 0xffffffff:
                     raise C.WinError(C.get_last_error())
                 if observe is not None:
+                    # Fix the budget before observation starts in every
+                    # caller, explicit or not.
+                    deadline = _scenario_deadline(deadline)
                     observe(process.process, job)
-                wait = self.wait(process.process, 90000)
+                wait = self.wait(process.process,
+                                 _remaining_milliseconds(deadline))
                 if wait != 0:
                     raise TimeoutError('AppContainer wait returned 0x%x' % wait)
                 code = ULONG()
@@ -498,6 +509,163 @@ def unregister_user_com_server(clsid):
             # A blocked registration never wrote this key; anything else is a
             # real cleanup failure and must stay visible.
             pass
+
+
+def witness_verdict(kernel, read_outcome, owner, package):
+    """Classify a kernel-inspected worker witness.
+
+    Only a same-user, same-package, AppContainer witness with an explicitly
+    denied credential read is 'contained'. An unrestricted or otherwise
+    anomalous witness is a boundary violation regardless of the read result;
+    a non-definitive read outcome is inconclusive. Callers fail on anything
+    but 'contained'."""
+    contained = (kernel['user'] == owner and kernel['app'] == 1 and
+                 kernel.get('package') == package)
+    if not contained:
+        if kernel['user'] != owner or kernel['app'] == 0:
+            return 'violation-unrestricted-witness'
+        return 'violation-anomalous-witness'
+    if read_outcome == 'allowed':
+        return 'violation-credentials-read'
+    if read_outcome != 'access-denied':
+        return 'inconclusive-read-outcome'
+    return 'contained'
+
+
+def reap_activation_wrapper(process):
+    """Kill and reap a wrapper; its pipes close even when reaping raises.
+
+    Every step is attempted regardless of earlier failures, the first
+    failure is preserved and raised, and both pipe streams are closed before
+    returning or propagating.
+    """
+    failure = None
+    try:
+        if process.poll() is None:
+            process.kill()
+    except Exception as error:
+        failure = error
+    try:
+        process.communicate(timeout=5)
+    except Exception as error:
+        if failure is None:
+            failure = error
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError as error:
+                if failure is None:
+                    failure = error
+    if failure is not None:
+        raise failure
+
+
+def activate_and_observe(command, report_path, owner, native, api):
+    """Run one activation while inspecting its witness live.
+
+    Polling continues for the full bounded deadline even after the wrapper
+    exits: the OS launches the witness asynchronously, so a report can still
+    appear once the activation call itself has failed or hung. Cleanup is
+    never silent: on the normal path a failed reap raises, and while a
+    primary error propagates the cleanup failure is printed so the primary
+    error still wins.
+    """
+    process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    payload = None
+    output = error = ''
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if report_path.exists():
+                payload = verify_task_route(report_path, owner, native, api)
+                break
+            time.sleep(0.05)
+        try:
+            output, error = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            output, error = process.communicate(timeout=5)
+    except BaseException:
+        # The primary error wins; a failing cleanup is reported, not hidden.
+        try:
+            reap_activation_wrapper(process)
+        except Exception as cleanup:
+            print(json.dumps({'probe': 'com-control',
+                              'cleanup_error': repr(cleanup)}), flush=True)
+        raise
+    reap_activation_wrapper(process)
+    return payload, {'exit': process.returncode, 'stdout': output,
+                     'stderr': error}
+
+
+def _scenario_deadline(deadline, now=None):
+    """The single budget start: an explicit deadline, or now + 90 seconds."""
+    if deadline is not None:
+        return deadline
+    if now is None:
+        now = time.monotonic()
+    return now + 90
+
+
+def _remaining_milliseconds(deadline, now=None):
+    """Wait budget for a monotonic deadline; the classic 90 s when None."""
+    if deadline is None:
+        return 90000
+    if now is None:
+        now = time.monotonic()
+    return max(0, int((deadline - now) * 1000))
+
+
+def watch_worker_witnesses(remaining_reports, deadline, root_alive, inspect):
+    """Observe armed witness reports until all appear or bounds are hit.
+
+    One active bound governs everything: the scenario deadline while the
+    root runs, shortened to a two-second grace once the root exits, with no
+    fallback to the longer scenario bound afterwards. Every report read and
+    every inspection starts only while that bound is in the future, so an
+    earlier inspection that consumes time can never push a later one past
+    it. Returns {name: (payload, kernel)} for every report observed;
+    unobserved names simply stay out of the result.
+    """
+    observed = {}
+
+    def sweep(active_deadline):
+        # Re-check before EACH report: a slow step earlier in this sweep must
+        # not license another past the bound.
+        for name, report_path in list(remaining_reports.items()):
+            if time.monotonic() >= active_deadline:
+                return
+            if not report_path.exists():
+                continue
+            if time.monotonic() >= active_deadline:
+                # exists() consumed the budget; never start the read past
+                # the bound.
+                return
+            payload = json.loads(report_path.read_text())
+            if time.monotonic() >= active_deadline:
+                # The read consumed the budget; never inspect past it.
+                return
+            observed[name] = (payload, inspect(payload))
+            del remaining_reports[name]
+
+    while remaining_reports:
+        alive = root_alive()
+        active = deadline if alive else min(deadline, time.monotonic() + 2)
+        if time.monotonic() >= active:
+            break
+        sweep(active)
+        if not remaining_reports:
+            break
+        if alive:
+            time.sleep(0.05)
+            continue
+        while remaining_reports and time.monotonic() < active:
+            sweep(active)
+            time.sleep(0.05)
+        break
+    return observed
 
 
 def private_dacl(owner):
@@ -1073,6 +1241,245 @@ print('RETURNED', flush=True)
                         with self.assertRaisesRegex(RuntimeError, 'kernel'):
                             verify_task_route(report, 'u', native, api)
 
+    def test_witness_verdict_only_accepts_denied_contained_witnesses(self):
+        verdict = witness_verdict
+        contained = {'user': 'u', 'app': 1, 'package': 'pkg'}
+        cases = [
+            (contained, 'access-denied', 'contained'),
+            (contained, 'allowed', 'violation-credentials-read'),
+            (contained, 'unexpected-error', 'inconclusive-read-outcome'),
+            ({'user': 'u', 'app': 0, 'package': None}, 'access-denied',
+             'violation-unrestricted-witness'),
+            ({'user': 'other', 'app': 1, 'package': 'pkg'}, 'access-denied',
+             'violation-unrestricted-witness'),
+            ({'user': 'u', 'app': 1, 'package': 'other'}, 'access-denied',
+             'violation-anomalous-witness'),
+        ]
+        for kernel, read, expected in cases:
+            with self.subTest(kernel=kernel, read=read):
+                self.assertEqual(verdict(kernel, read, 'u', 'pkg'), expected)
+
+    def fake_activation_process(self, alive=True):
+        process = mock.Mock()
+        process.poll.return_value = None if alive else 0
+        process.communicate.side_effect = lambda timeout=5: ('out', 'err')
+        process.returncode = 0
+        return process
+
+    def test_activation_observation_survives_wrapper_exit(self):
+        module = sys.modules[__name__]
+        report = mock.Mock()
+        report.exists.side_effect = [False, False, True]
+        payload = {'pid': 1}
+        clock = iter(range(0, 100))
+        with mock.patch.object(subprocess, 'Popen',
+                               return_value=self.fake_activation_process(False)), \
+                mock.patch.object(module, 'verify_task_route',
+                                  return_value=payload) as verify, \
+                mock.patch.object(time, 'monotonic',
+                                  side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            result = activate_and_observe(['x'], report, 'u', None, None)
+        # The wrapper exited immediately; polling still caught the report.
+        self.assertEqual(result[0], payload)
+        verify.assert_called_once_with(report, 'u', None, None)
+
+    def test_activation_observation_kills_wrapper_on_error(self):
+        module = sys.modules[__name__]
+        report = mock.Mock()
+        report.exists.return_value = True
+        clock = iter(range(0, 100))
+        process = self.fake_activation_process(alive=True)
+        with mock.patch.object(subprocess, 'Popen', return_value=process), \
+                mock.patch.object(module, 'verify_task_route',
+                                  side_effect=RuntimeError('bad report')), \
+                mock.patch.object(time, 'monotonic',
+                                  side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'bad report'):
+                activate_and_observe(['x'], report, 'u', None, None)
+        # A live wrapper is killed and reaped even when verification raised.
+        process.kill.assert_called_once()
+        self.assertGreaterEqual(process.communicate.call_count, 1)
+
+    def test_activation_observation_times_out_without_report(self):
+        module = sys.modules[__name__]
+        report = mock.Mock()
+        report.exists.return_value = False
+        clock = iter([0, 30] + [31] * 50)
+        process = self.fake_activation_process(alive=True)
+        with mock.patch.object(subprocess, 'Popen', return_value=process), \
+                mock.patch.object(module, 'verify_task_route') as verify, \
+                mock.patch.object(time, 'monotonic',
+                                  side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            result = activate_and_observe(['x'], report, 'u', None, None)
+        self.assertIsNone(result[0])
+        verify.assert_not_called()
+        process.kill.assert_called_once()
+
+    def test_activation_cleanup_failure_surfaces_on_normal_path(self):
+        module = sys.modules[__name__]
+        report = mock.Mock()
+        report.exists.return_value = False
+        clock = iter([0, 30] + [31] * 50)
+        process = self.fake_activation_process(alive=True)
+        process.communicate.side_effect = [('out', 'err'),
+                                           RuntimeError('reap failed')]
+        with mock.patch.object(subprocess, 'Popen', return_value=process), \
+                mock.patch.object(module, 'verify_task_route') as verify, \
+                mock.patch.object(time, 'monotonic',
+                                  side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'reap failed'):
+                activate_and_observe(['x'], report, 'u', None, None)
+        verify.assert_not_called()
+
+    def test_activation_cleanup_failure_is_reported_not_hidden(self):
+        module = sys.modules[__name__]
+        report = mock.Mock()
+        report.exists.return_value = True
+        clock = iter(range(0, 100))
+        process = self.fake_activation_process(alive=True)
+        process.communicate.side_effect = RuntimeError('cleanup broke')
+        with mock.patch.object(subprocess, 'Popen', return_value=process), \
+                mock.patch.object(module, 'verify_task_route',
+                                  side_effect=RuntimeError('bad report')), \
+                mock.patch.object(time, 'monotonic',
+                                  side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'), \
+                mock.patch('builtins.print') as printed:
+            with self.assertRaisesRegex(RuntimeError, 'bad report'):
+                activate_and_observe(['x'], report, 'u', None, None)
+        diagnostic = json.loads(printed.call_args.args[0])
+        self.assertEqual(diagnostic['probe'], 'com-control')
+        self.assertIn('cleanup broke', diagnostic['cleanup_error'])
+
+    def test_watcher_observes_report_at_root_exit_boundary(self):
+        with tempfile.TemporaryDirectory() as name:
+            report = Path(name) / 'r.json'
+            report.write_text(json.dumps({'pid': 7}))
+            captured = watch_worker_witnesses(
+                {'w': report}, time.monotonic() + 1,
+                lambda: False, lambda payload: {'kernel': True})
+        # Root already exited; the sweep-before-exit-check ordering still
+        # observes the report instead of skipping it.
+        self.assertEqual(captured['w'][0]['pid'], 7)
+        self.assertEqual(captured['w'][1], {'kernel': True})
+
+    def test_watcher_grace_catches_late_report_after_root_exit(self):
+        report = mock.Mock()
+        report.exists.side_effect = [False, False, True]
+        report.read_text.return_value = json.dumps({'pid': 9})
+        # Fine-grained clock within the two-second grace; all three report
+        # checks are accounted for, and the capture happens inside the
+        # grace sweeps themselves.
+        clock = iter([0.0, 1.0, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30,
+                      1.35, 1.40])
+        with mock.patch.object(time, 'monotonic',
+                               side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            captured = watch_worker_witnesses(
+                {'w': report}, 50.0, lambda: False, lambda payload: None)
+        self.assertEqual(captured['w'][0]['pid'], 9)
+        self.assertEqual(report.exists.call_count, 3)
+
+    def test_watcher_ignores_report_after_grace_expires(self):
+        report = mock.Mock()
+        # The report would exist on the third check, but only after the
+        # two-second post-exit grace has already expired.
+        report.exists.side_effect = [False, False, True]
+        report.read_text.return_value = json.dumps({'pid': 11})
+        clock = iter([0.0, 1.0, 1.1, 1.5, 1.9, 2.1])
+        with mock.patch.object(time, 'monotonic',
+                               side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            captured = watch_worker_witnesses(
+                {'w': report}, 50.0, lambda: False, lambda payload: None)
+        self.assertEqual(captured, {})
+        self.assertEqual(report.exists.call_count, 2)
+
+    def test_watcher_slow_inspection_cannot_license_another(self):
+        reports = {}
+        for name in ('a', 'b'):
+            report = mock.Mock()
+            report.exists.return_value = True
+            report.read_text.return_value = json.dumps({'pid': 1})
+            reports[name] = report
+        clock = [0.0]
+
+        # The first inspection consumes the entire remaining budget.
+        def inspect(payload):
+            clock[0] = 20.0
+            return 'inspected'
+        with mock.patch.object(time, 'monotonic',
+                               side_effect=lambda: clock[0]):
+            captured = watch_worker_witnesses(
+                reports, 10.0, lambda: True, inspect)
+        self.assertEqual(captured, {'a': ({'pid': 1}, 'inspected')})
+        self.assertIn('b', reports)
+        reports['b'].exists.assert_not_called()
+
+    def test_watcher_slow_exists_cannot_license_read(self):
+        report = mock.Mock()
+        clock = [0.0]
+        # exists() consumes the entire remaining budget; the read must not
+        # start afterwards.
+        report.exists.side_effect = lambda: clock.__setitem__(0, 20.0) or True
+        with mock.patch.object(time, 'monotonic',
+                               side_effect=lambda: clock[0]):
+            captured = watch_worker_witnesses(
+                {'w': report}, 10.0, lambda: True, lambda payload: None)
+        self.assertEqual(captured, {})
+        report.read_text.assert_not_called()
+
+    def test_watcher_never_sweeps_after_deadline(self):
+        report = mock.Mock()
+        report.exists.return_value = False
+        # Deadline reached at the sweep's own check: no report is read, and
+        # the loop-bound check after sleep stops the watcher.
+        clock = iter([0.0, 5.0, 5.0])
+        with mock.patch.object(time, 'monotonic',
+                               side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            captured = watch_worker_witnesses(
+                {'w': report}, 5.0, lambda: True, lambda payload: None)
+        self.assertEqual(captured, {})
+        self.assertEqual(report.exists.call_count, 0)
+
+    def test_watcher_returns_empty_at_deadline_without_reports(self):
+        report = mock.Mock()
+        report.exists.return_value = False
+        clock = iter([0, 5, 6, 7])
+        with mock.patch.object(time, 'monotonic',
+                               side_effect=lambda: next(clock)), \
+                mock.patch.object(time, 'sleep'):
+            captured = watch_worker_witnesses(
+                {'w': report}, 5.5, lambda: True, lambda payload: None)
+        self.assertEqual(captured, {})
+        # One report read inside the loop; the deadline expires before the
+        # second sweep can start.
+        self.assertEqual(report.exists.call_count, 1)
+
+    def test_reap_closes_pipes_even_when_reaping_fails(self):
+        process = self.fake_activation_process(alive=True)
+        process.communicate.side_effect = RuntimeError('reap failed')
+        with self.assertRaisesRegex(RuntimeError, 'reap failed'):
+            reap_activation_wrapper(process)
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+        process.kill.assert_called_once()
+
+    def test_scenario_deadline_defaults_before_observation(self):
+        self.assertEqual(_scenario_deadline(123.0), 123.0)
+        self.assertEqual(_scenario_deadline(None, now=100.0), 190.0)
+
+    def test_remaining_milliseconds_computes_shared_budget(self):
+        self.assertEqual(_remaining_milliseconds(None), 90000)
+        self.assertEqual(_remaining_milliseconds(110.0, now=100.0), 10000)
+        self.assertEqual(_remaining_milliseconds(90.0, now=100.0), 0)
+        self.assertEqual(_remaining_milliseconds(100.25, now=100.0), 250)
+
     def test_guid_from_text_matches_memory_layout(self):
         guid = escape_helpers['guid_from_text']
         # IID_IUnknown has a canonical little-endian memory layout.
@@ -1087,14 +1494,15 @@ print('RETURNED', flush=True)
 
     def test_com_activation_outcomes(self):
         api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
-        cases = [(-2147024891, 'activation-denied'),   # E_ACCESS_DENIED
-                 (-2147221164, 'class-not-registered'),  # REGDB_E_CLASSNOTREG
-                 (0, 'unexpected-activation-result'),
-                 (-2147467259, 'unexpected-activation-result')]
-        for hresult, outcome in cases:
+        for hresult, phase, outcome in [
+                (-2147024891, 'co-create', 'activation-denied'),
+                (-2147221164, 'co-create', 'class-not-registered'),
+                (0, 'co-create', 'unexpected-activation-result'),
+                (-2147467259, 'co-create', 'unexpected-activation-result'),
+                (-2147024891, 'co-initialize', 'unexpected-activation-result')]:
             reply = subprocess.CompletedProcess(
-                [], 0, json.dumps({'hresult': hresult, 'phase': 'co-create'}), '')
-            with self.subTest(hresult=hresult), \
+                [], 0, json.dumps({'hresult': hresult, 'phase': phase}), '')
+            with self.subTest(hresult=hresult, phase=phase), \
                     mock.patch('builtins.print'), \
                     mock.patch.object(subprocess, 'run', return_value=reply):
                 result = api.com_launch('{00000000-0000-0000-0000-000000000000}')
@@ -1521,7 +1929,6 @@ class AppContainerTests(unittest.TestCase):
         # route is live and dangerous via an unrestricted control activation,
         # then retarget the registration at the worker-attempt report. If the
         # control cannot launch, the route stays explicitly untested.
-        com_cls = None
         com_control_report = root / ('com-control-' + uuid.uuid4().hex + '.json')
         com_report = root / ('com-report-' + uuid.uuid4().hex + '.json')
         clsid = '{%s}' % uuid.uuid4()
@@ -1530,82 +1937,72 @@ class AppContainerTests(unittest.TestCase):
             return subprocess.list2cmdline(
                 [sys.executable, '-I', '-u', __file__, '--launch-witness',
                  str(manifest), str(report)])
+
         register_user_com_server(clsid, com_witness(com_control_report))
         self.addCleanup(unregister_user_com_server, clsid)
         escapes = Path(__file__).with_name('windows_escapes.py')
-        try:
-            control = subprocess.run(
-                [sys.executable, '-I', '-u', str(escapes), '--com-activate',
-                 clsid], capture_output=True, text=True, timeout=25)
-            control_detail = {'exit': control.returncode, 'stdout': control.stdout,
-                              'stderr': control.stderr}
-        except subprocess.TimeoutExpired as error:
-            control_detail = {'timed_out': True, 'detail': str(error)}
-        deadline = time.monotonic() + 15
-        while not com_control_report.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if com_control_report.exists():
-            payload = verify_task_route(com_control_report, owner, native, api)
+        # Each live route arms one independent worker attempt with its own
+        # per-arm report; no arm substitutes for another.
+        com_targets = []
+        payload, detail = activate_and_observe(
+            [sys.executable, '-I', '-u', str(escapes), '--com-activate', clsid],
+            com_control_report, owner, native, api)
+        if payload is not None:
             print(json.dumps({'com_control': payload, 'scope': 'user'}),
                   flush=True)
             # Wait out the control witness so a live instance cannot mask the
             # worker attempt, then retarget the registration.
             time.sleep(12)
             register_user_com_server(clsid, com_witness(com_report))
-            com_cls = clsid
+            com_targets.append({'name': 'user', 'clsid': clsid,
+                                'report': str(com_report)})
         else:
             print(json.dumps({'com_setup': 'control-failed',
                               'scope': 'user',
-                              'activation': control_detail}), flush=True)
+                              'activation': detail}), flush=True)
         # Machine-wide registration (arm 2): the supervisor registered a
         # disposable local server whose fixed bootstrap reads this request
-        # file. A separate control report path is mandatory: a late arm-1
-        # witness must never be counted as this arm's evidence. (Arm 1's
-        # 9757654 CLASSNOTREG is retracted: the activation used a mis-built
-        # GUID, so per-user session-0 visibility is unmeasured, not denied.)
+        # file. The arm runs unconditionally, and when its control goes live
+        # it receives its own worker attempt regardless of arm 1; a separate
+        # control report path is mandatory, since a late arm-1 witness must
+        # never count as this arm's evidence. (Arm 1's 9757654 CLASSNOTREG is
+        # retracted: the activation used a mis-built GUID, so per-user
+        # session-0 visibility is unmeasured, not denied.)
         com_fixture_path = Path(__file__).parent / 'com-fixture.json'
-        if com_cls is None and com_fixture_path.exists():
+        if com_fixture_path.exists():
             machine = json.loads(com_fixture_path.read_text())
             machine_cls = machine['clsid']
             com_request = Path(machine['request'])
             machine_control_report = root / ('com-machine-control-'
                                              + uuid.uuid4().hex + '.json')
+            machine_report = root / ('com-machine-report-'
+                                     + uuid.uuid4().hex + '.json')
             com_request.write_text(json.dumps(
                 {'manifest': str(manifest),
                  'report': str(machine_control_report)}))
-            try:
-                control = subprocess.run(
-                    [sys.executable, '-I', '-u', str(escapes), '--com-activate',
-                     machine_cls], capture_output=True, text=True, timeout=25)
-                control_detail = {'exit': control.returncode,
-                                  'stdout': control.stdout,
-                                  'stderr': control.stderr}
-            except subprocess.TimeoutExpired as error:
-                control_detail = {'timed_out': True, 'detail': str(error)}
-            deadline = time.monotonic() + 15
-            while not machine_control_report.exists() and \
-                    time.monotonic() < deadline:
-                time.sleep(0.05)
-            if machine_control_report.exists():
-                payload = verify_task_route(machine_control_report, owner,
-                                            native, api)
+            payload, detail = activate_and_observe(
+                [sys.executable, '-I', '-u', str(escapes), '--com-activate',
+                 machine_cls], machine_control_report, owner, native, api)
+            if payload is not None:
                 print(json.dumps({'com_control': payload, 'scope': 'machine'}),
                       flush=True)
                 # Wait out the control witness, then retarget the bootstrap.
                 time.sleep(12)
                 com_request.write_text(json.dumps(
-                    {'manifest': str(manifest), 'report': str(com_report)}))
-                com_cls = machine_cls
+                    {'manifest': str(manifest),
+                     'report': str(machine_report)}))
+                com_targets.append({'name': 'machine', 'clsid': machine_cls,
+                                    'report': str(machine_report)})
             else:
                 print(json.dumps({'com_setup': 'control-failed',
                                   'scope': 'machine',
-                                  'activation': control_detail}), flush=True)
+                                  'activation': detail}), flush=True)
         manifest.write_text(json.dumps({'secret': str(secret),
                                         'workspace': str(workspace),
                                         'owner': owner, 'package': package,
                                         'broker_pid': os.getpid(), 'peer': target,
                                         'scheduled_task': task_name,
-                                        'com': {'clsid': com_cls} if com_cls else None}))
+                                        'com': com_targets}))
         for mode in ('normal-root-exit', 'terminated-root'):
             with self.subTest(cleanup=mode):
                 directory = workspace / mode
@@ -1776,29 +2173,92 @@ class AppContainerTests(unittest.TestCase):
                             cleanup.callback(api.retire, handle)
         log = root / 'contained.log'
         self.assertIsNone(peer.poll(), 'unrestricted target exited before attacks')
+
+        def witness_kernel_token(payload):
+            """Inspect a witness process only while verifiably still running."""
+            try:
+                handle = native.check(native.open_process(
+                    0x1000 | 0x100000 | 1, False, payload['pid']))
+            except OSError:
+                return None
+            try:
+                if native.wait(handle, 0) != 258:
+                    # Already exited: this would not be a live inspection.
+                    return None
+                token = api.token(handle, 8)
+                try:
+                    return api.snapshot(token)
+                finally:
+                    api.close(token)
+            except OSError:
+                return None
+            finally:
+                api.close(handle)
+
+        # Live observation during the scenario: witnesses self-exit ten
+        # seconds after publishing, so kernel inspection must happen while
+        # the root process still runs. The observer and the final wait share
+        # one deadline, so observation never extends the launch budget.
+        live_witnesses = {}
+        scenario_deadline = time.monotonic() + 90
+
+        def observe_worker_witnesses(root_process, job):
+            watched = dict(
+                [('scheduled-task', task_report)] +
+                [('com-' + entry['name'], Path(entry['report']))
+                 for entry in com_targets])
+            live_witnesses.update(watch_worker_witnesses(
+                watched, scenario_deadline,
+                lambda: native.wait(root_process, 0) == 258,
+                witness_kernel_token))
+
         try:
             code = native.launch([sys.executable, '-I', '-u', __file__,
                                   '--contained', str(manifest)],
-                                 sid, workspace, log)
+                                 sid, workspace, log,
+                                 observe=observe_worker_witnesses,
+                                 deadline=scenario_deadline)
         finally:
             if log.exists():
                 print(log.read_text(errors='replace'), flush=True)
         self.assertIsNone(peer.poll(), 'unrestricted target died during attacks')
-        # Worker-side evidence is invoke-only; this protected report decides.
-        if task_report.exists():
-            payload = json.loads(task_report.read_text())
-            print(json.dumps({'scheduled_task_witness': payload}), flush=True)
-            unrestricted = payload['token']['user'] == owner and payload['token']['app'] == 0
-            read_credentials = payload['credential_access']['outcome'] != 'access-denied'
-            self.assertFalse(unrestricted and read_credentials,
-                             'contained worker invoked an unrestricted task')
-        if com_report.exists():
-            payload = json.loads(com_report.read_text())
-            print(json.dumps({'com_witness': payload}), flush=True)
-            unrestricted = payload['token']['user'] == owner and payload['token']['app'] == 0
-            read_credentials = payload['credential_access']['outcome'] != 'access-denied'
-            self.assertFalse(unrestricted and read_credentials,
-                             'contained worker launched an unrestricted COM server')
+        # Worker-side evidence: only a witness observed live while the
+        # scenario ran is decisive. A report that escaped live observation,
+        # a witness that could not be kernel-inspected while alive, or a
+        # token disagreement each fail closed rather than fall back to the
+        # self-report.
+        watched_reports = [('scheduled-task', task_report,
+                            'contained worker invoked an unrestricted task')]
+        watched_reports += [
+            ('com-' + entry['name'], Path(entry['report']),
+             'contained worker launched an unrestricted COM server')
+            for entry in com_targets]
+        for name, report_path, message in watched_reports:
+            live = live_witnesses.get(name)
+            if live is None:
+                if report_path.exists():
+                    self.fail('%s: witness report appeared but was never '
+                              'observed live' % name)
+                print(json.dumps({'witness': name,
+                                  'result': 'no report; invocation was '
+                                            'rejected or the route was not '
+                                            'armed'}), flush=True)
+                continue
+            payload, kernel = live
+            if kernel is None:
+                self.fail('%s: witness was not kernel-inspectable while '
+                          'live' % name)
+            if kernel != payload['token']:
+                self.fail('%s: kernel token disagrees with witness report'
+                          % name)
+            verdict = witness_verdict(
+                kernel, payload['credential_access'].get('outcome'),
+                owner, package)
+            print(json.dumps({'witness': name, 'verdict': verdict,
+                              'report': payload, 'kernel_token': kernel}),
+                  flush=True)
+            self.assertEqual(verdict, 'contained',
+                             '%s: %s' % (message, verdict))
         # Check integrity independently of the child-reported operation results.
         for leaf in names:
             self.assertEqual((secret / leaf).read_bytes(), b'FAKE-CREDENTIAL')

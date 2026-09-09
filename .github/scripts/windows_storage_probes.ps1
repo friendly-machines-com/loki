@@ -178,14 +178,25 @@ public static extern IntPtr LocalFree(IntPtr memory);
             }
             $descriptor = [IntPtr]::Zero
             $descriptorSize = [uint32]0
-            $launchSddl = 'O:SYD:P(A;;GA;;;' + $sid + ')(A;;GA;;;SY)(A;;GA;;;BA)'
+            # Old-format COM ACL: every ACE grants only COM_RIGHTS_EXECUTE,
+            # which the COM ACL documentation explicitly preserves for
+            # backward compatibility ("COM_RIGHTS_EXECUTE must always be
+            # present"; never mix old and new formats within one ACL). The
+            # legacy form is chosen deliberately as the simplest supported
+            # grant, and the descriptor still excludes every package SID,
+            # which is the property under test.
+            $launchRights = '0x1'
+            $launchSddl = 'O:SYD:P(A;;' + $launchRights + ';;;' + $sid +
+                ')(A;;' + $launchRights + ';;;SY)(A;;' + $launchRights + ';;;BA)'
             $converted = [Loki.ComSd]::ConvertStringSecurityDescriptorToSecurityDescriptor(
                 $launchSddl, 1, [ref]$descriptor, [ref]$descriptorSize)
             if (-not $converted) { throw 'Cannot build COM launch permission descriptor' }
-            $launchBytes = [byte[]]::new([int]$descriptorSize)
-            [Runtime.InteropServices.Marshal]::Copy(
-                $descriptor, $launchBytes, 0, [int]$descriptorSize)
-            [void][Loki.ComSd]::LocalFree($descriptor)
+            try {
+                $launchBytes = [byte[]]::new([int]$descriptorSize)
+                [Runtime.InteropServices.Marshal]::Copy(
+                    $descriptor, $launchBytes, 0, [int]$descriptorSize)
+            }
+            finally { [void][Loki.ComSd]::LocalFree($descriptor) }
             New-Item -Path ($comClsidPath + '\LocalServer32') -Force | Out-Null
             Set-ItemProperty -Path ($comClsidPath + '\LocalServer32') -Name '(default)' -Value $comCommand
             Set-ItemProperty -Path $comClsidPath -Name 'AppID' -Value $comAppid
@@ -278,17 +289,24 @@ finally {
         }
     }
     if ($comClsid -or $comAppid) {
-        # Quiet removal for keys a blocked registration never wrote; real
-        # failures are warnings.
-        try {
-            if ($comClsid -and (Test-Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid))) {
-                Remove-Item -Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid) -Recurse -Force
+        # Each key is attempted independently so one failure cannot hide
+        # another; quiet removal for keys a blocked registration never wrote.
+        if ($comClsid) {
+            try {
+                if (Test-Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid)) {
+                    Remove-Item -Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid) -Recurse -Force
+                }
             }
-            if ($comAppid -and (Test-Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid))) {
-                Remove-Item -Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid) -Recurse -Force
-            }
+            catch { Write-Warning $_; $cleanupFailed = $true }
         }
-        catch { Write-Warning $_; $cleanupFailed = $true }
+        if ($comAppid) {
+            try {
+                if (Test-Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid)) {
+                    Remove-Item -Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid) -Recurse -Force
+                }
+            }
+            catch { Write-Warning $_; $cleanupFailed = $true }
+        }
     }
     if ($null -ne $user) {
         if ($Probe -eq 'appcontainer') {
