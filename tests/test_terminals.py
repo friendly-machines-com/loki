@@ -1241,6 +1241,58 @@ class PromptControllerTests(unittest.TestCase):
             self.read_with_events([terminals.KeyEvent("CTRL_C")])
 
 
+class InputHistoryTests(unittest.TestCase):
+    def test_submitted_message_is_recalled_in_already_open_prompt(self):
+        async def scenario(restore_draft):
+            history = ["older message"]
+            next_prompt_open = asyncio.Event()
+
+            class Reader:
+                def __init__(self):
+                    self.keys = asyncio.Queue()
+                    self.read_count = 0
+
+                async def read_key(self):
+                    self.read_count += 1
+                    if self.read_count == 3:
+                        next_prompt_open.set()
+                    return await self.keys.get()
+
+            session = terminals.InputSession(
+                fd=0, history_provider=lambda: list(history))
+            session.reader = Reader()
+            for event in [terminals.KeyEvent("TEXT", "submitted message"),
+                          terminals.KeyEvent("ENTER")]:
+                session.reader.keys.put_nowait(event)
+            producer = asyncio.create_task(session._produce())
+            try:
+                submitted = await asyncio.wait_for(session.user_messages.get(), 1)
+                await asyncio.wait_for(next_prompt_open.wait(), 1)
+                # The turn consumer records the message after the next input
+                # field opens. Even if the API then fails, recall must work
+                # without reopening that field or submitting another message.
+                history.append(submitted)
+                events = [terminals.KeyEvent("TEXT", "draft"),
+                          terminals.KeyEvent("CURSOR_UP")]
+                if restore_draft:
+                    events.append(terminals.KeyEvent("CURSOR_DOWN"))
+                events.append(terminals.KeyEvent("ENTER"))
+                for event in events:
+                    session.reader.keys.put_nowait(event)
+                result = await asyncio.wait_for(session.user_messages.get(), 1)
+                self.assertEqual(
+                    result, "draft" if restore_draft else "submitted message")
+            finally:
+                producer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await producer
+
+        with mock.patch.object(terminals.os, "isatty", return_value=False):
+            for restore_draft in [False, True]:
+                with self.subTest(restore_draft=restore_draft):
+                    asyncio.run(scenario(restore_draft))
+
+
 class InputModalTests(unittest.TestCase):
     def test_modal_is_the_exclusive_direct_input_path(self):
         session = terminals.InputSession(fd=0)

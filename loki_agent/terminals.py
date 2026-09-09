@@ -1790,10 +1790,11 @@ class PromptRenderer:
 
 class PromptController:
     def __init__(self, terminal, prompt: str = 'User: ', history=None, session=None,
-                 on_mode_cycle=None):
+                 on_mode_cycle=None, history_provider=None):
         self.terminal = terminal
         self.prompt = prompt
         self.history = list(history or [])
+        self.history_provider = history_provider
         self.session = session  # AsyncKeyReader held for the whole session
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
 
@@ -1868,6 +1869,12 @@ class PromptController:
             elif event.kind == "END":
                 buffer.end()
             elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
+                if history_index == len(self.history) and self.history_provider:
+                    # The producer opens this prompt before the consumer adds
+                    # the submitted message to the transcript. Refresh on entry
+                    # to history, but keep a stable list while browsing it.
+                    self.history = list(self.history_provider() or [])
+                    history_index = len(self.history)
                 if self.history and history_index > 0:
                     if history_index == len(self.history):
                         saved_input = buffer.text()
@@ -1898,9 +1905,11 @@ class PromptController:
                 renderer.render(buffer)
 
 
-async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle=None):
+async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle=None,
+                          history_provider=None):
     return await PromptController(terminal, prompt or 'User: ', history=history, session=session,
-                                  on_mode_cycle=on_mode_cycle).read_text()
+                                  on_mode_cycle=on_mode_cycle,
+                                  history_provider=history_provider).read_text()
 
 
 class InputModal:
@@ -2077,8 +2086,8 @@ class InputSession:
     async def _produce(self):
         while True:
             try:
-                history = self.history_provider() if self.history_provider else None
-                text = await get_input_async(session=self.reader, history=history,
+                text = await get_input_async(session=self.reader,
+                                             history_provider=self.history_provider,
                                              on_mode_cycle=self.on_mode_cycle)
             except EOFError:
                 self.user_messages.put_nowait(None)  # sentinel: end of session
