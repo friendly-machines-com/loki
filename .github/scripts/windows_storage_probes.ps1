@@ -205,6 +205,70 @@ public static extern IntPtr LocalFree(IntPtr memory);
                 -Type Binary -Value $launchBytes
             @{ clsid = $comClsid; request = $comRequest } | ConvertTo-Json |
                 Set-Content -LiteralPath (Join-Path $root 'com-fixture.json')
+            # Read-only diagnosis of the machine registration. The arms differ
+            # in registry hive, AppID/LaunchPermission and launch command/
+            # bootstrap; the logs do not identify the offending value. Dump
+            # stored values, kinds and descriptor decoding without assigning
+            # a cause.
+            $dump = [ordered]@{ clsid = $comClsid; appid = $comAppid }
+            $paths = [ordered]@{
+                clsid_values = ('SOFTWARE\Classes\CLSID\' + $comClsid)
+                server_values = ('SOFTWARE\Classes\CLSID\' + $comClsid + '\LocalServer32')
+                appid_values = ('SOFTWARE\Classes\AppID\' + $comAppid)
+            }
+            foreach ($section in $paths.Keys) {
+                $key = $null
+                $dump[$section] = @()
+                try {
+                    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($paths[$section])
+                    if ($null -eq $key) { throw 'Registry key not found' }
+                    foreach ($valueName in $key.GetValueNames()) {
+                        # Attach the entry before reading it so partial data
+                        # survives a failure of this value or a later value.
+                        $entry = [ordered]@{ name = $valueName }
+                        $dump[$section] += $entry
+                        try {
+                            $kind = $key.GetValueKind($valueName)
+                            $entry['kind'] = $kind.ToString()
+                            $data = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                            if ($null -eq $data) { throw 'Registry value disappeared during inspection' }
+                            if ($kind -eq [Microsoft.Win32.RegistryValueKind]::Binary) {
+                                $bytes = [byte[]]$data
+                                $entry['length'] = $bytes.Length
+                                $entry['base64'] = [Convert]::ToBase64String($bytes)
+                                if ($section -eq 'appid_values' -and $valueName -eq 'LaunchPermission') {
+                                    # Decode only the stored LaunchPermission
+                                    # byte array. Raw data survives any parse
+                                    # or SDDL conversion failure.
+                                    try {
+                                        $storedDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($bytes, 0)
+                                        $entry['control_hex'] = ([int]$storedDescriptor.ControlFlags).ToString('X4')
+                                        $entry['self_relative'] = (($storedDescriptor.ControlFlags -band [System.Security.AccessControl.ControlFlags]::SelfRelative) -ne 0)
+                                        $entry['stored_round_trip_sddl'] = $storedDescriptor.GetSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+                                        # Parsing is not COM permission validation.
+                                        $entry['descriptor_parsed'] = $true
+                                    }
+                                    catch {
+                                        $entry['descriptor_parsed'] = $false
+                                        $entry['descriptor_error'] = $_.Exception.Message
+                                    }
+                                }
+                            }
+                            else { $entry['data'] = $data }
+                        }
+                        catch { $entry['read_error'] = $_.Exception.Message }
+                    }
+                }
+                catch { $dump[$section + '_error'] = $_.Exception.Message }
+                finally {
+                    if ($null -ne $key) {
+                        try { $key.Close() }
+                        catch { $dump[$section + '_cleanup_error'] = $_.Exception.Message }
+                    }
+                }
+            }
+            Write-Host ('COM registration dump: ' +
+                ($dump | ConvertTo-Json -Depth 5))
         }
         catch { Write-Host "COM fixture blocked: $_" }
     }
