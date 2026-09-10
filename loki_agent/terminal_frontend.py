@@ -857,6 +857,7 @@ async def async_main(args) -> int:
             if not user_in and not pending_images:
                 continue
 
+            print()
             terminal.set_background_color(terminals.INPUT_COLOR)
             print('User: ', end='')
             terminal.write_text(user_in, multiline=True)
