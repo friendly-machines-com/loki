@@ -188,9 +188,13 @@ public static extern IntPtr LocalFree(IntPtr memory);
             # present"; never mix old and new formats within one ACL). The
             # legacy form is chosen deliberately as the simplest supported
             # grant, and the descriptor still excludes every package SID,
-            # which is the property under test.
+            # which is the property under test. AccessCheck documents that
+            # both owner and group SIDs must be present. Adding G:SY meets
+            # that requirement without changing the DACL grants. Whether the
+            # missing group caused COM's earlier REGDB_E_INVALIDVALUE remains
+            # a hypothesis pending native confirmation.
             $launchRights = '0x1'
-            $launchSddl = 'O:SYD:P(A;;' + $launchRights + ';;;' + $sid +
+            $launchSddl = 'O:SYG:SYD:P(A;;' + $launchRights + ';;;' + $sid +
                 ')(A;;' + $launchRights + ';;;SY)(A;;' + $launchRights + ';;;BA)'
             $converted = [Loki.ComSd]::ConvertStringSecurityDescriptorToSecurityDescriptor(
                 $launchSddl, 1, [ref]$descriptor, [ref]$descriptorSize)
