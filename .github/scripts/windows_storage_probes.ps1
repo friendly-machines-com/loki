@@ -19,6 +19,8 @@ $taskName = $null
 $comClsid = $null
 $comAppid = $null
 $comClsidNoApp = $null
+$comClsidBareApp = $null
+$comAppidBare = $null
 $setupError = $null
 $exitCode = 1
 $root = Join-Path $env:ProgramData ('LokiStorageProbes-' + [guid]::NewGuid().ToString('N'))
@@ -226,6 +228,26 @@ public static extern IntPtr LocalFree(IntPtr memory);
         }
         catch { Write-Host "COM no-AppID fixture blocked: $_" }
 
+        # Third comparison: AppID linkage WITHOUT an explicit
+        # LaunchPermission (the AppID key exists and is referenced, but the
+        # launch check falls back to DefaultLaunchPermission). Separates a
+        # linkage problem from a descriptor problem. Setup stays independent.
+        $comClsidBareApp = '{' + [guid]::NewGuid().ToString() + '}'
+        $comAppidBare = '{' + [guid]::NewGuid().ToString() + '}'
+        $comRequestBareApp = Join-Path $root 'com-bareapp-request.json'
+        $comCommandBareApp = '"{0}" -I -u "{1}" --com-witness "{2}"' -f $executable, $script, $comRequestBareApp
+        $comClsidBareAppPath = 'HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidBareApp
+        $comAppidBarePath = 'HKLM:\SOFTWARE\Classes\AppID\' + $comAppidBare
+        try {
+            New-Item -Path ($comClsidBareAppPath + '\LocalServer32') -Force | Out-Null
+            Set-ItemProperty -Path ($comClsidBareAppPath + '\LocalServer32') -Name '(default)' -Value $comCommandBareApp
+            Set-ItemProperty -Path $comClsidBareAppPath -Name 'AppID' -Value $comAppidBare
+            New-Item -Path $comAppidBarePath -Force | Out-Null
+            $comFixture['clsid_bareappid'] = $comClsidBareApp
+            $comFixture['request_bareappid'] = $comRequestBareApp
+        }
+        catch { Write-Host "COM bare-AppID fixture blocked: $_" }
+
         if ($comFixture.Count -gt 0) {
             $comFixture | ConvertTo-Json |
                 Set-Content -LiteralPath (Join-Path $root 'com-fixture.json')
@@ -237,13 +259,17 @@ public static extern IntPtr LocalFree(IntPtr memory);
             # stored values, kinds and descriptor decoding without assigning
             # a cause.
             $dump = [ordered]@{ clsid = $comClsid; appid = $comAppid
-                                clsid_noappid = $comClsidNoApp }
+                                clsid_noappid = $comClsidNoApp
+                                clsid_bareappid = $comClsidBareApp }
             $paths = [ordered]@{
                 clsid_values = ('SOFTWARE\Classes\CLSID\' + $comClsid)
                 server_values = ('SOFTWARE\Classes\CLSID\' + $comClsid + '\LocalServer32')
                 appid_values = ('SOFTWARE\Classes\AppID\' + $comAppid)
                 noappid_clsid_values = ('SOFTWARE\Classes\CLSID\' + $comClsidNoApp)
                 noappid_server_values = ('SOFTWARE\Classes\CLSID\' + $comClsidNoApp + '\LocalServer32')
+                bareappid_clsid_values = ('SOFTWARE\Classes\CLSID\' + $comClsidBareApp)
+                bareappid_server_values = ('SOFTWARE\Classes\CLSID\' + $comClsidBareApp + '\LocalServer32')
+                bareappid_key_values = ('SOFTWARE\Classes\AppID\' + $comAppidBare)
             }
             foreach ($section in $paths.Keys) {
                 $key = $null
@@ -381,7 +407,8 @@ finally {
             catch { Write-Warning $_; $cleanupFailed = $true }
         }
     }
-    if ($comClsid -or $comAppid -or $comClsidNoApp) {
+    if ($comClsid -or $comAppid -or $comClsidNoApp -or
+        $comClsidBareApp -or $comAppidBare) {
         # Each key is attempted independently so one failure cannot hide
         # another; quiet removal for keys a blocked registration never wrote.
         if ($comClsid) {
@@ -404,6 +431,22 @@ finally {
             try {
                 if (Test-Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidNoApp)) {
                     Remove-Item -Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidNoApp) -Recurse -Force
+                }
+            }
+            catch { Write-Warning $_; $cleanupFailed = $true }
+        }
+        if ($comClsidBareApp) {
+            try {
+                if (Test-Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidBareApp)) {
+                    Remove-Item -Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidBareApp) -Recurse -Force
+                }
+            }
+            catch { Write-Warning $_; $cleanupFailed = $true }
+        }
+        if ($comAppidBare) {
+            try {
+                if (Test-Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppidBare)) {
+                    Remove-Item -Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppidBare) -Recurse -Force
                 }
             }
             catch { Write-Warning $_; $cleanupFailed = $true }

@@ -1976,7 +1976,9 @@ class AppContainerTests(unittest.TestCase):
             # not by itself identify the offending registration value.
             for scope, clsid_field, request_field in (
                     ('machine', 'clsid', 'request'),
-                    ('machine-noappid', 'clsid_noappid', 'request_noappid')):
+                    ('machine-noappid', 'clsid_noappid', 'request_noappid'),
+                    ('machine-bareappid', 'clsid_bareappid',
+                     'request_bareappid')):
                 with self.subTest(com_control=scope):
                     if clsid_field not in machine:
                         print(json.dumps({'com_setup': 'registration-unavailable',
@@ -2000,8 +2002,8 @@ class AppContainerTests(unittest.TestCase):
                     print(json.dumps({'com_control': payload, 'scope': scope}),
                           flush=True)
                     time.sleep(12)
-                    # The no-AppID comparison is control-only. It never
-                    # becomes a worker target or substitutes for the AppID arm.
+                    # The comparison arms are control-only; only the full
+                    # AppID+LaunchPermission arm arms a worker attempt.
                     if scope == 'machine':
                         machine_report = root / (
                             'com-machine-report-' + uuid.uuid4().hex + '.json')
