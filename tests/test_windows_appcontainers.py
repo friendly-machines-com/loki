@@ -1971,32 +1971,45 @@ class AppContainerTests(unittest.TestCase):
         com_fixture_path = Path(__file__).parent / 'com-fixture.json'
         if com_fixture_path.exists():
             machine = json.loads(com_fixture_path.read_text())
-            machine_cls = machine['clsid']
-            com_request = Path(machine['request'])
-            machine_control_report = root / ('com-machine-control-'
-                                             + uuid.uuid4().hex + '.json')
-            machine_report = root / ('com-machine-report-'
-                                     + uuid.uuid4().hex + '.json')
-            com_request.write_text(json.dumps(
-                {'manifest': str(manifest),
-                 'report': str(machine_control_report)}))
-            payload, detail = activate_and_observe(
-                [sys.executable, '-I', '-u', str(escapes), '--com-activate',
-                 machine_cls], machine_control_report, owner, native, api)
-            if payload is not None:
-                print(json.dumps({'com_control': payload, 'scope': 'machine'}),
-                      flush=True)
-                # Wait out the control witness, then retarget the bootstrap.
-                time.sleep(12)
-                com_request.write_text(json.dumps(
-                    {'manifest': str(manifest),
-                     'report': str(machine_report)}))
-                com_targets.append({'name': 'machine', 'clsid': machine_cls,
-                                    'report': str(machine_report)})
-            else:
-                print(json.dumps({'com_setup': 'control-failed',
-                                  'scope': 'machine',
-                                  'activation': detail}), flush=True)
+            # Setup and control failures in one arm must not suppress the
+            # other. A differing result narrows the investigation, but does
+            # not by itself identify the offending registration value.
+            for scope, clsid_field, request_field in (
+                    ('machine', 'clsid', 'request'),
+                    ('machine-noappid', 'clsid_noappid', 'request_noappid')):
+                with self.subTest(com_control=scope):
+                    if clsid_field not in machine:
+                        print(json.dumps({'com_setup': 'registration-unavailable',
+                                          'scope': scope}), flush=True)
+                        continue
+                    machine_cls = machine[clsid_field]
+                    com_request = Path(machine[request_field])
+                    control_report_path = root / (
+                        'com-' + scope + '-control-' + uuid.uuid4().hex + '.json')
+                    com_request.write_text(json.dumps(
+                        {'manifest': str(manifest),
+                         'report': str(control_report_path)}))
+                    payload, detail = activate_and_observe(
+                        [sys.executable, '-I', '-u', str(escapes), '--com-activate',
+                         machine_cls], control_report_path, owner, native, api)
+                    if payload is None:
+                        print(json.dumps({'com_setup': 'control-failed',
+                                          'scope': scope,
+                                          'activation': detail}), flush=True)
+                        continue
+                    print(json.dumps({'com_control': payload, 'scope': scope}),
+                          flush=True)
+                    time.sleep(12)
+                    # The no-AppID comparison is control-only. It never
+                    # becomes a worker target or substitutes for the AppID arm.
+                    if scope == 'machine':
+                        machine_report = root / (
+                            'com-machine-report-' + uuid.uuid4().hex + '.json')
+                        com_request.write_text(json.dumps(
+                            {'manifest': str(manifest),
+                             'report': str(machine_report)}))
+                        com_targets.append({'name': scope, 'clsid': machine_cls,
+                                            'report': str(machine_report)})
         manifest.write_text(json.dumps({'secret': str(secret),
                                         'workspace': str(workspace),
                                         'owner': owner, 'package': package,

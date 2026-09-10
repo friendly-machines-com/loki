@@ -18,6 +18,7 @@ $password = $null
 $taskName = $null
 $comClsid = $null
 $comAppid = $null
+$comClsidNoApp = $null
 $setupError = $null
 $exitCode = 1
 $root = Join-Path $env:ProgramData ('LokiStorageProbes-' + [guid]::NewGuid().ToString('N'))
@@ -166,6 +167,7 @@ try {
         $comCommand = '"{0}" -I -u "{1}" --com-witness "{2}"' -f $executable, $script, $comRequest
         $comClsidPath = 'HKLM:\SOFTWARE\Classes\CLSID\' + $comClsid
         $comAppidPath = 'HKLM:\SOFTWARE\Classes\AppID\' + $comAppid
+        $comFixture = @{}
         try {
             if (-not ('Loki.ComSd' -as [type])) {
                 Add-Type -Namespace Loki -Name ComSd -MemberDefinition @'
@@ -203,18 +205,45 @@ public static extern IntPtr LocalFree(IntPtr memory);
             New-Item -Path $comAppidPath -Force | Out-Null
             Set-ItemProperty -Path $comAppidPath -Name 'LaunchPermission' `
                 -Type Binary -Value $launchBytes
-            @{ clsid = $comClsid; request = $comRequest } | ConvertTo-Json |
+            $comFixture['clsid'] = $comClsid
+            $comFixture['request'] = $comRequest
+        }
+        catch { Write-Host "COM AppID fixture blocked: $_" }
+
+        # Control-only comparison with no explicit AppID/LaunchPermission.
+        # Different outcomes narrow the investigation; neither outcome alone
+        # identifies the offending value or proves a hive-wide limitation.
+        # Keep setup independent so either arm can run if the other fails.
+        $comClsidNoApp = '{' + [guid]::NewGuid().ToString() + '}'
+        $comRequestNoApp = Join-Path $root 'com-noapp-request.json'
+        $comCommandNoApp = '"{0}" -I -u "{1}" --com-witness "{2}"' -f $executable, $script, $comRequestNoApp
+        $comClsidNoAppPath = 'HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidNoApp
+        try {
+            New-Item -Path ($comClsidNoAppPath + '\LocalServer32') -Force | Out-Null
+            Set-ItemProperty -Path ($comClsidNoAppPath + '\LocalServer32') -Name '(default)' -Value $comCommandNoApp
+            $comFixture['clsid_noappid'] = $comClsidNoApp
+            $comFixture['request_noappid'] = $comRequestNoApp
+        }
+        catch { Write-Host "COM no-AppID fixture blocked: $_" }
+
+        if ($comFixture.Count -gt 0) {
+            $comFixture | ConvertTo-Json |
                 Set-Content -LiteralPath (Join-Path $root 'com-fixture.json')
+        }
+        try {
             # Read-only diagnosis of the machine registration. The arms differ
             # in registry hive, AppID/LaunchPermission and launch command/
             # bootstrap; the logs do not identify the offending value. Dump
             # stored values, kinds and descriptor decoding without assigning
             # a cause.
-            $dump = [ordered]@{ clsid = $comClsid; appid = $comAppid }
+            $dump = [ordered]@{ clsid = $comClsid; appid = $comAppid
+                                clsid_noappid = $comClsidNoApp }
             $paths = [ordered]@{
                 clsid_values = ('SOFTWARE\Classes\CLSID\' + $comClsid)
                 server_values = ('SOFTWARE\Classes\CLSID\' + $comClsid + '\LocalServer32')
                 appid_values = ('SOFTWARE\Classes\AppID\' + $comAppid)
+                noappid_clsid_values = ('SOFTWARE\Classes\CLSID\' + $comClsidNoApp)
+                noappid_server_values = ('SOFTWARE\Classes\CLSID\' + $comClsidNoApp + '\LocalServer32')
             }
             foreach ($section in $paths.Keys) {
                 $key = $null
@@ -270,7 +299,7 @@ public static extern IntPtr LocalFree(IntPtr memory);
             Write-Host ('COM registration dump: ' +
                 ($dump | ConvertTo-Json -Depth 5))
         }
-        catch { Write-Host "COM fixture blocked: $_" }
+        catch { Write-Host "COM registration dump failed: $_" }
     }
 
     $start = [Diagnostics.ProcessStartInfo]::new()
@@ -352,7 +381,7 @@ finally {
             catch { Write-Warning $_; $cleanupFailed = $true }
         }
     }
-    if ($comClsid -or $comAppid) {
+    if ($comClsid -or $comAppid -or $comClsidNoApp) {
         # Each key is attempted independently so one failure cannot hide
         # another; quiet removal for keys a blocked registration never wrote.
         if ($comClsid) {
@@ -367,6 +396,14 @@ finally {
             try {
                 if (Test-Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid)) {
                     Remove-Item -Path ('HKLM:\SOFTWARE\Classes\AppID\' + $comAppid) -Recurse -Force
+                }
+            }
+            catch { Write-Warning $_; $cleanupFailed = $true }
+        }
+        if ($comClsidNoApp) {
+            try {
+                if (Test-Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidNoApp)) {
+                    Remove-Item -Path ('HKLM:\SOFTWARE\Classes\CLSID\' + $comClsidNoApp) -Recurse -Force
                 }
             }
             catch { Write-Warning $_; $cleanupFailed = $true }
