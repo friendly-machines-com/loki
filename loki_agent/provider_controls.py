@@ -5,19 +5,29 @@ values a known control renders; it can never add, name, or parameterize a
 control.  That keeps a changed or hostile backend from turning itself into new
 executable authority.
 
-This module resolves which controls apply to the current connection and owns
-the data exchanged with the front-end.  All interaction (menus, confirmation,
-output) belongs to the front-end, not here.
+This module resolves which controls apply to the current connection, owns the
+authenticated request path the controls share, and defines the data exchanged
+with the front-end.  All interaction (menus, confirmation, output) belongs to
+the front-end, not here.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Awaitable, Callable
+
+from . import authentications, http_client
 
 # The single in-session entry point.  Controls are addressed as tokens under
 # it, so registering a control never adds a global command.
 ENTRY = "/account"
+
+_REQUEST_TIMEOUT_S = 30
+_REQUEST_MAX_BYTES = 1024 * 1024
+# Idempotent reads may be retried on a transient transport failure.  A
+# mutation must not be: it supplies its own idempotency instead.
+READ_RETRY_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -63,8 +73,12 @@ class ControlSpec:
 
 def _registry() -> tuple[ControlSpec, ...]:
     # Imported lazily so provider modules can import these types.
-    from . import openai_controls
-    return openai_controls.CONTROLS
+    from . import deepseek_controls, openai_controls, openrouter_controls
+    return (
+        *openai_controls.CONTROLS,
+        *openrouter_controls.CONTROLS,
+        *deepseek_controls.CONTROLS,
+    )
 
 
 def available_controls(context: ControlContext) -> list[ControlSpec]:
@@ -106,3 +120,78 @@ def live_hint(context: ControlContext) -> str | None:
         return None
     return "Live account data: " + ", ".join(
         f"{ENTRY} {spec.id}" for spec in specs)
+
+
+def connection_origin(context: ControlContext) -> str | None:
+    """The active chat endpoint's origin, or None if there is not one."""
+    provider = getattr(context.config, "chat_provider", None)
+    url = getattr(provider, "chat_url", None)
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        return authentications.authorization_origin(url)
+    except authentications.CredentialUnavailable:
+        return None
+
+
+async def authorized_request(context: ControlContext, spec, method, url, *,
+                             body=None, content_type=None,
+                             retry_max_attempts=1):
+    """Lease, send one authenticated request, recover at most one 401."""
+    request = context.request or http_client.async_http_request
+    base = {"Accept": "application/json"}
+    if content_type is not None:
+        base["Content-Type"] = content_type
+    rejected_generation = None
+    recovered = False
+    while True:
+        headers, lease = await authentications.authorized_request_headers(
+            context.credential_authority,
+            spec,
+            url,
+            base,
+            rejected_generation,
+        )
+        kwargs = {
+            "headers_in": headers,
+            "timeout": _REQUEST_TIMEOUT_S,
+            "max_bytes": _REQUEST_MAX_BYTES,
+            "retry_max_attempts": retry_max_attempts,
+        }
+        if body is not None:
+            kwargs["body"] = body
+        response = await request(method, url, **kwargs)
+        if (response.status == 401
+                and lease is not None
+                and lease.refreshable
+                and not recovered):
+            # Match inference recovery: a rejected generation refreshes once.
+            rejected_generation = lease.generation
+            recovered = True
+            continue
+        break
+    return response
+
+
+def json_document(response) -> object:
+    """Parse a successful account response, or raise a user-facing error."""
+    if response.status >= 400:
+        raise OSError(
+            f"provider API returned HTTP {response.status} {response.reason}")
+    if response.truncated:
+        raise OSError("provider response exceeds its size limit")
+    try:
+        return json.loads(response.body.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise OSError(f"provider response is invalid: {error}") from error
+
+
+def credential_spec(credential, *, scheme, authorized_origins=frozenset(),
+                    authorized_urls=frozenset()):
+    """An AuthSpec for one account control's own endpoints."""
+    return authentications.AuthSpec(
+        credential,
+        scheme,
+        authorized_origins=authorized_origins,
+        authorized_urls=authorized_urls,
+    )

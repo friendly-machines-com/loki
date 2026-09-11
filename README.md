@@ -452,12 +452,14 @@ are reported rather than overwritten; remove the file manually to start over.
 This is best-effort diagnostic state, not credential storage or durable accounting.
 
 `/account` is separate from the saved observations above. It makes live,
-provider-dependent account requests and currently supports the OpenAI ChatGPT
-subscription: `usage` reports current usage windows and the banked reset
-count, and `resets` lists banked limit-reset credits and can redeem one after
-an explicit confirmation. Running the entry performs no request; it only lists
-the controls the active connection supports. Redeeming is irreversible and is
-never automatic. `/status` stays offline and merely points at `/account` when
-the connection supports live data. `/account` results are not written to the
-response-header snapshot.
+provider-dependent account requests. Running the entry performs no request; it
+only lists the controls the active connection supports, and every action is
+explicitly selected. Redeeming is irreversible and is never automatic.
+Current controls: the OpenAI ChatGPT subscription exposes `usage` (current
+usage windows and banked reset count) and `resets` (banked limit-reset credits,
+with redemption); OpenRouter and DeepSeek expose `balance` (per-key spend limit
+and prepaid credit, or prepaid account balance). Each control may reach only
+the endpoints it declares, under its own authorization rule. `/status` stays
+offline and merely points at `/account` when the connection supports live data.
+`/account` results are not written to the response-header snapshot.
 

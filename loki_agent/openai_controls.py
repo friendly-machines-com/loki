@@ -13,7 +13,7 @@ import datetime
 import json
 import uuid
 
-from . import authentications, http_client, provider_controls
+from . import authentications, provider_controls
 
 
 OPENAI_CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -27,8 +27,6 @@ OPENAI_CHATGPT_ACCOUNT_URLS = frozenset({
     OPENAI_CHATGPT_CONSUME_RESET_URL,
 })
 
-_ACCOUNT_TIMEOUT_S = 30
-_ACCOUNT_MAX_BYTES = 1024 * 1024
 _PROVIDER_LABEL = "OpenAI ChatGPT subscription"
 
 
@@ -210,65 +208,19 @@ def _auth_spec(credential):
     )
 
 
-async def _request(context, method, url, *, body=None, content_type=None):
+def _account_spec(context):
     spec = getattr(context.config, "auth_spec", None)
     if spec is None or spec.credential is None:
         raise authentications.CredentialUnavailable(
             "no OpenAI subscription credential is selected")
-    account_spec = _auth_spec(spec.credential)
-    request = context.request or http_client.async_http_request
-    base = {"Accept": "application/json"}
-    if content_type is not None:
-        base["Content-Type"] = content_type
-    rejected_generation = None
-    recovered = False
-    while True:
-        headers, lease = await authentications.authorized_request_headers(
-            context.credential_authority,
-            account_spec,
-            url,
-            base,
-            rejected_generation,
-        )
-        kwargs = {
-            "headers_in": headers,
-            "timeout": _ACCOUNT_TIMEOUT_S,
-            "max_bytes": _ACCOUNT_MAX_BYTES,
-            # Account operations are not automatically retried: the credential
-            # refresh below is the only replay, and a mutation supplies its own
-            # idempotency key instead.
-            "retry_max_attempts": 1,
-        }
-        if body is not None:
-            kwargs["body"] = body
-        response = await request(method, url, **kwargs)
-        if (response.status == 401
-                and lease is not None
-                and lease.refreshable
-                and not recovered):
-            # Match inference recovery: a rejected generation refreshes once.
-            rejected_generation = lease.generation
-            recovered = True
-            continue
-        break
-    return response
-
-
-def _json_body(response):
-    if response.status >= 400:
-        raise OSError(
-            f"account API returned HTTP {response.status} {response.reason}")
-    if response.truncated:
-        raise OSError("account response exceeds its size limit")
-    try:
-        return json.loads(response.body.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError) as error:
-        raise OSError(f"account response is invalid: {error}") from error
+    return _auth_spec(spec.credential)
 
 
 async def _read_usage(context) -> provider_controls.ControlResult:
-    response = await _request(context, "GET", OPENAI_CHATGPT_USAGE_URL)
-    payload = _json_body(response)
+    response = await provider_controls.authorized_request(
+        context, _account_spec(context), "GET", OPENAI_CHATGPT_USAGE_URL,
+        retry_max_attempts=provider_controls.READ_RETRY_MAX_ATTEMPTS)
+    payload = provider_controls.json_document(response)
     return provider_controls.ControlResult(
         lines=tuple(_usage_lines(payload)),
         document={
@@ -279,8 +231,11 @@ async def _read_usage(context) -> provider_controls.ControlResult:
 
 
 async def _read_resets(context) -> provider_controls.ControlResult:
-    response = await _request(context, "GET", OPENAI_CHATGPT_RESET_CREDITS_URL)
-    payload = _json_body(response)
+    response = await provider_controls.authorized_request(
+        context, _account_spec(context), "GET",
+        OPENAI_CHATGPT_RESET_CREDITS_URL,
+        retry_max_attempts=provider_controls.READ_RETRY_MAX_ATTEMPTS)
+    payload = provider_controls.json_document(response)
     credits = payload.get("credits") if isinstance(payload, dict) else None
     credits = credits if isinstance(credits, list) else []
     actions = tuple(
@@ -334,8 +289,9 @@ async def _redeem(context, credit_id: str) -> provider_controls.ControlResult:
         "redeem_request_id": request_id,
     }).encode("utf-8")
     try:
-        response = await _request(
-            context, "POST", OPENAI_CHATGPT_CONSUME_RESET_URL,
+        response = await provider_controls.authorized_request(
+            context, _account_spec(context), "POST",
+            OPENAI_CHATGPT_CONSUME_RESET_URL,
             body=body, content_type="application/json")
     except Exception as error:  # noqa: BLE001 - reported, never retried
         return provider_controls.ControlResult(lines=(
@@ -358,7 +314,7 @@ async def _redeem(context, credit_id: str) -> provider_controls.ControlResult:
             f"Provider returned HTTP {response.status} "
             f"{_text(response.reason)}.",
         ))
-    payload = _json_body(response)
+    payload = provider_controls.json_document(response)
     code = payload.get("code") if isinstance(payload, dict) else None
     windows = payload.get("windows_reset") if isinstance(payload, dict) else None
     if code == "reset":
