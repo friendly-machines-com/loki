@@ -231,11 +231,11 @@ def load_image_attachment(path_text: str, *,
 
 def _print_tool_args(args):
     if not isinstance(args, dict):
-        terminal.write_text(pformat(args), multiline=True)
+        terminal.write_text(pformat(args, width=10000), multiline=True)
         print()
         return
     for k, v in args.items():
-        terminal.write_text(pformat((k, v)), multiline=True)
+        terminal.write_text(pformat((k, v), width=10000), multiline=True)
         print()
 
 
