@@ -48,7 +48,12 @@ OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION = "0.153.0"
 OPENAI_CHATGPT_MODELS_REQUEST_URL = (
     f"{OPENAI_CHATGPT_MODELS_URL}?client_version="
     f"{OPENAI_CHATGPT_CODEX_COMPATIBILITY_VERSION}")
-OPENAI_CHATGPT_AUTHORIZED_URLS = frozenset({
+# The exact Codex endpoints the ChatGPT subscription credential may authorize
+# for inference and model discovery.  Account-level endpoints are a separate
+# authority domain and are declared by their own control module; they are never
+# added here, so a control-path bug cannot widen where the inference credential
+# may be sent.
+OPENAI_CHATGPT_CODEX_URLS = frozenset({
     OPENAI_CHATGPT_RESPONSES_URL,
     OPENAI_CHATGPT_MODELS_REQUEST_URL,
 })
@@ -113,6 +118,11 @@ class AuthSpec:
     # Provider was constructed. This binds authorization policy to provider
     # configuration without retaining a secret in either object.
     authorized_origins: frozenset[str] = frozenset()
+    # The subscription scheme authorizes exact request URLs rather than
+    # origins because its private endpoints permit no query or path variation.
+    # An empty set authorizes nothing, so a caller that forgets to supply its
+    # endpoints fails closed.
+    authorized_urls: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -522,7 +532,7 @@ def validate_authorization_target(
             or parsed.hostname is None
             or parsed.hostname.lower() != "chatgpt.com"
             or parsed.fragment
-            or request_url not in OPENAI_CHATGPT_AUTHORIZED_URLS):
+            or request_url not in spec.authorized_urls):
         raise CredentialUnavailable(
             "OpenAI subscription credentials may only be sent to "
             "the canonical ChatGPT Codex endpoints")

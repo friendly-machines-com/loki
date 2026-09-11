@@ -57,9 +57,10 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
         spec = auth.AuthSpec(
             auth.CredentialRef.openai_subscription(),
             "openai-subscription",
+            authorized_urls=auth.OPENAI_CHATGPT_CODEX_URLS,
         )
 
-        for url in auth.OPENAI_CHATGPT_AUTHORIZED_URLS:
+        for url in auth.OPENAI_CHATGPT_CODEX_URLS:
             auth.validate_authorization_target(spec, url)
         for url in [
                 "http://chatgpt.com/backend-api/codex/responses",
@@ -69,6 +70,36 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 auth.OPENAI_CHATGPT_MODELS_URL + "?client_version=999.0.0",
                 "https://chatgpt.com.evil.test/backend-api/codex/responses",
                 "https://evil.test/backend-api/codex/responses",
+        ]:
+            with self.subTest(url=url):
+                with self.assertRaises(auth.CredentialUnavailable):
+                    auth.validate_authorization_target(spec, url)
+
+    async def test_empty_authorized_urls_rejects_every_target(self):
+        # A caller that forgets its endpoint set must fail closed rather than
+        # fall back to a global allowlist.
+        spec = auth.AuthSpec(
+            auth.CredentialRef.openai_subscription(),
+            "openai-subscription",
+        )
+
+        with self.assertRaises(auth.CredentialUnavailable):
+            auth.validate_authorization_target(
+                spec, auth.OPENAI_CHATGPT_RESPONSES_URL)
+
+    async def test_account_urls_are_not_codex_inference_targets(self):
+        spec = auth.AuthSpec(
+            auth.CredentialRef.openai_subscription(),
+            "openai-subscription",
+            authorized_urls=auth.OPENAI_CHATGPT_CODEX_URLS,
+        )
+
+        for url in [
+                "https://chatgpt.com/backend-api/wham/usage",
+                "https://chatgpt.com/backend-api/wham/"
+                "rate-limit-reset-credits",
+                "https://chatgpt.com/backend-api/wham/"
+                "rate-limit-reset-credits/consume",
         ]:
             with self.subTest(url=url):
                 with self.assertRaises(auth.CredentialUnavailable):
@@ -418,7 +449,9 @@ class AuthorizedRequestHeaderTests(unittest.IsolatedAsyncioTestCase):
 
         headers, lease = await auth.authorized_request_headers(
             broker,
-            auth.AuthSpec(ref, "openai-subscription"),
+            auth.AuthSpec(
+                ref, "openai-subscription",
+                authorized_urls=auth.OPENAI_CHATGPT_CODEX_URLS),
             auth.OPENAI_CHATGPT_RESPONSES_URL,
             {"Accept": "text/event-stream"},
         )

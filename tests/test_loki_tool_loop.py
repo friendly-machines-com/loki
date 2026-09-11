@@ -2510,7 +2510,7 @@ class StatusTextTests(unittest.TestCase):
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
             "queued messages: 2, queued images: 1, "
             f"mode: {loki.current_agent_mode()}; "
-            "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
+            "/pwd, /cd DIR, /ps, /image PATH, !foo, /account, /quit",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)

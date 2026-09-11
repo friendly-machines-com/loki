@@ -52,6 +52,18 @@ class Guids(C.Structure):
                 ('data3', W.WORD), ('data4', C.c_ubyte * 8)]
 
 
+class PlainStartups(C.Structure):
+    """STARTUPINFO without the extended attribute list."""
+
+    _fields_ = [('cb', ULONG), ('reserved', W.LPWSTR),
+                ('desktop', W.LPWSTR), ('title', W.LPWSTR),
+                ('x', ULONG), ('y', ULONG), ('xsize', ULONG), ('ysize', ULONG),
+                ('xchars', ULONG), ('ychars', ULONG), ('fill', ULONG),
+                ('show', C.c_uint16),
+                ('reserved_size', C.c_uint16), ('reserved_bytes', HANDLE),
+                ('stdin', HANDLE), ('stdout', HANDLE), ('stderr', HANDLE)]
+
+
 class PrivilegeEntries(C.Structure):
     _fields_ = [('luid', Luids), ('attributes', ULONG)]
 
@@ -441,25 +453,34 @@ try {
                                (reply['pid'], error))
         return self.inspect_witness(process, report, owner, package)
 
-    def launch_as_user(self, primary, executable, command, startup, child):
+    def launch_as_user(self, primary, executable, command, startup, child,
+                       flags):
         return self.create_as_user(primary, executable, command, None, None,
-                                   False, 0x80000 | 4, None, None,
+                                   False, flags, None, None,
                                    C.byref(startup), C.byref(child))
 
-    def launch_with_token(self, primary, executable, command, startup, child):
+    def launch_with_token(self, primary, executable, command, startup, child,
+                          flags):
         # Nine-argument contract; dwLogonFlags 0 loads no profile for the
         # bounded suspended witness.
         return self.create_with_token(primary, 0, executable, command,
-                                      0x80000 | 4, None, None,
+                                      flags, None, None,
                                       C.byref(startup), C.byref(child))
 
-    def token_launch(self, launcher, rights, executable, owner, package):
+    def token_launch(self, launcher, rights, executable, owner, package,
+                     plain=False):
         """Launch through a token-based creator using a fresh primary duplicate.
 
         Duplication and creation denial are reported at their named stage and
         only for documented denial errors; other failures are probe errors.
         An unexpected success stays suspended until its token is inspected, so
         no uninspected code runs under a possibly widened identity.
+
+        The plain variant passes STARTUPINFO without
+        EXTENDED_STARTUPINFO_PRESENT: the API documents both forms, the probe
+        needs no attribute list, and the discriminator separates an
+        extended-structure rejection from other causes for the observed
+        error 87.
         """
         print(json.dumps({'probe': 'token-launch', 'phase': 'duplicate'}),
               flush=True)
@@ -471,29 +492,41 @@ try {
         finally:
             self.close(source)
         try:
-            startup = self.startup_type()
-            startup.startup.cb = C.sizeof(startup)
+            if plain:
+                startup = PlainStartups()
+                startup.cb = C.sizeof(startup)
+                flags = 4  # CREATE_SUSPENDED only
+            else:
+                startup = self.startup_type()
+                startup.startup.cb = C.sizeof(startup)
+                flags = 0x80000 | 4
             child = self.process_type()
             command = C.create_unicode_buffer(subprocess.list2cmdline(
                 [executable, '-I', '-c', 'pass']))
-            print(json.dumps({'probe': 'token-launch', 'phase': 'create'}),
+            print(json.dumps({'probe': 'token-launch', 'phase': 'create',
+                              'startupinfo': 'plain' if plain else 'extended'}),
                   flush=True)
-            success = launcher(primary, executable, command, startup, child)
+            success = launcher(primary, executable, command, startup, child,
+                               flags)
             if not success:
                 error = C.get_last_error()
                 if error in (5, 1314):  # ACCESS_DENIED, PRIVILEGE_NOT_HELD
                     return {'outcome': 'access-denied', 'phase': 'create',
-                            'winerror': error}
-                if error == 87:  # ERROR_INVALID_PARAMETER: native cea20fa
-                    # showed the DuplicateTokenEx primary does not meet this
-                    # API's undocumented logon-session requirement. Inconclusive
-                    # for this route; never denial and never an escape claim.
+                            'winerror': error,
+                            'startupinfo': 'plain' if plain else 'extended'}
+                if error == 87:  # ERROR_INVALID_PARAMETER
+                    # Documentation names DuplicateTokenEx as a valid token
+                    # source and 1314 as the privilege failure, never 87. The
+                    # extended-structure path is the untried documented
+                    # difference; inconclusive for this route either way.
                     return {'outcome': 'parameter-rejected-inconclusive',
-                            'phase': 'create', 'winerror': error}
+                            'phase': 'create', 'winerror': error,
+                            'startupinfo': 'plain' if plain else 'extended'}
                 # Invalid parameters and unknown failures are probe errors,
                 # never containment evidence.
                 return {'outcome': 'unexpected-launch-result',
-                        'phase': 'create', 'winerror': error}
+                        'phase': 'create', 'winerror': error,
+                        'startupinfo': 'plain' if plain else 'extended'}
             self.created += 1  # Conservatively treat success as a launch.
             with ExitStack() as cleanup:
                 cleanup.callback(self.close, child.thread)

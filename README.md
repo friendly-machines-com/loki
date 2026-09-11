@@ -138,7 +138,11 @@ Its selectable models come only from that account's authenticated ChatGPT
 Codex model catalog; Loki does not copy OpenAI Platform models from models.dev
 into the subscription provider. Subscription authorization is permitted only
 for the exact ChatGPT Codex Responses URL and the model-list request with
-Loki's pinned, tested Codex compatibility level. The authenticated account's
+Loki's pinned, tested Codex compatibility level. The separate `/account`
+usage and limit-reset endpoints are declared by their own control module and
+authorized through their own URL set, so inference code cannot reach them and
+an account-control defect cannot widen where the inference credential is sent.
+The authenticated account's
 picker-visible models remain authoritative; Loki does not silently remove
 models based on their request metadata. Models advertising Responses-Lite
 are sent with that protocol's header, all-turn reasoning context, developer
@@ -446,4 +450,14 @@ headers contain no secrets; do not publish the snapshot unreviewed. Values are
 escaped for terminal display and never replayed as request headers. Invalid snapshots
 are reported rather than overwritten; remove the file manually to start over.
 This is best-effort diagnostic state, not credential storage or durable accounting.
+
+`/account` is separate from the saved observations above. It makes live,
+provider-dependent account requests and currently supports the OpenAI ChatGPT
+subscription: `usage` reports current usage windows and the banked reset
+count, and `resets` lists banked limit-reset credits and can redeem one after
+an explicit confirmation. Running the entry performs no request; it only lists
+the controls the active connection supports. Redeeming is irreversible and is
+never automatic. `/status` stays offline and merely points at `/account` when
+the connection supports live data. `/account` results are not written to the
+response-header snapshot.
 

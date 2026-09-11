@@ -531,7 +531,8 @@ async def fetch_openai_subscription_models(
             "OpenAI subscription credential is unavailable")
     request_function = request or http_client.async_http_request
     auth_spec = authentications.AuthSpec(
-        credential, "openai-subscription")
+        credential, "openai-subscription",
+        authorized_urls=authentications.OPENAI_CHATGPT_CODEX_URLS)
     request_url = authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL
     authentications.validate_authorization_target(auth_spec, request_url)
 

@@ -23,6 +23,7 @@ from pprint import pformat
 
 from .diagnostics import debug_json
 from . import formats
+from . import authentications
 from . import credential_capabilities
 from . import credential_runtimes
 from . import models as modelsdev
@@ -502,7 +503,7 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
         remote + '\n'
         'Local: CWD: {}, turn: {}, queued messages: {}, queued images: {}, '
         'mode: {}; '
-        '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
+        '/pwd, /cd DIR, /ps, /image PATH, !foo, /account, /quit'
     ).format(
         fields["cwd"],
         fields["turn"],
@@ -538,7 +539,7 @@ def _write_status_text():
             print(terminals.BOLD_OFF, end="")
     print(", mode: ", end="")
     terminal.write_text(fields["mode"])
-    print("; /pwd, /cd DIR, /ps, /image PATH, !foo, /quit", end="")
+    print("; /pwd, /cd DIR, /ps, /image PATH, !foo, /account, /quit", end="")
 
 
 terminals.set_status_text_provider(_write_status_text)
@@ -637,6 +638,117 @@ async def confirm_saved_connection_async(
         return answer.strip().lower() in ("y", "yes")
 
 
+async def _numbered_choice_async(modal, header, rows, prompt):
+    """Minimal numbered choice, matching the reasoning-effort picker.
+
+    Rows are ``(value, label)``.  A bare number selects; empty cancels;
+    anything else re-renders.
+    """
+    print()
+    print(header)
+    for index, (_value, label) in enumerate(rows, start=1):
+        terminal.write_text(f"{index}. {label}", multiline=True)
+        print()
+    while True:
+        choice = (await modal.prompt(prompt) or "").strip()
+        if not choice:
+            return None
+        try:
+            index = int(choice)
+        except ValueError:
+            continue
+        if 1 <= index <= len(rows):
+            return rows[index - 1][0]
+
+
+def _write_control_result(result, as_json):
+    if as_json and result.document is not None:
+        terminal.write_text(
+            json.dumps(result.document, indent=2, ensure_ascii=True),
+            multiline=True)
+        print()
+        return
+    terminal.write_text("\n".join(result.lines), multiline=True)
+    print()
+
+
+async def run_account_controls_async(command_text, session):
+    """Dispatch the provider-dependent account-control entry point.
+
+    The entry lists controls available for the active connection; an optional
+    control id runs its read, and an optional action id performs one of the
+    actions that read offered.  Nothing here runs implicitly.
+    """
+    from . import provider_controls
+    tokens = command_text.split()
+    rest = [token for token in tokens[1:] if token != "--json"]
+    as_json = "--json" in tokens[1:]
+    context = provider_controls.ControlContext(
+        config=current_config(),
+        credential_authority=current_session().credential_authority,
+    )
+    async with session.modal() as modal:
+        if not rest:
+            specs = provider_controls.available_controls(context)
+            if not specs:
+                print()
+                print("No live account controls for the active connection.")
+                return
+            rows = [
+                (spec.id, f"{spec.title} - {spec.description}")
+                for spec in specs
+            ]
+            chosen = await _numbered_choice_async(
+                modal, "Account controls:", rows,
+                "Control choice (number selects, empty cancels): ")
+            if chosen is None:
+                return
+        else:
+            chosen = rest[0]
+        spec = provider_controls.find_control(context, chosen)
+        if spec is None:
+            print()
+            print(f"No such account control: {chosen}")
+            names = ", ".join(
+                item.id
+                for item in provider_controls.available_controls(context))
+            if names:
+                print(f"Available controls: {names}")
+            return
+        action_id = rest[1] if len(rest) > 1 else None
+        try:
+            result = await spec.read(context)
+        except (OSError, ValueError, OverflowError,
+                authentications.CredentialError) as error:
+            _print_text_line(
+                f"Could not read account {chosen}: ", error,
+                file=sys.stderr, multiline=True)
+            sys.stderr.flush()
+            return
+        _write_control_result(result, as_json)
+        if action_id is not None:
+            action = next(
+                (item for item in result.actions if item.id == action_id),
+                None)
+            if action is None:
+                print(f"No such action: {action_id}")
+                return
+        elif result.actions:
+            rows = [(item, item.title) for item in result.actions]
+            action = await _numbered_choice_async(
+                modal, "Actions:", rows,
+                "Action choice (number selects, empty cancels): ")
+            if action is None:
+                return
+        else:
+            return
+        answer = (await modal.prompt(f"{action.confirm} [y/N]: ") or "")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return
+        _write_control_result(await action.run(), as_json)
+
+
 USAGE = """\
 usage: loki [options]
 
@@ -653,6 +765,7 @@ Without options, loki starts the interactive TUI.
 Use /status for the current connection, /status all for all known connections.
 Add --json for JSON; /status save saves this runtime's response observations.
 Use loki status [--json] [--endpoint URL] to inspect saved response headers.
+Use /account for live provider usage and limit resets, when supported.
 """
 
 
@@ -904,6 +1017,14 @@ async def async_main(args) -> int:
                                 text += response_headers.render(document)
                         terminal.write_text(text, multiline=True)
                         print()
+                        # /status stays offline; this only points at live
+                        # provider data when the connection supports it.
+                        from . import provider_controls
+                        hint = provider_controls.live_hint(
+                            provider_controls.ControlContext(config=config))
+                        if hint is not None:
+                            terminal.write_text(hint, multiline=True)
+                            print()
                     except (OSError, ValueError, OverflowError) as error:
                         _print_text_line("Could not read response status: ",
                                          error, file=sys.stderr)
@@ -915,6 +1036,10 @@ async def async_main(args) -> int:
                     except (OSError, ValueError) as error:
                         _print_text_line("Could not save response status: ",
                                          error, file=sys.stderr)
+                    continue
+                case _ if (command_text == '/account'
+                           or command_text.startswith('/account ')):
+                    await run_account_controls_async(command_text, session)
                     continue
                 case '/model':
                     explicit_option = explicit_connection_option(_core.CREDENTIALS)

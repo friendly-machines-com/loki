@@ -412,6 +412,13 @@ def _auth_spec(provider_kind, credential_ref, request_urls,
             for url in request_urls
             if url is not None
         ),
+        # The subscription scheme is bound to the canonical Codex URLs here
+        # rather than to whatever endpoints the provider happens to expose, so
+        # a provider-configuration change cannot widen credential authority.
+        authorized_urls=(
+            authentications.OPENAI_CHATGPT_CODEX_URLS
+            if scheme == "openai-subscription" else frozenset()
+        ),
     )
 
 
