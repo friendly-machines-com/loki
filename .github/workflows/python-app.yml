@@ -48,6 +48,19 @@ jobs:
       # Fails on anything not named in vulture_whitelist.py, so new dead
       # functions/classes/attributes cannot land silently.
       run: python -m vulture
+    - name: Allow unprivileged user namespaces (Linux)
+      # The credential-isolation path (runtime_isolations.py) enters a private
+      # user+mount namespace via unshare(CLONE_NEWUSER|CLONE_NEWNS) and then
+      # writes "deny" to /proc/self/setgroups before mapping uid/gid. On
+      # Ubuntu 24.04 the AppArmor restriction
+      # kernel.apparmor_restrict_unprivileged_userns=1 denies the CAP_SYS_ADMIN
+      # that setgroups write needs, so every real-process test dies with:
+      #   Security initialization error: could not configure
+      #   /proc/self/setgroups: [Errno 13] Permission denied
+      # Disable only that one restriction for this job; the tests still run as
+      # the normal unprivileged runner user.
+      if: runner.os == 'Linux'
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
     - name: Test
       run: |
         python -m unittest discover -s tests -v
