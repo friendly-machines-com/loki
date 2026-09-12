@@ -21,6 +21,8 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 
+from . import paths
+
 
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _ANY_CREDENTIAL = object()
@@ -41,8 +43,9 @@ def _safe_value(name, value):
 
 
 def snapshot_path():
-    home = os.environ.get("XDG_STATE_HOME") or "~/.local/state"
-    return os.path.join(os.path.expanduser(home), "loki", "response-headers.json")
+    # One source of truth for the state location: this used to re-derive
+    # XDG_STATE_HOME independently, which is how the two copies could drift.
+    return os.path.join(paths.loki_state_dir(), "response-headers.json")
 
 
 def sanitized_endpoint(url):

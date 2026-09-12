@@ -442,7 +442,8 @@ lose pending observations. Other live workers' unsaved memory is not visible to
 `/status` or the standalone command; `/status save` only flushes this runtime.
 
 The snapshot is `$XDG_STATE_HOME/loki/response-headers.json` (normally
-`~/.local/state/loki/response-headers.json`), written by atomic replacement with
+`~/.local/state/loki/response-headers.json`; on Windows,
+`%LOCALAPPDATA%\loki\response-headers.json`), written by atomic replacement with
 mode 0600. Only response headers are observed, never request headers. Known
 secret-bearing fields (cookies, authorization/API keys, session tokens, and
 Codex routing state) retain their names but have values replaced by `[redacted]`

@@ -4,13 +4,15 @@ Credential supervisors and isolated runtimes must calculate the same path
 without importing :mod:`loki_agent.loki`: importing the complete agent core
 before runtime isolation would make the security boundary depend on import
 order.  This small module is therefore the single source of truth for Loki's
-XDG locations.
+locations: XDG on POSIX, the LocalAppData known folder on Windows.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+
+from . import windows_api
 
 
 LOKI_CONFIG_DIR_NAME = "loki"
@@ -50,15 +52,69 @@ def private_directory_support_error() -> str | None:
     )
 
 
-def xdg_config_home(environ=None) -> str:
+def config_base_directory(environ=None) -> str:
+    """Return the directory that holds Loki's per-user state.
+
+    ``XDG_CONFIG_HOME`` wins when it is explicitly set, on every platform: it
+    is the documented override, and it is how callers and tests inject a
+    location.  Otherwise POSIX falls back to ``~/.config`` and Windows asks for
+    the LocalAppData known folder.
+
+    Windows uses *local* rather than roaming app data because this tree holds
+    credentials: a roaming profile is copied to a server, and secrets must not
+    travel with it.
+    """
     values = os.environ if environ is None else environ
     configured = values.get("XDG_CONFIG_HOME")
-    return os.path.expanduser(configured or "~/.config")
+    if configured:
+        return os.path.expanduser(configured)
+    if sys.platform == "win32":
+        return _windows_local_app_data()
+    return os.path.expanduser("~/.config")
+
+
+def _windows_local_app_data() -> str:
+    resolved = windows_api.known_folder(
+        windows_api.FOLDERID_LOCAL_APP_DATA,
+        # Resolve the same path whether or not the caller is packaged or inside
+        # an AppContainer, so the credential directory cannot move with the
+        # calling context.
+        windows_api.KF_FLAG_NO_PACKAGE_REDIRECTION)
+    if resolved.startswith("\\\\"):
+        # Folder redirection to a share cannot provide the private-directory
+        # property credential storage depends on, so refuse rather than create
+        # a credential directory somewhere the premise does not hold.
+        raise windows_api.WindowsApiError(
+            "LocalAppData is redirected to a network location "
+            f"({resolved!r}); Loki's credential directory must be local")
+    return resolved
 
 
 def loki_config_dir(environ=None) -> str:
     return os.path.join(
-        xdg_config_home(environ), LOKI_CONFIG_DIR_NAME)
+        config_base_directory(environ), LOKI_CONFIG_DIR_NAME)
+
+
+def state_base_directory(environ=None) -> str:
+    """Return the directory that holds Loki's per-user state.
+
+    POSIX separates state from configuration (``XDG_STATE_HOME``, defaulting to
+    ``~/.local/state``), and that override wins when explicitly set.  Windows has
+    no such split -- per-user application data lives under LocalAppData -- so
+    there state resolves to the same base as the configuration directory.
+    """
+    values = os.environ if environ is None else environ
+    configured = values.get("XDG_STATE_HOME")
+    if configured:
+        return os.path.expanduser(configured)
+    if sys.platform == "win32":
+        return _windows_local_app_data()
+    return os.path.expanduser("~/.local/state")
+
+
+def loki_state_dir(environ=None) -> str:
+    return os.path.join(
+        state_base_directory(environ), LOKI_CONFIG_DIR_NAME)
 
 
 def credential_directory(environ=None) -> str:
