@@ -250,6 +250,11 @@ def _format_tool_arg(name, value):
     if isinstance(value, str) and "\n" in value:
         # Indent continuation lines under the opening value.
         rendered = _format_multiline_string(value, " " * len(head))
+    elif isinstance(value, list):
+        # Keep the brackets and commas, but break after each top-level
+        # comma so items wrap one per line instead of one long repr.
+        rendered = "[" + (",\n" + " " * (len(head) + 1)).join(
+            pformat(item, width=10000) for item in value) + "]"
     else:
         # A huge width stops pformat hard-wrapping; the terminal
         # soft-wraps instead.

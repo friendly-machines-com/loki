@@ -608,6 +608,25 @@ class TerminalWiringTests(unittest.TestCase):
         # newline.
         self.assertIn("command: \"it's\"\n         'fine'\n", output)
 
+    def test_list_tool_argument_wraps_after_each_item(self):
+        output = self.replay(
+            [{
+                "type": "tool_call",
+                "name": "TodoWrite",
+                "args": {"todos": [
+                    {"content": "first", "status": "completed"},
+                    {"content": "second", "status": "pending"},
+                ]},
+            }],
+            StyledTerminal(),
+        )
+
+        self.assertIn(
+            "\ntodos: [{'content': 'first', 'status': 'completed'},\n"
+            "        {'content': 'second', 'status': 'pending'}]\n",
+            output,
+        )
+
     def test_non_tty_terminal_emits_original_markdown(self):
         streamed = self.replay(
             self.stream_events(["**hel", "lo**"]), NoneTerminal())
