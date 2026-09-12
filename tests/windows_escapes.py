@@ -1033,12 +1033,14 @@ def probe(api, manifest, script, manifest_path, classify):
     primary_rights = 8 | 2 | 1  # TOKEN_QUERY|DUPLICATE|ASSIGN_PRIMARY
     for name, launcher, plain in [
             ('create-process-as-user', api.launch_as_user, False),
-            ('create-process-with-token', api.launch_with_token, False),
-            # The documented alternative to EXTENDED_STARTUPINFO_PRESENT: a
-            # plain STARTUPINFOW.  Running both forms separates a rejection of
-            # the extended structure from the token/privilege denial the API
-            # documents (SE_IMPERSONATE_NAME absent -> 1314), which is the
-            # discrimination the observed error 87 left unresolved.
+            # CreateProcessWithTokenW is probed with a plain STARTUPINFOW.
+            # The extended STARTUPINFOEX form (EXTENDED_STARTUPINFO_PRESENT)
+            # is rejected by this entrypoint with ERROR_INVALID_PARAMETER
+            # (87), while create-process-as-user above accepts the identical
+            # structure, flag and (NULL) attribute list -- so the rejection
+            # is specific to CreateProcessWithTokenW, not to the structure.
+            # The plain form is also the correct call here: the probe requests
+            # no attributes, so it has nothing to put in an attribute list.
             ('create-process-with-token-plain',
              api.launch_with_token, True)]:
         def token_launcher(launcher=launcher, plain=plain):
