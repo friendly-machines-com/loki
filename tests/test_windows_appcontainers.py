@@ -1066,6 +1066,42 @@ class EscapeResultTests(unittest.TestCase):
         self.assertEqual(flags & 0x80000, 0x80000)
         self.assertEqual(flags & 4, 4)
 
+    def test_caller_token_launch_reports_refusal_with_caller_privileges(self):
+        # The unrestricted control must report the caller's own privileges so
+        # an absent SE_IMPERSONATE_NAME is visible, and must not claim a launch
+        # when the create call was refused.
+        api = self.impersonation_free_api()
+        api.snapshot = mock.Mock(return_value={
+            'privileges': {'SeChangeNotifyPrivilege': 3}, 'app': 0})
+        api.create_with_token = mock.Mock(return_value=0)
+        with mock.patch('builtins.print'), \
+                mock.patch.object(C, 'get_last_error', return_value=1314,
+                                  create=True):
+            result = escape_helpers['caller_token_launch'](api, 'python.exe')
+        self.assertEqual(result['outcome'], 'create-refused')
+        self.assertEqual(result['winerror'], 1314)
+        self.assertEqual(result['caller_app'], 0)
+        self.assertEqual(result['caller_privileges'],
+                         {'SeChangeNotifyPrivilege': 3})
+        self.assertNotIn('created_processes', result)
+        self.assertNotIn('child', result)
+
+    def test_caller_token_launch_terminates_a_created_child(self):
+        # A created child is inspected while suspended and then terminated, so
+        # the control can never leave rejected-but-created code running.
+        api = self.impersonation_free_api()
+        api.snapshot = mock.Mock(return_value={
+            'privileges': {'SeChangeNotifyPrivilege': 3}, 'app': 0})
+        api.create_with_token = mock.Mock(return_value=1)
+        api.retire = mock.Mock()
+        with mock.patch('builtins.print'):
+            result = escape_helpers['caller_token_launch'](api, 'python.exe')
+        self.assertEqual(result['outcome'],
+                         'created-suspended-and-terminated')
+        self.assertEqual(result['created_processes'], 1)
+        self.assertIn('child', result)
+        api.retire.assert_called_once()
+
     def test_token_launch_success_requires_inspected_containment(self):
         api = self.impersonation_free_api()
         api.snapshot = mock.Mock(return_value={'user': 'user', 'app': 1,
@@ -2390,6 +2426,16 @@ if __name__ == '__main__':
         # CreateProcessW(NULL environment) then inherits these selected paths,
         # plus the CI supervisor's controlled PATH/TEMP/TMP and OS bootstrap.
         os.environ.update(paths)
+        # Characterization control: the same plain-form CreateProcessWithTokenW
+        # call the contained worker makes, run here unrestricted, so the
+        # worker's winerror can be attributed to its AppContainer/lowbox
+        # context or to the caller's privilege set.  Reported, not asserted:
+        # it is evidence for the investigation, and its outcome must not fail
+        # or pass this job.
+        api = escape_helpers['Escapes'](
+            native, primitives, ExtendedStartups, ProcessInfos)
+        print(json.dumps(escape_helpers['caller_token_launch'](
+            api, sys.executable)), flush=True)
         del sys.argv[1:]
         AppContainerTests.__unittest_skip__ = False
     unittest.main(verbosity=2)

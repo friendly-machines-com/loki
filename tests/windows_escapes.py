@@ -107,6 +107,61 @@ def identity_matches(snapshot, owner, package):
             snapshot['package'] == package)
 
 
+def caller_token_launch(api, executable):
+    """Unrestricted same-user control for the plain CreateProcessWithTokenW form.
+
+    The contained worker's plain-form call is denied with winerror 5, while the
+    reference names ERROR_PRIVILEGE_NOT_HELD (1314) for a caller without
+    SE_IMPERSONATE_NAME, and documents no ERROR_ACCESS_DENIED at all.  Running
+    the identical call from an unrestricted caller of the same user (the
+    standard-user broker) attributes the difference:
+
+    * a different winerror here means the worker's result is specific to its
+      AppContainer/lowbox context, not to the privilege; and
+    * the same winerror here means it is the caller's privilege set, and the
+      1314 documented for that absence simply does not appear on this path.
+
+    The caller's own privileges are reported either way so the presence or
+    absence of SE_IMPERSONATE_NAME is visible in the result.  A created child
+    stays suspended, is inspected, and is terminated without ever running.
+    """
+    own = api.token(api.n.current_process(), 8)
+    try:
+        caller = api.snapshot(own)
+    finally:
+        api.close(own)
+    source = api.token(api.n.current_process(), 8 | 2)
+    try:
+        primary = api.clone(source, 8 | 2 | 1)
+    finally:
+        api.close(source)
+    try:
+        startup = PlainStartups()
+        startup.cb = C.sizeof(startup)
+        child = api.process_type()
+        command = C.create_unicode_buffer(subprocess.list2cmdline(
+            [executable, '-I', '-c', 'pass']))
+        result = {'operation': 'caller-create-process-with-token-plain',
+                  'startupinfo': 'plain',
+                  'caller_app': caller['app'],
+                  'caller_privileges': caller['privileges']}
+        if not api.launch_with_token(
+                primary, executable, command, startup, child, 4):
+            result.update(outcome='create-refused', winerror=C.get_last_error())
+            return result
+        result['created_processes'] = 1
+        with ExitStack() as cleanup:
+            cleanup.callback(api.close, child.thread)
+            cleanup.callback(api.retire, child.process)
+            token = api.token(child.process, 8)
+            cleanup.callback(api.close, token)
+            result['child'] = api.snapshot(token)
+            result['outcome'] = 'created-suspended-and-terminated'
+        return result
+    finally:
+        api.close(primary)
+
+
 def run_powershell(script, probe):
     shell = Path(os.environ['SystemRoot']) / (
         'System32/WindowsPowerShell/v1.0/powershell.exe')
