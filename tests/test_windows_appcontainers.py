@@ -1013,6 +1013,59 @@ class EscapeResultTests(unittest.TestCase):
         self.assertEqual(token_args[:4], (9, 0, 'exe', 'cmd'))
         self.assertEqual(token_args[4], creation_flags)
 
+    def test_plain_startupinfo_matches_the_documented_layout(self):
+        # A dropped member (dwFlags is the easy one to lose when copying the
+        # shorter STARTUPINFOW declaration) changes cb and misaligns every
+        # later member, so the probe would test a malformed structure.
+        plain = escape_helpers['PlainStartups']
+        self.assertEqual(C.sizeof(plain), C.sizeof(StartupInfos))
+        self.assertEqual([name for name, _ in plain._fields_],
+                         [name for name, _ in StartupInfos._fields_])
+
+    def test_launch_with_token_accepts_both_documented_startup_forms(self):
+        api = self.impersonation_free_api()
+        api.create_with_token = mock.Mock(return_value=0)
+        extended = ExtendedStartups()
+        plain = escape_helpers['PlainStartups']()
+        with mock.patch('builtins.print'):
+            api.launch_with_token(9, 'exe', 'cmd', extended, ProcessInfos(), 4)
+            api.launch_with_token(9, 'exe', 'cmd', plain, ProcessInfos(), 4)
+        self.assertEqual(api.create_with_token.call_count, 2)
+        for call in api.create_with_token.call_args_list:
+            args = call.args
+            # Nine-argument contract, dwLogonFlags 0, and a startup pointer
+            # in the documented position for each form.
+            self.assertEqual(len(args), 9)
+            self.assertEqual(args[:4], (9, 0, 'exe', 'cmd'))
+            self.assertIsNotNone(args[7])
+
+    def test_token_launch_plain_omits_extended_startupinfo_flag(self):
+        api = self.impersonation_free_api()
+        creator = mock.Mock(return_value=0)
+        with mock.patch('builtins.print'), \
+                mock.patch.object(C, 'get_last_error', return_value=5,
+                                  create=True):
+            api.token_launch(creator, 0xB, 'python.exe', 'user', 'pkg',
+                             plain=True)
+        startup, flags = creator.call_args.args[3], creator.call_args.args[5]
+        self.assertIsInstance(startup, escape_helpers['PlainStartups'])
+        self.assertEqual(startup.cb, C.sizeof(startup))
+        # EXTENDED_STARTUPINFO_PRESENT must be clear for a plain STARTUPINFO;
+        # CREATE_SUSPENDED must stay set so nothing runs uninspected.
+        self.assertEqual(flags & 0x80000, 0)
+        self.assertEqual(flags & 4, 4)
+
+    def test_token_launch_extended_sets_extended_startupinfo_flag(self):
+        api = self.impersonation_free_api()
+        creator = mock.Mock(return_value=0)
+        with mock.patch('builtins.print'), \
+                mock.patch.object(C, 'get_last_error', return_value=5,
+                                  create=True):
+            api.token_launch(creator, 0xB, 'python.exe', 'user', 'pkg')
+        flags = creator.call_args.args[5]
+        self.assertEqual(flags & 0x80000, 0x80000)
+        self.assertEqual(flags & 4, 4)
+
     def test_token_launch_success_requires_inspected_containment(self):
         api = self.impersonation_free_api()
         api.snapshot = mock.Mock(return_value={'user': 'user', 'app': 1,

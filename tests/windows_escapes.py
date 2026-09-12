@@ -53,12 +53,20 @@ class Guids(C.Structure):
 
 
 class PlainStartups(C.Structure):
-    """STARTUPINFO without the extended attribute list."""
+    """STARTUPINFOW: the documented form with no extended attribute list.
+
+    Field order and members follow the documented STARTUPINFOW layout.  The
+    dwFlags member is easy to drop when copying the shorter AppContainer
+    declaration and must not be: without it cb is undersized and every later
+    member is misaligned, so CreateProcess would reject the structure rather
+    than test what the probe intends.
+    """
 
     _fields_ = [('cb', ULONG), ('reserved', W.LPWSTR),
                 ('desktop', W.LPWSTR), ('title', W.LPWSTR),
                 ('x', ULONG), ('y', ULONG), ('xsize', ULONG), ('ysize', ULONG),
                 ('xchars', ULONG), ('ychars', ULONG), ('fill', ULONG),
+                ('flags', ULONG),
                 ('show', C.c_uint16),
                 ('reserved_size', C.c_uint16), ('reserved_bytes', HANDLE),
                 ('stdin', HANDLE), ('stdout', HANDLE), ('stderr', HANDLE)]
@@ -463,9 +471,22 @@ try {
                           flags):
         # Nine-argument contract; dwLogonFlags 0 loads no profile for the
         # bounded suspended witness.
+        #
+        # The API documents lpStartupInfo as "a pointer to a STARTUPINFO or
+        # STARTUPINFOEX structure", selected by EXTENDED_STARTUPINFO_PRESENT.
+        # A ctypes function object carries a single argtypes, so the symbol is
+        # bound as POINTER(STARTUPINFOEXW) and the plain structure is passed
+        # through a pointer cast.  That is safe because STARTUPINFOEXW is
+        # exactly STARTUPINFOW plus a trailing attribute pointer: the prefix
+        # is identical, and with the extended flag clear the API reads only
+        # the STARTUPINFOW part.
+        if isinstance(startup, PlainStartups):
+            info = C.cast(C.pointer(startup), C.POINTER(self.startup_type))
+        else:
+            info = C.byref(startup)
         return self.create_with_token(primary, 0, executable, command,
                                       flags, None, None,
-                                      C.byref(startup), C.byref(child))
+                                      info, C.byref(child))
 
     def token_launch(self, launcher, rights, executable, owner, package,
                      plain=False):
@@ -1010,11 +1031,19 @@ def probe(api, manifest, script, manifest_path, classify):
         lambda: api.impersonation_launch(script, manifest_path),
         ('impersonated-contained', 'access-denied'))
     primary_rights = 8 | 2 | 1  # TOKEN_QUERY|DUPLICATE|ASSIGN_PRIMARY
-    for name, launcher in [('create-process-as-user', api.launch_as_user),
-                           ('create-process-with-token', api.launch_with_token)]:
-        def token_launcher(launcher=launcher):
+    for name, launcher, plain in [
+            ('create-process-as-user', api.launch_as_user, False),
+            ('create-process-with-token', api.launch_with_token, False),
+            # The documented alternative to EXTENDED_STARTUPINFO_PRESENT: a
+            # plain STARTUPINFOW.  Running both forms separates a rejection of
+            # the extended structure from the token/privilege denial the API
+            # documents (SE_IMPERSONATE_NAME absent -> 1314), which is the
+            # discrimination the observed error 87 left unresolved.
+            ('create-process-with-token-plain',
+             api.launch_with_token, True)]:
+        def token_launcher(launcher=launcher, plain=plain):
             return api.token_launch(launcher, primary_rights, sys.executable,
-                                    owner, package)
+                                    owner, package, plain=plain)
         run(name, token_launcher, ('access-denied', 'contained'))
 
     # Prearranged own-account task registered by the broker. Only a rejected
