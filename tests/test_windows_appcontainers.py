@@ -105,6 +105,12 @@ class AppContainers(NativeCalls):
                                  HANDLE, ULONG, C.POINTER(HANDLE))
         self.delete_profile = self.bind(self.userenv, 'DeleteAppContainerProfile',
                                         C.c_int32, W.LPCWSTR)
+        # One profile per workspace needs a SID that is a stable function of the
+        # name; this is the derivation used to reason about names before any
+        # profile exists.  The returned SID is caller-owned: FreeSid releases it.
+        self.derive_profile_sid = self.bind(
+            self.userenv, 'DeriveAppContainerSidFromAppContainerName',
+            C.c_int32, W.LPCWSTR, C.POINTER(HANDLE))
         self.free_sid = self.bind(self.advapi, 'FreeSid', HANDLE, HANDLE)
         self.convert_sd = self.bind(
             self.advapi, 'ConvertStringSecurityDescriptorToSecurityDescriptorW',
@@ -230,6 +236,37 @@ class AppContainers(NativeCalls):
                                        C.byref(size)))
             package = HANDLE.from_buffer(buffer)
             return is_app.value, self.sid(package) if package.value else None
+        finally:
+            self.check(self.close(token))
+
+    def integrity_level(self):
+        """Return the current token's integrity label as (name, rid).
+
+        ``TokenIntegrityLevel`` (25) returns a ``TOKEN_MANDATORY_LABEL``: a
+        ``SID_AND_ATTRIBUTES`` whose SID is in the ``S-1-16`` space, where the
+        trailing RID is the level (0x1000 low, 0x2000 medium, 0x3000 high).
+
+        This matters because mandatory integrity control denies write-up by
+        default.  If the container runs *below* the level of the workspace
+        files the user created, a contained tool cannot modify or delete them
+        however the DACL reads, and the workspace story needs a different
+        answer -- which is why the two probes below report rather than assert.
+        """
+        token = HANDLE()
+        self.check(self.open_token(self.current_process(), 8, C.byref(token)))
+        try:
+            size = ULONG()
+            result = self.token_info(token, 25, None, 0, C.byref(size))
+            if result or C.get_last_error() != 122 or not size.value:
+                raise OSError('unexpected integrity-label sizing result')
+            buffer = C.create_string_buffer(size.value)
+            self.check(self.token_info(token, 25, buffer, len(buffer),
+                                       C.byref(size)))
+            label = primitives['SidAttributes'].from_buffer(buffer)
+            text = self.sid(label.Sid)
+            rid = int(text.rsplit('-', 1)[1])
+            names = {0x1000: 'low', 0x2000: 'medium', 0x3000: 'high'}
+            return names.get(rid, 'other'), rid
         finally:
             self.check(self.close(token))
 
@@ -692,6 +729,98 @@ def access_outcome(name, operation):
     return {'operation': name, 'denied': False, 'outcome': 'allowed'}
 
 
+def probe_failed(result):
+    """Whether a probe result contradicts its expectation.
+
+    Most probes expect denial (``access-denied``).  A probe marked
+    ``characterized`` reports an observation instead: ``allowed`` and
+    ``access-denied`` are both findings.  Only a protocol failure -- an
+    exception rather than an access decision -- counts against it.  Keeping the
+    rule here is what stops a characterization from being laundered into a
+    containment claim, and what stops it from silently absorbing a broken probe.
+    """
+    expected = result.get('expected', 'access-denied')
+    if expected == 'characterized':
+        return result['outcome'] not in ('allowed', 'access-denied')
+    return result['outcome'] != expected
+
+
+def integrity_characterization(native, manifest):
+    """Report whether the container may write the user's own (medium) files.
+
+    Mandatory integrity control denies write-up by default, and AppContainer
+    processes are low integrity, while files the user created are medium.  If
+    that applies literally, a contained tool cannot modify or delete the very
+    workspace files it exists to edit, and the design must choose between
+    relabelling the user's tree, running the container at a higher level, or
+    copy-in/copy-out semantics.
+
+    Reported, never asserted -- the answer is the finding.  It runs only in the
+    first contained process, because the probes mutate the file and a second run
+    would report "already gone" rather than an access decision.
+    """
+    target = Path(manifest['workspace']) / 'existing-medium'
+    outcomes = []
+
+    def characterized(name, operation):
+        result = access_outcome(name, operation)
+        result['expected'] = 'characterized'
+        outcomes.append(result)
+        print(json.dumps(result), flush=True)
+
+    characterized('modify-broker-created-file',
+                  lambda: target.write_bytes(b'CHILD'))
+    characterized('delete-broker-created-file', lambda: target.unlink())
+    return outcomes
+
+
+def appcontainer_name_behavior(native, base_name):
+    """Characterize AppContainer profile naming for one-profile-per-workspace.
+
+    Cross-workspace isolation only works if the package SID is a stable function
+    of the profile name, and setup needs to know what an already-existing
+    profile reports.  Reported, never asserted: these are API properties, and
+    the case answer decides whether profile names must be canonicalized before
+    use.
+
+    The derived SID is caller-owned and released with ``FreeSid``, as the
+    reference requires.
+    """
+    def derive(name):
+        sid = HANDLE()
+        native.hresult(native.derive_profile_sid(name, C.byref(sid)))
+        try:
+            return native.sid(sid)
+        finally:
+            native.free_sid(sid)
+
+    derived = derive(base_name)
+    result = {
+        'probe': 'appcontainer-name',
+        'name': base_name,
+        'derived': derived,
+        'stable_across_calls': derived == derive(base_name),
+        'case_insensitive': derived == derive(base_name.upper()),
+        'differs_for_another_name': derived != derive(base_name + '.two'),
+    }
+    created = HANDLE()
+    result['create_status'] = native.profile(
+        base_name, base_name, base_name, None, 0, C.byref(created))
+    result['created_matches_derived'] = (
+        result['create_status'] == 0 and native.sid(created) == derived)
+    if result['create_status'] == 0:
+        native.free_sid(created)
+    existing = HANDLE()
+    result['create_existing_status'] = native.profile(
+        base_name, base_name, base_name, None, 0, C.byref(existing))
+    result['create_existing_hex'] = '0x%08x' % (
+        result['create_existing_status'] & 0xffffffff)
+    if result['create_existing_status'] == 0:
+        native.free_sid(existing)
+    result['delete_status'] = native.delete_profile(base_name)
+    return result
+
+
 def attempts(native, manifest):
     """Each attempt operates on a distinct disposable target."""
     secret = Path(manifest['secret'])
@@ -773,10 +902,14 @@ def contained(manifest_path, descendant=False):
     if identity != (1, manifest['package']):
         raise RuntimeError('unexpected AppContainer identity: %r' % (identity,))
     print(json.dumps({'appcontainer_identity': identity, 'user': details['user'],
+                      'integrity': native.integrity_level(),
                       'descendant': descendant}), flush=True)
     outcomes = attempts(native, manifest)
-    failed = any(result['outcome'] != result.get('expected', 'access-denied')
-                 for result in outcomes)
+    if not descendant:
+        # Characterization probes are not part of attempts(): they mutate the
+        # broker-created file, so they must not run twice in one scenario.
+        outcomes = outcomes + integrity_characterization(native, manifest)
+    failed = any(probe_failed(result) for result in outcomes)
     if not descendant:
         try:
             api = escape_helpers['Escapes'](
@@ -827,6 +960,66 @@ class EscapeResultTests(unittest.TestCase):
                                    ('user', 1, 'other')]:
             self.assertFalse(check({'user': user, 'app': app, 'package': package},
                                    'user', 'pkg'))
+
+    def test_characterized_probe_reports_instead_of_judging(self):
+        # Both outcomes are findings for a characterization; only a protocol
+        # failure counts against it.
+        for outcome in ('allowed', 'access-denied'):
+            with self.subTest(outcome=outcome):
+                self.assertFalse(probe_failed(
+                    {'outcome': outcome, 'expected': 'characterized'}))
+        self.assertTrue(probe_failed(
+            {'outcome': 'unexpected-error', 'expected': 'characterized'}))
+
+    def test_probe_failure_defaults_to_expecting_denial(self):
+        self.assertFalse(probe_failed({'outcome': 'access-denied'}))
+        self.assertTrue(probe_failed({'outcome': 'allowed'}))
+        self.assertFalse(probe_failed(
+            {'outcome': 'allowed', 'expected': 'allowed'}))
+
+    def test_appcontainer_name_behavior_reports_stability_and_existing_profile(
+            self):
+        class FakeNative:
+            def __init__(self):
+                self.name = None
+                self.creations = 0
+
+            @staticmethod
+            def hresult(result):
+                if result < 0:
+                    raise OSError('HRESULT 0x%08x' % (result & 0xffffffff))
+
+            def derive_profile_sid(self, name, out):
+                self.name = name
+                C.cast(out, C.POINTER(HANDLE)).contents.value = 7
+                return 0
+
+            def sid(self, pointer):
+                # Case-insensitive, which is the property under test.
+                return {'loki.probe': 'S-1-15-2-1',
+                        'loki.probe.two': 'S-1-15-2-2'}[self.name.lower()]
+
+            def free_sid(self, sid):
+                pass
+
+            def profile(self, name, *rest):
+                self.name = name
+                self.creations += 1
+                return 0 if self.creations == 1 else -2147024713
+
+            def delete_profile(self, name):
+                return 0
+
+        result = appcontainer_name_behavior(FakeNative(), 'Loki.Probe')
+
+        self.assertEqual(result['derived'], 'S-1-15-2-1')
+        self.assertTrue(result['stable_across_calls'])
+        self.assertTrue(result['case_insensitive'])
+        self.assertTrue(result['differs_for_another_name'])
+        self.assertTrue(result['created_matches_derived'])
+        # 0x800700B7: the already-exists result a second create reports.
+        self.assertEqual(result['create_existing_hex'], '0x800700b7')
+        self.assertEqual(result['delete_status'], 0)
 
     def test_wmi_wrapper_failures_are_not_wmi_denial(self):
         api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
@@ -1912,6 +2105,10 @@ class AppContainerTests(unittest.TestCase):
         workspace.mkdir()
         native.acl(workspace, private_dacl(owner) +
                    '(A;OICI;FA;;;%s)' % package)
+        # Medium-integrity file created by the unrestricted broker, for the
+        # contained process's write-up characterization: the DACL permits the
+        # container, so only mandatory integrity control can deny it.
+        (workspace / 'existing-medium').write_bytes(b'MEDIUM')
         os.link(secret / 'read', workspace / 'alias')
         junction = workspace / 'junction'
         result = subprocess.run(
@@ -2436,6 +2633,18 @@ if __name__ == '__main__':
             native, primitives, ExtendedStartups, ProcessInfos)
         print(json.dumps(escape_helpers['caller_token_launch'](
             api, sys.executable)), flush=True)
+        # Characterization control for one-profile-per-workspace: is the
+        # package SID a stable function of the profile name, and what does an
+        # existing profile report?  Reported, not asserted -- the answer
+        # decides whether names must be canonicalized before use.
+        try:
+            print(json.dumps(appcontainer_name_behavior(
+                native, 'Loki.NameProbe.' + uuid.uuid4().hex)), flush=True)
+        except Exception as error:
+            print(json.dumps({'probe': 'appcontainer-name',
+                              'outcome': 'unexpected-error',
+                              'exception': type(error).__name__,
+                              'message': str(error)}), flush=True)
         del sys.argv[1:]
         AppContainerTests.__unittest_skip__ = False
     unittest.main(verbosity=2)
