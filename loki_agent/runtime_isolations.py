@@ -89,7 +89,7 @@ def _unshare_user_and_mount_namespaces(libc) -> None:
     unshare = getattr(os, "unshare", None)
     if unshare is not None:
         # os.unshare() was added in Python 3.12. Prefer the standard-library
-        # wrapper whenever it exists; Loki's Python 3.10 minimum is the sole
+        # wrapper whenever it exists; Loki's Python 3.11 minimum is the sole
         # reason for retaining the terrible direct-libc fallback below.
         try:
             unshare(flags)
