@@ -12,6 +12,7 @@ from unittest import mock
 
 from loki_agent import authentications
 from loki_agent import credential_storages
+from loki_agent import paths
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -681,3 +682,49 @@ class CredentialDocumentTests(unittest.TestCase):
                 storage.load_document()["credentials"]["future:value"],
                 {"type": "future"},
             )
+
+
+class PrivateDirectorySupportTests(unittest.TestCase):
+    """The Windows mkdir(mode) floor is enforced at creation, not by metadata.
+
+    ``requires-python`` states the same floor but only installers enforce it,
+    so a checkout run is covered only by the runtime check.
+    """
+
+    def test_posix_is_unrestricted_regardless_of_version(self):
+        for version in ((3, 9, 0), (3, 11, 9), (3, 12, 3)):
+            with self.subTest(version=version), \
+                    mock.patch.object(sys, "platform", "linux"), \
+                    mock.patch.object(sys, "version_info", version):
+                self.assertIsNone(paths.private_directory_support_error())
+
+    def test_windows_versions_without_the_mkdir_fix_are_refused(self):
+        for version in ((3, 10, 11), (3, 11, 0), (3, 11, 9),
+                        (3, 12, 0), (3, 12, 3)):
+            with self.subTest(version=version), \
+                    mock.patch.object(sys, "platform", "win32"), \
+                    mock.patch.object(sys, "version_info", version):
+                message = paths.private_directory_support_error()
+                self.assertIn("Windows", message)
+                self.assertIn("3.11.10 or later", message)
+
+    def test_windows_versions_with_the_mkdir_fix_are_allowed(self):
+        for version in ((3, 11, 10), (3, 11, 16), (3, 12, 4),
+                        (3, 12, 10), (3, 13, 0), (3, 14, 7)):
+            with self.subTest(version=version), \
+                    mock.patch.object(sys, "platform", "win32"), \
+                    mock.patch.object(sys, "version_info", version):
+                self.assertIsNone(paths.private_directory_support_error())
+
+    def test_ensure_directory_refuses_before_creating_anything(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.path.join(temporary, "loki")
+            storage = credential_storages.JsonCredentialStorage(
+                os.path.join(parent, "credentials"))
+            with mock.patch.object(sys, "platform", "win32"), \
+                    mock.patch.object(sys, "version_info", (3, 11, 9)):
+                with self.assertRaises(
+                        credential_storages.CredentialStorageError):
+                    storage.ensure_directory()
+            # Refusal must precede makedirs/mkdir: nothing may be created.
+            self.assertFalse(os.path.exists(parent))

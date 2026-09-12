@@ -205,6 +205,12 @@ class JsonCredentialStorage:
             self.directory, paths.CREDENTIAL_LOCK_FILE_NAME)
 
     def ensure_directory(self):
+        # Refuse before creating anything: on Windows versions that ignore
+        # os.mkdir(mode) the directory would be created with inherited access,
+        # leaving credentials readable by other users.
+        unsupported = paths.private_directory_support_error()
+        if unsupported is not None:
+            raise CredentialStorageError(unsupported)
         parent = os.path.dirname(self.directory)
         os.makedirs(parent, exist_ok=True)
         try:

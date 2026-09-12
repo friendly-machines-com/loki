@@ -26,9 +26,11 @@ Supports Anthropic and OpenAI protocols.
 
 ## How to run
 
-Requires Python 3.11.10 or later; on the 3.12 branch use 3.12.4 or later.
-Earlier releases in those branches
-are excluded because Windows did not yet honor `mkdir(..., mode=0o700)`.
+On POSIX, requires Python 3.11.10 or later (on the 3.12 branch, 3.12.4 or
+later). On Windows, requires Python 3.12.4 or later: the 3.11 fix exists only
+in source-only releases, so no supported 3.11 can be installed there. Earlier
+releases in those branches are excluded because Windows did not yet honor
+`mkdir(..., mode=0o700)`.
 
 Run it in a VM or container.
 
