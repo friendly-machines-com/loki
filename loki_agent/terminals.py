@@ -175,9 +175,23 @@ else:
             '''
             End buffering without update, update.
             '''
-            assert self._synchronized_updates > 0, (
-                "end_synchronized_update called without an open frame")
+            if self._synchronized_updates <= 0:
+                # An ESU with no open frame is harmless on the terminal
+                # (RM ?2026 while reset is a no-op), so this is a bookkeeping
+                # imbalance to log, not a reason to raise or emit.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "end_synchronized_update called without an open frame")
+                return
             self._synchronized_updates -= 1
+            print('\033[?2026l', end='')
+
+        def force_end_synchronized_update(self):
+            # Teardown only: close any open frame unconditionally.  If a frame
+            # was left open this unfreezes the terminal; if none was open,
+            # RM ?2026 while reset is a no-op.  Never assert here -- at exit
+            # the counter may be anything and teardown must not raise.
+            self._synchronized_updates = 0
             print('\033[?2026l', end='')
 
         def hide_cursor(self):  # DECTCEM: the input area draws its own reverse-video caret.

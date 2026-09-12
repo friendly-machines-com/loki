@@ -1335,6 +1335,9 @@ def restore_terminal_overlay(active_terminal, run_step=lambda step: step()):
     run_step(active_terminal.clear_to_end_of_screen)
     # Reveal the real cursor only once it sits at its final resting position.
     run_step(active_terminal.show_cursor)
+    # Close any open synchronized frame without asserting: at teardown the
+    # counter may be anything, and the terminal must not be left frozen.
+    run_step(active_terminal.force_end_synchronized_update)
     run_step(active_terminal.flush)
 
 
@@ -1397,8 +1400,6 @@ async def _run_frontend(args) -> int:
     signal.signal(signal.SIGTERM, clean_up_and_exit)
     signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT,])
 
-    initialize_terminal_overlay(terminal)
-
     async def run_with_session_cleanup():
         try:
             return await async_main(args)
@@ -1409,6 +1410,10 @@ async def _run_frontend(args) -> int:
 
     exit_status = 1
     try:
+        # Setup lives inside the try so a partial setup failure still runs
+        # clean_up() in the finally: the terminal is restored before the
+        # exception surfaces, not left half-initialized.
+        initialize_terminal_overlay(terminal)
         exit_status = await run_with_session_cleanup()
     finally:
         clean_up()

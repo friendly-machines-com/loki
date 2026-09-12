@@ -2615,6 +2615,7 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
             ("goto_position", terminal_frontend.terminals.input_area[0], 1),
             ("clear_to_end_of_screen",),
             ("show_cursor",),
+            ("force_end_synchronized_update",),
             ("flush",),
         ])
         self.assertNotIn(("clear_screen",), terminal.calls)
