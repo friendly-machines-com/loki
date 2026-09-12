@@ -152,6 +152,9 @@ else:
         # While BSU is set the terminal keeps showing the last rendered frame
         # while it still parses and applies everything we send; ESU makes it
         # repaint once from the current screen buffer.
+        # Each BSU...ESU pair is one complete frame.  The only callers are
+        # PromptRenderer.render() and redraw_status_bar(); both are synchronous
+        # (no awaits), so two frames can never be open at once.
 
         def begin_synchronized_update(self):
             '''
@@ -672,12 +675,18 @@ def redraw_status_bar():
 
     refresh_terminal_layout()
     terminal.save_cursor_position()
+    # Frame start (DECSET 2026): hold the previous frame until ESU below, so
+    # the clear + status line paint as one update.  No awaits, so this frame
+    # cannot interleave with or nest inside render()'s frame.
+    terminal.begin_synchronized_update()
     try:
         update_status_bar()
     finally:
         terminal.set_clipping_region(*output_area)
         terminal.restore_cursor_position()
         terminal.reset_colors_and_flags()
+        # Frame end: ESU should be the final byte before flush.
+        terminal.end_synchronized_update()
         terminal.flush()
 
 
@@ -1763,6 +1772,10 @@ class PromptRenderer:
         """
         refresh_terminal_layout()
         self.terminal.save_cursor_position()
+        # Frame start (DECSET 2026): one frame from here to ESU below, covering
+        # input area, status area, prompt, caret, and trailing text.  No awaits,
+        # so this frame cannot interleave with or nest inside another frame.
+        self.terminal.begin_synchronized_update()
         try:
             # Draw the input area and status area.
             self.terminal.set_clipping_region(*input_area)
@@ -1802,6 +1815,8 @@ class PromptRenderer:
             self.terminal.set_clipping_region(*output_area)
             self.terminal.restore_cursor_position()
             self.terminal.reset_colors_and_flags()
+            # Frame end: ESU should be the final byte before flush.
+            self.terminal.end_synchronized_update()
             self.terminal.flush()
 
 

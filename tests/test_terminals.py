@@ -1448,6 +1448,7 @@ class PromptRendererTests(unittest.TestCase):
             recorder.calls,
             [
                 ("save_cursor_position",),
+                ("begin_synchronized_update",),
                 ("set_clipping_region", 10, 13),
                 ("goto_position", 1, 1),
                 ("set_background_color", terminals.INPUT_COLOR),
@@ -1461,6 +1462,7 @@ class PromptRendererTests(unittest.TestCase):
                 ("set_clipping_region", *terminals.output_area),
                 ("restore_cursor_position",),
                 ("reset_colors_and_flags",),
+                ("end_synchronized_update",),
                 ("flush",),
             ],
         )
