@@ -20,8 +20,8 @@ BOLD = "\033[1m"
 ITALIC = "\033[3m"
 CODE = "\033[36m"
 RESET = "\033[0m"
-HEADLINE = "\033[42m"
-HEADLINE_OFF = "\033[49m"
+HEADLINE = "\033[7m"
+HEADLINE_OFF = "\033[27m"
 BOLD_OFF = "\033[22m"
 ITALIC_OFF = "\033[23m"
 FOREGROUND_OFF = "\033[39m"
@@ -364,17 +364,17 @@ class DifferentialTests(unittest.TestCase):
     def _ansi_channels_closed(fragment):
         """Every SGR channel opened in the fragment must close inside it.
 
-        Headlines close inner spans with parameter-specific resets while the
-        background stays on, so counting RESET alone no longer proves the
+        Headlines close inner spans with parameter-specific resets while
+        reverse video stays on, so counting RESET alone no longer proves the
         invariant; simulate the channel state instead.
         """
         opens = [
             (BOLD, "bold"), (ITALIC, "italic"), (CODE, "code"),
-            (HEADLINE, "bg"),
+            (HEADLINE, "reverse"),
         ]
         closes = [
             (BOLD_OFF, "bold"), (ITALIC_OFF, "italic"),
-            (FOREGROUND_OFF, "code"), (HEADLINE_OFF, "bg"),
+            (FOREGROUND_OFF, "code"), (HEADLINE_OFF, "reverse"),
         ]
         state = {}
         i = 0

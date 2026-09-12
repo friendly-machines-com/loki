@@ -23,16 +23,19 @@ MARKDOWN_MAX_UNRESOLVED = 4096
 # Markdown headlines carry inline markup (`## The **uv** route`), but ANSI has
 # no style stack: a plain RESET closes everything, and restoring "the rest of
 # the state" would require tracking it. SGR channels are independent, so the
-# headline owns the background channel (42 = green bg) while inline spans
-# inside use foreground/attribute channels, each closed by its
-# parameter-specific cancel (22 bold-off, 23 italic-off, 39 default fg,
-# 49 default bg). That gives one nesting level with zero state tracking.
+# headline owns the reverse-video attribute (7 on, 27 off) while inline spans
+# inside use foreground/attribute channels, each closed by their
+# parameter-specific cancel (22 bold-off, 23 italic-off, 39 default fg).
+# Reverse video is theme-adaptive -- it swaps the user's own foreground and
+# background -- so headlines stay readable on light and dark palettes, unlike
+# a fixed background color. That gives one nesting level with zero state
+# tracking.
 # Attribute-inside-attribute (`**b *i* b**`) is intentionally out of scope:
 # it needs both channels' bookkeeping, i.e. the stack we refused.
-HEADLINE_BG = 42
-HEADLINE_BG_OFF = 49
-HEADLINE = f'\033[{HEADLINE_BG}m'
-HEADLINE_OFF = f'\033[{HEADLINE_BG_OFF}m'
+HEADLINE_REVERSE = 7
+HEADLINE_REVERSE_OFF = 27
+HEADLINE = f'\033[{HEADLINE_REVERSE}m'
+HEADLINE_OFF = f'\033[{HEADLINE_REVERSE_OFF}m'
 BOLD_OFF = '\033[22m'
 ITALIC_OFF = '\033[23m'
 FOREGROUND_OFF = '\033[39m'
@@ -176,12 +179,12 @@ class BoundedMarkdownAnsi:
     contents and marker lines pass through verbatim.
 
     Headlines are one to six ``#`` at line start (after up to three leading
-    spaces) followed by a space; the whole line renders on the SGR background
-    channel, and inline spans inside it render on the foreground/attribute
-    channels with parameter-specific resets, so both compose without a style
-    stack. Nesting an attribute inside another attribute (``**b *i* b**``)
-    stays literal as everywhere else; seven or more ``#``, or any ``#`` run
-    not followed by a space, renders literally.
+    spaces) followed by a space; the whole line renders on the SGR
+    reverse-video attribute, and inline spans inside it render on the
+    foreground/attribute channels with parameter-specific resets, so both
+    compose without a style stack. Nesting an attribute inside another
+    attribute (``**b *i* b**``) stays literal as everywhere else; seven or
+    more ``#``, or any ``#`` run not followed by a space, renders literally.
 
     ``feed`` and ``finish`` eagerly return tuples of terminal-state-neutral
     fragments. Plain text is emitted immediately. Only a possible fence or
@@ -242,7 +245,7 @@ class BoundedMarkdownAnsi:
         if not self.style:
             rendered = raw
         elif mode == "bold":
-            # RESET would also kill an open headline background, so inner
+            # RESET would also kill open headline reverse video, so inner
             # spans close with parameter-specific cancels instead.
             rendered = BOLD + raw[2:-2] + (BOLD_OFF if self.inner else RESET)
         elif mode == "emphasis":

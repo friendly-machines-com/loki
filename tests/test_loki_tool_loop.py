@@ -1790,7 +1790,7 @@ class ModelLoadingTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "\033[42m## Resume heading\033[49m", rendered)
+            "\033[7m## Resume heading\033[27m", rendered)
         self.assertIn(
             "\033[1mvisible resumed answer\033[0m", rendered)
         self.assertIn("\033[36mcode\033[0m", rendered)
