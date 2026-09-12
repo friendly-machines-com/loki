@@ -8,3 +8,5 @@ per-file-ignores =
     # These tests set required environment variables before importing Loki.
     tests/test_loki_tool_loop.py: E402
     tests/test_markdown_render.py: E402
+    # The vulture whitelist deliberately names symbols instead of using them.
+    vulture_whitelist.py: F821
