@@ -472,7 +472,9 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
 def _status_fields(activity):
     activity = activity or _terminal_activity
     displayed_model = current_model()
-    if (current_config() is not None
+    if not displayed_model:
+        displayed_model = "none"
+    elif (current_config() is not None
             and current_config().model_status == "deprecated"):
         displayed_model += " (deprecated)"
     return {
