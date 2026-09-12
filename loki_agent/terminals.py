@@ -682,12 +682,16 @@ def redraw_status_bar():
     try:
         update_status_bar()
     finally:
-        terminal.set_clipping_region(*output_area)
-        terminal.restore_cursor_position()
-        terminal.reset_colors_and_flags()
-        # Frame end: ESU should be the final byte before flush.
-        terminal.end_synchronized_update()
-        terminal.flush()
+        try:
+            terminal.set_clipping_region(*output_area)
+            terminal.restore_cursor_position()
+            terminal.reset_colors_and_flags()
+        finally:
+            # Frame end: ESU is the final byte before flush.  The inner
+            # finally runs it even if a restore step above raises, so the
+            # frame always closes.
+            terminal.end_synchronized_update()
+            terminal.flush()
 
 
 def refresh_terminal_layout():
@@ -1809,15 +1813,19 @@ class PromptRenderer:
                     print()
                 self.terminal.write_text(after[1:], multiline=True)
         finally:
-            # Restore the output scroll region and the cursor position.
-            # The real cursor is back in the output area where output
-            # writers expect it -- whether the try block succeeded or not.
-            self.terminal.set_clipping_region(*output_area)
-            self.terminal.restore_cursor_position()
-            self.terminal.reset_colors_and_flags()
-            # Frame end: ESU should be the final byte before flush.
-            self.terminal.end_synchronized_update()
-            self.terminal.flush()
+            try:
+                # Restore the output scroll region and the cursor position.
+                # The real cursor is back in the output area where output
+                # writers expect it -- whether the try block succeeded or not.
+                self.terminal.set_clipping_region(*output_area)
+                self.terminal.restore_cursor_position()
+                self.terminal.reset_colors_and_flags()
+            finally:
+                # Frame end: ESU is the final byte before flush.  The inner
+                # finally runs it even if a restore step above raises, so the
+                # frame always closes.
+                self.terminal.end_synchronized_update()
+                self.terminal.flush()
 
 
 class PromptController:
