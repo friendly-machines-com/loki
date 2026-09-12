@@ -2633,7 +2633,19 @@ async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
     return _tool_result(not _looks_like_tool_error(text), text)
 
 
-def _tool_access_error(fn_name: str, allowed=None, extra_context=None):
+def _refused_tool_hint(fn_name, args, allowed):
+    """Best-effort read-only alternative for a refused call. """
+    if fn_name != "Bash":
+        return None
+    try:
+        command = args["command"]
+        if "grep" in command and "Grep" in TOOL_REGISTRY and (allowed is None or "Grep" in allowed):
+            return 'This command liks like a grep; the Grep tool is still available.'
+    except Exception:
+        return None
+
+
+def _tool_access_error(fn_name: str, args=None, allowed=None, extra_context=None):
     inhibit_edits = (extra_context or {}).get('inhibit_edits', False)
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
@@ -2646,16 +2658,20 @@ def _tool_access_error(fn_name: str, allowed=None, extra_context=None):
         plan_only_tool = (
             inhibit_edits == "plan mode" and spec.get('plan') is True)
         if not plan_only_tool:
-            return (
+            message = (
                 f"Tool {fn_name} is unavailable while "
                 f"{inhibit_edits} is active.")
+            hint = _refused_tool_hint(fn_name, args, allowed)
+            if hint:
+                message = f"{message} {hint}"
+            return message
     return None
 
 
 async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_context=None) -> dict:
     spec = TOOL_REGISTRY.get(fn_name)
     access_error = _tool_access_error(
-        fn_name, allowed=allowed, extra_context=extra_context)
+        fn_name, args=args, allowed=allowed, extra_context=extra_context)
     if access_error:
         return _tool_result(False, access_error)
     cancel_event = (extra_context or {}).get("cancel_event")
@@ -2839,7 +2855,8 @@ async def execute_tool_call_async(
     )
 
     access_error = _tool_access_error(
-        fn_name, allowed=allowed, extra_context=extra_context)
+        fn_name, args=original_args, allowed=allowed,
+        extra_context=extra_context)
     if access_error:
         invocation.denied_reason = access_error
         invocation.denied_by = "loki.capability-gate"

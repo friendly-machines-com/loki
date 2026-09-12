@@ -7441,6 +7441,64 @@ class QuestionGuardTests(unittest.TestCase):
             "Read", {"file_path": __file__}, extra_context=extra))
         self.assertTrue(result["ok"])
 
+    def test_refused_bash_grep_recommends_grep_tool(self):
+        command = {"command": "grep -rn foo ."}
+        message = loki._tool_access_error(
+            "Bash",
+            args=command,
+            extra_context=self._context_for("what does run_edit do?"))
+        self.assertIn("answering the user's question", message)
+        hint = loki._refused_tool_hint("Bash", command, None)
+        self.assertIsNotNone(hint)
+        self.assertIn(hint, message)
+
+    def test_refused_bash_without_grep_gets_no_hint(self):
+        command = {"command": "echo hi"}
+        self.assertIsNone(loki._refused_tool_hint("Bash", command, None))
+        message = loki._tool_access_error(
+            "Bash",
+            args=command,
+            extra_context=self._context_for("what does run_edit do?"))
+        self.assertIn("answering the user's question", message)
+        self.assertNotIn("grep", message.lower())
+
+    def test_grep_hint_respects_subagent_allowed_set(self):
+        command = {"command": "grep -rn foo ."}
+        allowed = {"Bash", "Read"}
+        self.assertIsNone(
+            loki._refused_tool_hint("Bash", command, allowed))
+        message = loki._tool_access_error(
+            "Bash",
+            args=command,
+            allowed=allowed,
+            extra_context=self._context_for("what does run_edit do?"))
+        self.assertIn("answering the user's question", message)
+        self.assertNotIn("grep", message.lower())
+
+    def test_question_refusal_surfaces_grep_hint_in_transcript(self):
+        # Goes through execute_tool_call_async, not dispatch_tool_async:
+        # this is the path the real loop takes, and where the hint has to
+        # appear for the model (and the terminal) to see it.
+        transcript = [formats.message_item(
+            "user", "what does this grep do?")]
+        replies = [
+            [formats.message_item("assistant", "let me look"),
+             formats.tool_call_item(
+                 "t1", "Bash", {"command": "grep -rn foo ."})],
+            [formats.message_item("assistant", "done")],
+        ]
+
+        async def scripted_chat(items, *, codex_turn_state):
+            return replies.pop(0)
+
+        asyncio.run(loki.run_tool_loop_async(
+            transcript, chat_fn=scripted_chat))
+        self.assertIn("answering the user's question", str(transcript))
+        hint = loki._refused_tool_hint(
+            "Bash", {"command": "grep -rn foo ."}, None)
+        self.assertIsNotNone(hint)
+        self.assertIn(hint, str(transcript))
+
     def test_explore_tools_registry_shape_is_pinned(self):
         # Any change to the explore-allowed set must show up here,
         # deliberately, as a diff to this expected set.
