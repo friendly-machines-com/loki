@@ -231,17 +231,16 @@ def load_image_attachment(path_text: str, *,
 
 
 def _format_multiline_string(value, indent=""):
-    """Render a multi-line string as one repr per physical line.
+    """Render each physical line as a normal single-line string literal.
 
-    pformat writes every newline as a literal ``\\n`` and then, once a
-    line overflows its wrapping width, breaks that literal wherever the
-    margin happens to fall.  Splitting the value on its real newlines
-    first puts every break exactly at a newline: the quote closes at the
-    end of a line and reopens on the next one.  Over-long lines are left
-    alone for the terminal to soft-wrap.
+    ``splitlines(keepends=True)`` keeps every line's trailing newline, so
+    ``repr`` writes it as ``\\n`` inside the literal while keeping the
+    literal a one-line, valid Python string; the literals are joined with
+    real newlines so the argument reads line by line.  Over-long lines
+    are left for the terminal to soft-wrap.
     """
     return ("\n" + indent).join(
-        repr(line) for line in value.split("\n"))
+        repr(line) for line in value.splitlines(keepends=True))
 
 
 def _format_tool_arg(name, value):

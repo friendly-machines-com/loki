@@ -585,15 +585,12 @@ class TerminalWiringTests(unittest.TestCase):
         self.assertEqual(
             output,
             "\nnova: Executing Tool: 'Bash' with args:\n"
-            f"command: '{long_line}'\n"
-            "         'second'\n"
+            f"command: '{long_line}\\n'\n"
+            "         'second\\n'\n"
             "         '\\tthird'\n",
         )
-        # The over-long line is neither hard-wrapped nor escaped: the
-        # terminal soft-wraps it.  Only real newlines end lines.
-        self.assertNotIn("\\n", output)
 
-    def test_multiline_tool_argument_quotes_each_physical_line(self):
+    def test_multiline_tool_argument_keeps_the_newline_escape(self):
         output = self.replay(
             [{
                 "type": "tool_call",
@@ -603,10 +600,10 @@ class TerminalWiringTests(unittest.TestCase):
             StyledTerminal(),
         )
 
-        # repr picks double quotes for the line holding the apostrophe;
-        # each physical line keeps its own repr, reopened after the
-        # newline.
-        self.assertIn("command: \"it's\"\n         'fine'\n", output)
+        # Each physical line is its own one-line literal and keeps its
+        # trailing newline as ``\n``.  repr picks double quotes for the
+        # line holding the apostrophe.
+        self.assertIn("command: \"it's\\n\"\n         'fine'\n", output)
 
     def test_list_tool_argument_wraps_after_each_item(self):
         output = self.replay(
