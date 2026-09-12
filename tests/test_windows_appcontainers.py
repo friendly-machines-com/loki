@@ -768,6 +768,22 @@ def integrity_characterization(native, manifest):
         outcomes.append(result)
         print(json.dumps(result), flush=True)
 
+    # The labels decide how to read the outcomes below: a low-integrity process
+    # modifying an object is only "allowed" or "denied" against the object's own
+    # label, so report both levels alongside the results.
+    label = None
+    try:
+        handle = native.open(target, access=0x20000)  # READ_CONTROL
+        try:
+            label = native.mandatory_label(handle)
+        finally:
+            native.check(native.close(handle))
+    except OSError as error:
+        label = 'unreadable:%s' % type(error).__name__
+    print(json.dumps({'probe': 'integrity-labels',
+                      'process': native.integrity_level(),
+                      'target': label}), flush=True)
+
     characterized('modify-broker-created-file',
                   lambda: target.write_bytes(b'CHILD'))
     characterized('delete-broker-created-file', lambda: target.unlink())
@@ -2107,8 +2123,19 @@ class AppContainerTests(unittest.TestCase):
                    '(A;OICI;FA;;;%s)' % package)
         # Medium-integrity file created by the unrestricted broker, for the
         # contained process's write-up characterization: the DACL permits the
-        # container, so only mandatory integrity control can deny it.
+        # container, so only mandatory integrity control can deny it.  Both
+        # sides of that question are recorded here -- the broker's own integrity
+        # level and the label its file carries -- because a low-integrity
+        # container modifying a broker-created file cannot be interpreted
+        # without them.
         (workspace / 'existing-medium').write_bytes(b'MEDIUM')
+        handle = native.open(workspace / 'existing-medium', access=0x20000)
+        try:
+            created_label = native.mandatory_label(handle)
+        finally:
+            native.check(native.close(handle))
+        print(json.dumps({'broker_integrity': native.integrity_level(),
+                          'broker_created_label': created_label}), flush=True)
         os.link(secret / 'read', workspace / 'alias')
         junction = workspace / 'junction'
         result = subprocess.run(

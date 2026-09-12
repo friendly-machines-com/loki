@@ -63,6 +63,47 @@ class TokenGroups(C.Structure):
     _fields_ = [('GroupCount', ULONG), ('Groups', SidAttributes * 1)]
 
 
+class Acls(C.Structure):
+    """ACL header that precedes the ACE array in a security descriptor."""
+
+    _fields_ = [('revision', C.c_ubyte), ('sbz1', C.c_ubyte),
+                ('size', C.c_uint16), ('ace_count', C.c_uint16),
+                ('sbz2', C.c_uint16)]
+
+
+class AceHeaders(C.Structure):
+    _fields_ = [('type', C.c_ubyte), ('flags', C.c_ubyte),
+                ('size', C.c_uint16)]
+
+
+SE_FILE_OBJECT = 1
+LABEL_SECURITY_INFORMATION = 0x10
+SYSTEM_MANDATORY_LABEL_ACE_TYPE = 0x11
+
+
+def mandatory_label_sid(sacl_address):
+    """Return the address of the mandatory-label SID inside a SACL, or None.
+
+    An object's integrity label is not in the DACL: it is a
+    SYSTEM_MANDATORY_LABEL_ACE (type 0x11) in the SACL, whose SID follows the
+    ACE header and the access mask.  Walking it by hand keeps those offsets
+    visible, and the walk is regression-tested with a synthetic buffer -- a
+    wrong offset would silently report "no label" on the platform that matters.
+    """
+    if not sacl_address:
+        return None
+    acl = Acls.from_address(sacl_address)
+    ace_address = sacl_address + C.sizeof(Acls)
+    for _ in range(acl.ace_count):
+        ace = AceHeaders.from_address(ace_address)
+        if ace.type == SYSTEM_MANDATORY_LABEL_ACE_TYPE:
+            return ace_address + C.sizeof(AceHeaders) + C.sizeof(ULONG)
+        if not ace.size:
+            break
+        ace_address += ace.size
+    return None
+
+
 def require_standard_user(details, expected_sid):
     """Reject elevated and filtered administrator tokens, not just elevation."""
     if details['user'] != expected_sid:
@@ -211,6 +252,25 @@ class NativeCalls:
         finally:
             self.local_free(descriptor)
 
+    def mandatory_label(self, handle):
+        """Return the object's mandatory integrity label as a SID string.
+
+        Returns None when the object carries no label.  Distinguishing an
+        integrity denial from a DACL denial needs this: both surface as
+        ERROR_ACCESS_DENIED, so the levels are what tell them apart.
+        """
+        sacl, descriptor = HANDLE(), HANDLE()
+        error = self.get_security(handle, SE_FILE_OBJECT,
+                                  LABEL_SECURITY_INFORMATION, None, None,
+                                  None, C.byref(sacl), C.byref(descriptor))
+        if error:
+            raise C.WinError(error)
+        try:
+            sid = mandatory_label_sid(sacl.value)
+            return None if sid is None else self.sid(HANDLE(sid))
+        finally:
+            self.local_free(descriptor)
+
     def token_details(self, *, include_groups=False):
         token = HANDLE()
         self.check(self.open_token(self.current_process(), 8, C.byref(token)))
@@ -312,6 +372,63 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
                 start = RenameInfos.FileName.offset
                 self.assertEqual(buffer.raw[start:start + len(encoded) + 2],
                                  encoded + b'\0\0')
+
+    # S-1-16-4096: revision 1, one subauthority, authority 16, level 0x1000.
+    MANDATORY_LABEL_SID = bytes([1, 1, 0, 0, 0, 0, 0, 16]) + (
+        4096).to_bytes(4, 'little')
+
+    @staticmethod
+    def mandatory_label_buffer(sid, *, prefix_aces=()):
+        """Build a synthetic SACL whose last ACE carries ``sid``.
+
+        ``prefix_aces`` are (type, payload) pairs placed before it, so the walk
+        has to skip ACEs rather than assume the label comes first.
+        """
+        aces = list(prefix_aces) + [(SYSTEM_MANDATORY_LABEL_ACE_TYPE, sid)]
+        size = C.sizeof(Acls) + sum(
+            C.sizeof(AceHeaders) + C.sizeof(ULONG) + len(payload)
+            for _type, payload in aces)
+        buffer = C.create_string_buffer(size)
+        acl = Acls.from_buffer(buffer)
+        acl.revision = 2
+        acl.size = size
+        acl.ace_count = len(aces)
+        address = C.addressof(buffer) + C.sizeof(Acls)
+        for ace_type, payload in aces:
+            ace = AceHeaders.from_address(address)
+            ace.type = ace_type
+            ace.size = C.sizeof(AceHeaders) + C.sizeof(ULONG) + len(payload)
+            C.memmove(address + C.sizeof(AceHeaders) + C.sizeof(ULONG),
+                      payload, len(payload))
+            address += ace.size
+        return buffer
+
+    def test_mandatory_label_walk_finds_the_sid_after_header_and_mask(self):
+        buffer = self.mandatory_label_buffer(self.MANDATORY_LABEL_SID)
+
+        found = mandatory_label_sid(C.addressof(buffer))
+
+        self.assertEqual(
+            C.string_at(found, len(self.MANDATORY_LABEL_SID)),
+            self.MANDATORY_LABEL_SID)
+
+    def test_mandatory_label_walk_skips_other_aces(self):
+        buffer = self.mandatory_label_buffer(
+            self.MANDATORY_LABEL_SID, prefix_aces=[(0x00, b'\x01' * 12)])
+
+        found = mandatory_label_sid(C.addressof(buffer))
+
+        self.assertEqual(
+            C.string_at(found, len(self.MANDATORY_LABEL_SID)),
+            self.MANDATORY_LABEL_SID)
+
+    def test_mandatory_label_walk_returns_none_when_absent(self):
+        self.assertIsNone(mandatory_label_sid(0))
+        buffer = self.mandatory_label_buffer(
+            self.MANDATORY_LABEL_SID, prefix_aces=[(0x00, b'\x01' * 12)])
+        Acls.from_buffer(buffer).ace_count = 1  # count stops before the label
+
+        self.assertIsNone(mandatory_label_sid(C.addressof(buffer)))
 
     def exercise_token_queries(self, *, fail_elevation=False,
                                include_groups=False):
