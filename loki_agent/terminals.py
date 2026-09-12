@@ -97,9 +97,6 @@ else:
     class Terminal(_TerminalTextOutput):
         markdown_style = True
 
-        def __init__(self):
-            self.bracketed_paste = False
-
         def clear_screen(self):
             print('\033[2J', end='')
 
@@ -780,7 +777,6 @@ class TerminalMode:
             self.old_attrs = None
 
 
-PASTE_START_SEQUENCE = b'\x1b[200~'
 PASTE_END_SEQUENCE = b'\x1b[201~'
 FALLBACK_BACKSPACE_BYTES = frozenset((0x08, 0x7f))
 FALLBACK_BACKSPACE_WORD_BYTES = frozenset((0x17,))
@@ -2039,7 +2035,6 @@ class InputSession:
         )
         self.user_messages = UserMessageQueue(on_queue_size_change)
         self._producer = None
-        self._mode = None
         self._modal = None
         self._resources = None
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
@@ -2048,15 +2043,12 @@ class InputSession:
     async def __aenter__(self):
         resources = contextlib.AsyncExitStack()
         try:
-            self._mode = resources.enter_context(
+            resources.enter_context(
                 TerminalMode(self.fd, self.interactive))
             await resources.enter_async_context(self.reader)
             self._producer = asyncio.create_task(self._produce())
         except BaseException:
-            try:
-                await resources.__aexit__(*sys.exc_info())
-            finally:
-                self._mode = None
+            await resources.__aexit__(*sys.exc_info())
             raise
         self._resources = resources
         return self
@@ -2077,11 +2069,8 @@ class InputSession:
             finally:
                 self.user_messages.discard_pending_messages()
         finally:
-            try:
-                if resources is not None:
-                    await resources.__aexit__(*sys.exc_info())
-            finally:
-                self._mode = None
+            if resources is not None:
+                await resources.__aexit__(*sys.exc_info())
 
     async def _produce(self):
         while True:

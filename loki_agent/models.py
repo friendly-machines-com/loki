@@ -1176,18 +1176,6 @@ def flattened_config_option_choices(
     return choices
 
 
-def flattened_config_options(credentials, explicit_connection=None,
-                             groups=None):
-    """ACP select entries, preserving explicit config while offline."""
-    return [
-        option for option, _leaf in flattened_config_option_choices(
-            credentials,
-            explicit_connection=explicit_connection,
-            groups=groups,
-        )
-    ]
-
-
 async def run_model_picker_async(
         input_fn,
         credentials: CredentialStore | CredentialInventory,

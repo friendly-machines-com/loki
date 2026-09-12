@@ -48,10 +48,6 @@ class ProviderDetectionError(ProtocolError):
     pass
 
 
-class UnsupportedProtocolError(ProtocolError):
-    pass
-
-
 class StreamProtocolError(ProtocolError):
     def __init__(self, message, payload=None):
         super().__init__(message, payload=payload)
@@ -1329,13 +1325,3 @@ def make_provider(input_url, provider=AUTO, models_url=None,
         prompt_cache=prompt_cache,
         openai_request_profile=openai_request_profile,
     )
-
-
-def json_body(payload):
-    if payload is None:
-        return b""
-    return json.dumps(payload).encode("utf-8")
-
-
-def copy_headers(headers):
-    return copy.deepcopy(headers or {})

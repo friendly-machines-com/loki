@@ -31,13 +31,3 @@ def loki_config_dir(environ=None) -> str:
 def credential_directory(environ=None) -> str:
     """Return the directory hidden from credential-consuming runtimes."""
     return os.path.join(loki_config_dir(environ), "credentials")
-
-
-def credential_file(environ=None) -> str:
-    return os.path.join(
-        credential_directory(environ), CREDENTIAL_FILE_NAME)
-
-
-def credential_lock_file(environ=None) -> str:
-    return os.path.join(
-        credential_directory(environ), CREDENTIAL_LOCK_FILE_NAME)

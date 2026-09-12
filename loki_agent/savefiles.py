@@ -196,20 +196,6 @@ def report_chat_log_saved(path: str) -> None:
     pass
 
 
-def write_chat_log(file_obj, events: list, todos: list,
-                   session_state: dict, toolsets=None) -> None:
-    file_obj.seek(0)
-    json.dump(
-        chat_log_blob(
-            events, todos, session_state, toolsets=toolsets),
-        file_obj,
-        indent=4,
-    )
-    file_obj.truncate()
-    file_obj.flush()
-    report_chat_log_saved(file_obj.name)
-
-
 class ResumeTranscriptRenderer:
     """Describe and render the visible conversation in a loaded transcript.
 

@@ -112,12 +112,3 @@ class SseDecoder:
         self._event_type = ""
         self._event_bytes = 0
         return event
-
-
-async def iter_sse_events(byte_chunks, max_event_bytes=SSE_MAX_EVENT_BYTES):
-    decoder = SseDecoder(max_event_bytes=max_event_bytes)
-    async for chunk in byte_chunks:
-        for event in decoder.feed(chunk):
-            yield event
-    for event in decoder.finish():
-        yield event

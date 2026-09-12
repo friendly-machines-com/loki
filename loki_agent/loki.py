@@ -75,10 +75,6 @@ def current_cwd() -> str:
     return current_session().shell_cwd
 
 
-def current_previous_cwd() -> str:
-    return current_session().previous_shell_cwd
-
-
 def current_config():
     return current_session().runtime_config
 
@@ -210,11 +206,9 @@ MAX_LOOP_LIMIT = 50
 READ_CHAR_CAP = 10 * 1024 * 1024
 READ_PATHS_LIMIT = 1000
 READ_DEFAULT_LINES = 2000
-READ_MAX_LINES = 2000
 BASH_DEFAULT_TIMEOUT_MS = 300000
 BASH_MAX_TIMEOUT_MS = 600000
 BASH_MAX_OUTPUT_CHARS = 10_000_000
-WRITE_MAX_OUTPUT_CHARS = 1_000_000
 GLOB_MAX_RESULTS = 100
 GREP_DEFAULT_HEAD_LIMIT = 250
 SEARCH_TIMEOUT_S = 30
@@ -227,7 +221,6 @@ MAX_SUBAGENT_DEPTH = 3
 TODO_MAX_TODOS = 100
 SKILL_MAX_BYTES = 100_000
 LOKI_CONFIG_DIR_NAME = paths.LOKI_CONFIG_DIR_NAME
-XDG_CONFIG_HOME = paths.xdg_config_home()
 LOKI_CONFIG_DIR = paths.loki_config_dir()
 XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
 LOKI_STATE_DIR = os.path.join(os.path.expanduser(XDG_STATE_HOME), LOKI_CONFIG_DIR_NAME)
@@ -243,7 +236,6 @@ WEBFETCH_TIMEOUT_S = 30
 LLM_REQUEST_TIMEOUT_S = 300
 LLM_STREAM_IDLE_TIMEOUT_S = 300
 WEBFETCH_MAX_BYTES = 10_485_760  # 10 MiB
-WEBFETCH_MAX_OUTPUT = 100_000   # 100 KB inline result
 WEBFETCH_MAX_PROMPT_CHARS = 200_000
 WEBFETCH_CACHE_TTL = 15 * 60    # 15 minutes
 WEBFETCH_CACHE_MAX_ENTRIES = 128
@@ -1075,13 +1067,6 @@ def _existing_target(file_path: str, observed_stat) -> str:
     return target
 
 
-def _path_under(path: str, parent: str) -> bool:
-    try:
-        return os.path.commonpath([path, parent]) == parent
-    except ValueError:
-        return False
-
-
 def display_path(path: str) -> str:
     return path
 
@@ -1107,10 +1092,6 @@ def change_shell_cwd(path: str = None) -> str:
 ToolSchemaError = tool_runtime.ToolSchemaError
 
 
-class ToolValidationError(ValueError):
-    pass
-
-
 SCHEMA_ANNOTATION_KEYS = tool_runtime.SCHEMA_ANNOTATION_KEYS
 SCHEMA_VALIDATION_KEYS = tool_runtime.SCHEMA_VALIDATION_KEYS
 SCHEMA_ALLOWED_KEYS = tool_runtime.SCHEMA_ALLOWED_KEYS
@@ -1120,23 +1101,6 @@ def _schema_path(path: str, key) -> str:
     if isinstance(key, int):
         return f"{path}[{key}]"
     return f"{path}.{key}" if path else str(key)
-
-
-def _json_type_name(value) -> str:
-    return tool_runtime.json_type_name(value)
-
-
-def _matches_json_type(value, expected_type: str) -> bool:
-    return tool_runtime.matches_json_type(value, expected_type)
-
-
-def _validate_schema(schema: dict, value, path: str = "$"):
-    if path != "$":
-        raise ToolSchemaError(
-            "_validate_schema compatibility wrapper only accepts root path")
-    issues = tool_runtime.validate_schema(schema, value)
-    if issues:
-        raise ToolValidationError(issues[0].message)
 
 
 def _close_object_schemas(schema: dict):
@@ -1215,19 +1179,6 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
     if extra_handlers:
         raise ToolSchemaError(f"handler without tool definition: {', '.join(extra_handlers)}")
     return registry
-
-
-def validate_tool_args(fn_name: str, args) -> str | None:
-    spec = TOOL_REGISTRY.get(fn_name)
-    if spec is None:
-        return f"Error: unknown tool: {fn_name}"
-    try:
-        _validate_schema(spec["schema"], args)
-    except ToolValidationError as e:
-        return f"Error: invalid arguments for {fn_name}: {e}"
-    except ToolSchemaError as e:
-        return f"Error: invalid schema for {fn_name}: {e}"
-    return None
 
 
 def _truncate_text(s: str, max_chars: int) -> str:
@@ -1438,7 +1389,6 @@ class Job:
     stdout_path: str
     stderr_path: str
     metadata_path: str
-    started_at: float
     started_at_iso: str
     process: asyncio.subprocess.Process | None = field(default=None, repr=False)
     pid: int | None = None
@@ -1620,7 +1570,6 @@ class JobManager:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             metadata_path=metadata_path,
-            started_at=time.time(),
             started_at_iso=_now_iso(),
             timeout_ms=timeout_ms,
             session_owned=session_owned,

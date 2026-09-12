@@ -878,13 +878,6 @@ def openai_chat_message_to_items(message):
     return [_native_output(OPENAI_CHAT, message)]
 
 
-def openai_chat_messages_to_items(messages):
-    items = []
-    for message in messages or []:
-        items.extend(openai_chat_message_to_items(message))
-    return items
-
-
 def openai_chat_response_to_items(response):
     if not isinstance(response, dict):
         raise TranscriptFormatError("OpenAI Chat response must be an object")
