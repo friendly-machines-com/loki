@@ -579,14 +579,18 @@ class TerminalWiringTests(unittest.TestCase):
 
     def test_multiline_tool_argument_breaks_only_at_newlines(self):
         long_line = "x" * 200
-        output = self.replay(
-            [{
-                "type": "tool_call",
-                "name": "Bash",
-                "args": {"command": f"{long_line}\nsecond\n\tthird"},
-            }],
-            StyledTerminal(),
-        )
+        # `computer` is captured from socket.gethostname() at import time and
+        # copied into terminal_frontend, so patch that binding rather than the
+        # socket call: the tool-call label must not depend on the hostname.
+        with mock.patch.object(terminal_frontend, "computer", "nova"):
+            output = self.replay(
+                [{
+                    "type": "tool_call",
+                    "name": "Bash",
+                    "args": {"command": f"{long_line}\nsecond\n\tthird"},
+                }],
+                StyledTerminal(),
+            )
 
         self.assertEqual(
             output,
