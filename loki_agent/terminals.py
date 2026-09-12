@@ -100,6 +100,12 @@ else:
     class Terminal(_TerminalTextOutput):
         markdown_style = True
 
+        def __init__(self):
+            # DECSET 2026 frames must not nest: begin and end must pair up
+            # exactly, and only one frame may be open at a time.  This counter
+            # makes a violation fail loudly instead of silently nesting.
+            self._synchronized_updates = 0
+
         def clear_screen(self):
             print('\033[2J', end='')
 
@@ -160,12 +166,18 @@ else:
             '''
             Start buffering without update
             '''
+            assert self._synchronized_updates == 0, (
+                "begin_synchronized_update called while a frame is open")
+            self._synchronized_updates += 1
             print('\033[?2026h', end='')
 
         def end_synchronized_update(self):
             '''
             End buffering without update, update.
             '''
+            assert self._synchronized_updates == 1, (
+                "end_synchronized_update called without an open frame")
+            self._synchronized_updates -= 1
             print('\033[?2026l', end='')
 
         def hide_cursor(self):  # DECTCEM: the input area draws its own reverse-video caret.
