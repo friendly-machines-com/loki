@@ -2582,7 +2582,7 @@ def _refused_tool_hint(fn_name, args, allowed):
     try:
         command = args["command"]
         if "grep" in command and "Grep" in TOOL_REGISTRY and (allowed is None or "Grep" in allowed):
-            return 'This command liks like a grep; the Grep tool is still available.'
+            return 'This command looks like a grep; the Grep tool is still available.'
     except Exception:
         return None
 
