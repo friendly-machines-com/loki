@@ -27,3 +27,8 @@ dependencies = []
 [project.scripts]
 loki = "loki_agent.__main__:main"
 loki-acp = "loki_agent.acp_main:main"
+
+[tool.vulture]
+paths = ["loki_agent", "loki.py", "vulture_whitelist.py"]
+exclude = ["foot-git", "agent-shell", "shell-maker"]
+min_confidence = 60
