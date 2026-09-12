@@ -19,7 +19,6 @@ import signal
 import stat
 import sys
 from dataclasses import dataclass
-from pprint import pformat
 
 from .diagnostics import debug_json
 from . import formats
@@ -31,6 +30,7 @@ from . import protocols
 from . import savefiles
 from . import subagents
 from . import terminals
+from . import texts
 from . import tool_runtime
 from .connections import (
     ConnectionDescriptor,
@@ -230,62 +230,9 @@ def load_image_attachment(path_text: str, *,
     )
 
 
-_TOOL_ARG_INDENT = "    "
-
-
-def _indent_tool_arg(text):
-    """Indent every physical line of one rendered tool argument.
-
-    Continuation lines produced by ``_format_tool_arg`` already carry
-    their own relative alignment, so prefixing the same base indent to the
-    first and every wrapped line keeps them aligned under the value.
-    """
-    return "\n".join(
-        _TOOL_ARG_INDENT + line if line else line
-        for line in text.split("\n"))
-
-
-def _format_multiline_string(value, indent=""):
-    """Render each physical line as a normal single-line string literal.
-
-    ``splitlines(keepends=True)`` keeps every line's trailing newline, so
-    ``repr`` writes it as ``\\n`` inside the literal while keeping the
-    literal a one-line, valid Python string; the literals are joined with
-    real newlines so the argument reads line by line.  Over-long lines
-    are left for the terminal to soft-wrap.
-    """
-    return ("\n" + indent).join(
-        repr(line) for line in value.splitlines(keepends=True))
-
-
-def _format_tool_arg(name, value):
-    """Render one tool argument, ``name: value``, for display."""
-    head = f"{name}: "
-    if isinstance(value, str) and "\n" in value:
-        # Indent continuation lines under the opening value.
-        rendered = _format_multiline_string(value, " " * len(head))
-    elif isinstance(value, list):
-        # Keep the brackets and commas, but break after each top-level
-        # comma so items wrap one per line instead of one long repr.
-        rendered = "[" + (",\n" + " " * (len(head) + 1)).join(
-            pformat(item, width=10000) for item in value) + "]"
-    else:
-        # A huge width stops pformat hard-wrapping; the terminal
-        # soft-wraps instead.
-        rendered = pformat(value, width=10000)
-    return head + rendered
-
-
 def _print_tool_args(args):
-    if not isinstance(args, dict):
-        terminal.write_text(
-            _indent_tool_arg(pformat(args, width=10000)), multiline=True)
-        print()
-        return
-    for k, v in args.items():
-        terminal.write_text(
-            _indent_tool_arg(_format_tool_arg(k, v)), multiline=True)
-        print()
+    terminal.write_text(texts.format_tool_args(args), multiline=True)
+    print()
 
 
 def _print_text_line(prefix, text, *, file=None, multiline=False):

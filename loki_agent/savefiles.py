@@ -14,6 +14,7 @@ import uuid
 from pprint import pformat
 
 from . import formats
+from . import texts
 
 
 _PREVIEW_RE = re.compile(
@@ -286,7 +287,7 @@ class ResumeTranscriptRenderer:
             ("literal", "Tool call: "),
             ("program_atom", name),
             ("literal", "\n"),
-            ("text", pformat(input_value, width=100)),
+            ("text", texts.format_tool_args(input_value)),
         ]]
 
     @staticmethod

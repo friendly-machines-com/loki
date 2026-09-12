@@ -2656,7 +2656,7 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
             "User: hello\n\n"
             "Assistant: hi there\n\n"
             "Tool call: Read\n"
-            "{'file_path': 'README.md'}\n\n"
+            "    file_path: 'README.md'\n\n"
             "Tool result: Read\n"
             "file contents",
         )
@@ -2797,7 +2797,8 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         self.assertNotIn("\x1b]0;", rendered)
         self.assertIn(
             "'Read\\x1b]0;name\\x07\\nnext'", rendered)
-        self.assertIn("\\x1b]0;path\\x07\\nb", rendered)
+        self.assertIn("path: 'a\\x1b]0;path\\x07\\n'", rendered)
+        self.assertIn("'b'", rendered)
         self.assertIn(
             "first^[]0;result^G\nsecond\\x9b \u6a21\u578b",
             rendered,
