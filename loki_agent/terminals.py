@@ -147,6 +147,24 @@ else:
         def reset_colors_and_flags(self):
             print('\033[m', end='')
 
+        # -- synchronized output (DECSET 2026) --------------------------
+        # Double buffering.
+        # While BSU is set the terminal keeps showing the last rendered frame
+        # while it still parses and applies everything we send; ESU makes it
+        # repaint once from the current screen buffer.
+
+        def begin_synchronized_update(self):
+            '''
+            Start buffering without update
+            '''
+            print('\033[?2026h', end='')
+
+        def end_synchronized_update(self):
+            '''
+            End buffering without update, update.
+            '''
+            print('\033[?2026l', end='')
+
         def hide_cursor(self):  # DECTCEM: the input area draws its own reverse-video caret.
             print('\033[?25l', end='')
 

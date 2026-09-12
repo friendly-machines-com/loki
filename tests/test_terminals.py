@@ -281,6 +281,12 @@ class RecordingTerminal:
     def set_reverse_video(self, enabled):
         self.calls.append(("set_reverse_video", enabled))
 
+    def begin_synchronized_update(self):
+        self.calls.append(("begin_synchronized_update",))
+
+    def end_synchronized_update(self):
+        self.calls.append(("end_synchronized_update",))
+
     def clear_to_end_of_screen(self):
         self.calls.append(("clear_to_end_of_screen",))
 

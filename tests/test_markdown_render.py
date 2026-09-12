@@ -42,6 +42,12 @@ class PresentationTerminal(terminals._TerminalTextOutput):
     def reset_colors_and_flags(self):
         pass
 
+    def begin_synchronized_update(self):
+        pass
+
+    def end_synchronized_update(self):
+        pass
+
 
 class StyledTerminal(PresentationTerminal):
     def __init__(self):
