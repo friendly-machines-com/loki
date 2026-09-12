@@ -230,13 +230,40 @@ def load_image_attachment(path_text: str, *,
     )
 
 
+def _format_multiline_string(value, indent=""):
+    """Render a multi-line string as one repr per physical line.
+
+    pformat writes every newline as a literal ``\\n`` and then, once a
+    line overflows its wrapping width, breaks that literal wherever the
+    margin happens to fall.  Splitting the value on its real newlines
+    first puts every break exactly at a newline: the quote closes at the
+    end of a line and reopens on the next one.  Over-long lines are left
+    alone for the terminal to soft-wrap.
+    """
+    return ("\n" + indent).join(
+        repr(line) for line in value.split("\n"))
+
+
+def _format_tool_arg(name, value):
+    """Render one tool argument, ``name: value``, for display."""
+    head = f"{name}: "
+    if isinstance(value, str) and "\n" in value:
+        # Indent continuation lines under the opening value.
+        rendered = _format_multiline_string(value, " " * len(head))
+    else:
+        # A huge width stops pformat hard-wrapping; the terminal
+        # soft-wraps instead.
+        rendered = pformat(value, width=10000)
+    return head + rendered
+
+
 def _print_tool_args(args):
     if not isinstance(args, dict):
         terminal.write_text(pformat(args, width=10000), multiline=True)
         print()
         return
     for k, v in args.items():
-        terminal.write_text(pformat((k, v), width=10000), multiline=True)
+        terminal.write_text(_format_tool_arg(k, v), multiline=True)
         print()
 
 
@@ -413,6 +440,8 @@ def _terminal_agent_event(event: dict):
         terminal.reset_colors_and_flags()
     elif kind == "tool_call":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
+        # Blank line before the block, matching "User:" and "<model>:".
+        print()
         print(f"{computer}: Executing Tool: ", end="")
         terminal.write_text(repr(event["name"]))
         print(" with args:")

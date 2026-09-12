@@ -571,6 +571,43 @@ class TerminalWiringTests(unittest.TestCase):
         self.assertIn("\\nnext", output)
         self.assertIn("\u6a21\u578b", output)
 
+    def test_multiline_tool_argument_breaks_only_at_newlines(self):
+        long_line = "x" * 200
+        output = self.replay(
+            [{
+                "type": "tool_call",
+                "name": "Bash",
+                "args": {"command": f"{long_line}\nsecond\n\tthird"},
+            }],
+            StyledTerminal(),
+        )
+
+        self.assertEqual(
+            output,
+            "\nnova: Executing Tool: 'Bash' with args:\n"
+            f"command: '{long_line}'\n"
+            "         'second'\n"
+            "         '\\tthird'\n",
+        )
+        # The over-long line is neither hard-wrapped nor escaped: the
+        # terminal soft-wraps it.  Only real newlines end lines.
+        self.assertNotIn("\\n", output)
+
+    def test_multiline_tool_argument_quotes_each_physical_line(self):
+        output = self.replay(
+            [{
+                "type": "tool_call",
+                "name": "Bash",
+                "args": {"command": "it's\nfine"},
+            }],
+            StyledTerminal(),
+        )
+
+        # repr picks double quotes for the line holding the apostrophe;
+        # each physical line keeps its own repr, reopened after the
+        # newline.
+        self.assertIn("command: \"it's\"\n         'fine'\n", output)
+
     def test_non_tty_terminal_emits_original_markdown(self):
         streamed = self.replay(
             self.stream_events(["**hel", "lo**"]), NoneTerminal())
