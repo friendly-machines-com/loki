@@ -997,20 +997,21 @@ class EscapeResultTests(unittest.TestCase):
         api.create_as_user = mock.Mock(return_value=0)
         api.create_with_token = mock.Mock(return_value=0)
         startup, child = ExtendedStartups(), ProcessInfos()
+        creation_flags = 0x80000 | 4
         with mock.patch('builtins.print'):
-            api.launch_as_user(9, 'exe', 'cmd', startup, child)
-            api.launch_with_token(9, 'exe', 'cmd', startup, child)
+            api.launch_as_user(9, 'exe', 'cmd', startup, child, creation_flags)
+            api.launch_with_token(9, 'exe', 'cmd', startup, child, creation_flags)
         user_args = api.create_as_user.call_args.args
         self.assertEqual(len(user_args), 11)
         self.assertEqual(user_args[:3], (9, 'exe', 'cmd'))
         self.assertIsNone(user_args[3])
         self.assertIsNone(user_args[4])
         self.assertIs(user_args[5], False)
-        self.assertEqual(user_args[6], 0x80000 | 4)
+        self.assertEqual(user_args[6], creation_flags)
         token_args = api.create_with_token.call_args.args
         self.assertEqual(len(token_args), 9)
         self.assertEqual(token_args[:4], (9, 0, 'exe', 'cmd'))
-        self.assertEqual(token_args[4], 0x80000 | 4)
+        self.assertEqual(token_args[4], creation_flags)
 
     def test_token_launch_success_requires_inspected_containment(self):
         api = self.impersonation_free_api()
