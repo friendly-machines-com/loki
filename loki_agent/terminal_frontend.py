@@ -491,18 +491,18 @@ def _status_fields(activity):
 
 def status_text(activity: TerminalActivityStatus | None = None) -> str:
     fields = _status_fields(activity)
-    remote = 'Remote: API: {}; Model: {}'.format(
+    remote = 'Remote: API: {}, Model: {}'.format(
         fields["api"], fields["model"])
     if fields["effort"] is not None:
-        remote += '; Effort: {}; /model, /effort, /status'.format(
+        remote += ', Effort: {}; /model, /effort, /status, /account'.format(
             fields["effort"])
     else:
-        remote += '; /model, /status'
+        remote += '; /model, /status, /account'
     return (
         remote + '\n'
         'Local: CWD: {}, turn: {}, queued messages: {}, queued images: {}, '
         'mode: {}; '
-        '/pwd, /cd DIR, /ps, /image PATH, !foo, /account, /quit'
+        '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         fields["cwd"],
         fields["turn"],
@@ -515,14 +515,14 @@ def _write_status_text():
     fields = _status_fields(None)
     print("Remote: API: ", end="")
     terminal.write_text(fields["api"])
-    print("; Model: ", end="")
+    print(", Model: ", end="")
     terminal.write_text(fields["model"])
     if fields["effort"] is not None:
-        print("; Effort: ", end="")
+        print(", Effort: ", end="")
         terminal.write_text(fields["effort"])
-        print("; /model, /effort, /status\nLocal: CWD: ", end="")
+        print("; /model, /effort, /status, /account\nLocal: CWD: ", end="")
     else:
-        print("; /model, /status\nLocal: CWD: ", end="")
+        print("; /model, /status, /account\nLocal: CWD: ", end="")
     terminal.write_text(fields["cwd"])
     print(", turn: ", end="")
     for label, value, active in (
@@ -538,7 +538,7 @@ def _write_status_text():
             print(terminals.BOLD_OFF, end="")
     print(", mode: ", end="")
     terminal.write_text(fields["mode"])
-    print("; /pwd, /cd DIR, /ps, /image PATH, !foo, /account, /quit", end="")
+    print("; /pwd, /cd DIR, /ps, /image PATH, !foo, /quit", end="")
 
 
 terminals.set_status_text_provider(_write_status_text)

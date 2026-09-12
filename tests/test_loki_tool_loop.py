@@ -2455,7 +2455,24 @@ class StatusTextTests(unittest.TestCase):
                 remote, local = rendered.split("\n", 1)
                 self.assertIn("/status", remote)
                 self.assertNotIn("/status", local)
+                self.assertIn("/account", remote)
+                self.assertNotIn("/account", local)
                 self.assertEqual("/effort" in remote, effort is not None)
+
+    def test_status_text_shows_none_when_no_model_is_selected(self):
+        names = ["runtime_config"]
+        old_values = save_loki_state(names)
+
+        try:
+            loki.current_session().runtime_config = None
+            with mock.patch.object(loki, "reasoning_effort_status_text",
+                                   return_value=None):
+                text = terminal_frontend.status_text()
+        finally:
+            restore_loki_state(old_values)
+
+        self.assertIn("Model: none; /model", text)
+        self.assertNotIn("Model: ;", text)
 
     def test_activity_status_redraws_only_for_changed_counts(self):
         activity = terminal_frontend.TerminalActivityStatus()
@@ -2506,11 +2523,12 @@ class StatusTextTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "Remote: API: example.test:8443/base/path; Model: model-x; /model, /status\n"
+            "Remote: API: example.test:8443/base/path, Model: model-x; "
+            "/model, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
             "queued messages: 2, queued images: 1, "
             f"mode: {loki.current_agent_mode()}; "
-            "/pwd, /cd DIR, /ps, /image PATH, !foo, /account, /quit",
+            "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)
         self.assertNotIn("pass", text)
