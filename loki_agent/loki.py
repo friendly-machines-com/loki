@@ -56,9 +56,6 @@ from .sessions import (
     default_session,
 )
 
-# Backwards-compatible public name; the implementation belongs to savefiles.
-ResumeTranscriptRenderer = savefiles.ResumeTranscriptRenderer
-
 
 # Conversation state lives in a sessions.Session.  current_session() returns
 # the process-wide session used by the terminal and headless front-ends; a
@@ -5417,11 +5414,6 @@ def mark_chat_log_dirty():
     session = current_session()
     if session.chat_log_path is not None:
         session.chat_log_dirty = True
-
-
-def render_resume_transcript(items: list) -> str:
-    return savefiles.render_resume_transcript(
-        items, current_model() or "Assistant")
 
 
 def load_chat_log(filename, loaded=None):

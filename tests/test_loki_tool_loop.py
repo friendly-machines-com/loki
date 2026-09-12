@@ -2633,6 +2633,14 @@ class ApiErrorFormattingTests(unittest.TestCase):
 
 
 class ResumeTranscriptRendererTests(unittest.TestCase):
+    @staticmethod
+    def _render(renderer, events):
+        # Join a resume presentation the way a text front-end would; the
+        # terminal front-end walks the same segments itself.
+        return "\n\n".join(
+            "".join(text for _kind, text in block)
+            for block in renderer.presentation(events))
+
     def test_resume_renderer_replays_visible_conversation_without_metadata_dump(self):
         items = [
             formats.instruction_item("internal startup instruction"),
@@ -2649,7 +2657,9 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
             formats.tool_result_item("call_1", "file contents", name="Read"),
         ]
 
-        text = loki.ResumeTranscriptRenderer(assistant_label="Assistant").render(items)
+        text = self._render(
+            savefiles.ResumeTranscriptRenderer(assistant_label="Assistant"),
+            items)
 
         self.assertEqual(
             text,
@@ -2662,36 +2672,6 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         )
         self.assertNotIn("internal startup instruction", text)
         self.assertNotIn("response_metadata", text)
-
-    def test_resume_renderer_injects_presentation_for_assistant_text_only(self):
-        seen = []
-
-        def render_assistant(text):
-            seen.append(text)
-            return f"<rendered>{text}</rendered>"
-
-        items = [
-            formats.message_item("user", "**literal user input**"),
-            formats.model_response_event(
-                "openai_chat",
-                [formats.message_item(
-                    "assistant", "**formatted assistant output**")],
-                model="model-a",
-            ),
-        ]
-
-        text = loki.ResumeTranscriptRenderer(
-            assistant_label="Assistant",
-            assistant_text_renderer=render_assistant,
-        ).render(items)
-
-        self.assertEqual(seen, ["**formatted assistant output**"])
-        self.assertIn("User: **literal user input**", text)
-        self.assertIn(
-            "model-a: "
-            "<rendered>**formatted assistant output**</rendered>",
-            text,
-        )
 
     def test_resume_renderer_uses_response_model_labels(self):
         items = [
@@ -2709,8 +2689,9 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
             ),
         ]
 
-        text = loki.ResumeTranscriptRenderer(
-            assistant_label="current").render(items)
+        text = self._render(
+            savefiles.ResumeTranscriptRenderer(assistant_label="current"),
+            items)
 
         self.assertIn("model-a: from first", text)
         self.assertIn("model-b: from second", text)
@@ -2729,8 +2710,9 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
             },
         )
 
-        text = loki.ResumeTranscriptRenderer(
-            assistant_label="Assistant").render([event])
+        text = self._render(
+            savefiles.ResumeTranscriptRenderer(assistant_label="Assistant"),
+            [event])
 
         self.assertIn("Trusted Access", text)
         self.assertNotIn("Assistant:", text)
@@ -2761,8 +2743,9 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
             ),
         ]
 
-        text = loki.ResumeTranscriptRenderer(
-            assistant_label="Assistant").render(items)
+        text = self._render(
+            savefiles.ResumeTranscriptRenderer(assistant_label="Assistant"),
+            items)
 
         self.assertIn("Provider tool result", text)
         self.assertIn("Visible result", text)

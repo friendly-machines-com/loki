@@ -219,17 +219,8 @@ class ResumeTranscriptRenderer:
     module importing terminal code.
     """
 
-    def __init__(self, assistant_label: str = "Assistant",
-                 assistant_text_renderer=None, user_text_renderer=None):
+    def __init__(self, assistant_label: str = "Assistant"):
         self.assistant_label = assistant_label
-        self.assistant_text_renderer = (
-            assistant_text_renderer
-            if assistant_text_renderer is not None
-            else (lambda text: text))
-        self.user_text_renderer = (
-            user_text_renderer
-            if user_text_renderer is not None
-            else (lambda text: text))
 
     def _message_label(self, item: dict):
         role = item.get("role")
@@ -438,26 +429,3 @@ class ResumeTranscriptRenderer:
         for event in events:
             blocks.extend(self._event_blocks(event))
         return blocks
-
-    def render(self, events: list) -> str:
-        rendered_blocks = []
-        for block in self.presentation(events):
-            rendered_segments = []
-            for kind, text in block:
-                if kind == "assistant_markdown":
-                    text = self.assistant_text_renderer(text)
-                elif kind == "user_text":
-                    text = self.user_text_renderer(text)
-                rendered_segments.append(text)
-            rendered_blocks.append("".join(rendered_segments))
-        return "\n\n".join(rendered_blocks)
-
-
-def render_resume_transcript(
-        events: list, assistant_label: str,
-        assistant_text_renderer=None, user_text_renderer=None) -> str:
-    return ResumeTranscriptRenderer(
-        assistant_label=assistant_label,
-        assistant_text_renderer=assistant_text_renderer,
-        user_text_renderer=user_text_renderer,
-    ).render(events)
