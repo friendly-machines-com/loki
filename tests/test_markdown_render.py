@@ -585,9 +585,9 @@ class TerminalWiringTests(unittest.TestCase):
         self.assertEqual(
             output,
             "\nnova: Executing Tool: 'Bash' with args:\n"
-            f"command: '{long_line}\\n'\n"
-            "         'second\\n'\n"
-            "         '\\tthird'\n",
+            f"    command: '{long_line}\\n'\n"
+            "             'second\\n'\n"
+            "             '\\tthird'\n",
         )
 
     def test_multiline_tool_argument_keeps_the_newline_escape(self):
@@ -603,7 +603,8 @@ class TerminalWiringTests(unittest.TestCase):
         # Each physical line is its own one-line literal and keeps its
         # trailing newline as ``\n``.  repr picks double quotes for the
         # line holding the apostrophe.
-        self.assertIn("command: \"it's\\n\"\n         'fine'\n", output)
+        self.assertIn(
+            "    command: \"it's\\n\"\n             'fine'\n", output)
 
     def test_list_tool_argument_wraps_after_each_item(self):
         output = self.replay(
@@ -619,8 +620,8 @@ class TerminalWiringTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "\ntodos: [{'content': 'first', 'status': 'completed'},\n"
-            "        {'content': 'second', 'status': 'pending'}]\n",
+            "\n    todos: [{'content': 'first', 'status': 'completed'},\n"
+            "            {'content': 'second', 'status': 'pending'}]\n",
             output,
         )
 

@@ -230,6 +230,21 @@ def load_image_attachment(path_text: str, *,
     )
 
 
+_TOOL_ARG_INDENT = "    "
+
+
+def _indent_tool_arg(text):
+    """Indent every physical line of one rendered tool argument.
+
+    Continuation lines produced by ``_format_tool_arg`` already carry
+    their own relative alignment, so prefixing the same base indent to the
+    first and every wrapped line keeps them aligned under the value.
+    """
+    return "\n".join(
+        _TOOL_ARG_INDENT + line if line else line
+        for line in text.split("\n"))
+
+
 def _format_multiline_string(value, indent=""):
     """Render each physical line as a normal single-line string literal.
 
@@ -263,11 +278,13 @@ def _format_tool_arg(name, value):
 
 def _print_tool_args(args):
     if not isinstance(args, dict):
-        terminal.write_text(pformat(args, width=10000), multiline=True)
+        terminal.write_text(
+            _indent_tool_arg(pformat(args, width=10000)), multiline=True)
         print()
         return
     for k, v in args.items():
-        terminal.write_text(_format_tool_arg(k, v), multiline=True)
+        terminal.write_text(
+            _indent_tool_arg(_format_tool_arg(k, v)), multiline=True)
         print()
 
 
