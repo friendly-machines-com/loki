@@ -289,7 +289,7 @@ class TerminalImageCommandTests(unittest.TestCase):
             "durable terminal answer",
             [formats.item_text(item) for item in events],
         )
-        self.assertFalse(loki.current_dirty())
+        self.assertFalse(loki.current_session().chat_log_dirty)
 
     def test_image_command_attaches_snapshot_to_next_text_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4247,7 +4247,7 @@ class ChatLogPathTests(unittest.TestCase):
 
                 self.assertTrue(os.path.isdir(os.path.dirname(path)))
                 self.assertEqual(loki.current_chat_log_path(), path)
-                self.assertTrue(loki.current_dirty())
+                self.assertTrue(loki.current_session().chat_log_dirty)
                 self.assertFalse(os.path.exists(path))
         finally:
             restore_loki_state(old_values)
@@ -4655,7 +4655,7 @@ class ShellCwdTests(unittest.TestCase):
                 saved = loki.save_chat_log()
 
                 self.assertFalse(saved)
-                self.assertFalse(loki.current_dirty())
+                self.assertFalse(loki.current_session().chat_log_dirty)
                 self.assertEqual(pathlib.Path(path).read_bytes(), original)
                 self.assertEqual(
                     loki.current_state()["connection"], descriptor.to_dict())
@@ -4817,7 +4817,7 @@ class ShellCwdTests(unittest.TestCase):
                         loki.save_chat_log()
 
                 self.assertEqual(pathlib.Path(path).read_bytes(), original)
-                self.assertTrue(loki.current_dirty())
+                self.assertTrue(loki.current_session().chat_log_dirty)
                 self.assertEqual(
                     [name for name in os.listdir(tmpdir)
                      if name.endswith(".tmp")],

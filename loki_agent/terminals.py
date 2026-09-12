@@ -2035,6 +2035,7 @@ class InputSession:
         )
         self.user_messages = UserMessageQueue(on_queue_size_change)
         self._producer = None
+        self._mode = None
         self._modal = None
         self._resources = None
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
@@ -2043,12 +2044,15 @@ class InputSession:
     async def __aenter__(self):
         resources = contextlib.AsyncExitStack()
         try:
-            resources.enter_context(
+            self._mode = resources.enter_context(
                 TerminalMode(self.fd, self.interactive))
             await resources.enter_async_context(self.reader)
             self._producer = asyncio.create_task(self._produce())
         except BaseException:
-            await resources.__aexit__(*sys.exc_info())
+            try:
+                await resources.__aexit__(*sys.exc_info())
+            finally:
+                self._mode = None
             raise
         self._resources = resources
         return self
@@ -2069,8 +2073,11 @@ class InputSession:
             finally:
                 self.user_messages.discard_pending_messages()
         finally:
-            if resources is not None:
-                await resources.__aexit__(*sys.exc_info())
+            try:
+                if resources is not None:
+                    await resources.__aexit__(*sys.exc_info())
+            finally:
+                self._mode = None
 
     async def _produce(self):
         while True:

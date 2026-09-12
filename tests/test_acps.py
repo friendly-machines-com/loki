@@ -57,17 +57,6 @@ class FramingTests(unittest.TestCase):
         self.assertNotIn("id", note)
         self.assertEqual(note["method"], "session/update")
 
-    def test_read_messages_parses_lines_and_skips_blanks(self):
-        import io
-        fin = io.StringIO('\n{"id": 1}\n\n{"id": 2}\n')
-        messages = list(acps.read_messages(fin))
-        self.assertEqual([m["id"] for m in messages], [1, 2])
-
-    def test_read_messages_rejects_non_json(self):
-        import io
-        with self.assertRaises(acps.TransportError):
-            list(acps.read_messages(io.StringIO("not json\n")))
-
 
 class AsyncFdLineReaderTests(unittest.TestCase):
     def test_reads_buffered_lines_and_eof_without_changing_fd_flags(self):

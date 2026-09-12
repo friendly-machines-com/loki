@@ -151,10 +151,6 @@ def current_chat_log_path():
     return current_session().chat_log_path
 
 
-def current_dirty() -> bool:
-    return current_session().chat_log_dirty
-
-
 def current_agent_mode() -> str:
     return current_session().agent_mode
 

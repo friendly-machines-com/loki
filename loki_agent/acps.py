@@ -133,21 +133,6 @@ def make_writer(fd: int):
     return write
 
 
-def read_messages(fin):
-    """Yield parsed JSON-RPC messages, one per line; stop at EOF."""
-    for line in fin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise TransportError(f"line is not JSON: {error}") from error
-        if not isinstance(message, dict):
-            raise TransportError("line is not a JSON object")
-        yield message
-
-
 def response(request_id, result=None, error=None) -> dict:
     message = {"jsonrpc": "2.0", "id": request_id}
     if error is not None:
