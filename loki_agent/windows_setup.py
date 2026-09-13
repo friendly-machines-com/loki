@@ -59,10 +59,10 @@ from .windows_state import (
     add_package_ace,
     build_plan,
     entry_grants,
-    grants_package,
     ledger_entry,
     ledger_path,
     load_ledger,
+    names_package,
     remove_package_aces,
     save_ledger,
     workspace_key,
@@ -101,9 +101,13 @@ class WindowsBackend:
 
     def _ungrant_path(self, path: str, package: str) -> None:
         current = windows_api.dacl_sddl(path)
-        if grants_package(current, package):
-            windows_containers.set_dacl_sddl(
-                path, remove_package_aces(current, package))
+        if not names_package(current, package):
+            return
+        updated = remove_package_aces(current, package)
+        # A deny ACE names the package but has no allow to remove; do not rewrite
+        # a DACL that this edit did not change.
+        if updated != current:
+            windows_containers.set_dacl_sddl(path, updated)
 
     def _private_directory(self, path: str, user: str) -> None:
         os.makedirs(path, exist_ok=True)
