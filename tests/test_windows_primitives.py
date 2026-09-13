@@ -1246,6 +1246,48 @@ class WindowsPrimitiveTests(unittest.TestCase):
             record['samefile_error'] = str(error)
         print(json.dumps(record), flush=True)
 
+    def test_symlink_resolution_semantics(self):
+        # What Windows resolves for a directory symlink: `..` through it,
+        # realpath, readlink, and identity.  The path tests assert these, so
+        # their expectations must be written from this, not from POSIX.
+        real = self.root / 'real'
+        (real / 'child').mkdir(parents=True)
+        (real / 'child' / 'file').write_text('x')
+        link = self.root / 'link'
+        record = {'probe': 'symlink-semantics'}
+        try:
+            os.symlink(real / 'child', link, target_is_directory=True)
+        except OSError as error:
+            record['created'] = False
+            record['winerror'] = getattr(error, 'winerror', None)
+            print(json.dumps(record), flush=True)
+            return
+        record['created'] = True
+        record['readlink'] = os.readlink(link)
+        record['realpath_link'] = os.path.realpath(str(link))
+        record['realpath_dotdot'] = os.path.realpath(str(link / '..'))
+        record['realpath_child_dotdot'] = os.path.realpath(
+            str(link / 'child' / '..'))
+        record['dotdot_of_target'] = os.path.realpath(
+            str(real / 'child' / '..'))
+        try:
+            record['samefile_dotdot'] = os.path.samefile(
+                str(link / '..'), str(real))
+        except OSError as error:
+            record['samefile_dotdot_error'] = str(error)
+        record['samefile_file'] = os.path.samefile(
+            str(link / 'file'), str(real / 'child' / 'file'))
+        record['st_ino_link'] = os.stat(link).st_ino
+        record['st_ino_target'] = os.stat(real / 'child').st_ino
+        dangling = self.root / 'dangling'
+        try:
+            os.symlink(self.root / 'missing' / 'target', dangling)
+            record['dangling_created'] = True
+        except OSError as error:
+            record['dangling_created'] = False
+            record['dangling_winerror'] = getattr(error, 'winerror', None)
+        print(json.dumps(record), flush=True)
+
     def test_alias_creation_capabilities(self):
         # Which links can this standard user create?  The path tests must use
         # only what is actually available: a junction needs no privilege, a
