@@ -1246,6 +1246,57 @@ class WindowsPrimitiveTests(unittest.TestCase):
             record['samefile_error'] = str(error)
         print(json.dumps(record), flush=True)
 
+    def test_alias_creation_capabilities(self):
+        # Which links can this standard user create?  The path tests must use
+        # only what is actually available: a junction needs no privilege, a
+        # symbolic link needs SeCreateSymbolicLinkPrivilege or Developer Mode,
+        # and a hard link needs neither but only links files.
+        target = self.root / 'target'
+        target.mkdir()
+        (target / 'file').write_text('x')
+
+        def attempt(kind, operation):
+            record = {'probe': 'alias-creation', 'kind': kind}
+            try:
+                operation()
+            except OSError as error:
+                record['created'] = False
+                record['winerror'] = getattr(error, 'winerror', None)
+                record['message'] = str(error)
+            else:
+                record['created'] = True
+            print(json.dumps(record), flush=True)
+
+        attempt('directory-symlink', lambda: os.symlink(
+            target, self.root / 'dir-link', target_is_directory=True))
+        attempt('file-symlink', lambda: os.symlink(
+            target / 'file', self.root / 'file-link'))
+        attempt('hard-link', lambda: os.link(
+            target / 'file', self.root / 'hard-link'))
+        junction = subprocess.run(
+            ['cmd.exe', '/d', '/c', 'mklink', '/J',
+             str(self.root / 'junction'), str(target)],
+            capture_output=True, text=True, timeout=15)
+        print(json.dumps({'probe': 'alias-creation', 'kind': 'junction',
+                          'mklink_exit': junction.returncode,
+                          'created': (self.root / 'junction').exists()}),
+              flush=True)
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r'SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock')
+            try:
+                developer, _kind = winreg.QueryValueEx(
+                    key, 'AllowDevelopmentWithoutDevLicense')
+            finally:
+                key.Close()
+        except OSError:
+            developer = None
+        print(json.dumps({'probe': 'developer-mode',
+                          'allow_development_without_dev_license': developer}),
+              flush=True)
+
 
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '--child':
