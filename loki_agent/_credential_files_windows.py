@@ -246,15 +246,31 @@ def open_read_at(directory, name: str):
 
 def create_exclusive_at(directory, name: str, mode: int):
     _check_name(name)
-    # ``mode`` is a POSIX concept; the new file inherits the directory's DACL,
-    # and the storage already refused a directory that is not private, so the
-    # inherited ACL is the enforcement here.
-    return _open_relative(
+    # ``mode`` is a POSIX concept.  On POSIX the mode makes the new file
+    # private regardless of the directory; here the file's access comes from the
+    # directory's DACL by inheritance, and the directory was checked private.
+    # The file is what holds the secret, though, and its DACL is fixed at
+    # creation, so describe *this handle* before any byte is written: a
+    # directory widened between the check and the create would otherwise hand
+    # the file out.  Fails closed -- anything but a private, owned, regular file
+    # refuses.
+    handle = _open_relative(
         directory, name,
         windows_api.GENERIC_WRITE | windows_api.FILE_READ_ATTRIBUTES
         | windows_api.SYNCHRONIZE,
         windows_api.FILE_CREATE, _NON_DIRECTORY,
         windows_api.FILE_ATTRIBUTE_NORMAL)
+    try:
+        facts = _facts_from_handle(handle)
+    except BaseException:
+        windows_api.close_handle(handle)
+        raise
+    if not (facts.regular and facts.owned_by_current_user
+            and not facts.reparse_point and not facts.group_or_other_access):
+        windows_api.close_handle(handle)
+        raise CredentialStorageError(
+            f"new credential file is not private: {name}")
+    return handle
 
 
 def open_lock_file_at(directory, name: str, mode: int):

@@ -863,6 +863,50 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         return (f"D:P(A;OICI;FA;;;{owner})"
                 "(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)")
 
+    def _created_file_mocks(self, information, owner, sddl):
+        return (
+            mock.patch.object(windows_api, "nt_create_file",
+                              return_value=0x77),
+            mock.patch.object(windows_api, "by_handle_file_information",
+                              return_value=information),
+            mock.patch.object(windows_api, "handle_owner_sid",
+                              return_value=owner),
+            mock.patch.object(windows_api, "handle_dacl_sddl",
+                              return_value=sddl),
+            mock.patch.object(windows_api, "current_user_sid",
+                              return_value=owner),
+        )
+
+    def test_a_new_file_that_is_not_private_is_refused_before_writing(self):
+        from loki_agent import _credential_files_windows
+
+        information = windows_api.ByHandleFileInformation()
+        information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
+        owner = "S-1-5-21-1-2-3-1001"
+        patches = self._created_file_mocks(
+            information, owner, "D:P(A;;FA;;;S-1-5-21-1-2-3-1004)")
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                mock.patch.object(windows_api, "close_handle") as close:
+            with self.assertRaises(
+                    credential_storages.CredentialStorageError):
+                _credential_files_windows.create_exclusive_at(
+                    object(), "tokens.json", 0o600)
+        # Refused before returning, with the handle it opened released.
+        close.assert_called_once_with(0x77)
+
+    def test_a_new_private_file_is_returned(self):
+        from loki_agent import _credential_files_windows
+
+        information = windows_api.ByHandleFileInformation()
+        information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
+        owner = "S-1-5-21-1-2-3-1001"
+        patches = self._created_file_mocks(
+            information, owner, self._private_sddl(owner))
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            handle = _credential_files_windows.create_exclusive_at(
+                object(), "tokens.json", 0o600)
+        self.assertEqual(handle, 0x77)
+
     # The DACL the Windows runners report for os.mkdir(mode=0o700).  Its
     # trustees are SDDL aliases, which is what the first implementation
     # compared against full SIDs and so judged every private directory shared.
