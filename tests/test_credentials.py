@@ -241,6 +241,46 @@ print(json.dumps(result))
             self.assertGreaterEqual(result["filler_offset"], 0)
             self.assertGreater(result["after_offset"], result["filler_offset"])
 
+    def test_windows_scrub_deletes_duplicate_native_records(self):
+        # SetEnvironmentVariableW deletes one record per call, so a name with
+        # duplicate native records must be deleted until the API reports it
+        # absent; otherwise the credential stays readable in the block.
+        from unittest import mock
+
+        from loki_agent import credentials
+
+        native = ["one", "two"]
+        error = {"value": 0}
+        kernel = mock.Mock()
+
+        def set_last_error(value):
+            error["value"] = value
+
+        def get_last_error():
+            return error["value"]
+
+        def get(name, buffer, size):
+            set_last_error(0 if native else 203)
+            return 3 if native else 0
+
+        def set_variable(name, value):
+            native.pop(0)
+            return True
+
+        kernel.GetEnvironmentVariableW = get
+        kernel.SetEnvironmentVariableW = set_variable
+        environ = {"DUPLICATE_TOKEN": "two"}
+        with mock.patch("ctypes.WinDLL", return_value=kernel, create=True), \
+                mock.patch("ctypes.set_last_error", side_effect=set_last_error,
+                           create=True), \
+                mock.patch("ctypes.get_last_error", side_effect=get_last_error,
+                           create=True):
+            credentials._scrub_windows_credentials(
+                environ, ["DUPLICATE_TOKEN"])
+
+        self.assertEqual(native, [])
+        self.assertNotIn("DUPLICATE_TOKEN", environ)
+
     def test_process_capture_scrubs_duplicate_entries(self):
         # The scrub handles several records for the same name (the validator
         # collects a range per match).  Linux reaches that with execve and a

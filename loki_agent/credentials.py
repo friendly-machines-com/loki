@@ -310,6 +310,42 @@ def _scrub_native_credentials(
             ctypes.memset(address, ord("x"), prefix_length)
 
 
+def _scrub_windows_credentials(
+        environ: MutableMapping[str, str],
+        names: list[str],
+) -> None:
+    """Delete every native record for each credential name on Windows.
+
+    There is no libc ``environ`` to overwrite.  ``SetEnvironmentVariableW``
+    deletes one matching record, so a name that occurs more than once -- which
+    a crafted process environment block can arrange -- must be deleted until
+    the API reports the variable absent (``ERROR_ENVVAR_NOT_FOUND``).
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    get = kernel.GetEnvironmentVariableW
+    get.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get.restype = wintypes.DWORD
+    set_variable = kernel.SetEnvironmentVariableW
+    set_variable.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    set_variable.restype = wintypes.BOOL
+    buffer = ctypes.create_unicode_buffer(1)
+
+    for name in names:
+        while True:
+            ctypes.set_last_error(0)
+            get(name, buffer, len(buffer))
+            if ctypes.get_last_error() == 203:  # ERROR_ENVVAR_NOT_FOUND
+                break
+            if not set_variable(name, None):
+                raise CredentialScrubError(
+                    f"could not scrub {name}: {ctypes.get_last_error()}")
+    for name in names:
+        environ.pop(name, None)
+
+
 def capture_process_credentials() -> CredentialStore:
     """Capture and scrub credentials once, at process startup.
 
@@ -325,11 +361,12 @@ def capture_process_credentials() -> CredentialStore:
 
     values = dict(os.environ)
     names = [name for name in os.environ if is_credential_name(name)]
-    if (
-            (sys.platform.startswith("linux") or sys.platform == "darwin")
-            and names
-    ):
+    if names and (sys.platform.startswith("linux")
+                  or sys.platform == "darwin"):
         _scrub_native_credentials(os.environ, names)
+        store = CredentialStore(values)
+    elif names and sys.platform == "win32":
+        _scrub_windows_credentials(os.environ, names)
         store = CredentialStore(values)
     else:
         store = CredentialStore.capture(os.environ)
