@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import stat
 
-from .credential_files import FileFacts
+from .credential_types import FileFacts
 
 
 def _facts(result) -> FileFacts:
