@@ -41,6 +41,7 @@ from . import windows_api
 
 INFINITE = 0xFFFFFFFF
 WAIT_OBJECT_0 = 0
+FILE_TYPE_PIPE = 3
 
 
 class HandleReader:
@@ -71,8 +72,19 @@ class HandleReader:
         self.thread.start()
 
     def _run(self) -> None:
-        waited = (wintypes.HANDLE * 2)(self.handle, self.stop_event)
         buffer = ctypes.create_string_buffer(4096)
+        if _GetFileType(self.handle) == FILE_TYPE_PIPE:
+            self._read_pipe(buffer)
+        else:
+            self._read_handle(buffer)
+        if self.eof_sentinel:
+            self._post(b"")
+
+    def _read_handle(self, buffer) -> None:
+        """A console: the handle is signalled when input is waiting, and
+        ``ReadFile`` then returns at once, so waiting on it is what makes the
+        read interruptible."""
+        waited = (wintypes.HANDLE * 2)(self.handle, self.stop_event)
         while True:
             if _WaitForMultipleObjects(2, waited, False, INFINITE) != WAIT_OBJECT_0:
                 # The stop event, or a wait failure nothing here can act on.
@@ -83,8 +95,34 @@ class HandleReader:
                 break
             if read.value:
                 self._post(buffer.raw[:read.value])
-        if self.eof_sentinel:
-            self._post(b"")
+
+    def _read_pipe(self, buffer) -> None:
+        """A pipe: it must never block in ``ReadFile``.
+
+        A pipe handle reports readiness whether or not a read would block, so
+        reading first wedges the thread -- and a thread stuck in ``ReadFile``
+        cannot be stopped.  Ask how many bytes a read can return, read only
+        those, and wait on the stop event between polls.  A failed peek means
+        the other end is gone, which is this stream's end of file.
+        """
+        available = wintypes.DWORD()
+        total = wintypes.DWORD()
+        while True:
+            if _WaitForSingleObject(self.stop_event, 0) == WAIT_OBJECT_0:
+                return
+            if not _PeekNamedPipe(self.handle, None, 0, None,
+                                  ctypes.byref(available), ctypes.byref(total)):
+                return
+            if not available.value:
+                if _WaitForSingleObject(self.stop_event, 50) == WAIT_OBJECT_0:
+                    return
+                continue
+            read = wintypes.DWORD()
+            size = min(len(buffer), available.value)
+            if not _ReadFile(self.handle, buffer, size, ctypes.byref(read), None):
+                return
+            if read.value:
+                self._post(buffer.raw[:read.value])
 
     def _post(self, data: bytes) -> None:
         try:
@@ -156,3 +194,22 @@ def _SetEvent(handle):
 def _CloseHandle(handle):
     return _call("kernel32", "CloseHandle", wintypes.BOOL,
                  ctypes.c_void_p)(handle)
+
+
+def _GetFileType(handle):
+    return _call("kernel32", "GetFileType", wintypes.DWORD,
+                 ctypes.c_void_p)(handle)
+
+
+def _PeekNamedPipe(handle, buffer, size, read, available, left):
+    return _call("kernel32", "PeekNamedPipe", wintypes.BOOL,
+                 ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                 ctypes.POINTER(wintypes.DWORD),
+                 ctypes.POINTER(wintypes.DWORD),
+                 ctypes.POINTER(wintypes.DWORD))(handle, buffer, size, read,
+                                                 available, left)
+
+
+def _WaitForSingleObject(handle, timeout):
+    return _call("kernel32", "WaitForSingleObject", wintypes.DWORD,
+                 ctypes.c_void_p, wintypes.DWORD)(handle, timeout)
