@@ -76,6 +76,24 @@ jobs:
       # the normal unprivileged runner user.
       if: runner.os == 'Linux'
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    - name: Configure the Windows workspace container
+      # Every Windows entrypoint refuses to start until a container is
+      # configured ("run loki-setup"), so the end-to-end tests need one. The
+      # workspace is the test temp root: each test's TemporaryDirectory() then
+      # lands inside it, and the container's inherited workspace grant covers
+      # it (the gate looks up the nearest configured ancestor). Applied at
+      # setup time and never widened from a session.
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $workspace = Join-Path $env:RUNNER_TEMP 'loki-workspace'
+        New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+        python -m loki_agent.windows_setup --configure $workspace
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python -m loki_agent.windows_setup --verify $workspace
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        "TEMP=$workspace" | Out-File -FilePath $env:GITHUB_ENV -Append
+        "TMP=$workspace" | Out-File -FilePath $env:GITHUB_ENV -Append
     - name: Test
       run: |
         # tests/run_suite.py writes progress through and dumps every thread's

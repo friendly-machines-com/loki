@@ -54,6 +54,32 @@ def entrypoint(name: str) -> str:
     return os.path.join(ROOT, script)
 
 
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def seed_container_ledger(environment: dict) -> None:
+    """Give a Windows child the configured container ledger.
+
+    The entrypoint's gate looks the ledger up under the runtime's *state*
+    directory, and ``loki_state_dir`` honours ``XDG_STATE_HOME``.  A test that
+    points ``XDG_STATE_HOME`` at a fresh directory is simulating a fresh state,
+    so it must carry the configuration there; the container itself (profile and
+    ACLs) is machine state and is already in place.  No-op off Windows, where
+    there is no gate, and when the child keeps the real state directory.
+    """
+    if not _on_windows():
+        return
+    state_home = environment.get("XDG_STATE_HOME")
+    if not state_home:
+        return
+    from loki_agent import windows_state
+
+    target = os.path.join(state_home, "loki", "windows-setup.json")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    windows_state.save_ledger(windows_state.load_ledger(), target)
+
+
 def child_environment(**values) -> dict:
     """A reduced environment that a Windows executable can still start in.
 
