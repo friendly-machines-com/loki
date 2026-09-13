@@ -29,37 +29,24 @@ def require_checks(checks):
 
 
 def configured_workspace(arguments):
-    """The runtime's directory, once a configured container is shown to cover it.
-
-    Returns the *requested* directory (the working directory, or ``--shell-cwd``)
-    rather than the configured workspace, because that is where the child must
-    start.  The container is the nearest configured ancestor: the workspace
-    grant is inherited, so a directory beneath one is reachable by that
-    container, and :func:`launch` derives the package from the same lookup.
-
-    Supervisor-side only: use the frontend's parser rather than mistaking a
-    prompt value for a workspace option. The child's gate does not call this.
-    """
+    # Supervisor-side only: use the frontend's parser rather than mistaking a
+    # prompt value for a workspace option. The child's gate does not call this.
     from .terminal_frontend import parse_cli_args
-    directory = os.getcwd()
+    workspace = os.getcwd()
     options, _ = parse_cli_args(arguments)
     for option, value in options:
         if option == "--shell-cwd":
-            directory = value
-    directory = state.canonical_workspace(directory)
+            workspace = value
+    workspace = state.canonical_workspace(workspace)
     ledger = state.load_ledger()
-    container = state.container_workspace(directory, ledger)
-    if container is None:
-        raise RuntimeIsolationError(
-            f"No Windows container configured for {directory!r}; run loki-setup.")
-    entry = ledger.get("workspaces", {}).get(container)
+    entry = ledger.get("workspaces", {}).get(state.workspace_key(workspace))
     if not isinstance(entry, dict) or not entry.get("grants"):
         raise RuntimeIsolationError(
-            f"No Windows container configured for {container!r}; run loki-setup.")
-    if entry.get("profile") != state.profile_name_for(container):
+            f"No Windows container configured for {workspace!r}; run loki-setup.")
+    if entry.get("profile") != state.profile_name_for(workspace):
         raise RuntimeIsolationError("Windows container ledger profile mismatch")
-    require_checks(windows_verify.verify_workspace(ledger, container))
-    return directory
+    require_checks(windows_verify.verify_workspace(ledger, workspace))
+    return workspace
 
 
 def verify_runtime():
@@ -134,18 +121,17 @@ class ContainedProcess:
 def launch(executable, arguments, environment, workspace, inherited_handles):
     import msvcrt
 
-    # The profile and the child's gate name the configured container, which may
-    # be an ancestor of the directory the runtime starts in; current_directory
-    # stays the requested directory, inside that container's inherited grant.
-    container = state.container_workspace(workspace) or workspace
-    package = api.derive_app_container_sid(state.profile_name_for(container))
+    package = api.derive_app_container_sid(state.profile_name_for(workspace))
     child_environment = dict(environment)
-    child_environment[WORKSPACE_ENV] = container
-    # Use only the sanctioned executable; a source script needs this exact
-    # interpreter, whereas a frozen executable must not receive a script argv.
+    child_environment[WORKSPACE_ENV] = workspace
+    # The image is this process's own interpreter or executable, never the
+    # string the caller used to start it: in a frozen build sys.argv[0] can be
+    # a relative name or a symlink, and the child runs with the workspace as
+    # its cwd, so re-entering through that string would resolve elsewhere.  A
+    # source script is passed to the interpreter as an absolute path.
     if not getattr(sys, "frozen", False):
         arguments = [os.path.abspath(executable), *arguments]
-        executable = sys.executable
+    executable = sys.executable
 
     create_job = api.bind("kernel32", "CreateJobObjectW", ctypes.c_void_p,
                           ctypes.c_void_p, wintypes.LPCWSTR)

@@ -96,8 +96,13 @@ class WindowsBackend:
 
     def _grant_path(self, path: str, access: Access, package: str) -> None:
         current = windows_api.dacl_sddl(path)
-        windows_containers.set_dacl_sddl(
-            path, add_package_ace(current, package, access))
+        updated = add_package_ace(current, package, access)
+        # Do not rewrite a DACL this edit did not change.  The write is the
+        # expensive part (inherited ACEs propagate), and setup is re-runnable:
+        # re-applying an existing configuration must not re-touch the toolchain
+        # tree.  Same rule as _ungrant_path below.
+        if updated != current:
+            windows_containers.set_dacl_sddl(path, updated)
 
     def _ungrant_path(self, path: str, package: str) -> None:
         current = windows_api.dacl_sddl(path)
