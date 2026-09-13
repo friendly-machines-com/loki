@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import errno
 import json
 import os
@@ -22,6 +23,28 @@ from loki_agent import (
 )
 from loki_agent import __main__ as terminal_entrypoint
 from loki_agent.credentials import CredentialStore
+
+
+async def _finish_within(coroutine, seconds, label):
+    """Await ``coroutine``, dumping every task's stack if it does not finish.
+
+    A lost asyncio wakeup leaves the loop idle: the suite hangs with a bare
+    test name and no frame, which is how a bug here became a job timeout.
+    Bounding the await turns that into a failure naming the await each task is
+    stuck on.
+    """
+    task = asyncio.ensure_future(coroutine)
+    _done, pending = await asyncio.wait({task}, timeout=seconds)
+    if not pending:
+        return task.result()
+    for other in asyncio.all_tasks():
+        if other is not asyncio.current_task():
+            other.print_stack()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    raise AssertionError(
+        f"{label} did not finish within {seconds}s; task stacks above")
 
 
 class ProviderResponseContractTests(unittest.TestCase):
@@ -598,7 +621,15 @@ class JobOwnershipContractTests(unittest.TestCase):
                 task = asyncio.create_task(manager.run_background_exec(
                     [sys.executable, "-c", "import time; time.sleep(30)"],
                     cwd=tmpdir, session_owned=True, subagent=True))
-                await entered.wait()
+                entered_task = asyncio.create_task(entered.wait())
+                done, _pending = await asyncio.wait(
+                    {entered_task, task},
+                    return_when=asyncio.FIRST_COMPLETED)
+                if task in done:
+                    # The launch failed before it reached the spawn seam, so
+                    # ``entered`` will never be set; surface the failure now
+                    # rather than waiting on that event forever.
+                    task.result()
                 await manager.close_session_owned()
                 release.set()
                 with self.assertRaises(loki._JobRevokedDuringLaunch):
@@ -606,7 +637,8 @@ class JobOwnershipContractTests(unittest.TestCase):
             return manager
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = asyncio.run(scenario(tmpdir))
+            manager = asyncio.run(_finish_within(
+                scenario(tmpdir), 60, "session close during launch"))
 
         job = next(iter(manager.jobs.values()))
         self.assertEqual(job.status, "cancelled")
