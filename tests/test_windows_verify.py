@@ -12,13 +12,21 @@ from unittest import mock
 
 from loki_agent import paths
 from loki_agent import windows_api
+from loki_agent import windows_state
 from loki_agent import windows_verify
 
 
 PACKAGE = "S-1-15-2-1-2-3-4"
+OTHER = "S-1-5-21-1-2-3-1004"
 WORKSPACE = "/workspace"
+GRANTED = "/granted"
 CREDENTIALS = "/credentials"
+CONFIG = "/config"
+STATE = "/state"
 WORKSPACE_RW = windows_api.GENERIC_READ | windows_api.GENERIC_WRITE
+
+# A protected-tree DACL that names no package SID.
+NO_PACKAGE = f"D:PAI(A;OICI;FA;;;{OTHER})"
 
 _DENIED = object()
 
@@ -164,6 +172,115 @@ class ProbeContainmentTests(unittest.TestCase):
             checks = self.checks()
 
         self.assertEqual(checks["process token"].status, "fail")
+
+
+class VerifyContainerTests(unittest.TestCase):
+    """The uncontained inventory must read rights, not SID strings.
+
+    ``verify_container`` is the start-up gate: a false pass here accepts a
+    container the runtime then treats as contained.  Each descriptor below is
+    legal SDDL that the old substring check reported as a pass.
+    """
+
+    READ = windows_state.Access.READ
+    READ_WRITE = windows_state.Access.READ_WRITE
+
+    def setUp(self):
+        self.descriptors = {}
+        patches = [
+            mock.patch.object(windows_verify, "profile_name_for",
+                              return_value="profile"),
+            mock.patch.object(windows_api, "derive_app_container_sid",
+                              return_value=PACKAGE),
+            mock.patch.object(windows_api, "dacl_sddl",
+                              side_effect=lambda path: self.descriptors.get(
+                                  path, NO_PACKAGE)),
+            mock.patch.object(paths, "credential_directory",
+                              return_value=CREDENTIALS),
+            mock.patch.object(paths, "loki_config_dir", return_value=CONFIG),
+            mock.patch.object(paths, "loki_state_dir", return_value=STATE),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def check(self, path, access):
+        checks = windows_verify.verify_container(
+            WORKSPACE, [windows_state.Grant(path, access, "user")])
+        return {check.name: check for check in checks}
+
+    def test_read_write_grant_and_clean_trees_pass(self):
+        self.descriptors[GRANTED] = (
+            f"D:PAI(A;OICI;0x1301BF;;;{PACKAGE})")
+
+        checks = self.check(GRANTED, self.READ_WRITE)
+
+        for name, check in checks.items():
+            self.assertEqual(check.status, "pass", (name, check))
+
+    def test_a_deny_ace_is_not_a_grant(self):
+        self.descriptors[GRANTED] = f"D:PAI(D;OICI;FA;;;{PACKAGE})"
+
+        checks = self.check(GRANTED, self.READ)
+
+        self.assertEqual(checks[f"grant {GRANTED}"].status, "fail")
+
+    def test_a_rights_mask_smaller_than_the_level_fails(self):
+        self.descriptors[GRANTED] = (
+            f"D:PAI(A;OICI;0x00000100;;;{PACKAGE})")
+
+        checks = self.check(GRANTED, self.READ)
+
+        self.assertEqual(checks[f"grant {GRANTED}"].status, "fail")
+
+    def test_an_inherit_only_allow_fails(self):
+        self.descriptors[GRANTED] = f"D:PAI(A;OICIIO;FRFX;;;{PACKAGE})"
+
+        checks = self.check(GRANTED, self.READ)
+
+        self.assertEqual(checks[f"grant {GRANTED}"].status, "fail")
+
+    def test_read_only_does_not_satisfy_a_read_write_grant(self):
+        self.descriptors[GRANTED] = f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"
+
+        checks = self.check(GRANTED, self.READ_WRITE)
+
+        self.assertEqual(checks[f"grant {GRANTED}"].status, "fail")
+
+    def test_a_deny_ace_on_a_protected_tree_is_a_pass(self):
+        # A deny is the safest possible entry; it must not be reported as a
+        # package grant.
+        self.descriptors[GRANTED] = f"D:PAI(A;OICI;0x1301BF;;;{PACKAGE})"
+        self.descriptors[CREDENTIALS] = f"D:PAI(D;OICI;FA;;;{PACKAGE})"
+
+        checks = self.check(GRANTED, self.READ_WRITE)
+
+        self.assertEqual(checks["credentials"].status, "pass")
+
+    def test_an_allow_ace_on_a_protected_tree_fails(self):
+        self.descriptors[GRANTED] = f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"
+        self.descriptors[CONFIG] = f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"
+
+        checks = self.check(GRANTED, self.READ)
+
+        self.assertEqual(checks["config"].status, "fail")
+
+    def test_an_inherit_only_allow_on_a_protected_tree_fails(self):
+        # It grants the tree's children, so "holds no access on the directory"
+        # must not be read as containment.
+        self.descriptors[GRANTED] = f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"
+        self.descriptors[STATE] = f"D:PAI(A;OICIIO;FA;;;{PACKAGE})"
+
+        checks = self.check(GRANTED, self.READ)
+
+        self.assertEqual(checks["state"].status, "fail")
+
+    def test_an_unknown_rights_code_fails_closed(self):
+        self.descriptors[GRANTED] = f"D:PAI(A;OICI;ZZ;;;{PACKAGE})"
+
+        checks = self.check(GRANTED, self.READ)
+
+        self.assertEqual(checks[f"grant {GRANTED}"].status, "fail")
 
 
 if __name__ == "__main__":

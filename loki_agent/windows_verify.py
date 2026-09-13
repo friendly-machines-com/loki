@@ -17,10 +17,14 @@ from __future__ import annotations
 from . import paths
 from . import windows_api
 from .windows_state import (
+    Access,
     Check,
     Grant,
+    access_mask,
     entry_grants,
-    grants_package,
+    grants_access,
+    package_access,
+    package_allow,
     profile_name_for,
     workspace_key,
 )
@@ -53,26 +57,40 @@ def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
     for grant in grants:
         try:
             sddl = windows_api.dacl_sddl(grant.path)
+            granted = grants_access(sddl, package, grant.access)
         except windows_api.WindowsApiError as error:
             checks.append(Check(f"grant {grant.path}", "fail", str(error)))
             continue
-        granted = grants_package(sddl, package)
         checks.append(Check(
             f"grant {grant.path}", "pass" if granted else "fail",
-            grant.access.value if granted else "no ACE for the package SID"))
+            grant.access.value if granted
+            else _grant_failure(sddl, package, grant.access)))
     for tree, name in ((paths.credential_directory(), "credentials"),
                        (paths.loki_config_dir(), "config"),
                        (paths.loki_state_dir(), "state")):
         try:
             sddl = windows_api.dacl_sddl(tree)
+            allowed = package_allow(sddl, package)
         except windows_api.WindowsApiError as error:
             checks.append(Check(name, "fail", str(error)))
             continue
-        if grants_package(sddl, package):
-            checks.append(Check(name, "fail", "package SID is granted"))
+        if allowed:
+            checks.append(Check(
+                name, "fail", f"package SID is granted {allowed:#x}"))
         else:
-            checks.append(Check(name, "pass", "no package ACE"))
+            checks.append(Check(
+                name, "pass", "the package SID holds no access"))
     return checks
+
+
+def _grant_failure(sddl: str, package: str, access: Access) -> str:
+    """Explain why a grant's DACL does not confer ``access`` on ``package``."""
+    held = package_access(sddl, package)
+    if held == 0:
+        return "no allow ACE applies to the package SID"
+    required = access_mask(access)
+    return (f"the package SID holds {held:#x}, which does not cover "
+            f"{access.value} ({required:#x})")
 
 
 def probe_containment(workspace: str) -> list[Check]:

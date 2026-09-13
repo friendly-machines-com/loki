@@ -47,7 +47,7 @@ class SddlEditingTests(unittest.TestCase):
         self.assertTrue(result.startswith(self.EXISTING))
         self.assertEqual(result, self.EXISTING + "(A;OICI;FRFX;;;%s)"
                          % PACKAGE_SID)
-        self.assertTrue(windows_setup.grants_package(result, PACKAGE_SID))
+        self.assertTrue(windows_state.names_package(result, PACKAGE_SID))
 
     def test_add_rejects_something_that_is_not_a_dacl(self):
         with self.assertRaises(windows_api.WindowsApiError):
@@ -61,7 +61,7 @@ class SddlEditingTests(unittest.TestCase):
         removed = windows_setup.remove_package_aces(added, PACKAGE_SID)
 
         self.assertEqual(removed, self.EXISTING)
-        self.assertFalse(windows_setup.grants_package(removed, PACKAGE_SID))
+        self.assertFalse(windows_state.names_package(removed, PACKAGE_SID))
         self.assertEqual(
             windows_setup.remove_package_aces(removed, PACKAGE_SID), removed)
 
@@ -73,8 +73,140 @@ class SddlEditingTests(unittest.TestCase):
 
         removed = windows_setup.remove_package_aces(both, PACKAGE_SID)
 
-        self.assertFalse(windows_setup.grants_package(removed, PACKAGE_SID))
-        self.assertTrue(windows_setup.grants_package(removed, OTHER_SID))
+        self.assertFalse(windows_state.names_package(removed, PACKAGE_SID))
+        self.assertTrue(windows_state.names_package(removed, OTHER_SID))
+
+
+class PackageAccessTests(unittest.TestCase):
+    """The DACL must be judged on rights, not on naming the SID.
+
+    Every case here is legal SDDL that the old substring test reported as a
+    grant (or, on a protected tree, as a superset of its contents).  These are
+    the false passes a start-up gate must not have.
+    """
+
+    READ = windows_state.Access.READ
+    READ_WRITE = windows_state.Access.READ_WRITE
+
+    def dacl(self, ace):
+        return f"D:PAI{ace}"
+
+    def test_access_mask_matches_the_sddl_levels(self):
+        self.assertEqual(windows_state.access_mask(self.READ), 0x1200A9)
+        self.assertEqual(windows_state.access_mask(self.READ_WRITE), 0x1301BF)
+
+    def test_an_allow_ace_covering_the_level_is_a_grant(self):
+        self.assertTrue(windows_state.grants_access(
+            self.dacl(f"(A;OICI;FRFX;;;{PACKAGE_SID})"), PACKAGE_SID, self.READ))
+        self.assertTrue(windows_state.grants_access(
+            self.dacl(f"(A;OICI;0x1301BF;;;{PACKAGE_SID})"),
+            PACKAGE_SID, self.READ_WRITE))
+
+    def test_a_deny_ace_names_the_sid_without_granting_it(self):
+        sddl = self.dacl(f"(D;OICI;FA;;;{PACKAGE_SID})")
+
+        self.assertTrue(windows_state.names_package(sddl, PACKAGE_SID))
+        self.assertEqual(windows_state.package_access(sddl, PACKAGE_SID), 0)
+        self.assertFalse(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+
+    def test_a_deny_clears_the_bits_it_covers(self):
+        # Allow the level, deny only DELETE: read survives, read-write does not
+        # because Modify includes DELETE.
+        sddl = self.dacl(
+            f"(A;OICI;0x1301BF;;;{PACKAGE_SID})(D;;SD;;;{PACKAGE_SID})")
+
+        self.assertTrue(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+        self.assertFalse(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ_WRITE))
+
+    def test_a_mask_smaller_than_the_level_is_not_a_grant(self):
+        # FILE_WRITE_ATTRIBUTES alone names the SID and grants no data access.
+        sddl = self.dacl(f"(A;OICI;0x00000100;;;{PACKAGE_SID})")
+
+        self.assertFalse(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+
+    def test_an_inherit_only_allow_does_not_apply_to_the_object(self):
+        sddl = self.dacl(f"(A;OICIIO;FRFX;;;{PACKAGE_SID})")
+
+        self.assertEqual(windows_state.package_access(sddl, PACKAGE_SID), 0)
+        self.assertFalse(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+
+    def test_package_allow_still_counts_an_inherit_only_allow(self):
+        # It grants the tree's children, so the protected-tree check must fail.
+        sddl = self.dacl(f"(A;OICIIO;FRFX;;;{PACKAGE_SID})")
+
+        self.assertEqual(
+            windows_state.package_allow(sddl, PACKAGE_SID), 0x1200A9)
+
+    def test_package_allow_ignores_a_deny_only_dacl(self):
+        sddl = self.dacl(f"(D;OICI;FA;;;{PACKAGE_SID})")
+
+        self.assertEqual(windows_state.package_allow(sddl, PACKAGE_SID), 0)
+
+    def test_read_does_not_cover_read_write(self):
+        sddl = self.dacl(f"(A;OICI;FRFX;;;{PACKAGE_SID})")
+
+        self.assertFalse(windows_state.grants_access(
+            sddl, PACKAGE_SID, self.READ_WRITE))
+
+    def test_modify_covers_read(self):
+        sddl = self.dacl(f"(A;OICI;0x1301BF;;;{PACKAGE_SID})")
+
+        self.assertTrue(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+
+    def test_an_ace_for_another_sid_grants_nothing(self):
+        sddl = self.dacl(f"(A;OICI;FA;;;{OTHER_SID})")
+
+        self.assertEqual(windows_state.package_access(sddl, PACKAGE_SID), 0)
+        self.assertFalse(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+
+    def test_an_inherited_allow_still_applies_to_the_object(self):
+        sddl = self.dacl(f"(A;OICIID;FRFX;;;{PACKAGE_SID})")
+
+        self.assertTrue(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+
+    def test_hex_and_named_masks_agree(self):
+        named = self.dacl(f"(A;OICI;FR;;;{PACKAGE_SID})")
+        hexed = self.dacl(f"(A;OICI;0x120089;;;{PACKAGE_SID})")
+
+        self.assertEqual(windows_state.package_access(named, PACKAGE_SID),
+                         windows_state.package_access(hexed, PACKAGE_SID))
+
+    def test_named_file_masks_match_the_winnt_values(self):
+        for code, mask in (("FR", 0x120089), ("FW", 0x120116),
+                           ("FX", 0x1200A0), ("FA", 0x1F01FF)):
+            with self.subTest(code=code):
+                self.assertEqual(
+                    windows_state.package_access(
+                        self.dacl(f"(A;OICI;{code};;;{PACKAGE_SID})"),
+                        PACKAGE_SID),
+                    mask)
+
+    def test_an_object_ace_without_guids_is_evaluated(self):
+        sddl = self.dacl(f"(OA;OICI;FRFX;;;{PACKAGE_SID})")
+
+        self.assertTrue(
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ))
+
+    def test_an_object_ace_with_guids_is_refused_not_ignored(self):
+        guid = "{11111111-2222-3333-4444-555555555555}"
+        sddl = self.dacl(f"(OA;OICI;FRFX;{guid};;{PACKAGE_SID})")
+
+        with self.assertRaises(windows_api.WindowsApiError):
+            windows_state.package_access(sddl, PACKAGE_SID)
+
+    def test_an_unknown_rights_code_raises_rather_than_guessing(self):
+        sddl = self.dacl(f"(A;OICI;ZZ;;;{PACKAGE_SID})")
+
+        with self.assertRaises(windows_api.WindowsApiError):
+            windows_state.grants_access(sddl, PACKAGE_SID, self.READ)
 
 
 class ProtectedPathTests(unittest.TestCase):
