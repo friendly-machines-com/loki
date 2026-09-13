@@ -441,22 +441,31 @@ class AppContainerLaunchTests(unittest.TestCase):
             "DeleteProcThreadAttributeList": lambda attribute_list: None,
             "CreateProcessW": create,
         }
-        with mock.patch.object(
-                windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
-                mock.patch.object(
-                    windows_api, "drive_environment_entries",
-                    return_value=["=C:=C:\\work"]):
-            windows_api.create_process_in_app_container(
-                "loki.exe", ["--runtime"], "S-1-15-2-1",
-                environment={"Path": "C:\\bin"})
 
-        # wchar_t is 2 bytes on Windows and 4 on this host; the drive entry
-        # precedes the named ones.
-        width = ctypes.sizeof(ctypes.c_wchar)
-        encoding = "utf-16-le" if width == 2 else "utf-32-le"
-        text = seen["environment"].decode(encoding)
+        def run(drive_entries, current_directory):
+            with mock.patch.object(
+                    windows_api, "bind",
+                    side_effect=lambda library, symbol, *rest: fakes[symbol]), \
+                    mock.patch.object(
+                        windows_api, "drive_environment_entries",
+                        return_value=drive_entries):
+                windows_api.create_process_in_app_container(
+                    "loki.exe", ["--runtime"], "S-1-15-2-1",
+                    environment={"Path": "C:\\bin"},
+                    current_directory=current_directory)
+            # wchar_t is 2 bytes on Windows and 4 on this host.
+            width = ctypes.sizeof(ctypes.c_wchar)
+            encoding = "utf-16-le" if width == 2 else "utf-32-le"
+            return seen["environment"].decode(encoding)
+
+        # A drive entry the parent already holds is carried over.
+        text = run(["=C:=C:\\work"], None)
         self.assertTrue(text.startswith("=C:=C:\\work\0"), repr(text))
+        self.assertIn("Path=C:\\bin", text)
+        # With none to carry, the child's own drive is set from its current
+        # directory -- the block element the reference says must be supplied.
+        text = run([], "D:\\work\\ws")
+        self.assertTrue(text.startswith("=D:=D:\\work\\ws\0"), repr(text))
         self.assertIn("Path=C:\\bin", text)
 
 
