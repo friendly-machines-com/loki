@@ -199,6 +199,7 @@ def conpty_probe(root):
         return 0
     record['created'] = True
     attributes = None
+    closed = False
     process = ProbeProcessInfo()
     try:
         size = C.c_size_t()
@@ -230,31 +231,30 @@ def conpty_probe(root):
         # detect a broken pipe when the child exits.
         kernel.CloseHandle(input_read)
         kernel.CloseHandle(output_write)
-        output = bytearray()
-        deadline = time.monotonic() + 8
-        available, transferred = ULONG(), ULONG()
-        # Keep draining after the child exits: the pseudoconsole flushes its
-        # final frame when the session closes, and a poll that stops at process
-        # exit loses it.
-        while time.monotonic() < deadline and b'conpty-ok' not in output:
-            if not peek(output_read, None, 0, None, C.byref(available), None):
-                record['peek_failed'] = True
-                break
-            if available.value:
-                buffer = C.create_string_buffer(available.value)
-                if not read_file(output_read, buffer, available.value,
-                                 C.byref(transferred), None):
-                    record['read_failed'] = True
-                    break
-                output.extend(buffer.raw[:transferred.value])
-            else:
-                time.sleep(0.005)
-        record['saw_marker'] = b'conpty-ok' in output
-        record['output'] = output.decode('utf-8', 'replace')
         kernel.WaitForSingleObject(process.process, 5000)
         exit_code = ULONG()
         kernel.GetExitCodeProcess(process.process, C.byref(exit_code))
         record['exit_code'] = exit_code.value
+        # Closing the session emits its final frame to the output channel, so
+        # close first and then drain until the pipe breaks.
+        close_pseudo(hpc)
+        closed = True
+        output = bytearray()
+        available, transferred = ULONG(), ULONG()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not peek(output_read, None, 0, None, C.byref(available), None):
+                break
+            if not available.value:
+                time.sleep(0.005)
+                continue
+            buffer = C.create_string_buffer(available.value)
+            if not read_file(output_read, buffer, available.value,
+                             C.byref(transferred), None):
+                break
+            output.extend(buffer.raw[:transferred.value])
+        record['saw_marker'] = b'conpty-ok' in output
+        record['output'] = output.decode('utf-8', 'replace')
     except OSError as error:
         record['error'] = str(error)
         record['winerror'] = getattr(error, 'winerror', None)
@@ -263,7 +263,8 @@ def conpty_probe(root):
             kernel.CloseHandle(process.process)
         if process.thread:
             kernel.CloseHandle(process.thread)
-        close_pseudo(hpc)
+        if not closed:
+            close_pseudo(hpc)
         if attributes is not None:
             delete(attributes)
         kernel.CloseHandle(input_write)
