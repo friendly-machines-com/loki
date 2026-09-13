@@ -13,6 +13,8 @@ import json
 import os
 import sys
 
+from . import handle_reader
+
 
 class TransportError(Exception):
     def __init__(self, message: str, *, code: int = -32603):
@@ -40,6 +42,8 @@ class AsyncFdLineReader:
         self._buffer = bytearray()
         self._eof = False
         self._reading = False
+        self._threaded = None
+        self._chunks = None
 
     def _take_line(self) -> bytes | None:
         newline = self._buffer.find(b"\n")
@@ -62,6 +66,9 @@ class AsyncFdLineReader:
             line = self._take_line()
             if line is not None:
                 return line
+
+            if os.name == "nt":
+                return await self._readline_threaded()
 
             loop = asyncio.get_running_loop()
             ready = loop.create_future()
@@ -105,6 +112,30 @@ class AsyncFdLineReader:
             return line
         finally:
             self._reading = False
+
+    async def _readline_threaded(self) -> bytes:
+        """Windows: a thread reads the handle; the lines are the same code.
+
+        The proactor loop cannot register this fd (``add_reader`` is
+        selector-only) and a pipe or console handle does not support overlapped
+        I/O, so ``handle_reader`` waits on the handle, reads it and posts; the
+        assembly from bytes into lines below is unchanged.
+        """
+        loop = asyncio.get_running_loop()
+        if self._threaded is None:
+            self._chunks = asyncio.Queue()
+            self._threaded = handle_reader.HandleReader(
+                self.fd, loop, self._chunks, eof_sentinel=True)
+            self._threaded.start()
+        while True:
+            line = self._take_line()
+            if line is not None:
+                return line
+            chunk = await self._chunks.get()
+            if chunk:
+                self._buffer.extend(chunk)
+            else:
+                self._eof = True
 
     def __aiter__(self):
         return self

@@ -12,6 +12,7 @@ if os.name == "posix":
     import fcntl
     import termios
 else:
+    from . import handle_reader
     from . import host_terminal_windows
 
 from .texts import escape_terminal_text
@@ -770,7 +771,7 @@ class AsyncByteReader:
             # The reader's thread only reads and posts; every field on this
             # object stays owned by the loop thread.  The rules are in
             # host_terminal_windows.Reader.
-            self._windows_reader = host_terminal_windows.Reader(
+            self._windows_reader = handle_reader.HandleReader(
                 self.fd, self.loop, self.queue)
             self._windows_reader.start()
             return self
