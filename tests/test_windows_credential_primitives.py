@@ -23,6 +23,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from loki_agent import _private_files_windows  # noqa: E402
+from loki_agent import credential_storages  # noqa: E402
 from loki_agent import private_files  # noqa: E402
 from loki_agent import windows_acl  # noqa: E402
 from loki_agent import windows_api  # noqa: E402
@@ -158,9 +159,16 @@ class CredentialPrimitiveTests(unittest.TestCase):
 
         self.assertTrue(private_files.describe_path(str(link)).reparse_point)
         # A handle to the junction would still traverse it as a root, so
-        # open_directory must refuse the link itself.
+        # The primitive opens the link itself (FILE_OPEN_REPARSE_POINT) and
+        # returns its handle; refusing it is the caller's decision, made from
+        # describe() on that handle.
+        handle = _private_files_windows.open_directory(str(link))
+        try:
+            self.assertTrue(_private_files_windows.describe(handle).reparse_point)
+        finally:
+            _private_files_windows.close(handle)
         with self.assertRaises(private_files.CredentialStorageError):
-            _private_files_windows.open_directory(str(link))
+            credential_storages.JsonCredentialStorage(str(link))._open_directory()
 
     def test_fsync_flushes_a_file_and_is_a_no_op_for_a_directory(self):
         directory = _private_files_windows.open_directory(str(self.directory))
