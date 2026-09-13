@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import os
 import secrets
@@ -25,7 +24,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from . import authentications, paths
+from . import authentications, file_locks, paths
 
 
 FORMAT_VERSION = 1
@@ -394,8 +393,7 @@ class JsonCredentialStorage:
                 try:
                     while True:
                         try:
-                            fcntl.flock(
-                                lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            file_locks.try_lock_exclusive(lock_fd)
                             acquired = True
                             break
                         except BlockingIOError:
@@ -407,7 +405,7 @@ class JsonCredentialStorage:
                 finally:
                     if acquired:
                         with contextlib.suppress(OSError):
-                            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                            file_locks.unlock(lock_fd)
             finally:
                 os.close(lock_fd)
         finally:

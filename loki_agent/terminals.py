@@ -2,13 +2,21 @@ import asyncio
 import codecs
 import collections
 import contextlib
-import fcntl
 import os
 import signal
 import sys
-import termios
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
+
+if os.name == "posix":
+    import fcntl
+    import termios
+else:
+    # Windows has neither module.  Importing them at module scope made this
+    # module unimportable there; the paths that use them below have no Windows
+    # implementation yet.
+    fcntl = None
+    termios = None
 
 from .texts import escape_terminal_text
 

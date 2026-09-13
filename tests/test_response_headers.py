@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import fcntl
 import io
 import json
 import os
@@ -11,6 +10,7 @@ from unittest import mock
 from response_header_fixtures import isolated_response_headers
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
+from loki_agent import file_locks
 from loki_agent import http_client, loki, protocols, response_headers
 from loki_agent.sessions import Session
 
@@ -216,8 +216,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         await self.store.save()
         original = Path(self.path).read_bytes()
         self.observe(headers={"x-remaining": "5"})
-        with open(self.path + ".lock", "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with mock.patch.object(file_locks, 'try_lock_exclusive',
+                               side_effect=BlockingIOError):
             with contextlib.redirect_stderr(io.StringIO()) as errors:
                 await self.store.save_on_exit()
             self.assertIn("Could not save", errors.getvalue())
