@@ -16,7 +16,7 @@ the storage investigation measured:
   investigation, so it is not used.
 
 The token is a raw ``HANDLE`` (a POSIX descriptor is an ``int``), which is why
-``credential_files`` takes read/write/fsync/close from this module too.
+``private_files`` takes read/write/fsync/close from this module too.
 
 What the privacy check does and does not cover is stated at
 ``_PRIVATE_TRUSTEES``.
@@ -25,7 +25,8 @@ What the privacy check does and does not cover is stated at
 from __future__ import annotations
 
 from . import windows_acl, windows_api
-from .credential_types import CredentialStorageError, FileFacts
+from .credential_errors import CredentialStorageError
+from .file_facts import FileFacts
 
 
 # Trustees that may hold access to a private credential object besides its

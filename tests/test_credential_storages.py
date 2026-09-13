@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from loki_agent import authentications
-from loki_agent import credential_files
+from loki_agent import private_files
 from loki_agent import credential_storages
 from loki_agent import file_locks
 from loki_agent import paths
@@ -129,10 +129,10 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         else:
             # No mode bits on Windows; the primitives read the DACL.
             self.assertFalse(
-                credential_files.describe_path(
+                private_files.describe_path(
                     self.directory).group_or_other_access)
             self.assertFalse(
-                credential_files.describe_path(
+                private_files.describe_path(
                     self.storage.file_path).group_or_other_access)
         loaded = self.storage.load_openai_subscription()
         self.assertEqual(loaded.tokens, tokens().normalized())
@@ -293,7 +293,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         # Patch the platform close the storage actually calls: os.close on
         # POSIX, CloseHandle on Windows.  Patching os.close would inject
         # nothing on Windows, where the token is not a descriptor.
-        close = credential_files.close
+        close = private_files.close
 
         def close_then_report_error(token):
             close(token)
@@ -305,7 +305,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                                    return_value=directory_fd), \
                     mock.patch.object(self.storage, '_open_lock_at',
                                       return_value=lock_fd), \
-                    mock.patch.object(credential_files, 'close',
+                    mock.patch.object(private_files, 'close',
                                       side_effect=close_then_report_error):
                 with self.assertRaisesRegex(OSError, 'lock close failed'):
                     async with self.storage._locked_document():
@@ -339,7 +339,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                     self.assert_descriptor_closed(directory_fd)
 
     async def test_rejects_wrong_file_owner(self):
-        facts = credential_files.FileFacts(
+        facts = private_files.FileFacts(
             regular=True, directory=False, reparse_point=False, size=0,
             owned_by_current_user=False, group_or_other_access=False)
 
@@ -349,12 +349,12 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             self.storage._validate_secret_file(facts, "JSON file")
 
     async def test_rejects_wrong_directory_owner(self):
-        facts = credential_files.FileFacts(
+        facts = private_files.FileFacts(
             regular=False, directory=True, reparse_point=False, size=0,
             owned_by_current_user=False, group_or_other_access=False)
 
         with mock.patch.object(
-                credential_files, "describe_path", return_value=facts):
+                private_files, "describe_path", return_value=facts):
             with self.assertRaisesRegex(
                     credential_storages.CredentialStorageError,
                     "directory is not owned"):
@@ -829,12 +829,12 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
     """
 
     def test_a_name_that_is_not_one_component_is_refused(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         for name in ("", ".", "..", "a/b", "a\\b", "C:name"):
             with self.subTest(name=name), self.assertRaises(
                     credential_storages.CredentialStorageError):
-                _credential_files_windows.open_read_at(object(), name)
+                _private_files_windows.open_read_at(object(), name)
 
     @staticmethod
     def _failing_call(status):
@@ -843,7 +843,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         return call
 
     def test_missing_names_map_to_filenotfound(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         statuses = (windows_api.STATUS_OBJECT_NAME_NOT_FOUND,
                     windows_api.STATUS_OBJECT_PATH_NOT_FOUND,
@@ -854,39 +854,39 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
                     windows_api, "nt_create_file",
                     side_effect=self._failing_call(status)):
                 with self.assertRaises(FileNotFoundError):
-                    _credential_files_windows.open_read_at(
+                    _private_files_windows.open_read_at(
                         object(), "tokens.json")
 
     def test_a_name_collision_maps_to_fileexists(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         with mock.patch.object(
                 windows_api, "nt_create_file",
                 side_effect=self._failing_call(
                     windows_api.STATUS_OBJECT_NAME_COLLISION)):
             with self.assertRaises(FileExistsError):
-                _credential_files_windows.create_exclusive_at(
+                _private_files_windows.create_exclusive_at(
                     object(), "tokens.json", 0o600)
 
     def test_access_denied_maps_to_permissionerror(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         with mock.patch.object(
                 windows_api, "nt_create_file",
                 side_effect=self._failing_call(
                     windows_api.STATUS_ACCESS_DENIED)):
             with self.assertRaises(PermissionError):
-                _credential_files_windows.open_lock_file_at(
+                _private_files_windows.open_lock_file_at(
                     object(), "tokens.lock", 0o600)
 
     def test_an_unnamed_status_is_a_plain_oserror(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         with mock.patch.object(
                 windows_api, "nt_create_file",
                 side_effect=self._failing_call(0xDEADBEEF)):
             with self.assertRaises(OSError) as caught:
-                _credential_files_windows.open_read_at(
+                _private_files_windows.open_read_at(
                     object(), "tokens.json")
         self.assertNotIsInstance(caught.exception, FileNotFoundError)
 
@@ -910,7 +910,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         )
 
     def test_a_new_file_that_is_not_private_is_refused_before_writing(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         information = windows_api.ByHandleFileInformation()
         information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
@@ -921,13 +921,13 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
                 mock.patch.object(windows_api, "close_handle") as close:
             with self.assertRaises(
                     credential_storages.CredentialStorageError):
-                _credential_files_windows.create_exclusive_at(
+                _private_files_windows.create_exclusive_at(
                     object(), "tokens.json", 0o600)
         # Refused before returning, with the handle it opened released.
         close.assert_called_once_with(0x77)
 
     def test_a_new_private_file_is_returned(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         information = windows_api.ByHandleFileInformation()
         information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
@@ -935,7 +935,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         patches = self._created_file_mocks(
             information, owner, self._private_sddl(owner))
         with patches[0], patches[1], patches[2], patches[3], patches[4]:
-            handle = _credential_files_windows.create_exclusive_at(
+            handle = _private_files_windows.create_exclusive_at(
                 object(), "tokens.json", 0o600)
         self.assertEqual(handle, 0x77)
 
@@ -946,31 +946,31 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)")
 
     def test_the_kernel_alias_dacl_is_judged_private(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
-        self.assertFalse(_credential_files_windows._is_shared(
+        self.assertFalse(_private_files_windows._is_shared(
             self._MEASURED_PRIVATE_SDDL, "S-1-5-21-1-2-3-1001"))
 
     def test_an_alias_for_another_trustee_is_refused(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         sddl = self._MEASURED_PRIVATE_SDDL + "(A;;FR;;;WD)"
-        self.assertTrue(_credential_files_windows._is_shared(
+        self.assertTrue(_private_files_windows._is_shared(
             sddl, "S-1-5-21-1-2-3-1001"))
 
     def test_an_inheritable_grant_to_another_trustee_is_refused(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         # Inherit-only, so the directory's own access is clean, but a file
         # created in it inherits the grant: for a directory that is not private.
         sddl = self._MEASURED_PRIVATE_SDDL + "(A;IO;FR;;;S-1-5-21-1-2-3-1004)"
-        self.assertTrue(_credential_files_windows._is_shared(
+        self.assertTrue(_private_files_windows._is_shared(
             sddl, "S-1-5-21-1-2-3-1001", inheritable=True))
-        self.assertFalse(_credential_files_windows._is_shared(
+        self.assertFalse(_private_files_windows._is_shared(
             sddl, "S-1-5-21-1-2-3-1001", inheritable=False))
 
     def test_facts_for_a_private_file_owned_by_the_caller(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         information = windows_api.ByHandleFileInformation()
         information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
@@ -984,7 +984,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
                                   return_value=self._private_sddl(owner)), \
                 mock.patch.object(windows_api, "current_user_sid",
                                   return_value=owner):
-            facts = _credential_files_windows.describe(object())
+            facts = _private_files_windows.describe(object())
         self.assertTrue(facts.regular)
         self.assertFalse(facts.directory)
         self.assertFalse(facts.reparse_point)
@@ -993,25 +993,25 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         self.assertFalse(facts.group_or_other_access)
 
     def test_a_dacl_that_grants_another_trustee_is_not_private(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         owner = "S-1-5-21-1-2-3-1001"
         sddl = (f"D:P(A;OICI;FA;;;{owner})"
                 "(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)"
                 "(A;;FR;;;S-1-5-21-1-2-3-1004)")
         self.assertTrue(
-            _credential_files_windows._is_shared(sddl, owner))
+            _private_files_windows._is_shared(sddl, owner))
 
     def test_an_absent_dacl_is_not_private(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         # No DACL means everyone has full access; it must read as shared, never
         # as "no grant" because there was nothing to parse.
-        self.assertTrue(_credential_files_windows._is_shared(
+        self.assertTrue(_private_files_windows._is_shared(
             None, "S-1-5-21-1-2-3-1001"))
 
     def test_a_reparse_point_and_a_foreign_owner_are_reported(self):
-        from loki_agent import _credential_files_windows
+        from loki_agent import _private_files_windows
 
         information = windows_api.ByHandleFileInformation()
         information.dwFileAttributes = (
@@ -1024,7 +1024,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
                                   return_value=None), \
                 mock.patch.object(windows_api, "current_user_sid",
                                   return_value="S-1-5-21-1-2-3-1001"):
-            facts = _credential_files_windows.describe(object())
+            facts = _private_files_windows.describe(object())
         self.assertTrue(facts.reparse_point)
         self.assertFalse(facts.owned_by_current_user)
         self.assertTrue(facts.group_or_other_access)
@@ -1051,9 +1051,9 @@ class WindowsCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_load_and_logout_round_trip(self):
         stored = await self.storage.store_openai_login(tokens())
         self.assertEqual(stored.state, "active")
-        self.assertFalse(credential_files.describe_path(
+        self.assertFalse(private_files.describe_path(
             self.directory).group_or_other_access)
-        self.assertFalse(credential_files.describe_path(
+        self.assertFalse(private_files.describe_path(
             self.storage.file_path).group_or_other_access)
         self.assertEqual(
             self.storage.load_openai_subscription().tokens,

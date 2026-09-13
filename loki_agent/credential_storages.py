@@ -23,8 +23,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from . import authentications, credential_files, file_locks, paths
-from .credential_files import CredentialStorageError
+from . import authentications, file_locks, paths, private_files
+from .credential_errors import CredentialStorageError
 
 
 FORMAT_VERSION = 1
@@ -212,7 +212,7 @@ class JsonCredentialStorage:
             os.mkdir(self.directory, 0o700)
         except FileExistsError:
             pass
-        facts = credential_files.describe_path(self.directory)
+        facts = private_files.describe_path(self.directory)
         if not facts.directory:
             raise CredentialStorageError(
                 f"credential path is not a directory: {self.directory}")
@@ -232,7 +232,7 @@ class JsonCredentialStorage:
     def _open_directory(self):
         self.ensure_directory()
         try:
-            return credential_files.open_directory(self.directory)
+            return private_files.open_directory(self.directory)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential directory: {error}") from error
@@ -255,7 +255,7 @@ class JsonCredentialStorage:
 
     def _read_document_at(self, directory_fd):
         try:
-            fd = credential_files.open_read_at(
+            fd = private_files.open_read_at(
                 directory_fd, paths.CREDENTIAL_FILE_NAME)
         except FileNotFoundError:
             return _empty_document()
@@ -263,7 +263,7 @@ class JsonCredentialStorage:
             raise CredentialStorageError(
                 f"could not open credential JSON: {error}") from error
         try:
-            facts = credential_files.describe(fd)
+            facts = private_files.describe(fd)
             self._validate_secret_file(facts, "JSON file")
             if facts.size > MAX_CREDENTIAL_FILE_BYTES:
                 raise CredentialStorageError(
@@ -271,7 +271,7 @@ class JsonCredentialStorage:
             chunks = []
             remaining = MAX_CREDENTIAL_FILE_BYTES + 1
             while remaining:
-                chunk = credential_files.read(fd, min(65536, remaining))
+                chunk = private_files.read(fd, min(65536, remaining))
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -281,7 +281,7 @@ class JsonCredentialStorage:
                 raise CredentialStorageError(
                     "credential JSON exceeds its size limit")
         finally:
-            credential_files.close(fd)
+            private_files.close(fd)
         try:
             text = data.decode("utf-8")
             value = json.loads(
@@ -296,7 +296,7 @@ class JsonCredentialStorage:
         try:
             return self._read_document_at(directory_fd)
         finally:
-            credential_files.close(directory_fd)
+            private_files.close(directory_fd)
 
     def load_openai_subscription(self):
         return _openai_record(self.load_document())
@@ -319,42 +319,42 @@ class JsonCredentialStorage:
             f"{os.getpid()}.{secrets.token_hex(12)}")
         fd = None
         try:
-            fd = credential_files.create_exclusive_at(
+            fd = private_files.create_exclusive_at(
                 directory_fd, temporary_name, 0o600)
             view = memoryview(data)
             while view:
-                written = credential_files.write(fd, view)
+                written = private_files.write(fd, view)
                 if written <= 0:
                     raise OSError("short credential JSON write")
                 view = view[written:]
-            credential_files.fsync(fd)
-            credential_files.close(fd)
+            private_files.fsync(fd)
+            private_files.close(fd)
             fd = None
-            credential_files.replace_at(
+            private_files.replace_at(
                 directory_fd, temporary_name, paths.CREDENTIAL_FILE_NAME)
-            credential_files.fsync(directory_fd)
+            private_files.fsync(directory_fd)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not persist credential JSON: {error}") from error
         finally:
             if fd is not None:
-                credential_files.close(fd)
+                private_files.close(fd)
             with contextlib.suppress(
                     FileNotFoundError, CredentialStorageError):
-                credential_files.unlink_at(directory_fd, temporary_name)
+                private_files.unlink_at(directory_fd, temporary_name)
 
     def _open_lock_at(self, directory_fd):
         try:
-            fd = credential_files.open_lock_file_at(
+            fd = private_files.open_lock_file_at(
                 directory_fd, paths.CREDENTIAL_LOCK_FILE_NAME, 0o600)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential lock: {error}") from error
         try:
             self._validate_secret_file(
-                credential_files.describe(fd), "lock file")
+                private_files.describe(fd), "lock file")
         except BaseException:
-            credential_files.close(fd)
+            private_files.close(fd)
             raise
         return fd
 
@@ -384,9 +384,9 @@ class JsonCredentialStorage:
                         with contextlib.suppress(OSError):
                             file_locks.unlock(lock_fd)
             finally:
-                credential_files.close(lock_fd)
+                private_files.close(lock_fd)
         finally:
-            credential_files.close(directory_fd)
+            private_files.close(directory_fd)
 
     @staticmethod
     def _next_revision(document):

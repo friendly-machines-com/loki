@@ -20,7 +20,7 @@ import secrets
 import urllib.parse
 from datetime import datetime, timezone
 
-from . import credential_files, file_locks, paths
+from . import file_locks, paths, private_files
 
 
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
@@ -214,17 +214,17 @@ class Store:
         # symlink in the final component, the replace is handle-relative, and
         # the lock is taken on the token the platform can actually lock (a
         # descriptor on POSIX, a handle on Windows).
-        directory_fd = credential_files.open_directory(directory)
+        directory_fd = private_files.open_directory(directory)
         temporary_name = None
         try:
-            lock_fd = credential_files.open_lock_file_at(
+            lock_fd = private_files.open_lock_file_at(
                 directory_fd, name + ".lock", 0o600)
         except OSError as error:
-            credential_files.close(directory_fd)
+            private_files.close(directory_fd)
             raise OSError(
                 f"could not open response status lock: {error}") from error
         try:
-            facts = credential_files.describe(lock_fd)
+            facts = private_files.describe(lock_fd)
             if not facts.regular or facts.reparse_point:
                 raise OSError("response status lock is not a regular file")
             deadline = asyncio.get_running_loop().time() + 0.25
@@ -245,28 +245,28 @@ class Store:
             if len(content) > MAX_SNAPSHOT_BYTES:
                 raise ValueError("response status snapshot is too large")
             temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(12)}"
-            fd = credential_files.create_exclusive_at(
+            fd = private_files.create_exclusive_at(
                 directory_fd, temporary_name, 0o600)
             try:
                 view = memoryview((content + "\n").encode("utf-8"))
                 while view:
-                    written = credential_files.write(fd, view)
+                    written = private_files.write(fd, view)
                     if written <= 0:
                         raise OSError("short response status write")
                     view = view[written:]
-                credential_files.fsync(fd)
+                private_files.fsync(fd)
             finally:
-                credential_files.close(fd)
-            credential_files.replace_at(directory_fd, temporary_name, name)
-            credential_files.fsync(directory_fd)
+                private_files.close(fd)
+            private_files.replace_at(directory_fd, temporary_name, name)
+            private_files.fsync(directory_fd)
             temporary_name = None
             self.dirty = False
         finally:
             if temporary_name is not None:
                 with contextlib.suppress(OSError):
-                    credential_files.unlink_at(directory_fd, temporary_name)
-            credential_files.close(lock_fd)
-            credential_files.close(directory_fd)
+                    private_files.unlink_at(directory_fd, temporary_name)
+            private_files.close(lock_fd)
+            private_files.close(directory_fd)
 
     async def save_on_exit(self):
         try:
