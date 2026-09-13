@@ -1,10 +1,15 @@
-"""Read-only container verification, shared by the chat and the editor.
+"""Container verification: the DACL inventory and the runtime self-check.
 
-Everything reachable from the chat's start-up check only reads, so this module
-must never import ``windows_setup`` or ``windows_containers``.  The probe below
--- a token check plus a deliberate escape attempt -- is meant to prove the
-container is real; ``windows_setup`` explains why the import split is not
-itself the boundary.
+Shared by the chat and the editor, and this module must never import
+``windows_setup`` or ``windows_containers``: everything here either reads a DACL
+or asks for access it must be denied, closing the handle without using it.
+
+``verify_container`` is the uncontained view -- used by the editor's Verify
+button, and intended for the launcher once that exists -- and checks that the
+grants and the protected trees are what they should be.  ``probe_containment``
+is the check for inside the runtime: that its token is the AppContainer, and
+that the rights it must not have are refused.  ``windows_setup`` explains why
+the import split is not itself the boundary.
 """
 
 from __future__ import annotations
@@ -30,9 +35,9 @@ def verify_workspace(ledger: dict, workspace: str) -> list[Check]:
 def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
     """Check that ``grants`` are in place for ``workspace``'s profile.
 
-    Read-only: derive the SID from the name, read each DACL, and report the
-    token self-test as untested until it exists.  The editor's Verify button and
-    the chat's start-up check both come through here.
+    Read-only and safe to run uncontained, which is why it reads DACLs rather
+    than asking for access.  The editor's Verify button calls this; the
+    runtime's own check is :func:`probe_containment`.
     """
     profile = profile_name_for(workspace)
     checks: list[Check] = []
@@ -63,8 +68,98 @@ def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
             checks.append(Check(name, "fail", "package SID is granted"))
         else:
             checks.append(Check(name, "pass", "no package ACE"))
-    # The token self-test is the only check that proves the container can
-    # actually be entered; until it exists, say so instead of implying it passed.
-    checks.append(Check("contained probe", "untested",
-                        "token self-test not implemented yet"))
     return checks
+
+
+def probe_containment(workspace: str) -> list[Check]:
+    """Check, from inside the container, that this process is contained.
+
+    Read-only in effect: each denial is attempted and then closed without being
+    used, and nothing is read or written.  A granted path is opened too, as a
+    positive control -- a process denied *everything* would otherwise make every
+    denial below look like success.
+    """
+    checks = _identity_checks(workspace)
+    checks.append(_reachable(
+        "workspace reachable", workspace,
+        windows_api.GENERIC_READ | windows_api.GENERIC_WRITE,
+        "the workspace opens read-write"))
+    checks.append(_denied(
+        "credentials unreadable", paths.credential_directory(),
+        windows_api.GENERIC_READ, "opening the credential directory is denied"))
+    checks.append(_denied(
+        "cannot rewrite a DACL", workspace, windows_api.WRITE_DAC,
+        "requesting WRITE_DAC on a granted path is denied"))
+    return checks
+
+
+def _identity_checks(workspace: str) -> list[Check]:
+    """Check the process token, before asking about anything on disk."""
+    try:
+        expected = windows_api.derive_app_container_sid(
+            profile_name_for(workspace))
+    except windows_api.WindowsApiError as error:
+        return [Check("package SID", "fail", str(error))]
+    try:
+        token = windows_api.open_process_token(
+            windows_api.current_process_handle())
+    except windows_api.WindowsApiError as error:
+        return [Check("process token", "fail", str(error))]
+    try:
+        checks: list[Check] = []
+        try:
+            contained = windows_api.token_is_app_container(token)
+        except windows_api.WindowsApiError as error:
+            checks.append(Check("AppContainer", "fail", str(error)))
+        else:
+            checks.append(Check(
+                "AppContainer", "pass" if contained else "fail",
+                "the token is an AppContainer" if contained
+                else "the token is not an AppContainer"))
+        try:
+            package = windows_api.token_app_container_sid(token)
+        except windows_api.WindowsApiError as error:
+            checks.append(Check("package SID", "fail", str(error)))
+        else:
+            matches = package == expected
+            checks.append(Check(
+                "package SID", "pass" if matches else "fail",
+                package if matches
+                else f"token has {package}, expected {expected}"))
+        return checks
+    finally:
+        windows_api.close_handle(token)
+
+
+def _attempt(path: str, desired_access: int):
+    """Open ``path`` with ``desired_access`` and close it.
+
+    Returns the :class:`WindowsApiError` when the open was refused, or ``None``
+    when it succeeded; nothing is done with the handle either way.
+    """
+    try:
+        handle = windows_api.open_with_access(path, desired_access)
+    except windows_api.WindowsApiError as error:
+        return error
+    windows_api.close_handle(handle)
+    return None
+
+
+def _reachable(name: str, path: str, desired_access: int,
+               description: str) -> Check:
+    """A positive control: the access must be granted."""
+    error = _attempt(path, desired_access)
+    if error is None:
+        return Check(name, "pass", description)
+    return Check(name, "fail", f"{description}: {error}")
+
+
+def _denied(name: str, path: str, desired_access: int,
+            description: str) -> Check:
+    """A denial: the access must be refused, specifically as access denied."""
+    error = _attempt(path, desired_access)
+    if error is None:
+        return Check(name, "fail", f"{description}: access was granted")
+    if error.status == windows_api.ERROR_ACCESS_DENIED:
+        return Check(name, "pass", description)
+    return Check(name, "fail", f"{description}: {error}")

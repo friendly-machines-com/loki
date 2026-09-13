@@ -22,6 +22,7 @@ Two rules keep this module safe to share rather than copied around:
 from __future__ import annotations
 
 import ctypes
+import subprocess
 import sys
 from ctypes import wintypes
 
@@ -286,3 +287,316 @@ def sid_text(sid) -> str:
         return ctypes.wstring_at(text)
     finally:
         local_free(text)
+
+
+# -- container identity and launch ---------------------------------------
+# An AppContainer token is supplied when the process is created -- through the
+# security-capabilities attribute on CreateProcess -- rather than adopted by a
+# running process.  These declarations inspect a token and create a child with
+# one, so a launcher can verify a child while it is still suspended and the
+# runtime can check its own token.  Nothing here creates or modifies a profile
+# or a DACL.
+#
+# TOKEN_INFORMATION_CLASS (winnt.h).  The Learn page names the enumerators but
+# gives a value only for TokenUser (1), so these two numbers are from the
+# header and are not confirmed by that page.
+TOKEN_IS_APP_CONTAINER_CLASS = 29
+TOKEN_APP_CONTAINER_SID_CLASS = 31
+
+# PROCESS_ACCESS_RIGHTS, from
+# https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# Process creation flags, from
+# https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+CREATE_SUSPENDED = 0x00000004
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+
+# PROC_THREAD_ATTRIBUTE_* (winbase.h).  The names map to these values, not to
+# the bare enumerators 2 and 9.  The tested launch in
+# tests/test_windows_appcontainers.py passes 0x20002 and 0x20009.
+PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
+PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
+
+# File access for the containment probe.  The probe *asks* for rights it must be
+# denied and treats the refusal as the pass; it never reads or writes.
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+WRITE_DAC = 0x00040000
+OPEN_EXISTING = 3
+FILE_SHARE_ALL = 0x00000007
+# FILE_FLAG_BACKUP_SEMANTICS lets CreateFileW open a directory, which the
+# credential tree and the workspace both are.
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+ERROR_ACCESS_DENIED = 5
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class SecurityCapabilities(ctypes.Structure):
+    """SECURITY_CAPABILITIES: the package SID a child is created in."""
+
+    # Fixed-width types, not ``wintypes.DWORD``: the latter is ``c_ulong``,
+    # which is 8 bytes on LP64 non-Windows hosts and would give this structure
+    # the wrong layout in the portable tests that pin it.
+    _fields_ = [
+        ("AppContainerSid", ctypes.c_void_p),
+        ("Capabilities", ctypes.c_void_p),
+        ("CapabilityCount", ctypes.c_uint32),
+        ("Reserved", ctypes.c_uint32),
+    ]
+
+
+class StartupInfo(ctypes.Structure):
+    """STARTUPINFOW.
+
+    ``ctypes.wintypes`` does not define STARTUPINFO -- it carries scalar and
+    handle aliases and a few unrelated structures -- so the layout is declared
+    here.  The test pins its size and field order: a missing or misplaced member
+    shifts every field after it.
+    """
+
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("lpReserved", wintypes.LPWSTR),
+        ("lpDesktop", wintypes.LPWSTR),
+        ("lpTitle", wintypes.LPWSTR),
+        ("dwX", ctypes.c_uint32),
+        ("dwY", ctypes.c_uint32),
+        ("dwXSize", ctypes.c_uint32),
+        ("dwYSize", ctypes.c_uint32),
+        ("dwXCountChars", ctypes.c_uint32),
+        ("dwYCountChars", ctypes.c_uint32),
+        ("dwFillAttribute", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32),
+        ("wShowWindow", ctypes.c_uint16),
+        ("cbReserved2", ctypes.c_uint16),
+        ("lpReserved2", ctypes.c_void_p),
+        ("hStdInput", ctypes.c_void_p),
+        ("hStdOutput", ctypes.c_void_p),
+        ("hStdError", ctypes.c_void_p),
+    ]
+
+
+class StartupInfoEx(ctypes.Structure):
+    """STARTUPINFOEXW: a STARTUPINFOW plus the attribute list."""
+
+    _fields_ = [
+        ("StartupInfo", StartupInfo),
+        ("lpAttributeList", ctypes.c_void_p),
+    ]
+
+
+class ProcessInformation(ctypes.Structure):
+    """PROCESS_INFORMATION: the handles and IDs CreateProcessW returns."""
+
+    _fields_ = [
+        ("hProcess", ctypes.c_void_p),
+        ("hThread", ctypes.c_void_p),
+        ("dwProcessId", ctypes.c_uint32),
+        ("dwThreadId", ctypes.c_uint32),
+    ]
+
+
+def _get_token_information():
+    return bind("advapi32", "GetTokenInformation", wintypes.BOOL,
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+
+
+def close_handle(handle) -> None:
+    """Release a kernel handle."""
+    bind("kernel32", "CloseHandle", wintypes.BOOL, ctypes.c_void_p)(handle)
+
+
+def current_process_handle():
+    """The pseudo-handle for the calling process; it need not be closed."""
+    return bind("kernel32", "GetCurrentProcess", ctypes.c_void_p)()
+
+
+def open_with_access(path, desired_access, creation=OPEN_EXISTING,
+                     flags=FILE_FLAG_BACKUP_SEMANTICS,
+                     share_mode=FILE_SHARE_ALL):
+    """Open ``path`` requesting ``desired_access``, returning the handle.
+
+    The containment probe uses this to request rights it must not have, so a
+    refusal is the expected result and its ``status`` carries the Win32 error.
+    If the call unexpectedly succeeds the caller must close the handle without
+    using it.  ``FILE_FLAG_BACKUP_SEMANTICS`` is the default so that a
+    directory can be opened.
+    """
+    create_file = bind("kernel32", "CreateFileW", ctypes.c_void_p,
+                       wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p)
+    handle = create_file(path, desired_access, share_mode, None, creation,
+                         flags, None)
+    if handle is None or handle == INVALID_HANDLE_VALUE:
+        raise WindowsApiError(f"CreateFileW({path!r}) failed",
+                              status=ctypes.get_last_error())
+    return handle
+
+
+def open_process_token(process, rights: int = TOKEN_QUERY):
+    """Open ``process``'s token for the requested rights.
+
+    ``process`` is a handle the caller already holds; opening a child created
+    suspended is how the launcher inspects it before it runs.
+    """
+    open_token = bind("advapi32", "OpenProcessToken", wintypes.BOOL,
+                      ctypes.c_void_p, wintypes.DWORD,
+                      ctypes.POINTER(ctypes.c_void_p))
+    token = ctypes.c_void_p()
+    if not open_token(process, rights, ctypes.byref(token)):
+        raise WindowsApiError("OpenProcessToken failed")
+    return token
+
+
+def token_is_app_container(token) -> bool:
+    """Whether ``token`` is an AppContainer (lowbox) token.
+
+    This is a property of the token, so the same check covers a child created
+    suspended and the runtime's own token.
+    """
+    get_info = _get_token_information()
+    value = wintypes.BOOL()
+    returned = wintypes.DWORD()
+    if not get_info(token, TOKEN_IS_APP_CONTAINER_CLASS,
+                    ctypes.byref(value), ctypes.sizeof(value),
+                    ctypes.byref(returned)):
+        raise WindowsApiError(
+            "GetTokenInformation(TokenIsAppContainer) failed")
+    return bool(value.value)
+
+
+def token_app_container_sid(token) -> str:
+    """Return ``token``'s AppContainer package SID as a string.
+
+    ``TokenAppContainerSid`` yields a ``TOKEN_APPCONTAINER_INFORMATION`` whose
+    single member is the SID pointer, so the buffer is read as one pointer.
+    """
+    get_info = _get_token_information()
+    size = wintypes.DWORD()
+    get_info(token, TOKEN_APP_CONTAINER_SID_CLASS, None, 0,
+             ctypes.byref(size))
+    if not size.value:
+        raise WindowsApiError(
+            "GetTokenInformation(TokenAppContainerSid) reported no size")
+    buffer = ctypes.create_string_buffer(size.value)
+    if not get_info(token, TOKEN_APP_CONTAINER_SID_CLASS, buffer,
+                    len(buffer), ctypes.byref(size)):
+        raise WindowsApiError(
+            "GetTokenInformation(TokenAppContainerSid) failed")
+    sid = ctypes.c_void_p.from_buffer(buffer).value
+    if not sid:
+        raise WindowsApiError(
+            "GetTokenInformation(TokenAppContainerSid) returned a null SID")
+    return sid_text(sid)
+
+
+def resume_thread(thread) -> None:
+    """Resume a thread created suspended; the child starts running here."""
+    resumed = bind("kernel32", "ResumeThread", wintypes.DWORD, ctypes.c_void_p)
+    if resumed(thread) == 0xFFFFFFFF:
+        raise WindowsApiError("ResumeThread failed")
+
+
+def terminate_process(process, exit_code: int = 1) -> None:
+    """Terminate a process, used to drop a child that failed verification."""
+    terminate = bind("kernel32", "TerminateProcess", wintypes.BOOL,
+                     ctypes.c_void_p, ctypes.c_uint)
+    if not terminate(process, exit_code):
+        raise WindowsApiError("TerminateProcess failed")
+
+
+def create_process_in_app_container(executable, arguments, package_sid,
+                                    current_directory=None,
+                                    inherited_handles=None):
+    """Create ``executable`` suspended inside the AppContainer ``package_sid``.
+
+    ``package_sid`` is the package SID in string form, as
+    :func:`derive_app_container_sid` returns; the profile must already exist,
+    since this creates nothing and changes no DACL.  ``inherited_handles`` are
+    the handles the child must receive, passed explicitly through
+    ``PROC_THREAD_ATTRIBUTE_HANDLE_LIST`` with inheritance otherwise off.
+
+    The child is left suspended, so the caller can inspect its token and then
+    resume or terminate it.  The returned :class:`ProcessInformation` owns the
+    process and thread handles; the caller closes them.
+    """
+    convert_sid = bind("advapi32", "ConvertStringSidToSidW", wintypes.BOOL,
+                       wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+    initialize = bind("kernel32", "InitializeProcThreadAttributeList",
+                      wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD,
+                      wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t))
+    update = bind("kernel32", "UpdateProcThreadAttribute", wintypes.BOOL,
+                  ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t,
+                  ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                  ctypes.c_void_p)
+    delete = bind("kernel32", "DeleteProcThreadAttributeList", None,
+                  ctypes.c_void_p)
+    create = bind("kernel32", "CreateProcessW", wintypes.BOOL,
+                  wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
+                  ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
+                  ctypes.c_void_p, wintypes.LPCWSTR,
+                  ctypes.POINTER(StartupInfoEx),
+                  ctypes.POINTER(ProcessInformation))
+
+    sid = ctypes.c_void_p()
+    if not convert_sid(package_sid, ctypes.byref(sid)):
+        raise WindowsApiError(f"ConvertStringSidToSidW({package_sid!r}) failed")
+    # The list must be sized for every attribute it will receive: one for the
+    # package SID, plus one when handles are inherited.  Sizing it for one and
+    # then adding two makes the second UpdateProcThreadAttribute fail.
+    attribute_count = 1 + (1 if inherited_handles else 0)
+    size = ctypes.c_size_t()
+    attribute_list = None
+    handle_array = None
+    try:
+        initialize(None, attribute_count, 0, ctypes.byref(size))
+        if not size.value:
+            raise WindowsApiError(
+                "InitializeProcThreadAttributeList reported no size")
+        attribute_storage = ctypes.create_string_buffer(size.value)
+        attribute_list = ctypes.cast(attribute_storage, ctypes.c_void_p)
+        if not initialize(attribute_list, attribute_count, 0,
+                          ctypes.byref(size)):
+            raise WindowsApiError(
+                "InitializeProcThreadAttributeList failed")
+        capabilities = SecurityCapabilities(sid, None, 0, 0)
+        if not update(attribute_list, 0,
+                      PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                      ctypes.byref(capabilities),
+                      ctypes.sizeof(capabilities), None, None):
+            raise WindowsApiError(
+                "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed")
+        if inherited_handles:
+            handle_array = (ctypes.c_void_p * len(inherited_handles))(
+                *inherited_handles)
+            if not update(attribute_list, 0,
+                          PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                          ctypes.cast(handle_array, ctypes.c_void_p),
+                          ctypes.sizeof(handle_array), None, None):
+                raise WindowsApiError(
+                    "UpdateProcThreadAttribute(HANDLE_LIST) failed")
+
+        startup = StartupInfoEx()
+        startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
+        startup.lpAttributeList = attribute_list
+        information = ProcessInformation()
+        command_line = ctypes.create_unicode_buffer(
+            subprocess.list2cmdline([executable, *arguments]))
+        flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT
+        if not create(executable, command_line, None, None,
+                      bool(inherited_handles), flags, None,
+                      current_directory, ctypes.byref(startup),
+                      ctypes.byref(information)):
+            raise WindowsApiError(
+                "CreateProcessW failed: "
+                f"{ctypes.get_last_error()}")
+        return information
+    finally:
+        if attribute_list is not None:
+            delete(attribute_list)
+        local_free(sid)

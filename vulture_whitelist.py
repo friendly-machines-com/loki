@@ -12,10 +12,24 @@ with the package, so anything vulture reports beyond this list is dead.
 render_markdown
 status_text
 
-# Entry point for the chat's start-up container verification.  The Windows gate
-# that calls it is not wired yet; it lives in the read-only module so the
+# Entry points for the chat's start-up container verification.  The Windows gate
+# that calls them is not wired yet; they live in the read-only module so the
 # runtime has no built-in grant path.
 verify_workspace
+probe_containment
+
+# Container identity and launch declarations.  The launcher and the runtime gate
+# that will use these are not written yet, so nothing calls them.
+PROCESS_QUERY_LIMITED_INFORMATION
+close_handle
+open_process_token
+token_is_app_container
+token_app_container_sid
+resume_thread
+terminate_process
+create_process_in_app_container
+_.cb
+_.lpAttributeList
 
 # Test seams: production never reads these; the tests exercise them.
 _.credential_broker
