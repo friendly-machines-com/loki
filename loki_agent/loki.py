@@ -15,6 +15,7 @@ import logging
 import os
 import asyncio
 import collections
+import contextlib
 import copy
 import hashlib
 import json
@@ -1399,7 +1400,8 @@ class Job:
     finished_at_iso: str | None = None
     timeout_ms: int | None = None
     session_owned: bool = False
-    owner_signal_fd: int | None = field(default=None, repr=False)
+    # A descriptor on POSIX and a socket on Windows; see host_ipc.
+    owner_signal_fd: object | None = field(default=None, repr=False)
     credential_capability: object | None = field(
         default=None, repr=False)
     # Live resource accounting only. This is deliberately absent from
@@ -1409,6 +1411,10 @@ class Job:
 
 class SubagentCapacityError(RuntimeError):
     """The process already owns its maximum number of live subagents."""
+
+
+class _JobRevokedDuringLaunch(RuntimeError):
+    """The session revoked the job while its process was being created."""
 
 
 class JobManager:
@@ -1603,6 +1609,8 @@ class JobManager:
         owner_child = None
         credential_child = None
         credential_server = None
+        parent_handed_off = False
+        capability_handed_off = False
         spawn_command = command
         proc = None
         try:
@@ -1663,16 +1671,42 @@ class JobManager:
                         **host_process.spawn_kwargs(),
                         **host_ipc.spawn_kwargs(child_ends),
                     )
+
+            # The session may have revoked this job while it was launching.
+            # Publishing it now would leave a live child nobody owns.
+            if job.status != "starting":
+                raise _JobRevokedDuringLaunch(
+                    f"job was revoked while launching (status={job.status})")
+            job.process = proc
+            job.owner_signal_fd = owner_parent
+            parent_handed_off = True
+            job.credential_capability = credential_server
+            capability_handed_off = True
+            job.pid = proc.pid
+            job.pgid = host_process.process_group(proc, proc.pid)
+            job.status = "running"
+            self._write_metadata(job)
+            return job
         except BaseException as error:
-            # Nothing has escaped to a reaper yet, and the job is already
-            # registered, so this records the outcome and releases the
-            # reservation (exactly once, in the finalizer) before re-raising.
-            if isinstance(error, asyncio.CancelledError):
-                # Cancelled before it started is a cancellation, not a failure.
-                self._finalize_job(job, "cancelled")
-            else:
+            if proc is not None:
+                # A child exists, so end it before recording anything. An
+                # unowned live process is the one outcome this must not leave.
+                with contextlib.suppress(Exception):
+                    host_process.signal_group(
+                        proc, getattr(job, "pgid", None) or proc.pid,
+                        host_process.FORCE)
+                with contextlib.suppress(Exception):
+                    await proc.wait()
+            revoked = isinstance(
+                error, (asyncio.CancelledError, _JobRevokedDuringLaunch))
+            try:
                 self._finalize_job(
-                    job, "failed", f"{type(error).__name__}: {error}")
+                    job, "cancelled" if revoked else "failed",
+                    None if revoked else f"{type(error).__name__}: {error}")
+            except Exception:
+                # Recording the failure must not replace the failure itself.
+                pass
+            if not revoked:
                 try:
                     with open(job.stderr_path, 'ab') as stderr_file:
                         stderr_file.write(
@@ -1686,19 +1720,11 @@ class JobManager:
                 host_ipc.close_end(owner_child)
             if credential_child is not None:
                 host_ipc.close_end(credential_child)
-            if proc is None and owner_parent is not None:
+            # Close each parent-side end only if no job took ownership of it.
+            if owner_parent is not None and not parent_handed_off:
                 host_ipc.close_end(owner_parent)
-            if proc is None and credential_server is not None:
+            if credential_server is not None and not capability_handed_off:
                 await credential_server.close()
-
-        job.process = proc
-        job.owner_signal_fd = owner_parent
-        job.credential_capability = credential_server
-        job.pid = proc.pid
-        job.pgid = host_process.process_group(proc, proc.pid)
-        job.status = "running"
-        self._write_metadata(job)
-        return job
 
     async def _wait_for_job(self, job: Job) -> int:
         return await job.process.wait()
@@ -1953,7 +1979,16 @@ class JobManager:
             self._refresh_job(job)
             if not job.session_owned:
                 continue
-            if job.process is None or job.process.returncode is not None:
+            if job.process is None:
+                if job.status == "starting":
+                    # Launch still in flight: revoke it so it cannot publish a
+                    # live child nobody owns. _spawn re-checks after launching.
+                    job.status = "owner_closed"
+                self._close_owner_signal(job)
+                self._revoke_credential_capability(job)
+                cleanup.append(job)
+                continue
+            if job.process.returncode is not None:
                 self._close_owner_signal(job)
                 self._revoke_credential_capability(job)
                 cleanup.append(job)
