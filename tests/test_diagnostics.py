@@ -207,16 +207,23 @@ assert os.environ['LOKI_LOG_CONFIG'] == original
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Unknown test fields', log.read_text())
 
-    def test_dotdot_after_symlink_is_not_collapsed(self):
+    def test_dotdot_after_symlink_uses_platform_traversal(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             (base / 'project').mkdir()
             (base / 'elsewhere' / 'child').mkdir(parents=True)
-            (base / 'project' / 'link').symlink_to(base / 'elsewhere' / 'child')
+            (base / 'project' / 'link').symlink_to(
+                base / 'elsewhere' / 'child', target_is_directory=True)
             log = base / 'literal.log'
-            (base / 'elsewhere' / 'logging.ini').write_text(
+            # POSIX follows the link and applies `..` in its target, so the
+            # elsewhere copy is the one selected; Windows resolves `..`
+            # lexically and selects the project copy.  Put the requested config
+            # where each platform actually looks.
+            selected = base / ('project' if os.name != 'posix' else 'elsewhere')
+            other = base / ('elsewhere' if os.name != 'posix' else 'project')
+            (selected / 'logging.ini').write_text(
                 CONFIG.format(path=str(log)))
-            (base / 'project' / 'logging.ini').write_text('not the requested file')
+            (other / 'logging.ini').write_text('not the requested file')
             code = EMIT.replace(
                 'if not configure_logging():',
                 f'import os\nos.chdir({directory!r})\n'
