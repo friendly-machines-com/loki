@@ -1,6 +1,7 @@
 """Credential supervisor and dependency-free runtime-isolation tests."""
 
 import asyncio
+import contextlib
 import errno
 import json
 import os
@@ -17,6 +18,7 @@ from loki_agent import credential_runtimes
 from loki_agent import credential_storages
 from loki_agent import credential_supervisors
 from loki_agent import paths
+from loki_agent import runtime_isolation
 from loki_agent import runtime_isolations
 from loki_agent import windows_api
 from loki_agent.credentials import CredentialStore
@@ -252,6 +254,32 @@ print(json.dumps({
             with open(marker, encoding="ascii") as stream:
                 self.assertEqual(
                     stream.read(), "supervisor-visible")
+
+
+def launch_patches(spawn):
+    """Replace whatever starts the runtime, so the supervisor can be observed.
+
+    On POSIX the seam is the thin ``create_subprocess_exec`` delegation, so
+    replacing that one call runs the real seam around the stub.  On Windows the
+    runtime is a real AppContainer process -- it needs a configured workspace,
+    a profile and ACLs -- and the delegation channel is not ported yet, so the
+    real launch cannot run here at all.  The whole platform seam is stubbed
+    there instead, which keeps these tests on the supervisor's own behaviour
+    (which descriptors and environment the runtime is handed, and the
+    revoke-before-wait ordering); the gate and the launch themselves are
+    covered by ``test_windows_runtime`` and the AppContainer investigation.
+    """
+    if os.name != "nt":
+        return [mock.patch.object(
+            credential_supervisors.asyncio, "create_subprocess_exec",
+            new=spawn)]
+    return [
+        mock.patch.object(runtime_isolation, "configured_workspace",
+                          return_value=None),
+        mock.patch.object(runtime_isolation, "start_runtime", new=spawn),
+        mock.patch.object(runtime_isolation, "close_runtime_process",
+                          new=lambda process: None),
+    ]
 
 
 class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
@@ -498,28 +526,34 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             spawned["kwargs"] = kwargs
             return Process()
 
-        with mock.patch.object(
-                credential_supervisors.asyncio,
-                "create_subprocess_exec",
-                new=spawn):
+        with contextlib.ExitStack() as stack:
+            for patch in launch_patches(spawn):
+                stack.enter_context(patch)
             status = await supervisor.run_terminal_runtime(
                 "/installed/bin/loki", ["--headless"])
 
         self.assertEqual(status, 7)
-        self.assertEqual(spawned["args"][0:2], (
-            "/installed/bin/loki", "--runtime"))
-        self.assertIn("--session-owner-fd", spawned["args"])
-        self.assertIn(
-            "--credential-capability-fd", spawned["args"])
-        self.assertEqual(
-            spawned["args"][-2:], ("--", "--headless"))
-        self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 2)
-        self.assertTrue(spawned["kwargs"]["close_fds"])
-        self.assertNotIn(
-            "LOKI_API_KEY", spawned["kwargs"]["env"])
+        if os.name == "posix":
+            # The POSIX seam builds the command line, so its shape is asserted
+            # here.  Windows launch command shape is the launch's business.
+            self.assertEqual(spawned["args"][0:2], (
+                "/installed/bin/loki", "--runtime"))
+            self.assertIn("--session-owner-fd", spawned["args"])
+            self.assertIn(
+                "--credential-capability-fd", spawned["args"])
+            self.assertEqual(
+                spawned["args"][-2:], ("--", "--headless"))
+            self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 2)
+            self.assertTrue(spawned["kwargs"]["close_fds"])
+            environment = spawned["kwargs"]["env"]
+        else:
+            # start_runtime(executable, arguments, workspace, environment,
+            # delegation): the environment is the property under test.
+            environment = spawned["args"][3]
+        self.assertNotIn("LOKI_API_KEY", environment)
         self.assertNotIn(
             "must-not-enter-runtime-environment",
-            repr(spawned["kwargs"]["env"]),
+            repr(environment),
         )
 
     async def test_supervisor_revokes_then_allows_clean_runtime_exit(self):
@@ -566,13 +600,12 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
         async def spawn(*args, **kwargs):
             return process
 
-        with mock.patch.object(
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
                 supervisor, "delegate",
-                new=mock.AsyncMock(return_value=Delegation())), \
-                mock.patch.object(
-                    credential_supervisors.asyncio,
-                    "create_subprocess_exec",
-                    new=spawn):
+                new=mock.AsyncMock(return_value=Delegation())))
+            for patch in launch_patches(spawn):
+                stack.enter_context(patch)
             task = asyncio.create_task(
                 supervisor.run_terminal_runtime("/loki", []))
             await asyncio.sleep(0)
