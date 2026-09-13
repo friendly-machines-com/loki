@@ -32,7 +32,11 @@ PROFILE_ALREADY_EXISTS = 0x800700B7
 
 
 def set_dacl_sddl(path: str, sddl: str) -> None:
-    """Replace ``path``'s DACL with ``sddl`` and clear inheritance."""
+    """Set a DACL without unconditionally disabling inheritance.
+
+    ``D:P`` explicitly protects Loki's private trees. For an unprotected
+    descriptor, leave the object's inheritance setting unchanged.
+    """
     convert = bind(
         "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
         wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
@@ -57,12 +61,13 @@ def set_dacl_sddl(path: str, sddl: str) -> None:
         if not get_dacl(descriptor, ctypes.byref(present),
                         ctypes.byref(dacl), ctypes.byref(defaulted)):
             raise WindowsApiError("GetSecurityDescriptorDacl failed")
-        if not present.value:
-            raise WindowsApiError("security descriptor carries no DACL")
+        if not present.value or not dacl.value:
+            raise WindowsApiError("security descriptor carries no explicit DACL")
+        flags = DACL_SECURITY_INFORMATION
+        if 'P' in sddl.split('(', 1)[0][2:]:
+            flags |= PROTECTED_DACL_SECURITY_INFORMATION
         status = set_named(
-            path, SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None, None, dacl, None)
+            path, SE_FILE_OBJECT, flags, None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(
                 f"SetNamedSecurityInfoW({path!r}) failed: {status}")
