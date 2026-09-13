@@ -1214,8 +1214,13 @@ class WindowsPrimitiveTests(unittest.TestCase):
     def test_pseudoconsole_attaches_a_child(self):
         # ConPTY reachability as a standard user: the session is created and a
         # child attaches.  Child-output capture is a separate, unproven claim
-        # recorded by the probe, not asserted here.
-        self.run_child('conpty', 'conpty')
+        # recorded by the probe, not asserted here.  The child's record is
+        # printed even on success, so the characterization is visible.
+        result = subprocess.run(self.command('conpty', 'conpty'), timeout=15,
+                                capture_output=True, text=True)
+        print(result.stdout, flush=True)
+        print(result.stderr, file=sys.stderr, flush=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_path_resolution_semantics(self):
         # What Windows resolves for a directory junction, `..`, and identity:
