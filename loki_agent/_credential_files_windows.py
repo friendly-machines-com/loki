@@ -3,10 +3,11 @@
 Not implemented yet.  The POSIX bodies refuse a symlink in the final component
 and act relative to the open directory descriptor; the Windows equivalents are
 a retained directory handle with ``NtCreateFile(RootDirectory)`` and
-``FILE_FLAG_OPEN_REPARSE_POINT``, with the owner taken from the token's user
-SID via ``GetSecurityInfo``.  Until those exist, every entry point raises here
-so a Windows caller gets one clear error instead of a POSIX ``AttributeError``
-from whichever call site happened to run first.
+``FILE_FLAG_OPEN_REPARSE_POINT``, and a :class:`FileFacts` from
+``GetFileInformationByHandle`` plus ``GetSecurityInfo`` (owner SID and DACL).
+Until those exist, every entry point raises here so a Windows caller gets one
+clear error instead of a POSIX ``AttributeError`` from whichever call site
+happened to run first.
 """
 
 from __future__ import annotations
@@ -29,4 +30,5 @@ create_exclusive_at = _unsupported
 open_lock_file_at = _unsupported
 replace_at = _unsupported
 unlink_at = _unsupported
-owner_is_current_user = _unsupported
+describe = _unsupported
+describe_path = _unsupported
