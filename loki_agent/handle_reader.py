@@ -47,7 +47,8 @@ FILE_TYPE_PIPE = 3
 class HandleReader:
     """One thread reading one handle for one byte consumer."""
 
-    def __init__(self, fd: int, loop, queue, eof_sentinel: bool = False):
+    def __init__(self, fd: int | None, loop, queue,
+                 eof_sentinel: bool = False, handle=None):
         self.fd = fd
         self.loop = loop
         self.queue = queue
@@ -55,6 +56,10 @@ class HandleReader:
         # for an empty post when the read loop ends, so it does not wait for
         # input that will never come.
         self.eof_sentinel = eof_sentinel
+        # A caller holding a raw Windows HANDLE (an anonymous pipe from
+        # ``CreatePipe``) has no C descriptor to convert, so it passes the
+        # handle directly and ``fd`` is None.
+        self._explicit_handle = handle
         self.handle = None
         self.stop_event = None
         self.thread = None
@@ -63,7 +68,10 @@ class HandleReader:
         if sys.platform != "win32":
             raise windows_api.WindowsUnavailableError(
                 "the handle reader is available on Windows only")
-        self.handle = _handle(self.fd)
+        if self._explicit_handle is not None:
+            self.handle = self._explicit_handle
+        else:
+            self.handle = _handle(self.fd)
         self.stop_event = _CreateEventW(None, True, False, None)
         if not self.stop_event:
             raise OSError(ctypes.get_last_error(), "CreateEventW")
