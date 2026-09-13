@@ -61,10 +61,17 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.server, child_fd = (
             await credential_capabilities.CredentialCapabilityServer.create(
                 self.broker, allowed))
+        # POSIX: the parent must not leave its copy of the child's end
+        # inheritable.  Windows: the child end is a pipe endpoint whose handles
+        # must be inheritable to cross at all; there the explicit handle list,
+        # not this flag, bounds what else may inherit.
         if os.name == "posix":
-            # The Windows child end is a pipe endpoint whose handles must be
-            # inheritable to cross at all; the handle list bounds inheritance.
             self.assertFalse(os.get_inheritable(child_fd))
+        else:
+            self.assertTrue(host_ipc.is_endpoint(child_fd))
+            self.assertTrue(all(
+                os.get_handle_inheritable(handle)
+                for handle in child_fd.handles()))
         self.client = (
             await credential_capabilities.CredentialClient.from_fd(child_fd))
 
