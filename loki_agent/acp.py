@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import datetime
 import json
+import logging
 import os
 import sys
 import uuid
@@ -24,6 +25,8 @@ from .connections import (
 )
 from .credentials import CredentialStore
 from .loki import CHAT_LOG_DIR
+
+logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 AGENT_INFO = {
@@ -54,8 +57,13 @@ def worker_command() -> list[str]:
     executable.
     """
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--worker"]
-    return [sys.executable, os.path.abspath(sys.argv[0]), "--worker"]
+        command = [sys.executable, "--worker"]
+    else:
+        command = [sys.executable, os.path.abspath(sys.argv[0]), "--worker"]
+    logger.debug(
+        "worker command: %r (sys.argv[0]=%r sys.executable=%r frozen=%r)",
+        command, sys.argv[0], sys.executable, getattr(sys, "frozen", False))
+    return command
 
 
 class WorkerChannel:
