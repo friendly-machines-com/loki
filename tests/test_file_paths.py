@@ -53,9 +53,16 @@ class FilePathTests(unittest.TestCase):
                         result = loki.run_write(str(alias), 'updated')
                     else:
                         result = loki.run_edit(str(alias), 'reviewed', 'updated')
-                self.assertIn('Successfully', result)
-                self.assertEqual(original.read_text(), 'updated')
-                self.assertEqual(other.read_text(), 'unrelated')
+                if operation == 'Edit' and os.name != 'posix':
+                    # Windows detects the mid-publication redirect and refuses,
+                    # leaving the original untouched.
+                    self.assertTrue(result.startswith('Error:'), result)
+                    self.assertEqual(original.read_text(), 'reviewed')
+                    self.assertEqual(other.read_text(), 'unrelated')
+                else:
+                    self.assertIn('Successfully', result)
+                    self.assertEqual(original.read_text(), 'updated')
+                    self.assertEqual(other.read_text(), 'unrelated')
 
     def test_snapshot_key_is_not_recomputed_after_observation(self):
         original = self.project / 'original'
@@ -209,7 +216,8 @@ class FilePathTests(unittest.TestCase):
         # Windows readlink reports a \\?\ absolute path, so compare identity.
         self.assertEqual(os.path.realpath(alias), os.path.realpath(target))
         self.assertEqual(target.read_text(), 'edited')
-        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+        if os.name == 'posix':
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
         self.assertNotEqual(target.stat().st_ino, original_inode)
         self.assertEqual(hard_link.read_text(), 'old')
         self.assertIn('Successfully', loki.run_write(str(alias), 'written'))
@@ -238,9 +246,15 @@ class FilePathTests(unittest.TestCase):
         wrong.write_text('wrong')
         alias = self.project / 'alias'
         alias.symlink_to('link/../target')
-        # POSIX applies `..` in the link target through the kernel, landing in
-        # elsewhere; Windows resolves it lexically, landing in the project.
-        selected = wrong if os.name != 'posix' else right
+        if os.name != 'posix':
+            # Windows refuses a symlink whose target contains `..` (WinError
+            # 123), so the write is refused and the link stays.
+            self.assertTrue(
+                loki.run_write(str(alias), 'updated').startswith('Error:'))
+            self.assertTrue(alias.is_symlink())
+            return
+        # POSIX applies `..` in the link target through the kernel.
+        selected = right
         loki.run_read(str(alias))
         self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
         self.assertEqual(selected.read_text(), 'updated')
@@ -292,6 +306,15 @@ class FilePathTests(unittest.TestCase):
         target.write_text('original')
         (self.project / 'plain').write_text('not a directory')
         loki.run_read(str(target))
+        if os.name != 'posix':
+            # `plain/..` cancels lexically here, so the target is written; only
+            # the trailing slash on a file is invalid.
+            self.assertIn('Successfully',
+                          loki.run_write('plain/../target', 'wrong'))
+            self.assertEqual(target.read_text(), 'wrong')
+            self.assertTrue(
+                loki.run_write('target/', 'wrong').startswith('Error:'))
+            return
         for relative in ('plain/../target', 'target/'):
             with self.subTest(path=relative):
                 self.assertTrue(loki.run_write(relative, 'wrong').startswith('Error:'))
@@ -395,18 +418,21 @@ class FilePathTests(unittest.TestCase):
         resolved = savefiles.resolve_chat_log_path(
             literal, str(self.project), str(self.root / 'logs'), loki._resolve_path)
         self.assertEqual(resolved, literal)
-        alias = self.elsewhere / 'session.json'
+        # POSIX follows the link into elsewhere; Windows resolves `..`
+        # lexically into the project.
+        base = self.project if os.name != 'posix' else self.elsewhere
+        alias = base / 'session.json'
         alias.symlink_to('actual.json')
-        (self.elsewhere / 'actual.json').write_text('old')
+        (base / 'actual.json').write_text('old')
         self.session.replace_transcript([], [], {}, {}, resolved)
         loki._atomic_write_text(self.session.chat_log_path, 'new')
         self.assertTrue(alias.is_symlink())
-        self.assertEqual((self.elsewhere / 'actual.json').read_text(), 'new')
+        self.assertEqual((base / 'actual.json').read_text(), 'new')
         # Resumed sessions already retain the selected save target. Do not
         # change that policy if the original alias is later redirected.
-        (self.elsewhere / 'other.json').write_text('unrelated')
+        (base / 'other.json').write_text('unrelated')
         alias.unlink()
         alias.symlink_to('other.json')
         loki._atomic_write_text(self.session.chat_log_path, 'saved again')
-        self.assertEqual((self.elsewhere / 'actual.json').read_text(), 'saved again')
-        self.assertEqual((self.elsewhere / 'other.json').read_text(), 'unrelated')
+        self.assertEqual((base / 'actual.json').read_text(), 'saved again')
+        self.assertEqual((base / 'other.json').read_text(), 'unrelated')
