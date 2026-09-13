@@ -310,6 +310,51 @@ def handle_dacl_sddl(handle):
         local_free(descriptor)
 
 
+def set_handle_dacl(handle, sddl: str) -> None:
+    """Replace the DACL of the object ``handle`` refers to.
+
+    Handle-based on purpose: a temporary file whose *name* is replaced between
+    creation and this call cannot redirect the change to a different object,
+    which is what the POSIX code achieves by setting the mode through the open
+    descriptor rather than by pathname.
+    """
+    convert = bind(
+        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    get_dacl = bind(
+        "advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
+        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
+    set_info = bind(
+        "advapi32", "SetSecurityInfo", wintypes.DWORD, ctypes.c_void_p,
+        ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p)
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+
+    descriptor = ctypes.c_void_p()
+    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise WindowsApiError(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
+    try:
+        present = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        defaulted = wintypes.BOOL()
+        if not get_dacl(descriptor, ctypes.byref(present),
+                        ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise WindowsApiError("GetSecurityDescriptorDacl failed")
+        if not present.value or not dacl.value:
+            raise WindowsApiError("the descriptor has no DACL to apply")
+        status = set_info(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                          None, None, dacl, None)
+        if status != ERROR_SUCCESS:
+            raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}",
+                                  status=status)
+    finally:
+        local_free(descriptor)
+
+
 def app_container_profile_name_is_usable(name: str) -> bool:
     """Whether ``name`` matches the documented profile-name character set."""
     allowed = set("abcdefghijklmnopqrstuvwxyz"
