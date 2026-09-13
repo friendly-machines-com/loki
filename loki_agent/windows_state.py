@@ -157,7 +157,7 @@ def profile_name_for(workspace: str) -> str:
 class Grant:
     path: str
     access: Access
-    origin: str  # 'workspace' | 'toolchain' | 'temp' | 'user'
+    origin: str  # 'workspace' | 'runtime' | 'temp' | 'user'
 
 
 @dataclass
