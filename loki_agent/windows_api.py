@@ -1191,3 +1191,16 @@ def set_handle_information(handle, mask: int, flags: int) -> None:
 def clear_handle_inheritance(handle) -> None:
     """Clear ``HANDLE_FLAG_INHERIT`` so the end cannot leak into a child."""
     set_handle_information(handle, HANDLE_FLAG_INHERIT, 0)
+
+
+def handle_is_open(handle) -> bool:
+    """Whether ``handle`` names a live object in this process.
+
+    ``GetFileType`` reports ``FILE_TYPE_UNKNOWN`` and sets
+    ``ERROR_INVALID_HANDLE`` for a handle this process does not hold, so a
+    parsed reference can be validated the way the POSIX path validates a
+    descriptor with ``os.fstat``.
+    """
+    get_type = bind("kernel32", "GetFileType", wintypes.DWORD,
+                    ctypes.c_void_p)
+    return get_type(handle) != 0
