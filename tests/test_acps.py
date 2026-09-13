@@ -436,10 +436,6 @@ class EntrypointTests(unittest.TestCase):
 
 class FrontWorkerTests(unittest.TestCase):
     def _front_env(self, tmpdir):
-        os.makedirs(
-            os.path.join(tmpdir, "config", "loki", "credentials"),
-            mode=0o700, exist_ok=True,
-        )
         env = dict(os.environ)
         env.update({
             "HOME": tmpdir,

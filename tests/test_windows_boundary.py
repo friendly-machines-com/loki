@@ -265,41 +265,69 @@ class StagedGateClosureTests(unittest.TestCase):
 TESTS = ROOT / "tests"
 
 # The calls that produce the container configuration the gate consumes: the
-# ledger file, an object's DACL, and the private-DACL policy itself.  A test
-# that drives a real entrypoint must manufacture none of them -- it runs
-# loki-setup for its own environment -- or the suite certifies the fixture
-# instead of the product.
+# ledger file, an object's DACL, the private-DACL policy itself, and the
+# credential/config/state trees that setup creates.  A test that drives a real
+# entrypoint must manufacture none of them -- it runs loki-setup for its own
+# environment -- or the suite certifies the fixture instead of the product.
 SETUP_WRITES = ("save_ledger", "set_dacl_sddl", "private_dacl_sddl")
+TREE_CALLS = ("makedirs", "mkdir")
+STATE_MARKERS = ("credentials", "windows-setup")
+
+# The helper surface that starts or configures an entrypoint.  A module using
+# any of it is driving the product, so it is in scope; a module that merely
+# imports the helper for something else is not.
+LAUNCH_CALLS = ("entrypoint", "loki_command", "loki_acp_command",
+                "configure_container")
+
+
+def _called_name(node):
+    """The bare name of the function a call targets, or None."""
+    if not isinstance(node, ast.Call):
+        return None
+    function = node.func
+    if isinstance(function, ast.Attribute):
+        return function.attr
+    if isinstance(function, ast.Name):
+        return function.id
+    return None
 
 
 def _launching_modules(root=TESTS):
-    """Test modules that drive a sanctioned entrypoint, plus the helper."""
+    """Test modules that start or configure an entrypoint, plus the helper."""
     helper = root / "loki_entrypoints.py"
     modules = {helper}
     for path in root.rglob("*.py"):
         if path == helper:
             continue
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import) and any(
-                    alias.name == "loki_entrypoints" for alias in node.names):
+            if _called_name(node) in LAUNCH_CALLS:
                 modules.add(path)
-            elif (isinstance(node, ast.ImportFrom)
-                  and node.module == "loki_entrypoints"):
-                modules.add(path)
+                break
     return sorted(modules)
 
 
 def _setup_writes(path):
-    """The names from ``SETUP_WRITES`` that ``path`` calls."""
+    """Ways ``path`` manufactures container state instead of running setup.
+
+    The two bypasses a name check alone misses are making the trees with
+    ``makedirs``/``mkdir`` and writing the ledger with a plain ``open``, so
+    those are flagged by what their arguments mention.
+    """
     found = set()
     for node in ast.walk(ast.parse(path.read_text())):
-        if not isinstance(node, ast.Call):
+        name = _called_name(node)
+        if name is None:
             continue
-        func = node.func
-        name = (func.attr if isinstance(func, ast.Attribute)
-                else func.id if isinstance(func, ast.Name) else None)
         if name in SETUP_WRITES:
-            found.add(name)
+            found.add(f"{name}()")
+            continue
+        source = ast.unparse(node)
+        if not any(marker in source for marker in STATE_MARKERS):
+            continue
+        if name in TREE_CALLS:
+            found.add(f"{name} of a Loki tree")
+        elif name == "open":
+            found.add("open of the container ledger")
     return found
 
 
@@ -316,9 +344,9 @@ class ContainerStateFixtureTests(unittest.TestCase):
 
     def test_launching_test_modules_do_not_write_container_state(self):
         offenders = [
-            f"{path.name} calls {name}()"
+            f"{path.name} calls {write}"
             for path in _launching_modules()
-            for name in sorted(_setup_writes(path))
+            for write in sorted(_setup_writes(path))
         ]
 
         self.assertEqual(
