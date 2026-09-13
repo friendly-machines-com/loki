@@ -262,5 +262,70 @@ class StagedGateClosureTests(unittest.TestCase):
             + ", ".join(missing))
 
 
+TESTS = ROOT / "tests"
+
+# The calls that produce the container configuration the gate consumes: the
+# ledger file, an object's DACL, and the private-DACL policy itself.  A test
+# that drives a real entrypoint must manufacture none of them -- it runs
+# loki-setup for its own environment -- or the suite certifies the fixture
+# instead of the product.
+SETUP_WRITES = ("save_ledger", "set_dacl_sddl", "private_dacl_sddl")
+
+
+def _launching_modules(root=TESTS):
+    """Test modules that drive a sanctioned entrypoint, plus the helper."""
+    helper = root / "loki_entrypoints.py"
+    modules = {helper}
+    for path in root.rglob("*.py"):
+        if path == helper:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import) and any(
+                    alias.name == "loki_entrypoints" for alias in node.names):
+                modules.add(path)
+            elif (isinstance(node, ast.ImportFrom)
+                  and node.module == "loki_entrypoints"):
+                modules.add(path)
+    return sorted(modules)
+
+
+def _setup_writes(path):
+    """The names from ``SETUP_WRITES`` that ``path`` calls."""
+    found = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name) else None)
+        if name in SETUP_WRITES:
+            found.add(name)
+    return found
+
+
+class ContainerStateFixtureTests(unittest.TestCase):
+    """Tests that launch an entrypoint must not fabricate its container.
+
+    The gate reads the ledger and verifies the DACLs setup produced; a fixture
+    that writes either makes the suite certify the fixture, which is how an
+    earlier change looked green while exercising nothing.  Such tests run the
+    shipped tool instead (``loki_entrypoints.configure_container``), so these
+    calls may not appear in any module that launches an entrypoint.  Unit tests
+    of the setup functions themselves do not import the helper and stay free.
+    """
+
+    def test_launching_test_modules_do_not_write_container_state(self):
+        offenders = [
+            f"{path.name} calls {name}()"
+            for path in _launching_modules()
+            for name in sorted(_setup_writes(path))
+        ]
+
+        self.assertEqual(
+            offenders, [],
+            "run loki-setup for the test environment instead of manufacturing "
+            "state: " + ", ".join(offenders))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_entrypoints import child_environment, entrypoint
+from loki_entrypoints import child_environment, configure_container, entrypoint
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 
@@ -330,8 +330,11 @@ class ExternalHookTests(unittest.TestCase):
                 PATH=os.environ.get("PATH", ""),
                 TERM="dumb",
                 LOKI_HOOKS=config_path,
+                XDG_CONFIG_HOME=os.path.join(directory, "config"),
+                XDG_STATE_HOME=os.path.join(directory, "state"),
             )
 
+            configure_container(env, directory)
             result = subprocess.run(
                 [entrypoint("loki"), "--headless"],
                 cwd=directory,

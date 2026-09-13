@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 import sysconfig
 
 
@@ -54,32 +56,6 @@ def entrypoint(name: str) -> str:
     return os.path.join(ROOT, script)
 
 
-def _on_windows() -> bool:
-    return os.name == "nt"
-
-
-def seed_container_ledger(environment: dict) -> None:
-    """Give a Windows child the configured container ledger.
-
-    The entrypoint's gate looks the ledger up under the runtime's *state*
-    directory, and ``loki_state_dir`` honours ``XDG_STATE_HOME``.  A test that
-    points ``XDG_STATE_HOME`` at a fresh directory is simulating a fresh state,
-    so it must carry the configuration there; the container itself (profile and
-    ACLs) is machine state and is already in place.  No-op off Windows, where
-    there is no gate, and when the child keeps the real state directory.
-    """
-    if not _on_windows():
-        return
-    state_home = environment.get("XDG_STATE_HOME")
-    if not state_home:
-        return
-    from loki_agent import windows_state
-
-    target = os.path.join(state_home, "loki", "windows-setup.json")
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    windows_state.save_ledger(windows_state.load_ledger(), target)
-
-
 def child_environment(**values) -> dict:
     """A reduced environment that a Windows executable can still start in.
 
@@ -92,6 +68,35 @@ def child_environment(**values) -> dict:
             if name in os.environ:
                 environment.setdefault(name, os.environ[name])
     return environment
+
+
+def configure_container(environment: dict, cwd: str) -> None:
+    """Run the real setup for the environment an entrypoint child will get.
+
+    The Windows gate looks up a ledger entry and verifies the credential,
+    config and state trees *at the paths that environment resolves*.  A test
+    that relocates them must therefore have setup create them there, exactly as
+    a user would -- so this runs the shipped tool and nothing else.  It is
+    deliberately not a fixture that writes a ledger or makes directories: the
+    configuration must come from the code under test.
+
+    Both ``XDG_CONFIG_HOME`` and ``XDG_STATE_HOME`` are required, so the trees
+    and the ledger land inside the test's own directories instead of the
+    runner's real user state.  No-op off Windows, where there is no gate.
+    """
+    if os.name != "nt":
+        return
+    for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME"):
+        if not environment.get(name):
+            raise RuntimeError(
+                f"{name} must be set so that setup stays inside the test")
+    result = subprocess.run(
+        [sys.executable, "-m", "loki_agent.windows_setup", "--configure", cwd],
+        cwd=cwd, env=environment, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"loki-setup --configure failed for {cwd!r}: "
+            f"{result.stdout}{result.stderr}")
 
 
 def loki_command() -> list[str]:
