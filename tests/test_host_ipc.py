@@ -48,6 +48,62 @@ class PairConfirmationTests(unittest.TestCase):
         self.assertEqual(second.fileno(), -1)
 
 
+class PrivatePipePairTests(unittest.TestCase):
+    """Portable contract of the Windows pipe pair, with the calls mocked.
+
+    The primitive is Windows-only in effect but depends only on declarations,
+    so the marshalling, the parent-end inheritance clearing and both cleanup
+    paths are checked here; the pipe handles themselves need Windows.  This is
+    the transport that replaces the unreachable AF_UNIX emulation.
+    """
+
+    def test_only_the_child_ends_stay_inheritable(self):
+        created = iter([(0x10, 0x11), (0x12, 0x13)])
+        cleared = []
+        with mock.patch.object(host_ipc.windows_api, "create_pipe",
+                               side_effect=lambda: next(created)), \
+                mock.patch.object(host_ipc.windows_api,
+                                  "clear_handle_inheritance",
+                                  side_effect=cleared.append), \
+                mock.patch.object(host_ipc.windows_api, "close_handle"):
+            request, response = host_ipc._private_pipe_pair()
+
+        # request is (parent_read, child_write); response is
+        # (child_read, parent_write).
+        self.assertEqual(request, (0x10, 0x11))
+        self.assertEqual(response, (0x12, 0x13))
+        # Parent request-read 0x10 and parent response-write 0x13 are cleared;
+        # child request-write 0x11 and child response-read 0x12 keep inherit.
+        self.assertEqual(cleared, [0x10, 0x13])
+
+    def test_second_pipe_failure_closes_the_first_pipe(self):
+        closed = []
+        with mock.patch.object(
+                host_ipc.windows_api, "create_pipe",
+                side_effect=[(0x10, 0x11), OSError("no more handles")]), \
+                mock.patch.object(host_ipc.windows_api,
+                                  "clear_handle_inheritance"), \
+                mock.patch.object(host_ipc.windows_api, "close_handle",
+                                  side_effect=closed.append):
+            with self.assertRaises(OSError):
+                host_ipc._private_pipe_pair()
+        self.assertEqual(closed, [0x10, 0x11])
+
+    def test_inheritance_failure_closes_all_four_ends(self):
+        closed = []
+        with mock.patch.object(
+                host_ipc.windows_api, "create_pipe",
+                side_effect=[(0x10, 0x11), (0x12, 0x13)]), \
+                mock.patch.object(
+                    host_ipc.windows_api, "clear_handle_inheritance",
+                    side_effect=[None, OSError("cannot clear")]), \
+                mock.patch.object(host_ipc.windows_api, "close_handle",
+                                  side_effect=closed.append):
+            with self.assertRaises(OSError):
+                host_ipc._private_pipe_pair()
+        self.assertEqual(closed, [0x10, 0x11, 0x12, 0x13])
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX seam")
 class SocketPairTests(unittest.TestCase):
     def test_the_pair_is_connected_in_both_directions(self):

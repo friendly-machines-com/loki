@@ -94,6 +94,13 @@ class ExtendedLimits(C.Structure):
                 ('peak_process', C.c_size_t), ('peak_job', C.c_size_t)]
 
 
+class SecurityAttributes(C.Structure):
+    """SECURITY_ATTRIBUTES for CreatePipe; bInheritHandle is a 4-byte BOOL."""
+
+    _fields_ = [('length', ULONG), ('descriptor', HANDLE),
+                ('inherit', ULONG)]
+
+
 class AppContainers(NativeCalls):
     def __init__(self):
         super().__init__()
@@ -153,6 +160,23 @@ class AppContainers(NativeCalls):
                                    HANDLE, ULONG)
         self.open_process = self.bind(self.kernel, 'OpenProcess', HANDLE,
                                       ULONG, W.BOOL, ULONG)
+        # Anonymous-pipe transport experiment: can an AppContainer child read
+        # and write inherited pipe ends?  Handle access is checked at creation,
+        # not use, so this is confirmed natively rather than assumed.
+        self.create_pipe = self.bind(
+            self.kernel, 'CreatePipe', W.BOOL, C.POINTER(HANDLE),
+            C.POINTER(HANDLE), C.POINTER(SecurityAttributes), ULONG)
+        self.set_handle_information = self.bind(
+            self.kernel, 'SetHandleInformation', W.BOOL, HANDLE, ULONG, ULONG)
+        self.read_file = self.bind(
+            self.kernel, 'ReadFile', W.BOOL, HANDLE, HANDLE, ULONG,
+            C.POINTER(ULONG), HANDLE)
+        self.write_file = self.bind(
+            self.kernel, 'WriteFile', W.BOOL, HANDLE, HANDLE, ULONG,
+            C.POINTER(ULONG), HANDLE)
+        self.peek_pipe = self.bind(
+            self.kernel, 'PeekNamedPipe', W.BOOL, HANDLE, HANDLE, ULONG,
+            C.POINTER(ULONG), C.POINTER(ULONG), C.POINTER(ULONG))
 
     def profile_paths(self):
         """Restore only account/OS paths, never inherited runner configuration.
@@ -273,8 +297,58 @@ class AppContainers(NativeCalls):
         finally:
             self.check(self.close(token))
 
+    def pipe_pair(self):
+        """Create an inheritable anonymous pipe; return ``(read, write)``."""
+        read, write = HANDLE(), HANDLE()
+        attributes = SecurityAttributes(
+            C.sizeof(SecurityAttributes), None, 1)
+        self.check(self.create_pipe(C.byref(read), C.byref(write),
+                                    C.byref(attributes), 0))
+        return read.value, write.value
+
+    def write_all(self, handle, data):
+        """Write every byte, looping because a pipe write may be short."""
+        payload = bytes(data)
+        offset = 0
+        while offset < len(payload):
+            chunk = payload[offset:]
+            buffer = C.create_string_buffer(chunk)
+            written = ULONG()
+            self.check(self.write_file(handle, buffer, len(chunk),
+                                       C.byref(written), None))
+            if not written.value:
+                raise OSError('pipe write made no progress')
+            offset += written.value
+
+    def read_exactly(self, handle, count, deadline):
+        """Read ``count`` bytes, bounded by a monotonic deadline.
+
+        A blocking ``ReadFile`` on a pipe would hang the broker where only the
+        launch budget could stop it, so the available byte count is polled and
+        the deadline is enforced here."""
+        data = bytearray()
+        available = ULONG()
+        while len(data) < count:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('pipe read timed out at %d/%d bytes'
+                                   % (len(data), count))
+            self.check(self.peek_pipe(handle, None, 0, None,
+                                      C.byref(available), None))
+            if not available.value:
+                time.sleep(0.02)
+                continue
+            size = min(count - len(data), available.value)
+            buffer = C.create_string_buffer(size)
+            read = ULONG()
+            self.check(self.read_file(handle, buffer, size,
+                                      C.byref(read), None))
+            if not read.value:
+                raise OSError('pipe read made no progress')
+            data.extend(buffer.raw[:read.value])
+        return bytes(data)
+
     def launch(self, command, sid, workspace, output, observe=None,
-               deadline=None):
+               deadline=None, extra_handles=()):
         """Run one contained child under one monotonic budget.
 
         The deadline is fixed before the observer runs--an explicit one, or
@@ -300,8 +374,10 @@ class AppContainers(NativeCalls):
             limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             self.check(self.set_job(job, 9, C.byref(limits), C.sizeof(limits)))
             with open(output, 'wb', buffering=0) as log, open(os.devnull, 'rb') as null:
-                handles = (HANDLE * 2)(msvcrt.get_osfhandle(log.fileno()),
-                                       msvcrt.get_osfhandle(null.fileno()))
+                inherited = (msvcrt.get_osfhandle(log.fileno()),
+                             msvcrt.get_osfhandle(null.fileno()),
+                             *extra_handles)
+                handles = (HANDLE * len(inherited))(*inherited)
                 os.set_handle_inheritable(handles[0], True)
                 os.set_handle_inheritable(handles[1], True)
                 try:
@@ -465,6 +541,69 @@ def race_tree(directory, depth):
         if time.monotonic() >= deadline:
             raise TimeoutError('race witness exceeded its safety deadline')
         time.sleep(0.02)
+
+
+def pipe_child(read_handle, write_handle):
+    """Contained half of the inherited-anonymous-pipe experiment.
+
+    Both handles arrive through the child's explicit handle list.  The child
+    reads a nonce from the response pipe and echoes it on the request pipe, so
+    a successful parent-side match proves reads and writes both worked under
+    the AppContainer token."""
+    import msvcrt
+    read_fd = msvcrt.open_osfhandle(read_handle, os.O_RDONLY)
+    write_fd = msvcrt.open_osfhandle(write_handle, os.O_WRONLY)
+    data = bytearray()
+    while len(data) < 32:
+        chunk = os.read(read_fd, 32 - len(data))
+        if not chunk:
+            raise RuntimeError('response pipe closed before the nonce arrived')
+        data.extend(chunk)
+    os.write(write_fd, b'child:' + bytes(data))
+    return 0
+
+
+def pipe_inheritance_probe(native, sid, workspace, output):
+    """Confirm an AppContainer child can use inherited anonymous pipe ends.
+
+    This is the confirm-don't-assume step behind the credential transport: the
+    two child ends are the only extra handles in the child's list, and the two
+    parent ends have inheritance cleared and never cross the boundary.  A
+    nonce the parent writes must come back prefixed by ``child:`` on the other
+    pipe, which requires the child to read and write both inherited ends."""
+    request_read, request_write = native.pipe_pair()
+    response_read, response_write = native.pipe_pair()
+    try:
+        native.check(native.set_handle_information(request_read, 1, 0))
+        native.check(native.set_handle_information(response_write, 1, 0))
+        nonce = os.urandom(32)
+        observed = {}
+
+        def observe(process, job):
+            native.write_all(response_write, nonce)
+            observed['echo'] = native.read_exactly(
+                request_read, len(nonce) + len(b'child:'),
+                time.monotonic() + 30)
+
+        # The child reads the response pipe and writes the request pipe, so
+        # argv carries (read end, write end) in that order.
+        code = native.launch(
+            [sys.executable, '-I', '-u', __file__, '--pipe-child',
+             str(response_read), str(request_write)],
+            sid, workspace, output, observe=observe,
+            extra_handles=(request_write, response_read))
+        expected = b'child:' + nonce
+        if observed.get('echo') != expected:
+            raise RuntimeError('AppContainer pipe echo mismatch: %r'
+                               % (observed.get('echo'),))
+        if code != 0:
+            raise RuntimeError('AppContainer pipe child exited %d' % code)
+        return {'probe': 'inherited-anonymous-pipe',
+                'outcome': 'both-directions-used'}
+    finally:
+        for handle in (request_read, request_write,
+                       response_read, response_write):
+            native.check(native.close(handle))
 
 
 def peer_readiness_failure(peer, log):
@@ -2305,6 +2444,13 @@ class AppContainerTests(unittest.TestCase):
         workspace.mkdir()
         native.acl(workspace, private_dacl(owner) +
                    '(A;OICI;FA;;;%s)' % package)
+        # Confirm the credential-transport primitive before any of it is
+        # wired: can the contained child actually read and write inherited
+        # anonymous pipe ends?  Handle access is checked at creation, not use.
+        pipe_result = pipe_inheritance_probe(
+            native, sid, workspace, root / 'pipe-inheritance.log')
+        print(json.dumps(pipe_result), flush=True)
+        self.assertEqual(pipe_result['outcome'], 'both-directions-used')
         # Medium-integrity file created by the unrestricted broker, for the
         # contained process's write-up characterization: the DACL permits the
         # container, so only mandatory integrity control can deny it.  Both
@@ -2792,6 +2938,8 @@ if __name__ == '__main__':
     if len(sys.argv) == 4 and sys.argv[1] == '--cleanup-tree':
         cleanup_tree(Path(sys.argv[2]), int(sys.argv[3]))
         sys.exit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == '--pipe-child':
+        sys.exit(pipe_child(int(sys.argv[2]), int(sys.argv[3])))
     if len(sys.argv) == 4 and sys.argv[1] == '--peer':
         escape_helpers['peer'](AppContainers(), sys.argv[2], Path(sys.argv[3]))
         sys.exit(0)

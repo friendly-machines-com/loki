@@ -517,6 +517,98 @@ class HandleRelativeFileDeclarationTests(unittest.TestCase):
         self.assertEqual(windows_api.canonical_sid("WD"), "S-1-1-0")
 
 
+class PipeDeclarationTests(unittest.TestCase):
+    """The anonymous-pipe primitive the credential transport is built on."""
+
+    def test_security_attributes_layout_is_two_pointers_and_a_dword(self):
+        # bInheritHandle must be a fixed-width DWORD, not wintypes.BOOL (which
+        # is c_long and therefore 8 bytes on an LP64 host).  SECURITY_ATTRIBUTES
+        # is DWORD, LPVOID, BOOL: the 8-byte-aligned pointer pushes the flag to
+        # 2*pointer and the structure to 3*pointer.
+        pointer = ctypes.sizeof(ctypes.c_void_p)
+        attributes = windows_api.SecurityAttributes
+        self.assertEqual(attributes.nLength.offset, 0)
+        self.assertEqual(attributes.nLength.size, 4)
+        self.assertEqual(attributes.lpSecurityDescriptor.offset, pointer)
+        self.assertEqual(attributes.bInheritHandle.offset, 2 * pointer)
+        self.assertEqual(attributes.bInheritHandle.size, 4)
+        self.assertEqual(ctypes.sizeof(attributes), 3 * pointer)
+
+    def test_handle_inheritance_flag_matches_the_reference(self):
+        self.assertEqual(windows_api.HANDLE_FLAG_INHERIT, 0x00000001)
+
+    def test_create_pipe_returns_the_two_ends_and_requests_inheritance(self):
+        seen = {}
+
+        def create(read_out, write_out, attributes, size):
+            structure = ctypes.cast(
+                attributes,
+                ctypes.POINTER(windows_api.SecurityAttributes)).contents
+            seen["inherit"] = structure.bInheritHandle
+            seen["length"] = structure.nLength
+            seen["size"] = size
+            ctypes.cast(read_out, ctypes.POINTER(ctypes.c_void_p))[0] = 0x11
+            ctypes.cast(write_out, ctypes.POINTER(ctypes.c_void_p))[0] = 0x22
+            return True
+
+        with mock.patch.object(windows_api, "bind", return_value=create):
+            self.assertEqual(windows_api.create_pipe(), (0x11, 0x22))
+        self.assertEqual(seen["inherit"], 1)
+        self.assertEqual(seen["length"],
+                         ctypes.sizeof(windows_api.SecurityAttributes))
+        self.assertEqual(seen["size"], 0)
+
+    def test_create_pipe_without_inheritance_clears_the_flag(self):
+        seen = {}
+
+        def create(read_out, write_out, attributes, size):
+            seen["inherit"] = ctypes.cast(
+                attributes,
+                ctypes.POINTER(windows_api.SecurityAttributes)
+            ).contents.bInheritHandle
+            ctypes.cast(read_out, ctypes.POINTER(ctypes.c_void_p))[0] = 0
+            ctypes.cast(write_out, ctypes.POINTER(ctypes.c_void_p))[0] = 0
+            return True
+
+        with mock.patch.object(windows_api, "bind", return_value=create):
+            windows_api.create_pipe(inherit=False)
+        self.assertEqual(seen["inherit"], 0)
+
+    def test_create_pipe_failure_raises_with_the_win32_status(self):
+        with mock.patch.object(
+                windows_api, "bind",
+                return_value=lambda *arguments: False), \
+                mock.patch.object(windows_api.ctypes, "get_last_error",
+                                  return_value=6, create=True):
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                windows_api.create_pipe()
+        self.assertEqual(caught.exception.status, 6)
+
+    def test_clear_handle_inheritance_clears_only_that_flag(self):
+        seen = []
+
+        def set_information(handle, mask, flags):
+            seen.append((handle, mask, flags))
+            return True
+
+        with mock.patch.object(windows_api, "bind",
+                               return_value=set_information):
+            windows_api.clear_handle_inheritance(0x33)
+        self.assertEqual(
+            seen, [(0x33, windows_api.HANDLE_FLAG_INHERIT, 0)])
+
+    def test_set_handle_information_failure_raises_with_the_win32_status(self):
+        with mock.patch.object(
+                windows_api, "bind",
+                return_value=lambda *arguments: False), \
+                mock.patch.object(windows_api.ctypes, "get_last_error",
+                                  return_value=6, create=True):
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                windows_api.set_handle_information(
+                    1, windows_api.HANDLE_FLAG_INHERIT, 0)
+        self.assertEqual(caught.exception.status, 6)
+
+
 class RangeLockDeclarationTests(unittest.TestCase):
     def test_overlapped_states_the_offset_the_lock_starts_at(self):
         pointer = ctypes.sizeof(ctypes.c_void_p)
