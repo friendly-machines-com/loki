@@ -53,16 +53,9 @@ class FilePathTests(unittest.TestCase):
                         result = loki.run_write(str(alias), 'updated')
                     else:
                         result = loki.run_edit(str(alias), 'reviewed', 'updated')
-                if operation == 'Edit' and os.name != 'posix':
-                    # Windows detects the mid-publication redirect and refuses,
-                    # leaving the original untouched.
-                    self.assertTrue(result.startswith('Error:'), result)
-                    self.assertEqual(original.read_text(), 'reviewed')
-                    self.assertEqual(other.read_text(), 'unrelated')
-                else:
-                    self.assertIn('Successfully', result)
-                    self.assertEqual(original.read_text(), 'updated')
-                    self.assertEqual(other.read_text(), 'unrelated')
+                self.assertIn('Successfully', result)
+                self.assertEqual(original.read_text(), 'updated')
+                self.assertEqual(other.read_text(), 'unrelated')
 
     def test_snapshot_key_is_not_recomputed_after_observation(self):
         original = self.project / 'original'
@@ -266,10 +259,14 @@ class FilePathTests(unittest.TestCase):
         (self.project / 'plain').write_text('not a directory')
         if os.name != 'posix':
             # Windows cancels `..` lexically before the kernel sees the path, so
-            # the missing/non-directory component is dropped and the target is
-            # read normally; only a trailing slash on a file is invalid.
-            self.assertIn('must not read', loki.run_read('missing/../target'))
-            self.assertIn('must not read', loki.run_read('plain/../target'))
+            # the missing/non-directory component is dropped and the path
+            # resolves to the target; Loki then reports that the file changed
+            # under it, and never returns the content.  A trailing slash on a
+            # file is invalid outright.
+            for relative in ('missing/../target', 'plain/../target'):
+                self.assertTrue(
+                    loki.run_read(relative).startswith('Error:'),
+                    loki.run_read(relative))
             self.assertTrue(loki.run_read('target/').startswith('Error:'))
             return
         for relative in ('missing/../target', 'plain/../target', 'target/'):

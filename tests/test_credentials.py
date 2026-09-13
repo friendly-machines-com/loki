@@ -354,7 +354,9 @@ if os.name == "nt":
     info = Information()
     command = ctypes.create_unicode_buffer(subprocess.list2cmdline(
         [sys.executable, "-c", second_stage]))
-    if not create(sys.executable, command, None, None, False, 0, block,
+    # CREATE_UNICODE_ENVIRONMENT: the block handed to CreateProcessW is
+    # Unicode, and without the flag the API reads it as ANSI (WinError 87).
+    if not create(sys.executable, command, None, None, False, 0x400, block,
                   None, ctypes.byref(startup), ctypes.byref(info)):
         raise ctypes.WinError(ctypes.get_last_error())
     kernel.WaitForSingleObject(info.process, 10000)
