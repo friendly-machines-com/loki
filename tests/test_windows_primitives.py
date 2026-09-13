@@ -202,7 +202,10 @@ def conpty_probe(root):
     process = ProbeProcessInfo()
     try:
         size = C.c_size_t()
-        if not initialize(None, 1, 0, C.byref(size)):
+        # The sizing call is documented to fail with ERROR_INSUFFICIENT_BUFFER
+        # while filling in the required size; only a wrong error is a defect.
+        initialize(None, 1, 0, C.byref(size))
+        if C.get_last_error() != 122 or not size.value:
             raise C.WinError(C.get_last_error())
         storage = C.create_string_buffer(size.value)
         attributes = C.cast(storage, C.c_void_p)
