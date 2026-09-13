@@ -15,6 +15,7 @@ import enum
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -55,29 +56,30 @@ def access_sddl(access: Access) -> str:
 
 # -- path rules ----------------------------------------------------------
 
-def _runtime_trees() -> list[str]:
-    """Trees the container must never be granted."""
-    trees = [os.path.dirname(os.path.abspath(__file__)),
-             paths.loki_config_dir(),
-             paths.loki_state_dir(),
+def _runtime_trees(include_code: bool = True) -> list[str]:
+    """Private trees, plus trusted code when checking a writable grant."""
+    trees = [paths.loki_config_dir(), paths.loki_state_dir(),
              paths.credential_directory()]
-    if getattr(sys, "frozen", False):
+    if include_code:
+        trees.append(os.path.dirname(os.path.abspath(__file__)))
+    if include_code and getattr(sys, "frozen", False):
         # A packaged build's own directory holds the runtime and its bundled
         # interpreter; a grant covering it would let a tool rewrite Loki.
         trees.append(os.path.dirname(os.path.abspath(sys.executable)))
     return trees
 
 
-def protected_path_errors(path: str) -> list[str]:
-    """Return the reasons ``path`` may not be granted (empty when fine).
+def protected_path_errors(path: str, access: Access = Access.READ_WRITE) -> list[str]:
+    """Reject overlap with private data; trusted code may be read, not written.
 
-    ``path`` is refused when it *contains* a protected tree (a recursive grant
-    would cover it) or when it *sits inside* one.
+    Resolve existing aliases before comparing. This detects junction/symlink
+    aliases at validation time, not races replacing a path during ACL updates;
+    those require retained-handle operations in the Windows backend.
     """
-    target = os.path.normcase(os.path.abspath(path))
+    target = os.path.normcase(os.path.realpath(path))
     reasons = []
-    for tree in _runtime_trees():
-        protected = os.path.normcase(os.path.abspath(tree))
+    for tree in _runtime_trees(include_code=access is Access.READ_WRITE):
+        protected = os.path.normcase(os.path.realpath(tree))
         if target == protected:
             reasons.append(f"{path} is {tree}, which Loki never grants")
         elif _contains(target, protected):
@@ -233,36 +235,46 @@ def entry_grants(entry: dict) -> list[Grant]:
 # exactly it again), because replacing the DACL of someone's project directory
 # would be repairing their permissions, which this project does not do.
 
+def _dacl_parts(sddl: str):
+    """Parse basic DACL SDDL; refuse unsupported forms rather than corrupt them."""
+    header, separator, rest = sddl.partition("(")
+    if not re.fullmatch(r"D:(?:P|AI|AR)*", header):
+        raise windows_api.WindowsApiError("unsupported DACL header")
+    body = separator + rest
+    aces = re.findall(r"\([^()]*\)", body)
+    if ''.join(aces) != body or any(len(ace[1:-1].split(';')) != 6 for ace in aces):
+        raise windows_api.WindowsApiError("unsupported or malformed DACL ACE")
+    return header, aces
+
+
 def add_package_ace(sddl: str, package: str, access: Access) -> str:
-    """Return ``sddl`` with an inheritable ACE for ``package`` appended."""
-    ace = f"(A;OICI;{access_sddl(access)};;;{package})"
-    index = sddl.find("(")
-    if index < 0:
-        if not sddl.startswith("D:"):
-            raise windows_api.WindowsApiError(f"not a DACL: {sddl!r}")
-        return sddl + ace
-    return sddl[:index] + sddl[index:] + ace
+    """Replace this profile's explicit allow ACEs, preserving other entries."""
+    header, aces = _dacl_parts(remove_package_aces(sddl, package))
+    # Explicit entries precede inherited ones. Inserting after inherited denies
+    # would make the DACL noncanonical even though the new entry is an allow.
+    index = next((i for i, ace in enumerate(aces)
+                  if 'ID' in ace[1:-1].split(';')[1]), len(aces))
+    aces.insert(index, f"(A;OICI;{access_sddl(access)};;;{package})")
+    return header + ''.join(aces)
 
 
 def remove_package_aces(sddl: str, package: str) -> str:
-    """Return ``sddl`` with every ACE naming ``package`` removed."""
-    marker = f";;;{package})"
-    result = []
-    index = 0
-    while True:
-        start = sddl.find("(", index)
-        if start < 0:
-            result.append(sddl[index:])
-            return "".join(result)
-        result.append(sddl[index:start])
-        end = sddl.find(")", start)
-        if end < 0:
-            result.append(sddl[start:])
-            return "".join(result)
-        ace = sddl[start:end + 1]
-        if not ace.endswith(marker):
-            result.append(ace)
-        index = end + 1
+    """Remove explicit basic allows for Loki's profile, never deny ACEs.
+
+    An inherited allow must be changed at its source. Refuse rather than
+    disabling inheritance or claiming to revoke a right the parent still gives.
+    """
+    header, aces = _dacl_parts(sddl)
+    kept = []
+    for ace in aces:
+        kind, flags, _rights, _object, _inherited_object, sid = ace[1:-1].split(';')
+        if sid == package and kind != 'D':
+            if kind != 'A' or 'ID' in flags:
+                raise windows_api.WindowsApiError(
+                    "cannot edit inherited or non-basic package grants")
+            continue
+        kept.append(ace)
+    return header + ''.join(kept)
 
 
 def grants_package(sddl: str, package: str) -> bool:
@@ -297,7 +309,7 @@ def build_plan(definition: Definition, previous: dict | None) -> Plan:
     errors: list[str] = []
     warnings: list[str] = []
     for grant in definition.grants:
-        errors.extend(protected_path_errors(grant.path))
+        errors.extend(protected_path_errors(grant.path, grant.access))
         if grant.origin == "user":
             warnings.extend(covered_secret_warnings(grant.path))
 

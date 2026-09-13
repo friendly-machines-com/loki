@@ -109,65 +109,77 @@ class WindowsBackend:
         os.makedirs(path, exist_ok=True)
         windows_containers.set_dacl_sddl(path, private_dacl_sddl(user))
 
+    def _record_entry(self, key, entry):
+        workspaces = dict(self.ledger.get("workspaces", {}))
+        if entry is None:
+            workspaces.pop(key, None)
+        else:
+            workspaces[key] = entry
+        updated = {**self.ledger, "workspaces": workspaces}
+        save_ledger(updated, self.ledger_location)
+        self.ledger.clear()
+        self.ledger.update(updated)
+
     # -- Backend --
     def apply(self, plan: Plan, definition: Definition) -> list[Check]:
+        key = workspace_key(definition.workspace)
+        previous = self.ledger.get("workspaces", {}).get(key)
+        checked_plan = build_plan(definition, previous)
+        if not checked_plan.applicable or plan.profile != checked_plan.profile:
+            return [Check("plan", "fail", "; ".join(checked_plan.errors)
+                          or "profile does not match workspace")]
         checks: list[Check] = []
-        user = windows_api.current_user_sid()
-        self._private_directory(paths.credential_directory(), user)
-        self._private_directory(paths.loki_config_dir(), user)
-        self._private_directory(paths.loki_state_dir(), user)
         try:
-            package = self._ensure_profile(plan.profile)
-        except windows_api.WindowsApiError as error:
-            # Without a profile there is nothing to grant to; stop rather than
-            # record grants that name a SID we could not establish.
-            return checks + [Check("profile", "fail", str(error))]
-        checks.append(Check("profile", "pass", package))
-        for grant in definition.grants:
-            self._grant_path(grant.path, grant.access, package)
-            checks.append(Check(f"grant {grant.path}", "pass",
-                                grant.access.value))
-        entry = ledger_entry(definition.workspace, plan.profile,
-                             definition.grants)
-        self.ledger.setdefault("workspaces", {})[
-            workspace_key(definition.workspace)] = entry
-        save_ledger(self.ledger, self.ledger_location)
-        checks.append(Check("ledger", "pass", ledger_path()))
-        return checks
+            user = windows_api.current_user_sid()
+            self._private_directory(paths.credential_directory(), user)
+            self._private_directory(paths.loki_config_dir(), user)
+            self._private_directory(paths.loki_state_dir(), user)
+            # Persist recovery coverage BEFORE changing any grant. On a failed
+            # or interrupted apply, every old/new path remains recorded, and
+            # the startup gate refuses the pending entry. This is not a rollback
+            # or a claim of power-loss durability.
+            recovery = {workspace_key(g.path): g for g in entry_grants(previous or {})}
+            recovery.update({workspace_key(g.path): g for g in definition.grants})
+            pending = ledger_entry(definition.workspace, checked_plan.profile,
+                                   list(recovery.values()))
+            pending["pending"] = True
+            self._record_entry(key, pending)
+            package = self._ensure_profile(checked_plan.profile)
+            checks.append(Check("profile", "pass", package))
+            for change in checked_plan.changes:
+                if change.kind == "remove":
+                    self._ungrant_path(change.path, package)
+                    checks.append(Check(f"ungrant {change.path}", "pass"))
+            for grant in definition.grants:
+                self._grant_path(grant.path, grant.access, package)
+                checks.append(Check(f"grant {grant.path}", "pass", grant.access.value))
+            self._record_entry(key, ledger_entry(
+                definition.workspace, checked_plan.profile, definition.grants))
+        except (windows_api.WindowsApiError, OSError, ValueError) as error:
+            return checks + [Check("apply", "fail", str(error))]
+        return checks + [Check("ledger", "pass", ledger_path())]
 
     def verify(self, definition: Definition) -> list[Check]:
-        # One implementation for both sides, so the editor's Verify button
-        # and the chat's start-up check cannot drift apart.
-        return windows_verify.verify_container(definition.workspace,
-                                               definition.grants)
+        return windows_verify.verify_workspace(self.ledger, definition.workspace)
 
     def uninstall(self, blob: dict) -> list[Check]:
         checks: list[Check] = []
-        for key, entry in sorted(blob.get("workspaces", {}).items()):
+        for key, entry in sorted(list(blob.get("workspaces", {}).items())):
             profile = str(entry.get("profile", ""))
             try:
+                # Revocation is retryable. Keep all paths until every removal
+                # and profile deletion succeeds; a failed attempt is not an
+                # empty/successful installation.
+                self._record_entry(key, {**entry, "pending": True})
                 package = windows_api.derive_app_container_sid(profile)
-            except windows_api.WindowsApiError as error:
-                checks.append(Check(f"profile {key}", "fail", str(error)))
-                package = None
-            if package is not None:
                 for grant in entry_grants(entry):
-                    try:
-                        self._ungrant_path(grant.path, package)
-                        checks.append(Check(f"ungrant {grant.path}", "pass"))
-                    except (windows_api.WindowsApiError, OSError) as error:
-                        checks.append(Check(f"ungrant {grant.path}", "fail",
-                                            str(error)))
-                try:
-                    windows_containers.delete_app_container_profile(profile)
-                    checks.append(Check(f"profile {profile}", "pass",
-                                        "deleted"))
-                except windows_api.WindowsApiError as error:
-                    checks.append(Check(f"profile {profile}", "fail",
-                                        str(error)))
-        blob["workspaces"] = {}
-        save_ledger(blob, self.ledger_location)
-        checks.append(Check("ledger", "pass", "cleared"))
+                    self._ungrant_path(grant.path, package)
+                    checks.append(Check(f"ungrant {grant.path}", "pass"))
+                windows_containers.delete_app_container_profile(profile)
+                self._record_entry(key, None)
+                checks.append(Check(f"profile {profile}", "pass", "removed"))
+            except (windows_api.WindowsApiError, OSError, ValueError) as error:
+                checks.append(Check(f"uninstall {key}", "fail", str(error)))
         return checks
 
 
@@ -219,13 +231,10 @@ def access_label(access: Access) -> str:
 
 
 def automatic_grants(workspace: str) -> list[Grant]:
-    """The grants Loki shares for itself, shown but not editable.
+    """Workspace read-write and toolchain read access, shown as automatic rows.
 
-    Temporary files are not a grant: ``TEMP``/``TMP`` point inside the
-    workspace, which is already granted read-write.  A scratch directory of our
-    own was considered and rejected -- anything under the configuration tree
-    would put a package ACE inside the tree that holds ``credentials`` and make
-    it traversable, which is the same mistake the toolchain placement avoids.
+    This function does not configure TEMP/TMP. Runtime scratch placement is a
+    separate launcher responsibility; private configuration trees stay denied.
     """
     toolchain = os.path.dirname(os.path.abspath(sys.executable))
     return [
@@ -237,7 +246,8 @@ def automatic_grants(workspace: str) -> list[Grant]:
 def definition_for(workspace: str, previous: dict | None) -> Definition:
     """Build the definition to edit: automatic grants plus recorded user ones."""
     grants = automatic_grants(workspace)
-    grants.extend(entry_grants(previous or {}))
+    grants.extend(grant for grant in entry_grants(previous or {})
+                  if grant.origin == "user")
     return Definition(workspace, grants)
 
 
@@ -316,7 +326,11 @@ class EditorModel:
         return describe_plan(self.plan())
 
     def apply(self) -> list[Check]:
-        return self.backend.apply(self.plan(), self.definition)
+        checks = self.backend.apply(self.plan(), self.definition)
+        if checks and all(check.status == "pass" for check in checks):
+            self.previous = self.ledger.get("workspaces", {}).get(self.key)
+            self._saved = list(self.definition.grants)
+        return checks
 
     def verify(self) -> list[Check]:
         return self.backend.verify(self.definition)
@@ -396,8 +410,7 @@ class Editor:
         self.listing.pack(side="left", fill="both", expand=True)
         tk.Label(self.root, anchor="w", justify="left", fg="#444444", text=(
             "Automatically shared: this workspace (read and write) and Loki's "
-            "toolchain (read). Temporary files go inside the workspace, which "
-            "is already shared.\n"
+            "toolchain (read).\n"
             f"Always protected and never grantable: "
             f"{paths.credential_directory()}")).pack(
                 fill="x", padx=8, pady=(4, 8))
@@ -497,6 +510,7 @@ class Editor:
         """Apply the pending plan; False when refused or declined."""
         plan = self.model.plan()
         if not plan.applicable:
+            self.status = 1
             self.messagebox.showerror(
                 "Refused", "Loki never grants these paths:\n\n" +
                 "\n".join(f"  * {error}" for error in plan.errors))
@@ -505,7 +519,12 @@ class Editor:
                 "Apply",
                 f"{plan.workspace}\n\n{self.model.describe()}\n\nApply?"):
             return False
-        self.messagebox.showinfo("Applied", _check_text(self.model.apply()))
+        checks = self.model.apply()
+        if not checks or any(check.status != "pass" for check in checks):
+            self.status = 1
+            self.messagebox.showerror("Apply failed", _check_text(checks))
+            return False
+        self.messagebox.showinfo("Applied", _check_text(checks))
         self.status = 0
         return True
 
@@ -519,8 +538,12 @@ class Editor:
         if not self.messagebox.askokcancel(
                 UNINSTALL_TITLE, UNINSTALL_MESSAGE, icon="warning"):
             return
-        self.messagebox.showinfo("Uninstalled",
-                                 _check_text(self.model.uninstall()))
+        checks = self.model.uninstall()
+        self.status = 1  # No configured workspace to start after uninstall.
+        if any(check.status != "pass" for check in checks):
+            self.messagebox.showerror("Uninstall incomplete", _check_text(checks))
+        else:
+            self.messagebox.showinfo("Uninstalled", _check_text(checks))
 
 
 def run_editor(workspace: str, ledger: dict, backend: Backend) -> int:
@@ -567,9 +590,10 @@ def main(argv: list[str] | None = None) -> int:
         return list_workspaces(ledger)
     backend = backend_for(ledger)
     if mode == "--uninstall":
-        for check in backend.uninstall(ledger):
+        checks = backend.uninstall(ledger)
+        for check in checks:
             print(f"{check.status}: {check.name} {check.detail}".rstrip())
-        return 0
+        return 1 if any(check.status != "pass" for check in checks) else 0
     if mode == "--verify":
         if not rest:
             print("loki-setup: --verify needs a workspace", file=sys.stderr)

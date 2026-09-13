@@ -28,7 +28,11 @@ from .windows_state import (
 
 def verify_workspace(ledger: dict, workspace: str) -> list[Check]:
     """Verify the container recorded for ``workspace``, changing nothing."""
-    entry = ledger.get("workspaces", {}).get(workspace_key(workspace), {})
+    entry = ledger.get("workspaces", {}).get(workspace_key(workspace))
+    if not isinstance(entry, dict):
+        return [Check("ledger", "fail", "workspace is not configured")]
+    if entry.get("pending"):
+        return [Check("ledger", "fail", "setup or uninstall is incomplete; retry setup")]
     return verify_container(workspace, entry_grants(entry))
 
 
