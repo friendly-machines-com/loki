@@ -1663,7 +1663,9 @@ class JobManager:
         job.pid = proc.pid
         try:
             job.pgid = os.getpgid(proc.pid)
-        except OSError:
+        except (AttributeError, OSError):
+            # os.getpgid is Unix-only; on Windows the pid is the closest
+            # available identity for the process.
             job.pgid = proc.pid
         job.status = "running"
         self.jobs[job.id] = job
