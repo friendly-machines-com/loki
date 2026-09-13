@@ -43,7 +43,19 @@ RESTORE_METHODS = (
     "session/resume",
 )
 
-WORKER_COMMAND = [sys.argv[0], "--worker"]
+
+def worker_command() -> list[str]:
+    """The command that starts this program again as a worker.
+
+    ``sys.executable`` is the image: the bootloader in a frozen build, and the
+    interpreter for a source script, which is then handed its own launcher as
+    an absolute path.  ``sys.argv[0]`` is only the name the caller typed --
+    possibly relative, possibly a symlink -- and must not be used as an
+    executable.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--worker"]
+    return [sys.executable, os.path.abspath(sys.argv[0]), "--worker"]
 
 
 class WorkerChannel:
@@ -492,7 +504,7 @@ class Front:
             process = None
             try:
                 process = await asyncio.create_subprocess_exec(
-                    *WORKER_COMMAND,
+                    *worker_command(),
                     *delegation.child_arguments(),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
