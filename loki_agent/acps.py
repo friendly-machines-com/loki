@@ -131,11 +131,29 @@ class AsyncFdLineReader:
             line = self._take_line()
             if line is not None:
                 return line
-            chunk = await self._chunks.get()
+            try:
+                chunk = await self._chunks.get()
+            except BaseException:
+                # Cancelled or failed.  The thread and its stop-event handle
+                # belong to this reader, and nothing else will release them.
+                self.aclose()
+                raise
             if chunk:
                 self._buffer.extend(chunk)
             else:
                 self._eof = True
+
+    def aclose(self) -> None:
+        """Release the reader thread, if one was started.
+
+        Called when the stream ends and when a read is cancelled.  Idempotent:
+        the next ``readline`` starts a fresh thread, so a caller that cancels
+        one read and continues is still correct.
+        """
+        if self._threaded is not None:
+            self._threaded.stop()
+            self._threaded = None
+            self._chunks = None
 
     def __aiter__(self):
         return self
@@ -143,6 +161,7 @@ class AsyncFdLineReader:
     async def __anext__(self):
         line = await self.readline()
         if not line:
+            self.aclose()
             raise StopAsyncIteration
         return line
 
