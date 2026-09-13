@@ -1391,6 +1391,8 @@ class Job:
     status: str = "starting"
     exit_code: int | None = None
     signal: int | None = None
+    # Why the job never ran or why Loki ended it, when that is a failure.
+    error: str | None = None
     finished_at: float | None = None
     finished_at_iso: str | None = None
     timeout_ms: int | None = None
@@ -1424,7 +1426,7 @@ class JobManager:
         self._counter = 0
         self._active_subagents = 0
 
-    def _reserve_subagent_slot(self):
+    def _reserve_subagent_slot(self, job: Job):
         # This check-and-increment contains no await and JobManager belongs to
         # one event loop, so concurrent tasks cannot overbook the limit.
         if self._active_subagents >= MAX_ACTIVE_DIRECT_SUBAGENTS:
@@ -1432,6 +1434,10 @@ class JobManager:
                 "maximum active direct subagents reached "
                 f"({MAX_ACTIVE_DIRECT_SUBAGENTS})")
         self._active_subagents += 1
+        # The flag means "this job holds a slot", not "this is a subagent job":
+        # the release path keys off it, and a job is registered before its slot
+        # is reserved, so a refusal must not look like something to release.
+        job.subagent_slot = True
 
     def _release_subagent_slot(self, job: Job):
         # More than one observer can notice an exit. Ownership moves off the
@@ -1461,6 +1467,7 @@ class JobManager:
             "status": job.status,
             "exit_code": job.exit_code,
             "signal": job.signal,
+            "error": job.error,
             "started_at": job.started_at_iso,
             "finished_at": job.finished_at_iso,
             "timeout_ms": job.timeout_ms,
@@ -1502,30 +1509,44 @@ class JobManager:
             if job.credential_capability is capability:
                 job.credential_capability = None
 
-    def _record_exit(self, job: Job, exit_code: int):
-        # Status records why Loki ended the job; exit_code/signal record
-        # how the child process actually terminated.
-        job.signal = -exit_code if exit_code < 0 else None
-        if job.status in [
-                "cancelled", "timed_out", "stopped", "owner_closed"]:
-            # Preserve the user-visible reason even after wait() reports the
-            # eventual process exit code.
-            pass
-        elif job.status == "owner_closing":
-            job.status = "owner_closed"
-        elif job.status == "stopping":
-            job.status = "stopped"
-        elif exit_code < 0:
-            job.status = "signaled"
-        else:
-            job.status = "exited"
-        job.exit_code = exit_code
+    def _finalize_job(self, job: Job, status: str, error: str | None = None):
+        """Bring a job to a recorded state, whichever path it took.
+
+        Every exit from ``_spawn`` after the job exists comes through here, so a
+        launch that never happened is still a job a caller can observe instead
+        of an exception with no trace.  It is the only place that releases the
+        subagent reservation, which is what keeps that release exactly once.
+        """
+        job.status = status
+        if error is not None:
+            job.error = error
         job.finished_at = time.time()
         job.finished_at_iso = _now_iso()
         self._close_owner_signal(job)
         self._revoke_credential_capability(job)
         self._release_subagent_slot(job)
         self._write_metadata(job)
+
+    def _record_exit(self, job: Job, exit_code: int):
+        # Status records why Loki ended the job; exit_code/signal record
+        # how the child process actually terminated.
+        job.signal = -exit_code if exit_code < 0 else None
+        job.exit_code = exit_code
+        if job.status in [
+                "cancelled", "timed_out", "stopped", "owner_closed",
+                "failed"]:
+            # Preserve the user-visible reason even after wait() reports the
+            # eventual process exit code.
+            status = job.status
+        elif job.status == "owner_closing":
+            status = "owner_closed"
+        elif job.status == "stopping":
+            status = "stopped"
+        elif exit_code < 0:
+            status = "signaled"
+        else:
+            status = "exited"
+        self._finalize_job(job, status)
 
     def _refresh_job(self, job: Job):
         if job.status not in ["running", "stopping"]:
@@ -1568,13 +1589,13 @@ class JobManager:
             started_at_iso=_now_iso(),
             timeout_ms=timeout_ms,
             session_owned=session_owned,
-            subagent_slot=subagent,
         )
-        if subagent:
-            # Reserve immediately before the first operation which can yield
-            # to another event-loop task. Directory/setup failures above have
-            # not launched anything and therefore consume no slot.
-            self._reserve_subagent_slot()
+        # Registered before the first step that can fail.  A job that never
+        # launches is then a recorded failure rather than a missing record, so
+        # anything watching self.jobs sees an outcome instead of waiting for
+        # one; see _finalize_job.  It may be observed in "starting" briefly,
+        # before the launch resolves to "running" or "failed".
+        self.jobs[job.id] = job
 
         # Helper to unblock inherited signal masks in the child process context
         def unblock_child_signals():
@@ -1588,6 +1609,11 @@ class JobManager:
         spawn_command = command
         proc = None
         try:
+            if subagent:
+                # Reserved inside the failure boundary, immediately before the
+                # first operation that can yield to another task: a refusal
+                # here is a recorded failed job, not one stuck in "starting".
+                self._reserve_subagent_slot(job)
             # Descriptor acquisition belongs inside the same cleanup boundary
             # as process creation. A failed relay setup must not leave either
             # end of the already-created owner pipe live.
@@ -1642,10 +1668,23 @@ class JobManager:
                         cwd=cwd or current_cwd(),
                         preexec_fn=unblock_child_signals,
                     )
-        except BaseException:
-            # No Job has escaped to a reaper yet, so the launch attempt still
-            # owns the reservation.
-            self._release_subagent_slot(job)
+        except BaseException as error:
+            # Nothing has escaped to a reaper yet, and the job is already
+            # registered, so this records the outcome and releases the
+            # reservation (exactly once, in the finalizer) before re-raising.
+            if isinstance(error, asyncio.CancelledError):
+                # Cancelled before it started is a cancellation, not a failure.
+                self._finalize_job(job, "cancelled")
+            else:
+                self._finalize_job(
+                    job, "failed", f"{type(error).__name__}: {error}")
+                try:
+                    with open(job.stderr_path, 'ab') as stderr_file:
+                        stderr_file.write(
+                            f"\n[launch failed: {type(error).__name__}: "
+                            f"{error}]\n".encode('utf-8'))
+                except OSError:
+                    pass
             raise
         finally:
             if owner_read_fd is not None:
@@ -1668,7 +1707,6 @@ class JobManager:
             # available identity for the process.
             job.pgid = proc.pid
         job.status = "running"
-        self.jobs[job.id] = job
         self._write_metadata(job)
         return job
 
