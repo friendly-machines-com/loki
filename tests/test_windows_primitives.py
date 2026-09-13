@@ -631,6 +631,16 @@ class WindowsPrimitiveTests(unittest.TestCase):
         return process
 
     def test_environment_and_owner_observations(self):
+        import socket
+        # Recorded, not asserted: CPython gates AF_UNIX on HAVE_SYS_UN_H, which
+        # no MSVC pyconfig.h defines, but a mingw/MSYS2 interpreter is built
+        # with configure and its toolchain decides.  A transport that works on
+        # one Windows python and not the other is worse than none, so the
+        # answer has to come from each interpreter actually running.
+        print(json.dumps({
+            'interpreter': sys.executable,
+            'af_unix': hasattr(socket, 'AF_UNIX'),
+        }), flush=True)
         directory = self.root / 'private'
         directory.mkdir(mode=0o700)
         handle = self.handle(directory, access=READ_CONTROL, flags=BACKUP)
