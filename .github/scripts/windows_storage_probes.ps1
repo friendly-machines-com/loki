@@ -159,8 +159,9 @@ try {
         # the boundary test enforces that.
         $gate = Join-Path $root 'loki_agent'
         New-Item -ItemType Directory -Path $gate | Out-Null
-        foreach ($module in @('__init__.py', 'windows_api.py', 'paths.py',
-                              'windows_state.py', 'windows_verify.py')) {
+        foreach ($module in @('__init__.py', 'windows_api.py', 'windows_acl.py',
+                              'paths.py', 'windows_state.py',
+                              'windows_verify.py')) {
             $copy = Join-Path $gate $module
             Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "loki_agent/$module") -Destination $copy
             & "$env:SystemRoot/System32/icacls.exe" $copy /reset /Q
