@@ -99,7 +99,7 @@ class WindowsBackend:
         updated = add_package_ace(current, package, access)
         # Do not rewrite a DACL this edit did not change.  The write is the
         # expensive part (inherited ACEs propagate), and setup is re-runnable:
-        # re-applying an existing configuration must not re-touch the toolchain
+        # re-applying an existing configuration must not re-touch the runtime
         # tree.  Same rule as _ungrant_path below.
         if updated != current:
             windows_containers.set_dacl_sddl(path, updated)
@@ -240,15 +240,28 @@ def access_label(access: Access) -> str:
 
 
 def automatic_grants(workspace: str) -> list[Grant]:
-    """Workspace read-write and toolchain read access, shown as automatic rows.
+    """Workspace read-write and runtime read access, shown as automatic rows.
 
     This function does not configure TEMP/TMP. Runtime scratch placement is a
     separate launcher responsibility; private configuration trees stay denied.
     """
-    toolchain = os.path.dirname(os.path.abspath(sys.executable))
+    # The extracted release bundle:
+    #
+    #   <release>/
+    #   |- loki/         loki.exe       + _internal/
+    #   |- loki-acp/     loki-acp.exe   + _internal/
+    #   '- loki-setup/   loki-setup.exe + _internal/   <- this process
+    #
+    # The contained model runs the two runtimes, so both of their bundles are
+    # granted read.  This process's own bundle is deliberately not granted:
+    # the model must never reach the executable that writes profiles and ACLs.
+    setup_bundle = os.path.dirname(sys.executable)
+    release_bundle = os.path.dirname(setup_bundle)
+    runtimes = [os.path.join(release_bundle, name)
+                for name in ("loki", "loki-acp")]
     return [
         Grant(workspace, Access.READ_WRITE, "workspace"),
-        Grant(toolchain, Access.READ, "toolchain"),
+        *(Grant(runtime, Access.READ, "runtime") for runtime in runtimes),
     ]
 
 
@@ -418,8 +431,8 @@ class Editor:
         scrollbar.pack(side="right", fill="y")
         self.listing.pack(side="left", fill="both", expand=True)
         tk.Label(self.root, anchor="w", justify="left", fg="#444444", text=(
-            "Automatically shared: this workspace (read and write) and Loki's "
-            "toolchain (read).\n"
+            "Automatically shared: this workspace (read and write) and the "
+            "Loki runtime bundles (read).\n"
             f"Always protected and never grantable: "
             f"{paths.credential_directory()}")).pack(
                 fill="x", padx=8, pady=(4, 8))

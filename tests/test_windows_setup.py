@@ -388,15 +388,17 @@ class PlanTests(unittest.TestCase):
 
 
 class AutomaticGrantTests(unittest.TestCase):
-    def test_automatic_grants_are_the_workspace_and_toolchain(self):
+    def test_automatic_grants_are_the_workspace_and_the_runtimes(self):
         grants = windows_setup.automatic_grants("/work")
 
-        by_origin = {grant.origin: grant for grant in grants}
-        self.assertEqual(sorted(by_origin), ["toolchain", "workspace"])
-        self.assertEqual(by_origin["workspace"].access,
+        by_origin = {}
+        for grant in grants:
+            by_origin.setdefault(grant.origin, []).append(grant)
+        self.assertEqual(sorted(by_origin), ["runtime", "workspace"])
+        self.assertEqual(by_origin["workspace"][0].access,
                          windows_setup.Access.READ_WRITE)
-        self.assertEqual(by_origin["toolchain"].access,
-                         windows_setup.Access.READ)
+        for grant in by_origin["runtime"]:
+            self.assertEqual(grant.access, windows_setup.Access.READ)
         # No scratch grant: TEMP points inside the workspace, and a directory of
         # our own under the configuration tree would put a package ACE beside
         # the credential directory.
@@ -497,7 +499,7 @@ class ConfigureCommandTests(unittest.TestCase):
         _plan, definition = backend.applied[0]
         self.assertEqual(definition.workspace, "/work")
         self.assertEqual([grant.origin for grant in definition.grants],
-                         ["workspace", "toolchain"])
+                         ["workspace", "runtime", "runtime"])
 
     def test_a_failing_check_is_a_nonzero_exit(self):
         class Failing(FakeBackend):
@@ -572,7 +574,7 @@ class EditorModelTests(unittest.TestCase):
 
         self.assertIn("read: /extra", rows)
         self.assertTrue(any("[workspace]" in row for row in rows))
-        self.assertTrue(any("[toolchain]" in row for row in rows))
+        self.assertTrue(any("[runtime]" in row for row in rows))
 
     def test_user_rows_are_editable_and_automatic_rows_are_not(self):
         model = self.model(self.user_ledger())
