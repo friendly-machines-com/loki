@@ -49,6 +49,10 @@ jobs:
       run: |
         # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # flake8's default filename pattern only matches *.py, so "flake8 ."
+        # skips the extensionless console launchers; name them explicitly or a
+        # syntax error in one of them passes CI unnoticed.
+        flake8 loki-setup loki-acp --count --select=E9,F63,F7,F82 --show-source --statistics
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Check for dead code with vulture
@@ -174,6 +178,9 @@ jobs:
         python -m PyInstaller --noconfirm --clean --onedir --console --name loki loki.py
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         python -m PyInstaller --noconfirm --clean --onedir --console --name loki-acp loki-acp
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # Separate build via its spec: only the setup editor bundles tcl/tk.
+        python -m PyInstaller --noconfirm --clean loki-setup.spec
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Create portable ZIP
       run: |
