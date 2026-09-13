@@ -71,10 +71,10 @@ if sys.platform == "win32":
             executable, "--runtime", *delegation.child_arguments(),
             "--", *arguments,
         ]
+        inherited = [*host_ipc.handles(delegation.owner_child),
+                     *host_ipc.handles(delegation.credential_child)]
         return windows_runtime.launch(
-            executable, command[1:], environment, workspace,
-            [host_ipc.reference(delegation.owner_child),
-             host_ipc.reference(delegation.credential_child)])
+            executable, command[1:], environment, workspace, inherited)
 
     def close_runtime_process(process) -> None:
         process.close()

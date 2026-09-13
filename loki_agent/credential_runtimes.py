@@ -14,7 +14,7 @@ import contextlib
 import os
 import socket
 
-from . import acps, credential_capabilities
+from . import acps, credential_capabilities, host_ipc
 from .credentials import CredentialInventory
 
 
@@ -29,10 +29,18 @@ class SessionOwner:
     def __init__(self, owner):
         self.fd = None
         self.socket = None
+        self.endpoint = None
         if isinstance(owner, socket.socket):
             self.socket = owner
             self.closed_task = asyncio.create_task(
                 self._read_until_closed(owner),
+                name="loki-session-owner",
+            )
+        elif host_ipc.is_endpoint(owner):
+            # Windows anonymous-pipe read end; EOF is the owner's close.
+            self.endpoint = owner
+            self.closed_task = asyncio.create_task(
+                host_ipc.watch_closed(owner),
                 name="loki-session-owner",
             )
         else:
@@ -63,6 +71,8 @@ class SessionOwner:
         with contextlib.suppress(OSError):
             if self.socket is not None:
                 self.socket.close()
+            elif self.endpoint is not None:
+                host_ipc.close_end(self.endpoint)
             elif self.fd is not None:
                 os.close(self.fd)
 

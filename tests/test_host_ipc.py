@@ -1,11 +1,13 @@
-"""Tests for the IPC seam's POSIX contract.
+"""Tests for the IPC seam's POSIX contract and its Windows endpoint types.
 
-The Windows branch is AF_UNIX built by hand and cannot even be imported here
-(it binds a socket path and uses ``subprocess.STARTUPINFO``), so what is checked
-is the half that runs on this host: a connected pair, a channel whose close is
-EOF, and the reference/spawn/validation contract the child depends on.
+The Windows channel is now two anonymous pipes (AF_UNIX is unreachable through
+CPython), and its endpoint/encoder/stream classes depend only on import-safe
+declarations, so they are exercised here on Linux with the Windows calls
+mocked.  The POSIX half runs for real: a connected pair, a channel whose close
+is EOF, and the reference/spawn/validation contract the child depends on.
 """
 
+import asyncio
 import os
 import socket
 import unittest
@@ -146,6 +148,113 @@ class ReferenceTests(unittest.TestCase):
     def test_a_descriptor_that_was_not_inherited_is_rejected(self):
         with self.assertRaises(ValueError):
             host_ipc.child_endpoint("1")
+
+
+class PipeEndpointTests(unittest.TestCase):
+    """The Windows endpoint is the only thing that crosses to a child."""
+
+    def test_reference_round_trips_both_directions(self):
+        endpoint = host_ipc.PipeEndpoint(read=0x11, write=0x22)
+        self.assertEqual(endpoint.handles(), (0x11, 0x22))
+        self.assertEqual(endpoint.reference(), "r=17,w=34")
+        rebuilt = host_ipc.PipeEndpoint.parse("r=17,w=34")
+        self.assertEqual(rebuilt.handles(), (0x11, 0x22))
+
+    def test_a_unidirectional_endpoint_round_trips(self):
+        endpoint = host_ipc.PipeEndpoint(read=0x5)
+        self.assertEqual(endpoint.handles(), (0x5,))
+        self.assertEqual(host_ipc.PipeEndpoint.parse("r=5").read, 0x5)
+
+    def test_malformed_references_are_refused(self):
+        for value in ("", "5", "r=", "r=0", "x=5", "r=1,r=2", "r=1,w=2,z=3"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    host_ipc.PipeEndpoint.parse(value)
+
+    def test_close_releases_every_handle(self):
+        closed = []
+        with mock.patch.object(host_ipc.windows_api, "close_handle",
+                               side_effect=closed.append):
+            host_ipc.PipeEndpoint(read=1, write=2).close()
+        self.assertEqual(closed, [1, 2])
+
+    def test_is_endpoint_distinguishes_windows_endpoints(self):
+        self.assertTrue(host_ipc.is_endpoint(host_ipc.PipeEndpoint(read=1)))
+        self.assertFalse(host_ipc.is_endpoint(3))
+        self.assertFalse(host_ipc.is_endpoint(None))
+
+    def test_a_descriptor_reports_one_handle(self):
+        # POSIX path: spawn_kwargs flattens this to pass_fds.
+        self.assertEqual(host_ipc.handles(4), (4,))
+
+
+class HandleWriterTests(unittest.IsolatedAsyncioTestCase):
+    """The writer thread keeps a blocking WriteFile off the event loop."""
+
+    async def test_writes_are_flushed_in_order(self):
+        written = []
+
+        def write_file(handle, data):
+            written.append((handle, bytes(data)))
+            return len(data)
+
+        with mock.patch.object(host_ipc.windows_api, "write_file",
+                               side_effect=write_file):
+            writer = host_ipc._HandleWriter(0xAA, asyncio.get_running_loop())
+            writer.start()
+            try:
+                writer.write(b"one")
+                writer.write(b"two")
+                await writer.drain()
+            finally:
+                writer.stop_and_join()
+
+        self.assertEqual(written, [(0xAA, b"one"), (0xAA, b"two")])
+
+    async def test_short_writes_are_completed(self):
+        written = bytearray()
+
+        def write_file(handle, data):
+            piece = bytes(data)[:2]
+            written.extend(piece)
+            return len(piece)
+
+        with mock.patch.object(host_ipc.windows_api, "write_file",
+                               side_effect=write_file):
+            writer = host_ipc._HandleWriter(1, asyncio.get_running_loop())
+            writer.start()
+            try:
+                writer.write(b"abcdef")
+                await writer.drain()
+            finally:
+                writer.stop_and_join()
+
+        self.assertEqual(bytes(written), b"abcdef")
+
+    async def test_a_write_failure_is_raised_by_drain(self):
+        def write_file(handle, data):
+            raise OSError("pipe closed")
+
+        with mock.patch.object(host_ipc.windows_api, "write_file",
+                               side_effect=write_file):
+            writer = host_ipc._HandleWriter(1, asyncio.get_running_loop())
+            writer.start()
+            try:
+                writer.write(b"data")
+                with self.assertRaises(OSError):
+                    await writer.drain()
+            finally:
+                writer.stop_and_join()
+
+    async def test_drain_of_an_empty_queue_returns(self):
+        with mock.patch.object(host_ipc.windows_api, "write_file") as write:
+            writer = host_ipc._HandleWriter(1, asyncio.get_running_loop())
+            writer.start()
+            try:
+                await writer.drain()
+            finally:
+                writer.stop_and_join()
+        write.assert_not_called()
 
 
 if __name__ == "__main__":
