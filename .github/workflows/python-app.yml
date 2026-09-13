@@ -94,6 +94,13 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         "TEMP=$workspace" | Out-File -FilePath $env:GITHUB_ENV -Append
         "TMP=$workspace" | Out-File -FilePath $env:GITHUB_ENV -Append
+    - name: Trace the launch commands (Windows)
+      # windows_runtime.launch, runtime_isolation.start_runtime and
+      # acp.worker_command log the command they are about to run at DEBUG,
+      # which diagnostics.configure_logging emits only under LOKI_TRACE=1.
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: '"LOKI_TRACE=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
     - name: Test
       run: |
         # tests/run_suite.py writes progress through and dumps every thread's

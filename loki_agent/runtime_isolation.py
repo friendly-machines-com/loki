@@ -16,9 +16,12 @@ locally rather than pushing the condition back into the callers.
 
 from __future__ import annotations
 
+import logging
 import sys
 
 from . import host_ipc
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "RuntimeIsolationError",
@@ -71,6 +74,7 @@ if sys.platform == "win32":
             executable, "--runtime", *delegation.child_arguments(),
             "--", *arguments,
         ]
+        logger.debug("runtime command: %r", command)
         inherited = [*host_ipc.handles(delegation.owner_child),
                      *host_ipc.handles(delegation.credential_child)]
         return windows_runtime.launch(
@@ -105,6 +109,7 @@ else:
             executable, "--runtime", *delegation.child_arguments(),
             "--", *arguments,
         ]
+        logger.debug("runtime command: %r", command)
         return await asyncio.create_subprocess_exec(
             *command, close_fds=True, env=environment,
             **delegation.child_spawn_kwargs())

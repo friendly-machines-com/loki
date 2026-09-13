@@ -8,6 +8,7 @@ preconditions, not arbitrary escape routes or future ACL changes.
 
 import asyncio
 import ctypes
+import logging
 import os
 import sys
 from ctypes import wintypes
@@ -18,6 +19,8 @@ from . import windows_verify
 from .runtime_isolations import RuntimeIsolationError
 
 WORKSPACE_ENV = "LOKI_CONTAINER_WORKSPACE"
+
+logger = logging.getLogger(__name__)
 
 
 def require_checks(checks):
@@ -132,6 +135,11 @@ def launch(executable, arguments, environment, workspace, inherited_handles):
     if not getattr(sys, "frozen", False):
         arguments = [os.path.abspath(executable), *arguments]
     executable = sys.executable
+    logger.debug(
+        "runtime launch: executable=%r arguments=%r sys.argv[0]=%r "
+        "sys.executable=%r frozen=%r",
+        executable, arguments, sys.argv[0], sys.executable,
+        getattr(sys, "frozen", False))
 
     create_job = api.bind("kernel32", "CreateJobObjectW", ctypes.c_void_p,
                           ctypes.c_void_p, wintypes.LPCWSTR)
