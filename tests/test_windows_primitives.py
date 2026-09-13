@@ -86,6 +86,187 @@ SE_FILE_OBJECT = 1
 LABEL_SECURITY_INFORMATION = 0x10
 SYSTEM_MANDATORY_LABEL_ACE_TYPE = 0x11
 
+# Probe-only declarations for the transport/scrub/identity questions.  Kept
+# local because this file is staged without the package.
+GENERIC_WRITE = 0x40000000
+LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+FILE_ID_INFO_CLASS = 18
+FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
+
+class Overlapped(C.Structure):
+    """OVERLAPPED: the offset a LockFileEx range starts at."""
+
+    _fields_ = [('Internal', C.c_size_t), ('InternalHigh', C.c_size_t),
+                ('Offset', ULONG), ('OffsetHigh', ULONG), ('hEvent', HANDLE)]
+
+
+class FileIdInfo(C.Structure):
+    """FILE_ID_INFO: volume serial plus the 128-bit file id."""
+
+    _fields_ = [('VolumeSerialNumber', C.c_ulonglong),
+                ('FileId', C.c_ubyte * 16)]
+
+
+PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+
+
+class Coord(C.Structure):
+    _fields_ = [('x', C.c_int16), ('y', C.c_int16)]
+
+
+class ProbeStartupInfo(C.Structure):
+    _fields_ = [('cb', ULONG), ('reserved', W.LPWSTR), ('desktop', W.LPWSTR),
+                ('title', W.LPWSTR), ('x', ULONG), ('y', ULONG),
+                ('xsize', ULONG), ('ysize', ULONG), ('xchars', ULONG),
+                ('ychars', ULONG), ('fill', ULONG), ('flags', ULONG),
+                ('show', C.c_uint16), ('reserved_size', C.c_uint16),
+                ('reserved_bytes', HANDLE), ('stdin', HANDLE),
+                ('stdout', HANDLE), ('stderr', HANDLE)]
+
+
+class SharedStartupInfo(C.Structure):
+    _fields_ = [('startup', ProbeStartupInfo), ('attributes', HANDLE)]
+
+
+class ProbeProcessInfo(C.Structure):
+    _fields_ = [('process', HANDLE), ('thread', HANDLE),
+                ('pid', ULONG), ('tid', ULONG)]
+
+
+def conpty_probe(root):
+    """Attach a child to a pseudoconsole and record what comes back.
+
+    Decides whether the terminal-attach seam is reachable with the documented
+    synchronous ConPTY calls as a standard user: create the session, launch a
+    child on it, read the child's output through the pipe, and close.
+    """
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    create_pipe = kernel.CreatePipe
+    create_pipe.argtypes = [C.POINTER(HANDLE), C.POINTER(HANDLE), C.c_void_p,
+                            ULONG]
+    create_pipe.restype = W.BOOL
+    create_pseudo = kernel.CreatePseudoConsole
+    create_pseudo.argtypes = [Coord, HANDLE, HANDLE, ULONG, C.POINTER(HANDLE)]
+    create_pseudo.restype = C.c_long
+    close_pseudo = kernel.ClosePseudoConsole
+    close_pseudo.argtypes = [HANDLE]
+    close_pseudo.restype = None
+    initialize = kernel.InitializeProcThreadAttributeList
+    initialize.argtypes = [C.c_void_p, ULONG, ULONG, C.POINTER(C.c_size_t)]
+    initialize.restype = W.BOOL
+    update = kernel.UpdateProcThreadAttribute
+    update.argtypes = [C.c_void_p, ULONG, C.c_size_t, C.c_void_p, C.c_size_t,
+                       C.c_void_p, C.c_void_p]
+    update.restype = W.BOOL
+    delete = kernel.DeleteProcThreadAttributeList
+    delete.argtypes = [C.c_void_p]
+    delete.restype = None
+    create_process = kernel.CreateProcessW
+    create_process.argtypes = [W.LPCWSTR, W.LPWSTR, C.c_void_p, C.c_void_p,
+                               W.BOOL, ULONG, C.c_void_p, W.LPCWSTR,
+                               C.POINTER(ProbeStartupInfo),
+                               C.POINTER(ProbeProcessInfo)]
+    create_process.restype = W.BOOL
+    read_file = kernel.ReadFile
+    read_file.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
+                          C.c_void_p]
+    read_file.restype = W.BOOL
+    peek = kernel.PeekNamedPipe
+    peek.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
+                     C.POINTER(ULONG), C.POINTER(ULONG)]
+    peek.restype = W.BOOL
+
+    def pair():
+        read, write = HANDLE(), HANDLE()
+        if not create_pipe(C.byref(read), C.byref(write), None, 0):
+            raise C.WinError(C.get_last_error())
+        return read, write
+
+    input_read, input_write = pair()
+    output_read, output_write = pair()
+    hpc = HANDLE()
+    record = {'probe': 'conpty'}
+    status = create_pseudo(Coord(80, 24), input_read, output_write, 0,
+                           C.byref(hpc))
+    if status < 0:
+        for handle in (input_read, input_write, output_read, output_write):
+            kernel.CloseHandle(handle)
+        record.update({'created': False, 'hresult': '0x%08x' % (status & 0xffffffff)})
+        print(json.dumps(record), flush=True)
+        return 0
+    record['created'] = True
+    attributes = None
+    process = ProbeProcessInfo()
+    try:
+        size = C.c_size_t()
+        if not initialize(None, 1, 0, C.byref(size)):
+            raise C.WinError(C.get_last_error())
+        storage = C.create_string_buffer(size.value)
+        attributes = C.cast(storage, C.c_void_p)
+        if not initialize(attributes, 1, 0, C.byref(size)):
+            raise C.WinError(C.get_last_error())
+        if not update(attributes, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                      C.cast(hpc, C.c_void_p), C.sizeof(hpc), None, None):
+            raise C.WinError(C.get_last_error())
+        startup = SharedStartupInfo()
+        startup.startup.cb = C.sizeof(SharedStartupInfo)
+        startup.attributes = attributes
+        command = '"%s" /d /c echo conpty-ok' % os.path.join(
+            os.environ.get('SystemRoot', 'C:\\Windows'), 'System32',
+            'cmd.exe')
+        text = C.create_unicode_buffer(command)
+        if not create_process(None, text, None, None, False,
+                              EXTENDED_STARTUPINFO_PRESENT, None, str(root),
+                              C.byref(startup.startup),
+                              C.byref(process)):
+            raise C.WinError(C.get_last_error())
+        # The pseudoconsole keeps its copies; release ours so the channel can
+        # detect a broken pipe when the child exits.
+        kernel.CloseHandle(input_read)
+        kernel.CloseHandle(output_write)
+        output = bytearray()
+        deadline = time.monotonic() + 10
+        available, transferred = ULONG(), ULONG()
+        while time.monotonic() < deadline:
+            if not peek(output_read, None, 0, None, C.byref(available), None):
+                break
+            if available.value:
+                buffer = C.create_string_buffer(available.value)
+                if not read_file(output_read, buffer, available.value,
+                                 C.byref(transferred), None):
+                    break
+                output.extend(buffer.raw[:transferred.value])
+                if b'conpty-ok' in output:
+                    break
+            elif kernel.WaitForSingleObject(process.process, 100) == 0:
+                break
+            else:
+                time.sleep(0.02)
+        record['saw_marker'] = b'conpty-ok' in output
+        record['output'] = output.decode('utf-8', 'replace')
+        kernel.WaitForSingleObject(process.process, 5000)
+        exit_code = ULONG()
+        kernel.GetExitCodeProcess(process.process, C.byref(exit_code))
+        record['exit_code'] = exit_code.value
+    except OSError as error:
+        record['error'] = str(error)
+        record['winerror'] = getattr(error, 'winerror', None)
+    finally:
+        if process.process:
+            kernel.CloseHandle(process.process)
+        if process.thread:
+            kernel.CloseHandle(process.thread)
+        close_pseudo(hpc)
+        if attributes is not None:
+            delete(attributes)
+        kernel.CloseHandle(input_write)
+        kernel.CloseHandle(output_read)
+    print(json.dumps(record), flush=True)
+    return 0 if record.get('saw_marker') else 2
+
 
 def mandatory_label_sid(sacl_address):
     """Return the address of the mandatory-label SID inside a SACL, or None.
@@ -155,6 +336,20 @@ class NativeCalls:
         self.token_info = self.bind(self.advapi, 'GetTokenInformation',
                                     W.BOOL, HANDLE, C.c_int, HANDLE, ULONG,
                                     C.POINTER(ULONG))
+        # Probe additions: environment block, byte-range lock, file identity.
+        self.lock_file = self.bind(
+            self.kernel, 'LockFileEx', W.BOOL, HANDLE, ULONG, ULONG, ULONG,
+            ULONG, C.POINTER(Overlapped))
+        self.unlock_file = self.bind(
+            self.kernel, 'UnlockFileEx', W.BOOL, HANDLE, ULONG, ULONG, ULONG,
+            C.POINTER(Overlapped))
+        self.file_information = self.bind(
+            self.kernel, 'GetFileInformationByHandleEx', W.BOOL, HANDLE,
+            C.c_int, HANDLE, ULONG)
+        self.get_environment = self.bind(
+            self.kernel, 'GetEnvironmentStringsW', C.c_void_p)
+        self.free_environment = self.bind(
+            self.kernel, 'FreeEnvironmentStringsW', W.BOOL, C.c_void_p)
 
     @staticmethod
     def bind(dll, name, result, *args):
@@ -325,6 +520,9 @@ class NativeCalls:
 def child(mode, root, stage=None):
     """Subprocess checkpoints acknowledge completion, not durable storage."""
     root = Path(root)
+
+    if mode == 'conpty':
+        return conpty_probe(root)
 
     if mode == 'second-user-create':
         # Create the credential directory exactly as the storage does: a
@@ -885,6 +1083,139 @@ class WindowsPrimitiveTests(unittest.TestCase):
         os.replace(temporary, target)
         self.assertEqual(target.read_bytes(), b'new')
         self.assertFalse(temporary.exists())
+
+    # -- transport / scrub / identity probes -------------------------------
+    # Each records what Windows actually does; the answer decides whether the
+    # production port needs code or only a test.  Recorded, not asserted,
+    # except where the documented contract is the observation.
+
+    def environment_block(self):
+        pointer = self.native.get_environment()
+        if not pointer:
+            raise C.WinError(C.get_last_error())
+        try:
+            entries, address = [], pointer
+            while True:
+                text = C.wstring_at(address)
+                if not text:
+                    break
+                entries.append(text)
+                address += (len(text) + 1) * C.sizeof(C.c_wchar)
+            return entries
+        finally:
+            self.native.free_environment(pointer)
+
+    def file_identity(self, handle):
+        info = FileIdInfo()
+        self.native.check(self.native.file_information(
+            handle, FILE_ID_INFO_CLASS, C.cast(C.byref(info), HANDLE),
+            C.sizeof(info)))
+        return info.VolumeSerialNumber, bytes(info.FileId)
+
+    def test_credential_environment_block_after_removal(self):
+        # Does removing a variable through os.environ also remove it from the
+        # native block a child would receive, or does the original record
+        # survive as it does in Linux /proc/<pid>/environ?
+        name, value = 'LOKI_SCRUB_PROBE', 'top-secret'
+        os.environ[name] = value
+        self.addCleanup(os.environ.pop, name, None)
+        before = self.environment_block()
+        del os.environ[name]
+        after = self.environment_block()
+        print(json.dumps({
+            'probe': 'environment-block-removal',
+            'before_has_name': any(e.startswith(name + '=') for e in before),
+            'before_has_value': any(e.endswith('=' + value) for e in before),
+            'after_has_name': any(e.startswith(name + '=') for e in after),
+            'after_has_value': any(e.endswith('=' + value) for e in after),
+        }), flush=True)
+
+    def test_lockfileex_contention_reports_the_error(self):
+        # LockFileEx documents FAIL_IMMEDIATELY as "returns immediately" but
+        # names no error; record the actual code rather than assume 33.
+        path = self.root / 'lockfile'
+        path.touch()
+        first = self.handle(path, access=GENERIC_READ | GENERIC_WRITE)
+        second = self.handle(path, access=GENERIC_READ | GENERIC_WRITE)
+        overlapped = Overlapped()
+        self.native.check(self.native.lock_file(
+            first, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0, 1, 0, C.byref(overlapped)))
+        try:
+            result = self.native.lock_file(
+                second, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0, 1, 0, C.byref(overlapped))
+            print(json.dumps({'probe': 'lockfileex-contention',
+                              'succeeded': bool(result),
+                              'winerror': C.get_last_error()}), flush=True)
+        finally:
+            self.native.unlock_file(first, 0, 1, 0, C.byref(overlapped))
+
+    def test_file_identity_survives_rename(self):
+        # FILE_ID_INFO (Windows 8 / Server 2012+): volume serial + 128-bit id
+        # identify an open object across a rename.
+        target = self.root / 'identity'
+        publish = self.root / 'identity-published'
+        target.write_bytes(b'x')
+        handle = self.handle(target, access=GENERIC_READ)
+        before = self.file_identity(handle)
+        os.rename(target, publish)
+        moved = self.handle(publish, access=GENERIC_READ)
+        after = self.file_identity(moved)
+        print(json.dumps({'probe': 'file-id-identity',
+                          'same': before == after,
+                          'volume_serial': before[0],
+                          'file_id': before[1].hex()}), flush=True)
+
+    def test_junction_is_a_reparse_point(self):
+        # Junctions are the unprivileged directory alias; record whether
+        # creation needs elevation and how the alias is typed.
+        real = self.root / 'real'
+        real.mkdir()
+        alias = self.root / 'alias'
+        result = subprocess.run(
+            ['cmd.exe', '/d', '/c', 'mklink', '/J', str(alias), str(real)],
+            capture_output=True, text=True, timeout=15)
+        record = {'probe': 'junction-alias', 'mklink_exit': result.returncode}
+        if alias.exists():
+            stat = os.lstat(alias)
+            record['is_directory'] = os.path.isdir(alias)
+            record['reparse_tag'] = hex(getattr(stat, 'st_reparse_tag', 0))
+            record['has_reparse_attribute'] = bool(
+                stat.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT
+                if hasattr(stat, 'st_file_attributes') else False)
+        print(json.dumps(record), flush=True)
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+
+    def test_pseudoconsole_attaches_a_child(self):
+        # ConPTY: the documented synchronous path must launch a child on the
+        # pseudoconsole and return its output to a standard user.
+        self.run_child('conpty', 'conpty')
+
+    def test_path_resolution_semantics(self):
+        # What Windows resolves for a directory junction, `..`, and identity:
+        # the file_paths expectations have to be written from this, not from
+        # the POSIX kernel behaviour.
+        real = self.root / 'real'
+        (real / 'child').mkdir(parents=True)
+        (real / 'child' / 'file').write_text('x')
+        alias = self.root / 'alias'
+        subprocess.run(
+            ['cmd.exe', '/d', '/c', 'mklink', '/J', str(alias), str(real)],
+            capture_output=True, text=True, timeout=15)
+        record = {'probe': 'path-semantics', 'alias_exists': alias.exists(),
+                  'alias_is_dir': os.path.isdir(alias)}
+        record['realpath_alias'] = os.path.realpath(str(alias))
+        record['dotdot_plain'] = os.path.realpath(str(real / 'child' / '..'))
+        record['dotdot_through_alias'] = os.path.realpath(
+            str(alias / 'child' / '..'))
+        try:
+            record['samefile'] = os.path.samefile(
+                str(alias / 'child' / 'file'), str(real / 'child' / 'file'))
+        except OSError as error:
+            record['samefile_error'] = str(error)
+        print(json.dumps(record), flush=True)
 
 
 if __name__ == '__main__':
