@@ -226,6 +226,42 @@ LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
 STARTUP_CWD = os.getcwd()
 _UMASK = os.umask(0)          # probe: sets umask to 0 momentarily, returns the previous value
 os.umask(_UMASK)             # restore immediately; no concurrent code runs at startup
+
+
+if os.name == "posix":
+    def _apply_destination_permissions(file_path, fd, tmp_path, target_mode):
+        """Set the captured mode through the open descriptor."""
+        fchmod = getattr(os, 'fchmod', None)
+        if fchmod is not None:
+            fchmod(fd, target_mode)
+        else:
+            # This legacy fallback lacks the descriptor branch's protection
+            # against replacement of the temporary directory entry.
+            os.chmod(tmp_path, target_mode)
+else:
+    def _apply_destination_permissions(file_path, fd, tmp_path, target_mode):
+        """Preserve the destination's DACL on the open temporary file.
+
+        Windows has no file modes.  The destination's DACL is captured by name
+        (mirroring the POSIX mode capture) and applied through the descriptor's
+        handle, so a replaced temporary name cannot redirect it to another
+        object.  A destination that does not exist yet keeps the inherited
+        default DACL, which is what a plain create would have given it.
+        """
+        import msvcrt
+
+        from . import windows_api
+        try:
+            sddl = windows_api.dacl_sddl(file_path)
+        except windows_api.WindowsApiError as error:
+            if error.status in (windows_api.ERROR_FILE_NOT_FOUND,
+                                windows_api.ERROR_PATH_NOT_FOUND):
+                # A destination that does not exist yet keeps the inherited
+                # default DACL; any other read failure must not be papered over.
+                return
+            raise
+        if sddl is not None:
+            windows_api.set_handle_dacl(msvcrt.get_osfhandle(fd), sddl)
 LOCAL_LOKI_DIR = os.path.join(STARTUP_CWD, ".loki")
 CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
 JOB_TAIL_CHARS = 20_000
@@ -1268,14 +1304,9 @@ def _atomic_write_text(file_path: str, content: str):
             f.write(content)
             f.flush()
             # os.fsync(f.fileno())
-            # Apply permissions to the still-open inode, after buffered writes.
-            fchmod = getattr(os, 'fchmod', None)
-            if fchmod is not None:
-                fchmod(f.fileno(), target_mode)
-            else:
-                # This legacy fallback lacks the descriptor branch's protection
-                # against replacement of the temporary directory entry.
-                os.chmod(tmp_path, target_mode)
+            # Apply permissions to the still-open temp, after buffered writes.
+            _apply_destination_permissions(
+                file_path, f.fileno(), tmp_path, target_mode)
         os.replace(tmp_path, file_path)
     except Exception:
         try:
