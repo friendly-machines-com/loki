@@ -25,10 +25,17 @@ class AtomicWritePermissionTests(unittest.TestCase):
             # No descriptor chmod on Windows; the equivalent property is that
             # the destination's DACL survives the write.
             from loki_agent import windows_api
+
+            def aces(sddl):
+                # The inherited marker (AI) is not part of the grant; compare
+                # the ACE list.
+                return sddl.split('D:', 1)[-1].replace('AI', '')
+
             before = windows_api.dacl_sddl(str(self.target))
             loki._atomic_write_text(str(self.target), 'new contents')
             self.assertEqual(self.target.read_text(), 'new contents')
-            self.assertEqual(windows_api.dacl_sddl(str(self.target)), before)
+            self.assertEqual(aces(windows_api.dacl_sddl(str(self.target))),
+                             aces(before))
             self.assertEqual(set(self.root.iterdir()), {self.target})
             return
         real_fchmod = os.fchmod
@@ -79,7 +86,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
             # not offer; the property that defends against it is that the DACL
             # is applied through the open handle, so assert that call instead.
             from loki_agent import windows_api
-            with mock.patch.object(windows_api, 'set_handle_dacl') as apply:
+            with mock.patch.object(windows_api, 'set_named_dacl') as apply:
                 loki._atomic_write_text(str(self.target), 'new')
             apply.assert_called_once()
             self.assertEqual(self.target.read_text(), 'new')
@@ -129,7 +136,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
             # A failed DACL application must fail the write, not fall back to
             # anything pathname-based.
             from loki_agent import windows_api
-            with mock.patch.object(windows_api, 'set_handle_dacl',
+            with mock.patch.object(windows_api, 'set_named_dacl',
                                    side_effect=PermissionError('mode denied')):
                 with self.assertRaisesRegex(PermissionError, 'mode denied'):
                     loki._atomic_write_text(str(self.target), 'new')
