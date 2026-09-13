@@ -1,9 +1,10 @@
 """Tests for the spawn/signal seam.
 
-The Windows branch is not exercised here -- it needs a console and a real
-``CTRL_BREAK_EVENT`` -- so these cover the POSIX contract that the seam has to
-keep: a detached session, an unblocked signal mask, a queryable group, and a
-group that actually receives the signal.
+Each platform asserts its own contract: POSIX detaches into a new session and
+signals the group by ``killpg``; Windows gives the child its own process group
+(``CREATE_NEW_PROCESS_GROUP``), identifies the group by its leader pid, and
+stops it by terminating (``FORCE``) or, where a console is shared, by
+``CTRL_BREAK_EVENT``.
 """
 
 import os
@@ -20,6 +21,12 @@ class PosixSpawnTests(unittest.TestCase):
     def test_the_child_is_detached_into_its_own_session(self):
         kwargs = host_process.spawn_kwargs()
 
+        if os.name != "posix":
+            # Windows gives the child its own process group, which is what a
+            # console control event can be addressed to.
+            self.assertEqual(
+                kwargs, {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP})
+            return
         self.assertIs(kwargs["start_new_session"], True)
         self.assertTrue(callable(kwargs["preexec_fn"]))
 
@@ -28,6 +35,11 @@ class ProcessGroupTests(unittest.TestCase):
     def test_a_live_pid_reports_its_process_group(self):
         proc = types.SimpleNamespace(pid=os.getpid())
 
+        if os.name != "posix":
+            # No queryable process-group id; the group is the leader's pid.
+            self.assertEqual(
+                host_process.process_group(proc, os.getpid()), os.getpid())
+            return
         self.assertEqual(
             host_process.process_group(proc, os.getpid()),
             os.getpgid(os.getpid()))
@@ -40,28 +52,37 @@ class ProcessGroupTests(unittest.TestCase):
 
 
 class SignalTests(unittest.TestCase):
-    def test_the_signal_reaches_the_process_group(self):
+    def _running_child(self):
+        kwargs = ({"start_new_session": True} if os.name == "posix"
+                  else host_process.spawn_kwargs())
         proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            start_new_session=True)
+            [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
+        return proc
 
-        host_process.signal_group(
-            proc, host_process.process_group(proc, proc.pid), signal.SIGKILL)
+    def test_the_signal_reaches_the_process_group(self):
+        proc = self._running_child()
+        group = host_process.process_group(proc, proc.pid)
+
+        if os.name != "posix":
+            # No signals; a forced stop terminates the process.
+            host_process.signal_group(proc, group, host_process.FORCE)
+            self.assertEqual(proc.wait(timeout=5), 1)
+            return
+        host_process.signal_group(proc, group, signal.SIGKILL)
 
         self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
 
     def test_a_forced_stop_maps_to_sigkill_without_naming_it(self):
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            start_new_session=True)
-        self.addCleanup(proc.wait)
-        self.addCleanup(proc.kill)
+        proc = self._running_child()
 
         host_process.signal_group(
             proc, host_process.process_group(proc, proc.pid), host_process.FORCE)
 
+        if os.name != "posix":
+            self.assertEqual(proc.wait(timeout=5), 1)
+            return
         self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
 
 
