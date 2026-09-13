@@ -41,17 +41,88 @@ from __future__ import annotations
 
 import contextlib
 import os
+import secrets
 import socket
+
+# A confirmed pair is one whose two ends really are connected to each other.
+# The nonce round-trip cannot fail for a POSIX ``socketpair()``; it exists
+# because the Windows pair is built around a filesystem name, and ``accept``
+# cannot say whose connection it accepted, so a process that wins the
+# bind/connect race would otherwise be handed one end of a foreign connection.
+_PAIR_CONFIRM_BYTES = 32
+_PAIR_CONFIRM_TIMEOUT = 5.0
+
+
+class PairConfirmationError(RuntimeError):
+    """The two channel ends are not two halves of one connection."""
+
+
+def _receive_exactly(end, count: int) -> bytes:
+    received = bytearray()
+    while len(received) < count:
+        chunk = end.recv(count - len(received))
+        if not chunk:
+            raise PairConfirmationError(
+                "a channel end closed before it confirmed the pair")
+        received.extend(chunk)
+    return bytes(received)
+
+
+def confirm_pair(first, second) -> None:
+    """Prove ``first`` and ``second`` are connected to each other.
+
+    One direction suffices: a nonce sent on ``second`` must arrive on
+    ``first``.  If it does not -- because a racing process was accepted in
+    place of our own connect -- the two ends are not a pair, and this closes
+    both and raises rather than letting a mismatched channel be handed to a
+    child.  Both platforms run it: POSIX ``socketpair()`` cannot be
+    substituted, but the contract is the same, and this host is the only place
+    the check itself can be tested.
+    """
+    nonce = secrets.token_bytes(_PAIR_CONFIRM_BYTES)
+    first_timeout = first.gettimeout()
+    second_timeout = second.gettimeout()
+    first.settimeout(_PAIR_CONFIRM_TIMEOUT)
+    second.settimeout(_PAIR_CONFIRM_TIMEOUT)
+    try:
+        second.sendall(nonce)
+        received = _receive_exactly(first, len(nonce))
+        if received != nonce:
+            raise PairConfirmationError(
+                "the channel ends are not connected to each other")
+    except OSError as error:
+        first.close()
+        second.close()
+        raise PairConfirmationError(
+            "the channel ends did not confirm the pair") from error
+    except PairConfirmationError:
+        first.close()
+        second.close()
+        raise
+    finally:
+        # The caller owns both ends afterwards; leave their modes as found.
+        # A closed end accepts no timeout and raises OSError, suppressed here.
+        for end, timeout in ((first, first_timeout), (second, second_timeout)):
+            with contextlib.suppress(OSError):
+                end.settimeout(timeout)
+
 
 if os.name == "posix":
     def owner_channel():
-        """(parent end, child end) for the session-lifetime channel."""
+        """(parent end, child end) for the session-lifetime channel.
+
+        A pipe carries no name, so there is no connection for another process
+        to race; ``confirm_pair`` does not apply to its two unidirectional ends
+        and is not needed.
+        """
         read_fd, write_fd = os.pipe()
         return write_fd, read_fd
 
     def socket_pair():
-        """A connected AF_UNIX pair; the platform has ``socketpair``."""
-        return socket.socketpair()
+        """A connected AF_UNIX pair, confirmed as our own; ``socketpair``."""
+        pair = socket.socketpair()
+        confirm_pair(*pair)
+        return pair
 
     def prepare_child_socket(end):
         """Detach ``end`` so only the child's copy of the descriptor remains."""
@@ -87,22 +158,29 @@ else:
         Microsoft's own documentation implies: bind a path, connect to it,
         accept.  The difference from ``socket.socketpair()`` is what a third
         party can address -- a path in a directory only this user can write,
-        not a port any local process can reach.
+        not a port any local process can reach.  That path exists for the
+        bind/connect/accept instant, so ``accept`` is confirmed against our own
+        connect before either end is returned.
         """
         directory = tempfile.mkdtemp(prefix="loki-ipc-")
         path = os.path.join(directory, "socket")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client = None
+        server = None
         try:
             listener.bind(path)
             listener.listen(1)
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             client.connect(path)
             server, _ = listener.accept()
+            # accept() cannot say whose connection it took, so prove the two
+            # ends are each other's before the name is even removed.
+            confirm_pair(server, client)
         except BaseException:
             listener.close()
-            if client is not None:
-                client.close()
+            for end in (client, server):
+                if end is not None:
+                    end.close()
             with contextlib.suppress(OSError):
                 os.unlink(path)
             with contextlib.suppress(OSError):
