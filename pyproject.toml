@@ -30,6 +30,7 @@ dependencies = []
 [project.scripts]
 loki = "loki_agent.__main__:main"
 loki-acp = "loki_agent.acp_main:main"
+loki-setup = "loki_agent.windows_setup:main"
 
 [tool.vulture]
 paths = ["loki_agent", "loki.py", "vulture_whitelist.py"]
