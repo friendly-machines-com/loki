@@ -8,21 +8,30 @@ from loki_agent import authentications
 from loki_agent import credential_storages
 
 
-async def run(directory, calls_path, release_path):
+def _append(path):
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o600,
+    )
+    try:
+        os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+async def run(directory, calls_path, release_path, loaded_path):
     storage = credential_storages.JsonCredentialStorage(directory)
     current = storage.load_openai_subscription().tokens
+    # Signal that this process has read the document.  The document is read
+    # outside the lock, so a process must read it while the holder is still
+    # mid-rotation; if it reads after publication it sees the refreshed tokens
+    # and rotates again.  The test waits for this marker instead of sleeping.
+    _append(loaded_path)
 
     async def refresh(_refresh_token):
-        descriptor = os.open(
-            calls_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o600,
-        )
-        try:
-            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _append(calls_path)
         while not os.path.exists(release_path):
             await asyncio.sleep(0.01)
         return authentications.RefreshResult(
