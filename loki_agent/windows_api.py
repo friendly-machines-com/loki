@@ -742,6 +742,36 @@ def terminate_process(process, exit_code: int = 1) -> None:
         raise WindowsApiError("TerminateProcess failed")
 
 
+def drive_environment_entries() -> list:
+    """The ``=X:=...`` per-drive current-directory entries of this process.
+
+    Windows keeps a hidden environment entry per drive recording that drive's
+    current directory.  A supplied environment block that omits the entry for
+    the drive holding the child's current directory is rejected by
+    ``CreateProcessW`` with ``ERROR_ENVVAR_NOT_FOUND`` (203), so they are read
+    from this process's block and placed at the front of the child's.
+    """
+    get = bind("kernel32", "GetEnvironmentStringsW", ctypes.c_void_p)
+    free = bind("kernel32", "FreeEnvironmentStringsW", wintypes.BOOL,
+                ctypes.c_void_p)
+    pointer = get()
+    if not pointer:
+        return []
+    entries = []
+    try:
+        address = pointer
+        while True:
+            text = ctypes.wstring_at(address)
+            if not text:
+                break
+            if text.startswith("="):
+                entries.append(text)
+            address += (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+    finally:
+        free(pointer)
+    return entries
+
+
 def create_process_in_app_container(executable, arguments, package_sid,
                                     current_directory=None,
                                     inherited_handles=None, environment=None,
@@ -831,7 +861,10 @@ def create_process_in_app_container(executable, arguments, package_sid,
         flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT
         environment_block = None
         if environment is not None:
-            entries = []
+            # ``=X:=...`` drive-current-directory entries come first, as the
+            # child's current directory is on a drive; a block that omits them
+            # makes CreateProcessW fail with ERROR_ENVVAR_NOT_FOUND (203).
+            entries = list(drive_environment_entries())
             for key, value in sorted(environment.items(), key=lambda item: item[0].upper()):
                 if not key or '=' in key or '\0' in key or '\0' in value:
                     raise ValueError("invalid child environment entry")
