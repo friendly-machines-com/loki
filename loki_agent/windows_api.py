@@ -320,14 +320,35 @@ PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
 
 # File access for the containment probe.  The probe *asks* for rights it must be
 # denied and treats the refusal as the pass; it never reads or writes.
+#
+# ACCESS_MASK values (winnt.h) are declared once, here, because two read-only
+# modules compare them: ``windows_verify`` requests them from inside the
+# container, and ``windows_state`` evaluates DACL rights against them.  A value
+# that named one right in two places could let the two disagree about what a
+# grant means.
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
+FILE_GENERIC_READ = 0x00120089
+FILE_GENERIC_WRITE = 0x00120116
+FILE_GENERIC_EXECUTE = 0x001200A0
+FILE_ALL_ACCESS = 0x001F01FF
+DELETE = 0x00010000
+READ_CONTROL = 0x00020000
 WRITE_DAC = 0x00040000
+WRITE_OWNER = 0x00080000
+SYNCHRONIZE = 0x00100000
+ACCESS_SYSTEM_SECURITY = 0x01000000
+# A directory's FILE_WRITE_DATA is FILE_ADD_FILE and its FILE_APPEND_DATA is
+# FILE_ADD_SUBDIRECTORY; the probe requests the former to test create denial.
+FILE_WRITE_DATA = 0x00000002
+FILE_APPEND_DATA = 0x00000004
 OPEN_EXISTING = 3
 FILE_SHARE_ALL = 0x00000007
 # FILE_FLAG_BACKUP_SEMANTICS lets CreateFileW open a directory, which the
 # credential tree and the workspace both are.
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+ERROR_FILE_NOT_FOUND = 2
+ERROR_PATH_NOT_FOUND = 3
 ERROR_ACCESS_DENIED = 5
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 

@@ -7,6 +7,7 @@ unexpected error must not pass, and an unreachable workspace must not make the
 denials look successful by making them vacuous.
 """
 
+import os
 import unittest
 from unittest import mock
 
@@ -21,6 +22,7 @@ OTHER = "S-1-5-21-1-2-3-1004"
 WORKSPACE = "/workspace"
 GRANTED = "/granted"
 CREDENTIALS = "/credentials"
+CREDENTIAL_FILE = os.path.join(CREDENTIALS, paths.CREDENTIAL_FILE_NAME)
 CONFIG = "/config"
 STATE = "/state"
 WORKSPACE_RW = windows_api.GENERIC_READ | windows_api.GENERIC_WRITE
@@ -78,9 +80,10 @@ class ProbeContainmentTests(unittest.TestCase):
             "denied", status=status)
 
     def happy(self):
+        # Everything not named here defaults to ACCESS_DENIED, including the
+        # credential file's read, which is also how the probe learns the file
+        # exists rather than being absent.
         self.allow(WORKSPACE, WORKSPACE_RW)
-        self.deny(CREDENTIALS, windows_api.GENERIC_READ)
-        self.deny(WORKSPACE, windows_api.WRITE_DAC)
 
     def checks(self):
         return {check.name: check
@@ -93,7 +96,11 @@ class ProbeContainmentTests(unittest.TestCase):
 
         self.assertEqual(set(checks), {
             "AppContainer", "package SID", "workspace reachable",
-            "credentials unreadable", "cannot rewrite a DACL"})
+            "credentials unlistable", "cannot create credentials",
+            "credential file unreadable", "credential file not writable",
+            "credential file not appendable", "credential file not deletable",
+            "credential file DACL not rewritable",
+            "credential file owner not rewritable", "cannot rewrite a DACL"})
         for name, check in checks.items():
             self.assertEqual(check.status, "pass", (name, check))
 
@@ -105,6 +112,13 @@ class ProbeContainmentTests(unittest.TestCase):
         self.assertEqual(self.attempts, [
             (WORKSPACE, WORKSPACE_RW),
             (CREDENTIALS, windows_api.GENERIC_READ),
+            (CREDENTIALS, windows_api.FILE_WRITE_DATA),
+            (CREDENTIAL_FILE, windows_api.GENERIC_READ),
+            (CREDENTIAL_FILE, windows_api.GENERIC_WRITE),
+            (CREDENTIAL_FILE, windows_api.FILE_APPEND_DATA),
+            (CREDENTIAL_FILE, windows_api.DELETE),
+            (CREDENTIAL_FILE, windows_api.WRITE_DAC),
+            (CREDENTIAL_FILE, windows_api.WRITE_OWNER),
             (WORKSPACE, windows_api.WRITE_DAC)])
 
     def test_an_opened_handle_and_the_token_are_closed(self):
@@ -133,12 +147,87 @@ class ProbeContainmentTests(unittest.TestCase):
 
         self.assertEqual(checks["package SID"].status, "fail")
 
-    def test_readable_credentials_fail(self):
+    def test_a_listable_credential_directory_fails(self):
         self.happy()
         self.allow(CREDENTIALS, windows_api.GENERIC_READ)
 
         self.assertEqual(
-            self.checks()["credentials unreadable"].status, "fail")
+            self.checks()["credentials unlistable"].status, "fail")
+
+    def test_a_creatable_credential_directory_fails(self):
+        self.happy()
+        self.allow(CREDENTIALS, windows_api.FILE_WRITE_DATA)
+
+        self.assertEqual(
+            self.checks()["cannot create credentials"].status, "fail")
+
+    def test_a_granted_credential_read_fails(self):
+        self.happy()
+        self.allow(CREDENTIAL_FILE, windows_api.GENERIC_READ)
+
+        self.assertEqual(
+            self.checks()["credential file unreadable"].status, "fail")
+
+    def test_a_granted_credential_write_fails(self):
+        self.happy()
+        self.allow(CREDENTIAL_FILE, windows_api.GENERIC_WRITE)
+
+        self.assertEqual(
+            self.checks()["credential file not writable"].status, "fail")
+
+    def test_a_granted_credential_append_fails(self):
+        self.happy()
+        self.allow(CREDENTIAL_FILE, windows_api.FILE_APPEND_DATA)
+
+        self.assertEqual(
+            self.checks()["credential file not appendable"].status, "fail")
+
+    def test_a_granted_credential_delete_fails(self):
+        self.happy()
+        self.allow(CREDENTIAL_FILE, windows_api.DELETE)
+
+        self.assertEqual(
+            self.checks()["credential file not deletable"].status, "fail")
+
+    def test_a_granted_credential_dacl_write_fails(self):
+        self.happy()
+        self.allow(CREDENTIAL_FILE, windows_api.WRITE_DAC)
+
+        self.assertEqual(
+            self.checks()["credential file DACL not rewritable"].status,
+            "fail")
+
+    def test_a_granted_credential_owner_write_fails(self):
+        self.happy()
+        self.allow(CREDENTIAL_FILE, windows_api.WRITE_OWNER)
+
+        self.assertEqual(
+            self.checks()["credential file owner not rewritable"].status,
+            "fail")
+
+    def test_an_absent_credential_file_skips_the_direction_probes(self):
+        self.happy()
+        self.deny(CREDENTIAL_FILE, windows_api.GENERIC_READ,
+                  status=windows_api.ERROR_FILE_NOT_FOUND)
+
+        checks = self.checks()
+
+        self.assertEqual(checks["credential file"].status, "pass")
+        self.assertNotIn("credential file unreadable", checks)
+        self.assertNotIn("credential file not writable", checks)
+        # With nothing to read, the create denial is what carries the claim.
+        self.assertEqual(checks["cannot create credentials"].status, "pass")
+        self.assertEqual(
+            [attempt for attempt in self.attempts
+             if attempt[0] == CREDENTIAL_FILE],
+            [(CREDENTIAL_FILE, windows_api.GENERIC_READ)])
+
+    def test_an_unexpected_credential_file_error_is_not_a_pass(self):
+        self.happy()
+        self.deny(CREDENTIAL_FILE, windows_api.GENERIC_READ, status=87)
+
+        self.assertEqual(
+            self.checks()["credential file unreadable"].status, "fail")
 
     def test_a_granted_write_dac_fails(self):
         self.happy()
@@ -155,14 +244,14 @@ class ProbeContainmentTests(unittest.TestCase):
 
         self.assertEqual(checks["workspace reachable"].status, "fail")
         # The denials are still reported on their own merits.
-        self.assertEqual(checks["credentials unreadable"].status, "pass")
+        self.assertEqual(checks["credentials unlistable"].status, "pass")
 
     def test_an_unexpected_error_is_not_reported_as_a_pass(self):
         self.happy()
         self.deny(CREDENTIALS, windows_api.GENERIC_READ, status=87)
 
         self.assertEqual(
-            self.checks()["credentials unreadable"].status, "fail")
+            self.checks()["credentials unlistable"].status, "fail")
 
     def test_an_unopenable_token_fails(self):
         self.happy()

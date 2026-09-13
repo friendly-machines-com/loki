@@ -207,6 +207,23 @@ class ContainerDeclarationTests(unittest.TestCase):
         self.assertEqual(windows_api.INVALID_HANDLE_VALUE,
                          ctypes.c_void_p(-1).value)
 
+    def test_access_masks_match_the_winnt_values(self):
+        # These decide what a DACL grant means and what the containment probe
+        # asks for; a wrong digit is invisible on the host that writes it.
+        self.assertEqual(windows_api.FILE_GENERIC_READ, 0x00120089)
+        self.assertEqual(windows_api.FILE_GENERIC_WRITE, 0x00120116)
+        self.assertEqual(windows_api.FILE_GENERIC_EXECUTE, 0x001200A0)
+        self.assertEqual(windows_api.FILE_ALL_ACCESS, 0x001F01FF)
+        self.assertEqual(windows_api.FILE_WRITE_DATA, 0x00000002)
+        self.assertEqual(windows_api.FILE_APPEND_DATA, 0x00000004)
+        self.assertEqual(windows_api.DELETE, 0x00010000)
+        self.assertEqual(windows_api.READ_CONTROL, 0x00020000)
+        self.assertEqual(windows_api.WRITE_OWNER, 0x00080000)
+        self.assertEqual(windows_api.SYNCHRONIZE, 0x00100000)
+        self.assertEqual(windows_api.ACCESS_SYSTEM_SECURITY, 0x01000000)
+        self.assertEqual(windows_api.ERROR_FILE_NOT_FOUND, 2)
+        self.assertEqual(windows_api.ERROR_PATH_NOT_FOUND, 3)
+
 
 class TokenInspectionTests(unittest.TestCase):
     @staticmethod
