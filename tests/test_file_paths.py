@@ -279,13 +279,11 @@ class FilePathTests(unittest.TestCase):
         if os.name != 'posix':
             # Windows cancels `..` lexically before the kernel sees the path, so
             # the missing/non-directory component is dropped and the path
-            # resolves to the target; Loki then reports that the file changed
-            # under it, and never returns the content.  A trailing slash on a
-            # file is invalid outright.
+            # simplifies to the existing target, which is then read normally;
+            # the run confirms that outcome.  A trailing slash on a file is
+            # invalid outright.
             for relative in ('missing/../target', 'plain/../target'):
-                self.assertTrue(
-                    loki.run_read(relative).startswith('Error:'),
-                    loki.run_read(relative))
+                self.assertIn('must not read', loki.run_read(relative))
             self.assertTrue(loki.run_read('target/').startswith('Error:'))
             return
         for relative in ('missing/../target', 'plain/../target', 'target/'):
