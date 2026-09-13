@@ -12,9 +12,12 @@ New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
 $logPrefix = if ($Probe -eq 'storage') { 'standard-user' } else { 'appcontainer' }
 Start-Transcript -Path (Join-Path $diagnostics "$logPrefix-supervisor.log") | Out-Null
 $user = $null
+$userB = $null
 $process = $null
 $started = $false
 $password = $null
+$passwordB = $null
+$sidB = $null
 $taskName = $null
 $comClsid = $null
 $comAppid = $null
@@ -38,6 +41,69 @@ function Set-ProbeDirectoryAcl([string]$Path, [string]$UserSid, [string]$Rights)
         $acl.AddAccessRule($rule)
     }
     Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function New-ProbeAccount([string]$Label) {
+    # A fresh disposable local standard account, never reused across runs.
+    $accountName = 'loki_' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $random = [byte[]]::new(32)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($random)
+    $plain = 'Aa1!' + [Convert]::ToBase64String($random)
+    $accountPassword = ConvertTo-SecureString $plain -AsPlainText -Force
+    $plain = $null
+    $account = New-LocalUser -Name $accountName -Password $accountPassword -Description 'Disposable Loki CI probes'
+    $group = Get-LocalGroup -SID 'S-1-5-32-545'
+    if ($account.SID.Value -notin @(Get-LocalGroupMember -Group $group | ForEach-Object { $_.SID.Value })) {
+        Add-LocalGroupMember -Group $group -Member $account
+    }
+    Write-Host "$Label`: $accountName; expected SID: $($account.SID.Value)"
+    return @{ Name = $accountName; User = $account; Password = $accountPassword }
+}
+
+function Invoke-ProbeChildAs([string]$UserName, [securestring]$UserPassword, [string[]]$ChildArguments, [string]$LogName) {
+    # Run the staged probe as the given account and return its exit code, with
+    # the same minimal environment the main standard-user run receives.
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $executable
+    $info.WorkingDirectory = $work
+    $info.UseShellExecute = $false
+    $info.UserName = $UserName
+    $info.Domain = $env:COMPUTERNAME
+    $info.Password = $UserPassword
+    $info.LoadUserProfile = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    foreach ($argument in $ChildArguments) { $info.ArgumentList.Add($argument) }
+    $info.Environment.Clear()
+    $info.Environment['SystemRoot'] = $env:SystemRoot
+    $info.Environment['WINDIR'] = $env:SystemRoot
+    $info.Environment['COMSPEC'] = Join-Path $env:SystemRoot 'System32/cmd.exe'
+    $info.Environment['PATH'] = (Split-Path $executable) + ';' + (Join-Path $env:SystemRoot 'System32')
+    $info.Environment['TEMP'] = $temporary
+    $info.Environment['TMP'] = $temporary
+
+    $childProcess = [Diagnostics.Process]::new()
+    $childProcess.StartInfo = $info
+    if (-not $childProcess.Start()) { throw "$LogName Python did not start" }
+    $childProcess.StandardInput.Close()
+    $out = $childProcess.StandardOutput.ReadToEndAsync()
+    $err = $childProcess.StandardError.ReadToEndAsync()
+    $childTimedOut = -not $childProcess.WaitForExit(120000)
+    if ($childTimedOut) {
+        $childProcess.Kill($true)
+        if (-not $childProcess.WaitForExit(10000)) { throw "$LogName tree did not exit" }
+    }
+    foreach ($entry in @(@($out, "$LogName-stdout.log"), @($err, "$LogName-stderr.log"))) {
+        if (-not $entry[0].Wait(10000)) { throw 'Probe output pipe did not close' }
+        $text = $entry[0].GetAwaiter().GetResult()
+        [IO.File]::WriteAllText((Join-Path $diagnostics $entry[1]), $text)
+        Write-Host $text
+    }
+    $childCode = $childProcess.ExitCode
+    $childProcess.Dispose()
+    if ($childTimedOut) { throw "$LogName exceeded 120 seconds" }
+    return $childCode
 }
 
 try {
@@ -392,6 +458,36 @@ public static extern IntPtr LocalFree(IntPtr memory);
     $exitCode = $process.ExitCode
     Write-Host "Standard-user probe exit: $exitCode; timed out: $timedOut"
     if ($timedOut) { throw 'Standard-user probes exceeded 180 seconds' }
+
+    if ($Probe -eq 'storage') {
+        # The credential store is only private if a *different* standard user is
+        # refused it.  Account A creates the credential directory the product
+        # creates (a private os.mkdir, protected DACL naming owner, SYSTEM and
+        # Administrators); account B must then be denied listing it and denied
+        # reading tokens.json.  B is granted read-and-execute on the stage so
+        # the refusal can only come from the credential directory's own DACL.
+        $second = New-ProbeAccount 'Second standard-user account'
+        $userB = $second.User
+        $passwordB = $second.Password
+        $sidB = $userB.SID.Value
+        & "$env:SystemRoot/System32/icacls.exe" $root /grant "*${sidB}:(OI)(CI)RX" /T /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot grant the second account the stage' }
+        # B needs a writable TEMP of its own; the credential directory's DACL,
+        # not the stage, is what must refuse it.
+        & "$env:SystemRoot/System32/icacls.exe" $temporary /grant "*${sidB}:(OI)(CI)M" /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot grant the second account a temp directory' }
+
+        $created = Invoke-ProbeChildAs $name $password `
+            @('-I', '-u', $script, '--child', 'second-user-create', $work, 'ignored') `
+            'second-user-create'
+        if ($created -ne 0) { throw "The owner could not create the credential store: $created" }
+
+        $read = Invoke-ProbeChildAs $userB.Name $passwordB `
+            @('-I', '-u', $script, '--child', 'second-user-read', $work, 'ignored') `
+            'second-user-read'
+        if ($read -ne 0) { throw "A second standard user was not refused the credential store: $read" }
+        Write-Host 'Second-account denial observed: the private store refused the other user.'
+    }
 }
 catch {
     # Preserve the original failure; a finally throw would otherwise mask it
@@ -485,6 +581,14 @@ finally {
         }
         catch { Write-Warning $_; $cleanupFailed = $true }
         try { Remove-LocalUser -SID $user.SID }
+        catch { Write-Warning $_; $cleanupFailed = $true }
+    }
+    if ($null -ne $userB) {
+        try {
+            Get-CimInstance Win32_UserProfile | Where-Object SID -EQ $userB.SID.Value | Remove-CimInstance
+        }
+        catch { Write-Warning $_; $cleanupFailed = $true }
+        try { Remove-LocalUser -SID $userB.SID }
         catch { Write-Warning $_; $cleanupFailed = $true }
     }
     try {
