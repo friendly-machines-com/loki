@@ -729,3 +729,30 @@ class PrivateDirectorySupportTests(unittest.TestCase):
                     storage.ensure_directory()
             # Refusal must precede makedirs/mkdir: nothing may be created.
             self.assertFalse(os.path.exists(parent))
+
+
+class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
+    """The Windows primitive layer fails closed with one clear error.
+
+    These bodies are not implemented yet, so every entry point must raise a
+    ``CredentialStorageError`` naming the gap rather than letting a POSIX
+    ``AttributeError`` escape from whichever call site ran first.
+    """
+
+    def test_every_entry_point_refuses_with_a_clear_error(self):
+        from loki_agent import _credential_files_windows
+
+        names = (
+            "open_directory", "open_read_at", "create_exclusive_at",
+            "open_lock_file_at", "replace_at", "unlink_at",
+            "owner_is_current_user",
+        )
+        for name in names:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    credential_storages.CredentialStorageError,
+                    "not implemented yet"):
+                getattr(_credential_files_windows, name)(None, "name")
+
+
+if __name__ == "__main__":
+    unittest.main()
