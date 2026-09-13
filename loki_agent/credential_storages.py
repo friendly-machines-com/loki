@@ -212,15 +212,18 @@ class JsonCredentialStorage:
             os.mkdir(self.directory, 0o700)
         except FileExistsError:
             pass
-        directory_stat = os.lstat(self.directory)
-        if not credential_files.is_directory(directory_stat):
+        facts = credential_files.describe_path(self.directory)
+        if not facts.directory:
             raise CredentialStorageError(
                 f"credential path is not a directory: {self.directory}")
-        if not credential_files.owner_is_current_user(directory_stat):
+        if facts.reparse_point:
+            raise CredentialStorageError(
+                f"credential directory is a reparse point: {self.directory}")
+        if not facts.owned_by_current_user:
             raise CredentialStorageError(
                 f"credential directory is not owned by this user: "
                 f"{self.directory}")
-        if credential_files.grants_group_or_other(directory_stat):
+        if facts.group_or_other_access:
             raise CredentialStorageError(
                 f"credential directory has group or other permission bits "
                 f"set: {self.directory!r}; adjust its permissions before "
@@ -235,14 +238,17 @@ class JsonCredentialStorage:
                 f"could not open credential directory: {error}") from error
 
     @staticmethod
-    def _validate_secret_file(file_stat, label):
-        if not credential_files.is_regular(file_stat):
+    def _validate_secret_file(facts, label):
+        if not facts.regular:
             raise CredentialStorageError(
                 f"credential {label} is not a regular file")
-        if not credential_files.owner_is_current_user(file_stat):
+        if facts.reparse_point:
+            raise CredentialStorageError(
+                f"credential {label} is a reparse point")
+        if not facts.owned_by_current_user:
             raise CredentialStorageError(
                 f"credential {label} is not owned by this user")
-        if credential_files.grants_group_or_other(file_stat):
+        if facts.group_or_other_access:
             raise CredentialStorageError(
                 f"credential {label} permissions must not grant "
                 "group or other access")
@@ -257,9 +263,9 @@ class JsonCredentialStorage:
             raise CredentialStorageError(
                 f"could not open credential JSON: {error}") from error
         try:
-            file_stat = credential_files.fstat(fd)
-            self._validate_secret_file(file_stat, "JSON file")
-            if file_stat.st_size > MAX_CREDENTIAL_FILE_BYTES:
+            facts = credential_files.describe(fd)
+            self._validate_secret_file(facts, "JSON file")
+            if facts.size > MAX_CREDENTIAL_FILE_BYTES:
                 raise CredentialStorageError(
                     "credential JSON exceeds its size limit")
             chunks = []
@@ -346,7 +352,7 @@ class JsonCredentialStorage:
                 f"could not open credential lock: {error}") from error
         try:
             self._validate_secret_file(
-                credential_files.fstat(fd), "lock file")
+                credential_files.describe(fd), "lock file")
         except BaseException:
             credential_files.close(fd)
             raise

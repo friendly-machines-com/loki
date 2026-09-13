@@ -8,6 +8,30 @@ is the one checked rather than a pathname resolved a second time.
 from __future__ import annotations
 
 import os
+import stat
+
+from .credential_files import FileFacts
+
+
+def _facts(result) -> FileFacts:
+    return FileFacts(
+        regular=stat.S_ISREG(result.st_mode),
+        directory=stat.S_ISDIR(result.st_mode),
+        # O_NOFOLLOW refused a link at open; a link seen by describe_path is
+        # neither a regular file nor a directory, which the store refuses.
+        reparse_point=False,
+        size=result.st_size,
+        owned_by_current_user=result.st_uid == os.geteuid(),
+        group_or_other_access=bool(stat.S_IMODE(result.st_mode) & 0o077),
+    )
+
+
+def describe(fd) -> FileFacts:
+    return _facts(os.fstat(fd))
+
+
+def describe_path(path) -> FileFacts:
+    return _facts(os.lstat(path))
 
 
 def _no_follow(flags: int) -> int:
@@ -41,7 +65,3 @@ def replace_at(directory_fd: int, temporary: str, name: str) -> None:
 
 def unlink_at(directory_fd: int, name: str) -> None:
     os.unlink(name, dir_fd=directory_fd)
-
-
-def owner_is_current_user(result) -> bool:
-    return result.st_uid == os.geteuid()

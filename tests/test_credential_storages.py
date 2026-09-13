@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from loki_agent import authentications
+from loki_agent import credential_files
 from loki_agent import credential_storages
 from loki_agent import file_locks
 from loki_agent import paths
@@ -264,27 +265,22 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                     self.assert_descriptor_closed(directory_fd)
 
     async def test_rejects_wrong_file_owner(self):
-        file_stat = mock.Mock(
-            st_mode=stat.S_IFREG | 0o600,
-            st_uid=os.geteuid() + 1,
-        )
+        facts = credential_files.FileFacts(
+            regular=True, directory=False, reparse_point=False, size=0,
+            owned_by_current_user=False, group_or_other_access=False)
 
         with self.assertRaisesRegex(
                 credential_storages.CredentialStorageError,
                 "not owned by this user"):
-            self.storage._validate_secret_file(
-                file_stat, "JSON file")
+            self.storage._validate_secret_file(facts, "JSON file")
 
     async def test_rejects_wrong_directory_owner(self):
-        directory_stat = mock.Mock(
-            st_mode=stat.S_IFDIR | 0o700,
-            st_uid=os.geteuid() + 1,
-        )
+        facts = credential_files.FileFacts(
+            regular=False, directory=True, reparse_point=False, size=0,
+            owned_by_current_user=False, group_or_other_access=False)
 
         with mock.patch.object(
-                credential_storages.os,
-                "lstat",
-                return_value=directory_stat):
+                credential_files, "describe_path", return_value=facts):
             with self.assertRaisesRegex(
                     credential_storages.CredentialStorageError,
                     "directory is not owned"):
@@ -745,7 +741,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         names = (
             "open_directory", "open_read_at", "create_exclusive_at",
             "open_lock_file_at", "replace_at", "unlink_at",
-            "owner_is_current_user",
+            "describe", "describe_path",
         )
         for name in names:
             with self.subTest(name=name), self.assertRaisesRegex(
