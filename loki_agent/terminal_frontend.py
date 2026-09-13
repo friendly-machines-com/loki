@@ -1398,7 +1398,11 @@ async def _run_frontend(args) -> int:
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, clean_up_and_exit)
-    signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT,])
+    if hasattr(signal, "pthread_sigmask"):
+        # POSIX only: block SIGINT so it is delivered to this handler rather
+        # than interrupting a turn.  Windows has neither the call nor the
+        # signal.
+        signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT,])
 
     async def run_with_session_cleanup():
         try:
