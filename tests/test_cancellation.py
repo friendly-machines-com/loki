@@ -14,6 +14,7 @@ which ACP's stopReason: "cancelled" depends on:
 
 import asyncio
 import json
+import os
 import signal
 import unittest
 from unittest import mock
@@ -304,12 +305,17 @@ class ForegroundJobCancelTests(unittest.TestCase):
         job, status, metadata, elapsed = asyncio.run(run())
         self.assertEqual(status, "cancelled")
         self.assertEqual(job.status, "cancelled")
-        self.assertEqual(job.exit_code, -signal.SIGINT)
-        self.assertEqual(job.signal, signal.SIGINT)
         self.assertEqual(metadata["status"], "cancelled")
-        self.assertEqual(metadata["exit_code"], -signal.SIGINT)
-        self.assertEqual(metadata["signal"], signal.SIGINT)
-        self.assertLess(elapsed, 5.0)  # SIGINT kills sleep immediately
+        self.assertIsNotNone(job.exit_code)
+        self.assertEqual(metadata["exit_code"], job.exit_code)
+        if os.name == "posix":
+            # POSIX kills a cancelled foreground job with SIGINT; Windows
+            # stops it through CTRL_BREAK/terminate, which carries no signal
+            # number, so only the timing contract is shared.
+            self.assertEqual(job.exit_code, -signal.SIGINT)
+            self.assertEqual(job.signal, signal.SIGINT)
+            self.assertEqual(metadata["signal"], signal.SIGINT)
+        self.assertLess(elapsed, 5.0)  # cancellation ends sleep immediately
 
     def test_no_cancel_event_uses_timeout_path(self):
         from loki_agent.loki import JobManager

@@ -18,6 +18,7 @@ from loki_agent import credential_storages
 from loki_agent import credential_supervisors
 from loki_agent import paths
 from loki_agent import runtime_isolations
+from loki_agent import windows_api
 from loki_agent.credentials import CredentialStore
 
 
@@ -26,20 +27,37 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class PathTests(unittest.TestCase):
     def test_credential_directory_uses_xdg_config_home(self):
+        # os.path.join, not a literal: the separator is the platform's.
         self.assertEqual(
             paths.credential_directory({
                 "HOME": "/ignored",
                 "XDG_CONFIG_HOME": "/configuration",
             }),
-            "/configuration/loki/credentials",
+            os.path.join("/configuration", "loki", "credentials"),
         )
 
-    def test_credential_directory_falls_back_to_home_config(self):
-        with mock.patch.dict(
-                os.environ, {"HOME": "/home/tester"}, clear=True):
+    def test_credential_directory_falls_back_to_home_config_on_posix(self):
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(
+                    os.path, "expanduser",
+                    return_value="/home/tester/.config"), \
+                mock.patch.dict(
+                    os.environ, {"HOME": "/home/tester"}, clear=True):
             self.assertEqual(
                 paths.credential_directory(),
-                "/home/tester/.config/loki/credentials",
+                os.path.join(
+                    "/home/tester", ".config", "loki", "credentials"),
+            )
+
+    def test_credential_directory_uses_local_app_data_on_windows(self):
+        base = os.path.join(tempfile.gettempdir(), "Local")
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(windows_api, "known_folder",
+                                  return_value=base), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                paths.credential_directory(),
+                os.path.join(base, "loki", "credentials"),
             )
 
 

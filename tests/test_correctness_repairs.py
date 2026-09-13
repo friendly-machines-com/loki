@@ -693,6 +693,22 @@ class JobOwnershipContractTests(unittest.TestCase):
 
 
 class TerminalEntrypointContractTests(unittest.TestCase):
+    def setUp(self):
+        # Windows gates the entrypoints on windows_runtime before the work
+        # under test: configured_workspace for the public path, verify_runtime
+        # for the runtime/subagent paths.  Mock those so the shared credential
+        # routing is what these tests exercise on either platform.
+        self.windows_steps = {}
+        if os.name != "nt":
+            return
+        from loki_agent import windows_runtime
+        for name, value in (("configured_workspace", "/workspace"),
+                            ("verify_runtime", None)):
+            patcher = mock.patch.object(
+                windows_runtime, name, return_value=value)
+            self.windows_steps[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_public_entrypoint_protects_credential_supervisor(self):
         credentials = CredentialStore({})
         storage = mock.Mock()
@@ -755,10 +771,13 @@ class TerminalEntrypointContractTests(unittest.TestCase):
 
             self.assertEqual(status, 19)
             capture.assert_not_called()
-            isolate.assert_called_once_with()
             protect.assert_called_once_with()
             terminal_main.assert_called_once_with(
                 ["--headless"], owner_read, capability_read)
+            if os.name == "posix":
+                isolate.assert_called_once_with()
+            else:
+                self.windows_steps["verify_runtime"].assert_called_once_with()
         finally:
             os.close(owner_read)
             os.close(owner_write)
