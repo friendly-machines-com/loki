@@ -87,6 +87,19 @@ try {
             & "$env:SystemRoot/System32/icacls.exe" $copy /reset /Q
             if ($LASTEXITCODE -ne 0) { throw 'Cannot set ACL on AppContainer probe copy' }
         }
+        # The shipped in-container gate runs in --runtime-gate mode, so stage
+        # exactly the read-only modules it imports. No agent core, frontend or
+        # ACL/profile mutation is copied: windows_verify cannot reach them, and
+        # the boundary test enforces that.
+        $gate = Join-Path $root 'loki_agent'
+        New-Item -ItemType Directory -Path $gate | Out-Null
+        foreach ($module in @('__init__.py', 'windows_api.py', 'paths.py',
+                              'windows_state.py', 'windows_verify.py')) {
+            $copy = Join-Path $gate $module
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "loki_agent/$module") -Destination $copy
+            & "$env:SystemRoot/System32/icacls.exe" $copy /reset /Q
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot set ACL on staged gate module' }
+        }
     }
     $work = Join-Path $root 'work'
     New-Item -ItemType Directory -Path $work | Out-Null

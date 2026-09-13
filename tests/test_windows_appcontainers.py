@@ -21,8 +21,11 @@ Documentation contracts used by these probes:
   documents CreateProcess child association and KILL_ON_JOB_CLOSE, but also
   WMI/breakaway exceptions. No all-launch-path containment claim is made.
 
-All files are disposable. No network capabilities, real tokens, runtime Loki
-imports, elevation requests, or durability claims. The companion
+All files are disposable. No network capabilities, real tokens, elevation
+requests, or durability claims. The one deliberate Loki import is the shipped
+read-only gate (``windows_verify`` and the modules it pulls) in the
+``--runtime-gate`` mode, so the probe that ships is exercised natively; it
+imports no agent core, frontend, or ACL/profile mutation. The companion
 windows_escapes.py probes selected token and ShellExecute/WMI launch routes;
 its documented limits remain distinct from complete escape resistance.
 """
@@ -907,6 +910,29 @@ def attempts(native, manifest):
             native.check(native.close(handle))
         denied(name, open_broker)
     return outcomes
+
+
+def runtime_gate(manifest_path):
+    """Run the shipped in-container gate against the manifest's fixture.
+
+    Deliberately imports the read-only gate: the point is to exercise the probe
+    that ships, not a re-implementation. ``windows_verify`` cannot reach the
+    ACL/profile mutation or the frontend -- the boundary test enforces that --
+    and the CI stage carries only that closure. The credential location comes
+    from the shipped path rule rather than a patched function, so the fixture
+    supplies ``XDG_CONFIG_HOME`` and the real resolution is exercised.
+    """
+    manifest = json.loads(Path(manifest_path).read_text())
+    # Under isolated (-I) Python the script's directory is not on sys.path, so
+    # the staged package must be named explicitly, as the sibling helpers are.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from loki_agent import windows_verify
+    os.environ['XDG_CONFIG_HOME'] = manifest['config_home']
+    checks = windows_verify.probe_containment(manifest['workspace'])
+    for check in checks:
+        print(json.dumps({'check': check.name, 'status': check.status,
+                          'detail': check.detail}), flush=True)
+    return 1 if any(check.status != 'pass' for check in checks) else 0
 
 
 def contained(manifest_path, descendant=False):
@@ -2076,6 +2102,126 @@ class AppContainerMarshallingTests(unittest.TestCase):
 
 @unittest.skip('requires explicit --standard-user invocation in disposable CI stage')
 class AppContainerTests(unittest.TestCase):
+    def test_runtime_gate(self):
+        """Native evidence for the shipped in-container containment gate.
+
+        The profile name, workspace grant and credential layout follow the
+        shipped rules, so the real gate runs against a real DACL. Controls open
+        one object at a time -- the file, then the directory -- and must fail
+        the matching check, so a probe that denies nothing cannot pass. The
+        file control is exactly the blind spot the old directory-only probe had.
+        """
+        native = AppContainers()
+        details = native.token_details(include_groups=True)
+        owner = details['user']
+        primitives['require_standard_user'](details, owner)
+        stage = Path(__file__).resolve().parent
+        if (not stage.name.startswith('LokiStorageProbes-') or
+                Path(sys.base_prefix) != stage / 'runtime'):
+            raise RuntimeError('refusing ACL changes outside disposable CI copies')
+        # The broker imports the staged read-only gate too, to derive the
+        # profile name with the shipped rule instead of a copy of it.
+        sys.path.insert(0, str(stage))
+        from loki_agent import windows_state
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        workspace = root / 'workspace'
+        workspace.mkdir()
+        # Derive the profile from the workspace with the shipped rule, or the
+        # gate's first check (token package SID vs derived SID) cannot match.
+        name = windows_state.profile_name_for(str(workspace))
+        sid = HANDLE()
+        native.hresult(native.profile(name, name, name, None, 0, C.byref(sid)))
+        self.addCleanup(lambda: native.hresult(native.delete_profile(name)))
+        self.addCleanup(lambda: native.free_sid(sid))
+        package = native.sid(sid)
+        result = subprocess.run(
+            ['icacls.exe', str(stage), '/grant', '*%s:(OI)(CI)RX' % package,
+             '/T', '/Q'], capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Traverse only for the package on the disposable root, never inherited.
+        native.acl(root, private_dacl(owner) + '(A;;0x20;;;%s)' % package)
+        # Exactly the level setup writes: Modify excludes WRITE_DAC, which the
+        # gate then asserts is absent; FA would grant it and fail the gate.
+        native.acl(workspace, private_dacl(owner) +
+                   '(A;OICI;0x1301BF;;;%s)' % package)
+
+        def credential_tree(label, tokens=b'FAKE-CREDENTIAL',
+                            directory_ace='', file_ace=''):
+            home = root / label
+            credentials = home / 'loki' / 'credentials'
+            credentials.mkdir(parents=True)
+            # Traverse only on the parents, never inherited; the credential
+            # directory and file keep no package ACE. Without traverse a denial
+            # would surface as not-found rather than access-denied.
+            traverse = private_dacl(owner) + '(A;;0x20;;;%s)' % package
+            native.acl(home, traverse)
+            native.acl(home / 'loki', traverse)
+            native.acl(credentials, private_dacl(owner) + directory_ace)
+            if tokens is not None:
+                target = credentials / 'tokens.json'
+                target.write_bytes(tokens)
+                handle = native.open(target, access=0x20000)  # READ_CONTROL
+                try:
+                    self.assertEqual(native.owner(handle), owner,
+                                     'fixture must exercise same-user ownership')
+                finally:
+                    native.check(native.close(handle))
+                native.acl(target, private_dacl(owner) + file_ace)
+            return home
+
+        # Inside the workspace, not the root: the contained process may read it
+        # only where the package has read, and the root grants traverse alone.
+        manifest = workspace / 'gate-manifest.json'
+
+        def run(config_home):
+            manifest.write_text(json.dumps({'workspace': str(workspace),
+                                            'config_home': str(config_home)}))
+            log = root / (config_home.name + '.log')
+            code = native.launch([sys.executable, '-I', '-u', __file__,
+                                  '--runtime-gate', str(manifest)],
+                                 sid, workspace, log)
+            text = log.read_text(errors='replace')
+            print(text, flush=True)
+            checks = []
+            for line in text.splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and 'check' in entry:
+                    checks.append(entry)
+            return code, checks
+
+        def failures(checks):
+            return {c['check'] for c in checks if c['status'] != 'pass'}
+
+        code, checks = run(credential_tree('protected'))
+        self.assertTrue(checks, 'the gate produced no checks')
+        self.assertEqual(failures(checks), set(), checks)
+        self.assertEqual(code, 0, 'the protected gate did not pass')
+
+        # Directory still private, file opened to the package: only the old
+        # probe's blind spot can hide this, so it is the decisive control.
+        code, checks = run(credential_tree(
+            'file-open', file_ace='(A;;FR;;;%s)' % package))
+        self.assertEqual(code, 1)
+        self.assertEqual(failures(checks), {'credential file unreadable'},
+                         checks)
+
+        # No file yet, directory opened for create: the absent-file path and
+        # the create denial are the two claims still under test.
+        code, checks = run(credential_tree(
+            'fresh', tokens=None, directory_ace='(A;;0x2;;;%s)' % package))
+        self.assertEqual(code, 1)
+        self.assertEqual(failures(checks), {'cannot create credentials'},
+                         checks)
+        detail = {c['check']: c['detail'] for c in checks}.get(
+            'credential file', '')
+        self.assertIn('no credential file exists yet', detail,
+                      'the absent-file path was not exercised: %r' % detail)
+
     def test_same_user_containment(self):
         native = AppContainers()
         details = native.token_details(include_groups=True)
@@ -2634,6 +2780,8 @@ if __name__ == '__main__':
             native, primitives, ExtendedStartups, ProcessInfos)
         escape_helpers['witness'](api, manifest, report, access_outcome)
         sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == '--runtime-gate':
+        sys.exit(runtime_gate(sys.argv[2]))
     if len(sys.argv) == 3 and sys.argv[1] in ('--contained', '--descendant'):
         sys.exit(contained(sys.argv[2], sys.argv[1] == '--descendant'))
     if len(sys.argv) == 3 and sys.argv[1] == '--standard-user':
