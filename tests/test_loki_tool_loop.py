@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import socket
 import subprocess
 import sys
@@ -140,7 +141,8 @@ class TerminalImageCommandTests(unittest.TestCase):
                 "picture.dat", base_dir=tmpdir)
             path.write_bytes(b"changed later")
 
-        self.assertEqual(image.path, os.path.realpath(path))
+        self.assertEqual(
+            os.path.realpath(image.path), os.path.realpath(path))
         self.assertEqual(image.media_type, "image/png")
         self.assertEqual(image.byte_size, len(data))
         self.assertEqual(
@@ -184,9 +186,9 @@ class TerminalImageCommandTests(unittest.TestCase):
                     "unsupported image data"):
                 terminal_frontend.load_image_attachment(
                     str(text_path), base_dir=tmpdir)
-            with self.assertRaisesRegex(
-                    terminal_frontend.ImageAttachmentError,
-                    "not a regular file"):
+            # A directory is refused on both platforms; Windows reports it
+            # through the denied open, so only the contract is asserted here.
+            with self.assertRaises(terminal_frontend.ImageAttachmentError):
                 terminal_frontend.load_image_attachment(
                     tmpdir, base_dir=tmpdir)
             with self.assertRaisesRegex(
@@ -4235,13 +4237,16 @@ class ChatLogPathTests(unittest.TestCase):
         )
 
     def test_path_like_resume_arguments_stay_explicit(self):
+        # normpath on both sides: the argument keeps its own separators.
         self.assertEqual(
-            loki.resolve_chat_log_path("./chat-abc.json"),
-            os.path.join(loki.STARTUP_CWD, "./chat-abc.json"),
+            os.path.normpath(loki.resolve_chat_log_path("./chat-abc.json")),
+            os.path.normpath(
+                os.path.join(loki.STARTUP_CWD, "./chat-abc.json")),
         )
         self.assertEqual(
-            loki.resolve_chat_log_path("logs/chat-abc.json"),
-            os.path.join(loki.STARTUP_CWD, "logs", "chat-abc.json"),
+            os.path.normpath(loki.resolve_chat_log_path("logs/chat-abc.json")),
+            os.path.normpath(
+                os.path.join(loki.STARTUP_CWD, "logs", "chat-abc.json")),
         )
 
     def test_new_chat_log_path_uses_local_loki_chat_directory(self):
@@ -4265,7 +4270,8 @@ class ChatLogPathTests(unittest.TestCase):
                 loki.new_chat_log(path)
 
                 self.assertTrue(os.path.isdir(os.path.dirname(path)))
-                self.assertEqual(loki.current_chat_log_path(), path)
+                self.assertEqual(
+                    loki.current_chat_log_path(), os.path.realpath(path))
                 self.assertTrue(loki.current_session().chat_log_dirty)
                 self.assertFalse(os.path.exists(path))
         finally:
@@ -4506,10 +4512,13 @@ class ShellCwdTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 loki.change_shell_cwd(tmpdir)
+                resolved = os.path.realpath(tmpdir)
 
-                self.assertEqual(loki.current_cwd(), tmpdir)
+                self.assertEqual(loki.current_cwd(), resolved)
                 self.assertEqual(os.getcwd(), process_cwd)
-                self.assertEqual(loki._resolve_path("file.txt"), os.path.join(tmpdir, "file.txt"))
+                self.assertEqual(
+                    loki._resolve_path("file.txt"),
+                    os.path.join(resolved, "file.txt"))
         finally:
             restore_loki_state(old_values)
 
@@ -4524,12 +4533,18 @@ class ShellCwdTests(unittest.TestCase):
                 loki.current_session().job_manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
                 loki.change_shell_cwd(workdir)
 
-                result = asyncio.run(loki.run_bash_async("pwd"))
+                # Report a native path rather than the shell's rendering: the
+                # Git Bash pwd prints /c/... which no Windows path comparison
+                # can use.
+                executable = sys.executable.replace(os.sep, "/")
+                result = asyncio.run(loki.run_bash_async(
+                    f"{shlex.quote(executable)} -c "
+                    "\"import os; print(os.getcwd())\""))
                 jobs = list(loki.current_job_manager().jobs.values())
         finally:
             restore_loki_state(old_values)
 
-        self.assertIn("[stdout]\n" + workdir, result)
+        self.assertIn("[stdout]\n" + os.path.realpath(workdir), result)
         self.assertEqual(os.path.basename(jobs[0].stdout_path), "stdout.log")
         self.assertEqual(os.path.basename(jobs[0].stderr_path), "stderr.log")
 
@@ -4556,7 +4571,8 @@ class ShellCwdTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
-        self.assertEqual(blob["session_state"]["shell_cwd"], cwd)
+        self.assertEqual(
+            blob["session_state"]["shell_cwd"], os.path.realpath(cwd))
 
     def test_save_chat_log_persists_connection_without_credential_value(self):
         names = [
@@ -4907,7 +4923,7 @@ class ShellCwdTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmpdir:
                 loki.load_session_state({"shell_cwd": tmpdir})
 
-                self.assertEqual(loki.current_cwd(), tmpdir)
+                self.assertEqual(loki.current_cwd(), os.path.realpath(tmpdir))
         finally:
             restore_loki_state(old_values)
 
