@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from loki_entrypoints import entrypoint
+from loki_entrypoints import entrypoint, seed_container_ledger
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -162,6 +162,7 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
                 'LOKI_MODEL': 'dummy-model',
                 'LOKI_DUMMY_REPLY': 'logging test answer',
             })
+            seed_container_ledger(environment)
             result = subprocess.run(
                 [entrypoint('loki'), '--headless', '--prompt', 'hello'],
                 cwd=directory, env=environment, capture_output=True,
