@@ -70,17 +70,17 @@ class ReaderThreadTests(unittest.TestCase):
             ctypes.cast(read, ctypes.POINTER(wintypes.DWORD)).contents.value = 3
             return True
 
-        with mock.patch.object(host_terminal_windows, "_handle",
+        with mock.patch.object(handle_reader, "_handle",
                                return_value=1), \
-                mock.patch.object(host_terminal_windows, "_CreateEventW",
+                mock.patch.object(handle_reader, "_CreateEventW",
                                   return_value=2), \
                 mock.patch.object(host_terminal_windows,
                                   "_WaitForMultipleObjects",
                                   side_effect=wait_for_objects), \
-                mock.patch.object(host_terminal_windows, "_ReadFile",
+                mock.patch.object(handle_reader, "_ReadFile",
                                   side_effect=read_file), \
-                mock.patch.object(host_terminal_windows, "_SetEvent"), \
-                mock.patch.object(host_terminal_windows, "_CloseHandle"):
+                mock.patch.object(handle_reader, "_SetEvent"), \
+                mock.patch.object(handle_reader, "_CloseHandle"):
             reader = handle_reader.HandleReader(7, _InlineLoop(), queue)
             reader.start()
             reader.thread.join(timeout=5)
@@ -95,15 +95,15 @@ class ReaderThreadTests(unittest.TestCase):
         def wait_for_objects(count, handles, wait_all, timeout):
             return next(waits)
 
-        with mock.patch.object(host_terminal_windows, "_handle",
+        with mock.patch.object(handle_reader, "_handle",
                                return_value=1), \
-                mock.patch.object(host_terminal_windows, "_CreateEventW",
+                mock.patch.object(handle_reader, "_CreateEventW",
                                   return_value=2), \
                 mock.patch.object(host_terminal_windows,
                                   "_WaitForMultipleObjects",
                                   side_effect=wait_for_objects), \
-                mock.patch.object(host_terminal_windows, "_SetEvent"), \
-                mock.patch.object(host_terminal_windows, "_CloseHandle"):
+                mock.patch.object(handle_reader, "_SetEvent"), \
+                mock.patch.object(handle_reader, "_CloseHandle"):
             reader = handle_reader.HandleReader(
                 7, _InlineLoop(), _FakeQueue())
             reader.start()
