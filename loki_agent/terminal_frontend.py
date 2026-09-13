@@ -304,9 +304,15 @@ def _terminal_agent_event(event: dict):
         terminal.reset_colors_and_flags()
         print()
     elif kind == "network_error":
-        _print_text_line(
-            f"\n{computer}: NETWORK ERROR: ", event["error"],
-            multiline=True)
+        # Same bracketing as the other error branches: the leading blank line
+        # stays uncolored, then the label and body carry the error color, and
+        # the reset precedes the final newline so scroll-fill stays neutral.
+        print()
+        terminal.set_background_color(ERROR_COLOR)
+        print(f"{computer}: NETWORK ERROR: ", end="")
+        terminal.write_text(event["error"], multiline=True)
+        terminal.reset_colors_and_flags()
+        print()
     elif kind == "transcript_error":
         terminal.set_background_color(ERROR_COLOR)
         error = event["error"]

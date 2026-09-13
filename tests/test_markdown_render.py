@@ -793,6 +793,43 @@ class TerminalDiagnosticTests(unittest.TestCase):
             terminal_frontend._terminal_agent_event(event)
         self.assertIn("1.250s", "\n".join(logs.output))
 
+    def test_network_error_is_rendered_in_the_error_color(self):
+        calls = []
+
+        class RecordingTerminal:
+            def set_background_color(self, index):
+                calls.append(("set_background_color", index))
+
+            def write_text(self, text, *, multiline=False, file=None):
+                calls.append(("write_text", text))
+                terminals._TerminalTextOutput.write_text(
+                    self, text, multiline=multiline, file=file)
+
+            def reset_colors_and_flags(self):
+                calls.append(("reset_colors_and_flags",))
+
+        output = io.StringIO()
+        with mock.patch.object(
+                terminal_frontend, "terminal", RecordingTerminal()), \
+                contextlib.redirect_stdout(output):
+            terminal_frontend._terminal_agent_event({
+                "type": "network_error",
+                "error": "[Errno -3] Temporary failure in name resolution",
+            })
+
+        self.assertEqual(
+            calls,
+            [
+                ("set_background_color", loki.ERROR_COLOR),
+                ("write_text",
+                 "[Errno -3] Temporary failure in name resolution"),
+                ("reset_colors_and_flags",),
+            ],
+        )
+        self.assertIn(
+            "NETWORK ERROR: [Errno -3] Temporary failure in name resolution",
+            output.getvalue())
+
     def test_hook_stderr_stays_multiline_but_neutralizes_controls(self):
         stderr = io.StringIO()
         stdout = io.StringIO()
