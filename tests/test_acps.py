@@ -410,7 +410,6 @@ class QuarantineTests(unittest.TestCase):
                          {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class EntrypointTests(unittest.TestCase):
     def test_subagent_uses_inherited_worker_authority(self):
         with mock.patch.object(
@@ -441,7 +440,6 @@ class EntrypointTests(unittest.TestCase):
         ])
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class FrontWorkerTests(unittest.TestCase):
     def _front_env(self, tmpdir):
         os.makedirs(
@@ -631,7 +629,14 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
         self.assertNotIn(credential_name, child_environment)
         self.assertNotIn(credential_value, repr(child_environment))
         self.assertTrue(spawned["kwargs"]["close_fds"])
-        self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 2)
+        if os.name == "posix":
+            self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 2)
+        else:
+            # Windows hands the same two ends over in the startup handle list
+            # rather than as inherited descriptors.
+            handles = spawned["kwargs"]["startupinfo"].lpAttributeList[
+                "handle_list"]
+            self.assertEqual(len(handles), 2)
         self.assertIn("--session-owner-fd", spawned["args"])
         self.assertIn("--credential-capability-fd", spawned["args"])
         self.assertTrue(spawned["kwargs"]["start_new_session"])
@@ -896,7 +901,6 @@ class EventMapperTests(unittest.TestCase):
                 acp_events.map_event("s", {"type": kind}, {}), [])
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class UpdateStreamingTests(unittest.TestCase):
     """A tool-call turn must stream session/update notifications."""
 
@@ -965,7 +969,6 @@ class UpdateStreamingTests(unittest.TestCase):
                     front.wait()
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class CancelEndToEndTests(unittest.TestCase):
     """session/cancel mid-turn must yield stopReason "cancelled"."""
 
@@ -1059,7 +1062,6 @@ class CancelEndToEndTests(unittest.TestCase):
                     front.wait()
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class SessionRestoreTests(unittest.TestCase):
     def _front(self, env, cwd):
         process = subprocess.Popen(
@@ -1233,7 +1235,6 @@ class SessionRestoreTests(unittest.TestCase):
             self.assertIn("after minimal resume", persisted)
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class SessionListTests(unittest.TestCase):
     def test_list_reports_saved_sessions_with_cwd(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1320,7 +1321,6 @@ class SessionListTests(unittest.TestCase):
                 front2.wait(timeout=5)
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs subprocess")
 class ConfigOptionTests(unittest.TestCase):
     def test_session_new_returns_model_options(self):
         # The dummy env has no usable catalog credentials, so the option
@@ -2198,8 +2198,12 @@ class WorkerSessionContractTests(unittest.TestCase):
                         [entry["value"] for entry in option["options"]],
                     )
                 self.assertNotEqual(paths[0], paths[1])
+                # Session paths are stored through os.path.realpath; compare
+                # resolved directories, or a differently-spelled temp path
+                # (Windows short names) fails on spelling alone.
+                log_dir = os.path.realpath(loki.CHAT_LOG_DIR)
                 self.assertTrue(all(
-                    os.path.dirname(path) == loki.CHAT_LOG_DIR
+                    os.path.realpath(os.path.dirname(path)) == log_dir
                     for path in paths))
         finally:
             loki._DEFAULT_SESSION = old_session
