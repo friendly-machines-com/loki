@@ -2,10 +2,16 @@
 
 ``JsonCredentialStorage`` is one algorithm over a directory and a few files.
 The parts that differ per platform are opening those files without following a
-symlink, creating/replacing/removing them relative to the directory, and
-describing an open object (is it a regular file, who owns it, is it private);
-those are chosen here once, so the storage code has no platform branch and
-there is no second copy of the algorithm.
+symlink, reading/writing/flushing/closing the open object, creating/replacing/
+removing them relative to the directory, and describing an open object (is it a
+regular file, who owns it, is it private); those are chosen here once, so the
+storage code has no platform branch and there is no second copy of the
+algorithm.
+
+Read, write, fsync and close live in the platform module rather than here
+because the token they operate on is the platform's: a POSIX descriptor is an
+``int`` that ``os.*`` understands, a Windows handle is not, so a single
+``os.read`` for both would be wrong on one of them.
 
 The description is a :class:`FileFacts` record rather than a ``stat_result``:
 a POSIX descriptor has mode bits and a uid, while a Windows handle has
@@ -20,7 +26,6 @@ storage re-exports it, so importers are unaffected.
 
 from __future__ import annotations
 
-import os
 import sys
 from dataclasses import dataclass
 
@@ -41,43 +46,35 @@ class CredentialStorageError(RuntimeError):
     pass
 
 
-def read(fd, size):
-    return os.read(fd, size)
-
-
-def write(fd, data):
-    return os.write(fd, data)
-
-
-def fsync(fd) -> None:
-    os.fsync(fd)
-
-
-def close(fd) -> None:
-    os.close(fd)
-
-
 if sys.platform == "win32":
     from ._credential_files_windows import (
+        close,
         create_exclusive_at,
         describe,
         describe_path,
+        fsync,
         open_directory,
         open_lock_file_at,
         open_read_at,
+        read,
         replace_at,
         unlink_at,
+        write,
     )
 else:
     from ._credential_files_posix import (
+        close,
         create_exclusive_at,
         describe,
         describe_path,
+        fsync,
         open_directory,
         open_lock_file_at,
         open_read_at,
+        read,
         replace_at,
         unlink_at,
+        write,
     )
 
 

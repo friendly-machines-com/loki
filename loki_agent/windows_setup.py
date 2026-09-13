@@ -49,6 +49,7 @@ from . import paths
 from . import windows_api
 from . import windows_containers
 from . import windows_verify
+from .windows_acl import names_package
 from .windows_state import (
     Access,
     Backend,
@@ -62,7 +63,6 @@ from .windows_state import (
     ledger_entry,
     ledger_path,
     load_ledger,
-    names_package,
     remove_package_aces,
     save_ledger,
     workspace_key,

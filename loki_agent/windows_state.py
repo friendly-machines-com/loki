@@ -15,7 +15,6 @@ import enum
 import hashlib
 import json
 import os
-import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -23,20 +22,11 @@ from typing import Protocol
 
 from . import paths
 from . import windows_api
-from .windows_api import (
-    ACCESS_SYSTEM_SECURITY,
-    DELETE,
-    FILE_ALL_ACCESS,
-    FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE,
-    READ_CONTROL,
-    SYNCHRONIZE,
-    WRITE_DAC,
-    WRITE_OWNER,
+from .windows_acl import (
+    dacl_parts,
+    package_access,
+    rights_mask,
 )
-
-
 LEDGER_VERSION = 1
 PROFILE_NAME_PREFIX = "Loki.Workspace."
 
@@ -54,55 +44,6 @@ class Access(enum.Enum):
     READ_WRITE = "read-write"
 
 
-# SDDL file-object rights strings (Ace Strings reference) and their masks.
-# The numeric rights come from ``windows_api`` so the probe and this table
-# cannot disagree about what a right means; the generic codes are expanded
-# here to the file rights the kernel maps them to, so an ACE that literally
-# stores ``GR`` is judged by the access it actually confers.
-_RIGHTS = {
-    "FA": FILE_ALL_ACCESS,
-    "FR": FILE_GENERIC_READ,
-    "FW": FILE_GENERIC_WRITE,
-    "FX": FILE_GENERIC_EXECUTE,
-    "GA": FILE_ALL_ACCESS,
-    "GR": FILE_GENERIC_READ,
-    "GW": FILE_GENERIC_WRITE,
-    "GX": FILE_GENERIC_EXECUTE,
-    "RC": READ_CONTROL,
-    "SD": DELETE,
-    "WD": WRITE_DAC,
-    "WO": WRITE_OWNER,
-    "SY": SYNCHRONIZE,
-    "AS": ACCESS_SYSTEM_SECURITY,
-}
-
-
-def _rights_mask(rights: str) -> int:
-    """Parse an SDDL rights field to a numeric access mask.
-
-    Refuse an unknown string instead of under-counting it: this result decides
-    whether a grant is present, so guessing low would turn a real grant into a
-    false "no access".
-    """
-    if rights[:2].lower() == "0x":
-        try:
-            return int(rights, 16)
-        except ValueError as error:
-            raise windows_api.WindowsApiError(
-                f"malformed SDDL rights {rights!r}") from error
-    if not rights or len(rights) % 2:
-        raise windows_api.WindowsApiError(
-            f"unsupported SDDL rights {rights!r}")
-    mask = 0
-    for index in range(0, len(rights), 2):
-        code = rights[index:index + 2]
-        if code not in _RIGHTS:
-            raise windows_api.WindowsApiError(
-                f"unsupported SDDL rights {rights!r}")
-        mask |= _RIGHTS[code]
-    return mask
-
-
 def access_sddl(access: Access) -> str:
     """Return the DACL rights for a level.
 
@@ -117,7 +58,7 @@ def access_sddl(access: Access) -> str:
 
 def access_mask(access: Access) -> int:
     """The numeric rights a level means, derived from :func:`access_sddl`."""
-    return _rights_mask(access_sddl(access))
+    return rights_mask(access_sddl(access))
 
 
 # -- path rules ----------------------------------------------------------
@@ -301,21 +242,9 @@ def entry_grants(entry: dict) -> list[Grant]:
 # exactly it again), because replacing the DACL of someone's project directory
 # would be repairing their permissions, which this project does not do.
 
-def _dacl_parts(sddl: str):
-    """Parse basic DACL SDDL; refuse unsupported forms rather than corrupt them."""
-    header, separator, rest = sddl.partition("(")
-    if not re.fullmatch(r"D:(?:P|AI|AR)*", header):
-        raise windows_api.WindowsApiError("unsupported DACL header")
-    body = separator + rest
-    aces = re.findall(r"\([^()]*\)", body)
-    if ''.join(aces) != body or any(len(ace[1:-1].split(';')) != 6 for ace in aces):
-        raise windows_api.WindowsApiError("unsupported or malformed DACL ACE")
-    return header, aces
-
-
 def add_package_ace(sddl: str, package: str, access: Access) -> str:
     """Replace this profile's explicit allow ACEs, preserving other entries."""
-    header, aces = _dacl_parts(remove_package_aces(sddl, package))
+    header, aces = dacl_parts(remove_package_aces(sddl, package))
     # Explicit entries precede inherited ones. Inserting after inherited denies
     # would make the DACL noncanonical even though the new entry is an allow.
     index = next((i for i, ace in enumerate(aces)
@@ -330,7 +259,7 @@ def remove_package_aces(sddl: str, package: str) -> str:
     An inherited allow must be changed at its source. Refuse rather than
     disabling inheritance or claiming to revoke a right the parent still gives.
     """
-    header, aces = _dacl_parts(sddl)
+    header, aces = dacl_parts(sddl)
     kept = []
     for ace in aces:
         kind, flags, _rights, _object, _inherited_object, sid = ace[1:-1].split(';')
@@ -341,98 +270,6 @@ def remove_package_aces(sddl: str, package: str) -> str:
             continue
         kept.append(ace)
     return header + ''.join(kept)
-
-
-def _ace_fields(sddl: str):
-    """Yield ``(kind, flags, rights, object, inherited_object, sid)`` per ACE.
-
-    Naming an ACE's fields lets a caller tell an allow from a deny and a SID
-    from a rights string without assuming basic (non-object) ACEs: object and
-    inherited-object GUIDs occupy the same columns, and the SID is always last.
-    """
-    _header, aces = _dacl_parts(sddl)
-    for ace in aces:
-        yield tuple(ace[1:-1].split(';'))
-
-
-def _flag_codes(flags: str) -> set[str]:
-    """Split an ACE-flags field into its two-character codes."""
-    if len(flags) % 2:
-        raise windows_api.WindowsApiError(f"unsupported ACE flags {flags!r}")
-    return {flags[index:index + 2] for index in range(0, len(flags), 2)}
-
-
-def names_package(sddl: str, package: str) -> bool:
-    """Whether any ACE in ``sddl`` names ``package``, allow or deny.
-
-    Presence only, for deciding whether an edit has anything to touch; it says
-    nothing about access, which is :func:`package_access`'s question.
-    """
-    return any(sid == package
-               for _kind, _flags, _rights, _object, _inherited, sid
-               in _ace_fields(sddl))
-
-
-def _ace_mask(kind, rights, obj, inherited):
-    """The access mask an ACE grants or denies, or ``None`` if it does neither.
-
-    Object ACEs with a GUID restrict the entry to a property or object type,
-    which this check cannot evaluate; refuse rather than assume the mask
-    applies unqualified.
-    """
-    if kind in ("A", "D"):
-        return _rights_mask(rights)
-    if kind in ("OA", "OD"):
-        if obj or inherited:
-            raise windows_api.WindowsApiError(
-                "cannot evaluate an object ACE for the package SID")
-        return _rights_mask(rights)
-    return None
-
-
-def package_access(sddl: str, package: str) -> int:
-    """The rights ``sddl`` actually confers on ``package``.
-
-    This is the ACL's own answer for one trustee: the union of the allow masks
-    that apply to the object, minus the union of the deny masks that apply to
-    it.  An inherit-only ACE (``IO``) applies only to children and is not
-    counted; an inherited ACE (``ID``) does apply and is.  Audit, alarm and
-    mandatory-label entries neither grant nor deny and are skipped.  Group
-    membership and implicit owner rights are outside this computation, which
-    answers only what the DACL says about this SID.
-    """
-    allowed = denied = 0
-    for kind, flags, rights, obj, inherited, sid in _ace_fields(sddl):
-        if sid != package or "IO" in _flag_codes(flags):
-            continue
-        mask = _ace_mask(kind, rights, obj, inherited)
-        if mask is None:
-            continue
-        if kind in ("D", "OD"):
-            denied |= mask
-        else:
-            allowed |= mask
-    return allowed & ~denied
-
-
-def package_allow(sddl: str, package: str) -> int:
-    """The allow rights any ACE naming ``package`` could confer.
-
-    Unlike :func:`package_access`, inherit-only allows are counted: an entry
-    that grants only children still hands the package the contents of a
-    protected tree, so the private-tree check must not read the tree's own
-    DACL as clearing an inheritable grant.  Deny entries alone contribute
-    nothing, which is what keeps a deny-only DACL from being reported as a
-    grant.
-    """
-    allowed = 0
-    for kind, _flags, rights, obj, inherited, sid in _ace_fields(sddl):
-        if sid != package:
-            continue
-        mask = _ace_mask(kind, rights, obj, inherited)
-        if mask is not None and kind in ("A", "OA"):
-            allowed |= mask
-    return allowed
 
 
 def grants_access(sddl: str, package: str, access: Access) -> bool:

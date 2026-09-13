@@ -65,3 +65,25 @@ def replace_at(directory_fd: int, temporary: str, name: str) -> None:
 
 def unlink_at(directory_fd: int, name: str) -> None:
     os.unlink(name, dir_fd=directory_fd)
+
+
+# -- descriptor operations ------------------------------------------------
+# The token on this platform is an integer descriptor, so these are ``os.*``.
+# They are functions rather than aliases so a test can still intercept the
+# call the storage makes (``credential_storages`` swaps one descriptor for an
+# invalid one to prove it was closed).
+
+def read(fd, size):
+    return os.read(fd, size)
+
+
+def write(fd, data):
+    return os.write(fd, data)
+
+
+def fsync(fd) -> None:
+    os.fsync(fd)
+
+
+def close(fd) -> None:
+    os.close(fd)
