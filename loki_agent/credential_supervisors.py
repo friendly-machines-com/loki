@@ -58,6 +58,10 @@ class CredentialSupervisor:
     async def run_terminal_runtime(
             self, executable: str, arguments: list[str]) -> int:
         """Run one terminal/headless child while serving its credentials."""
+        workspace = None
+        if os.name == "nt":
+            from . import windows_runtime
+            workspace = windows_runtime.configured_workspace(arguments)
         delegation = await self.delegate()
         process = None
         try:
@@ -68,12 +72,18 @@ class CredentialSupervisor:
                 "--",
                 *arguments,
             ]
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                close_fds=True,
-                env=self.environment,
-                **delegation.child_spawn_kwargs(),
-            )
+            if workspace is not None:
+                process = windows_runtime.launch(
+                    executable, command[1:], self.environment, workspace,
+                    [host_ipc.reference(delegation.owner_child),
+                     host_ipc.reference(delegation.credential_child)])
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    close_fds=True,
+                    env=self.environment,
+                    **delegation.child_spawn_kwargs(),
+                )
             delegation.child_spawned()
             return await process.wait()
         finally:
@@ -81,26 +91,31 @@ class CredentialSupervisor:
             # terminal child observes owner EOF and gets a chance to restore
             # raw tty state itself. Sending SIGTERM immediately would race
             # that cleanup and could leave the caller's terminal damaged.
-            delegation.revoke_now()
-            if process is not None and process.returncode is None:
-                wait_task = asyncio.create_task(
-                    process.wait(), name="loki-runtime-shutdown")
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(wait_task), timeout=2)
-                except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.terminate()
+            try:
+                delegation.revoke_now()
+                if process is not None and process.returncode is None:
+                    wait_task = asyncio.create_task(
+                        process.wait(), name="loki-runtime-shutdown")
                     try:
                         await asyncio.wait_for(
                             asyncio.shield(wait_task), timeout=2)
                     except asyncio.TimeoutError:
                         with contextlib.suppress(ProcessLookupError):
-                            process.kill()
-                        await wait_task
-            # Awaited capability cleanup serializes refresh cancellation with
-            # the supervisor's lifecycle transition.
-            await delegation.close()
+                            process.terminate()
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(wait_task), timeout=2)
+                        except asyncio.TimeoutError:
+                            with contextlib.suppress(ProcessLookupError):
+                                process.kill()
+                            await wait_task
+            finally:
+                # Cleanup must also run when waiting or termination fails.
+                try:
+                    await delegation.close()
+                finally:
+                    if workspace is not None and process is not None:
+                        process.close()
 
 
 @dataclass

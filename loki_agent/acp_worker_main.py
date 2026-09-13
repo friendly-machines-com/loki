@@ -12,6 +12,7 @@ import os
 import sys
 
 from . import credential_capabilities, credential_runtimes, host_ipc
+from .windows_api import WindowsApiError
 from .process_protections import (
     ProcessProtectionError,
     protect_credential_process,
@@ -156,12 +157,16 @@ def main() -> int:
         # This is the worker's earliest trusted startup phase. Establish its
         # filesystem view before importing the agent runtime, then make the
         # final credential-consuming process non-dumpable.
-        isolate_credential_directory()
+        if os.name == "nt":
+            from .windows_runtime import verify_runtime
+            verify_runtime()
+        else:
+            isolate_credential_directory()
         protect_credential_process()
     except ValueError as error:
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
-    except (ProcessProtectionError, RuntimeIsolationError) as error:
+    except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError) as error:
         print(f"Security initialization error: {error}", file=sys.stderr)
         return 2
     if not configure_logging():
