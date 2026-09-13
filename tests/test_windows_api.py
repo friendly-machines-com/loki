@@ -322,7 +322,10 @@ class AppContainerLaunchTests(unittest.TestCase):
         }
         with mock.patch.object(
                 windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]):
+                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
+                mock.patch.object(
+                    windows_api, "drive_environment_entries",
+                    return_value=[]):
             information = windows_api.create_process_in_app_container(
                 "loki.exe", ["--runtime", "x"], "S-1-15-2-1")
 
@@ -389,7 +392,10 @@ class AppContainerLaunchTests(unittest.TestCase):
         }
         with mock.patch.object(
                 windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]):
+                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
+                mock.patch.object(
+                    windows_api, "drive_environment_entries",
+                    return_value=[]):
             windows_api.create_process_in_app_container(
                 "loki.exe", ["--runtime"], "S-1-15-2-1",
                 inherited_handles=[0x11])
@@ -400,6 +406,58 @@ class AppContainerLaunchTests(unittest.TestCase):
             [attribute for _, attribute in seen["attributes"]],
             [windows_api.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
              windows_api.PROC_THREAD_ATTRIBUTE_HANDLE_LIST])
+
+    def test_environment_block_carries_the_drive_entries_first(self):
+        seen = {}
+
+        def convert_sid(string_sid, out):
+            ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 0xABCD
+            return True
+
+        def initialize(attribute_list, count, flags, size):
+            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = 256
+            return attribute_list is not None
+
+        def update(*arguments):
+            return True
+
+        def create(application, command_line, process_attributes,
+                   thread_attributes, inherit, flags, environment, directory,
+                   startup, information):
+            seen["environment"] = bytes(environment)
+            process = ctypes.cast(
+                information,
+                ctypes.POINTER(windows_api.ProcessInformation)).contents
+            process.hProcess = 1
+            process.hThread = 2
+            process.dwProcessId = 3
+            return True
+
+        fakes = {
+            "ConvertStringSidToSidW": convert_sid,
+            "LocalFree": lambda pointer: None,
+            "InitializeProcThreadAttributeList": initialize,
+            "UpdateProcThreadAttribute": update,
+            "DeleteProcThreadAttributeList": lambda attribute_list: None,
+            "CreateProcessW": create,
+        }
+        with mock.patch.object(
+                windows_api, "bind",
+                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
+                mock.patch.object(
+                    windows_api, "drive_environment_entries",
+                    return_value=["=C:=C:\\work"]):
+            windows_api.create_process_in_app_container(
+                "loki.exe", ["--runtime"], "S-1-15-2-1",
+                environment={"Path": "C:\\bin"})
+
+        # wchar_t is 2 bytes on Windows and 4 on this host; the drive entry
+        # precedes the named ones.
+        width = ctypes.sizeof(ctypes.c_wchar)
+        encoding = "utf-16-le" if width == 2 else "utf-32-le"
+        text = seen["environment"].decode(encoding)
+        self.assertTrue(text.startswith("=C:=C:\\work\0"), repr(text))
+        self.assertIn("Path=C:\\bin", text)
 
 
 class FileAccessTests(unittest.TestCase):
