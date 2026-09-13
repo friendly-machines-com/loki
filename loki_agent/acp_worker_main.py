@@ -12,15 +12,13 @@ import os
 import sys
 
 from . import credential_capabilities, credential_runtimes, host_ipc
+from . import runtime_isolation
 from .windows_api import WindowsApiError
 from .process_protections import (
     ProcessProtectionError,
     protect_credential_process,
 )
-from .runtime_isolations import (
-    RuntimeIsolationError,
-    isolate_credential_directory,
-)
+from .runtime_isolation import RuntimeIsolationError
 
 
 async def amain(owner_fd: int, capability_fd: int) -> int:
@@ -157,11 +155,7 @@ def main() -> int:
         # This is the worker's earliest trusted startup phase. Establish its
         # filesystem view before importing the agent runtime, then make the
         # final credential-consuming process non-dumpable.
-        if os.name == "nt":
-            from .windows_runtime import verify_runtime
-            verify_runtime()
-        else:
-            isolate_credential_directory()
+        runtime_isolation.isolate_runtime()
         protect_credential_process()
     except ValueError as error:
         print(f"Configuration error: {error}", file=sys.stderr)

@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import sys
 import types
 import unittest
 from unittest import mock
@@ -55,27 +56,53 @@ class GateTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
-    def test_failed_probe_stops_before_process_protection(self):
+    def test_failed_isolation_stops_before_process_protection(self):
         from loki_agent import __main__ as entry
-        with mock.patch.object(entry, 'os', types.SimpleNamespace(name='nt')), \
-                mock.patch.object(runtime, 'verify_runtime',
-                                  side_effect=RuntimeIsolationError('denied')), \
-                mock.patch.object(entry, 'protect_credential_process') as protect, \
-                mock.patch.object(entry, 'isolate_credential_directory') as isolate:
+        with mock.patch.object(
+                entry.runtime_isolation, 'isolate_runtime',
+                side_effect=RuntimeIsolationError('denied')) as isolate, \
+                mock.patch.object(entry, 'protect_credential_process') as protect:
             with self.assertRaises(RuntimeIsolationError):
                 entry._protect_runtime()
+        isolate.assert_called_once_with()
         protect.assert_not_called()
-        isolate.assert_not_called()
 
-    def test_windows_verifies_instead_of_linux_isolation(self):
+    def test_isolation_precedes_process_protection(self):
         from loki_agent import __main__ as entry
-        with mock.patch.object(entry, 'os', types.SimpleNamespace(name='nt')), \
-                mock.patch.object(runtime, 'verify_runtime') as verify, \
-                mock.patch.object(entry, 'protect_credential_process'), \
-                mock.patch.object(entry, 'isolate_credential_directory') as isolate:
+        calls = []
+
+        def isolate():
+            calls.append('isolate')
+
+        def protect():
+            calls.append('protect')
+            return True
+
+        with mock.patch.object(entry.runtime_isolation, 'isolate_runtime',
+                               side_effect=isolate), \
+                mock.patch.object(entry, 'protect_credential_process',
+                                  side_effect=protect):
             entry._protect_runtime()
+
+        self.assertEqual(calls, ['isolate', 'protect'])
+
+
+@unittest.skipUnless(sys.platform == "win32",
+                     "Windows selection inside the runtime_isolation seam")
+class IsolationSeamTests(unittest.TestCase):
+    def test_isolate_runtime_verifies_the_token(self):
+        from loki_agent import runtime_isolation
+        with mock.patch.object(runtime_isolation.windows_runtime,
+                               'verify_runtime') as verify:
+            runtime_isolation.isolate_runtime()
         verify.assert_called_once_with()
-        isolate.assert_not_called()
+
+    def test_verify_contained_runtime_rechecks_the_token(self):
+        from loki_agent import runtime_isolation
+        with mock.patch.object(runtime_isolation.windows_runtime,
+                               'verify_runtime') as verify:
+            runtime_isolation.verify_contained_runtime()
+        verify.assert_called_once_with()
 
 
 class LaunchTests(unittest.TestCase):
