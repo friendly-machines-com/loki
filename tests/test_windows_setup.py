@@ -520,6 +520,31 @@ class ConfigureCommandTests(unittest.TestCase):
         self.assertIn("needs a workspace", error.getvalue())
 
 
+class ContainerWorkspaceTests(unittest.TestCase):
+    """A configured workspace covers the directories beneath it."""
+
+    @staticmethod
+    def ledger(*workspaces):
+        return {"workspaces": {
+            windows_state.workspace_key(workspace): {"profile": "p", "grants": [{}]}
+            for workspace in workspaces}}
+
+    def test_the_nearest_configured_ancestor_covers_a_directory(self):
+        blob = self.ledger("/work", "/work/tools")
+
+        self.assertEqual(
+            windows_state.container_workspace("/work/tools/project", blob),
+            windows_state.workspace_key("/work/tools"))
+
+    def test_a_shared_text_prefix_is_not_an_ancestor(self):
+        self.assertIsNone(
+            windows_state.container_workspace("/workshop", self.ledger("/work")))
+
+    def test_an_unconfigured_directory_has_no_container(self):
+        self.assertIsNone(
+            windows_state.container_workspace("/elsewhere", self.ledger("/work")))
+
+
 class DescribePlanTests(unittest.TestCase):
     def plan(self, *changes, warnings=(), errors=()):
         return windows_setup.Plan("/p", "profile", list(changes),
