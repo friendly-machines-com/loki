@@ -2159,6 +2159,21 @@ class AppContainerTests(unittest.TestCase):
             native.acl(home, traverse)
             native.acl(home / 'loki', traverse)
             native.acl(credentials, private_dacl(owner) + directory_ace)
+            # Record the levels each denial must be read against. The contained
+            # process is Low integrity, so a write right on this Medium-integrity
+            # directory is refused by mandatory policy whatever the DACL grants
+            # -- the same write-up distinction the escape probes record, and the
+            # reason a granted create right can still read as denied.
+            label_handle = native.open(credentials, access=0x20000,
+                                       flags=0x02000000)  # READ_CONTROL|BACKUP
+            try:
+                directory_label = native.mandatory_label(label_handle)
+            finally:
+                native.check(native.close(label_handle))
+            print(json.dumps({'probe': 'gate-integrity-labels', 'tree': label,
+                              'broker_integrity': native.integrity_level(),
+                              'directory_label': directory_label,
+                              'directory_ace': directory_ace}), flush=True)
             if tokens is not None:
                 target = credentials / 'tokens.json'
                 target.write_bytes(tokens)
