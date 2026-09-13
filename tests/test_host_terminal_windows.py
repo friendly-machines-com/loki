@@ -74,7 +74,7 @@ class ReaderThreadTests(unittest.TestCase):
                                return_value=1), \
                 mock.patch.object(handle_reader, "_CreateEventW",
                                   return_value=2), \
-                mock.patch.object(host_terminal_windows,
+                mock.patch.object(handle_reader,
                                   "_WaitForMultipleObjects",
                                   side_effect=wait_for_objects), \
                 mock.patch.object(handle_reader, "_ReadFile",
@@ -99,7 +99,7 @@ class ReaderThreadTests(unittest.TestCase):
                                return_value=1), \
                 mock.patch.object(handle_reader, "_CreateEventW",
                                   return_value=2), \
-                mock.patch.object(host_terminal_windows,
+                mock.patch.object(handle_reader,
                                   "_WaitForMultipleObjects",
                                   side_effect=wait_for_objects), \
                 mock.patch.object(handle_reader, "_SetEvent"), \
