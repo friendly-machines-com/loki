@@ -108,6 +108,22 @@ class PrivatePipePairTests(unittest.TestCase):
 
 class SocketPairTests(unittest.TestCase):
     def test_the_pair_is_connected_in_both_directions(self):
+        if os.name != "posix":
+            # Two anonymous pipes: the parent end carries the request read and
+            # the response write, the child end the complementary two, and only
+            # the parent ends have inheritance cleared.
+            created = iter([(0x10, 0x11), (0x12, 0x13)])
+            cleared = []
+            with mock.patch.object(host_ipc.windows_api, "create_pipe",
+                                   side_effect=lambda: next(created)), \
+                    mock.patch.object(host_ipc.windows_api,
+                                      "clear_handle_inheritance",
+                                      side_effect=cleared.append):
+                parent, child = host_ipc.socket_pair()
+            self.assertEqual(parent.handles(), (0x10, 0x13))
+            self.assertEqual(child.handles(), (0x12, 0x11))
+            self.assertEqual(cleared, [0x10, 0x13])
+            return
         first, second = host_ipc.socket_pair()
         self.addCleanup(first.close)
         self.addCleanup(second.close)
@@ -120,6 +136,19 @@ class SocketPairTests(unittest.TestCase):
 
 class OwnerChannelTests(unittest.TestCase):
     def test_closing_the_parent_end_is_eof_for_the_child(self):
+        if os.name != "posix":
+            import msvcrt
+            parent_end, child_end = host_ipc.owner_channel()
+            # The child owns only the read end; the fd takes ownership of that
+            # handle, so the endpoint must not close it a second time.
+            fd = msvcrt.open_osfhandle(child_end.read, os.O_RDONLY)
+            child_end.read = None
+            try:
+                host_ipc.close_end(parent_end)
+                self.assertEqual(os.read(fd, 1), b"")
+            finally:
+                os.close(fd)
+            return
         parent_end, child_end = host_ipc.owner_channel()
         self.addCleanup(os.close, child_end)
 
@@ -130,6 +159,12 @@ class OwnerChannelTests(unittest.TestCase):
 
 class ReferenceTests(unittest.TestCase):
     def test_a_reference_names_the_child_end(self):
+        if os.name != "posix":
+            endpoint = host_ipc.PipeEndpoint(read=0x11, write=0x22)
+            value = host_ipc.reference(endpoint)
+            self.assertEqual(
+                host_ipc.child_endpoint(value).handles(), (0x11, 0x22))
+            return
         reader, writer = os.pipe()
         self.addCleanup(os.close, reader)
         self.addCleanup(os.close, writer)
@@ -140,6 +175,12 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(host_ipc.child_endpoint(str(value)), reader)
 
     def test_spawn_kwargs_hand_the_references_over(self):
+        if os.name != "posix":
+            endpoint = host_ipc.PipeEndpoint(read=0x21, write=0x22)
+            startup = host_ipc.spawn_kwargs((endpoint,))["startupinfo"]
+            self.assertEqual(
+                startup.lpAttributeList["handle_list"], [0x21, 0x22])
+            return
         self.assertEqual(host_ipc.spawn_kwargs((4, 7)), {"pass_fds": (4, 7)})
 
     def test_a_descriptor_that_was_not_inherited_is_rejected(self):
@@ -181,6 +222,10 @@ class PipeEndpointTests(unittest.TestCase):
         self.assertFalse(host_ipc.is_endpoint(None))
 
     def test_a_descriptor_reports_one_handle(self):
+        if os.name != "posix":
+            self.assertEqual(
+                host_ipc.handles(host_ipc.PipeEndpoint(read=4)), (4,))
+            return
         # POSIX path: spawn_kwargs flattens this to pass_fds.
         self.assertEqual(host_ipc.handles(4), (4,))
 
