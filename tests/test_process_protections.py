@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -55,7 +56,35 @@ class ProcessProtectionTests(unittest.TestCase):
             ],
         )
 
-    def test_real_linux_process_reports_non_dumpable(self):
+    def test_real_process_reports_protection(self):
+        if os.name == "nt":
+            # Windows has no prctl; the protection is the process object's
+            # DACL, so a child applies it and reports its own process DACL.
+            code = (
+                "import json\n"
+                "from loki_agent import process_protections, windows_api\n"
+                "process_protections.protect_credential_process()\n"
+                "print(json.dumps({'dacl': windows_api.handle_dacl_sddl(\n"
+                "    windows_api.current_process_handle(),\n"
+                "    windows_api.SE_KERNEL_OBJECT)}))\n"
+            )
+            process = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            dacl = json.loads(process.stdout)["dacl"]
+            self.assertIsNotNone(dacl)
+            # Only the owner, SYSTEM and the Administrators hold full control;
+            # the inherited Everyone/Users grants are gone.
+            self.assertIn("SY", dacl)
+            self.assertIn("BA", dacl)
+            self.assertNotIn("WD", dacl)
+            self.assertNotIn("BU", dacl)
+            return
         code = (
             "import ctypes\n"
             "from loki_agent import process_protections\n"

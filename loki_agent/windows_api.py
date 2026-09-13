@@ -162,6 +162,9 @@ PROFILE_ALREADY_EXISTS = 0x800700B7
 DACL_SECURITY_INFORMATION = 0x00000004
 PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 SE_FILE_OBJECT = 1
+# SE_OBJECT_TYPE for kernel objects (processes, threads, jobs, ...), used when
+# a process object's DACL is replaced rather than a file's.
+SE_KERNEL_OBJECT = 6
 SDDL_REVISION_1 = 1
 ERROR_SUCCESS = 0
 TOKEN_QUERY = 0x0008
@@ -285,18 +288,20 @@ def handle_owner_sid(handle) -> str:
         local_free(descriptor)
 
 
-def handle_dacl_sddl(handle):
+def handle_dacl_sddl(handle, object_type: int = SE_FILE_OBJECT):
     """Return the DACL of the object ``handle`` refers to, as SDDL, or ``None``.
 
     ``None`` means the object has no DACL, which grants everyone full access:
     a caller must read that as "not private", never as "no grant".
+    ``object_type`` selects the kind of object -- a file by default, or
+    ``SE_KERNEL_OBJECT`` for a process.
     """
     get = _get_security_info()
     local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
                       ctypes.c_void_p)
     dacl = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
-    status = get(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+    status = get(handle, object_type, DACL_SECURITY_INFORMATION,
                  None, None, ctypes.byref(dacl), None,
                  ctypes.byref(descriptor))
     if status != ERROR_SUCCESS:
@@ -310,13 +315,15 @@ def handle_dacl_sddl(handle):
         local_free(descriptor)
 
 
-def set_handle_dacl(handle, sddl: str) -> None:
+def set_handle_dacl(handle, sddl: str, object_type: int = SE_FILE_OBJECT) -> None:
     """Replace the DACL of the object ``handle`` refers to.
 
     Handle-based on purpose: a temporary file whose *name* is replaced between
     creation and this call cannot redirect the change to a different object,
     which is what the POSIX code achieves by setting the mode through the open
-    descriptor rather than by pathname.
+    descriptor rather than by pathname.  ``object_type`` selects the kind of
+    object -- a file by default, or ``SE_KERNEL_OBJECT`` for a process or
+    thread.
     """
     convert = bind(
         "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
@@ -346,7 +353,7 @@ def set_handle_dacl(handle, sddl: str) -> None:
             raise WindowsApiError("GetSecurityDescriptorDacl failed")
         if not present.value or not dacl.value:
             raise WindowsApiError("the descriptor has no DACL to apply")
-        status = set_info(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        status = set_info(handle, object_type, DACL_SECURITY_INFORMATION,
                           None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}",
