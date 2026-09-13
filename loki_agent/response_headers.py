@@ -9,19 +9,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import os
 import re
-import stat
 import sys
-import tempfile
 import time
 import secrets
 import urllib.parse
 from datetime import datetime, timezone
 
-from . import file_locks, paths
+from . import credential_files, file_locks, paths
 
 
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
@@ -208,12 +207,25 @@ class Store:
         if not self.dirty:
             return
         directory = os.path.dirname(self.path)
+        name = os.path.basename(self.path)
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        lock_fd = os.open(self.path + ".lock", os.O_CREAT | os.O_RDWR
-                          | os.O_NOFOLLOW, 0o600)
-        temporary = None
+        # Publish through the platform file primitives, as the credential store
+        # does: the open is relative to the retained directory and refuses a
+        # symlink in the final component, the replace is handle-relative, and
+        # the lock is taken on the token the platform can actually lock (a
+        # descriptor on POSIX, a handle on Windows).
+        directory_fd = credential_files.open_directory(directory)
+        temporary_name = None
         try:
-            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            lock_fd = credential_files.open_lock_file_at(
+                directory_fd, name + ".lock", 0o600)
+        except OSError as error:
+            credential_files.close(directory_fd)
+            raise OSError(
+                f"could not open response status lock: {error}") from error
+        try:
+            facts = credential_files.describe(lock_fd)
+            if not facts.regular or facts.reparse_point:
                 raise OSError("response status lock is not a regular file")
             deadline = asyncio.get_running_loop().time() + 0.25
             while True:
@@ -232,17 +244,29 @@ class Store:
             content = json.dumps(_document(entries), indent=2, ensure_ascii=True)
             if len(content) > MAX_SNAPSHOT_BYTES:
                 raise ValueError("response status snapshot is too large")
-            fd, temporary = tempfile.mkstemp(prefix=".response-headers-",
-                                             dir=directory)
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                output.write(content + "\n")
-            os.replace(temporary, self.path)
-            temporary = None
+            temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(12)}"
+            fd = credential_files.create_exclusive_at(
+                directory_fd, temporary_name, 0o600)
+            try:
+                view = memoryview((content + "\n").encode("utf-8"))
+                while view:
+                    written = credential_files.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short response status write")
+                    view = view[written:]
+                credential_files.fsync(fd)
+            finally:
+                credential_files.close(fd)
+            credential_files.replace_at(directory_fd, temporary_name, name)
+            credential_files.fsync(directory_fd)
+            temporary_name = None
             self.dirty = False
         finally:
-            if temporary is not None:
-                os.unlink(temporary)
-            os.close(lock_fd)
+            if temporary_name is not None:
+                with contextlib.suppress(OSError):
+                    credential_files.unlink_at(directory_fd, temporary_name)
+            credential_files.close(lock_fd)
+            credential_files.close(directory_fd)
 
     async def save_on_exit(self):
         try:
