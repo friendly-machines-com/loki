@@ -101,15 +101,27 @@ def _raise_oserror(error: windows_api.WindowsApiError) -> None:
     raise OSError(message) from error
 
 
-def _is_shared(sddl, owner: str) -> bool:
-    """Whether the DACL grants access to anyone beyond the allowed trustees."""
+def _is_shared(sddl, owner: str, inheritable: bool = False) -> bool:
+    """Whether the DACL grants access to anyone beyond the allowed trustees.
+
+    Fails closed in every direction that matters: a missing DACL (which grants
+    everyone), a trustee ``canonical_sid`` cannot classify (it refuses rather
+    than guesses), and any allow ACE naming an unlisted trustee all answer
+    "shared", so the storage refuses the object instead of trusting it.
+
+    ``inheritable`` is set when describing a directory: its contents inherit
+    its ACEs, so a grant that applies only to children still reaches the
+    credential JSON that will be created there.  For a file it is the object's
+    own access that counts.
+    """
     if sddl is None:
         # No DACL at all grants everyone full access; never "private".
         return True
     allowed = {windows_api.canonical_sid(sid)
                for sid in (_PRIVATE_TRUSTEES | {owner})}
-    trustees = {windows_api.canonical_sid(sid)
-                for sid in windows_acl.allow_trustees(sddl)}
+    trustees = {windows_api.canonical_sid(sid) for sid in
+                windows_acl.allow_trustees(
+                    sddl, include_inherit_only=inheritable)}
     return not trustees <= allowed
 
 
@@ -137,7 +149,7 @@ def _facts_from_handle(handle) -> FileFacts:
             attributes & windows_api.FILE_ATTRIBUTE_REPARSE_POINT),
         size=(information.nFileSizeHigh << 32) | information.nFileSizeLow,
         owned_by_current_user=(owner == current_user),
-        group_or_other_access=_is_shared(dacl, owner),
+        group_or_other_access=_is_shared(dacl, owner, inheritable=directory),
     )
 
 

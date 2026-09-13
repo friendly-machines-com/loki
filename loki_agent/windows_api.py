@@ -353,20 +353,42 @@ def sid_text(sid) -> str:
         local_free(text)
 
 
+# Well-known SIDs that the kernel spells as SDDL aliases when it renders a
+# DACL (SID Strings reference).  On Windows the API is authoritative and this
+# table is not consulted; it is the off-Windows path that keeps the privacy
+# predicate runnable, and testable, where the API is not.  A wrong entry could
+# therefore only weaken a test, never a running system; the native test checks
+# each one against the API's own answer.  An alias not listed here still
+# refuses on a non-Windows host rather than passing.
+_WELL_KNOWN_SIDS = {
+    "SY": "S-1-5-18",      # LOCAL SYSTEM
+    "BA": "S-1-5-32-544",  # BUILTIN\Administrators
+    "OW": "S-1-3-4",       # OWNER RIGHTS
+    "CO": "S-1-3-0",       # CREATOR OWNER
+    "WD": "S-1-1-0",       # Everyone
+    "AU": "S-1-5-11",      # Authenticated Users
+    "BU": "S-1-5-32-545",  # BUILTIN\Users
+    "IU": "S-1-5-4",       # INTERACTIVE
+    "AN": "S-1-5-7",       # ANONYMOUS LOGON
+}
+
+
 def canonical_sid(text: str) -> str:
     """Return the full ``S-1-...`` spelling of a SID or an SDDL alias.
 
     A DACL read back from the kernel spells well-known trustees as SDDL
     aliases (``SY``, ``BA``, ``OW``) and everyone else in full form, so one
-    trustee can arrive in two spellings.  ``ConvertStringSidToSidW`` accepts
-    both; the result is always the full form.
-
-    A string already in full form is returned as is -- the conversion is a
-    round trip -- which also keeps this callable where the API is not (the
-    portable tests pass full SIDs).
+    trustee can arrive in two spellings and a comparison needs one.  A string
+    already in full form is returned as is.
     """
     if text.startswith("S-"):
         return text
+    if sys.platform != "win32":
+        known = _WELL_KNOWN_SIDS.get(text)
+        if known is None:
+            raise WindowsUnavailableError(
+                f"cannot resolve the SID alias {text!r} without Windows")
+        return known
     convert = bind("advapi32", "ConvertStringSidToSidW", wintypes.BOOL,
                    wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
     local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,

@@ -167,19 +167,22 @@ def package_allow(sddl: str, package: str) -> int:
     return allowed
 
 
-def allow_trustees(sddl: str) -> set[str]:
+def allow_trustees(sddl: str, include_inherit_only: bool = False) -> set[str]:
     """The SIDs an allow ACE confers access on for the object itself.
 
-    Inherit-only entries (``IO``) are excluded: they apply to children, not to
-    this object, and each child restates them as its own inherited ACE, which a
-    check on the child's handle then reads.  Deny and audit entries confer
+    Inherit-only entries (``IO``) are excluded by default: they apply to
+    children, not to this object, and each child restates them as its own
+    inherited ACE, which a check on the child's handle then reads.  A directory
+    that grants its *children* to someone is still not private, so a caller
+    asking about a directory passes ``include_inherit_only=True`` and sees the
+    trustees its contents would inherit.  Deny and audit entries confer
     nothing.  Group membership and implicit owner rights are not resolved --
     this is the DACL's own list of trustees, which is what a "is this shared"
     check needs.
     """
     trustees = set()
     for kind, flags, rights, obj, inherited, sid in ace_fields(sddl):
-        if "IO" in flag_codes(flags):
+        if not include_inherit_only and "IO" in flag_codes(flags):
             continue
         if kind in ("A", "OA") and ace_mask(kind, rights, obj, inherited) is not None:
             trustees.add(sid)
