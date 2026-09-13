@@ -14,6 +14,7 @@ from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 from loki_agent import (
     authentications,
     formats,
+    host_process,
     http_client,
     loki,
     protocols,
@@ -194,7 +195,8 @@ class JobOwnershipContractTests(unittest.TestCase):
                         subagent=True,
                     )
 
-                os.killpg(first.pgid, signal.SIGTERM)
+                host_process.signal_group(
+                    first.process, first.pgid, signal.SIGTERM)
                 await asyncio.wait_for(first.process.wait(), timeout=3)
                 manager._refresh_job(first)
                 third = await manager.run_background_exec(
@@ -208,7 +210,8 @@ class JobOwnershipContractTests(unittest.TestCase):
                 for job in (first, second, third):
                     if (job is not None
                             and job.process.returncode is None):
-                        os.killpg(job.pgid, signal.SIGKILL)
+                        host_process.signal_group(
+                            job.process, job.pgid, host_process.FORCE)
                         await job.process.wait()
                         manager._refresh_job(job)
 
@@ -249,6 +252,11 @@ class JobOwnershipContractTests(unittest.TestCase):
             script = (
                 "import signal,time\n"
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                # A non-forced stop is a signal on POSIX and CTRL_BREAK_EVENT
+                # on Windows, so ignore both to make the first stop genuinely
+                # ineffective on either platform.
+                "if hasattr(signal, 'SIGBREAK'):\n"
+                "    signal.signal(signal.SIGBREAK, signal.SIG_IGN)\n"
                 "print('ready', flush=True)\n"
                 "time.sleep(30)\n"
             )
@@ -276,38 +284,44 @@ class JobOwnershipContractTests(unittest.TestCase):
                 return first, second, job, metadata
             finally:
                 if job.process.returncode is None:
-                    os.killpg(job.pgid, signal.SIGKILL)
+                    host_process.signal_group(
+                        job.process, job.pgid, host_process.FORCE)
                     await job.process.wait()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             first, second, job, metadata = asyncio.run(scenario(tmpdir))
-        self.assertIn("SIGTERM", first)
-        self.assertIn("SIGKILL", second)
+        self.assertIn(host_process.label(signal.SIGTERM), first)
+        self.assertIn(host_process.label(host_process.FORCE), second)
         self.assertEqual(job.status, "stopped")
-        self.assertEqual(job.exit_code, -signal.SIGKILL)
-        self.assertEqual(job.signal, signal.SIGKILL)
+        self.assertIsNotNone(job.exit_code)
         self.assertEqual(metadata["status"], "stopped")
-        self.assertEqual(metadata["exit_code"], -signal.SIGKILL)
-        self.assertEqual(metadata["signal"], signal.SIGKILL)
+        self.assertEqual(metadata["exit_code"], job.exit_code)
+        if os.name == "posix":
+            # A forced stop is SIGKILL on POSIX.  Windows terminates instead,
+            # which has an ordinary exit code and no signal number.
+            self.assertEqual(job.exit_code, -signal.SIGKILL)
+            self.assertEqual(job.signal, signal.SIGKILL)
+            self.assertEqual(metadata["signal"], signal.SIGKILL)
 
-    def test_failed_credential_relay_setup_closes_owner_pipe(self):
+    def test_failed_credential_relay_setup_closes_owner_channel(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
             session = loki.current_session()
             old_authority = session.credential_authority
             session.credential_authority = (
                 authentications.CredentialBroker())
-            pipe_fds = []
-            real_pipe = loki.os.pipe
+            ends = []
+            real_channel = loki.host_ipc.owner_channel
 
-            def recording_pipe():
-                pair = real_pipe()
-                pipe_fds.extend(pair)
+            def recording_channel():
+                pair = real_channel()
+                ends.extend(pair)
                 return pair
 
             try:
                 with mock.patch.object(
-                        loki.os, "pipe", side_effect=recording_pipe), \
+                        loki.host_ipc, "owner_channel",
+                        side_effect=recording_channel), \
                         mock.patch.object(
                             loki.credential_capabilities.
                             CredentialCapabilityServer,
@@ -324,21 +338,26 @@ class JobOwnershipContractTests(unittest.TestCase):
                         )
             finally:
                 session.credential_authority = old_authority
-            return pipe_fds
+            return ends
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            pipe_fds = asyncio.run(scenario(tmpdir))
+            ends = asyncio.run(scenario(tmpdir))
 
-        self.assertEqual(len(pipe_fds), 2)
-        for fd in pipe_fds:
-            with self.assertRaises(OSError):
-                os.fstat(fd)
+        self.assertEqual(len(ends), 2)
+        for end in ends:
+            if isinstance(end, int):
+                with self.assertRaises(OSError):
+                    os.fstat(end)
+            else:
+                # Windows hands over a socket; a closed one has no handle.
+                self.assertEqual(end.fileno(), -1)
 
     def test_cancelling_owner_task_reaps_foreground_process(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
             task = asyncio.create_task(manager.run_exec(
-                ["sleep", "30"], 60_000, cwd=tmpdir))
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                60_000, cwd=tmpdir))
             # A job is registered before it is launched, so wait (bounded) for
             # a live process rather than for the job to appear, or a cancelled
             # launch would be observed instead of a cancelled running job.
@@ -368,19 +387,25 @@ class JobOwnershipContractTests(unittest.TestCase):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
             owned_script = (
-                "import os,sys\n"
-                "owner_fd = int(sys.argv[-1])\n"
-                "print('owned-ready', flush=True)\n"
-                "os.read(owner_fd, 1)\n"
+                "import asyncio,sys\n"
+                "from loki_agent import credential_runtimes, host_ipc\n"
+                "async def main():\n"
+                "    owner = credential_runtimes.SessionOwner(\n"
+                "        host_ipc.child_endpoint(sys.argv[-1]))\n"
+                "    print('owned-ready', flush=True)\n"
+                "    await owner.closed_task\n"
+                "asyncio.run(main())\n"
             )
             ordinary_script = (
                 "import time\n"
                 "print('ordinary-ready', flush=True)\n"
                 "time.sleep(30)\n"
             )
+            # The child imports loki_agent to use the real owner-channel
+            # reader, so it must run where the package is importable.
             owned = await manager.run_background_exec(
                 [sys.executable, "-c", owned_script],
-                cwd=tmpdir,
+                cwd=os.path.dirname(os.path.dirname(__file__)),
                 session_owned=True,
             )
             ordinary = await manager.run_background_exec(
@@ -409,7 +434,9 @@ class JobOwnershipContractTests(unittest.TestCase):
                 return owned, ordinary, metadata
             finally:
                 if ordinary.process.returncode is None:
-                    os.killpg(ordinary.pgid, signal.SIGKILL)
+                    host_process.signal_group(
+                        ordinary.process, ordinary.pgid,
+                        host_process.FORCE)
                     await ordinary.process.wait()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -420,7 +447,7 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertEqual(metadata["status"], "owner_closed")
         self.assertIsNotNone(ordinary.process.returncode)
 
-    def test_delegated_credential_fd_is_not_inherited_by_child_command(self):
+    def test_delegated_credential_end_is_not_inherited_by_child_command(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
             credential = authentications.CredentialRef.environment(
@@ -431,28 +458,29 @@ class JobOwnershipContractTests(unittest.TestCase):
             old_authority = session.credential_authority
             session.credential_authority = broker
             probe_code = (
-                "import os,sys\n"
+                "import sys\n"
+                "from loki_agent import host_ipc\n"
                 "try:\n"
-                "    os.fstat(int(sys.argv[1]))\n"
-                "except OSError:\n"
+                "    host_ipc.child_endpoint(sys.argv[1])\n"
+                "except (OSError, ValueError):\n"
                 "    print('closed')\n"
                 "else:\n"
                 "    print('inherited')\n"
             )
             script = (
-                "import asyncio,os,subprocess,sys\n"
+                "import asyncio,subprocess,sys\n"
                 "from loki_agent import authentications\n"
-                "from loki_agent import credential_capabilities\n"
+                "from loki_agent import credential_capabilities, host_ipc\n"
                 "async def main():\n"
-                "    fd = int(sys.argv[-1])\n"
                 "    client = await "
-                "credential_capabilities.CredentialClient.from_fd(fd)\n"
+                "credential_capabilities.CredentialClient.from_fd(\n"
+                "        host_ipc.child_endpoint(sys.argv[-1]))\n"
                 "    lease = await client.lease("
                 "authentications.CredentialRef.environment("
                 "'EXAMPLE_API_KEY'))\n"
                 "    probe = subprocess.check_output([\n"
                 f"        sys.executable, '-c', {probe_code!r},\n"
-                "        str(fd)], stderr=subprocess.STDOUT, text=True)\n"
+                "        sys.argv[-1]], stderr=subprocess.STDOUT, text=True)\n"
                 "    print(lease.value)\n"
                 "    print(probe.strip())\n"
                 "    await client.close()\n"
