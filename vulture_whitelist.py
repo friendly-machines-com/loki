@@ -36,6 +36,12 @@ _.retained_characters
 _.has_custom_hooks
 _._mode
 
+# Stage 1 of the Windows credential transport: the anonymous-pipe pair has no
+# production caller until the Stage 2 endpoint swap consumes it.  The portable
+# tests exercise it now, so it is not dead -- removing the wire-up later would
+# not be silent, because this entry and the tests name it.
+_private_pipe_pair
+
 # Intentional protocol vocabulary and terminal interface surface.
 event_id
 REPEAT
