@@ -13,6 +13,29 @@ _PR_GET_DUMPABLE = 3
 _PR_SET_DUMPABLE = 4
 
 
+def _protect_windows_process() -> bool:
+    """Restrict the process object to its owner, SYSTEM and Administrators.
+
+    Windows has no ``PR_SET_DUMPABLE``.  Another process reaches this one's
+    memory through the process object, so the protection is that object's
+    DACL: this grants full control to the current user, SYSTEM and the
+    Administrators and removes everything else, including the inherited
+    ``Everyone`` and ``Users`` grants.  The AppContainer probes measured that a
+    contained worker is then refused ``PROCESS_VM_READ``, which is the property
+    this establishes.  A same-user owner still holds ``WRITE_DAC`` and can
+    re-grant access, so this is "other principals are refused", not a
+    non-dumpable guarantee.
+    """
+    from . import windows_api
+
+    owner = windows_api.current_user_sid()
+    sddl = f"D:P(A;;FA;;;{owner})(A;;FA;;;SY)(A;;FA;;;BA)"
+    windows_api.set_handle_dacl(
+        windows_api.current_process_handle(), sddl,
+        object_type=windows_api.SE_KERNEL_OBJECT)
+    return True
+
+
 def protect_credential_process() -> bool:
     """Block same-UID ptrace and /proc descriptor inspection on Linux.
 
@@ -26,6 +49,8 @@ def protect_credential_process() -> bool:
     Other systems currently get descriptor isolation without a claimed
     same-UID introspection guarantee until they have a tested native backend.
     """
+    if sys.platform == "win32":
+        return _protect_windows_process()
     if not sys.platform.startswith("linux"):
         return False
     libc = ctypes.CDLL(None, use_errno=True)
