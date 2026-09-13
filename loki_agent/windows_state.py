@@ -23,6 +23,18 @@ from typing import Protocol
 
 from . import paths
 from . import windows_api
+from .windows_api import (
+    ACCESS_SYSTEM_SECURITY,
+    DELETE,
+    FILE_ALL_ACCESS,
+    FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE,
+    READ_CONTROL,
+    SYNCHRONIZE,
+    WRITE_DAC,
+    WRITE_OWNER,
+)
 
 
 LEDGER_VERSION = 1
@@ -42,22 +54,11 @@ class Access(enum.Enum):
     READ_WRITE = "read-write"
 
 
-# Numeric rights (winnt.h), so verification compares masks instead of trusting
-# that a SID being *named* means access being *granted*.
-FILE_GENERIC_READ = 0x00120089
-FILE_GENERIC_WRITE = 0x00120116
-FILE_GENERIC_EXECUTE = 0x001200A0
-FILE_ALL_ACCESS = 0x001F01FF
-DELETE = 0x00010000
-READ_CONTROL = 0x00020000
-WRITE_DAC = 0x00040000
-WRITE_OWNER = 0x00080000
-SYNCHRONIZE = 0x00100000
-ACCESS_SYSTEM_SECURITY = 0x01000000
-
 # SDDL file-object rights strings (Ace Strings reference) and their masks.
-# Generic rights are expanded to the file rights the kernel maps them to, so an
-# ACE that literally stores ``GR`` is judged by the access it actually confers.
+# The numeric rights come from ``windows_api`` so the probe and this table
+# cannot disagree about what a right means; the generic codes are expanded
+# here to the file rights the kernel maps them to, so an ACE that literally
+# stores ``GR`` is judged by the access it actually confers.
 _RIGHTS = {
     "FA": FILE_ALL_ACCESS,
     "FR": FILE_GENERIC_READ,

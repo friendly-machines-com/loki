@@ -14,6 +14,8 @@ the import split is not itself the boundary.
 
 from __future__ import annotations
 
+import os
+
 from . import paths
 from . import windows_api
 from .windows_state import (
@@ -106,12 +108,69 @@ def probe_containment(workspace: str) -> list[Check]:
         "workspace reachable", workspace,
         windows_api.GENERIC_READ | windows_api.GENERIC_WRITE,
         "the workspace opens read-write"))
-    checks.append(_denied(
-        "credentials unreadable", paths.credential_directory(),
-        windows_api.GENERIC_READ, "opening the credential directory is denied"))
+    checks.extend(_credential_checks())
     checks.append(_denied(
         "cannot rewrite a DACL", workspace, windows_api.WRITE_DAC,
         "requesting WRITE_DAC on a granted path is denied"))
+    return checks
+
+
+# The directions the credential *file* must refuse, beyond the read that also
+# detects whether it exists.  Opening and closing without using the handle
+# cannot write, truncate, delete or re-own anything: the access check happens
+# at open, so each entry measures permission without performing the act.
+CREDENTIAL_FILE_PROBES = (
+    ("credential file not writable", windows_api.GENERIC_WRITE,
+     "the credential file cannot be opened for write"),
+    ("credential file not appendable", windows_api.FILE_APPEND_DATA,
+     "the credential file cannot be opened for append"),
+    ("credential file not deletable", windows_api.DELETE,
+     "the credential file cannot be opened to delete it"),
+    ("credential file DACL not rewritable", windows_api.WRITE_DAC,
+     "the credential file cannot be opened to rewrite its DACL"),
+    ("credential file owner not rewritable", windows_api.WRITE_OWNER,
+     "the credential file cannot be opened to change its owner"),
+)
+
+
+def _credential_checks() -> list[Check]:
+    """Denials for the credential directory and the file that holds the token.
+
+    The directory and the file are different objects with different access
+    checks, so listing the directory says nothing about reading ``tokens.json``;
+    the file itself is opened for each direction Windows.md measured.  Opening
+    the real path is also what governs a read through a workspace hard link or
+    junction: the target file's DACL is checked, not the path's.
+    """
+    directory = paths.credential_directory()
+    checks = [
+        _denied("credentials unlistable", directory,
+                windows_api.GENERIC_READ,
+                "listing the credential directory is denied"),
+        # Creating an entry is the claim that still holds on a fresh install,
+        # when there is no credential file to open.  A directory's
+        # FILE_WRITE_DATA is FILE_ADD_FILE, so the open tests create rights
+        # without creating anything.
+        _denied("cannot create credentials", directory,
+                windows_api.FILE_WRITE_DATA,
+                "creating an entry in the credential directory is denied"),
+    ]
+    asset = os.path.join(directory, paths.CREDENTIAL_FILE_NAME)
+    error = _attempt(asset, windows_api.GENERIC_READ)
+    if error is not None and error.status in (
+            windows_api.ERROR_FILE_NOT_FOUND,
+            windows_api.ERROR_PATH_NOT_FOUND):
+        # Nothing to leak, and the directory refuses to let the container make
+        # one; the per-direction denials have no object to test.
+        checks.append(Check(
+            "credential file", "pass",
+            "no credential file exists yet; creating one is denied"))
+        return checks
+    checks.append(_denied_from(
+        "credential file unreadable", error,
+        "the credential file cannot be opened for read"))
+    for name, access, description in CREDENTIAL_FILE_PROBES:
+        checks.append(_denied(name, asset, access, description))
     return checks
 
 
@@ -179,7 +238,16 @@ def _reachable(name: str, path: str, desired_access: int,
 def _denied(name: str, path: str, desired_access: int,
             description: str) -> Check:
     """A denial: the access must be refused, specifically as access denied."""
-    error = _attempt(path, desired_access)
+    return _denied_from(name, _attempt(path, desired_access), description)
+
+
+def _denied_from(name: str, error, description: str) -> Check:
+    """A denial decided from an already-attempted open.
+
+    Split out so the credential file's read attempt can double as the check
+    that it exists: re-opening to learn the same error would be a second scan
+    of the same asset.
+    """
     if error is None:
         return Check(name, "fail", f"{description}: access was granted")
     if error.status == windows_api.ERROR_ACCESS_DENIED:
