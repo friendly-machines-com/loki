@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from loki_entrypoints import loki_acp_command
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import (
@@ -27,13 +28,6 @@ from loki_agent import (
 from loki_agent.credentials import CredentialStore, is_credential_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-LOKI_ACP = os.path.join(ROOT, "loki-acp")
-
-
-def loki_acp_command():
-    """The user-facing ACP entrypoint, as shipped."""
-    return [LOKI_ACP]
 
 
 def _close_process_streams(process):

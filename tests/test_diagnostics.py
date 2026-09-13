@@ -7,6 +7,8 @@ import sys
 import tempfile
 import unittest
 
+from loki_entrypoints import entrypoint
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = """\
@@ -161,7 +163,7 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
                 'LOKI_DUMMY_REPLY': 'logging test answer',
             })
             result = subprocess.run(
-                [str(ROOT / 'loki.py'), '--headless', '--prompt', 'hello'],
+                [entrypoint('loki'), '--headless', '--prompt', 'hello'],
                 cwd=directory, env=environment, capture_output=True,
                 text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)

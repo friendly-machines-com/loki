@@ -2,12 +2,13 @@ import asyncio
 import copy
 import json
 import os
-import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+
+from loki_entrypoints import child_environment, entrypoint
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 
@@ -320,20 +321,19 @@ class HookPipelineTests(unittest.TestCase):
 
 class ExternalHookTests(unittest.TestCase):
     def test_invalid_hook_configuration_exits_before_terminal_startup(self):
-        root = pathlib.Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "hooks.json")
             with open(config_path, "w", encoding="utf-8") as stream:
                 stream.write("{invalid")
-            env = {
-                "HOME": directory,
-                "PATH": os.environ.get("PATH", ""),
-                "TERM": "dumb",
-                "LOKI_HOOKS": config_path,
-            }
+            env = child_environment(
+                HOME=directory,
+                PATH=os.environ.get("PATH", ""),
+                TERM="dumb",
+                LOKI_HOOKS=config_path,
+            )
 
             result = subprocess.run(
-                [str(root / "loki.py"), "--headless"],
+                [entrypoint("loki"), "--headless"],
                 cwd=directory,
                 env=env,
                 stdout=subprocess.PIPE,

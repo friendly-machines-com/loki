@@ -7,12 +7,11 @@ import tempfile
 import unittest
 from unittest import mock
 
+from loki_entrypoints import entrypoint
+
 from loki_agent import authentication_commands
 from loki_agent import authentications
 from loki_agent import credential_storages
-
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def tokens():
@@ -231,7 +230,7 @@ class AuthenticationEntrypointTests(unittest.TestCase):
 
             terminal = subprocess.run(
                 [
-                    os.path.join(ROOT, "loki.py"),
+                    entrypoint("loki"),
                     "--headless",
                 ],
                 input="",
@@ -244,7 +243,7 @@ class AuthenticationEntrypointTests(unittest.TestCase):
                 check=False,
             )
             acp = subprocess.run(
-                [os.path.join(ROOT, "loki-acp")],
+                [entrypoint("loki-acp")],
                 input="",
                 env=environment,
                 cwd=temporary,
@@ -271,7 +270,7 @@ class AuthenticationEntrypointTests(unittest.TestCase):
                 "XDG_CONFIG_HOME": config_home,
             })
             command = [
-                os.path.join(ROOT, "loki.py"),
+                entrypoint("loki"),
                 "auth",
             ]
 
