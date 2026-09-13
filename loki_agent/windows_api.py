@@ -258,7 +258,8 @@ def dacl_sddl(path: str) -> str:
     status = get_named(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
                        None, None, None, None, ctypes.byref(descriptor))
     if status != ERROR_SUCCESS:
-        raise WindowsApiError(f"GetNamedSecurityInfoW({path!r}) failed: {status}")
+        raise WindowsApiError(f"GetNamedSecurityInfoW({path!r}) failed: {status}",
+                              status=status)
     try:
         return _sddl_from_descriptor(descriptor, DACL_SECURITY_INFORMATION)
     finally:
@@ -358,6 +359,52 @@ def set_handle_dacl(handle, sddl: str, object_type: int = SE_FILE_OBJECT) -> Non
         if status != ERROR_SUCCESS:
             raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}",
                                   status=status)
+    finally:
+        local_free(descriptor)
+
+
+def set_named_dacl(path: str, sddl: str) -> None:
+    """Replace ``path``'s DACL from SDDL.
+
+    A pathname fallback for handles that were opened without ``WRITE_DAC``
+    (``SetSecurityInfo`` on such a handle is refused).  Like the POSIX
+    ``os.chmod`` fallback, it lacks the descriptor branch's protection against a
+    replaced temporary entry, so the caller must name that gap.
+    """
+    convert = bind(
+        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    get_dacl = bind(
+        "advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
+        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
+    set_named = bind(
+        "advapi32", "SetNamedSecurityInfoW", wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p)
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+
+    descriptor = ctypes.c_void_p()
+    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise WindowsApiError(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
+    try:
+        present = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        defaulted = wintypes.BOOL()
+        if not get_dacl(descriptor, ctypes.byref(present),
+                        ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise WindowsApiError("GetSecurityDescriptorDacl failed")
+        if not present.value or not dacl.value:
+            raise WindowsApiError("the descriptor has no DACL to apply")
+        status = set_named(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                           None, None, dacl, None)
+        if status != ERROR_SUCCESS:
+            raise WindowsApiError(
+                f"SetNamedSecurityInfoW({path!r}) failed: {status}",
+                status=status)
     finally:
         local_free(descriptor)
 

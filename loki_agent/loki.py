@@ -240,16 +240,16 @@ if os.name == "posix":
             os.chmod(tmp_path, target_mode)
 else:
     def _apply_destination_permissions(file_path, fd, tmp_path, target_mode):
-        """Preserve the destination's DACL on the open temporary file.
+        """Preserve the destination's DACL on the temporary file.
 
         Windows has no file modes.  The destination's DACL is captured by name
-        (mirroring the POSIX mode capture) and applied through the descriptor's
-        handle, so a replaced temporary name cannot redirect it to another
-        object.  A destination that does not exist yet keeps the inherited
-        default DACL, which is what a plain create would have given it.
+        (mirroring the POSIX mode capture).  The descriptor from ``mkstemp`` was
+        not opened with ``WRITE_DAC``, so the DACL is applied by pathname -- the
+        same fallback and the same limitation as the POSIX ``os.chmod`` branch:
+        a replaced temporary entry could receive it instead.  A destination that
+        does not exist yet keeps the inherited default DACL, which is what a
+        plain create would have given it.
         """
-        import msvcrt
-
         from . import windows_api
         try:
             sddl = windows_api.dacl_sddl(file_path)
@@ -261,7 +261,7 @@ else:
                 return
             raise
         if sddl is not None:
-            windows_api.set_handle_dacl(msvcrt.get_osfhandle(fd), sddl)
+            windows_api.set_named_dacl(tmp_path, sddl)
 LOCAL_LOKI_DIR = os.path.join(STARTUP_CWD, ".loki")
 CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
 JOB_TAIL_CHARS = 20_000
