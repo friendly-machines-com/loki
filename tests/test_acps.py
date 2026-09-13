@@ -447,7 +447,9 @@ class FrontWorkerTests(unittest.TestCase):
             "LOKI_MODEL": "dummy-model",
             "LOKI_DUMMY_REPLY": "acp reply text",
         })
-        configure_container(env, tmpdir)
+        workspace = os.path.join(tmpdir, "workspace")
+        os.makedirs(workspace, exist_ok=True)
+        configure_container(env, workspace)
         return env
 
     def test_ini_logging_reaches_real_front_and_worker(self):
@@ -471,7 +473,8 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
 
             def relative_config_env(cwd):
                 env = front_env(cwd)
-                env["LOKI_LOG_CONFIG"] = os.path.relpath(config, cwd)
+                env["LOKI_LOG_CONFIG"] = os.path.relpath(
+                    config, os.path.join(cwd, "workspace"))
                 return env
 
             with mock.patch.object(
@@ -489,7 +492,7 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env, cwd=tmpdir)
+                stderr=subprocess.PIPE, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
@@ -707,7 +710,7 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
                 stderr=subprocess.PIPE,
                 text=True,
                 env=env,
-                cwd=tmpdir,
+                cwd=os.path.join(tmpdir, "workspace"),
             )
             self.addCleanup(_close_process_streams, front)
             try:
@@ -798,7 +801,7 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env, cwd=tmpdir)
+                stderr=subprocess.PIPE, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 front.stdin.write(json.dumps({
@@ -910,11 +913,13 @@ class UpdateStreamingTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
                 "LOKI_DUMMY_REPLY": "plain answer",
             })
-            configure_container(env, tmpdir)
+            workspace = os.path.join(tmpdir, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+            configure_container(env, workspace)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
@@ -983,11 +988,13 @@ class CancelEndToEndTests(unittest.TestCase):
                     '["first ", "second part"]',
                 "LOKI_DUMMY_STREAM_GATE": gate,
             })
-            configure_container(env, tmpdir)
+            workspace = os.path.join(tmpdir, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+            configure_container(env, workspace)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
@@ -1076,7 +1083,9 @@ class SessionRestoreTests(unittest.TestCase):
             "LOKI_MODEL": "dummy-model",
             "LOKI_DUMMY_REPLY": reply,
         })
-        configure_container(env, tmpdir)
+        workspace = os.path.join(tmpdir, "workspace")
+        os.makedirs(workspace, exist_ok=True)
+        configure_container(env, workspace)
         return env
 
     def _send(self, front, request_id, method, params):
@@ -1243,11 +1252,13 @@ class SessionListTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
                 "LOKI_DUMMY_REPLY": "one",
             })
-            configure_container(env, tmpdir)
+            workspace = os.path.join(tmpdir, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+            configure_container(env, workspace)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(m):
@@ -1286,7 +1297,7 @@ class SessionListTests(unittest.TestCase):
             front2 = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front2)
             try:
                 front2.stdin.write(json.dumps({
@@ -1333,11 +1344,13 @@ class ConfigOptionTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
                 "LOKI_DUMMY_REPLY": "x",
             })
-            configure_container(env, tmpdir)
+            workspace = os.path.join(tmpdir, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+            configure_container(env, workspace)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=tmpdir)
+                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(m):
@@ -1408,7 +1421,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
         old_credentials = loki.CREDENTIALS
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                session = Session(shell_cwd=tmpdir)
+                session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
                 loki._DEFAULT_SESSION = session
                 loki.CREDENTIALS = CredentialStore({
                     "OPENROUTER_API_KEY": "secret",
@@ -1654,10 +1667,11 @@ class TtyStdinTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
                 "LOKI_DUMMY_REPLY": "x",
             })
+            os.makedirs(os.path.join(tmpdir, "workspace"), exist_ok=True)
             proc = subprocess.Popen(
                 loki_acp_command(),
                 stdin=slave, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, env=env, cwd=tmpdir,
+                stderr=subprocess.DEVNULL, env=env, cwd=os.path.join(tmpdir, "workspace"),
                 preexec_fn=child_setup, text=True)
             self.addCleanup(_close_process_streams, proc)
             os.close(slave)
@@ -1910,7 +1924,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                         url, 200, "OK", {}, b"{}")
 
                 async def scenario():
-                    first_session = Session(shell_cwd=tmpdir)
+                    first_session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
                     first_session.credential_authority = broker
                     loki._DEFAULT_SESSION = first_session
                     first_worker = Worker(
@@ -1965,7 +1979,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                         saved_text = stream.read()
                     await first_worker.close()
 
-                    resumed_session = Session(shell_cwd=tmpdir)
+                    resumed_session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
                     resumed_session.credential_authority = broker
                     loki._DEFAULT_SESSION = resumed_session
                     resumed_worker = Worker(
@@ -2170,7 +2184,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 loki.CHAT_LOG_DIR = os.path.join(tmpdir, "chats")
                 loki.CREDENTIALS = CredentialStore({})
                 for number in range(2):
-                    session = Session(shell_cwd=tmpdir)
+                    session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
                     loki._DEFAULT_SESSION = session
                     worker = Worker(session, lambda message: None)
                     with mock.patch.object(
@@ -2214,7 +2228,7 @@ class WorkerSessionContractTests(unittest.TestCase):
         old_session = loki._DEFAULT_SESSION
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                session = Session(shell_cwd=tmpdir)
+                session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
                 session.transcript_items = [
                     formats.instruction_item("system"),
                 ]
@@ -2266,7 +2280,7 @@ class WorkerSessionContractTests(unittest.TestCase):
         old_session = loki._DEFAULT_SESSION
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                session = Session(shell_cwd=tmpdir)
+                session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
                 loki._DEFAULT_SESSION = session
                 worker = Worker(session, lambda message: None, "s")
 
@@ -2292,7 +2306,7 @@ class WorkerSessionContractTests(unittest.TestCase):
         old_session = loki._DEFAULT_SESSION
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                session = Session(shell_cwd=tmpdir)
+                session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
                 loki._DEFAULT_SESSION = session
                 worker = Worker(session, lambda message: None, "s")
 
@@ -2333,7 +2347,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 initial = [formats.instruction_item("system")]
                 chat_path = os.path.join(tmpdir, "chat-refusal.json")
                 session = Session(
-                    shell_cwd=tmpdir,
+                    shell_cwd=os.path.join(tmpdir, "workspace"),
                     transcript_items=list(initial),
                     chat_log_path=chat_path,
                 )
@@ -2432,7 +2446,7 @@ class WorkerSessionContractTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 session = Session(
-                    shell_cwd=tmpdir,
+                    shell_cwd=os.path.join(tmpdir, "workspace"),
                     transcript_items=[formats.instruction_item("system")],
                 )
                 loki._DEFAULT_SESSION = session
