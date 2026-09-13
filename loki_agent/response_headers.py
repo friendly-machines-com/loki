@@ -17,6 +17,7 @@ import stat
 import sys
 import tempfile
 import time
+import secrets
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -147,6 +148,12 @@ class Store:
         self.path = path or snapshot_path()
         self.observations = {}
         self.dirty = False
+        # A high-low observation id: the high half is random and unique to
+        # this store, the low half counts observations within it, so two
+        # observations can never share an id even when one clock tick covers
+        # both.
+        self._observation_high = secrets.randbits(32)
+        self._observation_low = 0
 
     def observer(self, endpoint, credential, model, provider_id=None,
                  provider_name=None):
@@ -155,7 +162,17 @@ class Store:
 
         def observe(status, headers):
             now = time.time_ns()
-            context = {"observed_at_ns": now, "status": status, "model": model}
+            self._observation_low += 1
+            # An id, not the timestamp, says "same observation": two responses
+            # can share a clock tick (Windows), and the quota summary compares
+            # observations for equality only.
+            context = {
+                "observed_id": (
+                    (self._observation_high << 32) | self._observation_low),
+                "observed_at_ns": now,
+                "status": status,
+                "model": model,
+            }
             values = {
                 name.lower(): {**context, "value": _safe_value(name, value)}
                 for name, value in headers.items()
@@ -252,10 +269,14 @@ def _codex_quota_summary(entry):
         window_name = f"{prefix}-{window}-window-minutes"
         window_observation = headers.get(window_name)
         # Destructive per-key updates can retain a window from a different
-        # response. Do not synthesize a quota from that mixed observation.
+        # response. Do not synthesize a quota from that mixed observation; the
+        # id says "same", never the timestamp, because two responses can share
+        # a clock tick.  Snapshot files written before the id existed have no
+        # way to prove sameness, so they are skipped rather than guessed.
+        used_id = used_observation.get("observed_id")
         if (window_observation is None
-                or window_observation["observed_at_ns"]
-                != used_observation["observed_at_ns"]):
+                or used_id is None
+                or window_observation.get("observed_id") != used_id):
             continue
         try:
             used = float(used_observation["value"])

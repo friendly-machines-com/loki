@@ -116,6 +116,19 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("\x1b", text)
         self.assertIn("Model\\x1b[2J\\nspoof", text)
 
+    async def test_codex_summary_does_not_mix_observations_in_one_tick(self):
+        # Windows can return the same time_ns() for two responses. The summary
+        # must still not pair a window from one with a used-percent from the
+        # other; only the observation id says which values belong together.
+        with mock.patch.object(response_headers.time, "time_ns",
+                               return_value=1):
+            observer = self.codex_observer()
+            observer(200, {"x-codex-primary-window-minutes": "300"})
+            observer(200, {"x-codex-primary-used-percent": "56"})
+        self.assertNotIn(
+            "Subscription quota",
+            response_headers.render(self.store.snapshot()))
+
     async def test_codex_summary_marks_retained_and_omits_mixed_observations(self):
         with mock.patch.object(response_headers.time, "time_ns", return_value=1):
             self.codex_observer()(200, {
