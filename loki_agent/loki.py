@@ -34,6 +34,7 @@ from html.parser import HTMLParser
 from pprint import pformat
 
 from . import formats
+from . import host_process
 from . import http_client
 from . import models as modelsdev
 from . import openai_models
@@ -1568,6 +1569,13 @@ class JobManager:
                 "credential capabilities require a direct executable")
         if subagent and not session_owned:
             raise ValueError("subagents must be session-owned")
+        if os.name != "posix" and (session_owned or credential_refs is not None):
+            # A child receives handles through pass_fds on POSIX.  The Windows
+            # equivalent (inheritable handles via
+            # PROC_THREAD_ATTRIBUTE_HANDLE_LIST) is not implemented yet, and
+            # dropping the handles would start a child that cannot use them.
+            raise RuntimeError(
+                "passing handles to a child is not implemented on Windows yet")
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -1596,11 +1604,6 @@ class JobManager:
         # one; see _finalize_job.  It may be observed in "starting" briefly,
         # before the launch resolves to "running" or "failed".
         self.jobs[job.id] = job
-
-        # Helper to unblock inherited signal masks in the child process context
-        def unblock_child_signals():
-            import signal
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT, signal.SIGTERM])
 
         owner_read_fd = None
         owner_write_fd = None
@@ -1646,11 +1649,10 @@ class JobManager:
                         stdin=subprocess.DEVNULL,
                         stdout=stdout_file,
                         stderr=stderr_file,
-                        start_new_session=True,
                         close_fds=True,
                         env=env,
                         cwd=cwd or current_cwd(),
-                        preexec_fn=unblock_child_signals,
+                        **host_process.spawn_kwargs(),
                     )
                 else:
                     pass_fds = tuple(
@@ -1661,12 +1663,11 @@ class JobManager:
                         stdin=subprocess.DEVNULL,
                         stdout=stdout_file,
                         stderr=stderr_file,
-                        start_new_session=True,
                         close_fds=True,
                         pass_fds=pass_fds,
                         env=env,
                         cwd=cwd or current_cwd(),
-                        preexec_fn=unblock_child_signals,
+                        **host_process.spawn_kwargs(),
                     )
         except BaseException as error:
             # Nothing has escaped to a reaper yet, and the job is already
@@ -1700,12 +1701,7 @@ class JobManager:
         job.owner_signal_fd = owner_write_fd
         job.credential_capability = credential_server
         job.pid = proc.pid
-        try:
-            job.pgid = os.getpgid(proc.pid)
-        except (AttributeError, OSError):
-            # os.getpgid is Unix-only; on Windows the pid is the closest
-            # available identity for the process.
-            job.pgid = proc.pid
+        job.pgid = host_process.process_group(proc, proc.pid)
         job.status = "running"
         self._write_metadata(job)
         return job
@@ -1753,15 +1749,15 @@ class JobManager:
 
         def _signal_job(signum):
             # Signal the job's whole process group so shell children are not
-            # left behind. The status check and killpg call contain no await,
-            # so another event-loop task cannot reap the job between them.
+            # left behind.  The status check and the signal call contain no
+            # await, so another task cannot reap the job between them.
             if (job.status != "running"
                     or job.process.returncode is not None):
                 return False
             try:
-                os.killpg(job.pgid or job.pid, signum)
+                host_process.signal_group(job.process, job.pgid, signum)
                 return True
-            except ProcessLookupError:
+            except OSError:
                 return False
 
         async def terminate(signum, grace_s: float):
@@ -1928,9 +1924,9 @@ class JobManager:
         if job.process is None or job.process.returncode is not None:
             return False
         try:
-            os.killpg(job.pgid or job.pid, signum)
+            host_process.signal_group(job.process, job.pgid, signum)
             return True
-        except ProcessLookupError:
+        except OSError:
             return False
 
     async def _finish_owned_job(self, job: Job):
@@ -2044,8 +2040,8 @@ class JobManager:
             return f"Job {job.id} is no longer running."
         sig = signal.SIGKILL if force else signal.SIGTERM
         try:
-            os.killpg(job.pgid or job.pid, sig)
-        except ProcessLookupError:
+            host_process.signal_group(job.process, job.pgid, sig)
+        except OSError:
             return f"Job {job.id} is no longer running."
         job.status = "stopping"
         self._write_metadata(job)
