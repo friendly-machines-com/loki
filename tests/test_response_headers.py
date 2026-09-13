@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
-from loki_entrypoints import entrypoint, seed_container_ledger
+from loki_entrypoints import configure_container, entrypoint
 from response_header_fixtures import isolated_response_headers
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
@@ -349,7 +349,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_BASE": url, "LOKI_MODEL": "test-model",
             "LOKI_API_KEY": "test-key-not-for-recording",
         })
-        seed_container_ledger(environment)
+        configure_container(environment, self.directory.name)
         child = await asyncio.create_subprocess_exec(
             entrypoint("loki"), "--headless", "--prompt", "Say ok",
             cwd=self.directory.name, env=environment,
@@ -385,7 +385,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_BASE": url, "LOKI_MODEL": "test-model",
             "LOKI_API_KEY": "test-key",
         })
-        seed_container_ledger(environment)
+        configure_container(environment, self.directory.name)
         child = await asyncio.create_subprocess_exec(
             entrypoint("loki-acp"), cwd=self.directory.name, env=environment,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,

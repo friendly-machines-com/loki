@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from loki_entrypoints import loki_acp_command, seed_container_ledger
+from loki_entrypoints import configure_container, loki_acp_command
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import (
@@ -451,7 +451,7 @@ class FrontWorkerTests(unittest.TestCase):
             "LOKI_MODEL": "dummy-model",
             "LOKI_DUMMY_REPLY": "acp reply text",
         })
-        seed_container_ledger(env)
+        configure_container(env, tmpdir)
         return env
 
     def test_ini_logging_reaches_real_front_and_worker(self):
@@ -914,7 +914,7 @@ class UpdateStreamingTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
                 "LOKI_DUMMY_REPLY": "plain answer",
             })
-            seed_container_ledger(env)
+            configure_container(env, tmpdir)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -987,7 +987,7 @@ class CancelEndToEndTests(unittest.TestCase):
                     '["first ", "second part"]',
                 "LOKI_DUMMY_STREAM_GATE": gate,
             })
-            seed_container_ledger(env)
+            configure_container(env, tmpdir)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1080,7 +1080,7 @@ class SessionRestoreTests(unittest.TestCase):
             "LOKI_MODEL": "dummy-model",
             "LOKI_DUMMY_REPLY": reply,
         })
-        seed_container_ledger(env)
+        configure_container(env, tmpdir)
         return env
 
     def _send(self, front, request_id, method, params):
@@ -1247,7 +1247,7 @@ class SessionListTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
                 "LOKI_DUMMY_REPLY": "one",
             })
-            seed_container_ledger(env)
+            configure_container(env, tmpdir)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1337,7 +1337,7 @@ class ConfigOptionTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
                 "LOKI_DUMMY_REPLY": "x",
             })
-            seed_container_ledger(env)
+            configure_container(env, tmpdir)
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,

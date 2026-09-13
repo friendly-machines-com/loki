@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_entrypoints import entrypoint
+from loki_entrypoints import configure_container, entrypoint
 
 from loki_agent import authentication_commands
 from loki_agent import authentications
@@ -223,11 +223,13 @@ class AuthenticationEntrypointTests(unittest.TestCase):
             environment.update({
                 "HOME": temporary,
                 "XDG_CONFIG_HOME": config_home,
+                "XDG_STATE_HOME": os.path.join(temporary, "state"),
                 "LOKI_API_BASE": "http://dummy.invalid/v1",
                 "LOKI_PROVIDER": "dummy",
                 "LOKI_MODEL": "dummy-model",
             })
 
+            configure_container(environment, temporary)
             terminal = subprocess.run(
                 [
                     entrypoint("loki"),
