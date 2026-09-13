@@ -863,6 +863,36 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         return (f"D:P(A;OICI;FA;;;{owner})"
                 "(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)")
 
+    # The DACL the Windows runners report for os.mkdir(mode=0o700).  Its
+    # trustees are SDDL aliases, which is what the first implementation
+    # compared against full SIDs and so judged every private directory shared.
+    _MEASURED_PRIVATE_SDDL = (
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)")
+
+    def test_the_kernel_alias_dacl_is_judged_private(self):
+        from loki_agent import _credential_files_windows
+
+        self.assertFalse(_credential_files_windows._is_shared(
+            self._MEASURED_PRIVATE_SDDL, "S-1-5-21-1-2-3-1001"))
+
+    def test_an_alias_for_another_trustee_is_refused(self):
+        from loki_agent import _credential_files_windows
+
+        sddl = self._MEASURED_PRIVATE_SDDL + "(A;;FR;;;WD)"
+        self.assertTrue(_credential_files_windows._is_shared(
+            sddl, "S-1-5-21-1-2-3-1001"))
+
+    def test_an_inheritable_grant_to_another_trustee_is_refused(self):
+        from loki_agent import _credential_files_windows
+
+        # Inherit-only, so the directory's own access is clean, but a file
+        # created in it inherits the grant: for a directory that is not private.
+        sddl = self._MEASURED_PRIVATE_SDDL + "(A;IO;FR;;;S-1-5-21-1-2-3-1004)"
+        self.assertTrue(_credential_files_windows._is_shared(
+            sddl, "S-1-5-21-1-2-3-1001", inheritable=True))
+        self.assertFalse(_credential_files_windows._is_shared(
+            sddl, "S-1-5-21-1-2-3-1001", inheritable=False))
+
     def test_facts_for_a_private_file_owned_by_the_caller(self):
         from loki_agent import _credential_files_windows
 

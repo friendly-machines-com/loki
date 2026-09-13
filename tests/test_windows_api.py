@@ -503,14 +503,18 @@ class HandleRelativeFileDeclarationTests(unittest.TestCase):
         self.assertEqual(windows_api.STATUS_ACCESS_DENIED, 0xC0000022)
         self.assertEqual(windows_api.STATUS_NOT_A_DIRECTORY, 0xC0000103)
 
-    def test_a_full_sid_is_already_canonical(self):
-        # The shortcut is what keeps canonical_sid callable where the API is
-        # not (the portable privacy tests pass full SIDs), and avoids a round
-        # trip for the common case.  Aliases need Windows.
+    def test_full_sids_pass_through_and_aliases_resolve(self):
+        # A full SID is already canonical.  Off Windows an alias resolves
+        # through the documented table (on Windows the API is authoritative),
+        # which is what makes the privacy predicate testable on this host.
         self.assertEqual(
             windows_api.canonical_sid("S-1-5-21-1-2-3-1001"),
             "S-1-5-21-1-2-3-1001")
         self.assertEqual(windows_api.canonical_sid("S-1-3-4"), "S-1-3-4")
+        self.assertEqual(windows_api.canonical_sid("SY"), "S-1-5-18")
+        self.assertEqual(windows_api.canonical_sid("BA"), "S-1-5-32-544")
+        self.assertEqual(windows_api.canonical_sid("OW"), "S-1-3-4")
+        self.assertEqual(windows_api.canonical_sid("WD"), "S-1-1-0")
 
 
 class RangeLockDeclarationTests(unittest.TestCase):
