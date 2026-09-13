@@ -5401,6 +5401,23 @@ class SubagentLaunchTests(unittest.TestCase):
 
     def test_owner_close_cancels_pending_credential_handshake(self):
         async def scenario():
+            if os.name != "posix":
+                owner_parent, owner_child = loki.host_ipc.owner_channel()
+                owner = credential_runtimes.SessionOwner(owner_child)
+                server_end, client_end = loki.host_ipc.socket_pair()
+                capability_fd = loki.host_ipc.prepare_child_socket(client_end)
+                try:
+                    task = asyncio.create_task(
+                        credential_runtimes._connect_while_owned(
+                            capability_fd, owner))
+                    await asyncio.sleep(0)
+                    loki.host_ipc.close_end(owner_parent)
+                    result = await asyncio.wait_for(task, timeout=1)
+                    self.assertEqual(capability_fd.handles(), ())
+                    return result
+                finally:
+                    await owner.close()
+                    loki.host_ipc.close_end(server_end)
             read_fd, write_fd = os.pipe()
             owner = credential_runtimes.SessionOwner(read_fd)
             broker_socket, child_socket = socket.socketpair()
@@ -5426,8 +5443,18 @@ class SubagentLaunchTests(unittest.TestCase):
 
     def test_subagent_operation_is_cancelled_when_broker_closes(self):
         async def scenario():
-            read_fd, write_fd = os.pipe()
-            owner = credential_runtimes.SessionOwner(read_fd)
+            if os.name != "posix":
+                owner_parent, owner_child = loki.host_ipc.owner_channel()
+                owner = credential_runtimes.SessionOwner(owner_child)
+
+                def release_owner():
+                    loki.host_ipc.close_end(owner_parent)
+            else:
+                read_fd, write_fd = os.pipe()
+                owner = credential_runtimes.SessionOwner(read_fd)
+
+                def release_owner():
+                    os.close(write_fd)
             broker_closed = asyncio.Event()
             cancelled = asyncio.Event()
 
@@ -5452,7 +5479,7 @@ class SubagentLaunchTests(unittest.TestCase):
                     task, timeout=1)
                 return completed, cancelled.is_set()
             finally:
-                os.close(write_fd)
+                release_owner()
                 await owner.close()
 
         completed, cancelled = asyncio.run(scenario())
@@ -5461,15 +5488,30 @@ class SubagentLaunchTests(unittest.TestCase):
 
     def test_subagent_owner_fd_is_not_inherited_by_child_commands(self):
         async def scenario():
-            read_fd, write_fd = os.pipe()
-            owner = credential_runtimes.SessionOwner(read_fd)
-            inherited = []
+            if os.name != "posix":
+                owner_parent, owner_child = loki.host_ipc.owner_channel()
+                owner = credential_runtimes.SessionOwner(owner_child)
+                owner_argv = str(loki.host_ipc.reference(owner_child))
 
-            class CredentialClient:
-                async def wait_closed(self):
-                    await asyncio.Event().wait()
+                def release_owner():
+                    loki.host_ipc.close_end(owner_parent)
+                code = (
+                    "import sys\n"
+                    "from loki_agent import host_ipc\n"
+                    "try:\n"
+                    "    host_ipc.child_endpoint(sys.argv[1])\n"
+                    "except (OSError, ValueError):\n"
+                    "    print('closed')\n"
+                    "else:\n"
+                    "    print('inherited')\n"
+                )
+            else:
+                read_fd, write_fd = os.pipe()
+                owner = credential_runtimes.SessionOwner(read_fd)
+                owner_argv = str(read_fd)
 
-            async def operation():
+                def release_owner():
+                    os.close(write_fd)
                 code = (
                     "import os,sys\n"
                     "try:\n"
@@ -5479,11 +5521,18 @@ class SubagentLaunchTests(unittest.TestCase):
                     "else:\n"
                     "    print('inherited')\n"
                 )
+            inherited = []
+
+            class CredentialClient:
+                async def wait_closed(self):
+                    await asyncio.Event().wait()
+
+            async def operation():
                 process = await asyncio.create_subprocess_exec(
                     sys.executable,
                     "-c",
                     code,
-                    str(read_fd),
+                    owner_argv,
                     stdout=asyncio.subprocess.PIPE,
                     close_fds=True,
                 )
@@ -5495,7 +5544,7 @@ class SubagentLaunchTests(unittest.TestCase):
                     owner, CredentialClient())
                 completed, _result = await runtime.run(operation())
             finally:
-                os.close(write_fd)
+                release_owner()
                 await owner.close()
             return completed, inherited
 
@@ -5504,6 +5553,18 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertEqual(inherited, ["closed"])
 
     def test_owner_fd_is_closed_without_credential_capability(self):
+        if os.name != "posix":
+            owner_parent, owner_child = loki.host_ipc.owner_channel()
+            with contextlib.redirect_stderr(io.StringIO()):
+                status = asyncio.run(subagents.async_main([
+                    "Explore",
+                    "--session-owner-fd",
+                    str(loki.host_ipc.reference(owner_child)),
+                ]))
+            self.assertEqual(status, 2)
+            self.assertEqual(owner_child.handles(), ())
+            loki.host_ipc.close_end(owner_parent)
+            return
         read_fd, write_fd = os.pipe()
         try:
             with contextlib.redirect_stderr(io.StringIO()):
