@@ -371,8 +371,11 @@ class JobOwnershipContractTests(unittest.TestCase):
             if isinstance(end, int):
                 with self.assertRaises(OSError):
                     os.fstat(end)
+            elif loki.host_ipc.is_endpoint(end):
+                # A closed Windows pipe endpoint has released its handles.
+                self.assertEqual(end.handles(), ())
             else:
-                # Windows hands over a socket; a closed one has no handle.
+                # A closed socket has no handle.
                 self.assertEqual(end.fileno(), -1)
 
     def test_cancelling_owner_task_reaps_foreground_process(self):

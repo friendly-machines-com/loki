@@ -528,7 +528,7 @@ else:
         reader = asyncio.StreamReader(limit=limit)
         queue = asyncio.Queue()
         source = handle_reader.HandleReader(
-            end.read, loop, queue, eof_sentinel=True)
+            None, loop, queue, eof_sentinel=True, handle=end.read)
         source.start()
         pump = loop.create_task(
             _feed_reader(reader, queue), name="loki-pipe-reader")
@@ -543,7 +543,7 @@ else:
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
         source = handle_reader.HandleReader(
-            end.read, loop, queue, eof_sentinel=True)
+            None, loop, queue, eof_sentinel=True, handle=end.read)
         source.start()
         try:
             while True:

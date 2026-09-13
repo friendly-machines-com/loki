@@ -183,6 +183,7 @@ class PipeEndpointTests(unittest.TestCase):
         self.assertFalse(host_ipc.is_endpoint(3))
         self.assertFalse(host_ipc.is_endpoint(None))
 
+    @unittest.skipUnless(os.name == "posix", "POSIX descriptor")
     def test_a_descriptor_reports_one_handle(self):
         # POSIX path: spawn_kwargs flattens this to pass_fds.
         self.assertEqual(host_ipc.handles(4), (4,))
