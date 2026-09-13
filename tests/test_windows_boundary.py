@@ -12,10 +12,13 @@ would be made on, not only on Windows.
 
 import ast
 import pathlib
+import re
 import tempfile
 import unittest
 
-AGENT = pathlib.Path(__file__).resolve().parent.parent / "loki_agent"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+AGENT = ROOT / "loki_agent"
+PROBES = ROOT / ".github/scripts/windows_storage_probes.ps1"
 
 # Modules that carry the editor's capabilities.  Who may import them:
 #   * windows_setup is the editor itself; nothing the chat reaches may import it.
@@ -201,6 +204,62 @@ class FunctionBoundaryTests(unittest.TestCase):
         defined = _defined_functions(ast.parse(
             (AGENT / "windows_api.py").read_text()))
         self.assertEqual(defined & MUTATION_NAMES, set())
+
+
+def _sibling_imports(path):
+    """Sibling modules ``path`` imports by relative name."""
+    found = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if not isinstance(node, ast.ImportFrom) or not node.level:
+            continue
+        if node.module:
+            found.add(node.module.split(".")[0])
+        else:
+            found.update(alias.name.split(".")[0] for alias in node.names)
+    return found
+
+
+def _gate_closure(entry):
+    """Every package module the staged gate reaches from ``entry``."""
+    reached = {"__init__"}
+    pending = [entry]
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        module = AGENT / (name + ".py")
+        if module.exists():
+            pending.extend(_sibling_imports(module) - reached)
+    return reached
+
+
+def _staged_gate_modules():
+    """The modules the AppContainer gate's staging step copies."""
+    text = PROBES.read_text()
+    match = re.search(r"foreach \(\$module in @\(([^)]*)\)", text)
+    if match is None:
+        raise AssertionError("staging step not found in the probe script")
+    names = re.findall(r"'([^']+)'", match.group(1))
+    return {name[:-3] if name.endswith(".py") else name for name in names}
+
+
+class StagedGateClosureTests(unittest.TestCase):
+    """The gate is staged by an explicit list, so the list must match the code.
+
+    A module added to ``windows_verify``'s own imports but not to the staging
+    list made the in-container gate die with ``ModuleNotFoundError`` on Windows
+    -- invisible on this host, where the package is importable regardless.
+    """
+
+    def test_every_module_the_gate_imports_is_staged(self):
+        staged = _staged_gate_modules()
+        missing = sorted(_gate_closure("windows_verify") - staged)
+
+        self.assertEqual(
+            missing, [],
+            "the staged gate is missing modules it imports: "
+            + ", ".join(missing))
 
 
 if __name__ == "__main__":
