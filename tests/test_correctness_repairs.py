@@ -516,6 +516,76 @@ class JobOwnershipContractTests(unittest.TestCase):
                 side_effect=ProcessLookupError(errno.ESRCH, "gone")):
             self.assertFalse(manager._signal_process_group(job, signal.SIGTERM))
 
+    def test_a_post_spawn_failure_reaps_the_child_and_frees_its_slot(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            with mock.patch.object(manager, "_write_metadata",
+                                   side_effect=OSError("metadata unavailable")):
+                with self.assertRaisesRegex(OSError, "metadata unavailable"):
+                    await manager.run_exec(
+                        [sys.executable, "-c",
+                         "import time; time.sleep(30)"],
+                        5_000, cwd=tmpdir, session_owned=True, subagent=True)
+            return manager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = asyncio.run(scenario(tmpdir))
+
+        job = next(iter(manager.jobs.values()))
+        self.assertEqual(job.status, "failed")
+        self.assertIsNotNone(job.process.returncode)
+        self.assertFalse(job.subagent_slot)
+        self.assertEqual(manager._active_subagents, 0)
+
+    def test_recording_a_failure_does_not_replace_it(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            with mock.patch.object(
+                    asyncio, "create_subprocess_exec",
+                    side_effect=FileNotFoundError("no such program")), \
+                    mock.patch.object(
+                        manager, "_write_metadata",
+                        side_effect=PermissionError("cannot record")):
+                with self.assertRaises(FileNotFoundError):
+                    await manager.run_exec(
+                        ["definitely-not-a-program"], 1_000, cwd=tmpdir)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asyncio.run(scenario(tmpdir))
+
+    def test_session_close_during_launch_does_not_publish_a_live_child(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            real = asyncio.create_subprocess_exec
+
+            async def delayed(*args, **kwargs):
+                entered.set()
+                await release.wait()
+                return await real(*args, **kwargs)
+
+            with mock.patch.object(asyncio, "create_subprocess_exec",
+                                   side_effect=delayed):
+                task = asyncio.create_task(manager.run_background_exec(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    cwd=tmpdir, session_owned=True, subagent=True))
+                await entered.wait()
+                await manager.close_session_owned()
+                release.set()
+                with self.assertRaises(loki._JobRevokedDuringLaunch):
+                    await task
+            return manager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = asyncio.run(scenario(tmpdir))
+
+        job = next(iter(manager.jobs.values()))
+        self.assertEqual(job.status, "cancelled")
+        # Never published, so the revoked child left no job-owned process.
+        self.assertIsNone(job.process)
+        self.assertEqual(manager._active_subagents, 0)
+
     def test_a_failed_spawn_is_left_as_a_recorded_failed_job(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
