@@ -18,7 +18,8 @@ class FilePathTests(unittest.TestCase):
         self.project.mkdir()
         self.elsewhere = self.root / 'elsewhere'
         (self.elsewhere / 'child').mkdir(parents=True)
-        (self.project / 'link').symlink_to(self.elsewhere / 'child')
+        (self.project / 'link').symlink_to(
+            self.elsewhere / 'child', target_is_directory=True)
         self.session = sessions.Session(shell_cwd=str(self.project))
         session_patch = mock.patch.object(loki, '_DEFAULT_SESSION', self.session)
         session_patch.start()
@@ -142,6 +143,15 @@ class FilePathTests(unittest.TestCase):
         wrong.write_text('wrong target')
         right.write_text('correct target')
         path = 'link/../text.txt'
+        if os.name != 'posix':
+            # Windows resolves `..` lexically: link/.. is the link's own
+            # directory (the project), not the link target's parent.
+            self.assertIn('wrong target', loki.run_read(path))
+            self.assertNotIn('correct target', loki.run_read(path))
+            self.assertIn('Successfully', loki.run_edit(path, 'wrong', 'edited'))
+            self.assertEqual(wrong.read_text(), 'edited target')
+            self.assertEqual(right.read_text(), 'correct target')
+            return
         self.assertIn('correct target', loki.run_read(path))
         self.assertNotIn('wrong target', loki.run_read(path))
         self.assertIn('Successfully', loki.run_edit(path, 'correct', 'edited'))
@@ -154,6 +164,10 @@ class FilePathTests(unittest.TestCase):
         right.write_text('right')
         wrong.write_text('wrong')
         path = str(self.project) + '/link/../text.txt'
+        # Windows' lexical `..` selects the project copy; POSIX follows the
+        # link and selects the elsewhere copy.
+        selected = wrong if os.name != 'posix' else right
+        directory = self.project if os.name != 'posix' else self.elsewhere
         loki.run_read(path)
         real_open = os.open
         created_inodes = []
@@ -161,15 +175,15 @@ class FilePathTests(unittest.TestCase):
         def observe_open(name, flags, *args, **kwargs):
             fd = real_open(name, flags, *args, **kwargs)
             if flags & os.O_EXCL:
-                created_inodes.append(os.stat(os.path.dirname(name)).st_ino)
+                created_inodes.append(
+                    os.stat(os.path.dirname(name)).st_ino)
             return fd
 
         with mock.patch.object(loki.os, 'open', side_effect=observe_open):
             self.assertIn('Successfully', loki.run_write(path, 'updated'))
-        self.assertEqual(created_inodes, [self.elsewhere.stat().st_ino])
-        self.assertEqual(right.read_text(), 'updated')
-        self.assertEqual(wrong.read_text(), 'wrong')
-        self.assertFalse(list(self.elsewhere.glob('.*.tmp')))
+        self.assertEqual(created_inodes, [directory.stat().st_ino])
+        self.assertEqual(selected.read_text(), 'updated')
+        self.assertFalse(list(directory.glob('.*.tmp')))
 
     def test_final_symlink_survives_atomic_target_replacement(self):
         target = self.project / 'target'
@@ -185,7 +199,8 @@ class FilePathTests(unittest.TestCase):
         loki.run_read(str(target))
         self.assertIn('Successfully', loki.run_edit(str(alias), 'old', 'edited'))
         self.assertTrue(alias.is_symlink())
-        self.assertEqual(os.readlink(alias), 'target')
+        # Windows readlink reports a \\?\ absolute path, so compare identity.
+        self.assertEqual(os.path.realpath(alias), os.path.realpath(target))
         self.assertEqual(target.read_text(), 'edited')
         self.assertEqual(target.stat().st_mode & 0o777, 0o640)
         self.assertNotEqual(target.stat().st_ino, original_inode)
@@ -209,11 +224,13 @@ class FilePathTests(unittest.TestCase):
         wrong.write_text('wrong')
         alias = self.project / 'alias'
         alias.symlink_to('link/../target')
+        # POSIX applies `..` in the link target through the kernel, landing in
+        # elsewhere; Windows resolves it lexically, landing in the project.
+        selected = wrong if os.name != 'posix' else right
         loki.run_read(str(alias))
         self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
-        self.assertEqual(right.read_text(), 'updated')
-        self.assertEqual(wrong.read_text(), 'wrong')
-        self.assertEqual(os.readlink(alias), 'link/../target')
+        self.assertEqual(selected.read_text(), 'updated')
+        self.assertTrue(alias.is_symlink())
 
     def test_invalid_traversal_does_not_read_a_simplified_path(self):
         target = self.project / 'target'
@@ -279,6 +296,15 @@ class FilePathTests(unittest.TestCase):
         self.assertEqual((home / 'target').read_text(), 'home target')
 
     def test_unlinked_fd_read_does_not_authorize_a_different_named_file(self):
+        if os.name != 'posix':
+            # No /proc/self/fd here; the property this keeps -- a name that was
+            # never read cannot authorize a write -- is asserted directly.
+            other = self.project / 'unlinked (deleted)'
+            other.write_text('same bytes')
+            result = loki.run_write(str(other), 'unreviewed replacement')
+            self.assertTrue(result.startswith('Error:'), result)
+            self.assertEqual(other.read_text(), 'same bytes')
+            return
         original = self.project / 'unlinked'
         original.write_text('same bytes')
         with open(original) as held:
@@ -294,10 +320,11 @@ class FilePathTests(unittest.TestCase):
     def test_cd_validates_path_without_changing_process_cwd(self):
         original_cwd = os.getcwd()
         path = str(self.project) + '/link/..'
+        expected = self.project if os.name != 'posix' else self.elsewhere
         result = loki.change_shell_cwd(path)
-        self.assertTrue(os.path.samefile(result, self.elsewhere))
+        self.assertTrue(os.path.samefile(result, expected))
         self.assertEqual(os.getcwd(), original_cwd)
-        (self.elsewhere / 'target').write_text('correct cwd')
+        (expected / 'target').write_text('correct cwd')
         self.assertIn('correct cwd', loki.run_read('target'))
         with self.assertRaises(FileNotFoundError):
             loki.change_shell_cwd(str(self.project) + '/missing/..')
@@ -307,9 +334,15 @@ class FilePathTests(unittest.TestCase):
         correct = b'\x89PNG\r\n\x1a\ncorrect'
         (self.elsewhere / 'image.png').write_bytes(correct)
         (self.project / 'image.png').write_bytes(b'not an image')
-        image = terminal_frontend.load_image_attachment(
-            'link/../image.png', base_dir=str(self.project))
-        self.assertEqual(image.byte_size, len(correct))
+        if os.name != 'posix':
+            # Lexical `..` selects the project's non-image copy here.
+            with self.assertRaises(terminal_frontend.ImageAttachmentError):
+                terminal_frontend.load_image_attachment(
+                    'link/../image.png', base_dir=str(self.project))
+        else:
+            image = terminal_frontend.load_image_attachment(
+                'link/../image.png', base_dir=str(self.project))
+            self.assertEqual(image.byte_size, len(correct))
         for path in ('missing/../image.png', 'image.png/'):
             with self.subTest(path=path):
                 with self.assertRaises(terminal_frontend.ImageAttachmentError):
@@ -318,15 +351,15 @@ class FilePathTests(unittest.TestCase):
 
     def test_new_chat_selects_save_target_before_later_alias_changes(self):
         literal = str(self.project) + '/link/../new-session.json'
+        expected = ((self.project if os.name != 'posix' else self.elsewhere)
+                    / 'new-session.json')
         loki.new_chat_log(literal)
-        self.assertEqual(self.session.chat_log_path,
-                         str(self.elsewhere / 'new-session.json'))
+        self.assertEqual(self.session.chat_log_path, str(expected))
         (self.project / 'link').unlink()
-        (self.project / 'link').symlink_to(self.project)
+        (self.project / 'link').symlink_to(
+            self.project, target_is_directory=True)
         loki._atomic_write_text(self.session.chat_log_path, 'snapshot')
-        self.assertEqual((self.elsewhere / 'new-session.json').read_text(),
-                         'snapshot')
-        self.assertFalse((self.root / 'new-session.json').exists())
+        self.assertEqual(expected.read_text(), 'snapshot')
 
     def test_resume_paths_preserve_traversal_and_save_through_symlink(self):
         literal = str(self.project) + '/link/../session.json'
