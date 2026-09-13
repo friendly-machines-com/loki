@@ -5036,16 +5036,24 @@ class SubagentLaunchTests(unittest.TestCase):
         supervisor = credential_supervisors.CredentialSupervisor(
             credentials or CredentialStore({}))
         delegation = await supervisor.delegate()
-        owner_fd = os.dup(delegation.owner_child)
-        capability_fd = os.dup(delegation.credential_child)
-        delegation.child_spawned()
+        if os.name == "posix":
+            # Duplicate the descriptors so the delegation can close its own
+            # copies; a Windows endpoint is used directly and the delegation is
+            # closed after the subagent finishes instead.
+            owner_end = os.dup(delegation.owner_child)
+            capability_end = os.dup(delegation.credential_child)
+            delegation.child_spawned()
+        else:
+            owner_end = delegation.owner_child
+            capability_end = delegation.credential_child
         try:
             if "--subagent-depth" not in args:
                 args = [*args, "--subagent-depth", "1"]
             return await subagents.async_main([
                 *args,
-                "--session-owner-fd", str(owner_fd),
-                "--credential-capability-fd", str(capability_fd),
+                "--session-owner-fd", str(loki.host_ipc.reference(owner_end)),
+                "--credential-capability-fd",
+                str(loki.host_ipc.reference(capability_end)),
             ])
         finally:
             await delegation.close()
