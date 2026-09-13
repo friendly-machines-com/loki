@@ -5,20 +5,28 @@ The assertions check the SGR runs (bold / cyan) as raw byte substrings of
 what was written to the tty.
 """
 
-import fcntl
 import json
 import os
 import pathlib
-import pty
 import re
 import select
 import shutil
 import signal
 import struct
+import sys
 import tempfile
-import termios
 import time
 import unittest
+
+if sys.platform != "win32":
+    import fcntl
+    import pty
+    import termios
+else:
+    # The whole module drives a real pty; without one there is nothing to run.
+    fcntl = None
+    pty = None
+    termios = None
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -281,6 +289,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
+@unittest.skipIf(sys.platform == "win32", "requires a POSIX pty")
 class PtyUiTests(unittest.TestCase):
 
     def _assert_styled_output(self, output):
@@ -439,6 +448,7 @@ class PtyUiTests(unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
+@unittest.skipIf(sys.platform == "win32", "requires a POSIX pty")
 class PtyCliUsageTests(unittest.TestCase):
     """--help and argument errors must not touch the terminal.
 
@@ -648,6 +658,7 @@ class PtyCtrlCTests(unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
+@unittest.skipIf(sys.platform == "win32", "requires a POSIX pty")
 class PtyTurnCancelTests(unittest.TestCase):
     """A real turn: Ctrl+C must reach the reader's cancel event.
 

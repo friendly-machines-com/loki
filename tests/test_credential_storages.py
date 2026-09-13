@@ -12,6 +12,7 @@ from unittest import mock
 
 from loki_agent import authentications
 from loki_agent import credential_storages
+from loki_agent import file_locks
 from loki_agent import paths
 
 
@@ -247,7 +248,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                                return_value=directory_fd), \
                 mock.patch.object(self.storage, '_open_lock_at',
                                   return_value=lock_fd), \
-                mock.patch.object(credential_storages.fcntl, 'flock',
+                mock.patch.object(file_locks, 'try_lock_exclusive',
                                   side_effect=BlockingIOError):
             task = asyncio.create_task(self.storage.store_openai_login(tokens()))
             try:

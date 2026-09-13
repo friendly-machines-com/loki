@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import math
 import os
@@ -21,7 +20,7 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 
-from . import paths
+from . import file_locks, paths
 
 
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
@@ -202,7 +201,7 @@ class Store:
             deadline = asyncio.get_running_loop().time() + 0.25
             while True:
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    file_locks.try_lock_exclusive(lock_fd)
                     break
                 except BlockingIOError:
                     if asyncio.get_running_loop().time() >= deadline:
