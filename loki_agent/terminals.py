@@ -12,11 +12,7 @@ if os.name == "posix":
     import fcntl
     import termios
 else:
-    # Windows has neither module.  Importing them at module scope made this
-    # module unimportable there; the paths that use them below have no Windows
-    # implementation yet.
-    fcntl = None
-    termios = None
+    from . import host_terminal_windows
 
 from .texts import escape_terminal_text
 
@@ -756,6 +752,7 @@ class AsyncByteReader:
         self.queue = asyncio.Queue()
         self.old_flags = None
         self._reader_registered = False
+        self._windows_reader = None
 
     def _on_readable(self):
         try:
@@ -769,6 +766,14 @@ class AsyncByteReader:
 
     async def __aenter__(self):
         self.loop = asyncio.get_running_loop()
+        if os.name != "posix":
+            # The reader's thread only reads and posts; every field on this
+            # object stays owned by the loop thread.  The rules are in
+            # host_terminal_windows.Reader.
+            self._windows_reader = host_terminal_windows.Reader(
+                self.fd, self.loop, self.queue)
+            self._windows_reader.start()
+            return self
         self.old_flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
         try:
             fcntl.fcntl(
@@ -784,6 +789,15 @@ class AsyncByteReader:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        if self._windows_reader is not None:
+            # stop() signals, joins and then closes; nothing here may touch the
+            # reader before it returns.
+            try:
+                self._windows_reader.stop()
+            finally:
+                self._windows_reader = None
+                self.loop = None
+            return
         try:
             if self._reader_registered and self.loop is not None:
                 self.loop.remove_reader(self.fd)
@@ -812,9 +826,14 @@ class TerminalMode:
         self.fd = fd
         self.enabled = enabled
         self.old_attrs = None
+        self._windows_mode = None
 
     def __enter__(self):
         if self.enabled:
+            if os.name != "posix":
+                self._windows_mode = host_terminal_windows.RawMode(self.fd)
+                self._windows_mode.__enter__()
+                return self
             self.old_attrs = termios.tcgetattr(self.fd)
             new_attrs = self.old_attrs.copy()
             new_attrs[6] = self.old_attrs[6].copy()
@@ -840,6 +859,12 @@ class TerminalMode:
         self.restore()
 
     def restore(self):
+        if self._windows_mode is not None:
+            try:
+                self._windows_mode.restore()
+            finally:
+                self._windows_mode = None
+            return
         if self.old_attrs is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
             self.old_attrs = None
@@ -867,6 +892,10 @@ def _control_character_byte(value):
 
 def terminal_control_bytes(fd: int):
     """Return configured character-erase, word-erase, and interrupt bytes."""
+    if os.name != "posix":
+        return host_terminal_windows.control_bytes(
+            (FALLBACK_BACKSPACE_BYTES, FALLBACK_BACKSPACE_WORD_BYTES,
+             FALLBACK_INTERRUPT_BYTES))
     try:
         [
             iflag,
