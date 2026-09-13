@@ -92,19 +92,20 @@ class CredentialPrimitiveTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             _credential_files_windows.open_read_at(directory, 'absent.json')
 
-        # A reader holding the destination open must not block publication;
-        # this is why every open requests shared read/write/delete.
+        # Windows refuses a rename that would replace a destination another
+        # handle holds open (STATUS_ACCESS_DENIED), so publication closes the
+        # destination first.  The storage reads and closes the JSON before it
+        # writes, which is this same ordering; a reader must not be left holding
+        # tokens.json across the replace.
         reader = _credential_files_windows.open_read_at(directory, 'tokens.json')
-        try:
-            temporary = _credential_files_windows.create_exclusive_at(
-                directory, '.tokens.json.tmp', 0o600)
-            _credential_files_windows.write(temporary, b'{"secret": 2}')
-            _credential_files_windows.fsync(temporary)
-            _credential_files_windows.close(temporary)
-            _credential_files_windows.replace_at(
-                directory, '.tokens.json.tmp', 'tokens.json')
-        finally:
-            _credential_files_windows.close(reader)
+        _credential_files_windows.close(reader)
+        temporary = _credential_files_windows.create_exclusive_at(
+            directory, '.tokens.json.tmp', 0o600)
+        _credential_files_windows.write(temporary, b'{"secret": 2}')
+        _credential_files_windows.fsync(temporary)
+        _credential_files_windows.close(temporary)
+        _credential_files_windows.replace_at(
+            directory, '.tokens.json.tmp', 'tokens.json')
 
         reader = _credential_files_windows.open_read_at(directory, 'tokens.json')
         try:

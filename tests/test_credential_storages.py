@@ -251,9 +251,11 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(self.storage, '_open_directory',
                                side_effect=record_directory):
             for _ in range(3):
+                # O_NOFOLLOW refuses the lock open on POSIX; on Windows the
+                # link opens and is refused as a reparse point.
                 with self.assertRaisesRegex(
                         credential_storages.CredentialStorageError,
-                        'could not open credential lock'):
+                        'could not open credential lock|reparse point'):
                     await self.storage.store_openai_login(tokens())
                 self.assert_descriptor_closed(opened[-1])
 
@@ -279,11 +281,14 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_lock_close_error_still_closes_directory_descriptor(self):
         directory_fd = self.storage._open_directory()
         lock_fd = self.storage._open_lock_at(directory_fd)
-        close = os.close
+        # Patch the platform close the storage actually calls: os.close on
+        # POSIX, CloseHandle on Windows.  Patching os.close would inject
+        # nothing on Windows, where the token is not a descriptor.
+        close = credential_files.close
 
-        def close_then_report_error(fd):
-            close(fd)
-            if fd == lock_fd:
+        def close_then_report_error(token):
+            close(token)
+            if token == lock_fd:
                 raise OSError('lock close failed')
 
         try:
@@ -291,7 +296,8 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                                    return_value=directory_fd), \
                     mock.patch.object(self.storage, '_open_lock_at',
                                       return_value=lock_fd), \
-                    mock.patch.object(os, 'close', side_effect=close_then_report_error):
+                    mock.patch.object(credential_files, 'close',
+                                      side_effect=close_then_report_error):
                 with self.assertRaisesRegex(OSError, 'lock close failed'):
                     async with self.storage._locked_document():
                         pass
