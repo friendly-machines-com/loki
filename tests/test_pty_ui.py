@@ -288,8 +288,6 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
     return collected, before_stream_release
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
-@unittest.skipIf(sys.platform == "win32", "requires a POSIX pty")
 class PtyUiTests(unittest.TestCase):
 
     def _assert_styled_output(self, output):
@@ -447,8 +445,6 @@ class PtyUiTests(unittest.TestCase):
                     "codeword was never emitted with cyan foreground")
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
-@unittest.skipIf(sys.platform == "win32", "requires a POSIX pty")
 class PtyCliUsageTests(unittest.TestCase):
     """--help and argument errors must not touch the terminal.
 
@@ -550,7 +546,6 @@ class PtyCliUsageTests(unittest.TestCase):
         self.assertIn(b"\\x1b", output)
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
 class PtyCtrlCTests(unittest.TestCase):
     """Ctrl+C must reach the reader as byte 0x03, not become SIGINT.
 
@@ -657,8 +652,6 @@ class PtyCtrlCTests(unittest.TestCase):
         self.assertNotIn(b"CANCEL_NOT_SET", out)
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
-@unittest.skipIf(sys.platform == "win32", "requires a POSIX pty")
 class PtyTurnCancelTests(unittest.TestCase):
     """A real turn: Ctrl+C must reach the reader's cancel event.
 

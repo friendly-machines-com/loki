@@ -20,7 +20,6 @@ class AtomicWritePermissionTests(unittest.TestCase):
         self.target.chmod(0o640)
         self.mode = stat.S_IMODE(self.target.stat().st_mode)
 
-    @unittest.skipUnless(hasattr(os, 'fchmod'), 'requires native fchmod')
     def test_native_fchmod_runs_after_flush_before_close(self):
         real_fchmod = os.fchmod
         descriptors = []
@@ -43,8 +42,6 @@ class AtomicWritePermissionTests(unittest.TestCase):
             os.fstat(descriptors[0])
         self.assertEqual(set(self.root.iterdir()), {self.target})
 
-    @unittest.skipUnless(os.name == 'posix' and hasattr(os, 'fchmod'),
-                         'requires POSIX modes and fchmod')
     def test_native_fchmod_sets_new_file_mode(self):
         new_file = self.root / 'new-file'
         with mock.patch.object(os, 'fchmod', wraps=os.fchmod) as fchmod, \
@@ -56,8 +53,6 @@ class AtomicWritePermissionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(new_file.stat().st_mode),
                          0o666 & ~loki._UMASK)
 
-    @unittest.skipUnless(os.name == 'posix' and hasattr(os, 'fchmod'),
-                         'requires POSIX symlinks and fchmod')
     def test_replaced_temporary_name_cannot_redirect_fchmod(self):
         unrelated = self.root / 'unrelated'
         unrelated.write_text('untouched')

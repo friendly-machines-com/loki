@@ -55,8 +55,6 @@ class ProcessProtectionTests(unittest.TestCase):
             ],
         )
 
-    @unittest.skipUnless(
-        sys.platform.startswith("linux"), "Linux prctl contract")
     def test_real_linux_process_reports_non_dumpable(self):
         code = (
             "import ctypes\n"

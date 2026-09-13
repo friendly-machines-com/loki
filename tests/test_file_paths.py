@@ -9,7 +9,6 @@ from unittest import mock
 from loki_agent import loki, savefiles, sessions, terminal_frontend
 
 
-@unittest.skipUnless(os.name == 'posix', 'POSIX filesystem traversal tests')
 class FilePathTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -279,7 +278,6 @@ class FilePathTests(unittest.TestCase):
             self.assertIn('Successfully', loki.run_write('~/target', 'updated'))
         self.assertEqual((home / 'target').read_text(), 'home target')
 
-    @unittest.skipUnless(os.path.isdir('/proc/self/fd'), 'needs proc fd paths')
     def test_unlinked_fd_read_does_not_authorize_a_different_named_file(self):
         original = self.project / 'unlinked'
         original.write_text('same bytes')

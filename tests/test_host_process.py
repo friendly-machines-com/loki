@@ -16,7 +16,6 @@ import unittest
 from loki_agent import host_process
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX seam")
 class PosixSpawnTests(unittest.TestCase):
     def test_the_child_is_detached_into_its_own_session(self):
         kwargs = host_process.spawn_kwargs()
@@ -25,7 +24,6 @@ class PosixSpawnTests(unittest.TestCase):
         self.assertTrue(callable(kwargs["preexec_fn"]))
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX seam")
 class ProcessGroupTests(unittest.TestCase):
     def test_a_live_pid_reports_its_process_group(self):
         proc = types.SimpleNamespace(pid=os.getpid())
@@ -41,7 +39,6 @@ class ProcessGroupTests(unittest.TestCase):
         self.assertEqual(host_process.process_group(proc, missing), missing)
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX seam")
 class SignalTests(unittest.TestCase):
     def test_the_signal_reaches_the_process_group(self):
         proc = subprocess.Popen(

@@ -121,7 +121,6 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(state.protected_path_errors(code, state.Access.READ), [])
         self.assertTrue(state.protected_path_errors(code, state.Access.READ_WRITE))
 
-    @unittest.skipUnless(os.name == 'posix', 'symlink fixture without Windows elevation')
     def test_alias_to_private_directory_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             private = os.path.join(root, 'private')
