@@ -49,14 +49,37 @@ branch stays until then so its reasoning and tests are not lost.
 
 Both channels are therefore the same shape on Windows: a private channel,
 parent end non-inheritable, child end inheritable and named in the handle list.
+
+**The Windows ends are :class:`PipeEndpoint`.**  Every channel is a
+``(parent endpoint, child endpoint)`` pair at all times.  On Windows an
+endpoint wraps one handle per direction (the owner channel is unidirectional,
+so its endpoints have one handle each; the credential channel is
+bidirectional, so the child endpoint carries a read handle and a write handle
+and the parent endpoint carries the complementary two).  Only the child
+endpoint's handles are ever inherited or named in the child's handle list, and
+``reference``/``handles`` take the endpoint object -- never a bare handle -- so
+a caller cannot hand over the wrong side.  The child ends are distinct and
+unidirectional: the child cannot read its own requests or write its own
+responses.
+
+POSIX keeps the objects it always had -- an ``int`` descriptor for the owner
+channel and a ``socket.socket`` for the credential channel -- so its behaviour
+and tests are unchanged; the endpoints are a Windows type.  ``open_streams``
+and ``watch_closed`` are the transport-neutral seam the runtime layer uses: the
+Windows implementation builds an :class:`asyncio.StreamReader` fed by
+``handle_reader.HandleReader`` and flushes writes from a dedicated thread, so a
+blocking ``WriteFile`` on a full pipe never freezes the event loop.
 """
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import contextlib
 import os
 import secrets
 import socket
+import threading
 
 from . import windows_api
 
@@ -162,6 +185,220 @@ def _private_pipe_pair():
     return (request_read, request_write), (response_read, response_write)
 
 
+class PipeEndpoint:
+    """One side of a Windows anonymous-pipe channel.
+
+    ``read``/``write`` are Windows handles, or ``None`` when that direction is
+    absent.  The owner channel is unidirectional (parent write-only, child
+    read-only); the credential channel is bidirectional, so each side carries
+    one handle per direction.  An endpoint owns its handles and nothing else:
+    the two sides of a channel hold disjoint handles, and only a *child*
+    endpoint is ever inherited or named in a handle list.
+    """
+
+    def __init__(self, read=None, write=None):
+        self.read = read
+        self.write = write
+
+    def handles(self) -> tuple:
+        """The handles on this side, in a stable order (read, then write)."""
+        return tuple(handle for handle in (self.read, self.write)
+                     if handle is not None)
+
+    def reference(self) -> str:
+        """An argv value the child parses back with :meth:`parse`."""
+        parts = []
+        if self.read is not None:
+            parts.append(f"r={self.read}")
+        if self.write is not None:
+            parts.append(f"w={self.write}")
+        return ",".join(parts)
+
+    @classmethod
+    def parse(cls, value: str) -> "PipeEndpoint":
+        """Rebuild the endpoint an argv reference names."""
+        read = write = None
+        for part in str(value).split(","):
+            name, separator, number = part.partition("=")
+            if not separator:
+                raise ValueError("malformed pipe endpoint reference")
+            handle = int(number)
+            if handle <= 0:
+                raise ValueError("pipe endpoint handle was not inherited")
+            if name == "r":
+                if read is not None:
+                    raise ValueError("duplicate read end")
+                read = handle
+            elif name == "w":
+                if write is not None:
+                    raise ValueError("duplicate write end")
+                write = handle
+            else:
+                raise ValueError("unknown pipe endpoint direction")
+        if read is None and write is None:
+            raise ValueError("pipe endpoint reference names no end")
+        return cls(read, write)
+
+    def close(self) -> None:
+        for handle in self.handles():
+            windows_api.close_handle(handle)
+        self.read = self.write = None
+
+
+def is_endpoint(value) -> bool:
+    """Whether ``value`` is a Windows pipe endpoint (never true on POSIX)."""
+    return isinstance(value, PipeEndpoint)
+
+
+class _HandleWriter:
+    """Flush queued bytes to a Windows handle from one thread.
+
+    A blocking ``WriteFile`` on a full pipe must not run on the loop thread, or
+    it freezes every task -- the same reason ``HandleReader`` exists for the
+    read side (anonymous pipe handles support no overlapped I/O, so the
+    proactor loop cannot take them).  Writes are queued and flushed in order by
+    a single thread; the loop only enqueues and awaits the drain signal.
+    Closing the peer's complementary end makes an in-flight ``WriteFile`` fail,
+    which is what lets teardown stop a blocked thread.
+    """
+
+    def __init__(self, handle, loop):
+        self.handle = handle
+        self.loop = loop
+        self._pending = collections.deque()
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._drained = None
+        self._error = None
+        self.thread = None
+
+    def start(self) -> None:
+        self._drained = asyncio.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="loki-handle-writer", daemon=True)
+        self.thread.start()
+
+    def write(self, data) -> None:
+        with self._lock:
+            self._pending.append(bytes(data))
+        self._wake.set()
+
+    def _run(self) -> None:
+        while True:
+            # Poll the stop event as well as the work event, so an idle writer
+            # is not a thread that can never be joined.
+            self._wake.wait(0.05)
+            self._wake.clear()
+            failure = None
+            while True:
+                with self._lock:
+                    if not self._pending:
+                        break
+                    chunk = self._pending.popleft()
+                try:
+                    offset = 0
+                    while offset < len(chunk):
+                        offset += windows_api.write_file(
+                            self.handle, chunk[offset:])
+                except BaseException as error:  # noqa: BLE001 - re-raised on loop
+                    failure = error
+                    break
+            if failure is not None:
+                with self._lock:
+                    self._pending.clear()
+                self._error = failure
+                self._signal()
+                return
+            self._signal()
+            if self._stop.is_set():
+                return
+
+    def _signal(self) -> None:
+        try:
+            self.loop.call_soon_threadsafe(self._set_drained)
+        except RuntimeError:
+            # The loop is closed; teardown is already running.
+            pass
+
+    def _set_drained(self) -> None:
+        if self._drained is not None:
+            self._drained.set()
+
+    async def drain(self) -> None:
+        while True:
+            if self._error is not None:
+                raise self._error
+            with self._lock:
+                if not self._pending:
+                    return
+            # Clear, then re-check under the lock: a flush that completed
+            # between the check and the clear must not be lost, or this waits
+            # for a signal that already fired.
+            self._drained.clear()
+            with self._lock:
+                if not self._pending:
+                    continue
+            await self._drained.wait()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def stop_and_join(self, timeout: float = 2.0) -> None:
+        self.close()
+        if self.thread is not None:
+            self.thread.join(timeout)
+            if self.thread.is_alive():
+                # Closing a handle under a live writer is worse than failing.
+                raise RuntimeError("handle writer thread did not stop")
+            self.thread = None
+
+
+async def _feed_reader(reader: "asyncio.StreamReader", queue) -> None:
+    """Forward the reader thread's byte posts into an asyncio StreamReader."""
+    while True:
+        data = await queue.get()
+        if not data:
+            reader.feed_eof()
+            return
+        reader.feed_data(data)
+
+
+class _PipeStreamWriter:
+    """A ``StreamWriter``-shaped adapter over a handle writer and its reader.
+
+    The credential client and server are written against
+    ``StreamReader``/``StreamWriter``; this lets the Windows pipe transport
+    satisfy that interface without a parallel protocol implementation.  Writes
+    are queued to the writer thread, reads come from the handle reader, and
+    closing the adapter stops both threads and closes the endpoint's handles.
+    """
+
+    def __init__(self, source, pump, sink, endpoint):
+        self._source = source
+        self._pump = pump
+        self._sink = sink
+        self._endpoint = endpoint
+
+    def write(self, data) -> None:
+        self._sink.write(data)
+
+    async def drain(self) -> None:
+        await self._sink.drain()
+
+    def close(self) -> None:
+        self._sink.close()
+        self._source.stop()
+        if not self._pump.done():
+            self._pump.cancel()
+
+    async def wait_closed(self) -> None:
+        await asyncio.gather(self._pump, return_exceptions=True)
+        self._sink.stop_and_join()
+        self._endpoint.close()
+
+
 if os.name == "posix":
     def owner_channel():
         """(parent end, child end) for the session-lifetime channel.
@@ -188,11 +425,21 @@ if os.name == "posix":
         """The argv value that names ``child_end`` in the child."""
         return int(child_end)
 
+    def handles(child_end) -> tuple:
+        """The descriptor(s) that must cross to the child for ``child_end``."""
+        if isinstance(child_end, socket.socket):
+            return (child_end.fileno(),)
+        return (int(child_end),)
+
     def spawn_kwargs(references) -> dict:
-        return {"pass_fds": tuple(int(value) for value in references)}
+        return {"pass_fds": tuple(
+            fd for end in references for fd in handles(end))}
 
     def close_end(end) -> None:
-        os.close(end)
+        if isinstance(end, socket.socket):
+            end.close()
+        else:
+            os.close(end)
 
     def child_endpoint(value):
         """The child's view of a reference: a validated plain descriptor."""
@@ -202,83 +449,106 @@ if os.name == "posix":
         os.fstat(fd)
         return fd
 
+    async def open_streams(end, limit=None):
+        """The credential channel's async streams: ``open_connection``."""
+        # The parent end must never leak into a child, and the loop takes a
+        # non-blocking socket.
+        end.set_inheritable(False)
+        end.setblocking(False)
+        return await asyncio.open_connection(sock=end, limit=limit)
+
+    async def watch_closed(end):
+        """Await EOF on an inherited owner-channel end."""
+        if isinstance(end, socket.socket):
+            reader, writer = await asyncio.open_connection(sock=end)
+            try:
+                await reader.read()
+            finally:
+                writer.close()
+        else:
+            os.set_inheritable(end, False)
+            from . import acps
+            await acps.AsyncFdLineReader(end).readline()
+
 else:
     import subprocess
-    import tempfile
-
-    def _private_af_unix_pair():
-        """A connected AF_UNIX pair built by hand, in a private directory.
-
-        Winsock has no ``socketpair`` for AF_UNIX, so this is the emulation
-        Microsoft's own documentation implies: bind a path, connect to it,
-        accept.  The difference from ``socket.socketpair()`` is what a third
-        party can address -- a path in a directory only this user can write,
-        not a port any local process can reach.  That path exists for the
-        bind/connect/accept instant, so ``accept`` is confirmed against our own
-        connect before either end is returned.
-        """
-        directory = tempfile.mkdtemp(prefix="loki-ipc-")
-        path = os.path.join(directory, "socket")
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client = None
-        server = None
-        try:
-            listener.bind(path)
-            listener.listen(1)
-            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.connect(path)
-            server, _ = listener.accept()
-            # accept() cannot say whose connection it took, so prove the two
-            # ends are each other's before the name is even removed.
-            confirm_pair(server, client)
-        except BaseException:
-            listener.close()
-            for end in (client, server):
-                if end is not None:
-                    end.close()
-            with contextlib.suppress(OSError):
-                os.unlink(path)
-            with contextlib.suppress(OSError):
-                os.rmdir(directory)
-            raise
-        # Only connecting needs the path; the connected pair outlives it, and
-        # leaving it behind would block the next bind on the same name.
-        listener.close()
-        os.unlink(path)
-        os.rmdir(directory)
-        return server, client
 
     def owner_channel():
-        """A private AF_UNIX pair; the parent closing its end signals the child."""
-        parent_end, child_end = _private_af_unix_pair()
-        parent_end.set_inheritable(False)
-        child_end.set_inheritable(True)
-        return parent_end, child_end
+        """An anonymous pipe pair: the parent's write end is the lifetime.
+
+        The parent keeps the write end and closes it to signal the child; the
+        child reads.  Only the child's read handle stays inheritable.
+        """
+        read_handle, write_handle = windows_api.create_pipe()
+        windows_api.clear_handle_inheritance(write_handle)
+        return (PipeEndpoint(write=write_handle),
+                PipeEndpoint(read=read_handle))
 
     def socket_pair():
-        """The credential channel: a private AF_UNIX pair, not a loopback port."""
-        return _private_af_unix_pair()
+        """The credential channel: two anonymous pipes, no name to race."""
+        request, response = _private_pipe_pair()
+        # request is (parent_read, child_write); response is
+        # (child_read, parent_write).  Each side gets one read and one write.
+        return (PipeEndpoint(read=request[0], write=response[1]),
+                PipeEndpoint(read=response[0], write=request[1]))
 
     def prepare_child_socket(end):
         """Keep ``end`` alive, inheritable, for the child to inherit."""
-        end.set_inheritable(True)
         return end
 
-    def reference(child_end) -> int:
-        return int(child_end.fileno())
+    def reference(child_end) -> str:
+        """The argv value that names the child endpoint's handles."""
+        return child_end.reference()
+
+    def handles(child_end) -> tuple:
+        """The child handles that must cross for ``child_end``."""
+        return child_end.handles()
 
     def spawn_kwargs(references) -> dict:
         startup = subprocess.STARTUPINFO()
         startup.lpAttributeList = {
-            "handle_list": [int(value) for value in references]}
+            "handle_list": [handle for end in references
+                            for handle in handles(end)]}
         return {"startupinfo": startup}
 
     def close_end(end) -> None:
         end.close()
 
     def child_endpoint(value):
-        """The child's view of a reference: the socket the handle names."""
-        handle = int(value)
-        if handle == 0:
-            raise OSError("handle was not inherited")
-        return socket.socket(fileno=handle)
+        """The child's view of a reference: the endpoint the handles name."""
+        if isinstance(value, PipeEndpoint):
+            return value
+        return PipeEndpoint.parse(value)
+
+    async def open_streams(end, limit=None):
+        """Build ``StreamReader``/``StreamWriter``-shaped streams over pipes."""
+        from . import handle_reader
+
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader(limit=limit)
+        queue = asyncio.Queue()
+        source = handle_reader.HandleReader(
+            end.read, loop, queue, eof_sentinel=True)
+        source.start()
+        pump = loop.create_task(
+            _feed_reader(reader, queue), name="loki-pipe-reader")
+        sink = _HandleWriter(end.write, loop)
+        sink.start()
+        return reader, _PipeStreamWriter(source, pump, sink, end)
+
+    async def watch_closed(end):
+        """Await EOF on an inherited owner-channel read end."""
+        from . import handle_reader
+
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        source = handle_reader.HandleReader(
+            end.read, loop, queue, eof_sentinel=True)
+        source.start()
+        try:
+            while True:
+                data = await queue.get()
+                if not data:
+                    return
+        finally:
+            source.stop()

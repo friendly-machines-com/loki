@@ -42,8 +42,11 @@ def _endpoint_from_fd(fd: int) -> socket.socket:
     that race can cancel the initialization task, or a task canceled before
     its first instruction could leave the inherited credential FD open.
     """
+    if host_ipc.is_endpoint(fd):
+        # Windows pipe endpoint: the handles already are the transport.
+        return fd
     if isinstance(fd, socket.socket):
-        # Windows hands the child a handle, so it arrives already wrapped.
+        # A connected socket end, already wrapped.
         fd.setblocking(False)
         return fd
     try:
@@ -59,12 +62,12 @@ def _endpoint_from_fd(fd: int) -> socket.socket:
 
 async def _streams_from_endpoint(endpoint: socket.socket):
     try:
-        return await asyncio.open_connection(
-            sock=endpoint,
+        return await host_ipc.open_streams(
+            endpoint,
             limit=CAPABILITY_MAX_MESSAGE_BYTES,
         )
     except BaseException:
-        endpoint.close()
+        host_ipc.close_end(endpoint)
         raise
 
 
@@ -328,19 +331,17 @@ class CredentialCapabilityServer:
         if not permitted.issubset(authority.available()):
             raise ValueError(
                 "delegated credentials exceed the upstream authority")
-        parent_socket, child_socket = host_ipc.socket_pair()
-        parent_socket.set_inheritable(False)
-        parent_socket.setblocking(False)
+        parent_end, child_end = host_ipc.socket_pair()
         try:
-            reader, writer = await asyncio.open_connection(
-                sock=parent_socket,
+            reader, writer = await host_ipc.open_streams(
+                parent_end,
                 limit=CAPABILITY_MAX_MESSAGE_BYTES,
             )
             server = cls(authority, permitted, reader, writer)
-            return server, host_ipc.prepare_child_socket(child_socket)
+            return server, host_ipc.prepare_child_socket(child_end)
         except BaseException:
-            parent_socket.close()
-            child_socket.close()
+            host_ipc.close_end(parent_end)
+            host_ipc.close_end(child_end)
             raise
 
     async def _read_messages(self):

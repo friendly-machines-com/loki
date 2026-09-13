@@ -177,12 +177,13 @@ async def run_cli_async(
 
 
 def _close_descriptors(options: SubagentOptions) -> None:
-    for fd in (
+    for end in (
             options.session_owner_fd,
             options.credential_capability_fd):
-        if fd is not None:
+        if end is not None:
             try:
-                os.close(fd)
+                # POSIX passes a descriptor; Windows a pipe endpoint.
+                host_ipc.close_end(end)
             except OSError:
                 pass
 
