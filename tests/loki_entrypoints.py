@@ -2,50 +2,42 @@
 
 AGENTS.md names ``./loki.py`` and ``./loki-acp`` as the user-facing
 entrypoints.  POSIX runs those scripts directly, through their shebang.
-Windows has no shebang execution, so the same entrypoints exist there as
-packaged executables: the ``loki.exe`` / ``loki-acp.exe`` console scripts that
-``pip install`` writes from ``[project.scripts]``, or a PyInstaller build
-pointed at by the override variables below.
+Windows has no shebang execution, so the same entrypoints exist there as the
+PyInstaller executables from the release bundle, pointed at by the override
+variables below.
 
 A test must launch one of those.  Running the bare script on Windows fails with
-``WinError 193``; prefixing the interpreter would run the module rather than
-the entrypoint, which is not what ships and not what is being tested.
+``WinError 193``; an installed console script is not what ships and is not
+tested here.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
-import sys
-import sysconfig
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Per entrypoint: the POSIX script, the packaged executable name, and the
-# environment variable a packaging job can use to point at its own build.
+# environment variable the packaging job uses to point at its build.
 _ENTRYPOINTS = {
     "loki": ("loki.py", "LOKI_LAUNCHER"),
     "loki-acp": ("loki-acp", "LOKI_ACP_LAUNCHER"),
+    "loki-setup": ("loki-setup", "LOKI_SETUP_LAUNCHER"),
 }
 
 
 def _packaged(name: str) -> str:
-    override = os.environ.get(_ENTRYPOINTS[name][1])
-    candidates = [override] if override else []
-    scripts = sysconfig.get_path("scripts")
-    if scripts:
-        candidates.append(os.path.join(scripts, name + ".exe"))
-    found = shutil.which(name)
-    if found:
-        candidates.append(found)
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    raise RuntimeError(
-        f"no packaged Windows entrypoint for {name!r}: install the package "
-        f"(pip install -e .) or set {_ENTRYPOINTS[name][1]} to its build")
+    override_variable = _ENTRYPOINTS[name][1]
+    build = os.environ.get(override_variable)
+    if not build:
+        raise RuntimeError(
+            f"{override_variable} must point at the built {name} executable; "
+            f"the suite launches the release, not an installed console script")
+    if not os.path.exists(build):
+        raise RuntimeError(f"{override_variable} does not exist: {build}")
+    return build
 
 
 def entrypoint(name: str) -> str:
@@ -91,7 +83,7 @@ def configure_container(environment: dict, cwd: str) -> None:
             raise RuntimeError(
                 f"{name} must be set so that setup stays inside the test")
     result = subprocess.run(
-        [sys.executable, "-m", "loki_agent.windows_setup", "--configure", cwd],
+        [entrypoint("loki-setup"), "--configure", cwd],
         cwd=cwd, env=environment, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(

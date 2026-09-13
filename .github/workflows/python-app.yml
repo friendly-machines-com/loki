@@ -42,13 +42,24 @@ jobs:
         pip install flake8
         pip install vulture
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    - name: Install the package for its console entrypoints (Windows)
-      # The end-to-end tests launch the sanctioned entrypoints. On Windows that
-      # is the console script pip writes from [project.scripts] -- loki.exe and
-      # loki-acp.exe -- so the checkout scripts are never run through an
-      # interpreter, which would test the module rather than the entrypoint.
+    - name: Build the release the tests will launch (Windows)
+      # The end-to-end tests launch the shipped entrypoints.  On Windows those
+      # are the PyInstaller executables from the release bundle, so build them
+      # here and point the launcher overrides at them; an installed console
+      # script is not what a user runs and not what these tests exercise.
       if: runner.os == 'Windows'
-      run: python -m pip install -e .
+      shell: pwsh
+      run: |
+        python -m pip install "pyinstaller==6.16.0"
+        python -m PyInstaller --noconfirm --clean --onedir --console --name loki loki.py
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python -m PyInstaller --noconfirm --clean --onedir --console --name loki-acp loki-acp
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python -m PyInstaller --noconfirm --clean loki-setup.spec
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        "LOKI_LAUNCHER=$PWD/dist/loki/loki.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+        "LOKI_ACP_LAUNCHER=$PWD/dist/loki-acp/loki-acp.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+        "LOKI_SETUP_LAUNCHER=$PWD/dist/loki-setup/loki-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
@@ -88,9 +99,9 @@ jobs:
       run: |
         $workspace = Join-Path $env:RUNNER_TEMP 'loki-workspace'
         New-Item -ItemType Directory -Force -Path $workspace | Out-Null
-        python -m loki_agent.windows_setup --configure $workspace
+        & "$PWD/dist/loki-setup/loki-setup.exe" --configure $workspace
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        python -m loki_agent.windows_setup --verify $workspace
+        & "$PWD/dist/loki-setup/loki-setup.exe" --verify $workspace
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         "TEMP=$workspace" | Out-File -FilePath $env:GITHUB_ENV -Append
         "TMP=$workspace" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -107,6 +118,20 @@ jobs:
         # stack if the suite stalls, so a hang names its frame before the
         # job timeout instead of being canceled invisibly.
         python -u tests/run_suite.py
+    - name: Create the portable ZIP (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        Copy-Item COPYING, README.md dist/
+        Compress-Archive -Path dist/* -DestinationPath loki-windows-x64-portable.zip
+    - name: Upload portable ZIP (Windows)
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: loki-windows-x64-portable
+        path: loki-windows-x64-portable.zip
+        if-no-files-found: error
+        compression-level: 0
 
   windows-storage-investigation:
     # Independent of build/lint: failures there must not suppress these probes.
@@ -189,40 +214,3 @@ jobs:
         path: windows-diagnostics/
         if-no-files-found: warn
 
-  windows-portable:
-    needs: build
-    name: Windows portable ZIP
-    runs-on: windows-latest
-    timeout-minutes: 10
-
-    steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.13"
-        architecture: x64
-    - name: Install packaging dependencies
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install "pyinstaller==6.16.0" .
-    - name: Build portable executables
-      run: |
-        python -m PyInstaller --noconfirm --clean --onedir --console --name loki loki.py
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        python -m PyInstaller --noconfirm --clean --onedir --console --name loki-acp loki-acp
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        # Separate build via its spec: only the setup editor bundles tcl/tk.
-        python -m PyInstaller --noconfirm --clean loki-setup.spec
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    - name: Create portable ZIP
-      run: |
-        Copy-Item COPYING, README.md dist/
-        Compress-Archive -Path dist/* -DestinationPath loki-windows-x64-portable.zip
-    - name: Upload portable ZIP
-      uses: actions/upload-artifact@v4
-      with:
-        name: loki-windows-x64-portable
-        path: loki-windows-x64-portable.zip
-        if-no-files-found: error
-        compression-level: 0
