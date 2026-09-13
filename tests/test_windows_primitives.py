@@ -322,11 +322,48 @@ class NativeCalls:
             self.check(self.close(token))
 
 
-def child(mode, root, stage):
+def child(mode, root, stage=None):
     """Subprocess checkpoints acknowledge completion, not durable storage."""
-    import msvcrt
-
     root = Path(root)
+
+    if mode == 'second-user-create':
+        # Create the credential directory exactly as the storage does: a
+        # private os.mkdir, whose protected DACL names only the owner, SYSTEM
+        # and Administrators.  Another standard user must then be refused it.
+        credentials = root / 'credentials'
+        credentials.mkdir(mode=0o700)
+        (credentials / 'tokens.json').write_text('{"secret": "probe"}\n')
+        print(json.dumps({'created': str(credentials)}), flush=True)
+        return 0
+
+    if mode == 'second-user-read':
+        # Run as a different standard user: every credential object must refuse
+        # both listing the directory and reading the JSON.  The parent is listed
+        # first as a positive control -- a refuse-everything process would
+        # otherwise make the denials below vacuous.
+        credentials = root / 'credentials'
+        result = {}
+        attempts = (
+            ('parent', lambda: os.listdir(root)),
+            ('directory', lambda: os.listdir(credentials)),
+            ('file', lambda: (credentials / 'tokens.json').read_bytes()),
+        )
+        for label, attempt in attempts:
+            try:
+                attempt()
+            except PermissionError:
+                result[label] = 'denied'
+            except OSError as error:
+                result[label] = 'error'
+                result[label + '_winerror'] = getattr(error, 'winerror', None)
+            else:
+                result[label] = 'granted'
+        print(json.dumps(result), flush=True)
+        return 0 if (result.get('parent') == 'granted'
+                     and result.get('directory') == 'denied'
+                     and result.get('file') == 'denied') else 2
+
+    import msvcrt
     if mode == 'lock':
         with open(root / 'lock', 'r+b', buffering=0) as stream:
             stream.seek(0)
