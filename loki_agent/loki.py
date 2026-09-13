@@ -1345,13 +1345,22 @@ def _stale_file_error(file_path: str, action: str) -> str | None:
 
 
 def _stat_identity(stat_result) -> tuple:
-    return (
+    identity = (
         stat_result.st_dev,
         stat_result.st_ino,
         stat_result.st_size,
         stat_result.st_mtime_ns,
-        stat_result.st_ctime_ns,
     )
+    if os.name == "posix":
+        # POSIX ctime is the kernel-maintained metadata-change time: it moves on
+        # changes mtime misses (mode, owner, link count) and cannot be set by
+        # the process, so it is tamper evidence.  On Windows the field is
+        # deprecated and moving from creation time to metadata-change time (or
+        # zero), which makes it unstable rather than evidential, so it is left
+        # out there; st_birthtime is creation time and constant, so it is not a
+        # substitute.  The stored SHA-256 digest remains the content proof.
+        identity = identity + (stat_result.st_ctime_ns,)
+    return identity
 
 
 def _file_observation(
