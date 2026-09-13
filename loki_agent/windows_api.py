@@ -742,6 +742,17 @@ def terminate_process(process, exit_code: int = 1) -> None:
         raise WindowsApiError("TerminateProcess failed")
 
 
+def _drive_of(path: str) -> str:
+    """The ``X:`` drive of ``path``, or ``""``.
+
+    Stated here rather than with ``os.path.splitdrive`` so the value does not
+    depend on which platform's path rules the calling host happens to use.
+    """
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        return path[:2].upper()
+    return ""
+
+
 def drive_environment_entries() -> list:
     """The ``=X:=...`` per-drive current-directory entries of this process.
 
@@ -861,15 +872,29 @@ def create_process_in_app_container(executable, arguments, package_sid,
         flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT
         environment_block = None
         if environment is not None:
-            # ``=X:=...`` drive-current-directory entries come first, as the
-            # child's current directory is on a drive; a block that omits them
-            # makes CreateProcessW fail with ERROR_ENVVAR_NOT_FOUND (203).
-            entries = list(drive_environment_entries())
-            for key, value in sorted(environment.items(), key=lambda item: item[0].upper()):
+            # The supplied block replaces the inherited one, and Windows does
+            # not propagate the per-drive current-directory entries into it; a
+            # block that omits the entry for the drive holding the child's
+            # current directory is rejected with ERROR_ENVVAR_NOT_FOUND (203).
+            # Carry over any the parent already holds, set the child's own
+            # directory for its drive, and sort the whole block by name (the
+            # system expects a sorted environment; '=' sorts before letters,
+            # so the drive entries come first on their own).
+            entries = {}
+            for entry in drive_environment_entries():
+                name = entry.split("=", 2)[1]
+                entries[name] = entry
+            if current_directory:
+                drive = _drive_of(current_directory)
+                if drive:
+                    entries[drive] = f"={drive}={current_directory}"
+            for key, value in environment.items():
                 if not key or '=' in key or '\0' in key or '\0' in value:
                     raise ValueError("invalid child environment entry")
-                entries.append(f"{key}={value}")
-            environment_block = ctypes.create_unicode_buffer('\0'.join(entries) + '\0\0')
+                entries[key] = f"{key}={value}"
+            ordered = [entries[name] for name in sorted(entries, key=str.upper)]
+            environment_block = ctypes.create_unicode_buffer(
+                '\0'.join(ordered) + '\0\0')
             flags |= 0x400  # CREATE_UNICODE_ENVIRONMENT
         if not create(executable, command_line, None, None,
                       bool(inherited_handles), flags, environment_block,
