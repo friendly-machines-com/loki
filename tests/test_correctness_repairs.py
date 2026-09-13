@@ -338,9 +338,17 @@ class JobOwnershipContractTests(unittest.TestCase):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
             task = asyncio.create_task(manager.run_exec(
                 ["sleep", "30"], 60_000, cwd=tmpdir))
-            while not manager.jobs:
-                await asyncio.sleep(0)
-            job = next(iter(manager.jobs.values()))
+            # A job is registered before it is launched, so wait (bounded) for
+            # a live process rather than for the job to appear, or a cancelled
+            # launch would be observed instead of a cancelled running job.
+            deadline = asyncio.get_running_loop().time() + 5
+            while not any(job.process is not None
+                          for job in manager.jobs.values()):
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError("job never started")
+                await asyncio.sleep(0.01)
+            job = next(job for job in manager.jobs.values()
+                       if job.process is not None)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
@@ -489,6 +497,51 @@ class JobOwnershipContractTests(unittest.TestCase):
             result = asyncio.run(scenario(tmpdir))
         self.assertFalse(result["ok"])
         self.assertIn("timed_out", result["content"])
+
+    def test_a_failed_spawn_is_left_as_a_recorded_failed_job(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            with self.assertRaises(OSError):
+                await manager.run_exec(
+                    [os.path.join(tmpdir, "not-a-program")], 5_000,
+                    cwd=tmpdir)
+            return manager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = asyncio.run(scenario(tmpdir))
+
+            jobs = list(manager.jobs.values())
+            self.assertEqual(len(jobs), 1)
+            job = jobs[0]
+            self.assertEqual(job.status, "failed")
+            self.assertIsInstance(job.error, str)
+            self.assertIsNone(job.process)
+            with open(job.metadata_path, encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+            self.assertEqual(metadata["status"], "failed")
+            self.assertEqual(metadata["error"], job.error)
+            with open(job.stderr_path, encoding="utf-8") as stderr_file:
+                self.assertIn("launch failed", stderr_file.read())
+
+    def test_a_refused_subagent_is_recorded_and_frees_its_reservation(self):
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager._active_subagents = loki.MAX_ACTIVE_DIRECT_SUBAGENTS
+            with self.assertRaises(loki.SubagentCapacityError):
+                await manager.run_exec(
+                    [os.path.join(tmpdir, "not-a-program")], 5_000,
+                    cwd=tmpdir, session_owned=True, subagent=True)
+            return manager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = asyncio.run(scenario(tmpdir))
+
+        self.assertEqual(manager._active_subagents,
+                         loki.MAX_ACTIVE_DIRECT_SUBAGENTS)
+        job = next(iter(manager.jobs.values()))
+        self.assertEqual(job.status, "failed")
+        self.assertIn("SubagentCapacityError", job.error)
+        self.assertFalse(job.subagent_slot)
 
 
 class TerminalEntrypointContractTests(unittest.TestCase):
