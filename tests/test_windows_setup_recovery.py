@@ -131,11 +131,12 @@ class RulesTests(unittest.TestCase):
                 self.assertTrue(state.protected_path_errors(alias, state.Access.READ))
 
     def test_reload_does_not_duplicate_automatic_grants(self):
+        expected = len(setup.automatic_grants('/work'))
         definition = setup.definition_for('/work', None)
         for _ in range(3):
             entry = state.ledger_entry('/work', 'profile', definition.grants)
             definition = setup.definition_for('/work', entry)
-            self.assertEqual(len(definition.grants), 2)
+            self.assertEqual(len(definition.grants), expected)
 
     def test_replacing_allow_preserves_deny_and_other_principals(self):
         original = f'D:AI(D;;FW;;;{SID})(A;OICI;0x1301BF;;;{SID})(A;OICIID;FR;;;SY)'
