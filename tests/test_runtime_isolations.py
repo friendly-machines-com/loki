@@ -24,6 +24,22 @@ from loki_agent import windows_api
 from loki_agent.credentials import CredentialStore
 
 
+def _private_end(endpoint):
+    """A copy of an endpoint the delegation still owns.
+
+    POSIX duplicates the descriptor so ``child_spawned`` can close the
+    delegation's copy; a Windows endpoint is used directly and the delegation
+    is closed last instead.
+    """
+    return os.dup(endpoint) if os.name == "posix" else endpoint
+
+
+def _hand_off(delegation):
+    """Release the delegation's own copies of the child ends (POSIX only)."""
+    if os.name == "posix":
+        delegation.child_spawned()
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -355,9 +371,9 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             ))
         outer = await credential_supervisors.RuntimeDelegation.create(
             broker, {credential})
-        outer_owner = os.dup(outer.owner_child)
-        outer_capability = os.dup(outer.credential_child)
-        outer.child_spawned()
+        outer_owner = _private_end(outer.owner_child)
+        outer_capability = _private_end(outer.credential_child)
+        _hand_off(outer)
         outer_runtime = None
         inner = None
         inner_runtime = None
@@ -374,9 +390,9 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                     outer_session.credential_authority,
                     {credential},
                 ))
-            inner_owner = os.dup(inner.owner_child)
-            inner_capability = os.dup(inner.credential_child)
-            inner.child_spawned()
+            inner_owner = _private_end(inner.owner_child)
+            inner_capability = _private_end(inner.credential_child)
+            _hand_off(inner)
             inner_runtime = (
                 await credential_runtimes.CredentialRuntime.connect(
                     inner_owner, inner_capability))
@@ -477,9 +493,9 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
         supervisor = credential_supervisors.CredentialSupervisor(
             CredentialStore({name: value}))
         delegation = await supervisor.delegate()
-        owner_fd = os.dup(delegation.owner_child)
-        capability_fd = os.dup(delegation.credential_child)
-        delegation.child_spawned()
+        owner_fd = _private_end(delegation.owner_child)
+        capability_fd = _private_end(delegation.credential_child)
+        _hand_off(delegation)
         runtime = None
         try:
             runtime = await credential_runtimes.CredentialRuntime.connect(
