@@ -231,28 +231,39 @@ def conpty_probe(root):
         # detect a broken pipe when the child exits.
         kernel.CloseHandle(input_read)
         kernel.CloseHandle(output_write)
-        kernel.WaitForSingleObject(process.process, 5000)
+        output = bytearray()
+        available, transferred = ULONG(), ULONG()
+
+        def drain_channel():
+            while True:
+                if not peek(output_read, None, 0, None, C.byref(available),
+                            None):
+                    return False
+                if not available.value:
+                    return True
+                buffer = C.create_string_buffer(available.value)
+                if not read_file(output_read, buffer, available.value,
+                                 C.byref(transferred), None):
+                    return False
+                output.extend(buffer.raw[:transferred.value])
+
+        # Service the channel while the child runs: the session paints its
+        # output as it arrives, and the final frame clears the screen.
+        while kernel.WaitForSingleObject(process.process, 0) != 0:
+            if not drain_channel():
+                break
+            time.sleep(0.005)
         exit_code = ULONG()
         kernel.GetExitCodeProcess(process.process, C.byref(exit_code))
         record['exit_code'] = exit_code.value
-        # Closing the session emits its final frame to the output channel, so
-        # close first and then drain until the pipe breaks.
+        # Then close the session and drain its final frame until it breaks.
         close_pseudo(hpc)
         closed = True
-        output = bytearray()
-        available, transferred = ULONG(), ULONG()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            if not peek(output_read, None, 0, None, C.byref(available), None):
+            if not drain_channel():
                 break
-            if not available.value:
-                time.sleep(0.005)
-                continue
-            buffer = C.create_string_buffer(available.value)
-            if not read_file(output_read, buffer, available.value,
-                             C.byref(transferred), None):
-                break
-            output.extend(buffer.raw[:transferred.value])
+            time.sleep(0.005)
         record['saw_marker'] = b'conpty-ok' in output
         record['output'] = output.decode('utf-8', 'replace')
     except OSError as error:
