@@ -1,10 +1,42 @@
 import asyncio
 import os
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
 from loki_agent import authentications
 from loki_agent import credential_capabilities
+from loki_agent import credential_supervisors
+from loki_agent import host_ipc
+
+
+CHILD_SCRIPT = """
+import asyncio, sys
+from loki_agent import authentications, credential_capabilities
+from loki_agent import credential_runtimes, host_ipc
+
+
+def argument(flag):
+    return sys.argv[sys.argv.index(flag) + 1]
+
+
+async def main():
+    owner = credential_runtimes.SessionOwner(
+        host_ipc.child_endpoint(argument("--session-owner-fd")))
+    client = await credential_capabilities.CredentialClient.from_fd(
+        host_ipc.child_endpoint(argument("--credential-capability-fd")))
+    credential = authentications.CredentialRef.decode(
+        argument("--credential"))
+    lease = await client.lease(credential)
+    print("lease:" + lease.value, flush=True)
+    await owner.closed_task
+    print("revoked", flush=True)
+    await client.close()
+
+
+asyncio.run(main())
+"""
 
 
 class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
@@ -245,6 +277,74 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
             await server.close()
+
+
+class DelegatedRuntimeProcessTests(unittest.IsolatedAsyncioTestCase):
+    """A real child receives both ends and the delegation contract holds.
+
+    The child inherits the owner and credential ends through host_ipc -- the
+    POSIX descriptor list or the Windows handle list -- leases a credential,
+    and is revoked when the owner end closes.  Lifetime revocation is the
+    contract the shipped runtime depends on, so it is exercised here as a
+    process, not just as two connected sockets.
+    """
+
+    async def asyncSetUp(self):
+        self.broker = authentications.CredentialBroker()
+        self.credential = authentications.CredentialRef.environment(
+            "DELEGATED_API_KEY")
+        self.broker.install_static(self.credential, "delegated-secret")
+        self.delegation = None
+
+    async def asyncTearDown(self):
+        if self.delegation is not None:
+            await self.delegation.close()
+
+    async def test_a_delegated_child_leases_then_the_owner_revokes_it(self):
+        self.delegation = (
+            await credential_supervisors.RuntimeDelegation.create(
+                self.broker, {self.credential}))
+        arguments = self.delegation.child_arguments()
+        spawn = self.delegation.child_spawn_kwargs()
+        with tempfile.TemporaryDirectory() as scratch:
+            out_path = os.path.join(scratch, "child.out")
+            err_path = os.path.join(scratch, "child.err")
+            with open(out_path, "wb") as out, open(err_path, "wb") as err:
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", CHILD_SCRIPT,
+                    *arguments, "--credential", self.credential.encode(),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=out, stderr=err, close_fds=True, **spawn)
+                self.delegation.child_spawned()
+                await self._await_marker(out_path, b"lease:", process)
+                # Revoke lifetime only: closing the owner end must end the
+                # child while the credential server is still live.
+                host_ipc.close_end(self.delegation.owner_parent)
+                self.delegation.owner_parent = None
+                self.assertEqual(
+                    await asyncio.wait_for(process.wait(), 30), 0)
+            with open(out_path, encoding="utf-8") as stream:
+                stdout = stream.read()
+            with open(err_path, encoding="utf-8") as stream:
+                stderr = stream.read()
+
+        self.assertIn("lease:delegated-secret", stdout)
+        self.assertIn("revoked", stdout)
+        self.assertEqual(stderr, "")
+
+    @staticmethod
+    async def _await_marker(path, marker, process, timeout=30):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            with open(path, "rb") as stream:
+                if marker in stream.read():
+                    return
+            if process.returncode is not None:
+                raise AssertionError(
+                    "delegated child exited before writing %r" % marker)
+            await asyncio.sleep(0.05)
+        raise AssertionError("delegated child never wrote %r" % marker)
 
 
 if __name__ == "__main__":
