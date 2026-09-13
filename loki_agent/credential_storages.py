@@ -232,10 +232,28 @@ class JsonCredentialStorage:
     def _open_directory(self):
         self.ensure_directory()
         try:
-            return private_files.open_directory(self.directory)
+            directory_fd = private_files.open_directory(self.directory)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential directory: {error}") from error
+        # Checked on the retained handle, not the pathname: between
+        # ensure_directory's describe_path and this open the directory could
+        # have been swapped for a link, and every relative open traverses a
+        # handle to one.
+        try:
+            facts = private_files.describe(directory_fd)
+        except BaseException:
+            private_files.close(directory_fd)
+            raise
+        if not facts.directory:
+            private_files.close(directory_fd)
+            raise CredentialStorageError(
+                f"credential path is not a directory: {self.directory}")
+        if facts.reparse_point:
+            private_files.close(directory_fd)
+            raise CredentialStorageError(
+                f"credential directory is a reparse point: {self.directory}")
+        return directory_fd
 
     @staticmethod
     def _validate_secret_file(facts, label):
@@ -321,6 +339,16 @@ class JsonCredentialStorage:
         try:
             fd = private_files.create_exclusive_at(
                 directory_fd, temporary_name, 0o600)
+            # Describe the file this call just created, before a byte is
+            # written: it takes its access from the directory's DACL, and a
+            # directory widened between ensure_directory's check and this create
+            # would otherwise hand the file out.
+            facts = private_files.describe(fd)
+            if not (facts.regular and facts.owned_by_current_user
+                    and not facts.reparse_point
+                    and not facts.group_or_other_access):
+                raise CredentialStorageError(
+                    f"new credential file is not private: {temporary_name}")
             view = memoryview(data)
             while view:
                 written = private_files.write(fd, view)

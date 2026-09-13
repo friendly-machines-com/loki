@@ -224,16 +224,12 @@ def open_directory(path: str):
         windows_api.close_handle(handle)
         _raise_oserror(error)
     attributes = information.dwFileAttributes
-    # Re-checked on the handle, not the pathname: describe_path saw a pathname,
-    # and between it and this open the directory could have been swapped.  A
-    # handle to a reparse-point directory would still traverse it as a root.
+    # Only the mechanism is checked here: a root has to be a directory at
+    # all.  Whether a reparse-point directory is acceptable is policy, and
+    # the caller decides it from describe() on the returned handle.
     if not attributes & windows_api.FILE_ATTRIBUTE_DIRECTORY:
         windows_api.close_handle(handle)
         raise NotADirectoryError(path)
-    if attributes & windows_api.FILE_ATTRIBUTE_REPARSE_POINT:
-        windows_api.close_handle(handle)
-        raise CredentialStorageError(
-            f"credential directory is a reparse point: {path}")
     return handle
 
 
@@ -255,23 +251,14 @@ def create_exclusive_at(directory, name: str, mode: int):
     # directory widened between the check and the create would otherwise hand
     # the file out.  Fails closed -- anything but a private, owned, regular file
     # refuses.
-    handle = _open_relative(
+    # The new file's privacy is the caller's decision: it describes the
+    # handle it was given before writing anything.
+    return _open_relative(
         directory, name,
         windows_api.GENERIC_WRITE | windows_api.FILE_READ_ATTRIBUTES
         | windows_api.SYNCHRONIZE,
         windows_api.FILE_CREATE, _NON_DIRECTORY,
         windows_api.FILE_ATTRIBUTE_NORMAL)
-    try:
-        facts = _facts_from_handle(handle)
-    except BaseException:
-        windows_api.close_handle(handle)
-        raise
-    if not (facts.regular and facts.owned_by_current_user
-            and not facts.reparse_point and not facts.group_or_other_access):
-        windows_api.close_handle(handle)
-        raise CredentialStorageError(
-            f"new credential file is not private: {name}")
-    return handle
 
 
 def open_lock_file_at(directory, name: str, mode: int):

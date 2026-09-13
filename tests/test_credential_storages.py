@@ -910,21 +910,29 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         )
 
     def test_a_new_file_that_is_not_private_is_refused_before_writing(self):
-        from loki_agent import _private_files_windows
-
-        information = windows_api.ByHandleFileInformation()
-        information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
-        owner = "S-1-5-21-1-2-3-1001"
-        patches = self._created_file_mocks(
-            information, owner, "D:P(A;;FA;;;S-1-5-21-1-2-3-1004)")
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-                mock.patch.object(windows_api, "close_handle") as close:
-            with self.assertRaises(
-                    credential_storages.CredentialStorageError):
-                _private_files_windows.create_exclusive_at(
-                    object(), "tokens.json", 0o600)
-        # Refused before returning, with the handle it opened released.
-        close.assert_called_once_with(0x77)
+        # The privacy check is the store's: it describes the file it just
+        # created, before writing, and refuses anything not private.  The
+        # primitives only open and describe.
+        shared = private_files.FileFacts(
+            regular=True, directory=False, reparse_point=False, size=0,
+            owned_by_current_user=True, group_or_other_access=True)
+        with tempfile.TemporaryDirectory() as directory:
+            storage = credential_storages.JsonCredentialStorage(directory)
+            directory_fd = storage._open_directory()
+            try:
+                with mock.patch.object(private_files, "describe",
+                                       return_value=shared):
+                    with self.assertRaises(
+                            credential_storages.CredentialStorageError):
+                        storage._write_document_at(
+                            directory_fd,
+                            credential_storages._empty_document())
+            finally:
+                private_files.close(directory_fd)
+            # The refused temporary file is cleaned up, not left behind.
+            self.assertEqual(
+                [entry for entry in os.listdir(directory)
+                 if entry.startswith(".")], [])
 
     def test_a_new_private_file_is_returned(self):
         from loki_agent import _private_files_windows
