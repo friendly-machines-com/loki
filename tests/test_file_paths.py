@@ -9,6 +9,25 @@ from unittest import mock
 from loki_agent import loki, savefiles, sessions, terminal_frontend
 
 
+class StatIdentityTests(unittest.TestCase):
+    def test_identity_omits_the_deprecated_windows_ctime(self):
+        # Windows st_ctime is deprecated and moving from creation time to
+        # metadata-change time (or zero), so it is not an identity; POSIX ctime
+        # is the kernel-maintained change time and stays.
+        class Stat:
+            st_dev = 1
+            st_ino = 2
+            st_size = 3
+            st_mtime_ns = 4
+            st_ctime_ns = 5
+
+        identity = loki._stat_identity(Stat())
+        if os.name == "posix":
+            self.assertEqual(identity, (1, 2, 3, 4, 5))
+        else:
+            self.assertEqual(identity, (1, 2, 3, 4))
+
+
 class FilePathTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
