@@ -7,17 +7,14 @@ construct root authentication authority.
 """
 
 import asyncio
-import os
 import sys
 
 from . import host_ipc
+from . import runtime_isolation
 from .windows_api import WindowsApiError
 from .credentials import capture_process_credentials
 from .diagnostics import configure_logging
-from .runtime_isolations import (
-    RuntimeIsolationError,
-    isolate_credential_directory,
-)
+from .runtime_isolation import RuntimeIsolationError
 from .process_protections import (
     ProcessProtectionError,
     protect_credential_process,
@@ -50,11 +47,7 @@ def _terminal_runtime_arguments(args):
 def _protect_runtime() -> bool:
     # Isolation happens before the large runtime import and while this newly
     # execed Python process is still single-threaded.
-    if os.name == "nt":
-        from .windows_runtime import verify_runtime
-        verify_runtime()
-    else:
-        isolate_credential_directory()
+    runtime_isolation.isolate_runtime()
     return protect_credential_process()
 
 
@@ -84,9 +77,7 @@ def main() -> int:
             # Re-unsharing would add a namespace level for no security gain,
             # can hit nesting/policy limits, and would undermine the simple
             # invariant that only the first runtime establishes this view.
-            if os.name == "nt":
-                from .windows_runtime import verify_runtime
-                verify_runtime()
+            runtime_isolation.verify_contained_runtime()
             protect_credential_process()
         except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError) as error:
             return _report_security_error(error)
@@ -112,24 +103,12 @@ def main() -> int:
         from .authentication_commands import main as authentication_main
         return authentication_main(
             sys.argv[2:], program=sys.argv[0])
-    if os.name == "nt":
-        import getopt
-        from .terminal_frontend import parse_cli_args, USAGE
-        try:
-            options, positional = parse_cli_args(sys.argv[1:])
-            if positional:
-                raise getopt.GetoptError("unexpected positional arguments")
-        except getopt.GetoptError as error:
-            print(f"loki: {error}\n{USAGE}", file=sys.stderr)
-            return 2
-        if any(name in ("-h", "--help") for name, _ in options):
-            print(USAGE, end="")
-            return 0
-        from .windows_runtime import configured_workspace
-        try:
-            configured_workspace(sys.argv[1:])
-        except (RuntimeIsolationError, WindowsApiError) as error:
-            return _report_security_error(error)
+    try:
+        status = runtime_isolation.preflight(sys.argv[1:])
+    except (RuntimeIsolationError, WindowsApiError) as error:
+        return _report_security_error(error)
+    if status is not None:
+        return status
     from .credential_storages import (
         CredentialStorageError,
         JsonCredentialStorage,

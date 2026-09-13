@@ -694,20 +694,26 @@ class JobOwnershipContractTests(unittest.TestCase):
 
 class TerminalEntrypointContractTests(unittest.TestCase):
     def setUp(self):
-        # Windows gates the entrypoints on windows_runtime before the work
-        # under test: configured_workspace for the public path, verify_runtime
-        # for the runtime/subagent paths.  Mock those so the shared credential
-        # routing is what these tests exercise on either platform.
+        # The runtime_isolation seam gates the entrypoints on the platform
+        # module before the work under test: windows_runtime on Windows,
+        # runtime_isolations on POSIX.  Mock the one this host selects so the
+        # shared credential routing is what these tests exercise.
+        self.isolation = None
         self.windows_steps = {}
-        if os.name != "nt":
-            return
-        from loki_agent import windows_runtime
-        for name, value in (("configured_workspace", "/workspace"),
-                            ("verify_runtime", None)):
+        if os.name == "posix":
+            from loki_agent import runtime_isolations
             patcher = mock.patch.object(
-                windows_runtime, name, return_value=value)
-            self.windows_steps[name] = patcher.start()
+                runtime_isolations, "isolate_credential_directory")
+            self.isolation = patcher.start()
             self.addCleanup(patcher.stop)
+        else:
+            from loki_agent import windows_runtime
+            for name, value in (("configured_workspace", "/workspace"),
+                                ("verify_runtime", None)):
+                patcher = mock.patch.object(
+                    windows_runtime, name, return_value=value)
+                self.windows_steps[name] = patcher.start()
+                self.addCleanup(patcher.stop)
 
     def test_public_entrypoint_protects_credential_supervisor(self):
         credentials = CredentialStore({})
@@ -747,9 +753,6 @@ class TerminalEntrypointContractTests(unittest.TestCase):
                 "capture_process_credentials") as capture, \
                 mock.patch.object(
                     terminal_entrypoint,
-                    "isolate_credential_directory") as isolate, \
-                mock.patch.object(
-                    terminal_entrypoint,
                     "protect_credential_process") as protect, \
                 mock.patch.object(
                     terminal_entrypoint,
@@ -771,7 +774,7 @@ class TerminalEntrypointContractTests(unittest.TestCase):
         descriptors.assert_called_once_with([])
         terminal_main.assert_called_once_with(["--headless"], 11, 12)
         if os.name == "posix":
-            isolate.assert_called_once_with()
+            self.isolation.assert_called_once_with()
         else:
             self.windows_steps["verify_runtime"].assert_called_once_with()
 
@@ -779,9 +782,6 @@ class TerminalEntrypointContractTests(unittest.TestCase):
         with mock.patch.object(
                 terminal_entrypoint,
                 "capture_process_credentials") as capture, \
-                mock.patch.object(
-                    terminal_entrypoint,
-                    "isolate_credential_directory") as isolate, \
                 mock.patch.object(
                     terminal_entrypoint,
                     "protect_credential_process") as protect, \
@@ -799,8 +799,12 @@ class TerminalEntrypointContractTests(unittest.TestCase):
 
         self.assertEqual(status, 29)
         capture.assert_not_called()
-        isolate.assert_not_called()
         protect.assert_called_once_with()
+        if os.name == "posix":
+            # A subagent inherits the runtime's view; it does not isolate again.
+            self.isolation.assert_not_called()
+        else:
+            self.windows_steps["verify_runtime"].assert_called_once_with()
         subagent_main.assert_called_once_with([
             "Explore",
             "--session-owner-fd", "7",

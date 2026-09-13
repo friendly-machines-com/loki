@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 from dataclasses import dataclass
 
 from . import credential_capabilities, host_ipc
+from . import runtime_isolation
 from .authentications import CredentialBroker
 from .credentials import CredentialInventory, CredentialStore
 
@@ -58,32 +58,14 @@ class CredentialSupervisor:
     async def run_terminal_runtime(
             self, executable: str, arguments: list[str]) -> int:
         """Run one terminal/headless child while serving its credentials."""
-        workspace = None
-        if os.name == "nt":
-            from . import windows_runtime
-            workspace = windows_runtime.configured_workspace(arguments)
+        # The Windows workspace gate runs before any channel is created.
+        workspace = runtime_isolation.configured_workspace(arguments)
         delegation = await self.delegate()
         process = None
         try:
-            command = [
-                executable,
-                "--runtime",
-                *delegation.child_arguments(),
-                "--",
-                *arguments,
-            ]
-            if workspace is not None:
-                process = windows_runtime.launch(
-                    executable, command[1:], self.environment, workspace,
-                    [host_ipc.reference(delegation.owner_child),
-                     host_ipc.reference(delegation.credential_child)])
-            else:
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    close_fds=True,
-                    env=self.environment,
-                    **delegation.child_spawn_kwargs(),
-                )
+            process = await runtime_isolation.start_runtime(
+                executable, arguments, workspace, self.environment,
+                delegation)
             delegation.child_spawned()
             return await process.wait()
         finally:
@@ -114,8 +96,8 @@ class CredentialSupervisor:
                 try:
                     await delegation.close()
                 finally:
-                    if workspace is not None and process is not None:
-                        process.close()
+                    if process is not None:
+                        runtime_isolation.close_runtime_process(process)
 
 
 @dataclass
