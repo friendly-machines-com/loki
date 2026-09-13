@@ -11,6 +11,7 @@ from ctypes import wintypes
 from unittest import mock
 
 if sys.platform == "win32":
+    from loki_agent import handle_reader
     from loki_agent import host_terminal_windows
 
 
@@ -59,7 +60,7 @@ class _InlineLoop:
 class ReaderThreadTests(unittest.TestCase):
     def test_a_signalled_read_is_posted_then_the_stop_event_ends_the_thread(self):
         queue = _FakeQueue()
-        waits = iter([host_terminal_windows.WAIT_OBJECT_0, 1])
+        waits = iter([handle_reader.WAIT_OBJECT_0, 1])
 
         def wait_for_objects(count, handles, wait_all, timeout):
             return next(waits)
@@ -80,7 +81,7 @@ class ReaderThreadTests(unittest.TestCase):
                                   side_effect=read_file), \
                 mock.patch.object(host_terminal_windows, "_SetEvent"), \
                 mock.patch.object(host_terminal_windows, "_CloseHandle"):
-            reader = host_terminal_windows.Reader(7, _InlineLoop(), queue)
+            reader = handle_reader.HandleReader(7, _InlineLoop(), queue)
             reader.start()
             reader.thread.join(timeout=5)
             self.assertFalse(reader.thread.is_alive())
@@ -103,8 +104,8 @@ class ReaderThreadTests(unittest.TestCase):
                                   side_effect=wait_for_objects), \
                 mock.patch.object(host_terminal_windows, "_SetEvent"), \
                 mock.patch.object(host_terminal_windows, "_CloseHandle"):
-            reader = host_terminal_windows.Reader(7, _InlineLoop(),
-                                                  _FakeQueue())
+            reader = handle_reader.HandleReader(
+                7, _InlineLoop(), _FakeQueue())
             reader.start()
             reader.thread.join(timeout=5)
             reader.stop()
