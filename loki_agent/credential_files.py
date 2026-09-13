@@ -13,37 +13,20 @@ because the token they operate on is the platform's: a POSIX descriptor is an
 ``int`` that ``os.*`` understands, a Windows handle is not, so a single
 ``os.read`` for both would be wrong on one of them.
 
-The description is a :class:`FileFacts` record rather than a ``stat_result``:
-a POSIX descriptor has mode bits and a uid, while a Windows handle has
-attributes, an owner SID and a DACL, so the store must ask for facts, not for
-the platform's shape of them.  ``describe`` takes an open object; ``describe_path``
-takes a path, for the directory before it is opened.
+``FileFacts`` and ``CredentialStorageError`` live in ``credential_types``,
+below this module and the platform modules, so a platform module can import
+them without importing the module that imports it.  They are re-exported here
+so importers are unaffected.
 
-``CredentialStorageError`` is defined here rather than in the storage module so
-a platform implementation can raise the same error the storage raises; the
-storage re-exports it, so importers are unaffected.
+``describe`` takes an open object; ``describe_path`` takes a path, for the
+directory before it is opened.
 """
 
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
 
-
-@dataclass(frozen=True)
-class FileFacts:
-    """What the store needs to know about an object, per platform."""
-
-    regular: bool
-    directory: bool
-    reparse_point: bool
-    size: int
-    owned_by_current_user: bool
-    group_or_other_access: bool
-
-
-class CredentialStorageError(RuntimeError):
-    pass
+from .credential_types import CredentialStorageError, FileFacts
 
 
 if sys.platform == "win32":

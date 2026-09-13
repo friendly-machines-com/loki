@@ -25,7 +25,7 @@ What the privacy check does and does not cover is stated at
 from __future__ import annotations
 
 from . import windows_acl, windows_api
-from .credential_files import CredentialStorageError, FileFacts
+from .credential_types import CredentialStorageError, FileFacts
 
 
 # Trustees that may hold access to a private credential object besides its
@@ -42,7 +42,19 @@ from .credential_files import CredentialStorageError, FileFacts
 # AppContainer lowbox label lives), privileges (SeBackupPrivilege,
 # SeTakeOwnershipPrivilege), or a same-user process.  Group membership and
 # inherited-from-above ACEs are seen as the DACL states them, not resolved.
-_PRIVATE_TRUSTEES = frozenset({"S-1-5-18", "S-1-5-32-544"})
+#
+# The two owner spellings are here because that is how the kernel describes a
+# private directory: ``os.mkdir(mode=0o700)`` produces
+# ``D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)``, measured on the
+# Windows runners.  ``OW`` (OWNER RIGHTS, S-1-3-4) grants the object's owner,
+# and ``CO`` (CREATOR OWNER, S-1-3-0) the creator on inheritance, so both are
+# the user, not a third party.
+_PRIVATE_TRUSTEES = frozenset({
+    "S-1-5-18",      # LOCAL SYSTEM
+    "S-1-5-32-544",  # BUILTIN\Administrators
+    "S-1-3-0",       # CREATOR OWNER: the object's creator, i.e. the user
+    "S-1-3-4",       # OWNER RIGHTS: the object's current owner, i.e. the user
+})
 
 # NTSTATUS/Win32 error values that map onto the OSError subclasses the storage
 # protocol branches on; everything else becomes a plain OSError.
@@ -94,7 +106,11 @@ def _is_shared(sddl, owner: str) -> bool:
     if sddl is None:
         # No DACL at all grants everyone full access; never "private".
         return True
-    return not windows_acl.allow_trustees(sddl) <= (_PRIVATE_TRUSTEES | {owner})
+    allowed = {windows_api.canonical_sid(sid)
+               for sid in (_PRIVATE_TRUSTEES | {owner})}
+    trustees = {windows_api.canonical_sid(sid)
+                for sid in windows_acl.allow_trustees(sddl)}
+    return not trustees <= allowed
 
 
 def _facts_from_handle(handle) -> FileFacts:

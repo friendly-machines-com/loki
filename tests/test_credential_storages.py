@@ -190,9 +190,12 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         os.makedirs(os.path.dirname(self.directory))
         os.symlink(real, self.directory)
 
+        # POSIX lstat sees a link as neither file nor directory; a Windows
+        # directory link is a directory that is also a reparse point.  Both
+        # refuse, with the message each mechanism can state.
         with self.assertRaisesRegex(
                 credential_storages.CredentialStorageError,
-                "not a directory"):
+                "not a directory|reparse point"):
             self.storage.load_document()
 
     async def test_rejects_symlinked_json_file(self):
@@ -202,9 +205,12 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             stream.write("{}")
         os.symlink(target, self.storage.file_path)
 
+        # POSIX refuses the open with O_NOFOLLOW; Windows opens the link itself
+        # and refuses it as a reparse point.  Both refuse, with a message each
+        # mechanism can state.
         with self.assertRaisesRegex(
                 credential_storages.CredentialStorageError,
-                "could not open credential JSON"):
+                "could not open credential JSON|reparse point"):
             self.storage.load_document()
 
     async def test_rejects_symlinked_lock_file(self):
@@ -214,9 +220,11 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             stream.write("")
         os.symlink(target, self.storage.lock_path)
 
+        # Same divergence as the JSON file: O_NOFOLLOW refuses on POSIX, the
+        # reparse-point check refuses on Windows.
         with self.assertRaisesRegex(
                 credential_storages.CredentialStorageError,
-                "could not open credential lock"):
+                "could not open credential lock|reparse point"):
             await self.storage.store_openai_login(tokens())
 
     def assert_descriptor_closed(self, fd):

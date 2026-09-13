@@ -503,6 +503,15 @@ class HandleRelativeFileDeclarationTests(unittest.TestCase):
         self.assertEqual(windows_api.STATUS_ACCESS_DENIED, 0xC0000022)
         self.assertEqual(windows_api.STATUS_NOT_A_DIRECTORY, 0xC0000103)
 
+    def test_a_full_sid_is_already_canonical(self):
+        # The shortcut is what keeps canonical_sid callable where the API is
+        # not (the portable privacy tests pass full SIDs), and avoids a round
+        # trip for the common case.  Aliases need Windows.
+        self.assertEqual(
+            windows_api.canonical_sid("S-1-5-21-1-2-3-1001"),
+            "S-1-5-21-1-2-3-1001")
+        self.assertEqual(windows_api.canonical_sid("S-1-3-4"), "S-1-3-4")
+
 
 class RangeLockDeclarationTests(unittest.TestCase):
     def test_overlapped_states_the_offset_the_lock_starts_at(self):

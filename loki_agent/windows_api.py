@@ -353,6 +353,34 @@ def sid_text(sid) -> str:
         local_free(text)
 
 
+def canonical_sid(text: str) -> str:
+    """Return the full ``S-1-...`` spelling of a SID or an SDDL alias.
+
+    A DACL read back from the kernel spells well-known trustees as SDDL
+    aliases (``SY``, ``BA``, ``OW``) and everyone else in full form, so one
+    trustee can arrive in two spellings.  ``ConvertStringSidToSidW`` accepts
+    both; the result is always the full form.
+
+    A string already in full form is returned as is -- the conversion is a
+    round trip -- which also keeps this callable where the API is not (the
+    portable tests pass full SIDs).
+    """
+    if text.startswith("S-"):
+        return text
+    convert = bind("advapi32", "ConvertStringSidToSidW", wintypes.BOOL,
+                   wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+    sid = ctypes.c_void_p()
+    if not convert(text, ctypes.byref(sid)):
+        raise WindowsApiError(f"ConvertStringSidToSidW({text!r}) failed",
+                              status=ctypes.get_last_error())
+    try:
+        return sid_text(sid)
+    finally:
+        local_free(sid)
+
+
 # -- container identity and launch ---------------------------------------
 # An AppContainer token is supplied when the process is created -- through the
 # security-capabilities attribute on CreateProcess -- rather than adopted by a
