@@ -542,7 +542,7 @@ class EditorWidgetTests(unittest.TestCase):
         self.assertEqual(len(self.backend.applied), 1)
 
     def test_apply_refuses_a_protected_path_without_calling_the_backend(self):
-        with mock.patch.object(windows_setup, "_runtime_trees",
+        with mock.patch.object(windows_state, "_runtime_trees",
                                return_value=["/protected"]):
             editor = self.editor()
             editor.model.add("/protected", windows_setup.Access.READ)
