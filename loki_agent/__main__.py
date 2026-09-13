@@ -11,6 +11,7 @@ import os
 import sys
 
 from . import host_ipc
+from .windows_api import WindowsApiError
 from .credentials import capture_process_credentials
 from .diagnostics import configure_logging
 from .runtime_isolations import (
@@ -49,7 +50,11 @@ def _terminal_runtime_arguments(args):
 def _protect_runtime() -> bool:
     # Isolation happens before the large runtime import and while this newly
     # execed Python process is still single-threaded.
-    isolate_credential_directory()
+    if os.name == "nt":
+        from .windows_runtime import verify_runtime
+        verify_runtime()
+    else:
+        isolate_credential_directory()
     return protect_credential_process()
 
 
@@ -64,7 +69,7 @@ def main() -> int:
             owner_fd, capability_fd, args = (
                 _terminal_runtime_arguments(sys.argv[2:]))
             _protect_runtime()
-        except (ProcessProtectionError, RuntimeIsolationError,
+        except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError,
                 ValueError) as error:
             return _report_security_error(error)
         if not configure_logging():
@@ -79,8 +84,11 @@ def main() -> int:
             # Re-unsharing would add a namespace level for no security gain,
             # can hit nesting/policy limits, and would undermine the simple
             # invariant that only the first runtime establishes this view.
+            if os.name == "nt":
+                from .windows_runtime import verify_runtime
+                verify_runtime()
             protect_credential_process()
-        except ProcessProtectionError as error:
+        except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError) as error:
             return _report_security_error(error)
         if not configure_logging():
             return 2
@@ -104,6 +112,24 @@ def main() -> int:
         from .authentication_commands import main as authentication_main
         return authentication_main(
             sys.argv[2:], program=sys.argv[0])
+    if os.name == "nt":
+        import getopt
+        from .terminal_frontend import parse_cli_args, USAGE
+        try:
+            options, positional = parse_cli_args(sys.argv[1:])
+            if positional:
+                raise getopt.GetoptError("unexpected positional arguments")
+        except getopt.GetoptError as error:
+            print(f"loki: {error}\n{USAGE}", file=sys.stderr)
+            return 2
+        if any(name in ("-h", "--help") for name, _ in options):
+            print(USAGE, end="")
+            return 0
+        from .windows_runtime import configured_workspace
+        try:
+            configured_workspace(sys.argv[1:])
+        except (RuntimeIsolationError, WindowsApiError) as error:
+            return _report_security_error(error)
     from .credential_storages import (
         CredentialStorageError,
         JsonCredentialStorage,
@@ -119,7 +145,7 @@ def main() -> int:
     try:
         return asyncio.run(supervisor.run_terminal_runtime(
             sys.argv[0], sys.argv[1:]))
-    except OSError as error:
+    except (OSError, RuntimeIsolationError, WindowsApiError) as error:
         # sys.argv[0] is the exact sanctioned executable selected by the
         # caller (for example ./loki.py or an installed ``loki`` script).
         # Do not replace it with a random ambient Python interpreter.

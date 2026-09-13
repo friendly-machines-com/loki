@@ -510,12 +510,13 @@ def terminate_process(process, exit_code: int = 1) -> None:
 
 def create_process_in_app_container(executable, arguments, package_sid,
                                     current_directory=None,
-                                    inherited_handles=None):
+                                    inherited_handles=None, environment=None,
+                                    standard_handles=None):
     """Create ``executable`` suspended inside the AppContainer ``package_sid``.
 
     ``package_sid`` is the package SID in string form, as
     :func:`derive_app_container_sid` returns; the profile must already exist,
-    since this creates nothing and changes no DACL.  ``inherited_handles`` are
+    since this does not create a profile or change a DACL. ``inherited_handles`` are
     the handles the child must receive, passed explicitly through
     ``PROC_THREAD_ATTRIBUTE_HANDLE_LIST`` with inheritance otherwise off.
 
@@ -552,6 +553,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
     attribute_count = 1 + (1 if inherited_handles else 0)
     size = ctypes.c_size_t()
     attribute_list = None
+    initialized = False
     handle_array = None
     try:
         initialize(None, attribute_count, 0, ctypes.byref(size))
@@ -564,6 +566,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
                           ctypes.byref(size)):
             raise WindowsApiError(
                 "InitializeProcThreadAttributeList failed")
+        initialized = True
         capabilities = SecurityCapabilities(sid, None, 0, 0)
         if not update(attribute_list, 0,
                       PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
@@ -584,12 +587,25 @@ def create_process_in_app_container(executable, arguments, package_sid,
         startup = StartupInfoEx()
         startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
         startup.lpAttributeList = attribute_list
+        if standard_handles is not None:
+            startup.StartupInfo.dwFlags = 0x100  # STARTF_USESTDHANDLES
+            (startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput,
+             startup.StartupInfo.hStdError) = standard_handles
         information = ProcessInformation()
         command_line = ctypes.create_unicode_buffer(
             subprocess.list2cmdline([executable, *arguments]))
         flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT
+        environment_block = None
+        if environment is not None:
+            entries = []
+            for key, value in sorted(environment.items(), key=lambda item: item[0].upper()):
+                if not key or '=' in key or '\0' in key or '\0' in value:
+                    raise ValueError("invalid child environment entry")
+                entries.append(f"{key}={value}")
+            environment_block = ctypes.create_unicode_buffer('\0'.join(entries) + '\0\0')
+            flags |= 0x400  # CREATE_UNICODE_ENVIRONMENT
         if not create(executable, command_line, None, None,
-                      bool(inherited_handles), flags, None,
+                      bool(inherited_handles), flags, environment_block,
                       current_directory, ctypes.byref(startup),
                       ctypes.byref(information)):
             raise WindowsApiError(
@@ -597,6 +613,6 @@ def create_process_in_app_container(executable, arguments, package_sid,
                 f"{ctypes.get_last_error()}")
         return information
     finally:
-        if attribute_list is not None:
+        if initialized:
             delete(attribute_list)
         local_free(sid)
