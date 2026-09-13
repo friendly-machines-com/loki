@@ -231,23 +231,24 @@ def conpty_probe(root):
         kernel.CloseHandle(input_read)
         kernel.CloseHandle(output_write)
         output = bytearray()
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 8
         available, transferred = ULONG(), ULONG()
-        while time.monotonic() < deadline:
+        # Keep draining after the child exits: the pseudoconsole flushes its
+        # final frame when the session closes, and a poll that stops at process
+        # exit loses it.
+        while time.monotonic() < deadline and b'conpty-ok' not in output:
             if not peek(output_read, None, 0, None, C.byref(available), None):
+                record['peek_failed'] = True
                 break
             if available.value:
                 buffer = C.create_string_buffer(available.value)
                 if not read_file(output_read, buffer, available.value,
                                  C.byref(transferred), None):
+                    record['read_failed'] = True
                     break
                 output.extend(buffer.raw[:transferred.value])
-                if b'conpty-ok' in output:
-                    break
-            elif kernel.WaitForSingleObject(process.process, 100) == 0:
-                break
             else:
-                time.sleep(0.02)
+                time.sleep(0.005)
         record['saw_marker'] = b'conpty-ok' in output
         record['output'] = output.decode('utf-8', 'replace')
         kernel.WaitForSingleObject(process.process, 5000)
