@@ -27,7 +27,16 @@ from ctypes import wintypes
 
 
 class WindowsApiError(RuntimeError):
-    """A Windows call was attempted and returned failure."""
+    """A Windows call was attempted and returned failure.
+
+    ``status`` carries the HRESULT when the failure came from one, so callers
+    can distinguish a specific documented result (an already-existing profile,
+    for instance) from a genuine failure instead of pattern-matching messages.
+    """
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 class WindowsUnavailableError(WindowsApiError):
@@ -138,3 +147,212 @@ def known_folder(folder_id: str, flags: int = KF_FLAG_DEFAULT) -> str:
         return ctypes.wstring_at(buffer.value)
     finally:
         co_task_mem_free(buffer)
+
+
+# -- named security descriptors ------------------------------------------
+# DACL_SECURITY_INFORMATION asks for (or sets) the DACL only.
+# PROTECTED_DACL_SECURITY_INFORMATION clears inheritance, which is what makes
+# "nothing grants the package SID" an invariant we control rather than one the
+# parent directory can change under us.
+# 0x800700B7: ERROR_ALREADY_EXISTS.  Measured on all three investigation
+# interpreters when CreateAppContainerProfile is called for an existing name.
+PROFILE_ALREADY_EXISTS = 0x800700B7
+
+DACL_SECURITY_INFORMATION = 0x00000004
+PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+SE_FILE_OBJECT = 1
+SDDL_REVISION_1 = 1
+ERROR_SUCCESS = 0
+TOKEN_QUERY = 0x0008
+TOKEN_USER_CLASS = 1
+
+
+def current_user_sid() -> str:
+    """Return the calling process's user SID as a string.
+
+    The SID is what the SDDL grants name, so it has to come from the token
+    rather than from anything the environment claims.
+    """
+    open_token = bind("advapi32", "OpenProcessToken", wintypes.BOOL,
+                      ctypes.c_void_p, wintypes.DWORD,
+                      ctypes.POINTER(ctypes.c_void_p))
+    get_current_process = bind("kernel32", "GetCurrentProcess",
+                               ctypes.c_void_p)
+    get_token_information = bind(
+        "advapi32", "GetTokenInformation", wintypes.BOOL, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD))
+    convert_sid = bind("advapi32", "ConvertSidToStringSidW", wintypes.BOOL,
+                       ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+    close = bind("kernel32", "CloseHandle", wintypes.BOOL, ctypes.c_void_p)
+
+    token = ctypes.c_void_p()
+    if not open_token(get_current_process(), TOKEN_QUERY,
+                      ctypes.byref(token)):
+        raise WindowsApiError("OpenProcessToken failed")
+    try:
+        size = wintypes.DWORD()
+        get_token_information(token, TOKEN_USER_CLASS, None, 0,
+                              ctypes.byref(size))
+        buffer = ctypes.create_string_buffer(size.value)
+        if not get_token_information(token, TOKEN_USER_CLASS, buffer,
+                                     len(buffer), ctypes.byref(size)):
+            raise WindowsApiError("GetTokenInformation(TokenUser) failed")
+        sid = ctypes.c_void_p.from_buffer(buffer).value  # SID_AND_ATTRIBUTES
+        text = ctypes.c_void_p()
+        if not convert_sid(sid, ctypes.byref(text)):
+            raise WindowsApiError("ConvertSidToStringSidW failed")
+        try:
+            return ctypes.wstring_at(text)
+        finally:
+            local_free(text)
+    finally:
+        close(token)
+
+
+def set_dacl_sddl(path: str, sddl: str) -> None:
+    """Replace ``path``'s DACL with ``sddl`` and clear inheritance."""
+    convert = bind(
+        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    get_dacl = bind("advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
+                    ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.POINTER(wintypes.BOOL))
+    set_named = bind("advapi32", "SetNamedSecurityInfoW", wintypes.DWORD,
+                     wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+                     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                     ctypes.c_void_p)
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+
+    descriptor, dacl = ctypes.c_void_p(), ctypes.c_void_p()
+    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise WindowsApiError(f"invalid security descriptor: {sddl!r}")
+    try:
+        present = wintypes.BOOL()
+        defaulted = wintypes.BOOL()
+        if not get_dacl(descriptor, ctypes.byref(present),
+                        ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise WindowsApiError("GetSecurityDescriptorDacl failed")
+        if not present.value:
+            raise WindowsApiError("security descriptor carries no DACL")
+        status = set_named(
+            path, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, dacl, None)
+        if status != ERROR_SUCCESS:
+            raise WindowsApiError(
+                f"SetNamedSecurityInfoW({path!r}) failed: {status}")
+    finally:
+        local_free(descriptor)
+
+
+def dacl_sddl(path: str) -> str:
+    """Return ``path``'s DACL as SDDL, for verification and for diffs."""
+    get_named = bind(
+        "advapi32", "GetNamedSecurityInfoW", wintypes.DWORD,
+        wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p))
+    convert = bind(
+        "advapi32", "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+        wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+
+    descriptor = ctypes.c_void_p()
+    status = get_named(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                       None, None, None, None, ctypes.byref(descriptor))
+    if status != ERROR_SUCCESS:
+        raise WindowsApiError(f"GetNamedSecurityInfoW({path!r}) failed: {status}")
+    try:
+        text = ctypes.c_void_p()
+        if not convert(descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
+                       ctypes.byref(text), None):
+            raise WindowsApiError("ConvertSecurityDescriptorToString failed")
+        try:
+            return ctypes.wstring_at(text)
+        finally:
+            local_free(text)
+    finally:
+        local_free(descriptor)
+
+
+def app_container_profile_name_is_usable(name: str) -> bool:
+    """Whether ``name`` matches the documented profile-name character set."""
+    allowed = set("abcdefghijklmnopqrstuvwxyz"
+                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                  "0123456789.-_")
+    return bool(name) and len(name) <= 64 and set(name) <= allowed
+
+
+def create_app_container_profile(name: str) -> str:
+    """Create the profile and return its package SID."""
+    create = bind("userenv", "CreateAppContainerProfile", ctypes.c_long,
+                  wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                  ctypes.c_void_p, wintypes.DWORD,
+                  ctypes.POINTER(ctypes.c_void_p))
+    free_sid = bind("advapi32", "FreeSid", ctypes.c_void_p, ctypes.c_void_p)
+
+    sid = ctypes.c_void_p()
+    status = create(name, name, name, None, 0, ctypes.byref(sid))
+    if status < 0:
+        raise WindowsApiError(
+            f"CreateAppContainerProfile({name!r}) failed: "
+            f"0x{status & 0xffffffff:08x}",
+            status=status & 0xffffffff)
+    try:
+        return sid_text(sid)
+    finally:
+        free_sid(sid)
+
+
+def derive_app_container_sid(name: str) -> str:
+    """Derive the package SID for ``name`` without creating anything."""
+    derive = bind("userenv", "DeriveAppContainerSidFromAppContainerName",
+                  ctypes.c_long, wintypes.LPCWSTR,
+                  ctypes.POINTER(ctypes.c_void_p))
+    free_sid = bind("advapi32", "FreeSid", ctypes.c_void_p, ctypes.c_void_p)
+
+    sid = ctypes.c_void_p()
+    status = derive(name, ctypes.byref(sid))
+    if status < 0:
+        raise WindowsApiError(
+            f"DeriveAppContainerSidFromAppContainerName({name!r}) failed: "
+            f"0x{status & 0xffffffff:08x}")
+    try:
+        return sid_text(sid)
+    finally:
+        free_sid(sid)
+
+
+def delete_app_container_profile(name: str) -> None:
+    delete = bind("userenv", "DeleteAppContainerProfile", ctypes.c_long,
+                  wintypes.LPCWSTR)
+    status = delete(name)
+    if status < 0:
+        raise WindowsApiError(
+            f"DeleteAppContainerProfile({name!r}) failed: "
+            f"0x{status & 0xffffffff:08x}")
+
+
+def sid_text(sid) -> str:
+    """Convert a SID pointer to its string form."""
+    convert = bind("advapi32", "ConvertSidToStringSidW", wintypes.BOOL,
+                   ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+
+    text = ctypes.c_void_p()
+    if not convert(sid, ctypes.byref(text)):
+        raise WindowsApiError("ConvertSidToStringSidW failed")
+    try:
+        return ctypes.wstring_at(text)
+    finally:
+        local_free(text)

@@ -1,0 +1,580 @@
+"""Portable tests for the Windows setup editor's logic and rules.
+
+The Tk editor and the ACL/profile calls need Windows and are deliberately not
+covered here.  Everything that *decides* something -- path rules, warnings,
+naming, SDDL composition, the ledger, the plan diff, and the platform gate --
+is pure, and is checked on every platform because a mistake there either grants
+too much or refuses something legitimate.
+"""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+from loki_agent import windows_api
+from loki_agent import windows_setup
+
+
+PACKAGE_SID = "S-1-15-2-1-2-3-4-5-6-7-8"
+OTHER_SID = "S-1-5-21-1-2-3-1004"
+
+
+class AccessLevelTests(unittest.TestCase):
+    def test_read_is_generic_read_and_execute(self):
+        # Execute on a directory is traverse, which known-path access needs.
+        self.assertEqual(windows_setup.access_sddl(windows_setup.Access.READ),
+                         "FRFX")
+
+    def test_write_uses_modify_not_all_access(self):
+        # FA would include WRITE_DAC, letting a tool rewrite the DACL and lock
+        # the owner out of their own directory.
+        self.assertEqual(
+            windows_setup.access_sddl(windows_setup.Access.READ_WRITE),
+            "0x1301BF")
+
+
+class SddlEditingTests(unittest.TestCase):
+    EXISTING = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;" + OTHER_SID + ")"
+
+    def test_add_appends_an_inheritable_ace_and_keeps_existing_ones(self):
+        result = windows_setup.add_package_ace(
+            self.EXISTING, PACKAGE_SID, windows_setup.Access.READ)
+
+        self.assertTrue(result.startswith(self.EXISTING))
+        self.assertEqual(result, self.EXISTING + "(A;OICI;FRFX;;;%s)"
+                         % PACKAGE_SID)
+        self.assertTrue(windows_setup.grants_package(result, PACKAGE_SID))
+
+    def test_add_rejects_something_that_is_not_a_dacl(self):
+        with self.assertRaises(windows_api.WindowsApiError):
+            windows_setup.add_package_ace("S:PAI", PACKAGE_SID,
+                                          windows_setup.Access.READ)
+
+    def test_remove_deletes_only_that_package_and_is_idempotent_afterwards(self):
+        added = windows_setup.add_package_ace(
+            self.EXISTING, PACKAGE_SID, windows_setup.Access.READ_WRITE)
+
+        removed = windows_setup.remove_package_aces(added, PACKAGE_SID)
+
+        self.assertEqual(removed, self.EXISTING)
+        self.assertFalse(windows_setup.grants_package(removed, PACKAGE_SID))
+        self.assertEqual(
+            windows_setup.remove_package_aces(removed, PACKAGE_SID), removed)
+
+    def test_remove_leaves_other_packages_alone(self):
+        both = windows_setup.add_package_ace(
+            windows_setup.add_package_ace(
+                self.EXISTING, PACKAGE_SID, windows_setup.Access.READ),
+            OTHER_SID, windows_setup.Access.READ)
+
+        removed = windows_setup.remove_package_aces(both, PACKAGE_SID)
+
+        self.assertFalse(windows_setup.grants_package(removed, PACKAGE_SID))
+        self.assertTrue(windows_setup.grants_package(removed, OTHER_SID))
+
+
+class ProtectedPathTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = temporary.name
+        self.config = os.path.join(self.root, "loki")
+        self.credentials = os.path.join(self.config, "credentials")
+        self.state = os.path.join(self.root, "state")
+        for target, attribute in ((self.config, "loki_config_dir"),
+                                  (self.state, "loki_state_dir"),
+                                  (self.credentials, "credential_directory")):
+            patch = mock.patch.object(
+                windows_setup.paths, attribute, return_value=target)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_refuses_a_grant_that_covers_the_credential_directory(self):
+        self.assertTrue(windows_setup.protected_path_errors(self.root))
+
+    def test_refuses_the_credential_directory_itself(self):
+        self.assertTrue(
+            windows_setup.protected_path_errors(self.credentials))
+
+    def test_refuses_a_grant_inside_a_protected_tree(self):
+        self.assertTrue(windows_setup.protected_path_errors(
+            os.path.join(self.config, "sessions")))
+
+    def test_refuses_the_runtime_tree(self):
+        package = os.path.dirname(os.path.abspath(windows_setup.__file__))
+        self.assertTrue(windows_setup.protected_path_errors(package))
+
+    def test_allows_an_unrelated_directory(self):
+        self.assertEqual(
+            windows_setup.protected_path_errors(
+                os.path.join(self.root, "elsewhere")), [])
+
+
+class SecretWarningTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = temporary.name
+        patch = mock.patch.object(
+            windows_setup.os.path, "expanduser", return_value=self.home)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_warns_only_about_existing_covered_locations(self):
+        os.makedirs(os.path.join(self.home, ".ssh"))
+
+        warnings = windows_setup.covered_secret_warnings(self.home)
+
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(".ssh", warnings[0])
+
+    def test_is_silent_when_nothing_is_there(self):
+        self.assertEqual(
+            windows_setup.covered_secret_warnings(self.home), [])
+
+    def test_is_silent_for_an_unrelated_directory(self):
+        os.makedirs(os.path.join(self.home, ".ssh"))
+        elsewhere = os.path.join(self.home, "projects")
+
+        self.assertEqual(
+            windows_setup.covered_secret_warnings(elsewhere), [])
+
+
+class NamingTests(unittest.TestCase):
+    def test_canonical_form_collapses_spellings_of_one_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            child = os.path.join(root, "project")
+            os.makedirs(child)
+            link = os.path.join(root, "link")
+            os.symlink(child, link)
+
+            self.assertEqual(
+                windows_setup.canonical_workspace(child),
+                windows_setup.canonical_workspace(link))
+            self.assertEqual(
+                windows_setup.canonical_workspace(child),
+                windows_setup.canonical_workspace(child + os.sep))
+            self.assertEqual(
+                windows_setup.canonical_workspace(child),
+                windows_setup.canonical_workspace(
+                    os.path.join(child, "..", "project")))
+
+    def test_profile_name_is_deterministic_and_usable(self):
+        first = windows_setup.profile_name_for("/tmp/project")
+        second = windows_setup.profile_name_for("/tmp/project")
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, windows_setup.profile_name_for("/tmp/other"))
+        self.assertTrue(
+            windows_api.app_container_profile_name_is_usable(first))
+
+
+class LedgerTests(unittest.TestCase):
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as root:
+            location = os.path.join(root, "nested", "ledger.json")
+            blob = {"version": windows_setup.LEDGER_VERSION,
+                    "workspaces": {"k": {"workspace": "/p",
+                                         "profile": "Loki.Workspace.x",
+                                         "grants": []}}}
+
+            windows_setup.save_ledger(blob, location)
+
+            self.assertEqual(windows_setup.load_ledger(location), blob)
+
+    def test_missing_or_corrupt_ledger_is_empty(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = os.path.join(root, "absent.json")
+            self.assertEqual(
+                windows_setup.load_ledger(missing)["workspaces"], {})
+            corrupt = os.path.join(root, "corrupt.json")
+            with open(corrupt, "w", encoding="utf-8") as stream:
+                json.dump({"workspaces": "not a mapping"}, stream)
+            self.assertEqual(
+                windows_setup.load_ledger(corrupt)["workspaces"], {})
+
+
+class PlanTests(unittest.TestCase):
+    def definition(self, *grants):
+        return windows_setup.Definition("/p", list(grants))
+
+    def grant(self, path, access=windows_setup.Access.READ, origin="user"):
+        return windows_setup.Grant(path, access, origin)
+
+    def test_add_remove_and_level_changes(self):
+        definition = self.definition(
+            self.grant("/one"),
+            self.grant("/two", windows_setup.Access.READ_WRITE))
+        previous = windows_setup.ledger_entry(
+            "/p", "Loki.Workspace.x",
+            [self.grant("/two"),
+             self.grant("/gone", origin="workspace")])
+
+        plan = windows_setup.build_plan(definition, previous)
+
+        kinds = sorted((change.kind, change.path) for change in plan.changes)
+        self.assertEqual(kinds, [("add", "/one"),
+                                 ("level", "/two"),
+                                 ("remove", "/gone")])
+
+    def test_no_changes_when_everything_matches(self):
+        definition = self.definition(self.grant("/one"))
+        previous = windows_setup.ledger_entry("/p", "x", [self.grant("/one")])
+
+        self.assertEqual(
+            windows_setup.build_plan(definition, previous).changes, [])
+
+    def test_protected_paths_are_errors_and_block_apply(self):
+        with tempfile.TemporaryDirectory() as root:
+            credentials = os.path.join(root, "credentials")
+            with mock.patch.object(
+                    windows_setup, "_runtime_trees", return_value=[credentials]):
+                plan = windows_setup.build_plan(
+                    self.definition(self.grant(root)), None)
+
+        self.assertFalse(plan.applicable)
+        self.assertTrue(plan.errors)
+
+    def test_warnings_are_collected_for_user_grants_only(self):
+        with mock.patch.object(
+                windows_setup, "covered_secret_warnings",
+                side_effect=lambda path: [f"covers {path}"]) as warning:
+            plan = windows_setup.build_plan(
+                self.definition(self.grant("/user-dir"),
+                                self.grant("/auto", origin="workspace")),
+                None)
+
+        self.assertEqual(plan.warnings, ["covers /user-dir"])
+        warning.assert_called_once_with("/user-dir")
+
+
+class AutomaticGrantTests(unittest.TestCase):
+    def test_automatic_grants_are_the_workspace_and_toolchain(self):
+        grants = windows_setup.automatic_grants("/work")
+
+        by_origin = {grant.origin: grant for grant in grants}
+        self.assertEqual(sorted(by_origin), ["toolchain", "workspace"])
+        self.assertEqual(by_origin["workspace"].access,
+                         windows_setup.Access.READ_WRITE)
+        self.assertEqual(by_origin["toolchain"].access,
+                         windows_setup.Access.READ)
+        # No scratch grant: TEMP points inside the workspace, and a directory of
+        # our own under the configuration tree would put a package ACE beside
+        # the credential directory.
+        self.assertEqual(windows_setup.protected_path_errors("/work"), [])
+
+    def test_definition_is_automatic_plus_recorded_user_grants(self):
+        previous = windows_setup.ledger_entry(
+            "/work", "x", [windows_setup.Grant("/extra",
+                                               windows_setup.Access.READ,
+                                               "user")])
+
+        definition = windows_setup.definition_for("/work", previous)
+
+        origins = [grant.origin for grant in definition.grants]
+        self.assertEqual(origins.count("user"), 1)
+        self.assertIn("workspace", origins)
+
+
+class PlatformGateTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "needs a non-Windows host")
+    def test_posix_refuses_the_setup_entrypoint_entirely(self):
+        # Even --help: the flag vocabulary must not exist on POSIX, so an
+        # unknown option fails instead of quietly doing nothing.
+        for argument in (["--help"], ["--edit", "/work"], ["--verify", "/w"]):
+            with self.subTest(argument=argument):
+                self.assertEqual(windows_setup.main(argument), 2)
+
+    def test_unavailable_backend_refuses_every_operation(self):
+        backend = windows_setup.UnavailableBackend()
+        for call in (lambda: backend.apply(None, None),
+                     lambda: backend.verify(None),
+                     lambda: backend.uninstall({})):
+            with self.subTest(call=call), self.assertRaises(
+                    windows_api.WindowsUnavailableError):
+                call()
+
+    def test_uninstall_message_names_the_whole_harness(self):
+        message = windows_setup.UNINSTALL_MESSAGE
+        self.assertIn("entire Loki coding agent harness", message)
+        self.assertIn("Your files are not deleted", message)
+
+
+class FakeBackend:
+    """Records what the editor asked for and returns minimal checks."""
+
+    def __init__(self):
+        self.applied = []
+        self.verified = []
+        self.uninstalled = []
+
+    def apply(self, plan, definition):
+        self.applied.append((plan, definition))
+        return [windows_setup.Check("profile", "pass", "ok")]
+
+    def verify(self, definition):
+        self.verified.append(definition)
+        return [windows_setup.Check("contained probe", "untested", "probe")]
+
+    def uninstall(self, blob):
+        self.uninstalled.append(blob)
+        blob["workspaces"] = {}
+        return [windows_setup.Check("ledger", "pass", "cleared")]
+
+
+class DescribePlanTests(unittest.TestCase):
+    def plan(self, *changes, warnings=(), errors=()):
+        return windows_setup.Plan("/p", "profile", list(changes),
+                                  list(warnings), list(errors))
+
+    def change(self, kind, path, access=windows_setup.Access.READ):
+        return windows_setup.Change(kind, path, access)
+
+    def test_describes_each_change_with_its_level(self):
+        text = windows_setup.describe_plan(self.plan(
+            self.change("add", "/new", windows_setup.Access.READ_WRITE),
+            self.change("remove", "/gone"),
+            self.change("level", "/changed")))
+
+        self.assertIn("will grant /new (read and write)", text)
+        self.assertIn("will stop granting /gone (read)", text)
+        self.assertIn("will change /changed (read)", text)
+
+    def test_says_so_when_nothing_changes(self):
+        self.assertIn("no changes to grants",
+                      windows_setup.describe_plan(self.plan()))
+
+    def test_lists_warnings_after_the_changes(self):
+        text = windows_setup.describe_plan(
+            self.plan(self.change("add", "/x"), warnings=["covers /x/.ssh"]))
+
+        self.assertIn("Warnings:", text)
+        self.assertIn("! covers /x/.ssh", text)
+        self.assertLess(text.index("will grant"), text.index("Warnings:"))
+
+
+class EditorModelTests(unittest.TestCase):
+    def model(self, ledger=None, backend=None, workspace="/work"):
+        return windows_setup.EditorModel(
+            {"workspaces": {}} if ledger is None else ledger,
+            workspace, backend or FakeBackend())
+
+    def user_grant(self, path, access=windows_setup.Access.READ):
+        return windows_setup.Grant(path, access, "user")
+
+    def user_ledger(self, path="/extra", access=windows_setup.Access.READ):
+        entry = windows_setup.ledger_entry(
+            "/work", "p", [self.user_grant(path, access)])
+        return {"workspaces": {windows_setup.workspace_key("/work"): entry}}
+
+    def test_rows_show_level_path_and_origin(self):
+        model = self.model(self.user_ledger())
+
+        rows = model.rows()
+
+        self.assertIn("read: /extra", rows)
+        self.assertTrue(any("[workspace]" in row for row in rows))
+        self.assertTrue(any("[toolchain]" in row for row in rows))
+
+    def test_user_rows_are_editable_and_automatic_rows_are_not(self):
+        model = self.model(self.user_ledger())
+
+        automatic = [i for i, grant in enumerate(model.grants)
+                     if grant.origin != "user"]
+        user = [i for i, grant in enumerate(model.grants)
+                if grant.origin == "user"]
+        self.assertTrue(automatic)
+        for index in automatic:
+            self.assertIn("shared automatically", model.edit_refusal(index))
+        self.assertEqual(len(user), 1)
+        self.assertIsNone(model.edit_refusal(user[0]))
+
+    def test_adding_a_grant_makes_the_model_dirty_and_reload_discards_it(self):
+        model = self.model()
+        self.assertFalse(model.dirty)
+
+        model.add("/new", windows_setup.Access.READ)
+
+        self.assertTrue(model.dirty)
+        self.assertIn("read: /new", model.rows())
+
+        model.reload(model.workspace)
+
+        self.assertFalse(model.dirty)
+        self.assertNotIn("read: /new", model.rows())
+
+    def test_level_change_and_removal_edit_the_selected_row(self):
+        model = self.model(self.user_ledger())
+        index = [i for i, grant in enumerate(model.grants)
+                 if grant.origin == "user"][0]
+
+        model.set_level(index, windows_setup.Access.READ_WRITE)
+        self.assertIn("read and write: /extra", model.rows())
+
+        model.remove(index)
+        self.assertNotIn("read and write: /extra", model.rows())
+        self.assertTrue(model.dirty)
+
+    def test_apply_and_verify_delegate_to_the_backend(self):
+        backend = FakeBackend()
+        model = self.model(backend=backend)
+        model.add("/new", windows_setup.Access.READ)
+
+        checks = model.apply()
+        model.verify()
+
+        self.assertEqual(checks[0].status, "pass")
+        self.assertEqual(len(backend.applied), 1)
+        plan, definition = backend.applied[0]
+        self.assertIs(definition, model.definition)
+        self.assertEqual(plan.profile,
+                         windows_setup.profile_name_for("/work"))
+        self.assertEqual(backend.verified, [model.definition])
+
+    def test_uninstall_delegates_and_reloads(self):
+        ledger = self.user_ledger()
+        backend = FakeBackend()
+        model = self.model(ledger, backend)
+
+        model.uninstall()
+
+        self.assertEqual(backend.uninstalled, [ledger])
+        self.assertFalse(model.dirty)
+
+    def test_describe_is_the_plan_text(self):
+        model = self.model()
+        model.add("/new", windows_setup.Access.READ)
+
+        self.assertIn("will grant /new (read)", model.describe())
+
+
+@unittest.skipUnless(sys.platform == "win32",
+                     "Tk widgets need Windows (there is no display server)")
+class EditorWidgetTests(unittest.TestCase):
+    """Widget smoke tests: does each button do what it claims?
+
+    Only the wiring is covered -- the rules live in EditorModelTests, and the
+    appearance stays a visual check.
+    """
+
+    def setUp(self):
+        tk, _, _ = windows_setup._tk()
+        self.tk = tk
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.filedialog = mock.Mock()
+        self.messagebox = mock.Mock()
+        self.messagebox.askokcancel.return_value = True
+        self.messagebox.askyesnocancel.return_value = True
+        self.backend = FakeBackend()
+
+    def editor(self, ledger=None, workspace="/work"):
+        model = windows_setup.EditorModel(
+            {"workspaces": {}} if ledger is None else ledger,
+            workspace, self.backend)
+        return windows_setup.Editor(self.root, model, self.tk,
+                                    self.filedialog, self.messagebox)
+
+    def user_ledger(self, path="/extra"):
+        entry = windows_setup.ledger_entry(
+            "/work", "p", [windows_setup.Grant(path,
+                                               windows_setup.Access.READ,
+                                               "user")])
+        return {"workspaces": {windows_setup.workspace_key("/work"): entry}}
+
+    def rows(self, editor):
+        return list(editor.listing.get(0, "end"))
+
+    def select(self, editor, index):
+        editor.listing.selection_clear(0, "end")
+        editor.listing.selection_set(index)
+        self.root.update_idletasks()
+
+    def test_rows_render_each_grant_with_its_level(self):
+        self.assertIn("read: /extra", self.rows(self.editor(
+            self.user_ledger())))
+
+    def test_add_appends_the_chosen_path_at_the_chosen_level(self):
+        self.filedialog.askdirectory.return_value = "/chosen"
+        self.messagebox.askyesnocancel.return_value = False  # read only
+        editor = self.editor()
+
+        editor.add()
+
+        self.assertIn("read: /chosen", self.rows(editor))
+        self.assertTrue(editor.model.dirty)
+
+    def test_modify_refuses_an_automatic_grant_with_a_reason(self):
+        editor = self.editor()
+        automatic = [i for i, grant in enumerate(editor.model.grants)
+                     if grant.origin != "user"][0]
+        self.select(editor, automatic)
+        before = editor.model.grants[automatic].access
+
+        editor.modify()
+
+        self.messagebox.showinfo.assert_called_once()
+        self.assertIn("shared automatically",
+                      self.messagebox.showinfo.call_args.args[1])
+        self.assertIs(editor.model.grants[automatic].access, before)
+
+    def test_delete_removes_a_user_grant_after_confirmation(self):
+        editor = self.editor(self.user_ledger())
+        index = [i for i, grant in enumerate(editor.model.grants)
+                 if grant.origin == "user"][0]
+        self.select(editor, index)
+
+        editor.delete()
+
+        self.assertNotIn("read: /extra", self.rows(editor))
+
+    def test_apply_hands_the_definition_to_the_backend(self):
+        editor = self.editor(self.user_ledger())
+
+        editor.apply()
+
+        self.assertEqual(editor.status, 0)
+        self.assertEqual(len(self.backend.applied), 1)
+
+    def test_apply_refuses_a_protected_path_without_calling_the_backend(self):
+        with mock.patch.object(windows_setup, "_runtime_trees",
+                               return_value=["/protected"]):
+            editor = self.editor()
+            editor.model.add("/protected", windows_setup.Access.READ)
+
+            editor.apply()
+
+        self.messagebox.showerror.assert_called_once()
+        self.assertEqual(self.backend.applied, [])
+        self.assertEqual(editor.status, 1)
+
+    def test_switching_workspace_discards_changes_only_after_asking(self):
+        self.filedialog.askdirectory.return_value = "/other"
+        self.messagebox.askyesnocancel.return_value = False  # discard
+        editor = self.editor()
+        editor.model.add("/new", windows_setup.Access.READ)
+
+        editor.browse()
+
+        self.messagebox.askyesnocancel.assert_called_once()
+        self.assertEqual(editor.model.workspace, "/other")
+        self.assertFalse(editor.model.dirty)
+
+    def test_switching_workspace_stays_put_when_the_user_cancels(self):
+        self.filedialog.askdirectory.return_value = "/other"
+        self.messagebox.askyesnocancel.return_value = None  # cancel
+        editor = self.editor()
+        editor.model.add("/new", windows_setup.Access.READ)
+
+        editor.browse()
+
+        self.assertEqual(editor.model.workspace, "/work")
+        self.assertEqual(self.filedialog.askdirectory.call_count, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
