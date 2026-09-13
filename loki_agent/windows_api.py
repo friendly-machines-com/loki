@@ -1022,3 +1022,73 @@ def unlock_file(handle) -> None:
     if not call(handle, 0, 1, 0, ctypes.byref(overlapped)):
         raise WindowsApiError("UnlockFileEx failed",
                               status=ctypes.get_last_error())
+
+
+# -- anonymous pipes -----------------------------------------------------
+# The Windows credential IPC is two anonymous pipes, not an AF_UNIX socket:
+# CPython exposes no AF_UNIX on any interpreter Loki runs, because
+# ``Modules/socketmodule.h`` undefines it whenever ``HAVE_SYS_UN_H`` is absent
+# and no Windows toolchain -- MSVC or mingw-w64 -- provides ``sys/un.h``.  A
+# pipe has no name, so reachability is possession of the inherited handle (the
+# authorization ``host_ipc`` already documents) and there is no bind/connect
+# race to confirm.
+#
+# SECURITY_ATTRIBUTES is declared here because ``ctypes.wintypes`` does not
+# define it.  ``bInheritHandle`` is a fixed-width ``c_uint32`` rather than
+# ``wintypes.BOOL``: the latter is ``c_long``, which is 8 bytes on LP64 hosts,
+# and would give the structure the wrong layout in the portable tests that pin
+# it -- the same trap the other structures above avoid.
+
+HANDLE_FLAG_INHERIT = 0x00000001
+
+
+class SecurityAttributes(ctypes.Structure):
+    """SECURITY_ATTRIBUTES: an optional descriptor plus the inherit flag."""
+
+    _fields_ = [
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_uint32),
+    ]
+
+
+def create_pipe(inherit: bool = True, size: int = 0):
+    """Create an anonymous pipe; return ``(read_handle, write_handle)``.
+
+    ``inherit=True`` asks for both ends to be inheritable, which is what makes
+    it possible to name one end in a child's explicit handle list.  The caller
+    clears ``HANDLE_FLAG_INHERIT`` on the end it keeps, so only the child's end
+    remains eligible to be inherited.  ``size`` of 0 lets the system choose the
+    buffer size.
+    """
+    create = bind("kernel32", "CreatePipe", wintypes.BOOL,
+                  ctypes.POINTER(ctypes.c_void_p),
+                  ctypes.POINTER(ctypes.c_void_p),
+                  ctypes.POINTER(SecurityAttributes), ctypes.c_uint32)
+    attributes = SecurityAttributes(
+        ctypes.sizeof(SecurityAttributes), None, 1 if inherit else 0)
+    read_handle = ctypes.c_void_p()
+    write_handle = ctypes.c_void_p()
+    if not create(ctypes.byref(read_handle), ctypes.byref(write_handle),
+                  ctypes.byref(attributes), size):
+        raise WindowsApiError("CreatePipe failed",
+                              status=ctypes.get_last_error())
+    return read_handle.value, write_handle.value
+
+
+def set_handle_information(handle, mask: int, flags: int) -> None:
+    """Set ``handle``'s flag bits for ``mask``.
+
+    Loki declares it for the inheritance flag alone; the reference defines no
+    other callers for this API, so no other mask is passed.
+    """
+    call = bind("kernel32", "SetHandleInformation", wintypes.BOOL,
+                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD)
+    if not call(handle, mask, flags):
+        raise WindowsApiError("SetHandleInformation failed",
+                              status=ctypes.get_last_error())
+
+
+def clear_handle_inheritance(handle) -> None:
+    """Clear ``HANDLE_FLAG_INHERIT`` so the end cannot leak into a child."""
+    set_handle_information(handle, HANDLE_FLAG_INHERIT, 0)

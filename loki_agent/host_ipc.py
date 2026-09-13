@@ -33,8 +33,22 @@ be unlinked before the path can be reused.  There is no ``SCM_RIGHTS`` or
 need to be, because the child end is handed over as an inherited handle and
 possession of that handle is the authorization.
 
-Both channels are therefore the same shape on Windows: an AF_UNIX pair, parent
-end non-inheritable, child end inheritable and named in the handle list.
+**AF_UNIX is unreachable through CPython, so this is being replaced by pipes.**
+Measured 2026-09-13: ``socket.AF_UNIX`` is absent on every Windows interpreter
+Loki runs -- native CPython 3.12 and 3.13 and the mingw-w64 UCRT64 build, host
+and staged copy alike.  The cause is CPython's gate, not the OS:
+``Modules/socketmodule.h`` does ``#undef AF_UNIX`` whenever ``HAVE_SYS_UN_H``
+is absent, MSVC's ``pyconfig.h`` never defines it, and ``configure`` cannot
+find ``sys/un.h`` under mingw-w64 either.  The AF_UNIX branch below therefore
+cannot execute on any supported interpreter.  The intended transport is
+:func:`_private_pipe_pair`: two anonymous pipes, which have no name to
+enumerate, squat or confirm.  Possession of the inherited handle remains the
+authorization, exactly as for the session-lifetime channel.  The swap of
+``socket_pair`` and the transport-neutral endpoint is pending; the AF_UNIX
+branch stays until then so its reasoning and tests are not lost.
+
+Both channels are therefore the same shape on Windows: a private channel,
+parent end non-inheritable, child end inheritable and named in the handle list.
 """
 
 from __future__ import annotations
@@ -43,6 +57,8 @@ import contextlib
 import os
 import secrets
 import socket
+
+from . import windows_api
 
 # A confirmed pair is one whose two ends really are connected to each other.
 # The nonce round-trip cannot fail for a POSIX ``socketpair()``; it exists
@@ -105,6 +121,45 @@ def confirm_pair(first, second) -> None:
         for end, timeout in ((first, first_timeout), (second, second_timeout)):
             with contextlib.suppress(OSError):
                 end.settimeout(timeout)
+
+
+def _private_pipe_pair():
+    """Two anonymous pipes: a named-nothing bidirectional byte channel.
+
+    Returns ``(request, response)``, each a ``(parent, child)`` pair.  The
+    request pipe carries child-to-parent bytes (``request`` is
+    ``(parent_read, child_write)``); the response pipe carries parent-to-child
+    bytes (``response`` is ``(child_read, parent_write)``).  A delegated
+    process receives exactly the two ``child`` handles through the explicit
+    handle list, and the two ``parent`` handles stay here with inheritance
+    cleared.
+
+    There is no name, so -- unlike the AF_UNIX emulation -- nothing else can
+    connect, squat, or win a bind/connect race, and ``confirm_pair`` is not
+    needed: the only way to hold an end is to have been handed it.
+
+    Defined outside the platform branch because it depends only on
+    ``windows_api``'s import-safe declarations; calling it off Windows raises
+    the same ``WindowsUnavailableError`` any other Windows call does.
+    """
+    request_read, request_write = windows_api.create_pipe()
+    try:
+        response_read, response_write = windows_api.create_pipe()
+    except BaseException:
+        windows_api.close_handle(request_read)
+        windows_api.close_handle(request_write)
+        raise
+    try:
+        # Only the child's ends stay inheritable; the parent's ends are cleared
+        # so they can never be inherited by an unrestricted child.
+        windows_api.clear_handle_inheritance(request_read)
+        windows_api.clear_handle_inheritance(response_write)
+    except BaseException:
+        for handle in (request_read, request_write,
+                       response_read, response_write):
+            windows_api.close_handle(handle)
+        raise
+    return (request_read, request_write), (response_read, response_write)
 
 
 if os.name == "posix":
