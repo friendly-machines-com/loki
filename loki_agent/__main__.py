@@ -10,6 +10,7 @@ import asyncio
 import os
 import sys
 
+from . import host_ipc
 from .credentials import capture_process_credentials
 from .diagnostics import configure_logging
 from .runtime_isolations import (
@@ -22,13 +23,9 @@ from .process_protections import (
 )
 
 
-def _descriptor(value: str, description: str) -> int:
+def _descriptor(value: str, description: str):
     try:
-        fd = int(value)
-        if fd < 3:
-            raise ValueError()
-        os.fstat(fd)
-        return fd
+        return host_ipc.child_endpoint(value)
     except (OSError, ValueError) as error:
         raise ValueError(
             f"invalid {description} descriptor") from error

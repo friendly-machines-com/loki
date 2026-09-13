@@ -14,6 +14,7 @@ import json
 import os
 import socket
 
+from . import host_ipc
 from .authentications import (
     CredentialAuthority,
     CredentialError,
@@ -41,6 +42,10 @@ def _endpoint_from_fd(fd: int) -> socket.socket:
     that race can cancel the initialization task, or a task canceled before
     its first instruction could leave the inherited credential FD open.
     """
+    if isinstance(fd, socket.socket):
+        # Windows hands the child a handle, so it arrives already wrapped.
+        fd.setblocking(False)
+        return fd
     try:
         os.set_inheritable(fd, False)
         endpoint = socket.socket(fileno=fd)
@@ -323,9 +328,8 @@ class CredentialCapabilityServer:
         if not permitted.issubset(authority.available()):
             raise ValueError(
                 "delegated credentials exceed the upstream authority")
-        parent_socket, child_socket = socket.socketpair()
+        parent_socket, child_socket = host_ipc.socket_pair()
         parent_socket.set_inheritable(False)
-        child_socket.set_inheritable(False)
         parent_socket.setblocking(False)
         try:
             reader, writer = await asyncio.open_connection(
@@ -333,7 +337,7 @@ class CredentialCapabilityServer:
                 limit=CAPABILITY_MAX_MESSAGE_BYTES,
             )
             server = cls(authority, permitted, reader, writer)
-            return server, child_socket.detach()
+            return server, host_ipc.prepare_child_socket(child_socket)
         except BaseException:
             parent_socket.close()
             child_socket.close()

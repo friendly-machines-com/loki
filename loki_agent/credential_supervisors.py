@@ -20,7 +20,7 @@ import contextlib
 import os
 from dataclasses import dataclass
 
-from . import credential_capabilities
+from . import credential_capabilities, host_ipc
 from .authentications import CredentialBroker
 from .credentials import CredentialInventory, CredentialStore
 
@@ -71,8 +71,8 @@ class CredentialSupervisor:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 close_fds=True,
-                pass_fds=delegation.child_fds(),
                 env=self.environment,
+                **delegation.child_spawn_kwargs(),
             )
             delegation.child_spawned()
             return await process.wait()
@@ -108,65 +108,64 @@ class RuntimeDelegation:
     """Parent-owned lifetime and credential channels for one runtime."""
 
     credential_server: object
-    owner_read_fd: int | None
-    owner_write_fd: int | None
-    credential_fd: int | None
+    owner_child: object | None
+    owner_parent: object | None
+    credential_child: object | None
 
     @classmethod
     async def create(cls, authority, allowed=None):
-        owner_read_fd, owner_write_fd = os.pipe()
+        owner_parent, owner_child = host_ipc.owner_channel()
         credential_server = None
-        credential_fd = None
+        credential_child = None
         try:
-            credential_server, credential_fd = await (
+            credential_server, credential_child = await (
                 credential_capabilities.CredentialCapabilityServer.create(
                     authority, allowed))
-            for fd in (owner_read_fd, owner_write_fd, credential_fd):
-                os.set_inheritable(fd, False)
             return cls(
                 credential_server,
-                owner_read_fd,
-                owner_write_fd,
-                credential_fd,
+                owner_child,
+                owner_parent,
+                credential_child,
             )
         except BaseException:
-            for fd in (owner_read_fd, owner_write_fd, credential_fd):
-                if fd is not None:
+            for end in (owner_parent, owner_child, credential_child):
+                if end is not None:
                     with contextlib.suppress(OSError):
-                        os.close(fd)
+                        host_ipc.close_end(end)
             if credential_server is not None:
                 await credential_server.close()
             raise
 
     def child_arguments(self) -> list[str]:
-        if self.owner_read_fd is None or self.credential_fd is None:
+        if self.owner_child is None or self.credential_child is None:
             raise RuntimeError("runtime delegation was already handed off")
         return [
-            "--session-owner-fd", str(self.owner_read_fd),
-            "--credential-capability-fd", str(self.credential_fd),
+            "--session-owner-fd", str(host_ipc.reference(self.owner_child)),
+            "--credential-capability-fd",
+            str(host_ipc.reference(self.credential_child)),
         ]
 
-    def child_fds(self) -> tuple[int, int]:
-        if self.owner_read_fd is None or self.credential_fd is None:
+    def child_spawn_kwargs(self) -> dict:
+        if self.owner_child is None or self.credential_child is None:
             raise RuntimeError("runtime delegation was already handed off")
-        return self.owner_read_fd, self.credential_fd
+        return host_ipc.spawn_kwargs((self.owner_child, self.credential_child))
 
     def child_spawned(self) -> None:
-        """Close the supervisor's copies of descriptors owned by the child."""
-        for attribute in ("owner_read_fd", "credential_fd"):
-            fd = getattr(self, attribute)
+        """Close the supervisor's copies of the ends the child owns."""
+        for attribute in ("owner_child", "credential_child"):
+            end = getattr(self, attribute)
             setattr(self, attribute, None)
-            if fd is not None:
+            if end is not None:
                 with contextlib.suppress(OSError):
-                    os.close(fd)
+                    host_ipc.close_end(end)
 
     def revoke_now(self) -> None:
         """Synchronously revoke runtime lifetime and credential authority."""
-        owner_write_fd = self.owner_write_fd
-        self.owner_write_fd = None
-        if owner_write_fd is not None:
+        owner_parent = self.owner_parent
+        self.owner_parent = None
+        if owner_parent is not None:
             with contextlib.suppress(OSError):
-                os.close(owner_write_fd)
+                host_ipc.close_end(owner_parent)
         self.credential_server.close_now()
 
     async def close(self) -> None:
