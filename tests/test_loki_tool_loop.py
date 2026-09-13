@@ -2395,7 +2395,8 @@ class ExitStatusTests(unittest.TestCase):
             for async_status, expected_status in [(0, 1), (2, 2)]:
                 with self.subTest(async_status=async_status), mock.patch(
                             "loki_agent.terminal_frontend.signal.signal"), mock.patch(
-                                "loki_agent.terminal_frontend.signal.pthread_sigmask"
+                                "loki_agent.terminal_frontend.signal.pthread_sigmask",
+                                create=True,
                             ), mock.patch(
                                 "loki_agent.terminal_frontend.initialize_terminal_overlay"
                             ), mock.patch(
@@ -5105,18 +5106,14 @@ class SubagentLaunchTests(unittest.TestCase):
                 protocols.DUMMY,
                 model="dummy-model",
             ))
-            sys.argv = [
-                os.path.join(
-                    os.path.dirname(os.path.dirname(__file__)),
-                    parent_entrypoint,
-                )
-            ]
+            # The packaged entrypoint on Windows; the checkout script on POSIX.
+            sys.argv = [entrypoint(parent_entrypoint)]
             return await loki.run_agent_async(
                 "recursive launch", "inspect this")
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                for parent_entrypoint in ("loki.py", "loki-acp"):
+                for parent_entrypoint in ("loki", "loki-acp"):
                     with self.subTest(entrypoint=parent_entrypoint):
                         result = asyncio.run(
                             scenario(tmpdir, parent_entrypoint))
