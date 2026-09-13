@@ -119,8 +119,6 @@ class CredentialStoreTests(unittest.TestCase):
                 with self.assertRaises(CredentialScrubError):
                     _validate_entries_in_range(matches, low, high)
 
-    @unittest.skipUnless(
-        sys.platform.startswith("linux"), "Linux /proc environment semantics")
     def test_process_capture_scrubs_record_without_hiding_later_entries(self):
         code = r'''
 import ctypes
@@ -194,8 +192,6 @@ print(json.dumps({
         self.assertEqual(result["spawned"], "missing")
         self.assertEqual(result["forked"], "missing")
 
-    @unittest.skipUnless(
-        sys.platform == "darwin", "Darwin KERN_PROCARGS2 semantics")
     def test_process_capture_scrubs_darwin_procargs_environment(self):
         code = r'''
 import ctypes
@@ -283,8 +279,6 @@ print(json.dumps({
         )
         self.assertEqual(result["spawned"], "missing")
 
-    @unittest.skipUnless(
-        sys.platform.startswith("linux"), "Linux /proc environment semantics")
     def test_process_capture_scrubs_duplicate_execve_entries(self):
         second_stage = r'''
 import json

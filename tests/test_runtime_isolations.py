@@ -105,10 +105,6 @@ class UnshareSelectionTests(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(
-    sys.platform.startswith("linux") and os.path.isdir("/proc/self"),
-    "Linux user and mount namespaces",
-)
 class LinuxIsolationTests(unittest.TestCase):
     def test_runtime_rebinds_cwd_through_credential_cover(self):
         with tempfile.TemporaryDirectory() as directory:

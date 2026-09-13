@@ -641,10 +641,6 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
         lease = asyncio.run(front.credential_broker.lease(credential))
         self.assertEqual(lease.value, credential_value)
 
-    @unittest.skipUnless(
-        sys.platform.startswith("linux") and os.path.isdir("/proc/self"),
-        "Linux process environment contract",
-    )
     def test_real_front_scrubs_and_real_worker_never_receives_credential(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = {
@@ -1635,7 +1631,6 @@ class WorkerReasoningConfigTests(unittest.TestCase):
             loki._DEFAULT_SESSION = old_session
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "needs fork/pty")
 class TtyStdinTests(unittest.TestCase):
     """The front must work when stdin is a tty, not just a pipe.
 

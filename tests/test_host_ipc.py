@@ -106,7 +106,6 @@ class PrivatePipePairTests(unittest.TestCase):
         self.assertEqual(closed, [0x10, 0x11, 0x12, 0x13])
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX seam")
 class SocketPairTests(unittest.TestCase):
     def test_the_pair_is_connected_in_both_directions(self):
         first, second = host_ipc.socket_pair()
@@ -119,7 +118,6 @@ class SocketPairTests(unittest.TestCase):
         self.assertEqual(first.recv(4), b"pong")
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX seam")
 class OwnerChannelTests(unittest.TestCase):
     def test_closing_the_parent_end_is_eof_for_the_child(self):
         parent_end, child_end = host_ipc.owner_channel()
@@ -130,7 +128,6 @@ class OwnerChannelTests(unittest.TestCase):
         self.assertEqual(os.read(child_end, 1), b"")
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX seam")
 class ReferenceTests(unittest.TestCase):
     def test_a_reference_names_the_child_end(self):
         reader, writer = os.pipe()
@@ -183,7 +180,6 @@ class PipeEndpointTests(unittest.TestCase):
         self.assertFalse(host_ipc.is_endpoint(3))
         self.assertFalse(host_ipc.is_endpoint(None))
 
-    @unittest.skipUnless(os.name == "posix", "POSIX descriptor")
     def test_a_descriptor_reports_one_handle(self):
         # POSIX path: spawn_kwargs flattens this to pass_fds.
         self.assertEqual(host_ipc.handles(4), (4,))

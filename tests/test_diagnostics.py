@@ -207,7 +207,6 @@ assert os.environ['LOKI_LOG_CONFIG'] == original
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Unknown test fields', log.read_text())
 
-    @unittest.skipUnless(os.name == 'posix', 'POSIX symlink path semantics')
     def test_dotdot_after_symlink_is_not_collapsed(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

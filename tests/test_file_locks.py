@@ -7,7 +7,6 @@ callers' retry loops expect.
 """
 
 import os
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -17,7 +16,6 @@ from loki_agent import windows_api
 
 
 class ExclusiveLockTests(unittest.TestCase):
-    @unittest.skipIf(sys.platform == "win32", "POSIX flock semantics")
     def test_posix_contention_is_blocking_io_error(self):
         with tempfile.NamedTemporaryFile() as handle:
             # Two separate opens, so the two locks are independent; a dup would
