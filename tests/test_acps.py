@@ -455,6 +455,11 @@ class FrontWorkerTests(unittest.TestCase):
     def test_ini_logging_reaches_real_front_and_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             config = os.path.join(directory, "logging.ini")
+            # The handler arg is a Python literal that fileConfig evals, so the
+            # path must be repr'd: a raw Windows path would be consumed by
+            # backslash escapes before that eval ran, and the front would exit
+            # before opening its protocol loop.
+            trace_prefix = os.path.join(directory, "trace-")
             with open(config, "w") as stream:
                 stream.write("""[loggers]
 keys=root
@@ -467,8 +472,8 @@ level=DEBUG
 handlers=trace
 [handler_trace]
 class=FileHandler
-args=('%s/trace-' + str(__import__('os').getpid()), 'a')
-""" % directory)
+args=(%r + str(__import__('os').getpid()), 'a')
+""" % trace_prefix)
             front_env = self._front_env
 
             def relative_config_env(cwd):
