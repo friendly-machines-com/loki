@@ -1,4 +1,4 @@
-"""Credential-file primitives, selected once per platform.
+"""File primitives for a private directory, selected once per platform.
 
 ``JsonCredentialStorage`` is one algorithm over a directory and a few files.
 The parts that differ per platform are opening those files without following a
@@ -13,7 +13,7 @@ because the token they operate on is the platform's: a POSIX descriptor is an
 ``int`` that ``os.*`` understands, a Windows handle is not, so a single
 ``os.read`` for both would be wrong on one of them.
 
-``FileFacts`` and ``CredentialStorageError`` live in ``credential_types``,
+``FileFacts`` and ``CredentialStorageError`` live in their own leaf modules,
 below this module and the platform modules, so a platform module can import
 them without importing the module that imports it.  They are re-exported here
 so importers are unaffected.
@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import sys
 
-from .credential_types import CredentialStorageError, FileFacts
+from .credential_errors import CredentialStorageError
+from .file_facts import FileFacts
 
 
 if sys.platform == "win32":
-    from ._credential_files_windows import (
+    from ._private_files_windows import (
         close,
         create_exclusive_at,
         describe,
@@ -45,7 +46,7 @@ if sys.platform == "win32":
         write,
     )
 else:
-    from ._credential_files_posix import (
+    from ._private_files_posix import (
         close,
         create_exclusive_at,
         describe,
