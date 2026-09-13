@@ -7,6 +7,8 @@ is pure, and is checked on every platform because a mistake there either grants
 too much or refuses something legitimate.
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -457,6 +459,65 @@ class FakeBackend:
         self.uninstalled.append(blob)
         blob["workspaces"] = {}
         return [windows_setup.Check("ledger", "pass", "cleared")]
+
+
+class ConfigureCommandTests(unittest.TestCase):
+    """--configure applies the editor's plan without importing Tk.
+
+    It is the non-interactive setup path: a CI job or headless caller runs it,
+    and the entrypoint's gate then finds a ledger entry that verify accepts.
+    """
+
+    def configure(self, arguments, backend=None):
+        backend = FakeBackend() if backend is None else backend
+        # The plan's protected-path rule resolves Loki's real directories, and
+        # those are Windows known folders under the patched platform; pin them
+        # so this stays a host-independent test of the command, not of paths.
+        with mock.patch.object(windows_setup.sys, "platform", "win32"), \
+                mock.patch.object(windows_setup, "load_ledger",
+                                  return_value={"workspaces": {}}), \
+                mock.patch.object(windows_setup, "backend_for",
+                                  return_value=backend), \
+                mock.patch.object(windows_state.paths, "loki_config_dir",
+                                  return_value="/protected/config"), \
+                mock.patch.object(windows_state.paths, "loki_state_dir",
+                                  return_value="/protected/state"), \
+                mock.patch.object(windows_state.paths, "credential_directory",
+                                  return_value="/protected/credentials"), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = windows_setup.main(["--configure", *arguments])
+        return code, output.getvalue(), backend
+
+    def test_configure_applies_the_same_automatic_grants_as_the_editor(self):
+        code, output, backend = self.configure(["/work"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("pass: profile", output)
+        self.assertEqual(len(backend.applied), 1)
+        _plan, definition = backend.applied[0]
+        self.assertEqual(definition.workspace, "/work")
+        self.assertEqual([grant.origin for grant in definition.grants],
+                         ["workspace", "toolchain"])
+
+    def test_a_failing_check_is_a_nonzero_exit(self):
+        class Failing(FakeBackend):
+            def apply(self, plan, definition):
+                return [windows_setup.Check("profile", "fail", "denied")]
+
+        code, output, _backend = self.configure(["/work"], Failing())
+
+        self.assertEqual(code, 1)
+        self.assertIn("fail: profile denied", output)
+
+    def test_a_missing_workspace_is_a_usage_error(self):
+        with mock.patch.object(windows_setup.sys, "platform", "win32"), \
+                mock.patch.object(windows_setup, "load_ledger",
+                                  return_value={"workspaces": {}}), \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            code = windows_setup.main(["--configure"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("needs a workspace", error.getvalue())
 
 
 class DescribePlanTests(unittest.TestCase):
