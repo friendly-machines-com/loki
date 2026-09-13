@@ -32,6 +32,15 @@ def tokens(access="access-a", refresh="refresh-a"):
     )
 
 
+def _marker_lines(path):
+    """How many process markers a file has, or zero before it exists."""
+    try:
+        with open(path, encoding="ascii") as stream:
+            return len(stream.readlines())
+    except FileNotFoundError:
+        return 0
+
+
 class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -647,6 +656,7 @@ class CredentialDocumentTests(unittest.TestCase):
             asyncio.run(storage.store_openai_login(tokens()))
             calls_path = os.path.join(temporary, "calls")
             release_path = os.path.join(temporary, "release")
+            loaded_path = os.path.join(temporary, "loaded")
             command = [
                 sys.executable,
                 "-m",
@@ -654,6 +664,7 @@ class CredentialDocumentTests(unittest.TestCase):
                 directory,
                 calls_path,
                 release_path,
+                loaded_path,
             ]
             processes = []
             try:
@@ -686,7 +697,22 @@ class CredentialDocumentTests(unittest.TestCase):
                     text=True,
                 )
                 processes.append(second)
-                time.sleep(0.2)
+                # Wait until the second process has read the credential
+                # document, rather than guessing with a sleep.  It reads the
+                # document outside the lock, so it must read while the first
+                # still holds it; if it reads after publication it sees the
+                # refreshed tokens and rotates a second time.
+                deadline = time.monotonic() + 5
+                while _marker_lines(loaded_path) < 2:
+                    if second.poll() is not None:
+                        stdout, stderr = second.communicate()
+                        self.fail(
+                            "second refresh process failed: "
+                            f"{stdout!r} {stderr!r}")
+                    if time.monotonic() >= deadline:
+                        self.fail(
+                            "second refresh process did not read the document")
+                    time.sleep(0.01)
                 with open(
                         calls_path, encoding="ascii") as stream:
                     self.assertEqual(len(stream.readlines()), 1)
