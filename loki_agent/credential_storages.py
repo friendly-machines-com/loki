@@ -18,13 +18,13 @@ import contextlib
 import json
 import os
 import secrets
-import stat
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from . import authentications, file_locks, paths
+from . import authentications, credential_files, file_locks, paths
+from .credential_files import CredentialStorageError
 
 
 FORMAT_VERSION = 1
@@ -34,10 +34,6 @@ LOCK_TIMEOUT_S = 60
 OPENAI_RECORD_TYPE = "openai-chatgpt-oauth"
 OPENAI_CREDENTIAL_KEY = (
     authentications.CredentialRef.openai_subscription().encode())
-
-
-class CredentialStorageError(RuntimeError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -217,14 +213,14 @@ class JsonCredentialStorage:
         except FileExistsError:
             pass
         directory_stat = os.lstat(self.directory)
-        if not stat.S_ISDIR(directory_stat.st_mode):
+        if not credential_files.is_directory(directory_stat):
             raise CredentialStorageError(
                 f"credential path is not a directory: {self.directory}")
-        if directory_stat.st_uid != os.geteuid():
+        if not credential_files.owner_is_current_user(directory_stat):
             raise CredentialStorageError(
                 f"credential directory is not owned by this user: "
                 f"{self.directory}")
-        if stat.S_IMODE(directory_stat.st_mode) & 0o077:
+        if credential_files.grants_group_or_other(directory_stat):
             raise CredentialStorageError(
                 f"credential directory has group or other permission bits "
                 f"set: {self.directory!r}; adjust its permissions before "
@@ -232,44 +228,36 @@ class JsonCredentialStorage:
 
     def _open_directory(self):
         self.ensure_directory()
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_DIRECTORY", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            return os.open(self.directory, flags)
+            return credential_files.open_directory(self.directory)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential directory: {error}") from error
 
     @staticmethod
     def _validate_secret_file(file_stat, label):
-        if not stat.S_ISREG(file_stat.st_mode):
+        if not credential_files.is_regular(file_stat):
             raise CredentialStorageError(
                 f"credential {label} is not a regular file")
-        if file_stat.st_uid != os.geteuid():
+        if not credential_files.owner_is_current_user(file_stat):
             raise CredentialStorageError(
                 f"credential {label} is not owned by this user")
-        if stat.S_IMODE(file_stat.st_mode) & 0o077:
+        if credential_files.grants_group_or_other(file_stat):
             raise CredentialStorageError(
                 f"credential {label} permissions must not grant "
                 "group or other access")
 
     def _read_document_at(self, directory_fd):
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(
-                paths.CREDENTIAL_FILE_NAME,
-                flags,
-                dir_fd=directory_fd,
-            )
+            fd = credential_files.open_read_at(
+                directory_fd, paths.CREDENTIAL_FILE_NAME)
         except FileNotFoundError:
             return _empty_document()
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential JSON: {error}") from error
         try:
-            file_stat = os.fstat(fd)
+            file_stat = credential_files.fstat(fd)
             self._validate_secret_file(file_stat, "JSON file")
             if file_stat.st_size > MAX_CREDENTIAL_FILE_BYTES:
                 raise CredentialStorageError(
@@ -277,7 +265,7 @@ class JsonCredentialStorage:
             chunks = []
             remaining = MAX_CREDENTIAL_FILE_BYTES + 1
             while remaining:
-                chunk = os.read(fd, min(65536, remaining))
+                chunk = credential_files.read(fd, min(65536, remaining))
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -287,7 +275,7 @@ class JsonCredentialStorage:
                 raise CredentialStorageError(
                     "credential JSON exceeds its size limit")
         finally:
-            os.close(fd)
+            credential_files.close(fd)
         try:
             text = data.decode("utf-8")
             value = json.loads(
@@ -302,7 +290,7 @@ class JsonCredentialStorage:
         try:
             return self._read_document_at(directory_fd)
         finally:
-            os.close(directory_fd)
+            credential_files.close(directory_fd)
 
     def load_openai_subscription(self):
         return _openai_record(self.load_document())
@@ -323,61 +311,44 @@ class JsonCredentialStorage:
         temporary_name = (
             f".{paths.CREDENTIAL_FILE_NAME}."
             f"{os.getpid()}.{secrets.token_hex(12)}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
         fd = None
         try:
-            fd = os.open(
-                temporary_name,
-                flags,
-                0o600,
-                dir_fd=directory_fd,
-            )
+            fd = credential_files.create_exclusive_at(
+                directory_fd, temporary_name, 0o600)
             view = memoryview(data)
             while view:
-                written = os.write(fd, view)
+                written = credential_files.write(fd, view)
                 if written <= 0:
                     raise OSError("short credential JSON write")
                 view = view[written:]
-            os.fsync(fd)
-            os.close(fd)
+            credential_files.fsync(fd)
+            credential_files.close(fd)
             fd = None
-            os.replace(
-                temporary_name,
-                paths.CREDENTIAL_FILE_NAME,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
-            os.fsync(directory_fd)
+            credential_files.replace_at(
+                directory_fd, temporary_name, paths.CREDENTIAL_FILE_NAME)
+            credential_files.fsync(directory_fd)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not persist credential JSON: {error}") from error
         finally:
             if fd is not None:
-                os.close(fd)
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=directory_fd)
+                credential_files.close(fd)
+            with contextlib.suppress(
+                    FileNotFoundError, CredentialStorageError):
+                credential_files.unlink_at(directory_fd, temporary_name)
 
     def _open_lock_at(self, directory_fd):
-        flags = os.O_RDWR | os.O_CREAT
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(
-                paths.CREDENTIAL_LOCK_FILE_NAME,
-                flags,
-                0o600,
-                dir_fd=directory_fd,
-            )
+            fd = credential_files.open_lock_file_at(
+                directory_fd, paths.CREDENTIAL_LOCK_FILE_NAME, 0o600)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential lock: {error}") from error
         try:
             self._validate_secret_file(
-                os.fstat(fd), "lock file")
+                credential_files.fstat(fd), "lock file")
         except BaseException:
-            os.close(fd)
+            credential_files.close(fd)
             raise
         return fd
 
@@ -407,9 +378,9 @@ class JsonCredentialStorage:
                         with contextlib.suppress(OSError):
                             file_locks.unlock(lock_fd)
             finally:
-                os.close(lock_fd)
+                credential_files.close(lock_fd)
         finally:
-            os.close(directory_fd)
+            credential_files.close(directory_fd)
 
     @staticmethod
     def _next_revision(document):
