@@ -16,6 +16,7 @@ from unittest import mock
 
 from loki_agent import windows_api
 from loki_agent import windows_setup
+from loki_agent import windows_state
 
 
 PACKAGE_SID = "S-1-15-2-1-2-3-4-5-6-7-8"
@@ -25,14 +26,14 @@ OTHER_SID = "S-1-5-21-1-2-3-1004"
 class AccessLevelTests(unittest.TestCase):
     def test_read_is_generic_read_and_execute(self):
         # Execute on a directory is traverse, which known-path access needs.
-        self.assertEqual(windows_setup.access_sddl(windows_setup.Access.READ),
+        self.assertEqual(windows_state.access_sddl(windows_setup.Access.READ),
                          "FRFX")
 
     def test_write_uses_modify_not_all_access(self):
         # FA would include WRITE_DAC, letting a tool rewrite the DACL and lock
         # the owner out of their own directory.
         self.assertEqual(
-            windows_setup.access_sddl(windows_setup.Access.READ_WRITE),
+            windows_state.access_sddl(windows_setup.Access.READ_WRITE),
             "0x1301BF")
 
 
@@ -93,23 +94,23 @@ class ProtectedPathTests(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def test_refuses_a_grant_that_covers_the_credential_directory(self):
-        self.assertTrue(windows_setup.protected_path_errors(self.root))
+        self.assertTrue(windows_state.protected_path_errors(self.root))
 
     def test_refuses_the_credential_directory_itself(self):
         self.assertTrue(
-            windows_setup.protected_path_errors(self.credentials))
+            windows_state.protected_path_errors(self.credentials))
 
     def test_refuses_a_grant_inside_a_protected_tree(self):
-        self.assertTrue(windows_setup.protected_path_errors(
+        self.assertTrue(windows_state.protected_path_errors(
             os.path.join(self.config, "sessions")))
 
     def test_refuses_the_runtime_tree(self):
         package = os.path.dirname(os.path.abspath(windows_setup.__file__))
-        self.assertTrue(windows_setup.protected_path_errors(package))
+        self.assertTrue(windows_state.protected_path_errors(package))
 
     def test_allows_an_unrelated_directory(self):
         self.assertEqual(
-            windows_setup.protected_path_errors(
+            windows_state.protected_path_errors(
                 os.path.join(self.root, "elsewhere")), [])
 
 
@@ -126,21 +127,21 @@ class SecretWarningTests(unittest.TestCase):
     def test_warns_only_about_existing_covered_locations(self):
         os.makedirs(os.path.join(self.home, ".ssh"))
 
-        warnings = windows_setup.covered_secret_warnings(self.home)
+        warnings = windows_state.covered_secret_warnings(self.home)
 
         self.assertEqual(len(warnings), 1)
         self.assertIn(".ssh", warnings[0])
 
     def test_is_silent_when_nothing_is_there(self):
         self.assertEqual(
-            windows_setup.covered_secret_warnings(self.home), [])
+            windows_state.covered_secret_warnings(self.home), [])
 
     def test_is_silent_for_an_unrelated_directory(self):
         os.makedirs(os.path.join(self.home, ".ssh"))
         elsewhere = os.path.join(self.home, "projects")
 
         self.assertEqual(
-            windows_setup.covered_secret_warnings(elsewhere), [])
+            windows_state.covered_secret_warnings(elsewhere), [])
 
 
 class NamingTests(unittest.TestCase):
@@ -152,22 +153,22 @@ class NamingTests(unittest.TestCase):
             os.symlink(child, link)
 
             self.assertEqual(
-                windows_setup.canonical_workspace(child),
-                windows_setup.canonical_workspace(link))
+                windows_state.canonical_workspace(child),
+                windows_state.canonical_workspace(link))
             self.assertEqual(
-                windows_setup.canonical_workspace(child),
-                windows_setup.canonical_workspace(child + os.sep))
+                windows_state.canonical_workspace(child),
+                windows_state.canonical_workspace(child + os.sep))
             self.assertEqual(
-                windows_setup.canonical_workspace(child),
-                windows_setup.canonical_workspace(
+                windows_state.canonical_workspace(child),
+                windows_state.canonical_workspace(
                     os.path.join(child, "..", "project")))
 
     def test_profile_name_is_deterministic_and_usable(self):
-        first = windows_setup.profile_name_for("/tmp/project")
-        second = windows_setup.profile_name_for("/tmp/project")
+        first = windows_state.profile_name_for("/tmp/project")
+        second = windows_state.profile_name_for("/tmp/project")
 
         self.assertEqual(first, second)
-        self.assertNotEqual(first, windows_setup.profile_name_for("/tmp/other"))
+        self.assertNotEqual(first, windows_state.profile_name_for("/tmp/other"))
         self.assertTrue(
             windows_api.app_container_profile_name_is_usable(first))
 
@@ -176,7 +177,7 @@ class LedgerTests(unittest.TestCase):
     def test_round_trip(self):
         with tempfile.TemporaryDirectory() as root:
             location = os.path.join(root, "nested", "ledger.json")
-            blob = {"version": windows_setup.LEDGER_VERSION,
+            blob = {"version": windows_state.LEDGER_VERSION,
                     "workspaces": {"k": {"workspace": "/p",
                                          "profile": "Loki.Workspace.x",
                                          "grants": []}}}
@@ -231,7 +232,7 @@ class PlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             credentials = os.path.join(root, "credentials")
             with mock.patch.object(
-                    windows_setup, "_runtime_trees", return_value=[credentials]):
+                    windows_state, "_runtime_trees", return_value=[credentials]):
                 plan = windows_setup.build_plan(
                     self.definition(self.grant(root)), None)
 
@@ -240,7 +241,7 @@ class PlanTests(unittest.TestCase):
 
     def test_warnings_are_collected_for_user_grants_only(self):
         with mock.patch.object(
-                windows_setup, "covered_secret_warnings",
+                windows_state, "covered_secret_warnings",
                 side_effect=lambda path: [f"covers {path}"]) as warning:
             plan = windows_setup.build_plan(
                 self.definition(self.grant("/user-dir"),
@@ -264,7 +265,7 @@ class AutomaticGrantTests(unittest.TestCase):
         # No scratch grant: TEMP points inside the workspace, and a directory of
         # our own under the configuration tree would put a package ACE beside
         # the credential directory.
-        self.assertEqual(windows_setup.protected_path_errors("/work"), [])
+        self.assertEqual(windows_state.protected_path_errors("/work"), [])
 
     def test_definition_is_automatic_plus_recorded_user_grants(self):
         previous = windows_setup.ledger_entry(
@@ -331,7 +332,7 @@ class DescribePlanTests(unittest.TestCase):
                                   list(warnings), list(errors))
 
     def change(self, kind, path, access=windows_setup.Access.READ):
-        return windows_setup.Change(kind, path, access)
+        return windows_state.Change(kind, path, access)
 
     def test_describes_each_change_with_its_level(self):
         text = windows_setup.describe_plan(self.plan(
@@ -431,7 +432,7 @@ class EditorModelTests(unittest.TestCase):
         plan, definition = backend.applied[0]
         self.assertIs(definition, model.definition)
         self.assertEqual(plan.profile,
-                         windows_setup.profile_name_for("/work"))
+                         windows_state.profile_name_for("/work"))
         self.assertEqual(backend.verified, [model.definition])
 
     def test_uninstall_delegates_and_reloads(self):

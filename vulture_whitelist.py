@@ -12,6 +12,11 @@ with the package, so anything vulture reports beyond this list is dead.
 render_markdown
 status_text
 
+# Entry point for the chat's start-up container verification.  The Windows gate
+# that calls it is not wired yet; it lives in the read-only module so the
+# runtime has no built-in grant path.
+verify_workspace
+
 # Test seams: production never reads these; the tests exercise them.
 _.credential_broker
 _.from_fd
