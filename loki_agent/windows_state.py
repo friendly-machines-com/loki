@@ -212,6 +212,26 @@ def workspace_key(workspace: str) -> str:
     return canonical_workspace(workspace)
 
 
+def container_workspace(directory: str,
+                        ledger: dict | None = None) -> str | None:
+    """The configured workspace whose container covers ``directory``, if any.
+
+    A workspace grant is inherited, so a directory beneath a configured
+    workspace is reachable by the same container.  The *nearest* configured
+    ancestor is the one to use: it is the tightest container that still covers
+    the directory.  The match is on whole path components, never a shared text
+    prefix -- ``/work`` must not cover ``/workshop``.
+    """
+    blob = load_ledger() if ledger is None else ledger
+    target = canonical_workspace(directory)
+    nearest = None
+    for key in blob.get("workspaces", {}):
+        if target == key or _contains(key, target):
+            if nearest is None or len(key) > len(nearest):
+                nearest = key
+    return nearest
+
+
 def ledger_entry(workspace: str, profile: str,
                  grants: list[Grant]) -> dict:
     return {

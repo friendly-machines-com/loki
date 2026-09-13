@@ -39,6 +39,34 @@ class GateTests(unittest.TestCase):
                              workspace)
         verify.assert_called_once_with(ledger, workspace)
 
+    def test_a_directory_inside_a_configured_workspace_is_covered(self):
+        container = runtime.state.canonical_workspace('/work')
+        directory = runtime.state.canonical_workspace('/work/project')
+        entry = {'profile': runtime.state.profile_name_for(container),
+                 'grants': [{'path': container, 'access': 'read-write',
+                             'origin': 'workspace'}]}
+        ledger = {'workspaces': {container: entry}}
+        with mock.patch.object(runtime.state, 'load_ledger', return_value=ledger), \
+                mock.patch.object(runtime.windows_verify, 'verify_workspace',
+                                  return_value=[Check('inventory', 'pass')]) as verify:
+            self.assertEqual(
+                runtime.configured_workspace(['--shell-cwd', '/work/project']),
+                directory)
+        # The container that is verified is the ancestor, not the directory.
+        verify.assert_called_once_with(ledger, container)
+
+    def test_a_shared_path_prefix_is_not_covered(self):
+        workspace = runtime.state.canonical_workspace('/work')
+        entry = {'profile': runtime.state.profile_name_for(workspace),
+                 'grants': [{'path': workspace, 'access': 'read-write',
+                             'origin': 'workspace'}]}
+        ledger = {'workspaces': {workspace: entry}}
+        with mock.patch.object(runtime.state, 'load_ledger', return_value=ledger), \
+                mock.patch.object(runtime.windows_verify, 'verify_workspace') as verify:
+            with self.assertRaisesRegex(RuntimeIsolationError, 'run loki-setup'):
+                runtime.configured_workspace(['--shell-cwd', '/workshop'])
+        verify.assert_not_called()
+
     def test_runtime_requires_expected_workspace(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch.object(runtime.windows_verify, 'probe_containment') as probe:
