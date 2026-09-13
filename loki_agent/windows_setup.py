@@ -563,11 +563,13 @@ def run_editor(workspace: str, ledger: dict, backend: Backend) -> int:
 # -- command line --------------------------------------------------------
 
 USAGE = (
-    "usage: loki-setup [--edit [WORKSPACE]] [--verify WORKSPACE] "
-    "[--list] [--uninstall]\n"
+    "usage: loki-setup [--edit [WORKSPACE]] [--configure WORKSPACE] "
+    "[--verify WORKSPACE] [--list] [--uninstall]\n"
     "\n"
-    "Windows-only container setup for Loki. Grants are a setup-time property;\n"
-    "there is no way to widen a container from a running session.\n"
+    "Windows-only container setup for Loki. --configure applies the same plan\n"
+    "the editor would, without the editor; --edit opens the Tk editor. Grants\n"
+    "are a setup-time property; there is no way to widen a container from a\n"
+    "running session.\n"
 )
 
 
@@ -597,6 +599,15 @@ def main(argv: list[str] | None = None) -> int:
         checks = backend.uninstall(ledger)
         for check in checks:
             print(f"{check.status}: {check.name} {check.detail}".rstrip())
+        return 1 if any(check.status != "pass" for check in checks) else 0
+    if mode == "--configure":
+        if not rest:
+            print("loki-setup: --configure needs a workspace", file=sys.stderr)
+            return 2
+        # The editor's own plan and apply, so the non-interactive path cannot
+        # drift from what the buttons do. No Tk is imported.
+        checks = EditorModel(ledger, rest[0], backend).apply()
+        print(_check_text(checks))
         return 1 if any(check.status != "pass" for check in checks) else 0
     if mode == "--verify":
         if not rest:
