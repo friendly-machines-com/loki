@@ -18,6 +18,10 @@ import os
 
 from . import paths
 from . import windows_api
+from .windows_acl import (
+    package_access,
+    package_allow,
+)
 from .windows_state import (
     Access,
     Check,
@@ -25,8 +29,6 @@ from .windows_state import (
     access_mask,
     entry_grants,
     grants_access,
-    package_access,
-    package_allow,
     profile_name_for,
     workspace_key,
 )

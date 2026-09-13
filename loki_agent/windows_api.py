@@ -213,6 +213,33 @@ def current_user_sid() -> str:
         close(token)
 
 
+def _sddl_from_descriptor(descriptor, information) -> str:
+    """Render a security descriptor's requested sections as SDDL text."""
+    convert = bind(
+        "advapi32", "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+        wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+    text = ctypes.c_void_p()
+    if not convert(descriptor, SDDL_REVISION_1, information,
+                   ctypes.byref(text), None):
+        raise WindowsApiError(
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW failed")
+    try:
+        return ctypes.wstring_at(text)
+    finally:
+        local_free(text)
+
+
+def _get_security_info():
+    return bind(
+        "advapi32", "GetSecurityInfo", wintypes.DWORD, ctypes.c_void_p,
+        ctypes.c_int, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p))
+
+
 def dacl_sddl(path: str) -> str:
     """Return ``path``'s DACL as SDDL, for verification and for diffs."""
     get_named = bind(
@@ -221,10 +248,6 @@ def dacl_sddl(path: str) -> str:
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p))
-    convert = bind(
-        "advapi32", "ConvertSecurityDescriptorToStringSecurityDescriptorW",
-        wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
     local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
                       ctypes.c_void_p)
 
@@ -234,14 +257,55 @@ def dacl_sddl(path: str) -> str:
     if status != ERROR_SUCCESS:
         raise WindowsApiError(f"GetNamedSecurityInfoW({path!r}) failed: {status}")
     try:
-        text = ctypes.c_void_p()
-        if not convert(descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
-                       ctypes.byref(text), None):
-            raise WindowsApiError("ConvertSecurityDescriptorToString failed")
-        try:
-            return ctypes.wstring_at(text)
-        finally:
-            local_free(text)
+        return _sddl_from_descriptor(descriptor, DACL_SECURITY_INFORMATION)
+    finally:
+        local_free(descriptor)
+
+
+def handle_owner_sid(handle) -> str:
+    """Return the SID that owns the object ``handle`` refers to.
+
+    Reading from the handle, not a pathname, is the point: a rename after the
+    open cannot redirect the owner query to a different object.
+    """
+    get = _get_security_info()
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+    owner = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = get(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                 ctypes.byref(owner), None, None, None,
+                 ctypes.byref(descriptor))
+    if status != ERROR_SUCCESS:
+        raise WindowsApiError(f"GetSecurityInfo(owner) failed: {status}",
+                              status=status)
+    try:
+        return sid_text(owner)
+    finally:
+        local_free(descriptor)
+
+
+def handle_dacl_sddl(handle):
+    """Return the DACL of the object ``handle`` refers to, as SDDL, or ``None``.
+
+    ``None`` means the object has no DACL, which grants everyone full access:
+    a caller must read that as "not private", never as "no grant".
+    """
+    get = _get_security_info()
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = get(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                 None, None, ctypes.byref(dacl), None,
+                 ctypes.byref(descriptor))
+    if status != ERROR_SUCCESS:
+        raise WindowsApiError(f"GetSecurityInfo(dacl) failed: {status}",
+                              status=status)
+    try:
+        if not dacl.value:
+            return None
+        return _sddl_from_descriptor(descriptor, DACL_SECURITY_INFORMATION)
     finally:
         local_free(descriptor)
 
@@ -637,3 +701,274 @@ def create_process_in_app_container(executable, arguments, package_sid,
         if initialized:
             delete(attribute_list)
         local_free(sid)
+
+
+# -- handle-relative file operations -------------------------------------
+# ``CreateFileW`` resolves a pathname, so it cannot express POSIX ``dir_fd``:
+# a child opened against a *retained directory handle* is bound to the directory
+# object that was verified, not a pathname resolved a second time.  That is
+# ``NtCreateFile`` with ``RootDirectory``, which the Windows storage
+# investigation measured working (including after the directory is renamed and
+# its old pathname recreated).
+#
+# ``FILE_OPEN_REPARSE_POINT`` opens a reparse point itself rather than following
+# it, so the object inspected is the link, never its target.  Neither it nor
+# ``RootDirectory`` stops traversal through an *intermediate* reparse point, so
+# a caller must confirm the root handle is a real directory before using it.
+#
+# ``SetFileInformationByHandle`` cannot rename to a relative name -- the tested
+# Win32 form returned ERROR_INVALID_PARAMETER -- so rename and delete use the
+# native ``NtSetInformationFile`` / ``SetFileInformationByHandle`` as measured.
+
+OBJ_CASE_INSENSITIVE = 0x00000040
+FILE_NON_DIRECTORY_FILE = 0x00000040
+FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+FILE_OPEN_REPARSE_POINT = 0x00200000
+FILE_OPEN = 1
+FILE_CREATE = 2
+FILE_OPEN_IF = 3
+FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+FILE_READ_ATTRIBUTES = 0x00000080
+FILE_RENAME_INFORMATION = 10
+FILE_DISPOSITION_INFO = 4
+OWNER_SECURITY_INFORMATION = 0x00000001
+# NTSTATUS values.  ``NtCreateFile`` returns these directly; the caller
+# translates the ones it can name to the OSError the storage protocol expects.
+STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A
+STATUS_OBJECT_NAME_COLLISION = 0xC0000035
+STATUS_ACCESS_DENIED = 0xC0000022
+STATUS_NOT_A_DIRECTORY = 0xC0000103
+
+
+class FileTime(ctypes.Structure):
+    """FILETIME: two DWORDs, not a 64-bit integer, so the layout is exact.
+
+    Fixed-width ``c_uint32`` rather than ``wintypes.DWORD``: the latter is
+    ``c_ulong``, which is 8 bytes on LP64 hosts and would give this structure
+    the wrong layout in the portable tests that pin it.
+    """
+
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                ("dwHighDateTime", ctypes.c_uint32)]
+
+
+class UnicodeString(ctypes.Structure):
+    """UNICODE_STRING: lengths in *bytes*, buffer separately owned."""
+
+    _fields_ = [("Length", ctypes.c_uint16),
+                ("MaximumLength", ctypes.c_uint16),
+                ("Buffer", ctypes.c_void_p)]
+
+
+class ObjectAttributes(ctypes.Structure):
+    """OBJECT_ATTRIBUTES: ``RootDirectory`` is what makes an open relative."""
+
+    _fields_ = [("Length", ctypes.c_uint32),
+                ("RootDirectory", ctypes.c_void_p),
+                ("ObjectName", ctypes.POINTER(UnicodeString)),
+                ("Attributes", ctypes.c_uint32),
+                ("SecurityDescriptor", ctypes.c_void_p),
+                ("SecurityQualityOfService", ctypes.c_void_p)]
+
+
+class IoStatusBlock(ctypes.Structure):
+    """IO_STATUS_BLOCK: the first member is a union of NTSTATUS and a pointer."""
+
+    _fields_ = [("Status", ctypes.c_size_t),
+                ("Information", ctypes.c_size_t)]
+
+
+class FileRenameInformation(ctypes.Structure):
+    """FILE_RENAME_INFORMATION with ``RootDirectory`` for a relative rename."""
+
+    _fields_ = [("ReplaceIfExists", ctypes.c_ubyte),
+                ("RootDirectory", ctypes.c_void_p),
+                ("FileNameLength", ctypes.c_uint32),
+                ("FileName", ctypes.c_uint16 * 1)]
+
+
+class ByHandleFileInformation(ctypes.Structure):
+    """BY_HANDLE_FILE_INFORMATION: attributes and size, no security descriptor."""
+
+    _fields_ = [("dwFileAttributes", ctypes.c_uint32),
+                ("ftCreationTime", FileTime),
+                ("ftLastAccessTime", FileTime),
+                ("ftLastWriteTime", FileTime),
+                ("dwVolumeSerialNumber", ctypes.c_uint32),
+                ("nFileSizeHigh", ctypes.c_uint32),
+                ("nFileSizeLow", ctypes.c_uint32),
+                ("nNumberOfLinks", ctypes.c_uint32),
+                ("nFileIndexHigh", ctypes.c_uint32),
+                ("nFileIndexLow", ctypes.c_uint32)]
+
+
+def nt_create_file(directory, name, desired_access, disposition, options,
+                   attributes=0):
+    """Open or create ``name`` relative to the directory handle ``directory``.
+
+    ``name`` is one path component; the caller checks that.  ``attributes`` is
+    the FILE_ATTRIBUTE_* to give a created file and is ignored for an open.
+    Returns the handle.  Raises :class:`WindowsApiError` with the NTSTATUS in
+    ``status`` so the caller can translate it.
+    """
+    create = bind(
+        "ntdll", "NtCreateFile", ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD,
+        ctypes.POINTER(ObjectAttributes), ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD)
+    encoded = name.encode("utf-16-le")
+    text = ctypes.create_string_buffer(encoded + b"\0\0")
+    string = UnicodeString(len(encoded), len(encoded) + 2,
+                           ctypes.cast(text, ctypes.c_void_p))
+    attributes_block = ObjectAttributes(
+        ctypes.sizeof(ObjectAttributes), directory, ctypes.pointer(string),
+        OBJ_CASE_INSENSITIVE, None, None)
+    io = IoStatusBlock()
+    handle = ctypes.c_void_p()
+    status = create(ctypes.byref(handle), desired_access,
+                    ctypes.byref(attributes_block), ctypes.byref(io),
+                    None, attributes, FILE_SHARE_ALL, disposition, options,
+                    None, 0)
+    if status < 0:
+        raise WindowsApiError(
+            f"NtCreateFile({name!r}) failed: 0x{status & 0xffffffff:08x}",
+            status=status & 0xffffffff)
+    return handle.value
+
+
+def nt_rename(source, directory, name):
+    """Rename the object ``source`` to ``name`` relative to ``directory``.
+
+    ``source`` is an open handle, so the rename acts on the object that was
+    opened even if its old name has been replaced meanwhile.
+    """
+    set_information = bind(
+        "ntdll", "NtSetInformationFile", ctypes.c_int32, ctypes.c_void_p,
+        ctypes.POINTER(IoStatusBlock), ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_int)
+    encoded = name.encode("utf-16-le")
+    buffer = ctypes.create_string_buffer(
+        ctypes.sizeof(FileRenameInformation) + len(encoded) + 2)
+    info = FileRenameInformation.from_buffer(buffer)
+    info.ReplaceIfExists = 1
+    info.RootDirectory = directory
+    info.FileNameLength = len(encoded)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + FileRenameInformation.FileName.offset,
+        encoded, len(encoded))
+    io = IoStatusBlock()
+    status = set_information(source, ctypes.byref(io), buffer,
+                             ctypes.sizeof(buffer), FILE_RENAME_INFORMATION)
+    if status < 0:
+        raise WindowsApiError(
+            "NtSetInformationFile(rename) failed: "
+            f"0x{status & 0xffffffff:08x}",
+            status=status & 0xffffffff)
+
+
+def set_delete_disposition(handle) -> None:
+    """Mark ``handle``'s object for deletion when the last handle closes."""
+    set_information = bind(
+        "kernel32", "SetFileInformationByHandle", wintypes.BOOL,
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    disposition = ctypes.c_uint8(1)
+    if not set_information(handle, FILE_DISPOSITION_INFO,
+                           ctypes.byref(disposition), 1):
+        raise WindowsApiError("SetFileInformationByHandle(disposition) failed",
+                              status=ctypes.get_last_error())
+
+
+def by_handle_file_information(handle):
+    """Return BY_HANDLE_FILE_INFORMATION for an open handle."""
+    query = bind("kernel32", "GetFileInformationByHandle", wintypes.BOOL,
+                 ctypes.c_void_p, ctypes.POINTER(ByHandleFileInformation))
+    information = ByHandleFileInformation()
+    if not query(handle, ctypes.byref(information)):
+        raise WindowsApiError("GetFileInformationByHandle failed",
+                              status=ctypes.get_last_error())
+    return information
+
+
+def read_file(handle, size):
+    """Read up to ``size`` bytes; returns what was read (may be short)."""
+    read = bind("kernel32", "ReadFile", wintypes.BOOL, ctypes.c_void_p,
+                ctypes.c_void_p, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
+    buffer = ctypes.create_string_buffer(size)
+    count = wintypes.DWORD()
+    if not read(handle, ctypes.cast(buffer, ctypes.c_void_p), size,
+                ctypes.byref(count), None):
+        raise WindowsApiError("ReadFile failed", status=ctypes.get_last_error())
+    return buffer.raw[:count.value]
+
+
+def write_file(handle, data):
+    """Write ``data``; returns the number of bytes written."""
+    write = bind("kernel32", "WriteFile", wintypes.BOOL, ctypes.c_void_p,
+                 ctypes.c_void_p, wintypes.DWORD,
+                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
+    payload = bytes(data)
+    buffer = ctypes.create_string_buffer(payload)
+    count = wintypes.DWORD()
+    if not write(handle, ctypes.cast(buffer, ctypes.c_void_p), len(payload),
+                 ctypes.byref(count), None):
+        raise WindowsApiError("WriteFile failed", status=ctypes.get_last_error())
+    return count.value
+
+
+def flush_file(handle) -> None:
+    """Flush a file handle's buffered data to the volume."""
+    flush = bind("kernel32", "FlushFileBuffers", wintypes.BOOL,
+                 ctypes.c_void_p)
+    if not flush(handle):
+        raise WindowsApiError("FlushFileBuffers failed",
+                              status=ctypes.get_last_error())
+
+
+# -- range locks ---------------------------------------------------------
+# ``LockFileEx`` is the Windows equivalent of ``flock``: an advisory lock on a
+# byte range of an open handle.  It locks from the OVERLAPPED offset, so the
+# one-byte range at zero has to be stated explicitly.  Contention is reported
+# as ERROR_LOCK_VIOLATION, not as a blocking wait.
+
+LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+ERROR_LOCK_VIOLATION = 33
+
+
+class Overlapped(ctypes.Structure):
+    """OVERLAPPED: the offset a locked range starts at, and an event slot."""
+
+    # Fixed-width ``c_uint32`` for the offset fields: ``wintypes.DWORD`` is
+    # ``c_ulong`` (8 bytes on LP64) and would give this the wrong layout.
+    _fields_ = [("Internal", ctypes.c_size_t),
+                ("InternalHigh", ctypes.c_size_t),
+                ("Offset", ctypes.c_uint32),
+                ("OffsetHigh", ctypes.c_uint32),
+                ("hEvent", ctypes.c_void_p)]
+
+
+def lock_file(handle, flags) -> None:
+    """Lock the one-byte range at offset zero of ``handle``."""
+    call = bind("kernel32", "LockFileEx", wintypes.BOOL, ctypes.c_void_p,
+                wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, ctypes.POINTER(Overlapped))
+    overlapped = Overlapped()
+    if not call(handle, flags, 0, 1, 0, ctypes.byref(overlapped)):
+        raise WindowsApiError("LockFileEx failed",
+                              status=ctypes.get_last_error())
+
+
+def unlock_file(handle) -> None:
+    """Release the range :func:`lock_file` took."""
+    call = bind("kernel32", "UnlockFileEx", wintypes.BOOL, ctypes.c_void_p,
+                wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                ctypes.POINTER(Overlapped))
+    overlapped = Overlapped()
+    if not call(handle, 0, 1, 0, ctypes.byref(overlapped)):
+        raise WindowsApiError("UnlockFileEx failed",
+                              status=ctypes.get_last_error())

@@ -15,6 +15,7 @@ from loki_agent import credential_files
 from loki_agent import credential_storages
 from loki_agent import file_locks
 from loki_agent import paths
+from loki_agent import windows_api
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -46,44 +47,84 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(os, 'chmod', side_effect=AssertionError(
                     'directory permissions must not be repaired')):
             self.storage.ensure_directory()
+        # The mode is requested on every platform; on Windows it becomes a
+        # private DACL, which os.stat cannot show.  POSIX asserts the resulting
+        # bits here, Windows asserts the DACL in WindowsCredentialStorageTests.
         create.assert_any_call(self.directory, 0o700)
-        self.assertEqual(stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
+        if os.name == 'posix':
+            self.assertEqual(
+                stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
 
     async def test_existing_private_directory_is_not_changed(self):
         self.storage.ensure_directory()
-        before = os.stat(self.directory)
         with mock.patch.object(os, 'chmod', side_effect=AssertionError(
                 'existing permissions must not be changed')):
-            self.storage.ensure_directory()
-        after = os.stat(self.directory)
-        self.assertTrue(os.path.samestat(before, after))
-        self.assertEqual(stat.S_IMODE(after.st_mode), stat.S_IMODE(before.st_mode))
+            if os.name == 'posix':
+                before = os.stat(self.directory)
+                self.storage.ensure_directory()
+                after = os.stat(self.directory)
+                self.assertTrue(os.path.samestat(before, after))
+                self.assertEqual(
+                    stat.S_IMODE(after.st_mode), stat.S_IMODE(before.st_mode))
+            else:
+                # Windows has no mode bits; "not changed" is the DACL string.
+                before = windows_api.dacl_sddl(self.directory)
+                self.storage.ensure_directory()
+                self.assertEqual(windows_api.dacl_sddl(self.directory), before)
 
     async def test_existing_shared_directory_is_rejected_without_repair(self):
-        os.makedirs(self.directory)
-        for mode in (0o755, 0o750, 0o770):
-            with self.subTest(mode=oct(mode)):
-                os.chmod(self.directory, mode)
-                with mock.patch.object(os, 'chmod', side_effect=AssertionError(
-                        'existing permissions must not be changed')):
-                    with self.assertRaisesRegex(
-                            credential_storages.CredentialStorageError,
-                            'adjust its permissions.*Loki will not change'):
-                        await self.storage.store_openai_login(tokens())
-                self.assertEqual(stat.S_IMODE(os.stat(self.directory).st_mode), mode)
-                self.assertFalse(os.path.exists(self.storage.file_path))
-                self.assertFalse(os.path.exists(self.storage.lock_path))
+        os.makedirs(self.directory, exist_ok=True)
+        if os.name == 'posix':
+            modes = (0o755, 0o750, 0o770)
+            for mode in modes:
+                with self.subTest(mode=oct(mode)):
+                    os.chmod(self.directory, mode)
+                    with mock.patch.object(
+                            os, 'chmod', side_effect=AssertionError(
+                                'existing permissions must not be changed')):
+                        with self.assertRaisesRegex(
+                                credential_storages.CredentialStorageError,
+                                'adjust its permissions.*Loki will not change'):
+                            await self.storage.store_openai_login(tokens())
+                    self.assertEqual(
+                        stat.S_IMODE(os.stat(self.directory).st_mode), mode)
+                    self.assertFalse(os.path.exists(self.storage.file_path))
+                    self.assertFalse(os.path.exists(self.storage.lock_path))
+        else:
+            # POSIX widens the mode; Windows widens the DACL.  The DACL is set
+            # through the editor's mutation, the only caller that rewrites one.
+            from loki_agent import windows_containers, windows_state
+
+            widened = windows_state.add_package_ace(
+                windows_api.dacl_sddl(self.directory),
+                'S-1-5-21-0-0-0-1004', windows_state.Access.READ)
+            windows_containers.set_dacl_sddl(self.directory, widened)
+            with self.assertRaisesRegex(
+                    credential_storages.CredentialStorageError,
+                    'adjust its permissions.*Loki will not change'):
+                await self.storage.store_openai_login(tokens())
+            self.assertFalse(os.path.exists(self.storage.file_path))
+            self.assertFalse(os.path.exists(self.storage.lock_path))
 
     async def test_login_is_atomic_private_and_loadable(self):
         stored = await self.storage.store_openai_login(tokens())
 
         self.assertEqual(stored.state, "active")
-        self.assertEqual(
-            stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
-        self.assertEqual(
-            stat.S_IMODE(os.stat(self.storage.file_path).st_mode),
-            0o600,
-        )
+        if os.name == 'posix':
+            self.assertEqual(
+                stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
+            self.assertEqual(
+                stat.S_IMODE(os.stat(self.storage.file_path).st_mode),
+                0o600,
+            )
+        else:
+            # No mode bits on Windows; the primitives read the DACL.
+            self.assertFalse(
+                credential_files.describe_path(
+                    self.directory).group_or_other_access)
+            self.assertFalse(
+                credential_files.describe_path(
+                    self.storage.file_path).group_or_other_access)
         loaded = self.storage.load_openai_subscription()
         self.assertEqual(loaded.tokens, tokens().normalized())
         self.assertNotIn(
@@ -126,7 +167,17 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_group_readable_json(self):
         await self.storage.store_openai_login(tokens())
-        os.chmod(self.storage.file_path, 0o640)
+        if os.name == 'posix':
+            os.chmod(self.storage.file_path, 0o640)
+        else:
+            # The Windows equivalent of "group readable" is a DACL that grants
+            # another trustee.
+            from loki_agent import windows_containers, windows_state
+
+            widened = windows_state.add_package_ace(
+                windows_api.dacl_sddl(self.storage.file_path),
+                'S-1-5-21-0-0-0-1004', windows_state.Access.READ)
+            windows_containers.set_dacl_sddl(self.storage.file_path, widened)
 
         with self.assertRaisesRegex(
                 credential_storages.CredentialStorageError,
@@ -728,26 +779,173 @@ class PrivateDirectorySupportTests(unittest.TestCase):
 
 
 class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
-    """The Windows primitive layer fails closed with one clear error.
+    """Portable checks for the Windows primitive layer's own logic.
 
-    These bodies are not implemented yet, so every entry point must raise a
-    ``CredentialStorageError`` naming the gap rather than letting a POSIX
-    ``AttributeError`` escape from whichever call site ran first.
+    The native calls cannot run here, so these drive the layer around them with
+    ``windows_api`` mocked: the single-component name guard, the NTSTATUS /
+    Win32 to OSError translation the storage protocol branches on, and the
+    FileFacts a handle produces.  The calls themselves are exercised by the
+    Windows investigation experiments.
     """
 
-    def test_every_entry_point_refuses_with_a_clear_error(self):
+    def test_a_name_that_is_not_one_component_is_refused(self):
         from loki_agent import _credential_files_windows
 
-        names = (
-            "open_directory", "open_read_at", "create_exclusive_at",
-            "open_lock_file_at", "replace_at", "unlink_at",
-            "describe", "describe_path",
-        )
-        for name in names:
-            with self.subTest(name=name), self.assertRaisesRegex(
-                    credential_storages.CredentialStorageError,
-                    "not implemented yet"):
-                getattr(_credential_files_windows, name)(None, "name")
+        for name in ("", ".", "..", "a/b", "a\\b", "C:name"):
+            with self.subTest(name=name), self.assertRaises(
+                    credential_storages.CredentialStorageError):
+                _credential_files_windows.open_read_at(object(), name)
+
+    @staticmethod
+    def _failing_call(status):
+        def call(*args, **kwargs):
+            raise windows_api.WindowsApiError("call failed", status=status)
+        return call
+
+    def test_missing_names_map_to_filenotfound(self):
+        from loki_agent import _credential_files_windows
+
+        statuses = (windows_api.STATUS_OBJECT_NAME_NOT_FOUND,
+                    windows_api.STATUS_OBJECT_PATH_NOT_FOUND,
+                    windows_api.ERROR_FILE_NOT_FOUND,
+                    windows_api.ERROR_PATH_NOT_FOUND)
+        for status in statuses:
+            with self.subTest(status=status), mock.patch.object(
+                    windows_api, "nt_create_file",
+                    side_effect=self._failing_call(status)):
+                with self.assertRaises(FileNotFoundError):
+                    _credential_files_windows.open_read_at(
+                        object(), "tokens.json")
+
+    def test_a_name_collision_maps_to_fileexists(self):
+        from loki_agent import _credential_files_windows
+
+        with mock.patch.object(
+                windows_api, "nt_create_file",
+                side_effect=self._failing_call(
+                    windows_api.STATUS_OBJECT_NAME_COLLISION)):
+            with self.assertRaises(FileExistsError):
+                _credential_files_windows.create_exclusive_at(
+                    object(), "tokens.json", 0o600)
+
+    def test_access_denied_maps_to_permissionerror(self):
+        from loki_agent import _credential_files_windows
+
+        with mock.patch.object(
+                windows_api, "nt_create_file",
+                side_effect=self._failing_call(
+                    windows_api.STATUS_ACCESS_DENIED)):
+            with self.assertRaises(PermissionError):
+                _credential_files_windows.open_lock_file_at(
+                    object(), "tokens.lock", 0o600)
+
+    def test_an_unnamed_status_is_a_plain_oserror(self):
+        from loki_agent import _credential_files_windows
+
+        with mock.patch.object(
+                windows_api, "nt_create_file",
+                side_effect=self._failing_call(0xDEADBEEF)):
+            with self.assertRaises(OSError) as caught:
+                _credential_files_windows.open_read_at(
+                    object(), "tokens.json")
+        self.assertNotIsInstance(caught.exception, FileNotFoundError)
+
+    @staticmethod
+    def _private_sddl(owner):
+        return (f"D:P(A;OICI;FA;;;{owner})"
+                "(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)")
+
+    def test_facts_for_a_private_file_owned_by_the_caller(self):
+        from loki_agent import _credential_files_windows
+
+        information = windows_api.ByHandleFileInformation()
+        information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
+        information.nFileSizeLow = 1234
+        owner = "S-1-5-21-1-2-3-1001"
+        with mock.patch.object(windows_api, "by_handle_file_information",
+                               return_value=information), \
+                mock.patch.object(windows_api, "handle_owner_sid",
+                                  return_value=owner), \
+                mock.patch.object(windows_api, "handle_dacl_sddl",
+                                  return_value=self._private_sddl(owner)), \
+                mock.patch.object(windows_api, "current_user_sid",
+                                  return_value=owner):
+            facts = _credential_files_windows.describe(object())
+        self.assertTrue(facts.regular)
+        self.assertFalse(facts.directory)
+        self.assertFalse(facts.reparse_point)
+        self.assertEqual(facts.size, 1234)
+        self.assertTrue(facts.owned_by_current_user)
+        self.assertFalse(facts.group_or_other_access)
+
+    def test_a_dacl_that_grants_another_trustee_is_not_private(self):
+        from loki_agent import _credential_files_windows
+
+        owner = "S-1-5-21-1-2-3-1001"
+        sddl = (f"D:P(A;OICI;FA;;;{owner})"
+                "(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)"
+                "(A;;FR;;;S-1-5-21-1-2-3-1004)")
+        self.assertTrue(
+            _credential_files_windows._is_shared(sddl, owner))
+
+    def test_an_absent_dacl_is_not_private(self):
+        from loki_agent import _credential_files_windows
+
+        # No DACL means everyone has full access; it must read as shared, never
+        # as "no grant" because there was nothing to parse.
+        self.assertTrue(_credential_files_windows._is_shared(
+            None, "S-1-5-21-1-2-3-1001"))
+
+    def test_a_reparse_point_and_a_foreign_owner_are_reported(self):
+        from loki_agent import _credential_files_windows
+
+        information = windows_api.ByHandleFileInformation()
+        information.dwFileAttributes = (
+            windows_api.FILE_ATTRIBUTE_REPARSE_POINT)
+        with mock.patch.object(windows_api, "by_handle_file_information",
+                               return_value=information), \
+                mock.patch.object(windows_api, "handle_owner_sid",
+                                  return_value="S-1-5-21-1-2-3-1004"), \
+                mock.patch.object(windows_api, "handle_dacl_sddl",
+                                  return_value=None), \
+                mock.patch.object(windows_api, "current_user_sid",
+                                  return_value="S-1-5-21-1-2-3-1001"):
+            facts = _credential_files_windows.describe(object())
+        self.assertTrue(facts.reparse_point)
+        self.assertFalse(facts.owned_by_current_user)
+        self.assertTrue(facts.group_or_other_access)
+
+
+@unittest.skipUnless(
+    os.name == "nt", "the Windows DACL is the private mechanism")
+class WindowsCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
+    """The storage protocol end to end over the Windows primitives.
+
+    ``JsonCredentialStorageTests`` asserts POSIX mode bits, which do not exist
+    on Windows; this runs the same protocol and checks the same property
+    through the DACL the primitives read.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = os.path.join(
+            self.temporary.name, "loki", "credentials")
+        self.storage = credential_storages.JsonCredentialStorage(
+            self.directory)
+
+    async def test_login_load_and_logout_round_trip(self):
+        stored = await self.storage.store_openai_login(tokens())
+        self.assertEqual(stored.state, "active")
+        self.assertFalse(credential_files.describe_path(
+            self.directory).group_or_other_access)
+        self.assertFalse(credential_files.describe_path(
+            self.storage.file_path).group_or_other_access)
+        self.assertEqual(
+            self.storage.load_openai_subscription().tokens,
+            tokens().normalized())
+        self.assertTrue(await self.storage.remove_openai_subscription())
+        self.assertFalse(await self.storage.remove_openai_subscription())
 
 
 if __name__ == "__main__":

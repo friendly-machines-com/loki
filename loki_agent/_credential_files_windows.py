@@ -1,34 +1,295 @@
-"""Windows credential-file primitives.
+"""Windows credential-file primitives: handle-relative, reparse-refusing.
 
-Not implemented yet.  The POSIX bodies refuse a symlink in the final component
-and act relative to the open directory descriptor; the Windows equivalents are
-a retained directory handle with ``NtCreateFile(RootDirectory)`` and
-``FILE_FLAG_OPEN_REPARSE_POINT``, and a :class:`FileFacts` from
-``GetFileInformationByHandle`` plus ``GetSecurityInfo`` (owner SID and DACL).
-Until those exist, every entry point raises here so a Windows caller gets one
-clear error instead of a POSIX ``AttributeError`` from whichever call site
-happened to run first.
+The POSIX module's two guarantees are reproduced here with the native calls
+the storage investigation measured:
+
+* **No reparse point is followed.**  Every child is opened with
+  ``FILE_OPEN_REPARSE_POINT``, so the object acted on is the link itself; the
+  storage then refuses it because :class:`FileFacts` reports ``reparse_point``.
+  ``open_directory`` additionally refuses a reparse-point directory outright,
+  because a handle to one would still traverse an intermediate link.
+* **Every operation is bound to the retained directory handle.**  Children are
+  opened with ``NtCreateFile(RootDirectory=...)`` and renamed with
+  ``NtSetInformationFile``, not by re-resolving the directory's pathname.  This
+  is the Windows equivalent of ``dir_fd``; ``SetFileInformationByHandle`` with a
+  relative name is the form that returned ``ERROR_INVALID_PARAMETER`` in the
+  investigation, so it is not used.
+
+The token is a raw ``HANDLE`` (a POSIX descriptor is an ``int``), which is why
+``credential_files`` takes read/write/fsync/close from this module too.
+
+What the privacy check does and does not cover is stated at
+``_PRIVATE_TRUSTEES``.
 """
 
 from __future__ import annotations
 
-from .credential_files import CredentialStorageError
+from . import windows_acl, windows_api
+from .credential_files import CredentialStorageError, FileFacts
 
 
-_NOT_IMPLEMENTED = (
-    "Windows credential-file access is not implemented yet; Loki cannot read "
-    "or write credentials on this platform")
+# Trustees that may hold access to a private credential object besides its
+# owner: the local SYSTEM (S-1-5-18) and the built-in Administrators group
+# (S-1-5-32-544).  Both can take ownership of any object on the volume, and
+# Windows bakes them into the DACL a private directory is created with, so
+# refusing on their presence would refuse every real machine while buying
+# nothing -- the same reasoning that calls read-versus-execute "theater" in
+# ``windows_state``.
+#
+# This is deliberately the coarse analogue of the POSIX check
+# (``st_mode & 0o077``), not an access-control proof.  It reads the DACL only:
+# it does NOT examine the SACL or the mandatory integrity label (where the
+# AppContainer lowbox label lives), privileges (SeBackupPrivilege,
+# SeTakeOwnershipPrivilege), or a same-user process.  Group membership and
+# inherited-from-above ACEs are seen as the DACL states them, not resolved.
+_PRIVATE_TRUSTEES = frozenset({"S-1-5-18", "S-1-5-32-544"})
+
+# NTSTATUS/Win32 error values that map onto the OSError subclasses the storage
+# protocol branches on; everything else becomes a plain OSError.
+_MISSING = frozenset({
+    windows_api.STATUS_OBJECT_NAME_NOT_FOUND,
+    windows_api.STATUS_OBJECT_PATH_NOT_FOUND,
+    windows_api.ERROR_FILE_NOT_FOUND,
+    windows_api.ERROR_PATH_NOT_FOUND,
+})
+_DENIED = frozenset({
+    windows_api.STATUS_ACCESS_DENIED,
+    windows_api.ERROR_ACCESS_DENIED,
+})
 
 
-def _unsupported(*args, **kwargs):
-    raise CredentialStorageError(_NOT_IMPLEMENTED)
+def _check_name(name: str) -> None:
+    """Refuse anything that is not a single path component.
+
+    ``RootDirectory`` binds the open to the retained directory, but a name
+    containing a separator would still walk past it; the names the storage uses
+    are constants, and this keeps it that way.
+    """
+    if not name or name in (".", "..") or any(
+            part in name for part in ("/", "\\", ":")):
+        raise CredentialStorageError(
+            f"credential file name is not a single path component: {name!r}")
 
 
-open_directory = _unsupported
-open_read_at = _unsupported
-create_exclusive_at = _unsupported
-open_lock_file_at = _unsupported
-replace_at = _unsupported
-unlink_at = _unsupported
-describe = _unsupported
-describe_path = _unsupported
+def _raise_oserror(error: windows_api.WindowsApiError) -> None:
+    """Translate a failed call into the OSError the storage protocol expects."""
+    status = error.status
+    message = str(error)
+    if status is None:
+        raise OSError(message) from error
+    unsigned = status & 0xffffffff
+    if unsigned in _MISSING:
+        raise FileNotFoundError(message) from error
+    if unsigned == windows_api.STATUS_OBJECT_NAME_COLLISION:
+        raise FileExistsError(message) from error
+    if unsigned in _DENIED:
+        raise PermissionError(message) from error
+    if unsigned == windows_api.STATUS_NOT_A_DIRECTORY:
+        raise NotADirectoryError(message) from error
+    raise OSError(message) from error
+
+
+def _is_shared(sddl, owner: str) -> bool:
+    """Whether the DACL grants access to anyone beyond the allowed trustees."""
+    if sddl is None:
+        # No DACL at all grants everyone full access; never "private".
+        return True
+    return not windows_acl.allow_trustees(sddl) <= (_PRIVATE_TRUSTEES | {owner})
+
+
+def _facts_from_handle(handle) -> FileFacts:
+    """Describe an open object the way the storage needs it.
+
+    The object's facts come from the handle, so a rename between the open and
+    the query cannot change which object is described.
+    """
+    try:
+        information = windows_api.by_handle_file_information(handle)
+        owner = windows_api.handle_owner_sid(handle)
+        dacl = windows_api.handle_dacl_sddl(handle)
+        current_user = windows_api.current_user_sid()
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+    attributes = information.dwFileAttributes
+    directory = bool(attributes & windows_api.FILE_ATTRIBUTE_DIRECTORY)
+    return FileFacts(
+        # Windows has no device/pipe distinction here; a non-directory is the
+        # regular-file equivalent, and a reparse point is refused separately.
+        regular=not directory,
+        directory=directory,
+        reparse_point=bool(
+            attributes & windows_api.FILE_ATTRIBUTE_REPARSE_POINT),
+        size=(information.nFileSizeHigh << 32) | information.nFileSizeLow,
+        owned_by_current_user=(owner == current_user),
+        group_or_other_access=_is_shared(dacl, owner),
+    )
+
+
+def _open_relative(directory, name, desired_access, disposition, options,
+                   attributes=0):
+    try:
+        return windows_api.nt_create_file(
+            directory, name, desired_access, disposition, options, attributes)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+
+
+# FILE_SYNCHRONOUS_IO_NONALERT makes every read/write return synchronously, so
+# the storage never has to wait on an IO_STATUS_BLOCK it did not provide.
+_SYNCHRONOUS = windows_api.FILE_SYNCHRONOUS_IO_NONALERT
+_NO_FOLLOW = windows_api.FILE_NON_DIRECTORY_FILE | windows_api.FILE_OPEN_REPARSE_POINT
+_NON_DIRECTORY = _NO_FOLLOW | _SYNCHRONOUS
+
+
+# -- descriptor operations ------------------------------------------------
+
+def read(handle, size):
+    try:
+        return windows_api.read_file(handle, size)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+
+
+def write(handle, data):
+    try:
+        return windows_api.write_file(handle, data)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+
+
+def fsync(handle) -> None:
+    # Windows has no directory fsync: FlushFileBuffers needs write access and a
+    # directory cannot be opened for writing, so a directory handle is a
+    # deliberate no-op here.  The rename that publishes the JSON is a metadata
+    # operation the filesystem journals; the kill-at-each-checkpoint experiment
+    # is the evidence that the published file is whole old or whole new.
+    try:
+        information = windows_api.by_handle_file_information(handle)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+    if information.dwFileAttributes & windows_api.FILE_ATTRIBUTE_DIRECTORY:
+        return
+    try:
+        windows_api.flush_file(handle)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+
+
+def close(handle) -> None:
+    windows_api.close_handle(handle)
+
+
+# -- opens ----------------------------------------------------------------
+
+def open_directory(path: str):
+    try:
+        handle = windows_api.open_with_access(
+            path, windows_api.GENERIC_READ,
+            flags=(windows_api.FILE_FLAG_BACKUP_SEMANTICS
+                   | windows_api.FILE_OPEN_REPARSE_POINT))
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+    try:
+        information = windows_api.by_handle_file_information(handle)
+    except windows_api.WindowsApiError as error:
+        windows_api.close_handle(handle)
+        _raise_oserror(error)
+    attributes = information.dwFileAttributes
+    # Re-checked on the handle, not the pathname: describe_path saw a pathname,
+    # and between it and this open the directory could have been swapped.  A
+    # handle to a reparse-point directory would still traverse it as a root.
+    if not attributes & windows_api.FILE_ATTRIBUTE_DIRECTORY:
+        windows_api.close_handle(handle)
+        raise NotADirectoryError(path)
+    if attributes & windows_api.FILE_ATTRIBUTE_REPARSE_POINT:
+        windows_api.close_handle(handle)
+        raise CredentialStorageError(
+            f"credential directory is a reparse point: {path}")
+    return handle
+
+
+def open_read_at(directory, name: str):
+    _check_name(name)
+    return _open_relative(
+        directory, name,
+        windows_api.GENERIC_READ | windows_api.SYNCHRONIZE,
+        windows_api.FILE_OPEN, _NON_DIRECTORY)
+
+
+def create_exclusive_at(directory, name: str, mode: int):
+    _check_name(name)
+    # ``mode`` is a POSIX concept; the new file inherits the directory's DACL,
+    # and the storage already refused a directory that is not private, so the
+    # inherited ACL is the enforcement here.
+    return _open_relative(
+        directory, name,
+        windows_api.GENERIC_WRITE | windows_api.FILE_READ_ATTRIBUTES
+        | windows_api.SYNCHRONIZE,
+        windows_api.FILE_CREATE, _NON_DIRECTORY,
+        windows_api.FILE_ATTRIBUTE_NORMAL)
+
+
+def open_lock_file_at(directory, name: str, mode: int):
+    _check_name(name)
+    return _open_relative(
+        directory, name,
+        windows_api.GENERIC_READ | windows_api.GENERIC_WRITE
+        | windows_api.FILE_READ_ATTRIBUTES | windows_api.SYNCHRONIZE,
+        windows_api.FILE_OPEN_IF, _NON_DIRECTORY)
+
+
+# -- publish and remove ---------------------------------------------------
+
+def replace_at(directory, temporary: str, name: str) -> None:
+    _check_name(temporary)
+    _check_name(name)
+    # Delete access on the source is what a rename needs; the source handle
+    # names the object even if its entry has been swapped meanwhile.
+    source = _open_relative(
+        directory, temporary,
+        windows_api.DELETE | windows_api.SYNCHRONIZE,
+        windows_api.FILE_OPEN, _NON_DIRECTORY)
+    try:
+        try:
+            windows_api.nt_rename(source, directory, name)
+        except windows_api.WindowsApiError as error:
+            _raise_oserror(error)
+    finally:
+        windows_api.close_handle(source)
+
+
+def unlink_at(directory, name: str) -> None:
+    _check_name(name)
+    # Opened reparse-point-refusing, so a link is removed rather than its
+    # target; delete is disposition-on-close, performed when the handle closes.
+    target = _open_relative(
+        directory, name,
+        windows_api.DELETE | windows_api.SYNCHRONIZE,
+        windows_api.FILE_OPEN, _NON_DIRECTORY)
+    try:
+        try:
+            windows_api.set_delete_disposition(target)
+        except windows_api.WindowsApiError as error:
+            _raise_oserror(error)
+    finally:
+        windows_api.close_handle(target)
+
+
+# -- description ----------------------------------------------------------
+
+def describe(handle) -> FileFacts:
+    return _facts_from_handle(handle)
+
+
+def describe_path(path: str) -> FileFacts:
+    try:
+        handle = windows_api.open_with_access(
+            path, windows_api.GENERIC_READ,
+            flags=(windows_api.FILE_FLAG_BACKUP_SEMANTICS
+                   | windows_api.FILE_OPEN_REPARSE_POINT))
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+    try:
+        return _facts_from_handle(handle)
+    finally:
+        windows_api.close_handle(handle)

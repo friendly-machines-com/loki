@@ -425,5 +425,101 @@ class FileAccessTests(unittest.TestCase):
                          windows_api.ERROR_ACCESS_DENIED)
 
 
+class HandleRelativeFileDeclarationTests(unittest.TestCase):
+    """Layout and values the handle-relative credential operations rely on."""
+
+    def test_unicode_string_lengths_are_bytes_and_the_buffer_is_a_pointer(self):
+        pointer = ctypes.sizeof(ctypes.c_void_p)
+        self.assertEqual(windows_api.UnicodeString.Length.offset, 0)
+        self.assertEqual(windows_api.UnicodeString.MaximumLength.offset, 2)
+        self.assertEqual(windows_api.UnicodeString.Buffer.offset, pointer)
+        self.assertEqual(ctypes.sizeof(windows_api.UnicodeString), 2 * pointer)
+
+    def test_object_attributes_puts_the_root_directory_after_the_length(self):
+        # RootDirectory is what makes an open relative; a member added or
+        # dropped in the middle would shift it and every field after it.
+        pointer = ctypes.sizeof(ctypes.c_void_p)
+        attributes = windows_api.ObjectAttributes
+        self.assertEqual(attributes.Length.offset, 0)
+        self.assertEqual(attributes.RootDirectory.offset, pointer)
+        self.assertEqual(attributes.ObjectName.offset, 2 * pointer)
+        self.assertEqual(attributes.Attributes.offset, 3 * pointer)
+        self.assertEqual(attributes.SecurityDescriptor.offset, 4 * pointer)
+        self.assertEqual(
+            attributes.SecurityQualityOfService.offset, 5 * pointer)
+        self.assertEqual(ctypes.sizeof(attributes), 6 * pointer)
+
+    def test_io_status_block_is_a_status_then_a_size(self):
+        pointer = ctypes.sizeof(ctypes.c_void_p)
+        self.assertEqual(windows_api.IoStatusBlock.Status.offset, 0)
+        self.assertEqual(windows_api.IoStatusBlock.Information.offset, pointer)
+        self.assertEqual(ctypes.sizeof(windows_api.IoStatusBlock), 2 * pointer)
+
+    def test_file_rename_information_carries_a_root_and_a_counted_name(self):
+        pointer = ctypes.sizeof(ctypes.c_void_p)
+        rename = windows_api.FileRenameInformation
+        self.assertEqual(rename.ReplaceIfExists.offset, 0)
+        self.assertEqual(rename.RootDirectory.offset, pointer)
+        self.assertEqual(rename.FileNameLength.offset, 2 * pointer)
+        self.assertEqual(rename.FileName.offset, 2 * pointer + 4)
+
+    def test_by_handle_file_information_is_all_fixed_width(self):
+        # All c_uint32, so the layout is the same on every host -- which is the
+        # point of not using wintypes.DWORD, that is c_ulong (8 bytes) on LP64.
+        information = windows_api.ByHandleFileInformation
+        self.assertEqual(ctypes.sizeof(information), 52)
+        self.assertEqual(information.dwFileAttributes.offset, 0)
+        self.assertEqual(information.ftCreationTime.offset, 4)
+        self.assertEqual(information.ftLastAccessTime.offset, 12)
+        self.assertEqual(information.ftLastWriteTime.offset, 20)
+        self.assertEqual(information.dwVolumeSerialNumber.offset, 28)
+        self.assertEqual(information.nFileSizeHigh.offset, 32)
+        self.assertEqual(information.nFileSizeLow.offset, 36)
+        self.assertEqual(information.nNumberOfLinks.offset, 40)
+        self.assertEqual(information.nFileIndexHigh.offset, 44)
+        self.assertEqual(information.nFileIndexLow.offset, 48)
+        self.assertEqual(ctypes.sizeof(windows_api.FileTime), 8)
+
+    def test_handle_relative_values_match_the_reference(self):
+        self.assertEqual(windows_api.OBJ_CASE_INSENSITIVE, 0x40)
+        self.assertEqual(windows_api.FILE_NON_DIRECTORY_FILE, 0x40)
+        self.assertEqual(windows_api.FILE_SYNCHRONOUS_IO_NONALERT, 0x20)
+        self.assertEqual(windows_api.FILE_OPEN_REPARSE_POINT, 0x00200000)
+        self.assertEqual(windows_api.FILE_OPEN, 1)
+        self.assertEqual(windows_api.FILE_CREATE, 2)
+        self.assertEqual(windows_api.FILE_OPEN_IF, 3)
+        self.assertEqual(windows_api.FILE_ATTRIBUTE_DIRECTORY, 0x10)
+        self.assertEqual(windows_api.FILE_ATTRIBUTE_REPARSE_POINT, 0x400)
+        self.assertEqual(windows_api.FILE_ATTRIBUTE_NORMAL, 0x80)
+        self.assertEqual(windows_api.FILE_READ_ATTRIBUTES, 0x80)
+        self.assertEqual(windows_api.FILE_RENAME_INFORMATION, 10)
+        self.assertEqual(windows_api.FILE_DISPOSITION_INFO, 4)
+        self.assertEqual(windows_api.OWNER_SECURITY_INFORMATION, 0x1)
+
+    def test_ntstatus_values_match_the_reference(self):
+        self.assertEqual(windows_api.STATUS_OBJECT_NAME_NOT_FOUND, 0xC0000034)
+        self.assertEqual(windows_api.STATUS_OBJECT_PATH_NOT_FOUND, 0xC000003A)
+        self.assertEqual(windows_api.STATUS_OBJECT_NAME_COLLISION, 0xC0000035)
+        self.assertEqual(windows_api.STATUS_ACCESS_DENIED, 0xC0000022)
+        self.assertEqual(windows_api.STATUS_NOT_A_DIRECTORY, 0xC0000103)
+
+
+class RangeLockDeclarationTests(unittest.TestCase):
+    def test_overlapped_states_the_offset_the_lock_starts_at(self):
+        pointer = ctypes.sizeof(ctypes.c_void_p)
+        overlapped = windows_api.Overlapped
+        self.assertEqual(overlapped.Internal.offset, 0)
+        self.assertEqual(overlapped.InternalHigh.offset, pointer)
+        self.assertEqual(overlapped.Offset.offset, 2 * pointer)
+        self.assertEqual(overlapped.OffsetHigh.offset, 2 * pointer + 4)
+        self.assertEqual(overlapped.hEvent.offset, 2 * pointer + 8)
+        self.assertEqual(ctypes.sizeof(overlapped), 3 * pointer + 8)
+
+    def test_lock_values_match_the_reference(self):
+        self.assertEqual(windows_api.LOCKFILE_FAIL_IMMEDIATELY, 0x1)
+        self.assertEqual(windows_api.LOCKFILE_EXCLUSIVE_LOCK, 0x2)
+        self.assertEqual(windows_api.ERROR_LOCK_VIOLATION, 33)
+
+
 if __name__ == "__main__":
     unittest.main()

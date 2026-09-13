@@ -20,6 +20,11 @@ _.dwFlags
 _.hStdInput
 _.hStdOutput
 _.hStdError
+# FILE_RENAME_INFORMATION is filled in for NtSetInformationFile; nothing reads
+# the fields back on this side, the kernel does.
+_.ReplaceIfExists
+_.RootDirectory
+_.FileNameLength
 
 # Test seams: production never reads these; the tests exercise them.
 _.credential_broker
