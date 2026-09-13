@@ -7,9 +7,45 @@ EOF, and the reference/spawn/validation contract the child depends on.
 """
 
 import os
+import socket
 import unittest
+from unittest import mock
 
 from loki_agent import host_ipc
+
+
+class PairConfirmationTests(unittest.TestCase):
+    """The ends handed over must be each other's.
+
+    POSIX ``socketpair()`` cannot be substituted, so these run the same check
+    the Windows hand-built pair depends on -- on the only host where it can be
+    exercised portably.
+    """
+
+    def pair(self):
+        first, second = socket.socketpair()
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        return first, second
+
+    def test_a_connected_pair_confirms_and_stays_usable(self):
+        first, second = self.pair()
+
+        host_ipc.confirm_pair(first, second)
+
+        second.sendall(b"after")
+        self.assertEqual(first.recv(5), b"after")
+
+    def test_ends_from_two_different_pairs_are_refused_and_closed(self):
+        first, _first_peer = self.pair()
+        second, _second_peer = self.pair()
+
+        with mock.patch.object(host_ipc, "_PAIR_CONFIRM_TIMEOUT", 0.05):
+            with self.assertRaises(host_ipc.PairConfirmationError):
+                host_ipc.confirm_pair(first, second)
+
+        self.assertEqual(first.fileno(), -1)
+        self.assertEqual(second.fileno(), -1)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX seam")
