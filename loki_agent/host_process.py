@@ -12,8 +12,8 @@ The Windows notes here are not translations of the POSIX calls:
 * ``CREATE_NEW_PROCESS_GROUP`` gives the child its own group, which is what
   ``CTRL_BREAK_EVENT`` is addressed to.  Windows has no signal that can be
   delivered to an arbitrary process.
-* There is no ``SIGTERM``/``SIGKILL``.  A cooperative stop is
-  ``CTRL_BREAK_EVENT``; a forced stop terminates the process.
+* ``SIGKILL`` does not exist.  Callers request a forced stop with ``FORCE``;
+  the seam maps it to ``SIGKILL`` on POSIX and to a terminate on Windows.
 * ``terminate()`` reaches the direct child only.  Killing grandchildren needs a
   Job Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``, which is not
   implemented here yet.
@@ -24,6 +24,18 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+
+# ``signal.SIGKILL`` is absent on Windows, so a forced stop is named here and
+# mapped per platform instead of being spelled with a signal number.
+FORCE = "force"
+
+
+def label(signum) -> str:
+    """Human-readable name for a stop request, without naming a value Windows lacks."""
+    if signum == FORCE:
+        return "SIGKILL" if os.name == "posix" else "terminate"
+    return signum.name
+
 
 if os.name == "posix":
     def spawn_kwargs():
@@ -45,7 +57,8 @@ if os.name == "posix":
 
     def signal_group(proc, pgid, signum):
         """Signal the child's whole process group, so its shell children follow."""
-        os.killpg(pgid or proc.pid, signum)
+        os.killpg(pgid or proc.pid,
+                  signal.SIGKILL if signum == FORCE else signum)
 
 else:
     def spawn_kwargs():
@@ -64,10 +77,23 @@ else:
         stop with ``CTRL_BREAK_EVENT``, falling back to terminating it when the
         child cannot be reached that way.
         """
-        if signum == signal.SIGKILL:
-            proc.terminate()
+        if signum == FORCE:
+            _terminate(proc)
             return
         try:
             os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
         except OSError:
+            _terminate(proc)
+
+    def _terminate(proc):
+        # Callers distinguish "the process is gone" from "the signal failed",
+        # and Windows reports the former as an ordinary OSError.  Translate an
+        # exited process so that distinction survives the seam.
+        try:
             proc.terminate()
+        except ProcessLookupError:
+            raise
+        except OSError as error:
+            if proc.returncode is not None:
+                raise ProcessLookupError(error.errno) from error
+            raise

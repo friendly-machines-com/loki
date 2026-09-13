@@ -1751,7 +1751,7 @@ class JobManager:
             try:
                 host_process.signal_group(job.process, job.pgid, signum)
                 return True
-            except OSError:
+            except ProcessLookupError:
                 return False
 
         async def terminate(signum, grace_s: float):
@@ -1762,7 +1762,7 @@ class JobManager:
                 exit_code = await asyncio.wait_for(
                     asyncio.shield(exit_task), timeout=grace_s)
             except asyncio.TimeoutError:
-                _signal_job(signal.SIGKILL)
+                _signal_job(host_process.FORCE)
                 exit_code = await exit_task
             return exit_code
 
@@ -1920,7 +1920,7 @@ class JobManager:
         try:
             host_process.signal_group(job.process, job.pgid, signum)
             return True
-        except OSError:
+        except ProcessLookupError:
             return False
 
     async def _finish_owned_job(self, job: Job):
@@ -1935,7 +1935,7 @@ class JobManager:
                     exit_code = await asyncio.wait_for(
                         asyncio.shield(exit_task), timeout=2)
                 except asyncio.TimeoutError:
-                    self._signal_process_group(job, signal.SIGKILL)
+                    self._signal_process_group(job, host_process.FORCE)
                     exit_code = await exit_task
         finally:
             if not exit_task.done():
@@ -2032,14 +2032,15 @@ class JobManager:
         if job.process.returncode is not None:
             self._record_exit(job, job.process.returncode)
             return f"Job {job.id} is no longer running."
-        sig = signal.SIGKILL if force else signal.SIGTERM
+        sig = host_process.FORCE if force else signal.SIGTERM
         try:
             host_process.signal_group(job.process, job.pgid, sig)
-        except OSError:
+        except ProcessLookupError:
             return f"Job {job.id} is no longer running."
         job.status = "stopping"
         self._write_metadata(job)
-        return f"Sent {sig.name} to job {job.id} (pgid={job.pgid})."
+        return (f"Sent {host_process.label(sig)} to job {job.id} "
+                f"(pgid={job.pgid}).")
 
 
 def run_bash(command: str, timeout: int = None, description: str = "",
