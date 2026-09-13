@@ -658,43 +658,95 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
             os.makedirs(observer_dir)
             os.makedirs(report_dir)
             sitecustomize = os.path.join(observer_dir, "sitecustomize.py")
+            observer = r'''
+import ctypes
+import json
+import os
+import sys
+
+from loki_agent import credentials
+
+_capture = credentials.capture_process_credentials
+
+
+def native_environment():
+    if os.name == "nt":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        get = kernel.GetEnvironmentStringsW
+        get.restype = ctypes.c_void_p
+        free = kernel.FreeEnvironmentStringsW
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = ctypes.c_int
+        pointer = get()
+        if not pointer:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            entries, address = [], pointer
+            while True:
+                text = ctypes.wstring_at(address)
+                if not text:
+                    break
+                entries.append(text)
+                address += (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+            return b"\0".join(entry.encode("utf-8") for entry in entries)
+        finally:
+            free(pointer)
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sysctl.argtypes = (
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t)
+        libc.sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, os.getpid())
+        size = ctypes.c_size_t(os.sysconf("SC_ARG_MAX"))
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "sysctl failed")
+        return buffer.raw[:size.value]
+    with open("/proc/self/environ", "rb") as source:
+        return source.read()
+
+
+def report_environment():
+    raw = native_environment()
+    name = __NAME__.encode("ascii")
+    value = __VALUE__.encode("ascii")
+    filler = b"x" * len(name + b"=" + value)
+    after = b"LOKI_ACP_AFTER=visible\0"
+    report = {
+        "pid": os.getpid(),
+        "worker": "--worker" in sys.argv,
+        "name_present": name + b"=" in raw,
+        "value_present": value in raw,
+        "after_present": after in raw,
+    }
+    if sys.platform.startswith("linux"):
+        # Linux overwrites the original records in place, so the filler and the
+        # record that follows it are observable.  Windows removes them instead.
+        report["filler_present"] = filler in raw.split(b"\0")
+        report["after_follows_filler"] = (
+            raw.find(after) > raw.find(filler + b"\0")
+            if filler + b"\0" in raw else False)
+    path = os.path.join(os.environ["LOKI_TEST_REPORT_DIR"],
+                        "%d.json" % os.getpid())
+    with open(path, "w", encoding="ascii") as output:
+        json.dump(report, output)
+
+
+def capture_process_credentials():
+    store = _capture()
+    report_environment()
+    return store
+
+
+credentials.capture_process_credentials = capture_process_credentials
+if "--worker" in sys.argv:
+    report_environment()
+'''
+            observer = observer.replace("__NAME__", repr(credential_name))
+            observer = observer.replace("__VALUE__", repr(credential_value))
             with open(sitecustomize, "w", encoding="ascii") as stream:
-                stream.write(
-                    "import json, os, sys\n"
-                    "from loki_agent import credentials\n"
-                    "_capture = credentials.capture_process_credentials\n"
-                    "def report_environment():\n"
-                    "    with open('/proc/self/environ', 'rb') as source:\n"
-                    "        raw = source.read()\n"
-                    f"    name = {credential_name!r}.encode('ascii')\n"
-                    f"    value = {credential_value!r}.encode('ascii')\n"
-                    "    filler = b'x' * len(name + b'=' + value)\n"
-                    "    after = b'LOKI_ACP_AFTER=visible\\0'\n"
-                    "    report = {\n"
-                    "        'pid': os.getpid(),\n"
-                    "        'worker': '--worker' in sys.argv,\n"
-                    "        'name_present': name + b'=' in raw,\n"
-                    "        'value_present': value in raw,\n"
-                    "        'filler_present': filler in raw.split(b'\\0'),\n"
-                    "        'after_present': after in raw,\n"
-                    "        'after_follows_filler': (\n"
-                    "            raw.find(after) > raw.find(filler + b'\\0')\n"
-                    "            if filler + b'\\0' in raw else False),\n"
-                    "    }\n"
-                    "    path = os.path.join(\n"
-                    "        os.environ['LOKI_TEST_REPORT_DIR'],\n"
-                    "        f'{os.getpid()}.json')\n"
-                    "    with open(path, 'w', encoding='ascii') as output:\n"
-                    "        json.dump(report, output)\n"
-                    "def capture_process_credentials():\n"
-                    "    store = _capture()\n"
-                    "    report_environment()\n"
-                    "    return store\n"
-                    "credentials.capture_process_credentials = (\n"
-                    "    capture_process_credentials)\n"
-                    "if '--worker' in sys.argv:\n"
-                    "    report_environment()\n"
-                )
+                stream.write(observer)
             env["LOKI_TEST_REPORT_DIR"] = report_dir
             env["PYTHONPATH"] = os.pathsep.join(
                 [observer_dir, ROOT])
@@ -768,21 +820,26 @@ args=('%s/trace-' + str(__import__('os').getpid()), 'a')
                     self.assertFalse(report["name_present"])
                     self.assertFalse(report["value_present"])
                     self.assertTrue(report["after_present"])
-                self.assertTrue(front_report["filler_present"])
-                self.assertTrue(front_report["after_follows_filler"])
-                self.assertFalse(worker_report["filler_present"])
-                self.assertFalse(worker_report["after_follows_filler"])
-                credential_dir = os.path.join(
-                    tmpdir, "config", "loki", "credentials")
-                with open(
-                        f"/proc/{worker_report['pid']}/mountinfo",
-                        encoding="ascii") as stream:
-                    worker_mounts = stream.read()
-                self.assertTrue(any(
-                    f" {credential_dir} " in line
-                    and " - tmpfs " in line
-                    for line in worker_mounts.splitlines()
-                ), worker_mounts)
+                if sys.platform.startswith("linux"):
+                    # Linux overwrites in place and covers the directory with a
+                    # tmpfs; both are Linux mechanisms.  The Windows isolation
+                    # evidence is the AppContainer gate exercised by
+                    # test_windows_runtime and test_runtime_gate.
+                    self.assertTrue(front_report["filler_present"])
+                    self.assertTrue(front_report["after_follows_filler"])
+                    self.assertFalse(worker_report["filler_present"])
+                    self.assertFalse(worker_report["after_follows_filler"])
+                    credential_dir = os.path.join(
+                        tmpdir, "config", "loki", "credentials")
+                    with open(
+                            f"/proc/{worker_report['pid']}/mountinfo",
+                            encoding="ascii") as stream:
+                        worker_mounts = stream.read()
+                    self.assertTrue(any(
+                        f" {credential_dir} " in line
+                        and " - tmpfs " in line
+                        for line in worker_mounts.splitlines()
+                    ), worker_mounts)
             finally:
                 front.stdin.close()
                 try:
