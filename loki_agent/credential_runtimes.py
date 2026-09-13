@@ -12,22 +12,45 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import socket
 
 from . import acps, credential_capabilities
 from .credentials import CredentialInventory
 
 
 class SessionOwner:
-    """One inherited session-lifetime descriptor."""
+    """One inherited session-lifetime channel end.
 
-    def __init__(self, fd: int):
-        os.set_inheritable(fd, False)
-        self.fd = fd
-        self.closed_task = asyncio.create_task(
-            acps.AsyncFdLineReader(fd).readline(),
-            name="loki-session-owner",
-        )
+    POSIX watches a descriptor with ``add_reader``.  Windows cannot (the
+    proactor loop takes sockets only), so there the end is a socket and the
+    loop watches it as a stream instead.
+    """
+
+    def __init__(self, owner):
+        self.fd = None
+        self.socket = None
+        if isinstance(owner, socket.socket):
+            self.socket = owner
+            self.closed_task = asyncio.create_task(
+                self._read_until_closed(owner),
+                name="loki-session-owner",
+            )
+        else:
+            os.set_inheritable(owner, False)
+            self.fd = owner
+            self.closed_task = asyncio.create_task(
+                acps.AsyncFdLineReader(owner).readline(),
+                name="loki-session-owner",
+            )
         self._closed = False
+
+    @staticmethod
+    async def _read_until_closed(endpoint: socket.socket) -> bytes:
+        reader, writer = await asyncio.open_connection(sock=endpoint)
+        try:
+            return await reader.read()
+        finally:
+            writer.close()
 
     async def close(self):
         if self._closed:
@@ -38,7 +61,10 @@ class SessionOwner:
         await asyncio.gather(
             self.closed_task, return_exceptions=True)
         with contextlib.suppress(OSError):
-            os.close(self.fd)
+            if self.socket is not None:
+                self.socket.close()
+            elif self.fd is not None:
+                os.close(self.fd)
 
 
 async def _connect_while_owned(capability_fd: int, owner: SessionOwner):

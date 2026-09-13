@@ -222,8 +222,8 @@ class SavedConnectionAuthorizationTests(
             def child_arguments(self):
                 return ()
 
-            def child_fds(self):
-                return ()
+            def child_spawn_kwargs(self):
+                return {}
 
             def child_spawned(self):
                 return None

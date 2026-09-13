@@ -5015,8 +5015,8 @@ class SubagentLaunchTests(unittest.TestCase):
         supervisor = credential_supervisors.CredentialSupervisor(
             credentials or CredentialStore({}))
         delegation = await supervisor.delegate()
-        owner_fd = os.dup(delegation.owner_read_fd)
-        capability_fd = os.dup(delegation.credential_fd)
+        owner_fd = os.dup(delegation.owner_child)
+        capability_fd = os.dup(delegation.credential_child)
         delegation.child_spawned()
         try:
             if "--subagent-depth" not in args:

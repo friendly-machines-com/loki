@@ -314,8 +314,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             ))
         outer = await credential_supervisors.RuntimeDelegation.create(
             broker, {credential})
-        outer_owner = os.dup(outer.owner_read_fd)
-        outer_capability = os.dup(outer.credential_fd)
+        outer_owner = os.dup(outer.owner_child)
+        outer_capability = os.dup(outer.credential_child)
         outer.child_spawned()
         outer_runtime = None
         inner = None
@@ -333,8 +333,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                     outer_session.credential_authority,
                     {credential},
                 ))
-            inner_owner = os.dup(inner.owner_read_fd)
-            inner_capability = os.dup(inner.credential_fd)
+            inner_owner = os.dup(inner.owner_child)
+            inner_capability = os.dup(inner.credential_child)
             inner.child_spawned()
             inner_runtime = (
                 await credential_runtimes.CredentialRuntime.connect(
@@ -436,8 +436,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
         supervisor = credential_supervisors.CredentialSupervisor(
             CredentialStore({name: value}))
         delegation = await supervisor.delegate()
-        owner_fd = os.dup(delegation.owner_read_fd)
-        capability_fd = os.dup(delegation.credential_fd)
+        owner_fd = os.dup(delegation.owner_child)
+        capability_fd = os.dup(delegation.credential_child)
         delegation.child_spawned()
         runtime = None
         try:
@@ -516,8 +516,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             def child_arguments(self):
                 return []
 
-            def child_fds(self):
-                return ()
+            def child_spawn_kwargs(self):
+                return {}
 
             def child_spawned(self):
                 pass

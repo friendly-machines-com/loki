@@ -11,7 +11,7 @@ import getopt
 import os
 import sys
 
-from . import credential_capabilities, credential_runtimes
+from . import credential_capabilities, credential_runtimes, host_ipc
 from .process_protections import (
     ProcessProtectionError,
     protect_credential_process,
@@ -111,19 +111,15 @@ async def amain(owner_fd: int, capability_fd: int) -> int:
             await runtime.close()
 
 
-def _descriptor(value: str, description: str) -> int:
+def _descriptor(value: str, description: str):
     try:
-        fd = int(value)
-        if fd < 3:
-            raise ValueError()
-        os.fstat(fd)
+        return host_ipc.child_endpoint(value)
     except (OSError, ValueError) as error:
         raise ValueError(
             f"invalid ACP worker {description} descriptor") from error
-    return fd
 
 
-def _runtime_descriptors(args) -> tuple[int, int]:
+def _runtime_descriptors(args):
     options, positional = getopt.getopt(
         args, "", [
             "session-owner-fd=",

@@ -34,6 +34,7 @@ from html.parser import HTMLParser
 from pprint import pformat
 
 from . import formats
+from . import host_ipc
 from . import host_process
 from . import http_client
 from . import models as modelsdev
@@ -1482,12 +1483,12 @@ class JobManager:
 
     @staticmethod
     def _close_owner_signal(job: Job):
-        fd = job.owner_signal_fd
+        end = job.owner_signal_fd
         job.owner_signal_fd = None
-        if fd is None:
+        if end is None:
             return
         try:
-            os.close(fd)
+            host_ipc.close_end(end)
         except OSError:
             pass
 
@@ -1569,13 +1570,6 @@ class JobManager:
                 "credential capabilities require a direct executable")
         if subagent and not session_owned:
             raise ValueError("subagents must be session-owned")
-        if os.name != "posix" and (session_owned or credential_refs is not None):
-            # A child receives handles through pass_fds on POSIX.  The Windows
-            # equivalent (inheritable handles via
-            # PROC_THREAD_ATTRIBUTE_HANDLE_LIST) is not implemented yet, and
-            # dropping the handles would start a child that cannot use them.
-            raise RuntimeError(
-                "passing handles to a child is not implemented on Windows yet")
         os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
@@ -1605,9 +1599,9 @@ class JobManager:
         # before the launch resolves to "running" or "failed".
         self.jobs[job.id] = job
 
-        owner_read_fd = None
-        owner_write_fd = None
-        credential_fd = None
+        owner_parent = None
+        owner_child = None
+        credential_child = None
         credential_server = None
         spawn_command = command
         proc = None
@@ -1617,28 +1611,28 @@ class JobManager:
                 # first operation that can yield to another task: a refusal
                 # here is a recorded failed job, not one stuck in "starting".
                 self._reserve_subagent_slot(job)
-            # Descriptor acquisition belongs inside the same cleanup boundary
-            # as process creation. A failed relay setup must not leave either
-            # end of the already-created owner pipe live.
+            # Channel acquisition belongs inside the same cleanup boundary as
+            # process creation. A failed relay setup must not leave either end
+            # of the already-created owner channel live.
             if session_owned:
-                owner_read_fd, owner_write_fd = os.pipe()
+                owner_parent, owner_child = host_ipc.owner_channel()
                 spawn_command = [
                     *command,
                     "--session-owner-fd",
-                    str(owner_read_fd),
+                    str(host_ipc.reference(owner_child)),
                 ]
             if credential_refs is not None:
                 authority = current_session().credential_authority
                 if authority is None:
                     raise RuntimeError(
                         "cannot delegate credentials without an authority")
-                credential_server, credential_fd = await (
+                credential_server, credential_child = await (
                     credential_capabilities.CredentialCapabilityServer.create(
                         authority, credential_refs))
                 spawn_command = [
                     *spawn_command,
                     "--credential-capability-fd",
-                    str(credential_fd),
+                    str(host_ipc.reference(credential_child)),
                 ]
 
             with open(stdout_path, 'wb') as stdout_file, \
@@ -1655,19 +1649,19 @@ class JobManager:
                         **host_process.spawn_kwargs(),
                     )
                 else:
-                    pass_fds = tuple(
-                        fd for fd in (owner_read_fd, credential_fd)
-                        if fd is not None)
+                    child_ends = [
+                        end for end in (owner_child, credential_child)
+                        if end is not None]
                     proc = await asyncio.create_subprocess_exec(
                         *spawn_command,
                         stdin=subprocess.DEVNULL,
                         stdout=stdout_file,
                         stderr=stderr_file,
                         close_fds=True,
-                        pass_fds=pass_fds,
                         env=env,
                         cwd=cwd or current_cwd(),
                         **host_process.spawn_kwargs(),
+                        **host_ipc.spawn_kwargs(child_ends),
                     )
         except BaseException as error:
             # Nothing has escaped to a reaper yet, and the job is already
@@ -1688,17 +1682,17 @@ class JobManager:
                     pass
             raise
         finally:
-            if owner_read_fd is not None:
-                os.close(owner_read_fd)
-            if credential_fd is not None:
-                os.close(credential_fd)
-            if proc is None and owner_write_fd is not None:
-                os.close(owner_write_fd)
+            if owner_child is not None:
+                host_ipc.close_end(owner_child)
+            if credential_child is not None:
+                host_ipc.close_end(credential_child)
+            if proc is None and owner_parent is not None:
+                host_ipc.close_end(owner_parent)
             if proc is None and credential_server is not None:
                 await credential_server.close()
 
         job.process = proc
-        job.owner_signal_fd = owner_write_fd
+        job.owner_signal_fd = owner_parent
         job.credential_capability = credential_server
         job.pid = proc.pid
         job.pgid = host_process.process_group(proc, proc.pid)

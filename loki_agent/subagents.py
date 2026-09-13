@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from . import credential_capabilities
 from . import credential_runtimes
 from . import formats
+from . import host_ipc
 from . import loki as _core
 from . import protocols
 from . import texts
@@ -64,13 +65,9 @@ def _print_text_line(prefix, text, *, file=None):
     print(file=file)
 
 
-def _descriptor(value: str, description: str) -> int:
+def _descriptor(value: str, description: str):
     try:
-        fd = int(value)
-        if fd < 3:
-            raise ValueError(f"{description} descriptor must be at least 3")
-        os.fstat(fd)
-        return fd
+        return host_ipc.child_endpoint(value)
     except (OSError, ValueError) as error:
         raise ValueError(
             f"invalid {description} descriptor: {error}") from error

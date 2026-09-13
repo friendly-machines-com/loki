@@ -498,8 +498,8 @@ class Front:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=None,
                     close_fds=True,
-                    pass_fds=delegation.child_fds(),
                     env=self.environment,
+                    **delegation.child_spawn_kwargs(),
                     # ACP uses pipes, not a terminal. A new session prevents
                     # an inherited controlling terminal from becoming an
                     # escape channel through TIOCSTI or terminal signals.
