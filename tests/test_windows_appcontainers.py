@@ -2110,6 +2110,17 @@ class AppContainerTests(unittest.TestCase):
         one object at a time -- the file, then the directory -- and must fail
         the matching check, so a probe that denies nothing cannot pass. The
         file control is exactly the blind spot the old directory-only probe had.
+
+        The controls use read grants on purpose. The contained process is Low
+        integrity and the credential directory carries no label, so it is
+        implicitly Medium; mandatory no-write-up then refuses the container a
+        write right whatever the DACL grants (the tree logs both inputs, and
+        the escape probes record the same distinction). A granted create right
+        therefore cannot flip its check, and the write directions -- create,
+        write, append, delete, DACL, owner -- are live denials rather than
+        proof that the DACL alone would refuse. Read is not restricted upward,
+        so the file and directory read grants do flip their checks and are the
+        evidence that the probe answers a DACL grant at all.
         """
         native = AppContainers()
         details = native.token_details(include_groups=True)
@@ -2217,25 +2228,37 @@ class AppContainerTests(unittest.TestCase):
         self.assertEqual(failures(checks), set(), checks)
         self.assertEqual(code, 0, 'the protected gate did not pass')
 
-        # Directory still private, file opened to the package: only the old
-        # probe's blind spot can hide this, so it is the decisive control.
+        # Directory still private, file opened to the package for read: only
+        # the old probe's blind spot can hide this, so it is the decisive file
+        # control.
         code, checks = run(credential_tree(
             'file-open', file_ace='(A;;FR;;;%s)' % package))
         self.assertEqual(code, 1)
         self.assertEqual(failures(checks), {'credential file unreadable'},
                          checks)
 
-        # No file yet, directory opened for create: the absent-file path and
-        # the create denial are the two claims still under test.
+        # Directory opened to the package for read: the directory checks must
+        # answer a DACL grant too. Read, not create -- see the docstring; a
+        # granted create right cannot flip its check for a Low container on
+        # this implicitly Medium directory.
         code, checks = run(credential_tree(
-            'fresh', tokens=None, directory_ace='(A;;0x2;;;%s)' % package))
+            'directory-open', directory_ace='(A;;GR;;;%s)' % package))
         self.assertEqual(code, 1)
-        self.assertEqual(failures(checks), {'cannot create credentials'},
-                         checks)
+        self.assertEqual(failures(checks), {'credentials unlistable'}, checks)
+
+        # No credential file or lock yet, with no grant: the absent-file path
+        # is what this case exercises, and the directory's own denials stay.
+        code, checks = run(credential_tree('fresh', tokens=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(failures(checks), set(), checks)
         detail = {c['check']: c['detail'] for c in checks}.get(
             'credential file', '')
         self.assertIn('no credential file exists yet', detail,
                       'the absent-file path was not exercised: %r' % detail)
+        lock_detail = {c['check']: c['detail'] for c in checks}.get(
+            'credential lock', '')
+        self.assertIn('no credential lock exists yet', lock_detail,
+                      'the absent-lock path was not exercised: %r' % lock_detail)
 
     def test_same_user_containment(self):
         native = AppContainers()
