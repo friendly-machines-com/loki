@@ -55,6 +55,18 @@ class SignalTests(unittest.TestCase):
 
         self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
 
+    def test_a_forced_stop_maps_to_sigkill_without_naming_it(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+
+        host_process.signal_group(
+            proc, host_process.process_group(proc, proc.pid), host_process.FORCE)
+
+        self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
+
 
 if __name__ == "__main__":
     unittest.main()

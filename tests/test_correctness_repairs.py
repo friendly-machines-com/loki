@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import json
 import os
 import pathlib
@@ -497,6 +498,23 @@ class JobOwnershipContractTests(unittest.TestCase):
             result = asyncio.run(scenario(tmpdir))
         self.assertFalse(result["ok"])
         self.assertIn("timed_out", result["content"])
+
+    def test_a_signal_failure_is_not_reported_as_a_gone_process(self):
+        manager = loki.JobManager(
+            os.path.join(tempfile.gettempdir(), "loki-signal-audit"))
+        job = types.SimpleNamespace(
+            process=types.SimpleNamespace(returncode=None, pid=1), pgid=1)
+
+        with mock.patch.object(
+                loki.host_process, "signal_group",
+                side_effect=PermissionError(errno.EPERM, "denied")):
+            with self.assertRaises(PermissionError):
+                manager._signal_process_group(job, signal.SIGTERM)
+
+        with mock.patch.object(
+                loki.host_process, "signal_group",
+                side_effect=ProcessLookupError(errno.ESRCH, "gone")):
+            self.assertFalse(manager._signal_process_group(job, signal.SIGTERM))
 
     def test_a_failed_spawn_is_left_as_a_recorded_failed_job(self):
         async def scenario(tmpdir):
