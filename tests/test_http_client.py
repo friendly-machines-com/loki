@@ -622,7 +622,10 @@ class HttpClientRetryTests(unittest.TestCase):
         connector.open_connection = flaky_open
 
         with PatchedOpenConnection(connector):
-            start = time.monotonic()
+            # perf_counter, not monotonic: Windows monotonic() is tick-
+            # resolution (GetTickCount64, ~15.6 ms) and cannot measure a
+            # 50 ms bound.
+            start = time.perf_counter()
             response = asyncio.run(http_client.async_http_request(
                 "GET",
                 "https://example.test/",
@@ -633,7 +636,7 @@ class HttpClientRetryTests(unittest.TestCase):
                 retry_max_jitter_s=0.0,
                 retry_backoff_factor=2.0,
             ))
-            elapsed = time.monotonic() - start
+            elapsed = time.perf_counter() - start
 
         self.assertEqual(response.status, 200)
         self.assertEqual(response.body, b"hello")
