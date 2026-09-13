@@ -37,16 +37,15 @@ class PathTests(unittest.TestCase):
         )
 
     def test_credential_directory_falls_back_to_home_config_on_posix(self):
+        config_home = os.path.join("/home/tester", ".config")
         with mock.patch.object(sys, "platform", "linux"), \
                 mock.patch.object(
-                    os.path, "expanduser",
-                    return_value="/home/tester/.config"), \
+                    os.path, "expanduser", return_value=config_home), \
                 mock.patch.dict(
                     os.environ, {"HOME": "/home/tester"}, clear=True):
             self.assertEqual(
                 paths.credential_directory(),
-                os.path.join(
-                    "/home/tester", ".config", "loki", "credentials"),
+                os.path.join(config_home, "loki", "credentials"),
             )
 
     def test_credential_directory_uses_local_app_data_on_windows(self):

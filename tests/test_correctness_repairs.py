@@ -742,47 +742,38 @@ class TerminalEntrypointContractTests(unittest.TestCase):
             "/checkout/loki.py", ["--headless"])
 
     def test_internal_runtime_never_captures_root_credentials(self):
-        owner_read, owner_write = os.pipe()
-        capability_read, capability_write = os.pipe()
-        try:
-            with mock.patch.object(
+        with mock.patch.object(
+                terminal_entrypoint,
+                "capture_process_credentials") as capture, \
+                mock.patch.object(
                     terminal_entrypoint,
-                    "capture_process_credentials") as capture, \
-                    mock.patch.object(
-                        terminal_entrypoint,
-                        "isolate_credential_directory") as isolate, \
-                    mock.patch.object(
-                        terminal_entrypoint,
-                        "protect_credential_process") as protect, \
-                    mock.patch.object(
-                        terminal_frontend,
-                        "main",
-                        return_value=19) as terminal_main, \
-                    mock.patch.object(sys, "argv", [
-                        "/checkout/loki.py",
-                        "--runtime",
-                        "--session-owner-fd", str(owner_read),
-                        "--credential-capability-fd",
-                        str(capability_read),
-                        "--",
-                        "--headless",
-                    ]):
-                status = terminal_entrypoint.main()
+                    "isolate_credential_directory") as isolate, \
+                mock.patch.object(
+                    terminal_entrypoint,
+                    "protect_credential_process") as protect, \
+                mock.patch.object(
+                    terminal_entrypoint,
+                    "_terminal_runtime_arguments",
+                    return_value=(11, 12, ["--headless"])) as descriptors, \
+                mock.patch.object(
+                    terminal_frontend,
+                    "main",
+                    return_value=19) as terminal_main, \
+                mock.patch.object(
+                    sys, "argv", ["/checkout/loki.py", "--runtime"]):
+            status = terminal_entrypoint.main()
 
-            self.assertEqual(status, 19)
-            capture.assert_not_called()
-            protect.assert_called_once_with()
-            terminal_main.assert_called_once_with(
-                ["--headless"], owner_read, capability_read)
-            if os.name == "posix":
-                isolate.assert_called_once_with()
-            else:
-                self.windows_steps["verify_runtime"].assert_called_once_with()
-        finally:
-            os.close(owner_read)
-            os.close(owner_write)
-            os.close(capability_read)
-            os.close(capability_write)
+        self.assertEqual(status, 19)
+        capture.assert_not_called()
+        protect.assert_called_once_with()
+        # This is the routing contract: the descriptors the seam produced
+        # reach the frontend, and the runtime never captures root credentials.
+        descriptors.assert_called_once_with([])
+        terminal_main.assert_called_once_with(["--headless"], 11, 12)
+        if os.name == "posix":
+            isolate.assert_called_once_with()
+        else:
+            self.windows_steps["verify_runtime"].assert_called_once_with()
 
     def test_subagent_inherits_parent_isolation_and_never_captures(self):
         with mock.patch.object(
