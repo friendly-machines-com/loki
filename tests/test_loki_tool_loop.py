@@ -2369,10 +2369,12 @@ class ExitStatusTests(unittest.TestCase):
                 XDG_CONFIG_HOME=os.path.join(directory, "config"),
                 XDG_STATE_HOME=os.path.join(directory, "state"),
             )
-            configure_container(env, directory)
+            workspace = os.path.join(directory, "workspace")
+            os.makedirs(workspace)
+            configure_container(env, workspace)
             result = subprocess.run(
                 [entrypoint("loki"), "--headless"],
-                cwd=directory,
+                cwd=workspace,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

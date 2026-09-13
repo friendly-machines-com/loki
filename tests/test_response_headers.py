@@ -20,6 +20,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        self.workspace = os.path.join(self.directory.name, "workspace")
+        os.makedirs(self.workspace)
         self.path = os.path.join(self.directory.name, "headers.json")
         self.store = response_headers.Store(self.path)
 
@@ -279,6 +281,8 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        self.workspace = os.path.join(self.directory.name, "workspace")
+        os.makedirs(self.workspace)
         self.previous = loki._DEFAULT_SESSION
         self.session = Session(response_headers=response_headers.Store(
             os.path.join(self.directory.name, "headers.json")))
@@ -349,10 +353,10 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_BASE": url, "LOKI_MODEL": "test-model",
             "LOKI_API_KEY": "test-key-not-for-recording",
         })
-        configure_container(environment, self.directory.name)
+        configure_container(environment, self.workspace)
         child = await asyncio.create_subprocess_exec(
             entrypoint("loki"), "--headless", "--prompt", "Say ok",
-            cwd=self.directory.name, env=environment,
+            cwd=self.workspace, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         output, errors = await asyncio.wait_for(child.communicate(), 20)
         self.assertEqual(child.returncode, 0, errors.decode())
@@ -363,7 +367,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret-cookie", snapshot.read_text())
         child = await asyncio.create_subprocess_exec(
             entrypoint("loki"), "status", "--json",
-            cwd=self.directory.name, env=environment,
+            cwd=self.workspace, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         output, errors = await asyncio.wait_for(child.communicate(), 10)
         self.assertEqual(child.returncode, 0, errors.decode())
@@ -385,9 +389,9 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_BASE": url, "LOKI_MODEL": "test-model",
             "LOKI_API_KEY": "test-key",
         })
-        configure_container(environment, self.directory.name)
+        configure_container(environment, self.workspace)
         child = await asyncio.create_subprocess_exec(
-            entrypoint("loki-acp"), cwd=self.directory.name, env=environment,
+            entrypoint("loki-acp"), cwd=self.workspace, env=environment,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
 

@@ -229,7 +229,9 @@ class AuthenticationEntrypointTests(unittest.TestCase):
                 "LOKI_MODEL": "dummy-model",
             })
 
-            configure_container(environment, temporary)
+            workspace = os.path.join(temporary, "workspace")
+            os.makedirs(workspace)
+            configure_container(environment, workspace)
             terminal = subprocess.run(
                 [
                     entrypoint("loki"),
@@ -237,7 +239,7 @@ class AuthenticationEntrypointTests(unittest.TestCase):
                 ],
                 input="",
                 env=environment,
-                cwd=temporary,
+                cwd=workspace,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -248,7 +250,7 @@ class AuthenticationEntrypointTests(unittest.TestCase):
                 [entrypoint("loki-acp")],
                 input="",
                 env=environment,
-                cwd=temporary,
+                cwd=workspace,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

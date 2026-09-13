@@ -156,16 +156,18 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
                 'HOME': directory,
                 'XDG_CONFIG_HOME': str(Path(directory) / 'config'),
                 'XDG_STATE_HOME': str(Path(directory) / 'state'),
-                'LOKI_LOG_CONFIG': 'logging.ini',
+                'LOKI_LOG_CONFIG': str(Path(directory) / 'logging.ini'),
                 'LOKI_PROVIDER': 'dummy',
                 'LOKI_API_BASE': 'http://dummy.invalid/v1',
                 'LOKI_MODEL': 'dummy-model',
                 'LOKI_DUMMY_REPLY': 'logging test answer',
             })
-            configure_container(environment, directory)
+            workspace = os.path.join(directory, "workspace")
+            os.makedirs(workspace)
+            configure_container(environment, workspace)
             result = subprocess.run(
                 [entrypoint('loki'), '--headless', '--prompt', 'hello'],
-                cwd=directory, env=environment, capture_output=True,
+                cwd=workspace, env=environment, capture_output=True,
                 text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertGreaterEqual(len(list(Path(directory).glob('trace-*'))), 2)
