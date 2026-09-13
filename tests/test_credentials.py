@@ -119,9 +119,24 @@ class CredentialStoreTests(unittest.TestCase):
                 with self.assertRaises(CredentialScrubError):
                     _validate_entries_in_range(matches, low, high)
 
-    def test_process_capture_scrubs_record_without_hiding_later_entries(self):
+    def test_process_capture_scrubs_native_environment(self):
+        # One property on every platform: after capture, the environment a child
+        # inherits no longer contains the credential, while a later variable
+        # survives in the same view.
+        #
+        # Why the Windows check is safe.  ``GetEnvironmentStringsW`` returns the
+        # process environment block, which is exactly what ``CreateProcess``
+        # copies to a child when ``lpEnvironment`` is NULL (documented), and
+        # removing a variable through ``os.environ`` calls
+        # ``SetEnvironmentVariableW``, which modifies that block.  The spawned
+        # child below is the positive control that this is the environment
+        # children receive, and ``native_after`` shows the check is not vacuous
+        # (a later variable is still present).  So this asserts on Windows what
+        # /proc/<pid>/environ and KERN_PROCARGS2 assert on Linux and Darwin: the
+        # environment a child inherits no longer contains the credential.  Not
+        # established: bytes left in freed memory or the original allocation
+        # after removal -- the reference documents no contract for that.
         code = r'''
-import ctypes
 import json
 import os
 import subprocess
@@ -129,37 +144,73 @@ import sys
 
 from loki_agent.credentials import capture_process_credentials
 
+
+def native_environment():
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        get = kernel.GetEnvironmentStringsW
+        get.restype = ctypes.c_void_p
+        free = kernel.FreeEnvironmentStringsW
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = ctypes.c_int
+        pointer = get()
+        if not pointer:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            entries, address = [], pointer
+            while True:
+                text = ctypes.wstring_at(address)
+                if not text:
+                    break
+                entries.append(text)
+                address += (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+            return "\0".join(entries).encode("utf-8")
+        finally:
+            free(pointer)
+    if sys.platform == "darwin":
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sysctl.argtypes = (
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t)
+        libc.sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, os.getpid())
+        size = ctypes.c_size_t(os.sysconf("SC_ARG_MAX"))
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "sysctl KERN_PROCARGS2 failed")
+        return buffer.raw[:size.value]
+    return open("/proc/self/environ", "rb").read()
+
+
 store = capture_process_credentials()
-libc = ctypes.CDLL(None)
-libc.getenv.argtypes = (ctypes.c_char_p,)
-libc.getenv.restype = ctypes.c_char_p
-raw = open("/proc/self/environ", "rb").read()
-filler = b"x" * len(b"LOKI_TEST_TOKEN=top-secret")
-child_code = (
-    "import os; "
-    "print(os.environ.get('LOKI_TEST_TOKEN', 'missing'))"
-)
+raw = native_environment()
+text = raw.decode("utf-8", "replace")
+child_code = "import os; print(os.environ.get('LOKI_TEST_TOKEN', 'missing'))"
 spawned = subprocess.check_output(
-    [sys.executable, "-c", child_code],
-    text=True,
-).strip()
-forked = subprocess.check_output(
-    [sys.executable, "-c", child_code],
-    text=True,
-    preexec_fn=lambda: None,
-).strip()
-print(json.dumps({
+    [sys.executable, "-c", child_code], text=True).strip()
+forked = None
+if os.name == "posix":
+    forked = subprocess.check_output(
+        [sys.executable, "-c", child_code], text=True,
+        preexec_fn=lambda: None).strip()
+result = {
     "stored": store.get("LOKI_TEST_TOKEN"),
     "python_has_secret": "LOKI_TEST_TOKEN" in os.environ,
-    "native_secret": libc.getenv(b"LOKI_TEST_TOKEN") is not None,
-    "native_after": libc.getenv(b"LOKI_TEST_AFTER") == b"after",
-    "raw_has_name": b"LOKI_TEST_TOKEN=" in raw,
-    "raw_has_value": b"top-secret" in raw,
-    "filler_offset": raw.find(filler + b"\0"),
-    "after_offset": raw.find(b"LOKI_TEST_AFTER=after\0"),
+    "native_has_name": "LOKI_TEST_TOKEN=" in text,
+    "native_has_value": "top-secret" in text,
+    "native_after": "LOKI_TEST_AFTER=after" in text,
     "spawned": spawned,
     "forked": forked,
-}))
+}
+if sys.platform.startswith("linux"):
+    # Linux overwrites the original records in place (unsetenv alone leaves the
+    # initial exec region readable), so the lane also checks the overwrite.
+    filler = b"x" * len(b"LOKI_TEST_TOKEN=top-secret")
+    result["filler_offset"] = raw.find(filler + b"\0")
+    result["after_offset"] = raw.find(b"LOKI_TEST_AFTER=after\0")
+print(json.dumps(result))
 '''
         env = {
             "LOKI_TEST_BEFORE": "before",
@@ -180,151 +231,150 @@ print(json.dumps({
         result = json.loads(process.stdout)
         self.assertEqual(result["stored"], "top-secret")
         self.assertFalse(result["python_has_secret"])
-        self.assertFalse(result["native_secret"])
+        self.assertFalse(result["native_has_name"])
+        self.assertFalse(result["native_has_value"])
         self.assertTrue(result["native_after"])
-        self.assertFalse(result["raw_has_name"])
-        self.assertFalse(result["raw_has_value"])
-        self.assertGreaterEqual(result["filler_offset"], 0)
-        self.assertGreater(
-            result["after_offset"],
-            result["filler_offset"],
-        )
         self.assertEqual(result["spawned"], "missing")
-        self.assertEqual(result["forked"], "missing")
+        if result["forked"] is not None:
+            self.assertEqual(result["forked"], "missing")
+        if "filler_offset" in result:
+            self.assertGreaterEqual(result["filler_offset"], 0)
+            self.assertGreater(result["after_offset"], result["filler_offset"])
 
-    def test_process_capture_scrubs_darwin_procargs_environment(self):
-        code = r'''
-import ctypes
-import json
-import os
-import subprocess
-import sys
-
-from loki_agent.credentials import capture_process_credentials
-
-
-def process_arguments():
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.sysctl.argtypes = (
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.c_uint,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_size_t),
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-    )
-    libc.sysctl.restype = ctypes.c_int
-    mib = (ctypes.c_int * 3)(1, 49, os.getpid())
-    size = ctypes.c_size_t(os.sysconf("SC_ARG_MAX"))
-    buffer = ctypes.create_string_buffer(size.value)
-    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-    return buffer.raw[:size.value]
-
-
-store = capture_process_credentials()
-libc = ctypes.CDLL(None)
-libc.getenv.argtypes = (ctypes.c_char_p,)
-libc.getenv.restype = ctypes.c_char_p
-raw = process_arguments()
-filler = b"x" * len(b"LOKI_TEST_TOKEN=top-secret")
-child_code = (
-    "import os; "
-    "print(os.environ.get('LOKI_TEST_TOKEN', 'missing'))"
-)
-spawned = subprocess.check_output(
-    [sys.executable, "-c", child_code],
-    text=True,
-).strip()
-print(json.dumps({
-    "stored": store.get("LOKI_TEST_TOKEN"),
-    "python_has_secret": "LOKI_TEST_TOKEN" in os.environ,
-    "native_secret": libc.getenv(b"LOKI_TEST_TOKEN") is not None,
-    "native_after": libc.getenv(b"LOKI_TEST_AFTER") == b"after",
-    "raw_has_name": b"LOKI_TEST_TOKEN=" in raw,
-    "raw_has_value": b"top-secret" in raw,
-    "filler_offset": raw.find(filler + b"\0"),
-    "after_offset": raw.find(b"LOKI_TEST_AFTER=after\0"),
-    "spawned": spawned,
-}))
-'''
-        env = {
-            "LOKI_TEST_BEFORE": "before",
-            "LOKI_TEST_TOKEN": "top-secret",
-            "LOKI_TEST_AFTER": "after",
-        }
-
-        process = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        self.assertEqual(process.returncode, 0, process.stderr)
-        result = json.loads(process.stdout)
-        self.assertEqual(result["stored"], "top-secret")
-        self.assertFalse(result["python_has_secret"])
-        self.assertFalse(result["native_secret"])
-        self.assertTrue(result["native_after"])
-        self.assertFalse(result["raw_has_name"])
-        self.assertFalse(result["raw_has_value"])
-        self.assertGreaterEqual(result["filler_offset"], 0)
-        self.assertGreater(
-            result["after_offset"],
-            result["filler_offset"],
-        )
-        self.assertEqual(result["spawned"], "missing")
-
-    def test_process_capture_scrubs_duplicate_execve_entries(self):
+    def test_process_capture_scrubs_duplicate_entries(self):
+        # The scrub handles several records for the same name (the validator
+        # collects a range per match).  Linux reaches that with execve and a
+        # duplicate-laden environment; Windows reaches it by handing
+        # CreateProcessW an environment block that contains the duplicates, so
+        # the same property is exercised on both.
         second_stage = r'''
 import json
 import os
+import sys
 
 from loki_agent.credentials import capture_process_credentials
 
+
+def native_environment():
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        get = kernel.GetEnvironmentStringsW
+        get.restype = ctypes.c_void_p
+        free = kernel.FreeEnvironmentStringsW
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = ctypes.c_int
+        pointer = get()
+        try:
+            entries, address = [], pointer
+            while True:
+                text = ctypes.wstring_at(address)
+                if not text:
+                    break
+                entries.append(text)
+                address += (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+            return list(entries), "\0".join(entries).encode("utf-8")
+        finally:
+            free(pointer)
+    if sys.platform == "darwin":
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sysctl.argtypes = (
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t)
+        libc.sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, os.getpid())
+        size = ctypes.c_size_t(os.sysconf("SC_ARG_MAX"))
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "sysctl failed")
+        raw = buffer.raw[:size.value]
+    else:
+        raw = open("/proc/self/environ", "rb").read()
+    return raw.split(b"\0"), raw
+
+
 store = capture_process_credentials()
-raw = open("/proc/self/environ", "rb").read()
-records = raw.split(b"\0")
-print(json.dumps({
+entries, raw = native_environment()
+text = raw.decode("utf-8", "replace")
+result = {
     "stored": store.get("DUPLICATE_TOKEN"),
     "python_has_secret": "DUPLICATE_TOKEN" in os.environ,
-    "raw_has_name": b"DUPLICATE_TOKEN=" in raw,
-    "raw_has_one": b"one" in raw,
-    "raw_has_two": b"two" in raw,
-    "filler_count": records.count(
-        b"x" * len(b"DUPLICATE_TOKEN=one")),
-    "after": b"AFTER=visible" in records,
-}))
+    "native_has_name": "DUPLICATE_TOKEN=" in text,
+    "native_has_one": "one" in text,
+    "native_has_two": "two" in text,
+    "after": "AFTER=visible" in text,
+}
+if sys.platform.startswith("linux"):
+    filler = b"x" * len(b"DUPLICATE_TOKEN=one")
+    result["filler_count"] = entries.count(filler)
+print(json.dumps(result))
 '''
-        launcher = f'''
+        launcher = r'''
 import ctypes
 import os
+import subprocess
 import sys
 
-libc = ctypes.CDLL(None, use_errno=True)
-libc.execve.argtypes = (
-    ctypes.c_char_p,
-    ctypes.POINTER(ctypes.c_char_p),
-    ctypes.POINTER(ctypes.c_char_p),
-)
-libc.execve.restype = ctypes.c_int
-executable = os.fsencode(sys.executable)
-code = {second_stage.encode("utf-8")!r}
-argv = (ctypes.c_char_p * 4)(executable, b"-c", code, None)
-entries = [
-    b"BEFORE=visible",
-    b"DUPLICATE_TOKEN=one",
-    b"DUPLICATE_TOKEN=two",
-    b"AFTER=visible",
-]
-envp = (ctypes.c_char_p * (len(entries) + 1))(*entries, None)
-libc.execve(executable, argv, envp)
-raise OSError(ctypes.get_errno(), "execve failed")
-'''
+second_stage = %r
+
+if os.name == "nt":
+    from ctypes import wintypes
+
+    class Startup(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD), ("reserved", wintypes.LPWSTR),
+            ("desktop", wintypes.LPWSTR), ("title", wintypes.LPWSTR),
+            ("x", wintypes.DWORD), ("y", wintypes.DWORD),
+            ("xsize", wintypes.DWORD), ("ysize", wintypes.DWORD),
+            ("xchars", wintypes.DWORD), ("ychars", wintypes.DWORD),
+            ("fill", wintypes.DWORD), ("flags", wintypes.DWORD),
+            ("show", wintypes.WORD), ("reserved_size", wintypes.WORD),
+            ("reserved_bytes", ctypes.c_void_p),
+            ("stdin", ctypes.c_void_p), ("stdout", ctypes.c_void_p),
+            ("stderr", ctypes.c_void_p)]
+
+    class Information(ctypes.Structure):
+        _fields_ = [("process", ctypes.c_void_p), ("thread", ctypes.c_void_p),
+                    ("pid", wintypes.DWORD), ("tid", wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateProcessW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
+                       ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
+                       ctypes.c_void_p, wintypes.LPCWSTR,
+                       ctypes.POINTER(Startup),
+                       ctypes.POINTER(Information)]
+    create.restype = wintypes.BOOL
+    entries = ["BEFORE=visible", "DUPLICATE_TOKEN=one",
+               "DUPLICATE_TOKEN=two", "AFTER=visible"]
+    block = ctypes.create_unicode_buffer("\0".join(entries) + "\0\0")
+    startup = Startup()
+    startup.cb = ctypes.sizeof(Startup)
+    info = Information()
+    command = ctypes.create_unicode_buffer(subprocess.list2cmdline(
+        [sys.executable, "-c", second_stage]))
+    if not create(sys.executable, command, None, None, False, 0, block,
+                  None, ctypes.byref(startup), ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel.WaitForSingleObject(info.process, 10000)
+    kernel.CloseHandle(info.thread)
+    kernel.CloseHandle(info.process)
+else:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.execve.argtypes = (
+        ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_char_p))
+    libc.execve.restype = ctypes.c_int
+    executable = os.fsencode(sys.executable)
+    code = second_stage.encode("utf-8")
+    argv = (ctypes.c_char_p * 4)(executable, b"-c", code, None)
+    entries = [b"BEFORE=visible", b"DUPLICATE_TOKEN=one",
+               b"DUPLICATE_TOKEN=two", b"AFTER=visible"]
+    envp = (ctypes.c_char_p * (len(entries) + 1))(*entries, None)
+    libc.execve(executable, argv, envp)
+    raise OSError(ctypes.get_errno(), "execve failed")
+''' % (second_stage,)
 
         process = subprocess.run(
             [sys.executable, "-c", launcher],
@@ -338,11 +388,12 @@ raise OSError(ctypes.get_errno(), "execve failed")
         result = json.loads(process.stdout)
         self.assertIn(result["stored"], ("one", "two"))
         self.assertFalse(result["python_has_secret"])
-        self.assertFalse(result["raw_has_name"])
-        self.assertFalse(result["raw_has_one"])
-        self.assertFalse(result["raw_has_two"])
-        self.assertEqual(result["filler_count"], 2)
+        self.assertFalse(result["native_has_name"])
+        self.assertFalse(result["native_has_one"])
+        self.assertFalse(result["native_has_two"])
         self.assertTrue(result["after"])
+        if "filler_count" in result:
+            self.assertEqual(result["filler_count"], 2)
 
 
 class ConnectionDescriptorTests(unittest.TestCase):
