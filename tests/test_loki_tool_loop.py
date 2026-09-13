@@ -14,6 +14,7 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from loki_entrypoints import child_environment, entrypoint
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 
@@ -2360,15 +2361,14 @@ class SubscriptionResumeTests(unittest.TestCase):
 
 class ExitStatusTests(unittest.TestCase):
     def test_executable_entry_point_propagates_headless_failure(self):
-        root = pathlib.Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
-            env = {
-                "HOME": directory,
-                "PATH": os.environ.get("PATH", ""),
-                "TERM": "dumb",
-            }
+            env = child_environment(
+                HOME=directory,
+                PATH=os.environ.get("PATH", ""),
+                TERM="dumb",
+            )
             result = subprocess.run(
-                [str(root / "loki.py"), "--headless"],
+                [entrypoint("loki"), "--headless"],
                 cwd=directory,
                 env=env,
                 stdout=subprocess.PIPE,

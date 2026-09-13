@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from loki_entrypoints import entrypoint
 from response_header_fixtures import isolated_response_headers
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
@@ -339,7 +340,6 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
             b"X-Remaining: 12\r\nSet-Cookie: secret-cookie\r\nContent-Length: "
             + str(len(body)).encode() + b"\r\n\r\n" + body])
-        root = Path(__file__).resolve().parents[1]
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith("LOKI_")
                        and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
@@ -350,7 +350,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_KEY": "test-key-not-for-recording",
         })
         child = await asyncio.create_subprocess_exec(
-            str(root / "loki.py"), "--headless", "--prompt", "Say ok",
+            entrypoint("loki"), "--headless", "--prompt", "Say ok",
             cwd=self.directory.name, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         output, errors = await asyncio.wait_for(child.communicate(), 20)
@@ -361,7 +361,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("test-key-not-for-recording", snapshot.read_text())
         self.assertNotIn("secret-cookie", snapshot.read_text())
         child = await asyncio.create_subprocess_exec(
-            str(root / "loki.py"), "status", "--json",
+            entrypoint("loki"), "status", "--json",
             cwd=self.directory.name, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         output, errors = await asyncio.wait_for(child.communicate(), 10)
@@ -375,7 +375,6 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
             b"X-Remaining: 11\r\nContent-Length: "
             + str(len(body)).encode() + b"\r\n\r\n" + body])
-        root = Path(__file__).resolve().parents[1]
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith("LOKI_")
                        and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
@@ -386,7 +385,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_KEY": "test-key",
         })
         child = await asyncio.create_subprocess_exec(
-            str(root / "loki-acp"), cwd=self.directory.name, env=environment,
+            entrypoint("loki-acp"), cwd=self.directory.name, env=environment,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
 

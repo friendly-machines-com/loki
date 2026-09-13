@@ -42,6 +42,13 @@ jobs:
         pip install flake8
         pip install vulture
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Install the package for its console entrypoints (Windows)
+      # The end-to-end tests launch the sanctioned entrypoints. On Windows that
+      # is the console script pip writes from [project.scripts] -- loki.exe and
+      # loki-acp.exe -- so the checkout scripts are never run through an
+      # interpreter, which would test the module rather than the entrypoint.
+      if: runner.os == 'Windows'
+      run: python -m pip install -e .
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
