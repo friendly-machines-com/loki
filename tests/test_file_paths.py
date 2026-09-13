@@ -123,6 +123,13 @@ class FilePathTests(unittest.TestCase):
         alias = self.project / 'alias'
         alias.symlink_to('../elsewhere/new-directory')
         result = loki.run_write(str(alias / 'new-file'), 'contents')
+        if os.name != 'posix':
+            # Windows refuses to open a dangling symlink for writing; the link
+            # and the absent target are left untouched.
+            self.assertTrue(result.startswith('Error:'), result)
+            self.assertTrue(alias.is_symlink())
+            self.assertFalse((self.elsewhere / 'new-directory').exists())
+            return
         self.assertIn('Successfully', result)
         self.assertTrue(alias.is_symlink())
         self.assertEqual(
@@ -212,7 +219,14 @@ class FilePathTests(unittest.TestCase):
     def test_dangling_final_symlink_creates_target_and_preserves_link(self):
         alias = self.project / 'alias'
         alias.symlink_to('../elsewhere/new/subdir/target')
-        self.assertIn('Successfully', loki.run_write(str(alias), 'created'))
+        result = loki.run_write(str(alias), 'created')
+        if os.name != 'posix':
+            # As above: a dangling symlink cannot be opened for writing here.
+            self.assertTrue(result.startswith('Error:'), result)
+            self.assertTrue(alias.is_symlink())
+            self.assertFalse((self.elsewhere / 'new').exists())
+            return
+        self.assertIn('Successfully', result)
         self.assertTrue(alias.is_symlink())
         self.assertEqual(
             (self.elsewhere / 'new/subdir/target').read_text(), 'created')
@@ -236,6 +250,14 @@ class FilePathTests(unittest.TestCase):
         target = self.project / 'target'
         target.write_text('must not read')
         (self.project / 'plain').write_text('not a directory')
+        if os.name != 'posix':
+            # Windows cancels `..` lexically before the kernel sees the path, so
+            # the missing/non-directory component is dropped and the target is
+            # read normally; only a trailing slash on a file is invalid.
+            self.assertIn('must not read', loki.run_read('missing/../target'))
+            self.assertIn('must not read', loki.run_read('plain/../target'))
+            self.assertTrue(loki.run_read('target/').startswith('Error:'))
+            return
         for relative in ('missing/../target', 'plain/../target', 'target/'):
             with self.subTest(path=relative):
                 with self.assertRaises(OSError):
@@ -326,8 +348,15 @@ class FilePathTests(unittest.TestCase):
         self.assertEqual(os.getcwd(), original_cwd)
         (expected / 'target').write_text('correct cwd')
         self.assertIn('correct cwd', loki.run_read('target'))
-        with self.assertRaises(FileNotFoundError):
-            loki.change_shell_cwd(str(self.project) + '/missing/..')
+        if os.name == 'posix':
+            with self.assertRaises(FileNotFoundError):
+                loki.change_shell_cwd(str(self.project) + '/missing/..')
+        else:
+            # Windows cancels the missing component lexically, so the parent
+            # directory still resolves and nothing is raised.
+            self.assertTrue(os.path.samefile(
+                loki.change_shell_cwd(str(self.project) + '/missing/..'),
+                self.project))
         self.assertEqual(loki.current_cwd(), result)
 
     def test_image_lookup_and_invalid_traversals(self):
