@@ -78,13 +78,17 @@ def open_terminal_stdin() -> int:
     Reopening /dev/tty as fd 0 gives reads a fresh open file description
     whose status flags are independent of stdout's.
 
+    Windows has neither the shared-open-description problem nor /dev/tty:
+    the console input handle is already fd 0, reads go through the handle
+    reader, and nothing sets it non-blocking, so fd 0 is left alone.
+
     The terminal front-end calls this when it starts reading keys.
     Importing this module never touches fd 0: headless and ACP processes
     read stdin themselves and must not have it swapped under them.
     Without a controlling tty this is a no-op returning fd 0.
     """
     global new_stdin
-    if not os.isatty(0):
+    if os.name != "posix" or not os.isatty(0):
         new_stdin = 0
         return new_stdin
     sys.stdin.close()
