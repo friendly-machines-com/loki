@@ -117,62 +117,88 @@ def probe_containment(workspace: str) -> list[Check]:
     return checks
 
 
-# The directions the credential *file* must refuse, beyond the read that also
+# The directions the credential *directory* must refuse.  Listing and creating
+# are the entry checks; delete, DACL and owner are the mutations, which matter
+# because a container that could delete the directory or rewrite its DACL would
+# defeat the store without ever reading a token.
+_CREDENTIAL_DIRECTORY_PROBES = (
+    ("credentials unlistable", windows_api.GENERIC_READ,
+     "listing the credential directory is denied"),
+    # Creating an entry is the claim that still holds on a fresh install, when
+    # there is no credential file to open.  A directory's FILE_WRITE_DATA is
+    # FILE_ADD_FILE, so the open tests create rights without creating anything.
+    ("cannot create credentials", windows_api.FILE_WRITE_DATA,
+     "creating an entry in the credential directory is denied"),
+    ("credential directory not deletable", windows_api.DELETE,
+     "the credential directory cannot be opened to delete it"),
+    ("credential directory DACL not rewritable", windows_api.WRITE_DAC,
+     "the credential directory cannot be opened to rewrite its DACL"),
+    ("credential directory owner not rewritable", windows_api.WRITE_OWNER,
+     "the credential directory cannot be opened to change its owner"),
+)
+
+# The directions each credential *file* must refuse, beyond the read that also
 # detects whether it exists.  Opening and closing without using the handle
 # cannot write, truncate, delete or re-own anything: the access check happens
 # at open, so each entry measures permission without performing the act.
-CREDENTIAL_FILE_PROBES = (
-    ("credential file not writable", windows_api.GENERIC_WRITE,
-     "the credential file cannot be opened for write"),
-    ("credential file not appendable", windows_api.FILE_APPEND_DATA,
-     "the credential file cannot be opened for append"),
-    ("credential file not deletable", windows_api.DELETE,
-     "the credential file cannot be opened to delete it"),
-    ("credential file DACL not rewritable", windows_api.WRITE_DAC,
-     "the credential file cannot be opened to rewrite its DACL"),
-    ("credential file owner not rewritable", windows_api.WRITE_OWNER,
-     "the credential file cannot be opened to change its owner"),
+_CREDENTIAL_FILE_PROBES = (
+    ("not writable", windows_api.GENERIC_WRITE,
+     "cannot be opened for write"),
+    ("not appendable", windows_api.FILE_APPEND_DATA,
+     "cannot be opened for append"),
+    ("not deletable", windows_api.DELETE,
+     "cannot be opened to delete it"),
+    ("DACL not rewritable", windows_api.WRITE_DAC,
+     "cannot be opened to rewrite its DACL"),
+    ("owner not rewritable", windows_api.WRITE_OWNER,
+     "cannot be opened to change its owner"),
+)
+
+# Both files the storage uses, not just the JSON: the lock is a different
+# object with its own DACL, and a container that can write or delete it can
+# interfere with the read-modify-write transaction even without reading a token.
+_CREDENTIAL_FILES = (
+    (paths.CREDENTIAL_FILE_NAME, "credential file"),
+    (paths.CREDENTIAL_LOCK_FILE_NAME, "credential lock"),
 )
 
 
 def _credential_checks() -> list[Check]:
-    """Denials for the credential directory and the file that holds the token.
+    """Denials for the credential directory and the files it holds.
 
-    The directory and the file are different objects with different access
+    The directory and each file are different objects with different access
     checks, so listing the directory says nothing about reading ``tokens.json``;
-    the file itself is opened for each direction Windows.md measured.  Opening
-    the real path is also what governs a read through a workspace hard link or
+    every object is opened for each right the gate must refuse.  Opening the
+    real path is also what governs a read through a workspace hard link or
     junction: the target file's DACL is checked, not the path's.
     """
     directory = paths.credential_directory()
-    checks = [
-        _denied("credentials unlistable", directory,
-                windows_api.GENERIC_READ,
-                "listing the credential directory is denied"),
-        # Creating an entry is the claim that still holds on a fresh install,
-        # when there is no credential file to open.  A directory's
-        # FILE_WRITE_DATA is FILE_ADD_FILE, so the open tests create rights
-        # without creating anything.
-        _denied("cannot create credentials", directory,
-                windows_api.FILE_WRITE_DATA,
-                "creating an entry in the credential directory is denied"),
-    ]
-    asset = os.path.join(directory, paths.CREDENTIAL_FILE_NAME)
+    checks = [_denied(name, directory, access, description)
+              for name, access, description in _CREDENTIAL_DIRECTORY_PROBES]
+    for file_name, label in _CREDENTIAL_FILES:
+        checks.extend(_credential_file_checks(
+            os.path.join(directory, file_name), label))
+    return checks
+
+
+def _credential_file_checks(asset: str, label: str) -> list[Check]:
+    """Denials for one credential file, or a pass when it does not exist yet."""
     error = _attempt(asset, windows_api.GENERIC_READ)
     if error is not None and error.status in (
             windows_api.ERROR_FILE_NOT_FOUND,
             windows_api.ERROR_PATH_NOT_FOUND):
         # Nothing to leak, and the directory refuses to let the container make
         # one; the per-direction denials have no object to test.
-        checks.append(Check(
-            "credential file", "pass",
-            "no credential file exists yet; creating one is denied"))
-        return checks
-    checks.append(_denied_from(
-        "credential file unreadable", error,
-        "the credential file cannot be opened for read"))
-    for name, access, description in CREDENTIAL_FILE_PROBES:
-        checks.append(_denied(name, asset, access, description))
+        return [Check(
+            label, "pass",
+            f"no {label} exists yet; creating one is denied")]
+    checks = [_denied_from(
+        f"{label} unreadable", error,
+        f"the {label} cannot be opened for read")]
+    for suffix, access, description in _CREDENTIAL_FILE_PROBES:
+        checks.append(_denied(
+            f"{label} {suffix}", asset, access,
+            f"the {label} {description}"))
     return checks
 
 
