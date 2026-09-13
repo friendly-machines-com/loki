@@ -565,16 +565,67 @@ def run_editor(workspace: str, ledger: dict, backend: Backend) -> int:
     return editor.status
 
 
+EXPLORER_KEY = r"Software\Classes\Directory\shell\LokiSetup"
+EXPLORER_LABEL = "Loki: configure container here..."
+
+
+def register_explorer_hook(executable: str) -> str:
+    """Register the per-user Explorer verb that opens this editor on a folder.
+
+    HKCU only: no elevation and no machine-wide effect.
+    """
+    import winreg
+
+    with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, EXPLORER_KEY, 0,
+            winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, EXPLORER_LABEL)
+        winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, executable)
+    with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, EXPLORER_KEY + r"\command", 0,
+            winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(
+            key, None, 0, winreg.REG_SZ, f'"{executable}" --edit "%V"')
+    return EXPLORER_KEY
+
+
+def first_run() -> int:
+    """No arguments: install the Explorer entry, explain it, then edit.
+
+    Windows has no shebang and no shell entry for this tool, so the first run
+    has to create its own way to be invoked on a workspace.
+    """
+    try:
+        register_explorer_hook(sys.executable)
+    except OSError as error:
+        print(f"loki-setup: could not register the Explorer entry: {error}",
+              file=sys.stderr)
+        return 2
+    tk, _filedialog, messagebox = _tk()
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showinfo(
+        "Loki",
+        f"Loki added \"{EXPLORER_LABEL}\" to the folder right-click menu."
+        "\n\nCreate a directory to use as a workspace, right-click it, and "
+        "choose that entry. The editor then chooses which directories that "
+        "workspace shares with the model connected to Loki.")
+    root.destroy()
+    ledger = load_ledger()
+    return run_editor(os.path.expanduser("~"), ledger, backend_for(ledger))
+
+
 # -- command line --------------------------------------------------------
 
 USAGE = (
     "usage: loki-setup [--edit [WORKSPACE]] [--configure WORKSPACE] "
     "[--verify WORKSPACE] [--list] [--uninstall]\n"
     "\n"
-    "Windows-only container setup for Loki. --configure applies the same plan\n"
-    "the editor would, without the editor; --edit opens the Tk editor. Grants\n"
-    "are a setup-time property; there is no way to widen a container from a\n"
-    "running session.\n"
+    "Windows-only container setup for Loki. With no arguments it registers\n"
+    "the folder right-click entry and opens the editor. --configure applies\n"
+    "the same plan the editor would, without the editor; --edit opens the Tk\n"
+    "editor. Grants are a setup-time property; there is no way to widen a\n"
+    "container from a running session.\n"
 )
 
 
@@ -592,9 +643,11 @@ def main(argv: list[str] | None = None) -> int:
         print("loki-setup: the Windows setup editor runs on Windows only",
               file=sys.stderr)
         return 2
-    if not arguments or arguments[0] in ("-h", "--help"):
+    if arguments and arguments[0] in ("-h", "--help"):
         print(USAGE, end="")
         return 0
+    if not arguments:
+        return first_run()
     mode, rest = arguments[0], arguments[1:]
     ledger = load_ledger()
     if mode == "--list":
