@@ -407,6 +407,55 @@ class AppContainerLaunchTests(unittest.TestCase):
             [windows_api.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
              windows_api.PROC_THREAD_ATTRIBUTE_HANDLE_LIST])
 
+    def test_pseudoconsole_adds_a_third_attribute(self):
+        seen = {"attributes": [], "counts": []}
+
+        def convert_sid(string_sid, out):
+            ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 0xABCD
+            return True
+
+        def initialize(attribute_list, count, flags, size):
+            seen["counts"].append(count)
+            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = 256
+            return attribute_list is not None
+
+        def update(attribute_list, flags, attribute, value, size, previous,
+                   returned):
+            seen["attributes"].append((flags, attribute))
+            return True
+
+        def create(application, command_line, process_attributes,
+                   thread_attributes, inherit, flags, environment, directory,
+                   startup, information):
+            return True
+
+        fakes = {
+            "ConvertStringSidToSidW": convert_sid,
+            "LocalFree": lambda pointer: None,
+            "InitializeProcThreadAttributeList": initialize,
+            "UpdateProcThreadAttribute": update,
+            "DeleteProcThreadAttributeList": lambda attribute_list: None,
+            "CreateProcessW": create,
+        }
+        with mock.patch.object(
+                windows_api, "bind",
+                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
+                mock.patch.object(
+                    windows_api, "drive_environment_entries",
+                    return_value=[]):
+            windows_api.create_process_in_app_container(
+                "loki.exe", ["--runtime"], "S-1-15-2-1",
+                inherited_handles=[0x11], pseudoconsole=0x1234)
+
+        self.assertEqual(seen["counts"], [3, 3],
+                         "the list is sized for the package SID, the handle "
+                         "list and the pseudoconsole")
+        self.assertEqual(
+            [attribute for _, attribute in seen["attributes"]],
+            [windows_api.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+             windows_api.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+             windows_api.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE])
+
     def test_environment_block_carries_the_drive_entries_first(self):
         seen = {}
 

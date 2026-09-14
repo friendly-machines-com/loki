@@ -530,6 +530,9 @@ EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 # tests/test_windows_appcontainers.py passes 0x20002 and 0x20009.
 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
 PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
+# The attribute value is the HPCON itself, and the pseudoconsole then supplies
+# the child's standard handles.
+PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 
 # File access for the containment probe.  The probe *asks* for rights it must be
 # denied and treats the refusal as the pass; it never reads or writes.
@@ -786,7 +789,7 @@ def drive_environment_entries() -> list:
 def create_process_in_app_container(executable, arguments, package_sid,
                                     current_directory=None,
                                     inherited_handles=None, environment=None,
-                                    standard_handles=None):
+                                    standard_handles=None, pseudoconsole=None):
     """Create ``executable`` suspended inside the AppContainer ``package_sid``.
 
     ``package_sid`` is the package SID in string form, as
@@ -794,6 +797,8 @@ def create_process_in_app_container(executable, arguments, package_sid,
     since this does not create a profile or change a DACL. ``inherited_handles`` are
     the handles the child must receive, passed explicitly through
     ``PROC_THREAD_ATTRIBUTE_HANDLE_LIST`` with inheritance otherwise off.
+    ``pseudoconsole`` attaches the child to an existing ``HPCON`` (ConPTY), which
+    then supplies its standard handles in place of the caller's console.
 
     The child is left suspended, so the caller can inspect its token and then
     resume or terminate it.  The returned :class:`ProcessInformation` owns the
@@ -823,9 +828,11 @@ def create_process_in_app_container(executable, arguments, package_sid,
     if not convert_sid(package_sid, ctypes.byref(sid)):
         raise WindowsApiError(f"ConvertStringSidToSidW({package_sid!r}) failed")
     # The list must be sized for every attribute it will receive: one for the
-    # package SID, plus one when handles are inherited.  Sizing it for one and
-    # then adding two makes the second UpdateProcThreadAttribute fail.
-    attribute_count = 1 + (1 if inherited_handles else 0)
+    # package SID, plus one when handles are inherited, plus one when the child
+    # is attached to a pseudoconsole.  Sizing it for fewer and then adding more
+    # makes the extra UpdateProcThreadAttribute fail.
+    attribute_count = 1 + (1 if inherited_handles else 0) + (
+        1 if pseudoconsole is not None else 0)
     size = ctypes.c_size_t()
     attribute_list = None
     initialized = False
@@ -858,6 +865,16 @@ def create_process_in_app_container(executable, arguments, package_sid,
                           ctypes.sizeof(handle_array), None, None):
                 raise WindowsApiError(
                     "UpdateProcThreadAttribute(HANDLE_LIST) failed")
+        if pseudoconsole is not None:
+            # The value is the HPCON itself; the pseudoconsole then supplies the
+            # child's standard handles, so STARTF_USESTDHANDLES is not set.
+            hpcon = ctypes.c_void_p(pseudoconsole)
+            if not update(attribute_list, 0,
+                          PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                          ctypes.byref(hpcon), ctypes.sizeof(hpcon),
+                          None, None):
+                raise WindowsApiError(
+                    "UpdateProcThreadAttribute(PSEUDOCONSOLE) failed")
 
         startup = StartupInfoEx()
         startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
