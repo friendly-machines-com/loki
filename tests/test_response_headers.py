@@ -219,7 +219,10 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         entry = response_headers.Store(self.path).snapshot()["endpoints"][0]
         self.assertEqual(entry["headers"]["x-remaining"]["value"], "9")
         self.assertEqual(entry["headers"]["x-reset"]["value"], "soon")
-        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        if os.name == "posix":
+            # Windows has no POSIX permission bits; privacy there is the
+            # directory DACL, and the synthesised mode is 0o666.
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
         before = os.stat(self.path)
         await self.store.save()
         after = os.stat(self.path)
@@ -253,8 +256,18 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         await self.store.save()
         original = Path(self.path).read_bytes()
         self.observe(headers={"x-remaining": "5"})
-        with mock.patch.object(response_headers.os, "replace",
-                               side_effect=OSError("disk unavailable")):
+        # The publish goes through the platform seam: POSIX ends at
+        # os.replace, Windows at the retained-directory rename, so patch
+        # whichever one this platform actually uses.
+        if os.name == "posix":
+            publish = mock.patch.object(
+                response_headers.os, "replace",
+                side_effect=OSError("disk unavailable"))
+        else:
+            publish = mock.patch.object(
+                response_headers.private_files, "replace_at",
+                side_effect=OSError("disk unavailable"))
+        with publish:
             with self.assertRaises(OSError):
                 await self.store.save()
         self.assertEqual(Path(self.path).read_bytes(), original)
