@@ -140,12 +140,18 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
 
     def test_real_headless_supervisor_and_runtime_load_ini(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / 'logging.ini'
+            # The contained runtime reads this config and writes the trace it
+            # names, so both live inside the granted workspace.  The temp root
+            # is created private (0o700, honoured on Windows), which carries no
+            # package ACE and so is invisible to the container.
+            workspace = os.path.join(directory, "workspace")
+            os.makedirs(workspace)
+            config = Path(workspace) / 'logging.ini'
+            trace = str(Path(workspace) / 'trace')
             # Per-process files prove configuration in both execed processes.
-            text = CONFIG.format(path=str(Path(directory) / 'trace')).replace(
-                repr(str(Path(directory) / 'trace')),
-                repr(str(Path(directory) / 'trace-'))
-                + " + str(__import__('os').getpid())")
+            text = CONFIG.format(path=trace).replace(
+                repr(trace),
+                repr(trace + '-') + " + str(__import__('os').getpid())")
             config.write_text(text)
             environment = {
                 key: value for key, value in os.environ.items()
@@ -156,21 +162,20 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
                 'HOME': directory,
                 'XDG_CONFIG_HOME': str(Path(directory) / 'config'),
                 'XDG_STATE_HOME': str(Path(directory) / 'state'),
-                'LOKI_LOG_CONFIG': str(Path(directory) / 'logging.ini'),
+                'LOKI_LOG_CONFIG': str(config),
                 'LOKI_PROVIDER': 'dummy',
                 'LOKI_API_BASE': 'http://dummy.invalid/v1',
                 'LOKI_MODEL': 'dummy-model',
                 'LOKI_DUMMY_REPLY': 'logging test answer',
             })
-            workspace = os.path.join(directory, "workspace")
-            os.makedirs(workspace)
             configure_container(environment, workspace)
             result = subprocess.run(
                 [entrypoint('loki'), '--headless', '--prompt', 'hello'],
                 cwd=workspace, env=environment, capture_output=True,
                 text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertGreaterEqual(len(list(Path(directory).glob('trace-*'))), 2)
+            self.assertGreaterEqual(
+                len(list(Path(workspace).glob('trace-*'))), 2)
 
     def test_relative_filename_is_preserved_in_environment_snapshot(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
