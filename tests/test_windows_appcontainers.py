@@ -348,7 +348,7 @@ class AppContainers(NativeCalls):
         return bytes(data)
 
     def launch(self, command, sid, workspace, output, observe=None,
-               deadline=None, extra_handles=()):
+               deadline=None, extra_handles=(), stdio=None):
         """Run one contained child under one monotonic budget.
 
         The deadline is fixed before the observer runs--an explicit one, or
@@ -374,8 +374,19 @@ class AppContainers(NativeCalls):
             limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             self.check(self.set_job(job, 9, C.byref(limits), C.sizeof(limits)))
             with open(output, 'wb', buffering=0) as log, open(os.devnull, 'rb') as null:
-                inherited = (msvcrt.get_osfhandle(log.fileno()),
-                             msvcrt.get_osfhandle(null.fileno()),
+                log_handle = msvcrt.get_osfhandle(log.fileno())
+                null_handle = msvcrt.get_osfhandle(null.fileno())
+                # stderr always goes to the log.  stdin/stdout default to the
+                # null device and the log; a caller-supplied (stdin, stdout)
+                # pair replaces them and is added to the handle list, so the
+                # child's fd 0 and fd 1 are those pipe ends.
+                if stdio is None:
+                    child_stdin, child_stdout, stdio_handles = (
+                        null_handle, log_handle, ())
+                else:
+                    child_stdin, child_stdout = stdio
+                    stdio_handles = tuple(stdio)
+                inherited = (log_handle, null_handle, *stdio_handles,
                              *extra_handles)
                 handles = (HANDLE * len(inherited))(*inherited)
                 os.set_handle_inheritable(handles[0], True)
@@ -386,9 +397,9 @@ class AppContainers(NativeCalls):
                     startup = ExtendedStartups()
                     startup.startup.cb = C.sizeof(startup)
                     startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
-                    startup.startup.stdin = handles[1]
-                    startup.startup.stdout = handles[0]
-                    startup.startup.stderr = handles[0]
+                    startup.startup.stdin = child_stdin
+                    startup.startup.stdout = child_stdout
+                    startup.startup.stderr = log_handle
                     startup.attributes = C.cast(attributes, HANDLE)
                     text = C.create_unicode_buffer(subprocess.list2cmdline(command))
                     # Start suspended: no target code executes before assignment
@@ -563,6 +574,21 @@ def pipe_child(read_handle, write_handle):
     return 0
 
 
+def stdio_child():
+    """Contained half of the pipe-as-stdio experiment.
+
+    Launched with pipe ends as its stdio, so it reads fd 0 and writes fd 1
+    directly rather than opening a handle number handed over in argv."""
+    data = bytearray()
+    while len(data) < 32:
+        chunk = os.read(0, 32 - len(data))
+        if not chunk:
+            raise RuntimeError('stdio closed before the nonce arrived')
+        data.extend(chunk)
+    os.write(1, b'child:' + bytes(data))
+    return 0
+
+
 def pipe_inheritance_probe(native, sid, workspace, output):
     """Confirm an AppContainer child can use inherited anonymous pipe ends.
 
@@ -603,6 +629,45 @@ def pipe_inheritance_probe(native, sid, workspace, output):
     finally:
         for handle in (request_read, request_write,
                        response_read, response_write):
+            native.check(native.close(handle))
+
+
+def pipe_stdio_probe(native, sid, workspace, output):
+    """Confirm pipe handles can be an AppContainer child's stdio.
+
+    The sibling probe hands the two ends over in the child's handle list and
+    lets it open them itself.  This one hands them over as
+    ``STARTF_USESTDHANDLES``, so the child's fd 0 and fd 1 *are* the pipes.  The
+    ACP worker reads fd 0 and writes fd 1, so the front/worker transport depends
+    on this form, not on the other one."""
+    stdin_read, stdin_write = native.pipe_pair()
+    stdout_read, stdout_write = native.pipe_pair()
+    try:
+        native.check(native.set_handle_information(stdin_write, 1, 0))
+        native.check(native.set_handle_information(stdout_read, 1, 0))
+        nonce = os.urandom(32)
+        observed = {}
+
+        def observe(process, job):
+            native.write_all(stdin_write, nonce)
+            observed['echo'] = native.read_exactly(
+                stdout_read, len(nonce) + len(b'child:'),
+                time.monotonic() + 30)
+
+        code = native.launch(
+            [sys.executable, '-I', '-u', __file__, '--stdio-child'],
+            sid, workspace, output, observe=observe,
+            stdio=(stdin_read, stdout_write))
+        expected = b'child:' + nonce
+        if observed.get('echo') != expected:
+            raise RuntimeError('AppContainer stdio echo mismatch: %r'
+                               % (observed.get('echo'),))
+        if code != 0:
+            raise RuntimeError('AppContainer stdio child exited %d' % code)
+        return {'probe': 'inherited-pipe-as-stdio',
+                'outcome': 'stdio-both-directions-used'}
+    finally:
+        for handle in (stdin_read, stdin_write, stdout_read, stdout_write):
             native.check(native.close(handle))
 
 
@@ -2451,6 +2516,12 @@ class AppContainerTests(unittest.TestCase):
             native, sid, workspace, root / 'pipe-inheritance.log')
         print(json.dumps(pipe_result), flush=True)
         self.assertEqual(pipe_result['outcome'], 'both-directions-used')
+        # And the form the ACP transport needs: the pipe ends are the child's
+        # stdio, so the worker's fd 0 and fd 1 are the front's pipes.
+        stdio_result = pipe_stdio_probe(
+            native, sid, workspace, root / 'pipe-stdio.log')
+        print(json.dumps(stdio_result), flush=True)
+        self.assertEqual(stdio_result['outcome'], 'stdio-both-directions-used')
         # Medium-integrity file created by the unrestricted broker, for the
         # contained process's write-up characterization: the DACL permits the
         # container, so only mandatory integrity control can deny it.  Both
@@ -2940,6 +3011,8 @@ if __name__ == '__main__':
         sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] == '--pipe-child':
         sys.exit(pipe_child(int(sys.argv[2]), int(sys.argv[3])))
+    if len(sys.argv) == 2 and sys.argv[1] == '--stdio-child':
+        sys.exit(stdio_child())
     if len(sys.argv) == 4 and sys.argv[1] == '--peer':
         escape_helpers['peer'](AppContainers(), sys.argv[2], Path(sys.argv[3]))
         sys.exit(0)
