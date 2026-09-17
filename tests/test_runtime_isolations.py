@@ -652,5 +652,48 @@ class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(owner.closed)
 
 
+@unittest.skipUnless(os.name == "posix",
+                     "the POSIX worker spawn shape; Windows launch is covered "
+                     "by test_windows_runtime")
+class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_spawn_is_piped_delegated_and_sessioned(self):
+        spawned = {}
+
+        class Delegation:
+            def child_arguments(self):
+                return ["--session-owner-fd", "7",
+                        "--credential-capability-fd", "9"]
+
+            def child_spawn_kwargs(self):
+                return {"pass_fds": (7, 9)}
+
+        async def spawn(*args, **kwargs):
+            spawned["args"] = args
+            spawned["kwargs"] = kwargs
+            return object()
+
+        with mock.patch.object(
+                runtime_isolation, "worker_command",
+                return_value=["/installed/bin/loki", "--worker"]), \
+                mock.patch.object(asyncio, "create_subprocess_exec",
+                                  new=spawn):
+            await runtime_isolation.start_worker(
+                "/work", {"SAFE": "value"}, Delegation())
+
+        self.assertEqual(spawned["args"], (
+            "/installed/bin/loki", "--worker",
+            "--session-owner-fd", "7",
+            "--credential-capability-fd", "9",
+        ))
+        kwargs = spawned["kwargs"]
+        self.assertIs(kwargs["stdin"], asyncio.subprocess.PIPE)
+        self.assertIs(kwargs["stdout"], asyncio.subprocess.PIPE)
+        self.assertIsNone(kwargs["stderr"])
+        self.assertTrue(kwargs["close_fds"])
+        self.assertEqual(kwargs["env"], {"SAFE": "value"})
+        self.assertEqual(kwargs["pass_fds"], (7, 9))
+        self.assertTrue(kwargs["start_new_session"])
+
+
 if __name__ == "__main__":
     unittest.main()

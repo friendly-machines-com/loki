@@ -424,7 +424,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         try:
             await request(1, "initialize", {"protocolVersion": 1})
             opened = await request(2, "session/new", {
-                "cwd": self.directory.name, "mcpServers": []})
+                "cwd": self.workspace, "mcpServers": []})
             await request(3, "session/prompt", {
                 "sessionId": opened["sessionId"],
                 "prompt": [{"type": "text", "text": "Say ok"}]})

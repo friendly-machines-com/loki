@@ -40,7 +40,18 @@ def configured_workspace(arguments):
     for option, value in options:
         if option == "--shell-cwd":
             workspace = value
-    workspace = state.canonical_workspace(workspace)
+    return required_workspace(workspace)
+
+
+def required_workspace(path):
+    """Gate a launch on the container recorded for ``path``.
+
+    The ACP front knows the workspace as the session cwd, not as a command
+    line, so its worker launch resolves the same ledger entry, profile and
+    read-only verification the terminal gate uses -- and refuses identically
+    when no container is configured.
+    """
+    workspace = state.canonical_workspace(path)
     ledger = state.load_ledger()
     entry = ledger.get("workspaces", {}).get(state.workspace_key(workspace))
     if not isinstance(entry, dict) or not entry.get("grants"):
@@ -121,7 +132,23 @@ class ContainedProcess:
         api.close_handle(self.information.hProcess)
 
 
-def launch(executable, arguments, environment, workspace, inherited_handles):
+def launch(executable, arguments, environment, workspace, inherited_handles,
+           stdio=None, current_directory=None):
+    """Start the contained process, with piped or inherited standard handles.
+
+    ``stdio`` is ``(stdin_handle, stdout_handle)`` for children that speak a
+    protocol on their standard streams (the ACP worker): both handles must
+    already be inheritable and are named in the handle list, and the caller
+    owns them -- the launch never closes a handle it did not duplicate.
+    Without ``stdio`` the parent's own console handles are duplicated, as
+    before.  Either way ``stderr`` is a fresh inheritable duplicate of this
+    process's stderr: it is the log channel, inherited rather than piped.
+
+    ``current_directory`` is the child's initial cwd; ``None`` passes NULL
+    to ``CreateProcessW`` (inherit).  ``workspace`` names the AppContainer
+    the child runs in: the profile whose package SID confines it, and the
+    ``LOKI_CONTAINER_WORKSPACE`` value its own startup gate verifies.
+    """
     import msvcrt
 
     package = api.derive_app_container_sid(state.profile_name_for(workspace))
@@ -129,8 +156,8 @@ def launch(executable, arguments, environment, workspace, inherited_handles):
     child_environment[WORKSPACE_ENV] = workspace
     # The image is this process's own interpreter or executable, never the
     # string the caller used to start it: in a frozen build sys.argv[0] can be
-    # a relative name or a symlink, and the child runs with the workspace as
-    # its cwd, so re-entering through that string would resolve elsewhere.  A
+    # a relative name or a symlink, and the child's cwd is whatever the
+    # caller stated, which need not be where that string would resolve.  A
     # source script is passed to the interpreter as an absolute path.
     if not getattr(sys, "frozen", False):
         arguments = [os.path.abspath(executable), *arguments]
@@ -162,15 +189,19 @@ def launch(executable, arguments, environment, workspace, inherited_handles):
         _checked(set_job(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)),
                  "SetInformationJobObject")
         # Duplicate stdio rather than changing inheritance on the parent's fds.
-        for fd in (0, 1, 2):
+        for fd in (0, 1, 2) if stdio is None else (2,):
             handle = ctypes.c_void_p()
             _checked(duplicate(current, msvcrt.get_osfhandle(fd), current,
                                ctypes.byref(handle), 0, True, 2), "DuplicateHandle")
             duplicates.append(handle.value)
+        standard_handles = stdio + (duplicates[-1],) if stdio is not None \
+            else duplicates
         information = api.create_process_in_app_container(
-            executable, arguments, package, current_directory=workspace,
-            inherited_handles=[*inherited_handles, *duplicates],
-            environment=child_environment, standard_handles=duplicates)
+            executable, arguments, package,
+            current_directory=current_directory,
+            inherited_handles=[*inherited_handles, *duplicates, *(
+                stdio if stdio is not None else ())],
+            environment=child_environment, standard_handles=standard_handles)
         token = api.open_process_token(information.hProcess)
         try:
             if (not api.token_is_app_container(token)

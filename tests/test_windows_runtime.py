@@ -39,6 +39,27 @@ class GateTests(unittest.TestCase):
                              workspace)
         verify.assert_called_once_with(ledger, workspace)
 
+    def test_required_workspace_gates_the_same_ledger(self):
+        # The ACP front resolves the workspace from the session cwd, not a
+        # command line; the gate it passes must be the same one.
+        workspace = runtime.state.canonical_workspace(os.getcwd())
+        entry = {'profile': runtime.state.profile_name_for(workspace),
+                 'grants': [{'path': workspace, 'access': 'read-write',
+                             'origin': 'workspace'}]}
+        ledger = {'workspaces': {runtime.state.workspace_key(workspace): entry}}
+        with mock.patch.object(runtime.state, 'load_ledger', return_value=ledger), \
+                mock.patch.object(runtime.windows_verify, 'verify_workspace',
+                                  return_value=[Check('inventory', 'pass')]) as verify:
+            self.assertEqual(runtime.required_workspace(workspace), workspace)
+        verify.assert_called_once_with(ledger, workspace)
+
+    def test_required_workspace_without_ledger_refuses(self):
+        with mock.patch.object(runtime.state, 'load_ledger', return_value={}), \
+                mock.patch.object(runtime.windows_verify, 'verify_workspace') as verify:
+            with self.assertRaisesRegex(RuntimeIsolationError, 'run loki-setup'):
+                runtime.required_workspace(os.getcwd())
+        verify.assert_not_called()
+
     def test_runtime_requires_expected_workspace(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch.object(runtime.windows_verify, 'probe_containment') as probe:
@@ -104,6 +125,51 @@ class IsolationSeamTests(unittest.TestCase):
             runtime_isolation.verify_contained_runtime()
         verify.assert_called_once_with()
 
+    def test_worker_cwd_is_the_front_cwd_not_the_session_workspace(self):
+        # The invariant this pins: the worker's ACTUAL cwd is inherited from
+        # the front, exactly as the POSIX spawn inherits it by omission.  The
+        # session cwd gates and keys the container; it must never become the
+        # ambient directory the contained process resolves against.
+        import asyncio
+
+        from loki_agent import host_ipc
+        from loki_agent import runtime_isolation
+
+        class Delegation:
+            def child_arguments(self):
+                return ['--session-owner-fd', 'r=7']
+
+        front = (0x30, 0x31)
+        child = (0x32, 0x33)
+
+        with mock.patch.object(runtime_isolation.windows_runtime,
+                               'required_workspace',
+                               return_value='/recorded/work') as gate, \
+                mock.patch.object(runtime_isolation.host_ipc,
+                                  'worker_stdio',
+                                  return_value=(front, child)) as pipes, \
+                mock.patch.object(host_ipc, 'handles',
+                                  side_effect=lambda end: tuple(end)), \
+                mock.patch.object(host_ipc, 'WorkerStdio',
+                                  return_value=mock.Mock()) as streams, \
+                mock.patch.object(runtime_isolation.windows_runtime,
+                                  'launch',
+                                  return_value=mock.Mock()) as launch:
+            worker = asyncio.run(runtime_isolation.start_worker(
+                '/session/cwd', {'SAFE': 'value'}, Delegation()))
+        gate.assert_called_once_with('/session/cwd')
+        pipes.assert_called_once_with()
+        streams.assert_called_once_with(*front)
+        self.assertIs(worker._process, launch.return_value)
+        self.assertEqual(launch.call_args.args[0], sys.argv[0])
+        self.assertEqual(launch.call_args.args[1],
+                         ['--worker', '--session-owner-fd', 'r=7'])
+        self.assertEqual(launch.call_args.kwargs['stdio'], child)
+        self.assertEqual(launch.call_args.kwargs['current_directory'],
+                         os.getcwd())
+        # The workspace crosses as the container key only.
+        self.assertEqual(launch.call_args.args[3], '/recorded/work')
+
 
 class LaunchTests(unittest.TestCase):
     def exercise(self, contained):
@@ -121,6 +187,7 @@ class LaunchTests(unittest.TestCase):
                 return duplicate
             if symbol == 'WaitForSingleObject':
                 return lambda *args: 0
+
             def call(*args):
                 events.append(symbol)
                 return 1
@@ -143,14 +210,18 @@ class LaunchTests(unittest.TestCase):
                 mock.patch.object(api, 'close_handle') as close:
             if contained:
                 process = runtime.launch('loki.py', ['--runtime'], {'SAFE': 'value'},
-                                         '/work', [40, 41])
+                                         '/work', [40, 41],
+                                         current_directory='/work')
                 process.close()
             else:
                 with self.assertRaises(RuntimeIsolationError):
                     runtime.launch('loki.py', ['--runtime'], {'SAFE': 'value'},
-                                   '/work', [40, 41])
+                                   '/work', [40, 41],
+                                   current_directory='/work')
             self.assertEqual(create.call_args.kwargs['environment'],
                              {'SAFE': 'value', runtime.WORKSPACE_ENV: '/work'})
+            self.assertEqual(create.call_args.kwargs['current_directory'],
+                             '/work')
             self.assertEqual(create.call_args.kwargs['inherited_handles'],
                              [40, 41, 130, 131, 132])
             self.assertIn(mock.call(11), close.call_args_list)
@@ -167,3 +238,53 @@ class LaunchTests(unittest.TestCase):
         events = self.exercise(False)
         self.assertIn('terminate', events)
         self.assertNotIn('resume', events)
+
+    def exercise_stdio(self):
+        """A piped child: caller-owned stdin/stdout, duplicated stderr only."""
+        closed = []
+        information = api.ProcessInformation(11, 12, 13, 14)
+
+        def duplicate(source_process, source, target, output, rights, inherit, flags):
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = source + 100
+            return 1
+
+        def native_bind(library, symbol, *signature):
+            if symbol == 'CreateJobObjectW':
+                return lambda *args: 21
+            if symbol == 'DuplicateHandle':
+                return duplicate
+            return lambda *args: 1
+
+        with mock.patch.dict('sys.modules', {'msvcrt': types.SimpleNamespace(
+                get_osfhandle=lambda fd: fd + 30)}), \
+                mock.patch.object(api, 'bind', side_effect=native_bind), \
+                mock.patch.object(api, 'derive_app_container_sid', return_value='package'), \
+                mock.patch.object(api, 'current_process_handle', return_value=1), \
+                mock.patch.object(api, 'create_process_in_app_container',
+                                  return_value=information) as create, \
+                mock.patch.object(api, 'open_process_token', return_value=22), \
+                mock.patch.object(api, 'token_is_app_container', return_value=True), \
+                mock.patch.object(api, 'token_app_container_sid', return_value='package'), \
+                mock.patch.object(api, 'resume_thread'), \
+                mock.patch.object(api, 'close_handle',
+                                  side_effect=closed.append):
+            process = runtime.launch('loki.py', ['--worker'], {'SAFE': 'value'},
+                                     '/work', [40, 41], stdio=(50, 51),
+                                     current_directory=os.getcwd())
+            process.close()
+            self.assertEqual(create.call_args.kwargs['inherited_handles'],
+                             [40, 41, 132, 50, 51])
+            self.assertEqual(create.call_args.kwargs['standard_handles'],
+                             (50, 51, 132))
+            # The caller's cwd decision is forwarded unchanged: the launch
+            # never substitutes the workspace (or anything else) for it.
+            self.assertEqual(create.call_args.kwargs['current_directory'],
+                             os.getcwd())
+        # Only the launch's own handles are closed: the inspected token (22)
+        # and its stderr duplicate (fd 2 -> 32 -> 132); the caller's stdio
+        # handles 50 and 51 are not.  The process close then releases the
+        # job, thread and process handles.
+        self.assertEqual(closed, [22, 132, 21, 12, 11])
+
+    def test_piped_child_receives_caller_handles_and_duplicated_stderr(self):
+        self.exercise_stdio()
