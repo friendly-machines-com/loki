@@ -392,6 +392,14 @@ class SavedConnectionAuthorizationTests(
                     '"https://saved.example/v1/chat/completions"',
                     elicitation["params"]["message"],
                 )
+                self.assertIn(
+                    "Working directory:",
+                    elicitation["params"]["message"],
+                )
+                self.assertIn(
+                    ROOT,
+                    elicitation["params"]["message"],
+                )
 
     async def test_decline_closes_provisional_worker_without_commit(self):
         for method in acp.RESTORE_METHODS:

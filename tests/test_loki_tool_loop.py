@@ -4934,6 +4934,22 @@ class ShellCwdTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
+    def test_explicit_apply_shell_cwd_false_keeps_the_launch_directory(self):
+        names = ["shell_cwd", "previous_shell_cwd"]
+        old_values = save_loki_state(names)
+
+        try:
+            with tempfile.TemporaryDirectory() as saved_dir:
+                with tempfile.TemporaryDirectory() as launch_dir:
+                    loki.change_shell_cwd(launch_dir)
+                    loki.load_session_state(
+                        {"shell_cwd": saved_dir}, apply_shell_cwd=False)
+
+                    self.assertEqual(
+                        loki.current_cwd(), os.path.realpath(launch_dir))
+        finally:
+            restore_loki_state(old_values)
+
     def test_saved_connection_confirmation_is_explicit(self):
         descriptor = ConnectionDescriptor(
             provider_id="openrouter",

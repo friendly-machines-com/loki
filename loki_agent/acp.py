@@ -411,16 +411,21 @@ class Front:
 
     async def _authorize_saved_connection(
             self, descriptor: ConnectionDescriptor,
-            restore_request_id) -> None:
+            restore_request_id, working_directory=None) -> None:
         if not self._client_supports_form_elicitation:
             raise acps.TransportError(
                 "restoring a saved network connection requires an ACP "
                 "client with form elicitation support",
                 code=acps.INVALID_PARAMS,
             )
+        display = list(connection_display_fields(descriptor))
+        if working_directory:
+            # The workspace is part of what the client approves: it is where
+            # every tool reads and writes for this session.
+            display.append(("Working directory", working_directory))
         facts = "\n".join(
             f"{label}: {json.dumps(value, ensure_ascii=True)}"
-            for label, value in connection_display_fields(descriptor)
+            for label, value in display
         )
         result = await self._request_client("elicitation/create", {
             # A restore has not committed a session yet, so ACP requires
@@ -552,7 +557,7 @@ class Front:
                         f"worker returned an invalid connection: {error}"
                     ) from error
                 await self._authorize_saved_connection(
-                    descriptor, restore_request_id)
+                    descriptor, restore_request_id, cwd)
             reply = await channel.request("session/commit_open", {})
             # Publication is the commit point. Before this assignment no
             # prompt, config change, or close request can reach the worker.
