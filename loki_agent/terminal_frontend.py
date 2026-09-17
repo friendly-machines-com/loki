@@ -519,17 +519,23 @@ async def run_session_picker_async(session):
 
 async def confirm_saved_connection_async(
         descriptor: ConnectionDescriptor, session,
-        config: RuntimeConfig | None = None) -> bool:
+        config: RuntimeConfig | None = None,
+        working_directory: str | None = None) -> bool:
     displayed = (
         connection_descriptor_from_config(config)
         if config is not None else descriptor)
     if displayed is None:
         raise ValueError("a dummy provider cannot be resumed")
 
+    fields = connection_display_fields(displayed)
+    if working_directory:
+        # The directory is where every tool reads and writes, so it is part
+        # of what the resume approval covers, not just the connection.
+        fields = [*fields, ("Working directory", working_directory)]
     async with session.modal() as modal:
         print()
         print("Saved connection:")
-        for label, value in connection_display_fields(displayed):
+        for label, value in fields:
             if label in {
                     "Authentication", "Streaming",
                     "Anthropic prompt cache"}:
@@ -660,6 +666,8 @@ Options:
   -p, --prompt TEXT       one prompt for --headless mode
       --headless          headless single-prompt mode
       --toolset NAME      toolset for headless mode
+      --shell-cwd PATH    working directory for tools and Bash
+                          (an explicit value outranks a resumed one)
       --dangerously-skip-permissions
                           skip permission prompts
   -h, --help              show this help and exit
@@ -819,7 +827,10 @@ async def async_main(args) -> int:
                     config = config_from_connection_descriptor(
                         refreshed_descriptor, _core.CREDENTIALS)
                     confirmed = await confirm_saved_connection_async(
-                        refreshed_descriptor, session, config=config)
+                        refreshed_descriptor, session, config=config,
+                        working_directory=(
+                            shell_cwd if shell_cwd is not None
+                            else saved_state.get("shell_cwd")))
                     if not confirmed:
                         print("Resume cancelled.", file=sys.stderr)
                         return 0
@@ -845,7 +856,11 @@ async def async_main(args) -> int:
             sys.stderr.flush()
 
         if resolved_log_filename:
-            load_chat_log(resolved_log_filename, loaded_chat)
+            # --shell-cwd is an explicit instruction; a value saved in the log
+            # must not silently replace it.
+            load_chat_log(
+                resolved_log_filename, loaded_chat,
+                apply_shell_cwd=shell_cwd is None)
             if discard_saved_connection:
                 current_session().session_state.pop("connection", None)
                 mark_chat_log_dirty()

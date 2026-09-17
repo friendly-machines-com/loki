@@ -5466,7 +5466,7 @@ def mark_chat_log_dirty():
         session.chat_log_dirty = True
 
 
-def load_chat_log(filename, loaded=None):
+def load_chat_log(filename, loaded=None, *, apply_shell_cwd=True):
     """Load a saved conversation's state; rendering is the caller's job."""
     if loaded is None:
         with open(filename, 'r', encoding="utf-8") as f:
@@ -5474,10 +5474,10 @@ def load_chat_log(filename, loaded=None):
     transcript, todos, state, toolsets = loaded
     current_session().replace_transcript(
         transcript, todos, toolsets, state, filename)
-    load_session_state(state)
+    load_session_state(state, apply_shell_cwd=apply_shell_cwd)
 
 
-def load_session_state(state: dict):
+def load_session_state(state: dict, *, apply_shell_cwd=True):
     if not isinstance(state, dict):
         return
     session = current_session()
@@ -5496,6 +5496,11 @@ def load_session_state(state: dict):
             )
     session.reasoning_effort_preference = (
         reasoning_effort_from_session_state(state))
+    if not apply_shell_cwd:
+        # An explicit launch working directory outranks state restored from a
+        # file; the caller decides that precedence, and this function must not
+        # silently override it.
+        return
     loaded_shell_cwd = state.get("shell_cwd")
     if not isinstance(loaded_shell_cwd, str) or not loaded_shell_cwd:
         return

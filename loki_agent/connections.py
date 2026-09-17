@@ -13,9 +13,46 @@ class ConnectionDescriptorError(ValueError):
     pass
 
 
+# Fields of ConnectionDescriptor that the resume approval renders.  Together
+# with UNDISPLAYED_CONNECTION_FIELDS this partitions the dataclass, so the
+# coverage test in tests/test_connections.py fails when a field is added
+# without deciding whether a user must see it before approving a connection.
+DISPLAYED_CONNECTION_FIELDS = frozenset({
+    "provider_id",
+    "provider_name",
+    "model",
+    "chat_url",
+    "models_url",
+    "protocol",
+    "credential_ref",
+    "auth_header",
+    "auth_scheme",
+    "stream",
+    "prompt_cache",
+})
+
+# Fields deliberately kept out of the approval, each with the reason it is
+# safe to omit: none of them changes where a request goes, which credential is
+# attached, or how that credential is presented.
+UNDISPLAYED_CONNECTION_FIELDS = {
+    "max_tokens": "request budget, not an authorization fact",
+    "anthropic_version": "protocol header detail with a fixed default",
+    "model_status": "informational catalog state",
+    "openai_request_profile": (
+        "subscription request shape, implied by the credential-scoped "
+        "ChatGPT connection"),
+    "reasoning_effort_profile": "model capability metadata",
+}
+
+
 def connection_display_fields(
         descriptor: "ConnectionDescriptor") -> list[tuple[str, str]]:
-    """Return the complete non-secret connection facts shown for approval."""
+    """Return the non-secret connection facts shown for approval.
+
+    Every field of ConnectionDescriptor is either returned here or named in
+    UNDISPLAYED_CONNECTION_FIELDS; tests/test_connections.py holds the two
+    sets to the dataclass so an omitted field cannot go unnoticed.
+    """
     provider = (
         descriptor.provider_name or descriptor.provider_id or "custom")
     fields = [
@@ -25,6 +62,7 @@ def connection_display_fields(
     ]
     if descriptor.models_url:
         fields.append(("Models endpoint", descriptor.models_url))
+    fields.append(("Protocol", descriptor.protocol))
     if descriptor.credential_ref is None:
         fields.append(("Authentication", "none"))
     else:
@@ -34,6 +72,10 @@ def connection_display_fields(
             credential.name if credential.kind == "env"
             else credential.encode(),
         ))
+    if descriptor.auth_scheme:
+        fields.append(("Credential scheme", descriptor.auth_scheme))
+    if descriptor.auth_header:
+        fields.append(("Credential header", descriptor.auth_header))
     fields.append(("Streaming", "yes" if descriptor.stream else "no"))
     if descriptor.protocol == "anthropic_messages":
         fields.append((
