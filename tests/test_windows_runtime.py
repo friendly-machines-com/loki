@@ -125,6 +125,37 @@ class IsolationSeamTests(unittest.TestCase):
             runtime_isolation.verify_contained_runtime()
         verify.assert_called_once_with()
 
+    def test_runtime_cwd_is_the_supervisor_cwd_not_the_workspace(self):
+        # The terminal runtime's ambient cwd is inherited from the
+        # supervisor, as the POSIX spawn inherits it; the workspace crosses
+        # only as the container key, never as the process's directory.
+        import asyncio
+
+        from loki_agent import runtime_isolation
+
+        class Delegation:
+            owner_child = (7,)
+            credential_child = (9,)
+
+            def child_arguments(self):
+                return []
+
+        with mock.patch.object(runtime_isolation.host_ipc, 'handles',
+                               side_effect=lambda end: tuple(end)), \
+                mock.patch.object(runtime_isolation.windows_runtime,
+                                  'launch', return_value=mock.Mock()) as launch:
+            asyncio.run(runtime_isolation.start_runtime(
+                '/installed/loki', ['--headless'], '/recorded/work',
+                {'SAFE': 'value'}, Delegation()))
+        self.assertEqual(launch.call_args.args[0], '/installed/loki')
+        self.assertEqual(launch.call_args.args[1],
+                         ['--runtime', '--', '--headless'])
+        self.assertEqual(launch.call_args.args[3], '/recorded/work')
+        self.assertEqual(launch.call_args.kwargs['environment'],
+                         {'SAFE': 'value'})
+        self.assertEqual(launch.call_args.kwargs['current_directory'],
+                         os.getcwd())
+
     def test_worker_cwd_is_the_front_cwd_not_the_session_workspace(self):
         # The invariant this pins: the worker's ACTUAL cwd is inherited from
         # the front, exactly as the POSIX spawn inherits it by omission.  The
