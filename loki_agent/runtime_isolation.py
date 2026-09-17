@@ -104,9 +104,12 @@ if sys.platform == "win32":
         logger.debug("runtime command: %r", command)
         inherited = [*host_ipc.handles(delegation.owner_child),
                      *host_ipc.handles(delegation.credential_child)]
+        # Not the workspace: the ambient cwd is what relative opens, DLL
+        # searches and executable lookups resolve against, and the workspace
+        # is the one directory model-directed tools can write.
         return windows_runtime.launch(
             executable, command[1:], environment, workspace, inherited,
-            current_directory=workspace)
+            current_directory=os.getcwd())
 
     class _ContainedWorker:
         """An asyncio-``Process``-shaped view of one contained ACP worker.
