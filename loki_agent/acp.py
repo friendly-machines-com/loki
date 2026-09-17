@@ -17,7 +17,7 @@ import os
 import sys
 import uuid
 
-from . import __version__, acps, credential_supervisors, savefiles
+from . import __version__, acps, credential_supervisors, runtime_isolation, savefiles
 from .connections import (
     ConnectionDescriptor,
     ConnectionDescriptorError,
@@ -25,6 +25,7 @@ from .connections import (
 )
 from .credentials import CredentialStore
 from .loki import CHAT_LOG_DIR
+from .runtime_isolation import RuntimeIsolationError
 
 logger = logging.getLogger(__name__)
 
@@ -45,25 +46,6 @@ RESTORE_METHODS = (
     "session/load",
     "session/resume",
 )
-
-
-def worker_command() -> list[str]:
-    """The command that starts this program again as a worker.
-
-    ``sys.executable`` is the image: the bootloader in a frozen build, and the
-    interpreter for a source script, which is then handed its own launcher as
-    an absolute path.  ``sys.argv[0]`` is only the name the caller typed --
-    possibly relative, possibly a symlink -- and must not be used as an
-    executable.
-    """
-    if getattr(sys, "frozen", False):
-        command = [sys.executable, "--worker"]
-    else:
-        command = [sys.executable, os.path.abspath(sys.argv[0]), "--worker"]
-    logger.debug(
-        "worker command: %r (sys.argv[0]=%r sys.executable=%r frozen=%r)",
-        command, sys.argv[0], sys.executable, getattr(sys, "frozen", False))
-    return command
 
 
 class WorkerChannel:
@@ -198,6 +180,11 @@ class WorkerChannel:
         with contextlib.suppress(
                 asyncio.CancelledError, acps.TransportError):
             await self._reader_task
+        # The platform process is released only after the reader has stopped:
+        # on Windows this closes the stdio threads, the front pipe handles
+        # and the job whose close kills any descendants.  POSIX subprocesses
+        # own their transport and need nothing here.
+        runtime_isolation.close_runtime_process(self.process)
         if self.credential_delegation is not None:
             await self.credential_delegation.close()
             self.credential_delegation = None
@@ -511,20 +498,16 @@ class Front:
             delegation = await self.credential_supervisor.delegate()
             process = None
             try:
-                process = await asyncio.create_subprocess_exec(
-                    *worker_command(),
-                    *delegation.child_arguments(),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=None,
-                    close_fds=True,
-                    env=self.environment,
-                    **delegation.child_spawn_kwargs(),
-                    # ACP uses pipes, not a terminal. A new session prevents
-                    # an inherited controlling terminal from becoming an
-                    # escape channel through TIOCSTI or terminal signals.
-                    start_new_session=True,
-                )
+                # The platform seam spawns the worker contained where the
+                # platform has a container (Windows AppContainer) and piped
+                # on stdio everywhere; the front never launches it directly.
+                process = await runtime_isolation.start_worker(
+                    cwd, self.environment, delegation)
+            except RuntimeIsolationError as error:
+                raise acps.TransportError(
+                    f"could not start worker: {error}",
+                    code=acps.INTERNAL_ERROR,
+                ) from error
             finally:
                 if process is None:
                     await delegation.close()

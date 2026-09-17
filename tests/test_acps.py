@@ -30,6 +30,16 @@ from loki_agent.credentials import CredentialStore, is_credential_name
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _configured_workspace(tmpdir):
+    """The session cwd a test must request: the registered container dir.
+
+    Every front-spawning fixture here configures ``<tmpdir>/workspace`` with
+    the real ``loki-setup``, and the Windows front refuses a session whose
+    cwd is not a configured container.  On POSIX this is inert.
+    """
+    return os.path.join(tmpdir, "workspace")
+
+
 def _close_process_streams(process):
     for name in ("stdin", "stdout", "stderr"):
         stream = getattr(process, name, None)
@@ -137,6 +147,67 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         delegation.revoke_now.assert_called_once_with()
         delegation.close.assert_awaited_once_with()
         self.assertIsNone(channel.credential_delegation)
+
+    async def test_close_releases_the_platform_process(self):
+        # On Windows the platform process owns the stdio threads, the front
+        # pipe handles and the kill-on-close job; close must hand it back to
+        # the platform seam after the reader has stopped.
+        class Output:
+            async def readline(self):
+                return b""
+
+        class Stdin:
+            def close(self):
+                pass
+
+            async def wait_closed(self):
+                pass
+
+        class Process:
+            stdout = Output()
+            stdin = Stdin()
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        released = mock.Mock()
+        with mock.patch.object(
+                acp.runtime_isolation, "close_runtime_process",
+                new=released):
+            channel = acp.WorkerChannel(
+                "session", Process(), lambda message: None, None)
+            await channel.close()
+        released.assert_called_once_with(channel.process)
+
+
+class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_denied_workspace_fails_closed_and_releases_delegation(self):
+        # A session whose workspace has no configured container must not get
+        # an unprotected worker: the spawn seam's refusal surfaces as a
+        # transport error and the delegation it created is closed.
+        front = acp.Front(
+            lambda: None, lambda message: None, CredentialStore({}))
+        delegation = mock.Mock()
+        delegation.close = mock.AsyncMock()
+        spawned = mock.AsyncMock(
+            side_effect=acp.RuntimeIsolationError(
+                "No Windows container configured; run loki-setup"))
+        with mock.patch.object(
+                front.credential_supervisor,
+                "delegate",
+                new=mock.AsyncMock(return_value=delegation)), \
+                mock.patch.object(
+                    acp.runtime_isolation, "start_worker", new=spawned):
+            with self.assertRaisesRegex(
+                    acps.TransportError, "could not start worker"):
+                await front._open_worker(
+                    cwd=ROOT, open_method="session/new")
+        spawned.assert_awaited_once_with(
+            ROOT, front.environment, delegation)
+        delegation.close.assert_awaited_once_with()
+        self.assertFalse(front.workers)
+        self.assertFalse(front._opening_sessions)
 
 
 class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
@@ -280,8 +351,8 @@ class SavedConnectionAuthorizationTests(
                 "delegate",
                 new=mock.AsyncMock(return_value=delegation)), \
                 mock.patch.object(
-                    acp.asyncio,
-                    "create_subprocess_exec",
+                    acp.runtime_isolation,
+                    "start_worker",
                     new=mock.AsyncMock(return_value=object())), \
                 mock.patch.object(acp, "WorkerChannel", Channel):
             try:
@@ -534,7 +605,7 @@ args=(%r + str(__import__('os').getpid()), 'a')
                     capabilities["promptCapabilities"]["image"])
 
                 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": tmpdir}})
+                      "params": {"cwd": _configured_workspace(tmpdir)}})
                 reply = recv_reply(2)
                 session_id = reply["result"]["sessionId"]
                 self.assertTrue(session_id)
@@ -608,14 +679,15 @@ args=(%r + str(__import__('os').getpid()), 'a')
             async def close(self):
                 await self.credential_delegation.close()
 
-        async def fake_spawn(*args, **kwargs):
-            spawned["args"] = args
-            spawned["kwargs"] = kwargs
+        async def fake_spawn(cwd, environment, delegation):
+            spawned["cwd"] = cwd
+            spawned["environment"] = environment
+            spawned["delegation"] = delegation
             return FakeProcess()
 
         async def scenario():
             with mock.patch.object(
-                    acp.asyncio, "create_subprocess_exec",
+                    acp.runtime_isolation, "start_worker",
                     new=fake_spawn), mock.patch.object(
                         acp, "WorkerChannel", FakeChannel):
                 session_id, _reply = await front._open_worker(
@@ -624,21 +696,15 @@ args=(%r + str(__import__('os').getpid()), 'a')
 
         asyncio.run(scenario())
 
-        child_environment = spawned["kwargs"]["env"]
+        # The spawn seam receives the session's workspace and the sanitized
+        # environment -- the spawn-specific kwargs (pipes, descriptors or
+        # handle lists) are the seam's own contract, pinned in
+        # test_runtime_isolations and test_host_ipc.
+        self.assertEqual(spawned["cwd"], ROOT)
+        child_environment = spawned["environment"]
         self.assertNotIn(credential_name, child_environment)
         self.assertNotIn(credential_value, repr(child_environment))
-        self.assertTrue(spawned["kwargs"]["close_fds"])
-        if os.name == "posix":
-            self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 2)
-        else:
-            # Windows hands the same two ends over in the startup handle list
-            # rather than as inherited descriptors.
-            handles = spawned["kwargs"]["startupinfo"].lpAttributeList[
-                "handle_list"]
-            self.assertEqual(len(handles), 2)
-        self.assertIn("--session-owner-fd", spawned["args"])
-        self.assertIn("--credential-capability-fd", spawned["args"])
-        self.assertTrue(spawned["kwargs"]["start_new_session"])
+        self.assertIsNotNone(spawned["delegation"])
         credential = authentications.CredentialRef.environment(
             credential_name)
         self.assertTrue(front.credentials.has_ref(credential))
@@ -804,7 +870,7 @@ if "--worker" in sys.argv:
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "session/new",
-                    "params": {"cwd": tmpdir},
+                    "params": {"cwd": _configured_workspace(tmpdir)},
                 })
                 self.assertIn("result", recv_reply(2))
 
@@ -993,7 +1059,7 @@ class UpdateStreamingTests(unittest.TestCase):
                       "params": {"protocolVersion": 1}})
                 recv()
                 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": tmpdir}})
+                      "params": {"cwd": workspace}})
                 session_id = recv()["result"]["sessionId"]
                 send({"jsonrpc": "2.0", "id": 3,
                       "method": "session/prompt",
@@ -1069,7 +1135,7 @@ class CancelEndToEndTests(unittest.TestCase):
                 while recv().get("id") != 1:
                     pass
                 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": tmpdir}})
+                      "params": {"cwd": workspace}})
                 while True:
                     reply = recv()
                     if reply.get("id") == 2:
@@ -1177,10 +1243,11 @@ class SessionRestoreTests(unittest.TestCase):
         return self._response(front, 1)[0]["result"]
 
     def _create_saved_session(self, env, tmpdir):
+        workspace = _configured_workspace(tmpdir)
         front = self._front(env, tmpdir)
         try:
             self._initialize(front)
-            self._send(front, 2, "session/new", {"cwd": tmpdir})
+            self._send(front, 2, "session/new", {"cwd": workspace})
             session_id = self._response(front, 2)[0]["result"]["sessionId"]
             self._send(front, 3, "session/prompt", {
                 "sessionId": session_id,
@@ -1202,7 +1269,7 @@ class SessionRestoreTests(unittest.TestCase):
                 self._initialize(front)
                 self._send(front, 2, "session/load", {
                     "sessionId": saved_id,
-                    "cwd": tmpdir,
+                    "cwd": _configured_workspace(tmpdir),
                     "mcpServers": [],
                     # This former Loki extension cannot suppress ACP's
                     # mandatory load replay.
@@ -1242,8 +1309,8 @@ class SessionRestoreTests(unittest.TestCase):
                     ["sessionCapabilities"]["resume"],
                     {},
                 )
-                self._send(
-                    front, 2, "session/list", {"cwd": tmpdir})
+                self._send(front, 2, "session/list",
+                           {"cwd": _configured_workspace(tmpdir)})
                 listed = self._response(front, 2)[0]
                 self.assertIn(
                     saved_id,
@@ -1252,7 +1319,7 @@ class SessionRestoreTests(unittest.TestCase):
                 )
                 self._send(front, 3, "session/resume", {
                     "sessionId": saved_id,
-                    "cwd": tmpdir,
+                    "cwd": _configured_workspace(tmpdir),
                     "mcpServers": [],
                     # Nor can the old extension make resume replay.
                     "replay": True,
@@ -1333,7 +1400,7 @@ class SessionListTests(unittest.TestCase):
                 while recv().get("id") != 1:
                     pass
                 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": tmpdir}})
+                      "params": {"cwd": workspace}})
                 while True:
                     m = recv()
                     if m.get("id") == 2:
@@ -1378,7 +1445,7 @@ class SessionListTests(unittest.TestCase):
                 self.assertEqual(len(sessions), 1, sessions)
                 entry = sessions[0]
                 self.assertEqual(entry["sessionId"], session_id)
-                self.assertEqual(entry["cwd"], tmpdir)
+                self.assertEqual(entry["cwd"], workspace)
                 self.assertIn("updatedAt", entry)
             finally:
                 front2.stdin.close()
@@ -1425,7 +1492,7 @@ class ConfigOptionTests(unittest.TestCase):
                 while recv().get("id") != 1:
                     pass
                 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": tmpdir}})
+                      "params": {"cwd": workspace}})
                 while True:
                     m = recv()
                     if m.get("id") == 2:

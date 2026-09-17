@@ -244,6 +244,103 @@ class PipeEndpointTests(unittest.TestCase):
         self.assertEqual(host_ipc.handles(4), (4,))
 
 
+class WorkerStdioPipeTests(unittest.TestCase):
+    """The ACP worker's stdio pipes, with the Windows calls mocked.
+
+    Same contract as the credential channel's pair: only the child's ends
+    stay inheritable, and every partial-failure path closes everything it
+    created.
+    """
+
+    def test_only_the_child_ends_stay_inheritable(self):
+        created = iter([(0x20, 0x21), (0x22, 0x23)])
+        cleared = []
+        with mock.patch.object(host_ipc.windows_api, "create_pipe",
+                               side_effect=lambda: next(created)), \
+                mock.patch.object(host_ipc.windows_api,
+                                  "clear_handle_inheritance",
+                                  side_effect=cleared.append):
+            front, child = host_ipc.worker_stdio()
+
+        # front is (stdout_read, stdin_write); child is
+        # (stdin_read, stdout_write).
+        self.assertEqual(front, (0x22, 0x21))
+        self.assertEqual(child, (0x20, 0x23))
+        # The front's stdout-read 0x22 and stdin-write 0x21 are cleared; the
+        # child's stdin-read 0x20 and stdout-write 0x23 keep inherit.
+        self.assertEqual(cleared, [0x22, 0x21])
+
+    def test_second_pipe_failure_closes_the_first_pipe(self):
+        closed = []
+        with mock.patch.object(
+                host_ipc.windows_api, "create_pipe",
+                side_effect=[(0x20, 0x21), OSError("no more handles")]), \
+                mock.patch.object(host_ipc.windows_api,
+                                  "clear_handle_inheritance"), \
+                mock.patch.object(host_ipc.windows_api, "close_handle",
+                                  side_effect=closed.append):
+            with self.assertRaises(OSError):
+                host_ipc.worker_stdio()
+        self.assertEqual(closed, [0x20, 0x21])
+
+    def test_inheritance_failure_closes_all_four_ends(self):
+        closed = []
+        with mock.patch.object(
+                host_ipc.windows_api, "create_pipe",
+                side_effect=[(0x20, 0x21), (0x22, 0x23)]), \
+                mock.patch.object(
+                    host_ipc.windows_api, "clear_handle_inheritance",
+                    side_effect=[None, OSError("cannot clear")]), \
+                mock.patch.object(host_ipc.windows_api, "close_handle",
+                                  side_effect=closed.append):
+            with self.assertRaises(OSError):
+                host_ipc.worker_stdio()
+        self.assertEqual(closed, [0x20, 0x21, 0x22, 0x23])
+
+
+class StdioWriterTests(unittest.IsolatedAsyncioTestCase):
+    """The front's stdin writer: EOF is its handle closing, exactly once."""
+
+    def writer(self, write_file):
+        sink = host_ipc._HandleWriter(0xBB, asyncio.get_running_loop())
+        sink.start()
+        return host_ipc._StdioWriter(sink)
+
+    async def test_wait_closed_stops_the_thread_and_closes_the_handle(self):
+        written = []
+        closed = []
+        with mock.patch.object(host_ipc.windows_api, "write_file",
+                               side_effect=lambda handle, data: (
+                                   written.append(bytes(data)),
+                                   len(data))[1]), \
+                mock.patch.object(host_ipc.windows_api, "close_handle",
+                                  side_effect=closed.append):
+            writer = self.writer(None)
+            writer.write(b"last message")
+            await writer.drain()
+            await writer.wait_closed()
+
+        self.assertEqual(written, [b"last message"])
+        self.assertEqual(closed, [0xBB])
+        # The flush thread stopped; a release after wait_closed is a no-op.
+        writer.release()
+        self.assertEqual(closed, [0xBB])
+
+    async def test_release_closes_without_wait_closed(self):
+        # Teardown that never reached wait_closed must still release the
+        # handle -- this is the path that closes stdin for a worker whose
+        # reader died first.
+        closed = []
+        with mock.patch.object(host_ipc.windows_api, "write_file") as write, \
+                mock.patch.object(host_ipc.windows_api, "close_handle",
+                                  side_effect=closed.append):
+            writer = self.writer(None)
+            writer.release()
+            writer.release()
+        write.assert_not_called()
+        self.assertEqual(closed, [0xBB])
+
+
 class HandleWriterTests(unittest.IsolatedAsyncioTestCase):
     """The writer thread keeps a blocking WriteFile off the event loop."""
 
