@@ -281,13 +281,265 @@ def conpty_probe(root):
         kernel.CloseHandle(input_write)
         kernel.CloseHandle(output_read)
     print(json.dumps(record), flush=True)
-    # Recorded, not asserted.  What this establishes: CreatePseudoConsole works
-    # for a standard user, the child attaches (its title arrives in the frame),
-    # and the session emits frames.  What it does not establish: capturing the
-    # child's text -- the final frame clears the screen, and a minimal host does
-    # not reproduce the documented full client (concurrent servicing plus the
-    # win32-input-mode handshake).  Asserting the marker here would only be
-    # testing the host we deliberately did not build.
+    return 0
+
+
+def conpty_child(stage):
+    """The child half of the interactive ConPTY probes.
+
+    Runs attached to a pseudoconsole, so its stdout is conhost's screen and
+    its stdin is the host's pipe.  Each stage exercises one thing a terminal
+    harness would need: text over time, styled bytes, echoed input, and size
+    changes.
+    """
+    if stage in ('text', 'text-reply'):
+        print('MARK1', flush=True)
+        time.sleep(1.0)
+        print('MARK2', flush=True)
+        line = sys.stdin.readline()
+        print('ECHO:' + line.strip(), flush=True)
+        return 0
+    if stage == 'sgr':
+        sys.stdout.buffer.write(
+            b'\x1b[1mBOLD\x1b[m \x1b[38;5;196mC256\x1b[m '
+            b'\x1b[38;2;1;2;3mTRUE\x1b[m RAW\x1b END\n')
+        sys.stdout.buffer.flush()
+        time.sleep(1.5)
+        print('SGRDONE', flush=True)
+        return 0
+    if stage == 'resize':
+        import shutil
+        size = shutil.get_terminal_size()
+        print('SIZE:%d,%d' % (size.columns, size.lines), flush=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            current = shutil.get_terminal_size()
+            if (current.columns, current.lines) != (
+                    size.columns, size.lines):
+                print('SIZE:%d,%d' % (current.columns, current.lines),
+                      flush=True)
+                return 0
+        print('SIZE:unchanged', flush=True)
+        return 0
+    raise SystemExit('unknown conpty-child stage')
+
+
+def conpty_interactive_probe(root, stage):
+    """Drive a long-lived child on a pseudoconsole and record the exchange.
+
+    The reachability probe answered whether a session can exist at all; this
+    one answers what a terminal harness would need: does the child's text
+    arrive while it runs (not only in the teardown frame), do the host's bytes
+    reach the child's stdin, do styled bytes survive conhost's renderer, and
+    does ResizePseudoConsole reach the child's console.  The ``text-reply``
+    stage additionally answers conhost's mode queries, to characterize whether
+    host engagement changes painting at all.
+    """
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    create_pipe = kernel.CreatePipe
+    create_pipe.argtypes = [C.POINTER(HANDLE), C.POINTER(HANDLE), C.c_void_p,
+                            ULONG]
+    create_pipe.restype = W.BOOL
+    create_pseudo = kernel.CreatePseudoConsole
+    create_pseudo.argtypes = [Coord, HANDLE, HANDLE, ULONG, C.POINTER(HANDLE)]
+    create_pseudo.restype = C.c_long
+    resize_pseudo = kernel.ResizePseudoConsole
+    resize_pseudo.argtypes = [HANDLE, Coord]
+    resize_pseudo.restype = C.c_long
+    close_pseudo = kernel.ClosePseudoConsole
+    close_pseudo.argtypes = [HANDLE]
+    close_pseudo.restype = None
+    initialize = kernel.InitializeProcThreadAttributeList
+    initialize.argtypes = [C.c_void_p, ULONG, ULONG, C.POINTER(C.c_size_t)]
+    initialize.restype = W.BOOL
+    update = kernel.UpdateProcThreadAttribute
+    update.argtypes = [C.c_void_p, ULONG, C.c_size_t, C.c_void_p, C.c_size_t,
+                       C.c_void_p, C.c_void_p]
+    update.restype = W.BOOL
+    delete = kernel.DeleteProcThreadAttributeList
+    delete.argtypes = [C.c_void_p]
+    delete.restype = None
+    create_process = kernel.CreateProcessW
+    create_process.argtypes = [W.LPCWSTR, W.LPWSTR, C.c_void_p, C.c_void_p,
+                               W.BOOL, ULONG, C.c_void_p, W.LPCWSTR,
+                               C.POINTER(ProbeStartupInfo),
+                               C.POINTER(ProbeProcessInfo)]
+    create_process.restype = W.BOOL
+    read_file = kernel.ReadFile
+    read_file.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
+                          C.c_void_p]
+    read_file.restype = W.BOOL
+    write_file = kernel.WriteFile
+    write_file.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
+                           C.c_void_p]
+    write_file.restype = W.BOOL
+    peek = kernel.PeekNamedPipe
+    peek.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
+                     C.POINTER(ULONG), C.POINTER(ULONG)]
+    peek.restype = W.BOOL
+    wait_for = kernel.WaitForSingleObject
+    wait_for.argtypes = [HANDLE, ULONG]
+    wait_for.restype = ULONG
+
+    def pair():
+        read, write = HANDLE(), HANDLE()
+        if not create_pipe(C.byref(read), C.byref(write), None, 0):
+            raise C.WinError(C.get_last_error())
+        return read, write
+
+    input_read, input_write = pair()
+    output_read, output_write = pair()
+    hpc = HANDLE()
+    record = {'probe': 'conpty-interactive', 'stage': stage}
+    status = create_pseudo(Coord(80, 24), input_read, output_write, 0,
+                           C.byref(hpc))
+    if status < 0:
+        for handle in (input_read, input_write, output_read, output_write):
+            kernel.CloseHandle(handle)
+        record.update({'created': False,
+                       'hresult': '0x%08x' % (status & 0xffffffff)})
+        print(json.dumps(record), flush=True)
+        return 0
+    record['created'] = True
+    attributes = None
+    closed = False
+    process = ProbeProcessInfo()
+    output = bytearray()
+    try:
+        size = C.c_size_t()
+        initialize(None, 1, 0, C.byref(size))
+        if C.get_last_error() != 122 or not size.value:
+            raise C.WinError(C.get_last_error())
+        storage = C.create_string_buffer(size.value)
+        attributes = C.cast(storage, C.c_void_p)
+        if not initialize(attributes, 1, 0, C.byref(size)):
+            raise C.WinError(C.get_last_error())
+        if not update(attributes, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                      C.cast(hpc, C.c_void_p), C.sizeof(hpc), None, None):
+            raise C.WinError(C.get_last_error())
+        startup = SharedStartupInfo()
+        startup.startup.cb = C.sizeof(SharedStartupInfo)
+        startup.attributes = attributes
+        command = '"%s" -I -u "%s" --conpty-child %s' % (
+            sys.executable, Path(__file__).resolve(), stage)
+        text = C.create_unicode_buffer(command)
+        if not create_process(None, text, None, None, False,
+                              EXTENDED_STARTUPINFO_PRESENT, None, str(root),
+                              C.byref(startup.startup), C.byref(process)):
+            raise C.WinError(C.get_last_error())
+        # The pseudoconsole keeps its copies; release ours so a broken pipe is
+        # detectable when the child exits.
+        kernel.CloseHandle(input_read)
+        kernel.CloseHandle(output_write)
+
+        available, transferred, written = ULONG(), ULONG(), ULONG()
+        started = time.monotonic()
+        timings = {}
+
+        def drain():
+            while True:
+                if not peek(output_read, None, 0, None, C.byref(available),
+                            None):
+                    return False
+                if not available.value:
+                    return True
+                buffer = C.create_string_buffer(available.value)
+                if not read_file(output_read, buffer, available.value,
+                                 C.byref(transferred), None):
+                    return False
+                chunk = buffer.raw[:transferred.value]
+                output.extend(chunk)
+                if not timings:
+                    timings['first_byte_ms'] = round(
+                        (time.monotonic() - started) * 1000)
+                return True
+
+        def note(marker):
+            if marker not in timings and marker.encode() in output:
+                timings[marker + '_ms'] = round(
+                    (time.monotonic() - started) * 1000)
+
+        def send(data):
+            buffer = C.create_string_buffer(data)
+            if not write_file(input_write, buffer, len(data),
+                              C.byref(written), None):
+                return False
+            record['input_written'] = written.value == len(data)
+            return record['input_written']
+
+        replied = []
+        resize_sent = False
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if not drain():
+                break
+            for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
+                note(marker)
+            if stage == 'text' and 'MARK1_ms' in timings and (
+                    'input_written' not in record):
+                send(b'probe-key\r\n')
+            if stage == 'resize' and not resize_sent and b'SIZE:' in output:
+                status = resize_pseudo(hpc, Coord(120, 30))
+                record['resize_hresult'] = '0x%08x' % (
+                    status & 0xffffffff)
+                resize_sent = True
+            if stage == 'text-reply':
+                chunked = bytes(output)
+                for query, decline in ((b'\x1b[?9001h', b'\x1b[?9001l'),
+                                       (b'\x1b[?1004h', b'\x1b[?1004l')):
+                    if query in chunked and query not in replied:
+                        if send(decline):
+                            replied.append(query)
+                if b'\x1b[6n' in chunked and b'6n' not in replied:
+                    if send(b'\x1b[24;80R'):
+                        replied.append(b'6n')
+            if wait_for(process.process, 0) == 0:
+                break
+            time.sleep(0.01)
+        if not timings:
+            timings['first_byte_ms'] = None
+        for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
+            if marker.encode() not in output:
+                timings[marker + '_ms'] = None
+        record['replied_queries'] = [r.decode('latin1') for r in replied]
+        record.update(timings)
+        exit_code = ULONG()
+        kernel.GetExitCodeProcess(process.process, C.byref(exit_code))
+        record['exit_code'] = exit_code.value
+        # Snapshot what arrived while the session was live: the teardown frame
+        # is legitimate output, but the harness question is about liveness.
+        before_close = bytes(output)
+        close_pseudo(hpc)
+        closed = True
+        stop = time.monotonic() + 3
+        while time.monotonic() < stop:
+            if not drain():
+                break
+            time.sleep(0.01)
+        record['markers_before_close'] = {
+            marker: marker.encode() in before_close
+            for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:')}
+        record['output'] = output.decode('latin1')[-600:]
+    except OSError as error:
+        record['error'] = str(error)
+        record['winerror'] = getattr(error, 'winerror', None)
+    finally:
+        if process.process:
+            kernel.CloseHandle(process.process)
+        if process.thread:
+            kernel.CloseHandle(process.thread)
+        if not closed:
+            close_pseudo(hpc)
+        if attributes is not None:
+            delete(attributes)
+        kernel.CloseHandle(input_write)
+        kernel.CloseHandle(output_read)
+    print(json.dumps(record), flush=True)
+    # Recorded, not asserted.  What these four stages decide: whether a pty
+    # harness on ConPTY can see live text, send input, rely on styled bytes
+    # and observe resizes.  Asserting any of it here would test conhost, not
+    # Loki.
     return 0
 
 
@@ -546,6 +798,9 @@ def child(mode, root, stage=None):
 
     if mode == 'conpty':
         return conpty_probe(root)
+
+    if mode == 'conpty-interactive':
+        return conpty_interactive_probe(root, stage)
 
     if mode == 'second-user-create':
         # Create the credential directory exactly as the storage does: a
@@ -1222,6 +1477,23 @@ class WindowsPrimitiveTests(unittest.TestCase):
         print(result.stderr, file=sys.stderr, flush=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_conpty_interactive_characterization(self):
+        # Recorded, not asserted: whether the child's text arrives while it
+        # runs, whether the host's bytes reach its stdin, whether styled bytes
+        # survive conhost's renderer, and whether a resize reaches its console
+        # (with and without answering conhost's mode queries).  These records
+        # decide whether the pty_ui family can be ported onto ConPTY; the
+        # assertions belong to that harness, not to conhost.
+        for stage in ('text', 'text-reply', 'sgr', 'resize'):
+            with self.subTest(stage=stage):
+                result = subprocess.run(
+                    self.command('conpty-interactive', stage), timeout=25,
+                    capture_output=True, text=True)
+                print(result.stdout, flush=True)
+                print(result.stderr, file=sys.stderr, flush=True)
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+
     def test_path_resolution_semantics(self):
         # What Windows resolves for a directory junction, `..`, and identity:
         # the file_paths expectations have to be written from this, not from
@@ -1343,6 +1615,8 @@ class WindowsPrimitiveTests(unittest.TestCase):
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '--child':
         sys.exit(child(*sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == '--conpty-child':
+        sys.exit(conpty_child(sys.argv[2]))
     if len(sys.argv) > 1 and sys.argv[1] == '--standard-user':
         if len(sys.argv) != 3 or os.name != 'nt':
             raise RuntimeError('--standard-user requires native Windows and a SID')
