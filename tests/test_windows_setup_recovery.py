@@ -83,6 +83,7 @@ class RecoveryTests(unittest.TestCase):
     def test_final_save_failure_retains_pending_ledger_in_memory_and_on_disk(self):
         real_save = state.save_ledger
         calls = 0
+
         def save(blob, path):
             nonlocal calls
             calls += 1
@@ -182,9 +183,11 @@ class InheritanceTests(unittest.TestCase):
     def test_only_protected_sddl_requests_disabling_inheritance(self):
         for sddl, expected in [('D:AI(A;;FR;;;SY)', 4), ('D:P(A;;FR;;;SY)', 4 | 0x80000000)]:
             set_named = mock.Mock(return_value=0)
+
             def convert(text, revision, output, length):
                 ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 10
                 return 1
+
             def get_dacl(descriptor, present, output, defaulted):
                 ctypes.cast(present, ctypes.POINTER(ctypes.wintypes.BOOL))[0] = True
                 ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 11
