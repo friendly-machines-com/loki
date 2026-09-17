@@ -5,6 +5,7 @@ from unittest import mock
 
 from loki_agent import acp_commands
 from loki_agent import loki
+from loki_agent import provider_controls
 from loki_agent.sessions import Session
 
 
@@ -174,6 +175,103 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         _session = self._install("/tmp")
 
         self.assertIsNone(await acp_commands.run("hello", _session))
+
+
+class FakeControlTests(unittest.IsolatedAsyncioTestCase):
+    """The ACP /account path against a stub control, provider-independent."""
+
+    def setUp(self):
+        self._saved = loki._DEFAULT_SESSION
+        self.addCleanup(self._restore)
+        loki._DEFAULT_SESSION = session("/tmp")
+        self._actions = ()
+
+    def _restore(self):
+        loki._DEFAULT_SESSION = self._saved
+
+    async def _read(self, context):
+        return provider_controls.ControlResult(
+            lines=("Reset cards - live", "  5-hour reset cards: 1 available"),
+            actions=tuple(self._actions),
+        )
+
+    def _patch(self, actions=()):
+        self._actions = actions
+        spec = provider_controls.ControlSpec(
+            id="resets",
+            title="Reset cards",
+            description="quota reset cards",
+            applies=lambda context: True,
+            read=self._read,
+        )
+        for name in ("available_controls", "find_control"):
+            patch = mock.patch.object(
+                provider_controls, name, return_value=[spec]
+                if name == "available_controls" else spec)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    async def test_lists_controls_when_called_without_argument(self):
+        self._patch()
+
+        outcome = await acp_commands.run(
+            "/account", loki.current_session())
+
+        self.assertIn("resets - Reset cards", outcome.text)
+
+    async def test_reads_control_and_offers_action_ids(self):
+        ran = []
+        action = provider_controls.ControlAction(
+            id="use:7", title="Use 5-hour reset card",
+            confirm="Use the card?",
+            run=lambda: _ran(ran))
+        self._patch(actions=(action,))
+
+        outcome = await acp_commands.run(
+            "/account resets", loki.current_session())
+
+        self.assertIn("5-hour reset cards: 1 available", outcome.text)
+        self.assertIn("use:7 - Use 5-hour reset card", outcome.text)
+        self.assertEqual(ran, [])
+
+    async def test_named_action_is_the_confirmation_and_runs(self):
+        ran = []
+
+        async def run():
+            ran.append(True)
+            return provider_controls.ControlResult(
+                lines=("Reset card used: Weekly quota is back to 100%.",))
+
+        action = provider_controls.ControlAction(
+            id="use:7", title="Use reset card",
+            confirm="Use the card? This cannot be undone.",
+            run=run)
+        self._patch(actions=(action,))
+
+        outcome = await acp_commands.run(
+            "/account resets use:7", loki.current_session())
+
+        self.assertEqual(ran, [True])
+        self.assertIn("Use the card? This cannot be undone.", outcome.text)
+        self.assertIn("back to 100%", outcome.text)
+
+    async def test_unknown_action_is_reported_without_running(self):
+        ran = []
+        action = provider_controls.ControlAction(
+            id="use:7", title="Use reset card", confirm="Use?",
+            run=lambda: _ran(ran))
+        self._patch(actions=(action,))
+
+        outcome = await acp_commands.run(
+            "/account resets use:999", loki.current_session())
+
+        self.assertEqual(outcome.text, "No such action: use:999")
+        self.assertEqual(ran, [])
+
+
+async def _ran(bucket):
+    bucket.append(True)
+    return provider_controls.ControlResult(lines=("done",))
 
 
 if __name__ == "__main__":
