@@ -650,6 +650,128 @@ args=(%r + str(__import__('os').getpid()), 'a')
                     front.kill()
                     front.wait()
 
+    def test_advertises_commands_and_serves_slash_commands(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._front_env(tmpdir)
+            front = subprocess.Popen(
+                loki_acp_command(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=env,
+                cwd=os.path.join(tmpdir, "workspace"))
+            self.addCleanup(_close_process_streams, front)
+            try:
+                def send(message):
+                    front.stdin.write(json.dumps(message) + "\n")
+                    front.stdin.flush()
+
+                def recv():
+                    line = front.stdout.readline()
+                    self.assertTrue(line, "front produced no message")
+                    return json.loads(line)
+
+                def recv_reply(reply_id):
+                    while True:
+                        message = recv()
+                        if message.get("id") == reply_id:
+                            return message
+
+                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": 1}})
+                recv_reply(1)
+
+                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                      "params": {"cwd": _configured_workspace(tmpdir)}})
+                reply = recv_reply(2)
+                session_id = reply["result"]["sessionId"]
+
+                # The advertisement follows the session reply, so the client
+                # already knows the session it describes.
+                message = recv()
+                self.assertEqual(message["method"], "session/update")
+                self.assertEqual(message["params"]["sessionId"], session_id)
+                update = message["params"]["update"]
+                self.assertEqual(
+                    update["sessionUpdate"], "available_commands_update")
+                self.assertIn(
+                    "pwd",
+                    [command["name"] for command in update["availableCommands"]])
+
+                # /pwd is answered locally: no model turn, no dummy reply.
+                send({"jsonrpc": "2.0", "id": 3,
+                      "method": "session/prompt",
+                      "params": {
+                          "sessionId": session_id,
+                          "prompt": [{"type": "text", "text": "/pwd"}]}})
+                chunks = []
+                while True:
+                    message = recv()
+                    if message.get("id") == 3:
+                        reply = message
+                        break
+                    if (message.get("method") == "session/update"
+                            and message["params"]["update"]["sessionUpdate"]
+                            == "agent_message_chunk"):
+                        chunks.append(
+                            message["params"]["update"]["content"]["text"])
+                self.assertEqual(reply["result"]["stopReason"], "end_turn")
+                text = "".join(chunks)
+                self.assertIn("cwd:", text)
+                self.assertNotIn("acp reply text", text)
+
+                # /image stages a snapshot for the next prompt.
+                with open(os.path.join(
+                        _configured_workspace(tmpdir), "shot.png"), "wb") as stream:
+                    stream.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+                send({"jsonrpc": "2.0", "id": 6,
+                      "method": "session/prompt",
+                      "params": {
+                          "sessionId": session_id,
+                          "prompt": [{"type": "text",
+                                      "text": "/image shot.png"}]}})
+                chunks = []
+                while True:
+                    message = recv()
+                    if message.get("id") == 6:
+                        reply = message
+                        break
+                    if (message.get("method") == "session/update"
+                            and message["params"]["update"]["sessionUpdate"]
+                            == "agent_message_chunk"):
+                        chunks.append(
+                            message["params"]["update"]["content"]["text"])
+                self.assertEqual(reply["result"]["stopReason"], "end_turn")
+                self.assertIn("Attached image", "".join(chunks))
+
+                # A plain prompt still reaches the provider.
+                send({"jsonrpc": "2.0", "id": 4,
+                      "method": "session/prompt",
+                      "params": {
+                          "sessionId": session_id,
+                          "prompt": [{"type": "text", "text": "hello"}]}})
+                chunks = []
+                while True:
+                    message = recv()
+                    if message.get("id") == 4:
+                        break
+                    if (message.get("method") == "session/update"
+                            and message["params"]["update"]["sessionUpdate"]
+                            == "agent_message_chunk"):
+                        chunks.append(
+                            message["params"]["update"]["content"]["text"])
+                self.assertIn("acp reply text", "".join(chunks))
+
+                send({"jsonrpc": "2.0", "id": 5,
+                      "method": "session/close",
+                      "params": {"sessionId": session_id}})
+                self.assertEqual(recv_reply(5)["result"], {})
+            finally:
+                front.stdin.close()
+                try:
+                    front.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    front.kill()
+                    front.wait()
+
     def test_front_delegates_credentials_without_worker_environment_values(self):
         credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
         credential_value = "secret-" + ("v" * 137)

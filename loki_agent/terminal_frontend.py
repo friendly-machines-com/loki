@@ -9,19 +9,17 @@ log machinery -- importing it no longer touches the tty.
 from __future__ import annotations
 
 import asyncio
-import base64
 import getopt
 import json
 import logging
-import os
-import shlex
 import signal
-import stat
 import sys
 from dataclasses import dataclass
 
+from . import attachments
 from .diagnostics import debug_json
 from . import formats
+from .attachments import ImageAttachmentError, load_image_attachment
 from . import authentications
 from . import credential_capabilities
 from . import credential_runtimes
@@ -91,11 +89,8 @@ from .terminals import (
 logger = logging.getLogger(__name__)
 
 
-IMAGE_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
-
-
-class ImageAttachmentError(ValueError):
-    pass
+def _image_command_path(command_text: str) -> str:
+    return attachments.image_argument_path(command_text[len("/image"):])
 
 
 @dataclass
@@ -131,103 +126,6 @@ class TerminalActivityStatus:
 
 
 _terminal_activity = TerminalActivityStatus()
-
-
-@dataclass(frozen=True)
-class StagedImage:
-    path: str
-    media_type: str
-    encoded_data: str
-    byte_size: int
-
-    def content_block(self) -> dict:
-        return {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": self.media_type,
-                "data": self.encoded_data,
-            },
-        }
-
-
-def _image_media_type(data: bytes) -> str | None:
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if (len(data) >= 12
-            and data.startswith(b"RIFF")
-            and data[8:12] == b"WEBP"):
-        return "image/webp"
-    return None
-
-
-def _image_command_path(command_text: str) -> str:
-    try:
-        parts = shlex.split(command_text[len("/image"):].strip())
-    except ValueError as error:
-        raise ImageAttachmentError(f"invalid path quoting: {error}") from error
-    if len(parts) != 1:
-        raise ImageAttachmentError(
-            "usage: /image PATH (quote a path containing spaces)")
-    return parts[0]
-
-
-def load_image_attachment(path_text: str, *,
-                          base_dir: str | None = None,
-                          max_bytes: int | None = None) -> StagedImage:
-    """Read one local image snapshot for a later terminal prompt."""
-    limit = IMAGE_ATTACHMENT_MAX_BYTES if max_bytes is None else max_bytes
-    if limit < 1:
-        raise ValueError("image attachment limit must be positive")
-
-    path = path_text
-    if not os.path.isabs(path):
-        path = os.path.join(base_dir or current_cwd(), path)
-
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    fd = None
-    try:
-        fd = os.open(path, flags)
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ImageAttachmentError(
-                f"not a regular file: {display_path(path)}")
-        if file_stat.st_size > limit:
-            raise ImageAttachmentError(
-                f"image is {file_stat.st_size} bytes; maximum is "
-                f"{limit} bytes")
-        with os.fdopen(fd, "rb") as image_file:
-            fd = None
-            data = image_file.read(limit + 1)
-    except ImageAttachmentError:
-        raise
-    except (OSError, ValueError) as error:
-        detail = getattr(error, "strerror", None) or str(error)
-        raise ImageAttachmentError(
-            f"cannot read {display_path(path)}: {detail}") from error
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-    if len(data) > limit:
-        raise ImageAttachmentError(
-            f"image exceeds the {limit}-byte maximum")
-    media_type = _image_media_type(data)
-    if media_type is None:
-        raise ImageAttachmentError(
-            "unsupported image data; expected PNG, JPEG, GIF, or WebP")
-    return StagedImage(
-        path=path,
-        media_type=media_type,
-        encoded_data=base64.b64encode(data).decode("ascii"),
-        byte_size=len(data),
-    )
 
 
 def _print_tool_args(args):
