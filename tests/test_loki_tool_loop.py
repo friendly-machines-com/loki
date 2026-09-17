@@ -20,6 +20,7 @@ from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import formats
 from loki_agent import authentications
+from loki_agent import attachments
 from loki_agent import credential_runtimes
 from loki_agent import credential_supervisors
 from loki_agent import http_client
@@ -168,7 +169,7 @@ class TerminalImageCommandTests(unittest.TestCase):
         for data, expected in samples.items():
             with self.subTest(expected=expected, data=data):
                 self.assertEqual(
-                    terminal_frontend._image_media_type(data), expected)
+                    attachments.image_media_type(data), expected)
 
     def test_loader_rejects_missing_non_image_non_file_and_oversize(self):
         with tempfile.TemporaryDirectory() as tmpdir:

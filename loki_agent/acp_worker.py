@@ -10,6 +10,7 @@ import sys
 from dataclasses import dataclass
 
 from . import (
+    acp_commands,
     acps,
     acp_events,
     formats,
@@ -59,6 +60,8 @@ class Worker:
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
         self._pending_open: PendingSessionOpen | None = None
+        # Images staged by /image, attached to the next real-turn prompt.
+        self._pending_images: list = []
 
     async def handle(self, message: dict, concurrent: bool = False):
         method = message.get("method")
@@ -482,7 +485,12 @@ class Worker:
         # the agent's context and must not emit historical session updates.
         if pending.open_method == "session/load":
             self._replay_transcript()
-        return {"configOptions": self.config_options()}
+        return {
+            "configOptions": self.config_options(),
+            # The front emits these as available_commands_update after the
+            # session reply, so the client knows the session first.
+            "lokiCommands": acp_commands.advertised_commands(),
+        }
 
     def _install_catalog_choices(self, discovered):
         if not discovered:
@@ -645,8 +653,38 @@ class Worker:
 
         self.cancel_event.clear()
         self.session_id = params.get("sessionId") or self.session_id
+
+        # A command is recognized before it reaches the transcript: like the
+        # terminal front, local commands answer out of band and never become
+        # conversation.  Skills are advertised but not intercepted, so their
+        # text falls through to the model's Skill tool.
+        outcome = None
+        if user_text.lstrip().startswith(("/", "!")):
+            try:
+                outcome = await acp_commands.run(user_text, self.session)
+            except Exception as error:  # noqa: BLE001 - answered, not fatal
+                outcome = acp_commands.Outcome(
+                    text=f"Command failed: {error}")
+        if outcome is not None:
+            if outcome.text:
+                self.write(acps.notification(
+                    "session/update",
+                    acp_events.agent_message_chunk(
+                        self.session_id, outcome.text)))
+            if outcome.image is not None:
+                self._pending_images.append(outcome.image)
+            if outcome.model_text is None:
+                return {"stopReason": "end_turn"}
+            user_text = outcome.model_text
+
+        user_content = []
+        if user_text:
+            user_content.append(formats.text_block(user_text))
+        user_content.extend(
+            image.content_block() for image in self._pending_images)
+        self._pending_images.clear()
         self.session.transcript_items.append(
-            formats.message_item("user", user_text))
+            formats.message_item("user", user_content))
         loki.mark_chat_log_dirty()
         events = []
         mapper_state: dict = {}

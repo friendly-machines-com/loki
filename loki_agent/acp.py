@@ -307,7 +307,25 @@ class Front:
         finally:
             if forwarded is not None:
                 forwarded.set()
+        commands = None
+        if isinstance(result, dict):
+            commands = result.pop("lokiCommands", None)
         self.write(acps.response(request_id, result=result))
+        if commands:
+            # Ordering is the point: the client learns the session from the
+            # reply above, then receives the commands advertised for it.
+            session_id = (
+                result.get("sessionId") if isinstance(result, dict) else None)
+            if not isinstance(session_id, str) or not session_id:
+                session_id = (message.get("params") or {}).get("sessionId")
+            if isinstance(session_id, str) and session_id:
+                self.write(acps.notification("session/update", {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": commands,
+                    },
+                }))
 
     async def dispatch(
             self, method: str, params: dict, request_id=None,
@@ -559,6 +577,9 @@ class Front:
         config_options = worker_reply.get("configOptions")
         if config_options:
             result["configOptions"] = config_options
+        commands = worker_reply.get("lokiCommands")
+        if commands:
+            result["lokiCommands"] = commands
         return result
 
     async def restore_session(
@@ -581,6 +602,9 @@ class Front:
         config_options = worker_reply.get("configOptions")
         if config_options:
             result["configOptions"] = config_options
+        commands = worker_reply.get("lokiCommands")
+        if commands:
+            result["lokiCommands"] = commands
         return result
 
     def list_sessions(self, params: dict) -> dict:
