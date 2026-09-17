@@ -156,6 +156,7 @@ def main() -> int:
         # filesystem view before importing the agent runtime, then make the
         # final credential-consuming process non-dumpable.
         runtime_isolation.isolate_runtime()
+        runtime_isolation.prepare_runtime_scratch()
         protect_credential_process()
     except ValueError as error:
         print(f"Configuration error: {error}", file=sys.stderr)

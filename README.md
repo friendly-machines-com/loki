@@ -34,6 +34,13 @@ releases in those branches are excluded because Windows did not yet honor
 
 Run it in a VM or container.
 
+On Windows there is no VM requirement: ``loki-setup`` configures an
+AppContainer for a workspace and the runtimes it starts run inside it.  The
+contained runtime's ``TEMP`` and ``TMP`` point at ``<workspace>\.loki\tmp``,
+which it creates at startup if it is missing and never removes; the tools that
+use it may delete it between runs, and removing its contents is the user's
+business.
+
 ```
 export LOKI_API_KEY=xxx
 export LOKI_API_BASE="https://opencode.ai/zen/go/v1/chat/completions"
