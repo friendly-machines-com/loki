@@ -2,7 +2,9 @@
 
 import ctypes
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -76,6 +78,41 @@ class GateTests(unittest.TestCase):
         probe.assert_called_once_with('/work')
 
 
+class ScratchTests(unittest.TestCase):
+    """Scratch lives in the workspace, and startup recreates it."""
+
+    def test_startup_creates_and_recreates_the_directory(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            directory = runtime.scratch_directory(workspace)
+            self.assertEqual(
+                directory, os.path.join(workspace, '.loki', 'tmp'))
+            with mock.patch.dict(
+                    os.environ, {runtime.WORKSPACE_ENV: workspace}):
+                runtime.ensure_runtime_temp()
+                self.assertTrue(os.path.isdir(directory))
+                # The tools that use it may delete it between runs.
+                shutil.rmtree(directory)
+                runtime.ensure_runtime_temp()
+                self.assertTrue(os.path.isdir(directory))
+            # Startup never removes it afterwards.
+            self.assertTrue(os.path.isdir(directory))
+
+    def test_startup_requires_the_launch_workspace(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                    RuntimeIsolationError, 'launch workspace'):
+                runtime.ensure_runtime_temp()
+
+    def test_startup_fails_closed_when_the_directory_cannot_be_made(self):
+        with mock.patch.dict(
+                os.environ, {runtime.WORKSPACE_ENV: '/work'}), \
+                mock.patch.object(runtime.os, 'makedirs',
+                                  side_effect=OSError('denied')):
+            with self.assertRaisesRegex(
+                    RuntimeIsolationError, 'scratch directory'):
+                runtime.ensure_runtime_temp()
+
+
 class EntrypointTests(unittest.TestCase):
     def test_failed_isolation_stops_before_process_protection(self):
         from loki_agent import __main__ as entry
@@ -124,6 +161,13 @@ class IsolationSeamTests(unittest.TestCase):
                                'verify_runtime') as verify:
             runtime_isolation.verify_contained_runtime()
         verify.assert_called_once_with()
+
+    def test_prepare_runtime_scratch_creates_the_workspace_directory(self):
+        from loki_agent import runtime_isolation
+        with mock.patch.object(runtime_isolation.windows_runtime,
+                               'ensure_runtime_temp') as ensure:
+            runtime_isolation.prepare_runtime_scratch()
+        ensure.assert_called_once_with()
 
     def test_runtime_cwd_is_the_supervisor_cwd_not_the_workspace(self):
         # The terminal runtime's ambient cwd is inherited from the
@@ -249,8 +293,10 @@ class LaunchTests(unittest.TestCase):
                     runtime.launch('loki.py', ['--runtime'], {'SAFE': 'value'},
                                    '/work', [40, 41],
                                    current_directory='/work')
-            self.assertEqual(create.call_args.kwargs['environment'],
-                             {'SAFE': 'value', runtime.WORKSPACE_ENV: '/work'})
+            scratch = os.path.join('/work', runtime.SCRATCH_DIRECTORY)
+            self.assertEqual(create.call_args.kwargs['environment'], {
+                'SAFE': 'value', runtime.WORKSPACE_ENV: '/work',
+                'TEMP': scratch, 'TMP': scratch})
             self.assertEqual(create.call_args.kwargs['current_directory'],
                              '/work')
             self.assertEqual(create.call_args.kwargs['inherited_handles'],

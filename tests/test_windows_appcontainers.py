@@ -38,6 +38,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -589,6 +590,28 @@ def stdio_child():
     return 0
 
 
+def scratch_child(directory, report_path):
+    """Contained half of the workspace-scratch experiment.
+
+    The production runtime creates this directory at startup -- the tools that
+    use it can delete it between runs -- and writes its temporary files there.
+    This does the same with stdlib calls only, so the shipped probe still adds
+    no package import to the contained child."""
+    report = {'directory': directory, 'created': False, 'file': None,
+              'error': None}
+    try:
+        os.makedirs(directory, exist_ok=True)
+        report['created'] = os.path.isdir(directory)
+        with tempfile.NamedTemporaryFile(
+                dir=directory, prefix='loki-', delete=False) as stream:
+            stream.write(b'scratch\n')
+            report['file'] = stream.name
+    except OSError as error:
+        report['error'] = '%s: %s' % (type(error).__name__, error)
+    Path(report_path).write_text(json.dumps(report))
+    return 0
+
+
 def pipe_inheritance_probe(native, sid, workspace, output):
     """Confirm an AppContainer child can use inherited anonymous pipe ends.
 
@@ -669,6 +692,40 @@ def pipe_stdio_probe(native, sid, workspace, output):
     finally:
         for handle in (stdin_read, stdin_write, stdout_read, stdout_write):
             native.check(native.close(handle))
+
+
+def scratch_probe(native, sid, workspace, report_path):
+    """Confirm a contained process can create and use its scratch directory.
+
+    The contained runtime's TEMP/TMP point inside the granted workspace, and
+    the runtime itself creates the directory at startup.  So the native
+    question is whether a contained process can create that directory and
+    write a file in it -- not whether the unrestricted broker can pre-create
+    it.  The broker removes the directory first, so a successful child also
+    demonstrates the recreate-if-missing step."""
+    from loki_agent import windows_runtime
+
+    directory = windows_runtime.scratch_directory(str(workspace))
+    if os.path.isdir(directory):
+        shutil.rmtree(directory)
+    child_report = Path(report_path)
+    code = native.launch(
+        [sys.executable, '-I', '-u', __file__, '--scratch-child',
+         directory, str(child_report)],
+        sid, workspace, workspace / 'scratch-child.log')
+    if code != 0:
+        raise RuntimeError('AppContainer scratch child exited %d' % code)
+    report = json.loads(child_report.read_text())
+    if report.get('error') or not report.get('created'):
+        raise RuntimeError('AppContainer scratch child reported %r' % (report,))
+    if not str(report.get('file') or '').startswith(directory):
+        raise RuntimeError('scratch file outside its directory: %r'
+                           % (report.get('file'),))
+    if not os.path.isfile(report['file']):
+        raise RuntimeError('scratch file missing: %r' % (report.get('file'),))
+    return {'probe': 'workspace-scratch',
+            'outcome': 'created-and-used-after-removal',
+            'directory': directory}
 
 
 def peer_readiness_failure(peer, log):
@@ -1389,6 +1446,17 @@ class EscapeResultTests(unittest.TestCase):
                 result, 0, ('access-denied',))['passed']
             self.assertEqual(passed, outcome == 'access-denied')
         self.assertEqual(creator.call_count, 4)
+
+    def test_scratch_child_creates_and_uses_its_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, '.loki', 'tmp')
+            report_path = os.path.join(directory, 'report.json')
+            self.assertEqual(scratch_child(target, report_path), 0)
+            report = json.loads(Path(report_path).read_text())
+            self.assertIsNone(report['error'])
+            self.assertTrue(report['created'])
+            self.assertTrue(report['file'].startswith(target))
+            self.assertTrue(os.path.isfile(report['file']))
 
     def test_cleanup_tree_children_use_workspace_files(self):
         # Contained witnesses cannot open 'nul' (native errno 13), so the
@@ -2522,6 +2590,14 @@ class AppContainerTests(unittest.TestCase):
             native, sid, workspace, root / 'pipe-stdio.log')
         print(json.dumps(stdio_result), flush=True)
         self.assertEqual(stdio_result['outcome'], 'stdio-both-directions-used')
+        # The contained runtime's scratch directory lives inside the granted
+        # workspace and the runtime creates it itself, so the child -- not the
+        # broker -- must be able to create it and write there.
+        scratch_result = scratch_probe(
+            native, sid, workspace, workspace / 'scratch-report.json')
+        print(json.dumps(scratch_result), flush=True)
+        self.assertEqual(
+            scratch_result['outcome'], 'created-and-used-after-removal')
         # Medium-integrity file created by the unrestricted broker, for the
         # contained process's write-up characterization: the DACL permits the
         # container, so only mandatory integrity control can deny it.  Both
@@ -3013,6 +3089,8 @@ if __name__ == '__main__':
         sys.exit(pipe_child(int(sys.argv[2]), int(sys.argv[3])))
     if len(sys.argv) == 2 and sys.argv[1] == '--stdio-child':
         sys.exit(stdio_child())
+    if len(sys.argv) == 4 and sys.argv[1] == '--scratch-child':
+        sys.exit(scratch_child(sys.argv[2], sys.argv[3]))
     if len(sys.argv) == 4 and sys.argv[1] == '--peer':
         escape_helpers['peer'](AppContainers(), sys.argv[2], Path(sys.argv[3]))
         sys.exit(0)

@@ -20,6 +20,10 @@ from .runtime_isolations import RuntimeIsolationError
 
 WORKSPACE_ENV = "LOKI_CONTAINER_WORKSPACE"
 
+# The contained runtime's scratch directory, relative to the workspace.  It is
+# inside the granted tree on purpose; see ensure_runtime_temp.
+SCRATCH_DIRECTORY = os.path.join(".loki", "tmp")
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +72,37 @@ def verify_runtime():
     if not workspace:
         raise RuntimeIsolationError("Missing Windows container launch workspace")
     require_checks(windows_verify.probe_containment(workspace))
+
+
+def scratch_directory(workspace):
+    """This runtime's scratch directory, inside the granted workspace.
+
+    The workspace is the only tree the AppContainer may write, so scratch goes
+    there rather than in the user's profile TEMP -- which holds no package
+    grant (as do its USERPROFILE and Windows-directory fallbacks) and is shared
+    with every other process running as that user.  ``launch`` points TEMP and
+    TMP here; nothing else in Loki uses this path.
+    """
+    return os.path.join(workspace, SCRATCH_DIRECTORY)
+
+
+def ensure_runtime_temp():
+    """Create the scratch directory if it is missing.
+
+    The directory is writable by the very tools that use it, so it can be
+    deleted between runs; startup recreates it.  Loki never removes it or its
+    contents -- that is the user's business.
+    """
+    workspace = os.environ.get(WORKSPACE_ENV)
+    if not workspace:
+        raise RuntimeIsolationError("Missing Windows container launch workspace")
+    directory = scratch_directory(workspace)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as error:
+        raise RuntimeIsolationError(
+            f"could not create the runtime scratch directory "
+            f"{directory!r}: {error}") from error
 
 
 # Layouts used by the native fixture in tests/test_windows_appcontainers.py.
@@ -154,6 +189,12 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
     package = api.derive_app_container_sid(state.profile_name_for(workspace))
     child_environment = dict(environment)
     child_environment[WORKSPACE_ENV] = workspace
+    # Scratch inside the granted workspace: the profile TEMP holds no package
+    # grant and is shared with every other process running as the user.  The
+    # contained runtime recreates the directory if it is missing.
+    scratch = scratch_directory(workspace)
+    child_environment["TEMP"] = scratch
+    child_environment["TMP"] = scratch
     # The image is this process's own interpreter or executable, never the
     # string the caller used to start it: in a frozen build sys.argv[0] can be
     # a relative name or a symlink, and the child's cwd is whatever the

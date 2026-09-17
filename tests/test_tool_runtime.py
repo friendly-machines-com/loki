@@ -386,6 +386,21 @@ class ExternalHookTests(unittest.TestCase):
             finally:
                 loki.TOOL_HOOK_PIPELINE = old_pipeline
 
+    def test_hook_environment_carries_scratch_but_not_credentials(self):
+        source = dict(os.environ)
+        source.update({
+            "LOKI_API_KEY": "secret",
+            "UNRELATED_SECRET": "secret",
+            "TEMP": "/workspace/.loki/tmp",
+            "TMP": "/workspace/.loki/tmp",
+        })
+        environment = tool_runtime._hook_environment(source)
+        # Windows hook children have no profile TEMP to fall back on.
+        self.assertEqual(environment["TEMP"], "/workspace/.loki/tmp")
+        self.assertEqual(environment["TMP"], "/workspace/.loki/tmp")
+        self.assertNotIn("LOKI_API_KEY", environment)
+        self.assertNotIn("UNRELATED_SECRET", environment)
+
     def test_external_hook_is_bounded_to_minimal_environment(self):
         script = (
             "import json, os, sys; "

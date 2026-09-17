@@ -762,7 +762,7 @@ def _hook_environment(environ=None):
     source_environ = os.environ if environ is None else environ
     allowed = {
         "HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "SHELL",
-        "TERM", "TMPDIR", "USER",
+        "TEMP", "TERM", "TMP", "TMPDIR", "USER",
     }
     return {
         key: value for key, value in source_environ.items()

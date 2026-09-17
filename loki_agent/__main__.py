@@ -48,6 +48,7 @@ def _protect_runtime() -> bool:
     # Isolation happens before the large runtime import and while this newly
     # execed Python process is still single-threaded.
     runtime_isolation.isolate_runtime()
+    runtime_isolation.prepare_runtime_scratch()
     return protect_credential_process()
 
 

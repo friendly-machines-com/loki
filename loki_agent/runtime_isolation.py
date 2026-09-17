@@ -30,6 +30,7 @@ __all__ = [
     "configured_workspace",
     "isolate_runtime",
     "preflight",
+    "prepare_runtime_scratch",
     "start_runtime",
     "start_worker",
     "verify_contained_runtime",
@@ -72,6 +73,10 @@ if sys.platform == "win32":
     def verify_contained_runtime() -> None:
         """A subagent inherits containment; re-check the token on Windows."""
         windows_runtime.verify_runtime()
+
+    def prepare_runtime_scratch() -> None:
+        """Give the contained runtime the scratch directory it was pointed at."""
+        windows_runtime.ensure_runtime_temp()
 
     def configured_workspace(arguments: list[str]) -> str | None:
         return windows_runtime.configured_workspace(arguments)
@@ -197,6 +202,11 @@ else:
     def verify_contained_runtime() -> None:
         # A subagent inherits the runtime's covered mount; re-unsharing would
         # add a namespace level for no security gain.
+        return None
+
+    def prepare_runtime_scratch() -> None:
+        # POSIX scratch is the inherited TMPDIR: /tmp carries the sticky bit,
+        # and the surrounding VM is the boundary, so nothing is relocated.
         return None
 
     def configured_workspace(arguments: list[str]) -> str | None:
