@@ -73,11 +73,17 @@ class ControlSpec:
 
 def _registry() -> tuple[ControlSpec, ...]:
     # Imported lazily so provider modules can import these types.
-    from . import deepseek_controls, openai_controls, openrouter_controls
+    from . import (
+        deepseek_controls,
+        openai_controls,
+        openrouter_controls,
+        zai_controls,
+    )
     return (
         *openai_controls.CONTROLS,
         *openrouter_controls.CONTROLS,
         *deepseek_controls.CONTROLS,
+        *zai_controls.CONTROLS,
     )
 
 
