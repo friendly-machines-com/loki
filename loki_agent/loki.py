@@ -44,6 +44,7 @@ from . import paths
 from . import protocols
 from . import authentications
 from . import credential_capabilities
+from . import endpoint_pins
 from . import savefiles
 from . import sse
 from . import tool_runtime
@@ -809,6 +810,26 @@ def config_from_modelsdev_selection(
     if access is None:
         raise ValueError(
             f"provider {provider_id!r} is not available from startup credentials")
+    # A catalog endpoint decides where this provider's static credential is
+    # sent, and the catalog is untrusted input.  Only an endpoint+credential
+    # pair the user has approved may be used: the picker asks in the terminal,
+    # and the ACP front asks with an elicitation before forwarding the change.
+    # A front that cannot ask (headless, subagent) fails closed here.  A
+    # synthetic provider decides neither, so approval does not apply to it.
+    if not modelsdev.provider_is_synthetic(provider_entry):
+        state, approved = endpoint_pins.status(
+            provider_id, access.api_url, access.credential_ref.encode())
+        if state != endpoint_pins.PINNED:
+            detail = (
+                f"differs from the approved endpoint "
+                f"{approved['api']!r} with credential "
+                f"{approved['credential']!r}"
+                if state == endpoint_pins.CHANGED
+                else "has not been approved")
+            raise ValueError(
+                f"provider endpoint {access.api_url!r} with credential "
+                f"{access.credential_ref.encode()!r} {detail}; approve it "
+                "once before using this provider here")
     selected_model = model_entry.get("id") or model_entry.get("name")
     if not selected_model:
         raise ValueError(f"provider {provider_id!r} returned a model without an id")

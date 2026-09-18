@@ -13,6 +13,7 @@ from . import (
     acp_commands,
     acps,
     acp_events,
+    endpoint_pins,
     formats,
     loki,
     models as modelsdev,
@@ -165,10 +166,48 @@ class Worker:
             return self.commit_open()
         if method == "session/set_config_option":
             return self.set_config_option(params)
+        if method == "session/describe_config_selection":
+            return self.describe_config_selection(params)
         raise acps.TransportError(
             f"worker does not implement {method}",
             code=acps.METHOD_NOT_FOUND,
         )
+
+    def describe_config_selection(self, params: dict) -> dict:
+        """Report the endpoint+credential one config value would use.
+
+        Read-only, for the front to turn into an approval request.  An empty
+        object means there is nothing to approve: the value selects no catalog
+        provider (an explicit or saved connection, or the disconnected stub),
+        the provider is synthetic, the provider is unusable, or the pair is
+        already approved.
+        """
+        leaf = self._option_leaves.get(params.get("value"))
+        if not isinstance(leaf, tuple) or len(leaf) != 3:
+            return {}
+        provider_id, provider_entry, model_entry = leaf
+        if modelsdev.provider_is_synthetic(provider_entry):
+            return {}
+        effective = modelsdev.effective_provider(provider_entry, model_entry)
+        access = modelsdev.provider_access(effective, loki.CREDENTIALS)
+        if access is None:
+            return {}
+        credential = access.credential_ref.encode()
+        state, approved = endpoint_pins.status(
+            provider_id, access.api_url, credential)
+        if state == endpoint_pins.PINNED:
+            return {}
+        return {
+            "providerId": provider_id,
+            "endpoint": access.api_url,
+            "credential": credential,
+            "changed": state == endpoint_pins.CHANGED,
+            "approvedEndpoint": (
+                approved.get("api") if isinstance(approved, dict) else None),
+            "approvedCredential": (
+                approved.get("credential")
+                if isinstance(approved, dict) else None),
+        }
 
     # -- session lifecycle and model configuration -----------------------
 

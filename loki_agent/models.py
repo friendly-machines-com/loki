@@ -29,6 +29,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from . import authentications
+from . import endpoint_pins
 from . import http_client
 from . import openai_models
 from . import protocols
@@ -181,32 +182,15 @@ def _validate_catalog(data):
     return data
 
 
-def _openai_platform_signature(provider_entry):
-    """Whether this is exactly the native OpenAI provider models.dev emits."""
-    return (
-        provider_entry.get("id") == "openai"
-        and provider_entry.get("npm") == "@ai-sdk/openai"
-        and provider_entry.get("env") == ["OPENAI_API_KEY"]
-    )
-
-
-def _canonical_openai_platform_api(api):
-    if not isinstance(api, str):
-        return False
-    return api.rstrip("/") in {
-        OPENAI_PLATFORM_API_BASE,
-        OPENAI_PLATFORM_API_BASE + "/responses",
-    }
-
-
 def normalize_catalog(data):
-    """Return a catalog with fail-closed, explicitly marked Loki repairs.
+    """Return a catalog with Loki's endpoint repair applied.
 
-    The provider-map key, provider id, native SDK package, and credential
-    declaration must all identify OpenAI exactly.  The SDK package alone is
-    not unique in models.dev.  A changed signature or noncanonical endpoint
-    is rejected rather than risking disclosure of ``OPENAI_API_KEY`` to a
-    different service.
+    models.dev leaves the endpoint out for providers whose native SDK package
+    knows it internally; substituting the documented OpenAI platform base
+    keeps that provider usable.  Nothing else is decided here: which endpoint
+    receives which credential is confirmed by the user on selection
+    (``endpoint_pins``), for every provider alike, so a changed catalog entry
+    is shown rather than silently trusted or silently refused.
 
     This function never mutates the raw downloaded or cached catalog.
     """
@@ -218,29 +202,16 @@ def normalize_catalog(data):
         normalized.pop(OPENAI_SUBSCRIPTION_PROVIDER_ID, None)
 
     provider_entry = data.get("openai")
-    if provider_entry is None:
-        return normalized
-    if not isinstance(provider_entry, dict):
+    if not isinstance(provider_entry, dict) or provider_entry.get("api"):
         return normalized
 
     normalized = dict(normalized)
     normalized_provider = dict(provider_entry)
+    normalized_provider["api"] = OPENAI_PLATFORM_API_BASE
+    # Marked so the picker can say the endpoint came from Loki's own default
+    # rather than from the catalog; the user still approves it on selection.
+    normalized_provider[_LOKI_API_SOURCE_KEY] = _OPENAI_PLATFORM_API_SOURCE
     normalized["openai"] = normalized_provider
-
-    if not _openai_platform_signature(provider_entry):
-        normalized_provider[_LOKI_API_REJECTION_KEY] = (
-            "canonical OpenAI provider signature changed")
-        return normalized
-
-    api = provider_entry.get("api")
-    if not api:
-        normalized_provider["api"] = OPENAI_PLATFORM_API_BASE
-        normalized_provider[_LOKI_API_SOURCE_KEY] = (
-            _OPENAI_PLATFORM_API_SOURCE)
-    elif not _canonical_openai_platform_api(api):
-        normalized_provider[_LOKI_API_REJECTION_KEY] = (
-            "canonical OpenAI provider declared a non-OpenAI endpoint")
-        return normalized
 
     return normalized
 
@@ -607,10 +578,6 @@ def effective_provider(provider_entry, model_entry):
     if "shape" in override and override["shape"] not in (
             "responses", "completions"):
         resolved[_LOKI_API_REJECTION_KEY] = "invalid model provider shape"
-    # A model override must not bypass the canonical OpenAI endpoint checks
-    # applied to the provider during catalog normalization.
-    if provider_entry.get("id") == "openai":
-        resolved = normalize_catalog({"openai": resolved})["openai"]
     return resolved
 
 
@@ -1176,6 +1143,69 @@ def flattened_config_option_choices(
     return choices
 
 
+def provider_is_synthetic(provider_entry) -> bool:
+    """Whether this provider entry was built in-process, not downloaded.
+
+    The endpoint-approval check exists because the *catalog* decides where a
+    credential goes.  An entry Loki synthesized from authenticated discovery
+    decides nothing: its endpoint is one of Loki's own constants and its
+    credential is the in-process reference JSON cannot forge, with the AuthSpec
+    already bound to those exact URLs.
+    """
+    return provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
+        _OPENAI_SUBSCRIPTION_SENTINEL)
+
+
+async def _confirm_catalog_endpoint(
+        input_fn, text_writer, credentials, provider_id, provider_entry,
+        model_entry):
+    """Require explicit approval of what a catalog provider would send, and where.
+
+    The endpoint and the credential shown are the ones a request would
+    actually use (``effective_provider``, so a model-level ``api`` override is
+    covered), never the raw provider template.  Returns False when the user
+    declines.
+    """
+    if provider_is_synthetic(provider_entry):
+        # Loki's own endpoint and credential; nothing here is catalog-decided,
+        # so there is nothing to approve.
+        return True
+    effective = effective_provider(provider_entry, model_entry)
+    access = provider_access(effective, credentials)
+    if access is None:
+        # Unusable: no endpoint or no credential present.  Building the
+        # selection rejects it again, so there is nothing to approve here.
+        return True
+    api = access.api_url
+    credential = access.credential_ref.encode()
+    state, approved = endpoint_pins.status(provider_id, api, credential)
+    if state == endpoint_pins.PINNED:
+        return True
+    print()
+    print("Provider endpoint has not been approved yet:"
+          if state == endpoint_pins.NEW else "Provider endpoint changed:")
+    if state == endpoint_pins.CHANGED:
+        print("  approved endpoint:   ", end="")
+        text_writer(str(approved["api"]))
+        print()
+        print("  approved credential: ", end="")
+        text_writer(str(approved["credential"]))
+        print()
+    print("  endpoint:   ", end="")
+    text_writer(api)
+    print()
+    print("  credential: ", end="")
+    text_writer(credential)
+    print()
+    answer = (await input_fn(
+        "Send this credential to this endpoint? Type y to approve "
+        "(anything else cancels): ") or "")
+    if answer.strip().lower() not in ("y", "yes"):
+        return False
+    endpoint_pins.record(provider_id, api, credential)
+    return True
+
+
 async def run_model_picker_async(
         input_fn,
         credentials: CredentialStore | CredentialInventory,
@@ -1229,4 +1259,12 @@ async def run_model_picker_async(
         header="Usable providers:")
     if picked is None:
         return None
+    if not isinstance(picked, ExplicitConnectionOption):
+        # An explicit LOKI_* connection is the user's own configuration, not a
+        # downloaded catalog entry, so it is not subject to endpoint approval.
+        provider_id, provider_entry, model_entry = picked
+        if not await _confirm_catalog_endpoint(
+                input_fn, text_writer, credentials, provider_id,
+                provider_entry, model_entry):
+            return None
     return picked

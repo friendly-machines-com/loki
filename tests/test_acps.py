@@ -26,6 +26,7 @@ from loki_agent import (
     models,
 )
 from loki_agent.credentials import CredentialStore, is_credential_name
+from loki_endpoints import assume_endpoints_approved
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -223,6 +224,10 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
                     forwarded.set()
                 if method == "session/prompt":
                     return await prompt_reply
+                if method == "session/describe_config_selection":
+                    # Nothing to approve for this change; the front's read-only
+                    # question is part of forwarding a config option now.
+                    return {}
                 return {"configOptions": []}
 
         front = acp.Front(
@@ -251,6 +256,7 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(order, [
             "session/prompt",
+            "session/describe_config_selection",
             "session/set_config_option",
         ])
         prompt_reply.set_result({"stopReason": "end_turn"})
@@ -1663,6 +1669,9 @@ class ConfigOptionTests(unittest.TestCase):
 
 
 class WorkerReasoningConfigTests(unittest.TestCase):
+    def setUp(self):
+        assume_endpoints_approved(self)
+
     @staticmethod
     def _profile(*values):
         return models.ReasoningEffortProfile(tuple(values))
@@ -1998,6 +2007,9 @@ class WireCwdTests(unittest.TestCase):
 
 
 class WorkerSessionContractTests(unittest.TestCase):
+    def setUp(self):
+        assume_endpoints_approved(self)
+
     def test_worker_close_reaps_session_owned_jobs(self):
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
@@ -2747,6 +2759,118 @@ class WorkerSessionContractTests(unittest.TestCase):
                 formats.validate_events(session.transcript_items)
         finally:
             loki._DEFAULT_SESSION = old_session
+
+
+class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
+    """The ACP front asks before a catalog endpoint receives a credential."""
+
+    PAIR = {
+        "providerId": "acme",
+        "endpoint": "https://acme.invalid/v1",
+        "credential": "env:ACME_API_KEY",
+        "changed": False,
+        "approvedEndpoint": None,
+        "approvedCredential": None,
+    }
+
+    def _front(self, *, supports_elicitation=True):
+        front = acp.Front(
+            lambda: None, lambda message: None, CredentialStore({}))
+        front._client_supports_form_elicitation = supports_elicitation
+        return front
+
+    def _channel(self, selection):
+        channel = mock.Mock()
+        channel.session_id = "s"
+        channel.request = mock.AsyncMock(return_value=selection)
+        return channel
+
+    async def test_accepted_approval_records_the_pair_and_asks(self):
+        front = self._front()
+        channel = self._channel(dict(self.PAIR))
+        front._request_client = mock.AsyncMock(
+            return_value={"action": "accept", "content": {"approve": True}})
+
+        with mock.patch.object(acp.endpoint_pins, "record") as record:
+            await front._approve_config_endpoint(
+                channel, {"sessionId": "s"}, 9)
+
+        params = front._request_client.await_args.args[1]
+        self.assertEqual(params["requestId"], 9)
+        self.assertEqual(params["mode"], "form")
+        self.assertIn("https://acme.invalid/v1", params["message"])
+        self.assertIn("env:ACME_API_KEY", params["message"])
+        record.assert_called_once_with(
+            "acme", "https://acme.invalid/v1", "env:ACME_API_KEY")
+
+    async def test_declined_approval_fails_the_switch(self):
+        front = self._front()
+        channel = self._channel(dict(self.PAIR))
+        front._request_client = mock.AsyncMock(
+            return_value={"action": "decline"})
+
+        with mock.patch.object(acp.endpoint_pins, "record") as record:
+            with self.assertRaises(acps.TransportError):
+                await front._approve_config_endpoint(
+                    channel, {"sessionId": "s"}, 9)
+
+        record.assert_not_called()
+
+    async def test_changed_pair_shows_the_approved_values(self):
+        front = self._front()
+        selection = dict(self.PAIR, changed=True,
+                         approvedEndpoint="https://old.invalid/v1",
+                         approvedCredential="env:OLD_KEY")
+        channel = self._channel(selection)
+        front._request_client = mock.AsyncMock(
+            return_value={"action": "accept", "content": {"approve": True}})
+
+        with mock.patch.object(acp.endpoint_pins, "record"):
+            await front._approve_config_endpoint(
+                channel, {"sessionId": "s"}, 9)
+
+        message = front._request_client.await_args.args[1]["message"]
+        self.assertIn("https://old.invalid/v1", message)
+        self.assertIn("env:OLD_KEY", message)
+        self.assertIn("https://acme.invalid/v1", message)
+
+    async def test_nothing_to_approve_asks_nothing(self):
+        front = self._front()
+        channel = self._channel({})
+        front._request_client = mock.AsyncMock()
+
+        with mock.patch.object(acp.endpoint_pins, "record") as record:
+            await front._approve_config_endpoint(
+                channel, {"sessionId": "s"}, 9)
+
+        front._request_client.assert_not_awaited()
+        record.assert_not_called()
+
+    async def test_client_without_form_elicitation_fails_closed(self):
+        front = self._front(supports_elicitation=False)
+        channel = self._channel(dict(self.PAIR))
+        front._request_client = mock.AsyncMock()
+
+        with self.assertRaises(acps.TransportError):
+            await front._approve_config_endpoint(
+                channel, {"sessionId": "s"}, 9)
+
+        front._request_client.assert_not_awaited()
+
+    async def test_config_option_change_goes_through_the_approval(self):
+        front = self._front()
+        channel = self._channel({})
+        front.workers["s"] = channel
+        front._approve_config_endpoint = mock.AsyncMock()
+
+        await front.forward_to_worker(
+            "session/set_config_option", {"sessionId": "s", "value": "v"},
+            request_id=9)
+
+        front._approve_config_endpoint.assert_awaited_once()
+        self.assertEqual(
+            channel.request.await_args.args[0],
+            "session/set_config_option")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
 from loki_agent import savefiles
 from loki_agent import terminals
+from loki_endpoints import assume_endpoints_approved
 
 
 _MISSING = object()
@@ -690,6 +691,9 @@ class ProviderReinstallTests(unittest.TestCase):
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def setUp(self):
+        assume_endpoints_approved(self)
+
     def test_reasoning_preference_is_sticky_across_model_capabilities(self):
         saved = save_loki_state([
             "runtime_config",
@@ -1527,6 +1531,7 @@ class RuntimeConfigTests(unittest.TestCase):
 
 class ModelLoadingTests(unittest.TestCase):
     def setUp(self):
+        assume_endpoints_approved(self)
         names = [
             "runtime_config", "CREDENTIALS", "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos", "job_manager",
@@ -2182,6 +2187,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
     ]
 
     def setUp(self):
+        assume_endpoints_approved(self)
         self.saved = save_loki_state(self._state_names)
 
     def tearDown(self):

@@ -17,7 +17,14 @@ import os
 import sys
 import uuid
 
-from . import __version__, acps, credential_supervisors, runtime_isolation, savefiles
+from . import (
+    __version__,
+    acps,
+    credential_supervisors,
+    endpoint_pins,
+    runtime_isolation,
+    savefiles,
+)
 from .connections import (
     ConnectionDescriptor,
     ConnectionDescriptorError,
@@ -343,7 +350,8 @@ class Front:
             return await self.close_session(params)
         if method in SESSION_METHODS:
             return await self.forward_to_worker(
-                method, params, forwarded=forwarded)
+                method, params, forwarded=forwarded,
+                request_id=request_id)
         raise acps.TransportError(
             f"method not found: {method}", code=acps.METHOD_NOT_FOUND)
 
@@ -659,7 +667,8 @@ class Front:
 
     async def forward_to_worker(
             self, method: str, params: dict,
-            forwarded: asyncio.Event | None = None):
+            forwarded: asyncio.Event | None = None,
+            request_id=None):
         session_id = params.get("sessionId")
         channel = self.workers.get(session_id)
         if channel is None:
@@ -667,5 +676,76 @@ class Front:
                 f"unknown session {session_id!r}",
                 code=acps.INVALID_PARAMS,
             )
+        if method == "session/set_config_option":
+            # A catalog endpoint decides where a static credential is sent.
+            # The worker knows which pair a config value selects; the front
+            # owns the client channel, so the approval is asked here and the
+            # worker's own check then sees an approved pair.
+            await self._approve_config_endpoint(channel, params, request_id)
         return await channel.request(
             method, params, forwarded=forwarded)
+
+    async def _approve_config_endpoint(
+            self, channel, params: dict, request_id=None) -> None:
+        """Ask the client to approve a catalog endpoint+credential pair."""
+        selection = await channel.request(
+            "session/describe_config_selection", params)
+        if not isinstance(selection, dict) or not selection:
+            return
+        if not self._client_supports_form_elicitation:
+            raise acps.TransportError(
+                "switching to this provider requires an ACP client with "
+                "form elicitation support, so its endpoint can be approved",
+                code=acps.INVALID_PARAMS,
+            )
+        facts = [("Endpoint", selection.get("endpoint")),
+                 ("Credential", selection.get("credential"))]
+        if selection.get("changed"):
+            facts = [
+                ("Approved endpoint", selection.get("approvedEndpoint")),
+                ("Approved credential", selection.get("approvedCredential")),
+                *facts,
+            ]
+        result = await self._request_client("elicitation/create", {
+            "requestId": (
+                request_id if request_id is not None
+                else f"approve-endpoint-{channel.session_id}"),
+            "mode": "form",
+            "message": (
+                "Send this credential to this endpoint?\n"
+                + "\n".join(
+                    f"{label}: {json.dumps(value, ensure_ascii=True)}"
+                    for label, value in facts)),
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "approve": {
+                        "type": "boolean",
+                        "title": "Use this endpoint and credential",
+                        "description": (
+                            "Approve sending the named credential to the "
+                            "named endpoint for this provider."),
+                        "default": False,
+                    },
+                },
+                "required": ["approve"],
+            },
+        })
+        content = (
+            result.get("content") if isinstance(result, dict) else None)
+        approved = (
+            isinstance(result, dict)
+            and result.get("action") == "accept"
+            and isinstance(content, dict)
+            and content.get("approve") is True
+        )
+        if not approved:
+            raise acps.TransportError(
+                "the provider endpoint was not approved",
+                code=acps.INVALID_PARAMS,
+            )
+        endpoint_pins.record(
+            str(selection.get("providerId")),
+            str(selection.get("endpoint")),
+            str(selection.get("credential")),
+        )
