@@ -262,8 +262,7 @@ def _redeem_action(context, credit) -> provider_controls.ControlAction:
         id=f"redeem:{credit_id}",
         title=f"Redeem {title}",
         confirm=(
-            f"Redeem {title}? This clears the exhausted usage window(s) now "
-            "and cannot be undone."),
+            f"Redeem {title}?"),
         run=lambda credit_id=credit_id: _redeem(context, credit_id),
     )
 

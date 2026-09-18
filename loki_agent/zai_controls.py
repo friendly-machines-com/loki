@@ -304,10 +304,7 @@ def _use_action(context, reset_type, label, card):
     return provider_controls.ControlAction(
         id=f"use:{record_id}",
         title=f"Use {label} reset card ({expiry})",
-        confirm=(
-            f"Use the {label} reset card ({expiry})? That quota returns "
-            "to 100% immediately and the card is spent; this cannot be "
-            "undone."),
+        confirm=f"Use the {label} reset card ({expiry})?",
         run=lambda: _use(context, reset_type, record_id),
     )
 
