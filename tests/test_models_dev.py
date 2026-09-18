@@ -16,6 +16,7 @@ from loki_agent import (
     terminals,
 )
 from loki_agent.credentials import CredentialInventory, CredentialStore
+from loki_endpoints import assume_endpoints_approved
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
 DATA = {
@@ -403,11 +404,12 @@ class CatalogNormalizationTests(unittest.TestCase):
             models.provider_description(normalized["openai"]),
         )
 
-    def test_openai_repair_requires_complete_exact_signature(self):
+    def test_openai_platform_endpoint_is_supplied_when_catalog_omits_it(self):
         variants = {
-            "provider id": {"id": "not-openai"},
-            "native package": {"npm": "@ai-sdk/openai-compatible"},
-            "credential declaration": {
+            "canonical entry": {},
+            "changed provider id": {"id": "not-openai"},
+            "different native package": {"npm": "@ai-sdk/openai-compatible"},
+            "extra credential declaration": {
                 "env": ["OPENAI_API_KEY", "OPENAI_ORG_ID"],
             },
         }
@@ -415,9 +417,13 @@ class CatalogNormalizationTests(unittest.TestCase):
             with self.subTest(label):
                 raw = {"openai": self.openai_provider(**overrides)}
                 normalized = models.normalize_catalog(raw)
-                self.assertNotIn("api", normalized["openai"])
-                self.assertFalse(
-                    models.provider_supported(normalized["openai"]))
+                # Which endpoint and credential are used is not decided by the
+                # catalog or by a signature check; it is approved on selection
+                # (endpoint_pins).  The repair only supplies a missing field.
+                self.assertEqual(
+                    normalized["openai"]["api"],
+                    "https://api.openai.com/v1",
+                )
 
     def test_openai_repair_requires_canonical_provider_map_key(self):
         raw = {"openai-compatible": self.openai_provider()}
@@ -427,7 +433,7 @@ class CatalogNormalizationTests(unittest.TestCase):
         self.assertIs(normalized, raw)
         self.assertNotIn("api", normalized["openai-compatible"])
 
-    def test_noncanonical_openai_endpoint_is_preserved_but_rejected(self):
+    def test_catalog_supplied_openai_endpoint_is_preserved(self):
         raw = {
             "openai": self.openai_provider(
                 api="https://credentials.example/v1"),
@@ -435,11 +441,12 @@ class CatalogNormalizationTests(unittest.TestCase):
 
         normalized = models.normalize_catalog(raw)
 
+        # Preserved, not judged: the user approves it (or not) on selection.
         self.assertEqual(
             normalized["openai"]["api"],
             "https://credentials.example/v1",
         )
-        self.assertFalse(models.provider_supported(normalized["openai"]))
+        self.assertTrue(models.provider_supported(normalized["openai"]))
 
     def test_catalog_supplied_canonical_openai_endpoint_is_not_repaired(self):
         raw = {
@@ -1224,6 +1231,9 @@ class MenuTests(unittest.TestCase):
 
 
 class PickerTests(unittest.TestCase):
+    def setUp(self):
+        assume_endpoints_approved(self)
+
     def test_explicit_connection_is_selectable_without_catalog_models(self):
         explicit = models.ExplicitConnectionOption(
             model="private-model",

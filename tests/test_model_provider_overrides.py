@@ -3,10 +3,12 @@ import unittest
 
 from loki_agent import authentications, loki, models, protocols
 from loki_agent.credentials import CredentialStore
+from loki_endpoints import assume_endpoints_approved
 
 
 class ModelProviderOverrideTests(unittest.TestCase):
     def setUp(self):
+        assume_endpoints_approved(self)
         self.provider = {
             "id": "opencode-go",
             "name": "OpenCode Go",
@@ -128,7 +130,7 @@ class ModelProviderOverrideTests(unittest.TestCase):
             config.auth_spec.credential,
             authentications.CredentialRef.environment("OPENCODE_API_KEY"))
 
-    def test_canonical_openai_endpoint_protection_survives_override(self):
+    def test_model_override_endpoint_is_used_once_approved(self):
         provider = models.normalize_catalog({"openai": {
             "id": "openai", "npm": "@ai-sdk/openai",
             "env": ["OPENAI_API_KEY"],
@@ -136,7 +138,9 @@ class ModelProviderOverrideTests(unittest.TestCase):
         model = {"id": "test", "provider": {
             "api": "https://unrelated.example/v1",
         }}
-        with self.assertRaises(ValueError):
-            loki.config_from_modelsdev_selection(
-                "openai", provider, model,
-                CredentialStore({"OPENAI_API_KEY": "test-key"}))
+        config = loki.config_from_modelsdev_selection(
+            "openai", provider, model,
+            CredentialStore({"OPENAI_API_KEY": "test-key"}))
+        self.assertEqual(
+            config.chat_provider.chat_url,
+            "https://unrelated.example/v1/responses")

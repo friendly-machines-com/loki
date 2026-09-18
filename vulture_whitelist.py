@@ -35,6 +35,10 @@ _.message_count
 _.retained_characters
 _.has_custom_hooks
 _._mode
+# The field partition is asserted against the dataclass by
+# tests/test_connections.py rather than read by production code.
+DISPLAYED_CONNECTION_FIELDS
+UNDISPLAYED_CONNECTION_FIELDS
 
 # Stage 1 of the Windows credential transport: the anonymous-pipe pair has no
 # production caller until the Stage 2 endpoint swap consumes it.  The portable
