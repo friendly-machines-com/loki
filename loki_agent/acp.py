@@ -698,21 +698,24 @@ class Front:
                 "form elicitation support, so its endpoint can be approved",
                 code=acps.INVALID_PARAMS,
             )
-        name = (
-            selection.get("credentialName") or selection.get("credential"))
-        endpoint = selection.get("endpoint")
-        request = f"Send {name} to {endpoint}?"
+        facts = [("Endpoint", selection.get("endpoint")),
+                 ("Credential", selection.get("credential"))]
         if selection.get("changed"):
-            request += (
-                " It was previously approved as "
-                f"{selection.get('approvedEndpoint')} with "
-                f"{selection.get('approvedCredential')}.")
+            facts = [
+                ("Approved endpoint", selection.get("approvedEndpoint")),
+                ("Approved credential", selection.get("approvedCredential")),
+                *facts,
+            ]
         result = await self._request_client("elicitation/create", {
             "requestId": (
                 request_id if request_id is not None
                 else f"approve-endpoint-{channel.session_id}"),
             "mode": "form",
-            "message": request,
+            "message": (
+                "Send this credential to this endpoint?\n"
+                + "\n".join(
+                    f"{label}: {json.dumps(value, ensure_ascii=True)}"
+                    for label, value in facts)),
             "requestedSchema": {
                 "type": "object",
                 "properties": {

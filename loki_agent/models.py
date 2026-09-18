@@ -1181,24 +1181,25 @@ async def _confirm_catalog_endpoint(
     state, approved = endpoint_pins.status(provider_id, api, credential)
     if state == endpoint_pins.PINNED:
         return True
-    name = access.credential_ref.name
     print()
     print("Provider endpoint has not been approved yet:"
           if state == endpoint_pins.NEW else "Provider endpoint changed:")
     if state == endpoint_pins.CHANGED:
-        print("  previously approved: ", end="")
+        print("  approved endpoint:   ", end="")
         text_writer(str(approved["api"]))
-        print(" with ", end="")
+        print()
+        print("  approved credential: ", end="")
         text_writer(str(approved["credential"]))
         print()
-    print("  Endpoint: ", end="")
+    print("  endpoint:   ", end="")
     text_writer(api)
     print()
-    print("  Credential: ", end="")
-    text_writer(str(name))
+    print("  credential: ", end="")
+    text_writer(credential)
     print()
     answer = (await input_fn(
-        f"Send {name} to this endpoint? [y/N]: ") or "")
+        "Send this credential to this endpoint? Type y to approve "
+        "(anything else cancels): ") or "")
     if answer.strip().lower() not in ("y", "yes"):
         return False
     endpoint_pins.record(provider_id, api, credential)
