@@ -2768,6 +2768,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         "providerId": "acme",
         "endpoint": "https://acme.invalid/v1",
         "credential": "env:ACME_API_KEY",
+        "credentialName": "ACME_API_KEY",
         "changed": False,
         "approvedEndpoint": None,
         "approvedCredential": None,
@@ -2798,8 +2799,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         params = front._request_client.await_args.args[1]
         self.assertEqual(params["requestId"], 9)
         self.assertEqual(params["mode"], "form")
+        self.assertIn("ACME_API_KEY", params["message"])
         self.assertIn("https://acme.invalid/v1", params["message"])
-        self.assertIn("env:ACME_API_KEY", params["message"])
         record.assert_called_once_with(
             "acme", "https://acme.invalid/v1", "env:ACME_API_KEY")
 

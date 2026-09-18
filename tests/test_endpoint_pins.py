@@ -165,7 +165,7 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(picked)
             self.assertIn(API, shown)
-            self.assertIn(CREDENTIAL, shown)
+            self.assertIn("ACME_API_KEY", shown)
             self.assertEqual(
                 endpoint_pins.status("acme", API, CREDENTIAL)[0],
                 endpoint_pins.PINNED)
@@ -320,6 +320,7 @@ class WorkerSelectionTests(unittest.TestCase):
             self.assertEqual(selection["providerId"], "acme")
             self.assertEqual(selection["endpoint"], API)
             self.assertEqual(selection["credential"], CREDENTIAL)
+            self.assertEqual(selection["credentialName"], "ACME_API_KEY")
             self.assertFalse(selection["changed"])
 
     def test_reports_a_change_with_the_approved_pair(self):

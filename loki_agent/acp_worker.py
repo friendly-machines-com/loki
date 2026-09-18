@@ -201,6 +201,7 @@ class Worker:
             "providerId": provider_id,
             "endpoint": access.api_url,
             "credential": credential,
+            "credentialName": access.credential_ref.name,
             "changed": state == endpoint_pins.CHANGED,
             "approvedEndpoint": (
                 approved.get("api") if isinstance(approved, dict) else None),
