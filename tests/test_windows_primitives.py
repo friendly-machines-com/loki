@@ -5,6 +5,7 @@ protocol, ACL security, or power-loss durability. Run directly or via unittest.
 """
 
 import asyncio
+from contextlib import ExitStack
 import ctypes as C
 from ctypes import wintypes as W
 import errno
@@ -931,6 +932,65 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
         plain = NativeCalls.rename_buffer(123, name, replace_if_exists=0)
         self.assertEqual(RenameInfos.from_buffer(plain).ReplaceIfExists, 0)
 
+    def test_rename_variant_cleanup_and_success_checks(self):
+        # Exercise the probe's ownership and verdict logic with simulated
+        # native calls and real temporary files, not Windows API behaviour.
+        scenarios = (
+            ('success', None), ('refused', None),
+            ('source-open-error', OSError), ('rename-error', OSError),
+            ('missing-target', FileNotFoundError),
+            ('wrong-content', AssertionError), ('source-remains', AssertionError),
+        )
+        for outcome, expected_error in scenarios:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as root:
+                probe = WindowsPrimitiveTests(
+                    'test_relative_rename_variants_are_recorded')
+                probe.root = Path(root)
+                opened, live, closed = [], {}, []
+
+                def open_handle(path, **kwargs):
+                    if outcome == 'source-open-error' and path.name == 'source':
+                        raise OSError('source open failed')
+                    handle = len(opened) + 1
+                    opened.append(handle)
+                    live[handle] = path
+                    return handle
+
+                def close_handle(handle):
+                    self.assertIn(handle, live, 'handle closed more than once')
+                    del live[handle]
+                    closed.append(handle)
+                    return True
+
+                def rename_attempt(source, directory, name, **kwargs):
+                    if outcome == 'rename-error':
+                        raise OSError('rename failed')
+                    if outcome not in ('refused', 'missing-target'):
+                        target = live[directory] / name
+                        if outcome == 'source-remains':
+                            target.write_bytes(live[source].read_bytes())
+                        else:
+                            live[source].rename(target)
+                        if outcome == 'wrong-content':
+                            target.write_bytes(b'wrong')
+                    return {'refused': outcome == 'refused', 'simulation': True}
+
+                probe.native = mock.Mock(
+                    open=open_handle, close=close_handle,
+                    check=self.assertTrue, rename_attempt=rename_attempt)
+                try:
+                    if expected_error is None:
+                        probe.test_relative_rename_variants_are_recorded()
+                    else:
+                        with self.assertRaises(expected_error):
+                            probe.test_relative_rename_variants_are_recorded()
+                finally:
+                    self.assertTrue(probe.doCleanups())
+                    self.assertEqual(live, {})
+                    self.assertCountEqual(closed, opened)
+                if expected_error is None:
+                    self.assertEqual(len(opened), 16)
+
     # S-1-16-4096: revision 1, one subauthority, authority 16, level 0x1000.
     MANDATORY_LABEL_SID = bytes([1, 1, 0, 0, 0, 0, 0, 16]) + (
         4096).to_bytes(4, 'little')
@@ -1350,10 +1410,10 @@ class WindowsPrimitiveTests(unittest.TestCase):
     def test_relative_rename_variants_are_recorded(self):
         """Characterize which FILE_RENAME_INFO forms the entrypoints accept.
 
-        Recorded, not asserted: `test_win32_relative_rename_retains_both_identities`
-        carries the expectation.  This isolates the construction from the
-        invalidated-path scenario the sibling tests set up, and covers the
-        documented terminator/size combinations."""
+        API acceptance is recorded, not required; a reported success must
+        actually move the source and preserve its contents. The separate
+        retained-identity tests keep their expectations. This isolates buffer
+        variants from the pathname substitutions in those tests."""
         variants = (
             ('baseline', {}),
             ('terminator-counted', {'terminator_in_length': True}),
@@ -1365,21 +1425,28 @@ class WindowsPrimitiveTests(unittest.TestCase):
                 directory = self.root / ('variants-%d-%s' % (
                     index, 'nt' if native else 'win32'))
                 directory.mkdir()
-                handle = self.handle(directory, flags=BACKUP)
                 source = directory / 'source'
                 source.write_bytes(b'marker')
-                source_handle = self.handle(source, access=GENERIC_READ | DELETE)
-                try:
+                # These handles belong to this variant, not to self.handle's
+                # test-wide cleanup. Close them before ordinary CRT reads.
+                with ExitStack() as handles:
+                    handle = self.native.open(directory, flags=BACKUP)
+                    handles.callback(
+                        lambda h=handle: self.native.check(self.native.close(h)))
+                    source_handle = self.native.open(
+                        source, access=GENERIC_READ | DELETE)
+                    handles.callback(
+                        lambda h=source_handle: self.native.check(self.native.close(h)))
                     record = self.native.rename_attempt(
                         source_handle, handle, 'published', native=native,
                         **options)
-                finally:
-                    self.native.check(self.native.close(source_handle))
-                    self.native.check(self.native.close(handle))
                 record['variant'] = label
                 record['mode'] = 'nt' if native else 'win32'
                 print(json.dumps(record), flush=True)
-                self.assertIn('refused', record)
+                if not record['refused']:
+                    published = directory / 'published'
+                    self.assertEqual(published.read_bytes(), b'marker', record)
+                    self.assertFalse(source.exists(), record)
 
     def test_native_relative_rename_retains_both_identities(self):
         # An independent experiment, not a fallback which hides Win32 failure.
