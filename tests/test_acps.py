@@ -8,7 +8,6 @@ over pipes with the dummy provider (no network): initialize, session/new
 import asyncio
 import json
 import os
-import select
 import subprocess
 import sys
 import tempfile
@@ -958,102 +957,104 @@ if "--worker" in sys.argv:
             env["PYTHONPATH"] = os.pathsep.join(
                 [observer_dir, ROOT])
 
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-                cwd=os.path.join(tmpdir, "workspace"),
-            )
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(message):
-                    front.stdin.write(json.dumps(message) + "\n")
-                    front.stdin.flush()
+            # Drive the front the way the product drives a worker channel:
+            # an asyncio subprocess read line by line (WorkerChannel), under
+            # the default event-loop policy the entrypoints themselves use.
+            # stderr stays inherited, so a failing front or worker explains
+            # itself in the runner log.
+            async def converse(process):
+                async def send(message):
+                    process.stdin.write(
+                        (json.dumps(message) + "\n").encode("utf-8"))
+                    await process.stdin.drain()
 
-                def recv_reply(reply_id):
+                async def reply(reply_id):
                     while True:
-                        ready, _writable, _exceptional = select.select(
-                            [front.stdout], [], [], 5)
-                        if not ready:
-                            stderr_ready, _writable, _exceptional = (
-                                select.select([front.stderr], [], [], 0))
-                            diagnostic = (
-                                front.stderr.read()
-                                if stderr_ready else "")
-                            self.fail(
-                                "front produced no message"
-                                f" (status={front.poll()}): {diagnostic}")
-                        line = front.stdout.readline()
+                        line = await asyncio.wait_for(
+                            process.stdout.readline(), 30)
                         self.assertTrue(
                             line,
                             "front closed its protocol output",
                         )
-                        message = json.loads(line)
+                        message = json.loads(line.decode("utf-8"))
                         if message.get("id") == reply_id:
                             return message
 
-                send({
+                await send({
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
                     "params": {"protocolVersion": 1},
                 })
-                self.assertIn("result", recv_reply(1))
-                send({
+                self.assertIn("result", await reply(1))
+                await send({
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "session/new",
                     "params": {"cwd": _configured_workspace(tmpdir)},
                 })
-                self.assertIn("result", recv_reply(2))
+                self.assertIn("result", await reply(2))
 
-                report_names = os.listdir(report_dir)
-                self.assertEqual(len(report_names), 2)
-                reports = []
-                for name in report_names:
-                    with open(
-                            os.path.join(report_dir, name),
-                            encoding="ascii") as stream:
-                        reports.append(json.load(stream))
-                front_report = next(
-                    report for report in reports if not report["worker"])
-                worker_report = next(
-                    report for report in reports if report["worker"])
-
-                for report in reports:
-                    self.assertFalse(report["name_present"])
-                    self.assertFalse(report["value_present"])
-                    self.assertTrue(report["after_present"])
-                if sys.platform.startswith("linux"):
-                    # Linux overwrites in place and covers the directory with a
-                    # tmpfs; both are Linux mechanisms.  The Windows isolation
-                    # evidence is the AppContainer gate exercised by
-                    # test_windows_runtime and test_runtime_gate.
-                    self.assertTrue(front_report["filler_present"])
-                    self.assertTrue(front_report["after_follows_filler"])
-                    self.assertFalse(worker_report["filler_present"])
-                    self.assertFalse(worker_report["after_follows_filler"])
-                    credential_dir = os.path.join(
-                        tmpdir, "config", "loki", "credentials")
-                    with open(
-                            f"/proc/{worker_report['pid']}/mountinfo",
-                            encoding="ascii") as stream:
-                        worker_mounts = stream.read()
-                    self.assertTrue(any(
-                        f" {credential_dir} " in line
-                        and " - tmpfs " in line
-                        for line in worker_mounts.splitlines()
-                    ), worker_mounts)
-            finally:
-                front.stdin.close()
+            async def run():
+                process = await asyncio.create_subprocess_exec(
+                    *loki_acp_command(),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=None,
+                    env=env,
+                    cwd=os.path.join(tmpdir, "workspace"),
+                )
                 try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
+                    await converse(process)
+                    # Read the observer reports before tearing the
+                    # front down: the Linux check below needs the
+                    # worker's live /proc entry.
+                    report_names = os.listdir(report_dir)
+                    self.assertEqual(len(report_names), 2)
+                    reports = []
+                    for name in report_names:
+                        with open(
+                                os.path.join(report_dir, name),
+                                encoding="ascii") as stream:
+                            reports.append(json.load(stream))
+                    front_report = next(
+                        report for report in reports if not report["worker"])
+                    worker_report = next(
+                        report for report in reports if report["worker"])
+
+                    for report in reports:
+                        self.assertFalse(report["name_present"])
+                        self.assertFalse(report["value_present"])
+                        self.assertTrue(report["after_present"])
+                    if sys.platform.startswith("linux"):
+                        # Linux overwrites in place and covers the directory with a
+                        # tmpfs; both are Linux mechanisms.  The Windows isolation
+                        # evidence is the AppContainer gate exercised by
+                        # test_windows_runtime and test_runtime_gate.
+                        self.assertTrue(front_report["filler_present"])
+                        self.assertTrue(front_report["after_follows_filler"])
+                        self.assertFalse(worker_report["filler_present"])
+                        self.assertFalse(worker_report["after_follows_filler"])
+                        credential_dir = os.path.join(
+                            tmpdir, "config", "loki", "credentials")
+                        with open(
+                                f"/proc/{worker_report['pid']}/mountinfo",
+                                encoding="ascii") as stream:
+                            worker_mounts = stream.read()
+                        self.assertTrue(any(
+                            f" {credential_dir} " in line
+                            and " - tmpfs " in line
+                            for line in worker_mounts.splitlines()
+                        ), worker_mounts)
+                finally:
+                    process.stdin.close()
+                    try:
+                        await asyncio.wait_for(process.wait(), 5)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
+
+            asyncio.run(run())
 
     def test_unknown_session_is_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
