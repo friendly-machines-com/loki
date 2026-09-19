@@ -703,9 +703,7 @@ def scratch_probe(native, sid, workspace, report_path):
     write a file in it -- not whether the unrestricted broker can pre-create
     it.  The broker removes the directory first, so a successful child also
     demonstrates the recreate-if-missing step."""
-    from loki_agent import windows_runtime
-
-    directory = windows_runtime.scratch_directory(str(workspace))
+    directory = os.path.join(str(workspace), '.loki', 'tmp')
     if os.path.isdir(directory):
         shutil.rmtree(directory)
     child_report = Path(report_path)
