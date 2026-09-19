@@ -666,17 +666,21 @@ class NativeCalls:
         return result.value
 
     @staticmethod
-    def rename_buffer(directory, name):
+    def rename_buffer(directory, name, *, replace_if_exists=1,
+                      terminator_in_length=False, terminator_in_size=True):
+        """FILE_RENAME_INFO for ``name``; the length/size forms are probeable.
+
+        The reference calls FileName NUL-terminated while stating that
+        FileNameLength excludes the terminator, so which combination a given
+        entrypoint accepts is recorded rather than assumed."""
         encoded = name.encode('utf-16-le')
-        # The Win32 documentation describes FileName as NUL-terminated even
-        # though FileNameLength excludes the terminator. Provide both, with
-        # room for structure padding and the complete UTF-16 string.
-        buffer = C.create_string_buffer(C.sizeof(RenameInfos) + len(encoded)
-                                        + 2)
+        buffer = C.create_string_buffer(
+            C.sizeof(RenameInfos) + len(encoded)
+            + (2 if terminator_in_size else 0))
         info = RenameInfos.from_buffer(buffer)
-        info.ReplaceIfExists = 1
+        info.ReplaceIfExists = replace_if_exists
         info.RootDirectory = directory
-        info.FileNameLength = len(encoded)
+        info.FileNameLength = len(encoded) + (2 if terminator_in_length else 0)
         C.memmove(C.addressof(buffer) + RenameInfos.FileName.offset,
                   encoded, len(encoded))
         return buffer
@@ -704,6 +708,28 @@ class NativeCalls:
             print(json.dumps(diagnostic), flush=True)
             if not result:
                 raise C.WinError(error)
+
+    def rename_attempt(self, source, directory, name, *, native=False,
+                       **variants):
+        """Attempt a rename and record the outcome instead of raising."""
+        buffer = self.rename_buffer(directory, name, **variants)
+        size = C.sizeof(buffer)
+        info = RenameInfos.from_buffer(buffer)
+        record = {'operation': ('NtSetInformationFile' if native else
+                                'SetFileInformationByHandle'),
+                  'root_relative': directory is not None, 'name': name,
+                  'buffer_size': size, 'file_name_length': info.FileNameLength,
+                  'replace_if_exists': info.ReplaceIfExists}
+        if native:
+            io = IoStatuses()
+            status = self.ntset(source, C.byref(io), buffer, size, 10)
+            record['ntstatus'] = '0x%08x' % (status & 0xffffffff)
+            record['refused'] = status < 0
+        else:
+            result = self.set_info(source, 3, buffer, size)
+            record['refused'] = not result
+            record['winerror'] = 0 if result else C.get_last_error()
+        return record
 
     def delete(self, source):
         disposition = C.c_ubyte(1)
@@ -891,6 +917,19 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
                 start = RenameInfos.FileName.offset
                 self.assertEqual(buffer.raw[start:start + len(encoded) + 2],
                                  encoded + b'\0\0')
+
+    def test_rename_buffer_encodes_the_requested_variant(self):
+        name = 'published'
+        encoded = name.encode('utf-16-le')
+        counted = NativeCalls.rename_buffer(
+            123, name, terminator_in_length=True)
+        self.assertEqual(RenameInfos.from_buffer(counted).FileNameLength,
+                         len(encoded) + 2)
+        tight = NativeCalls.rename_buffer(123, name, terminator_in_size=False)
+        self.assertEqual(C.sizeof(tight),
+                         C.sizeof(RenameInfos) + len(encoded))
+        plain = NativeCalls.rename_buffer(123, name, replace_if_exists=0)
+        self.assertEqual(RenameInfos.from_buffer(plain).ReplaceIfExists, 0)
 
     # S-1-16-4096: revision 1, one subauthority, authority 16, level 0x1000.
     MANDATORY_LABEL_SID = bytes([1, 1, 0, 0, 0, 0, 0, 16]) + (
@@ -1307,6 +1346,40 @@ class WindowsPrimitiveTests(unittest.TestCase):
 
     def test_win32_relative_rename_retains_both_identities(self):
         self.check_source_handle_rename()
+
+    def test_relative_rename_variants_are_recorded(self):
+        """Characterize which FILE_RENAME_INFO forms the entrypoints accept.
+
+        Recorded, not asserted: `test_win32_relative_rename_retains_both_identities`
+        carries the expectation.  This isolates the construction from the
+        invalidated-path scenario the sibling tests set up, and covers the
+        documented terminator/size combinations."""
+        variants = (
+            ('baseline', {}),
+            ('terminator-counted', {'terminator_in_length': True}),
+            ('size-excludes-terminator', {'terminator_in_size': False}),
+            ('no-replace', {'replace_if_exists': 0}),
+        )
+        for index, (label, options) in enumerate(variants):
+            for native in (False, True):
+                directory = self.root / ('variants-%d-%s' % (
+                    index, 'nt' if native else 'win32'))
+                directory.mkdir()
+                handle = self.handle(directory, flags=BACKUP)
+                source = directory / 'source'
+                source.write_bytes(b'marker')
+                source_handle = self.handle(source, access=GENERIC_READ | DELETE)
+                try:
+                    record = self.native.rename_attempt(
+                        source_handle, handle, 'published', native=native,
+                        **options)
+                finally:
+                    self.native.check(self.native.close(source_handle))
+                    self.native.check(self.native.close(handle))
+                record['variant'] = label
+                record['mode'] = 'nt' if native else 'win32'
+                print(json.dumps(record), flush=True)
+                self.assertIn('refused', record)
 
     def test_native_relative_rename_retains_both_identities(self):
         # An independent experiment, not a fallback which hides Win32 failure.
