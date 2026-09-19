@@ -590,6 +590,62 @@ def stdio_child():
     return 0
 
 
+def inherited_nul_child(handle):
+    """Write to broker-opened NUL without opening the device in this process."""
+    import msvcrt
+
+    native = AppContainers()
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+    except BaseException:
+        native.check(native.close(handle))
+        raise
+    try:
+        payload = b'inherited-nul-write\n'
+        identity = native.app_identity()
+        if identity[0] != 1:
+            raise RuntimeError('NUL witness is not an AppContainer')
+        native.write_all(handle, payload)
+        written = os.write(fd, payload)
+        if written != len(payload):
+            raise RuntimeError('short CRT write to inherited NUL')
+    finally:
+        # open_osfhandle transfers ownership to the CRT descriptor.
+        os.close(fd)
+    print('inherited-nul-result:' + json.dumps({
+        'identity': identity, 'native_write': True, 'crt_bytes': written,
+    }), flush=True)
+    return 0
+
+
+def inherited_nul_probe(native, sid, workspace, output):
+    """Test inherited write access, not a contained caller opening NUL."""
+    import msvcrt
+
+    fd = os.open(os.devnull, os.O_WRONLY | os.O_BINARY)
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+        os.set_handle_inheritable(handle, True)
+        code = native.launch(
+            [sys.executable, '-I', '-u', __file__, '--inherited-nul-child',
+             str(handle)], sid, workspace, output, extra_handles=(handle,))
+    finally:
+        os.close(fd)
+    text = output.read_text(errors='replace')
+    print(text, flush=True)
+    if code != 0:
+        raise RuntimeError('AppContainer inherited-NUL child exited %d' % code)
+    prefix = 'inherited-nul-result:'
+    reports = [json.loads(line[len(prefix):]) for line in text.splitlines()
+               if line.startswith(prefix)]
+    expected = {'identity': [1, native.sid(sid)], 'native_write': True,
+                'crt_bytes': len(b'inherited-nul-write\n')}
+    if reports != [expected] or 'inherited-nul-write' in text:
+        raise RuntimeError('inherited-NUL write not confirmed: %r' % reports)
+    return {'probe': 'inherited-write-only-nul',
+            'outcome': 'native-and-crt-writes-succeeded'}
+
+
 def scratch_child(directory, report_path):
     """Contained half of the workspace-scratch experiment.
 
@@ -1233,6 +1289,66 @@ def contained(manifest_path, descendant=False):
 
 
 class EscapeResultTests(unittest.TestCase):
+    def test_inherited_nul_probe_requires_a_confirmed_write(self):
+        expected = {'identity': [1, 'package'], 'native_write': True,
+                    'crt_bytes': len(b'inherited-nul-write\n')}
+        scenarios = (
+            (0, expected, None),
+            (1, expected, RuntimeError),
+            (0, None, RuntimeError),
+            (0, {**expected, 'identity': [0, 'package']}, RuntimeError),
+            (0, {**expected, 'crt_bytes': 0}, RuntimeError),
+            (None, None, OSError),
+        )
+        for code, report, error in scenarios:
+            with self.subTest(code=code, report=report), \
+                    tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / 'nul.log'
+                output.write_text('' if report is None else
+                                  'inherited-nul-result:' + json.dumps(report))
+                native = mock.Mock()
+                native.sid.return_value = 'package'
+                native.launch.return_value = code
+                if code is None:
+                    native.launch.side_effect = OSError('launch failed')
+                crt = mock.Mock()
+                crt.get_osfhandle.return_value = 456
+                with mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                        mock.patch.object(os, 'O_BINARY', 0, create=True), \
+                        mock.patch.object(os, 'open', return_value=123) as opened, \
+                        mock.patch.object(os, 'close') as closed, \
+                        mock.patch.object(os, 'set_handle_inheritable',
+                                          create=True) as inheritance:
+                    if error is None:
+                        result = inherited_nul_probe(
+                            native, 'sid', Path(temporary), output)
+                        self.assertEqual(result['outcome'],
+                                         'native-and-crt-writes-succeeded')
+                    else:
+                        with self.assertRaises(error):
+                            inherited_nul_probe(
+                                native, 'sid', Path(temporary), output)
+                    opened.assert_called_once_with(os.devnull, os.O_WRONLY)
+                    inheritance.assert_called_once_with(456, True)
+                    self.assertEqual(native.launch.call_args.kwargs,
+                                     {'extra_handles': (456,)})
+                    closed.assert_called_once_with(123)
+
+    def test_inherited_nul_child_closes_its_descriptor_on_write_failure(self):
+        native = mock.Mock()
+        native.app_identity.return_value = (1, 'package')
+        native.write_all.side_effect = OSError('write denied')
+        crt = mock.Mock()
+        crt.open_osfhandle.return_value = 123
+        with mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                mock.patch.object(os, 'O_BINARY', 0, create=True), \
+                mock.patch.object(os, 'close') as closed, \
+                mock.patch(__name__ + '.AppContainers', return_value=native):
+            with self.assertRaisesRegex(OSError, 'write denied'):
+                inherited_nul_child(456)
+            closed.assert_called_once_with(123)
+            native.close.assert_not_called()
+
     def test_denial_after_creation_is_not_successful_containment(self):
         result = escape_helpers['finalize_result'](
             {'outcome': 'access-denied', 'denied': True}, 1,
@@ -2588,6 +2704,10 @@ class AppContainerTests(unittest.TestCase):
             native, sid, workspace, root / 'pipe-stdio.log')
         print(json.dumps(stdio_result), flush=True)
         self.assertEqual(stdio_result['outcome'], 'stdio-both-directions-used')
+        nul_result = inherited_nul_probe(
+            native, sid, workspace, root / 'inherited-nul.log')
+        print(json.dumps(nul_result), flush=True)
+        self.assertEqual(nul_result['outcome'], 'native-and-crt-writes-succeeded')
         # The contained runtime's scratch directory lives inside the granted
         # workspace and the runtime creates it itself, so the child -- not the
         # broker -- must be able to create it and write there.
@@ -3087,6 +3207,8 @@ if __name__ == '__main__':
         sys.exit(pipe_child(int(sys.argv[2]), int(sys.argv[3])))
     if len(sys.argv) == 2 and sys.argv[1] == '--stdio-child':
         sys.exit(stdio_child())
+    if len(sys.argv) == 3 and sys.argv[1] == '--inherited-nul-child':
+        sys.exit(inherited_nul_child(int(sys.argv[2])))
     if len(sys.argv) == 4 and sys.argv[1] == '--scratch-child':
         sys.exit(scratch_child(sys.argv[2], sys.argv[3]))
     if len(sys.argv) == 4 and sys.argv[1] == '--peer':
