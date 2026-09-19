@@ -487,6 +487,31 @@ class QuarantineTests(unittest.TestCase):
         self.assertEqual(json.loads(lines[0]),
                          {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
 
+        # A contained worker is given the null descriptor to redirect to
+        # instead of opening the device itself, which its container refuses.
+        # The borrowed descriptor stays the caller's, the protocol keeps its
+        # own, and stray output is still discarded.
+        borrowed = (
+            "import sys, os, json\n"
+            "from loki_agent import acps\n"
+            "null = os.open(os.devnull, os.O_WRONLY)\n"
+            "saved = os.dup(1)\n"
+            "acps.quarantine_stdout(null)\n"
+            "write = acps.make_writer(saved)\n"
+            "write(acps.response(1, result={'ok': True}))\n"
+            "print('stray output')\n"
+            "os.fstat(null)\n"
+            "os.close(null)\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", borrowed],
+            capture_output=True, text=True, cwd=ROOT)
+        lines = [
+            line for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0]),
+                         {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
+
 
 class EntrypointTests(unittest.TestCase):
     def test_subagent_uses_inherited_worker_authority(self):

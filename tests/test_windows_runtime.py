@@ -211,6 +211,9 @@ class IsolationSeamTests(unittest.TestCase):
         from loki_agent import runtime_isolation
 
         class Delegation:
+            owner_child = (7,)
+            credential_child = (9,)
+
             def child_arguments(self):
                 return ['--session-owner-fd', 'r=7']
 
@@ -237,8 +240,11 @@ class IsolationSeamTests(unittest.TestCase):
         streams.assert_called_once_with(*front)
         self.assertIs(worker._process, launch.return_value)
         self.assertEqual(launch.call_args.args[0], sys.argv[0])
-        self.assertEqual(launch.call_args.args[1],
+        arguments = launch.call_args.args[1]
+        self.assertEqual(arguments[:3],
                          ['--worker', '--session-owner-fd', 'r=7'])
+        self.assertEqual(arguments[3], '--stdout-null-handle')
+        self.assertEqual(int(arguments[4]), launch.call_args.args[4][-1])
         self.assertEqual(launch.call_args.kwargs['stdio'], child)
         self.assertEqual(launch.call_args.kwargs['current_directory'],
                          os.getcwd())

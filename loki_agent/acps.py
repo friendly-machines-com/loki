@@ -211,7 +211,7 @@ INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
 
-def quarantine_stdout() -> None:
+def quarantine_stdout(null_fd: int | None = None) -> None:
     """Reserve fd 1 for the protocol; everything else writes devnull.
 
     The original fd 1 is dup'd before being replaced, so the protocol
@@ -219,9 +219,16 @@ def quarantine_stdout() -> None:
     library's) silently discards instead of corrupting the message
     stream.  Stderr stays untouched: it is ACP's log channel.
     """
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.close(devnull)
+    # A contained Windows worker borrows its broker-opened descriptor. The
+    # caller retains ownership; only fd 1's duplicate survives redirection.
+    if null_fd is None:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, 1)
+        finally:
+            os.close(devnull)
+    else:
+        os.dup2(null_fd, 1, inheritable=False)
     # Replace the Python-level objects too, or print() would keep its old
     # buffer into the (now devnull) fd 1 while flush ordering gets strange.
     sys.stdout = os.fdopen(1, "w", encoding="utf-8", buffering=1)

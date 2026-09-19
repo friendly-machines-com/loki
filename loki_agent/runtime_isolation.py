@@ -161,6 +161,7 @@ if sys.platform == "win32":
         """
         workspace = windows_runtime.required_workspace(cwd)
         front, child = host_ipc.worker_stdio()
+        process = None
         try:
             inherited = [*host_ipc.handles(delegation.owner_child),
                          *host_ipc.handles(delegation.credential_child)]
@@ -170,14 +171,25 @@ if sys.platform == "win32":
             # directory model-directed tools can write, so as the ambient
             # directory it would turn every relative open, DLL search and
             # executable name into model-writable resolution.
-            process = windows_runtime.launch(
-                sys.argv[0],
-                ["--worker", *delegation.child_arguments()],
-                environment, workspace, inherited, stdio=child,
-                current_directory=os.getcwd())
+            with windows_runtime.worker_stdout_null() as null_handle:
+                process = windows_runtime.launch(
+                    sys.argv[0],
+                    ["--worker", *delegation.child_arguments(),
+                     "--stdout-null-handle", str(null_handle)],
+                    environment, workspace, [*inherited, null_handle],
+                    stdio=child, current_directory=os.getcwd())
         except BaseException:
-            for handle in (*front, *child):
-                windows_api.close_handle(handle)
+            try:
+                # Even failure to release the front's temporary NUL copy
+                # must unwind a launch that has already succeeded.
+                if process is not None:
+                    try:
+                        process.terminate()
+                    finally:
+                        process.close()
+            finally:
+                for handle in (*front, *child):
+                    windows_api.close_handle(handle)
             raise
         try:
             stdio = host_ipc.WorkerStdio(*front)

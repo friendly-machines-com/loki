@@ -8,6 +8,7 @@ preconditions, not arbitrary escape routes or future ACL changes.
 
 import asyncio
 import ctypes
+from contextlib import contextmanager
 import logging
 import os
 import sys
@@ -25,6 +26,39 @@ WORKSPACE_ENV = "LOKI_CONTAINER_WORKSPACE"
 SCRATCH_DIRECTORY = os.path.join(".loki", "tmp")
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def worker_stdout_null():
+    """Lend a write-only NUL handle to one explicit worker launch."""
+    import msvcrt
+
+    fd = os.open(os.devnull, os.O_WRONLY | os.O_BINARY)
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+        os.set_handle_inheritable(handle, True)
+        yield handle
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def inherited_stdout_null(handle):
+    """Own the inherited handle, transferring it to the CRT exactly once."""
+    import msvcrt
+
+    if not api.handle_is_open(handle):
+        raise ValueError("stdout NUL handle was not inherited")
+    try:
+        api.clear_handle_inheritance(handle)
+        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+    except BaseException:
+        api.close_handle(handle)
+        raise
+    try:
+        yield fd
+    finally:
+        os.close(fd)
 
 
 def require_checks(checks):
