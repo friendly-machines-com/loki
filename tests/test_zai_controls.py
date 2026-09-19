@@ -255,7 +255,9 @@ class ResetsTests(unittest.IsolatedAsyncioTestCase):
         five_hour = result.actions[0]
         self.assertEqual(five_hour.id, "use:101")
         self.assertIn("5-hour", five_hour.title)
-        self.assertIn("cannot be undone", five_hour.confirm)
+        self.assertIn(
+            "Use the 5-hour reset card", five_hour.confirm)
+        self.assertIn("expires 2100-01-01", five_hour.confirm)
         self.assertEqual(result.actions[1].id, "use:201")
         self.assertEqual(
             [card["recordId"] for card in result.document["cards"]],
