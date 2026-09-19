@@ -1179,7 +1179,7 @@ class UpdateStreamingTests(unittest.TestCase):
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
+                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
@@ -1254,7 +1254,7 @@ class CancelEndToEndTests(unittest.TestCase):
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
+                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(message):
@@ -1327,7 +1327,7 @@ class SessionRestoreTests(unittest.TestCase):
         process = subprocess.Popen(
             loki_acp_command(),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, env=env, cwd=cwd)
+            text=True, env=env, cwd=cwd)
         self.addCleanup(_close_process_streams, process)
         return process
 
@@ -1519,7 +1519,7 @@ class SessionListTests(unittest.TestCase):
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
+                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(m):
@@ -1558,7 +1558,7 @@ class SessionListTests(unittest.TestCase):
             front2 = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
+                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front2)
             try:
                 front2.stdin.write(json.dumps({
@@ -1611,7 +1611,7 @@ class ConfigOptionTests(unittest.TestCase):
             front = subprocess.Popen(
                 loki_acp_command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
+                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
             self.addCleanup(_close_process_streams, front)
             try:
                 def send(m):
@@ -1934,7 +1934,7 @@ class TtyStdinTests(unittest.TestCase):
             proc = subprocess.Popen(
                 loki_acp_command(),
                 stdin=slave, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, env=env, cwd=os.path.join(tmpdir, "workspace"),
+                env=env, cwd=os.path.join(tmpdir, "workspace"),
                 preexec_fn=child_setup, text=True)
             self.addCleanup(_close_process_streams, proc)
             os.close(slave)
