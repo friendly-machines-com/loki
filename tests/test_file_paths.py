@@ -350,7 +350,10 @@ class FilePathTests(unittest.TestCase):
         loki.run_read(str(target))
         if os.name != 'posix':
             # `plain/..` cancels lexically here, so the target is written; only
-            # the trailing slash on a file is invalid.
+            # the trailing slash on a file is invalid.  Read-before-write keys
+            # on the caller's spelling, so the spelling being written must be
+            # the one that was read.
+            loki.run_read('plain/../target')
             self.assertIn('Successfully',
                           loki.run_write('plain/../target', 'wrong'))
             self.assertEqual(target.read_text(), 'wrong')
@@ -422,7 +425,9 @@ class FilePathTests(unittest.TestCase):
             self.assertTrue(os.path.samefile(
                 loki.change_shell_cwd(str(self.project) + '/missing/..'),
                 self.project))
-        self.assertEqual(loki.current_cwd(), result)
+        # The second call reports the same directory under a different spelling
+        # on Windows, so compare the objects, not the strings.
+        self.assertTrue(os.path.samefile(loki.current_cwd(), result))
 
     def test_image_lookup_and_invalid_traversals(self):
         correct = b'\x89PNG\r\n\x1a\ncorrect'
