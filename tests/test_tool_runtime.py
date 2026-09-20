@@ -781,7 +781,11 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
             execution["hooks"][0]["status"], "error")
 
     def test_post_hook_workspace_changes_invalidate_remembered_files(self):
-        remembered = loki._resolve_path("README.md")
+        # The record must be keyed the way production keys it: ``_file_key``
+        # folds case and separators.  Seeding the raw resolved path happens to
+        # be the same key where normcase is identity (POSIX), but on Windows
+        # the invalidation pops the folded key and the raw one would survive.
+        remembered = loki._file_key(loki._resolve_path("README.md"))
         loki.file_state[remembered] = "old contents"
         pipeline = tool_runtime.ToolHookPipeline()
 
