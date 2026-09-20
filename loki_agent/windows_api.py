@@ -271,6 +271,59 @@ def dacl_sddl(path: str) -> str:
         local_free(descriptor)
 
 
+VOLUME_NAME_DOS = 0x00000000
+
+
+def open_directory_handle(path: str):
+    """Open ``path`` to query its identity: no access requested, no lock held.
+
+    ``desired_access`` of 0 asks for nothing beyond the open, and the share
+    mode lets other processes keep writing, deleting or replacing the object
+    while the handle lives -- which is what makes it safe to hold one across a
+    check.  ``FILE_FLAG_BACKUP_SEMANTICS`` is what opens a directory at all.
+    """
+    create_file = bind("kernel32", "CreateFileW", ctypes.c_void_p,
+                       wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p)
+    handle = create_file(path, 0, FILE_SHARE_ALL, None, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS, None)
+    if handle is None or handle == INVALID_HANDLE_VALUE:
+        raise WindowsApiError(f"CreateFileW({path!r}) failed",
+                              status=ctypes.get_last_error())
+    return handle
+
+
+def final_path_from_handle(handle) -> str:
+    """The canonical DOS path of the object behind ``handle``.
+
+    ``GetFinalPathNameByHandleW`` answers from the open object: no ancestor is
+    walked and no name is resolved again, so this works where ``realpath``
+    cannot, and cannot be redirected by a rename between the check and the use.
+    ``VOLUME_NAME_DOS`` is requested so the answer is in the same namespace a
+    user-supplied path uses, and the extended-length prefix is stripped because
+    the paths compared here never carry it.
+    """
+    get_final = bind("kernel32", "GetFinalPathNameByHandleW", wintypes.DWORD,
+                     ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD,
+                     wintypes.DWORD)
+    size = get_final(handle, None, 0, VOLUME_NAME_DOS)
+    if not size:
+        raise WindowsApiError("GetFinalPathNameByHandleW sizing failed",
+                              status=ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(size + 1)
+    written = get_final(handle, buffer, size + 1, VOLUME_NAME_DOS)
+    if not written:
+        raise WindowsApiError("GetFinalPathNameByHandleW failed",
+                              status=ctypes.get_last_error())
+    final = buffer.value
+    if final.startswith("\\?\\UNC\\"):
+        return "\\" + final[len("\\?\\UNC\\"):]
+    if final.startswith("\\?\\"):
+        return final[len("\\?\\"):]
+    return final
+
+
 def label_sddl(path: str) -> str:
     """Return ``path``'s mandatory integrity label as SDDL text.
 

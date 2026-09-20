@@ -11,8 +11,29 @@ from unittest import mock
 
 from loki_agent import windows_runtime as runtime
 from loki_agent import windows_api as api
+from loki_agent import windows_state
 from loki_agent.windows_state import Check
 from loki_agent.runtime_isolations import RuntimeIsolationError
+
+
+# The canonical path of an object is asked of the kernel about an open handle
+# (windows_state._final_path), which only exists on Windows.  These modules test
+# the ledger, plan and gate logic on every host, so they substitute the
+# platform's canonicalisation with its Python equivalent; the real call is
+# exercised by the Windows legs.
+_final_path_patch = None
+
+
+def setUpModule():
+    global _final_path_patch
+    _final_path_patch = mock.patch.object(
+        windows_state, '_final_path',
+        side_effect=lambda path: os.path.realpath(path))
+    _final_path_patch.start()
+
+
+def tearDownModule():
+    _final_path_patch.stop()
 
 
 class GateTests(unittest.TestCase):

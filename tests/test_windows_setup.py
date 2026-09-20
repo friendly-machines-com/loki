@@ -22,6 +22,26 @@ from loki_agent import windows_setup
 from loki_agent import windows_state
 
 
+# The canonical path of an object is asked of the kernel about an open handle
+# (windows_state._final_path), which only exists on Windows.  These modules test
+# the ledger, plan and gate logic on every host, so they substitute the
+# platform's canonicalisation with its Python equivalent; the real call is
+# exercised by the Windows legs.
+_final_path_patch = None
+
+
+def setUpModule():
+    global _final_path_patch
+    _final_path_patch = mock.patch.object(
+        windows_state, '_final_path',
+        side_effect=lambda path: os.path.realpath(path))
+    _final_path_patch.start()
+
+
+def tearDownModule():
+    _final_path_patch.stop()
+
+
 PACKAGE_SID = "S-1-15-2-1-2-3-4-5-6-7-8"
 OTHER_SID = "S-1-5-21-1-2-3-1004"
 

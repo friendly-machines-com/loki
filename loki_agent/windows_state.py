@@ -76,17 +76,45 @@ def _runtime_trees(include_code: bool = True) -> list[str]:
     return trees
 
 
+def _final_path(path: str) -> str:
+    """The object's canonical path, asked of the kernel about an open handle.
+
+    Not ``realpath``: that resolves per component, and an answer derived from
+    the object itself is cheaper and cannot be redirected by a rename during
+    the check.
+    """
+    handle = windows_api.open_directory_handle(path)
+    try:
+        return windows_api.final_path_from_handle(handle)
+    finally:
+        windows_api.close_handle(handle)
+
+
+def _canonical_or_absolute(path: str) -> str:
+    """The object's canonical path if it exists, else its absolute spelling.
+
+    A protected tree that does not exist yet still has a location, and a grant
+    covering that location must be refused before it is created -- there is no
+    handle to ask, so the spelling is the only answer available.
+    """
+    try:
+        return os.path.normcase(_final_path(path))
+    except windows_api.WindowsApiError:
+        return os.path.normcase(os.path.abspath(path))
+
+
 def protected_path_errors(path: str, access: Access = Access.READ_WRITE) -> list[str]:
     """Reject overlap with private data; trusted code may be read, not written.
 
-    Resolve existing aliases before comparing. This detects junction/symlink
-    aliases at validation time, not races replacing a path during ACL updates;
-    those require retained-handle operations in the Windows backend.
+    Both sides are canonicalised from an open handle, so an alias (junction or
+    symlink) is seen through.  This is decided here and the ACL is applied
+    later; closing that window needs the same handle retained through the ACL
+    write, which the backend does not do yet.
     """
-    target = os.path.normcase(os.path.realpath(path))
+    target = _canonical_or_absolute(path)
     reasons = []
     for tree in _runtime_trees(include_code=access is Access.READ_WRITE):
-        protected = os.path.normcase(os.path.realpath(tree))
+        protected = _canonical_or_absolute(tree)
         if target == protected:
             reasons.append(f"{path} is {tree}, which Loki never grants")
         elif _contains(target, protected):
@@ -115,14 +143,17 @@ SECRET_HINTS = (
 def covered_secret_warnings(path: str) -> list[str]:
     """Return warnings for existing secret locations a grant would cover."""
     profile = os.path.expanduser("~")
-    target = os.path.normcase(os.path.abspath(path))
+    try:
+        target = os.path.normcase(_final_path(path))
+    except windows_api.WindowsApiError:
+        return []
     warnings = []
     for hint in SECRET_HINTS:
         candidate = os.path.join(profile, hint)
         if not os.path.exists(candidate):
             continue
-        if target == os.path.normcase(os.path.abspath(candidate)) or _contains(
-                target, os.path.normcase(os.path.abspath(candidate))):
+        protected = os.path.normcase(_final_path(candidate))
+        if target == protected or _contains(target, protected):
             warnings.append(
                 f"{path} also covers {candidate}, which exists")
     return warnings
@@ -133,10 +164,13 @@ def covered_secret_warnings(path: str) -> list[str]:
 def canonical_workspace(path: str) -> str:
     """Canonical form used as the workspace key.
 
-    Naming only: it folds case and resolves reparse points so one directory has
-    one profile, and it is never used to rewrite the operand itself.
+    Naming only: it folds case and asks the kernel for the object's canonical
+    path so one directory has one profile, and it is never used to rewrite the
+    operand itself.  The answer comes from an open handle, so it does not
+    depend on the caller's cwd and cannot be changed by a rename during the
+    call.
     """
-    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    return os.path.normcase(_final_path(path))
 
 
 def profile_name_for(workspace: str) -> str:

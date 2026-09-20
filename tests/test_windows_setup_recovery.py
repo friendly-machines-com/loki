@@ -13,6 +13,26 @@ from loki_agent import windows_setup as setup
 from loki_agent import windows_state as state
 from loki_agent import windows_verify as verify
 
+
+# windows_state._final_path asks the kernel about an open handle, which only
+# exists on Windows; this module tests the ledger and recovery logic on every
+# host, so it substitutes the platform's canonicalisation.  The real call is
+# exercised by the Windows legs.
+_final_path_patch = None
+
+
+def setUpModule():
+    global _final_path_patch
+    _final_path_patch = mock.patch.object(
+        state, '_final_path',
+        side_effect=lambda path: os.path.realpath(path))
+    _final_path_patch.start()
+
+
+def tearDownModule():
+    _final_path_patch.stop()
+
+
 SID = 'S-1-15-2-1-2-3'
 
 
