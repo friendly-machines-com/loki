@@ -629,7 +629,9 @@ class Front:
                     "session/list cwd must be an absolute path",
                     code=acps.INVALID_PARAMS,
                 )
-            cwd_filter = os.path.realpath(cwd_filter)
+            # Case-folded names are compared, nothing is asked of the
+            # filesystem: Loki never resolves or normalises an operand.
+            cwd_filter = os.path.normcase(cwd_filter)
         entries = []
         for path in savefiles.filtered_chat_log_paths("", CHAT_LOG_DIR):
             try:
@@ -643,7 +645,7 @@ class Front:
             if not cwd:
                 continue
             if (cwd_filter is not None
-                    and os.path.realpath(cwd) != cwd_filter):
+                    and os.path.normcase(cwd) != cwd_filter):
                 continue
             entries.append({
                 "sessionId": (
