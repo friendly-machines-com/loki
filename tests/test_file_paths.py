@@ -192,30 +192,32 @@ class FilePathTests(unittest.TestCase):
         selected = wrong if os.name != 'posix' else right
         directory = self.project if os.name != 'posix' else self.elsewhere
         loki.run_read(path)
-        real_open = os.open
+        real_open_directory = loki.private_files.open_directory
+        real_create = loki.private_files.create_exclusive_at
+        opened = []
         created = []
 
-        def identity(stat_result):
-            # An inode number alone is unique only within one volume, so the
-            # volume has to be part of what is compared.
-            return (stat_result.st_dev, stat_result.st_ino)
+        def observe_open_directory(name):
+            directory_fd = real_open_directory(name)
+            opened.append(directory_fd)
+            return directory_fd
 
-        def observe_open(name, flags, *args, **kwargs):
-            fd = real_open(name, flags, *args, **kwargs)
-            if flags & os.O_EXCL:
-                dir_fd = kwargs.get('dir_fd')
-                if dir_fd is not None:
-                    # The parent directory was opened once; the descriptor says
-                    # which directory the kernel resolved it to.
-                    created.append(identity(os.fstat(dir_fd)))
-                else:
-                    created.append(
-                        identity(os.stat(os.path.dirname(name))))
-            return fd
+        def observe_create(directory_fd, name, mode):
+            created.append(directory_fd)
+            return real_create(directory_fd, name, mode)
 
-        with mock.patch.object(loki.os, 'open', side_effect=observe_open):
+        # The temporary file must be created relative to the directory the
+        # kernel opened, not to a spelling an allocator re-derived: the
+        # descriptor the create receives is the one the open returned.  This
+        # holds on both platforms, so no branch is needed.
+        with mock.patch.object(
+                loki.private_files, 'open_directory',
+                side_effect=observe_open_directory), \
+                mock.patch.object(
+                    loki.private_files, 'create_exclusive_at',
+                    side_effect=observe_create):
             self.assertIn('Successfully', loki.run_write(path, 'updated'))
-        self.assertEqual(created, [identity(directory.stat())])
+        self.assertEqual(created, opened)
         self.assertEqual(selected.read_text(), 'updated')
         self.assertFalse(list(directory.glob('.*.tmp')))
 

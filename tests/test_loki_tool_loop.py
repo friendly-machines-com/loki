@@ -4858,8 +4858,11 @@ class ShellCwdTests(unittest.TestCase):
                 loki.current_transcript().append(
                     formats.message_item("user", "must not publish"))
                 loki.mark_chat_log_dirty()
+                # Patch the seam the publisher uses, not os.replace: on Windows
+                # the publish is private_files.replace_at (a handle-relative
+                # rename), so an os.replace patch would never fire there.
                 with mock.patch(
-                        "loki_agent.loki.os.replace",
+                        "loki_agent.loki.private_files.replace_at",
                         side_effect=OSError("publish failed")):
                     with self.assertRaisesRegex(OSError, "publish failed"):
                         loki.save_chat_log()
