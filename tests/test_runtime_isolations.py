@@ -122,6 +122,22 @@ class UnshareSelectionTests(unittest.TestCase):
 
 
 class LinuxIsolationTests(unittest.TestCase):
+    """The POSIX enforcement seam of the isolation property.
+
+    The property is the same on Windows -- the contained runtime cannot read
+    the credential tree, and its ambient cwd is not that tree -- but the seam
+    is not.  POSIX hides the tree from a same-UID process by unsharing user and
+    mount namespaces inside the runtime itself, which is the production call
+    these tests exercise.  Windows enforces the same property at
+    ``CreateProcess`` with an AppContainer token, and the runtime only verifies
+    its token; that side is
+    ``test_windows_appcontainers.AppContainerTests.test_runtime_gate`` and, for
+    the cwd half,
+    ``test_windows_runtime.IsolationSeamTests.test_runtime_cwd_is_the_supervisor_cwd_not_the_workspace``.
+    They are separate because the subject, the fixtures and the observations
+    differ, not because the property does.
+    """
+
     def test_runtime_rebinds_cwd_through_credential_cover(self):
         with tempfile.TemporaryDirectory() as directory:
             credentials = os.path.join(directory, "credentials")

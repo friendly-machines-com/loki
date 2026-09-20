@@ -2507,6 +2507,12 @@ class AppContainerTests(unittest.TestCase):
         proof that the DACL alone would refuse. Read is not restricted upward,
         so the file and directory read grants do flip their checks and are the
         evidence that the probe answers a DACL grant at all.
+
+        This asserts the same property as the POSIX
+        ``test_runtime_isolations.LinuxIsolationTests``: a runtime cannot read
+        the credential tree.  Only the enforcement seam differs -- an
+        AppContainer applied at ``CreateProcess`` here, an in-process unshare of
+        user/mount namespaces there -- which is why the two are separate tests.
         """
         native = AppContainers()
         details = native.token_details(include_groups=True)

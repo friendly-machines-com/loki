@@ -193,7 +193,12 @@ class IsolationSeamTests(unittest.TestCase):
     def test_runtime_cwd_is_the_supervisor_cwd_not_the_workspace(self):
         # The terminal runtime's ambient cwd is inherited from the
         # supervisor, as the POSIX spawn inherits it; the workspace crosses
-        # only as the container key, never as the process's directory.
+        # only as the container key, never as the process's directory.  This is
+        # the Windows side of the cwd half of the isolation property; the POSIX
+        # side is
+        # test_runtime_isolations.LinuxIsolationTests
+        # .test_runtime_rebinds_cwd_through_credential_cover, where a mount
+        # cover is what makes relative opens miss the credential tree.
         import asyncio
 
         from loki_agent import runtime_isolation
