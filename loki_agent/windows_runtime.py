@@ -190,6 +190,12 @@ def report_write_failure(operation, path, error):
                 entry[key] = f"<{type(problem).__name__}: {problem}>"
         report[name] = entry
     report["can_create_child"] = _try_create_child(parent)
+    if path:
+        report["stat"] = _attempt(lambda: os.stat(path))
+        report["isdir"] = os.path.isdir(path)
+        report["mkdir"] = _attempt(lambda: os.mkdir(path))
+        report["makedirs_exist_ok"] = _attempt(
+            lambda: os.makedirs(path, exist_ok=True))
     try:
         token = api.open_process_token(api.current_process_handle())
         try:
@@ -199,6 +205,15 @@ def report_write_failure(operation, path, error):
     except Exception as problem:  # noqa: BLE001 - recording only
         report["integrity"] = f"<{type(problem).__name__}: {problem}>"
     print(json.dumps(report), file=sys.stderr, flush=True)
+
+
+def _attempt(operation):
+    """Run ``operation`` and describe the outcome, for the failure report."""
+    try:
+        operation()
+    except OSError as error:
+        return f"{type(error).__name__}: {error}"
+    return "ok"
 
 
 def _try_create_child(parent):
