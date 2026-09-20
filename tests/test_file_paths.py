@@ -10,6 +10,7 @@ from loki_agent import loki, savefiles, sessions, terminal_frontend
 
 
 class StatIdentityTests(unittest.TestCase):
+
     def test_identity_omits_the_deprecated_windows_ctime(self):
         # Windows st_ctime is deprecated and moving from creation time to
         # metadata-change time (or zero), so it is not an identity; POSIX ctime
@@ -29,6 +30,7 @@ class StatIdentityTests(unittest.TestCase):
 
 
 class FilePathTests(unittest.TestCase):
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -191,18 +193,29 @@ class FilePathTests(unittest.TestCase):
         directory = self.project if os.name != 'posix' else self.elsewhere
         loki.run_read(path)
         real_open = os.open
-        created_inodes = []
+        created = []
+
+        def identity(stat_result):
+            # An inode number alone is unique only within one volume, so the
+            # volume has to be part of what is compared.
+            return (stat_result.st_dev, stat_result.st_ino)
 
         def observe_open(name, flags, *args, **kwargs):
             fd = real_open(name, flags, *args, **kwargs)
             if flags & os.O_EXCL:
-                created_inodes.append(
-                    os.stat(os.path.dirname(name)).st_ino)
+                dir_fd = kwargs.get('dir_fd')
+                if dir_fd is not None:
+                    # The parent directory was opened once; the descriptor says
+                    # which directory the kernel resolved it to.
+                    created.append(identity(os.fstat(dir_fd)))
+                else:
+                    created.append(
+                        identity(os.stat(os.path.dirname(name))))
             return fd
 
         with mock.patch.object(loki.os, 'open', side_effect=observe_open):
             self.assertIn('Successfully', loki.run_write(path, 'updated'))
-        self.assertEqual(created_inodes, [directory.stat().st_ino])
+        self.assertEqual(created, [identity(directory.stat())])
         self.assertEqual(selected.read_text(), 'updated')
         self.assertFalse(list(directory.glob('.*.tmp')))
 

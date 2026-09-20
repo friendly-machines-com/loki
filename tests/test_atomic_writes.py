@@ -11,6 +11,7 @@ from loki_agent import loki
 
 
 class AtomicWritePermissionTests(unittest.TestCase):
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -92,38 +93,51 @@ class AtomicWritePermissionTests(unittest.TestCase):
             self.assertEqual(self.target.read_text(), 'new')
             self.assertEqual(set(self.root.iterdir()), {self.target})
             return
+
+        from loki_agent import private_files
+
         unrelated = self.root / 'unrelated'
         unrelated.write_text('untouched')
         unrelated.chmod(0o600)
-        real_mkstemp = tempfile.mkstemp
+        real_create = private_files.create_exclusive_at
         real_fchmod = os.fchmod
         temporary = {}
 
-        def create_temporary(*args, **kwargs):
-            fd, path = real_mkstemp(*args, **kwargs)
-            temporary.update(fd=fd, path=path, identity=os.fstat(fd))
-            return fd, path
+        def create_temporary(directory_fd, name, *args, **kwargs):
+            fd = real_create(directory_fd, name, *args, **kwargs)
+            temporary.update(
+                dir_fd=directory_fd,
+                name=name,
+                fd=fd,
+                identity=os.fstat(fd),
+            )
+            return fd
 
         def replace_name_then_set_mode(fd, mode):
-            os.unlink(temporary['path'])
-            os.symlink(unrelated, temporary['path'])
+            # Unlink the temporary entry and swap in a symlink to unrelated
+            # within the open destination directory.
+            private_files.unlink_at(temporary['dir_fd'], temporary['name'])
+            os.symlink(str(unrelated), temporary['name'],
+                       dir_fd=temporary['dir_fd'])
             self.assertTrue(os.path.samestat(
                 os.fstat(fd), temporary['identity']))
             real_fchmod(fd, mode)
             self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), self.mode)
             self.assertEqual(stat.S_IMODE(unrelated.stat().st_mode), 0o600)
 
-        # Stop before rename: selecting the source entry for publication is a
-        # separate remaining issue, not something fchmod claims to protect.
-        with mock.patch.object(tempfile, 'mkstemp', side_effect=create_temporary), \
+        # Stop before publication: we are testing that mode assignment is bound
+        # to the descriptor, not entry publication.
+        with mock.patch.object(private_files, 'create_exclusive_at',
+                               side_effect=create_temporary), \
                 mock.patch.object(os, 'fchmod',
                                   side_effect=replace_name_then_set_mode), \
                 mock.patch.object(os, 'chmod', side_effect=AssertionError(
                     'pathname chmod must not run')), \
-                mock.patch.object(os, 'replace',
+                mock.patch.object(private_files, 'replace_at',
                                   side_effect=OSError('stop before publication')):
             with self.assertRaisesRegex(OSError, 'stop before publication'):
                 loki._atomic_write_text(str(self.target), 'new')
+
         self.assertEqual(unrelated.read_text(), 'untouched')
         self.assertEqual(stat.S_IMODE(unrelated.stat().st_mode), 0o600)
         self.assertEqual(self.target.read_text(), 'old')

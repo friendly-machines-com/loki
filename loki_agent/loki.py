@@ -26,7 +26,6 @@ import subprocess
 import signal
 import socket
 import stat
-import tempfile
 import uuid
 import shutil
 import shlex
@@ -36,6 +35,7 @@ from pprint import pformat
 
 from . import formats
 from . import host_ipc
+from . import private_files
 from . import host_process
 from . import http_client
 from . import models as modelsdev
@@ -1325,40 +1325,43 @@ def _atomic_write_text(file_path: str, content: str):
     # A final symlink is followed so its target is replaced and the link stays,
     # the same rule as the write tools apply; callers that already selected a
     # target hand one that is not itself a link.
-    directory = os.path.dirname(file_path) or '.'
+    directory, name = os.path.split(file_path)
+    directory = directory or '.'
+    if not name or name in ('.', '..'):
+        raise IsADirectoryError(file_path)
     # Capture the desired final mode BEFORE writing so a write/replace failure
     # can never leave the public path's mode corrupted. For an existing file we
     # preserve its current mode (rwx bits, including execute); for a new file
     # we match what plain open(...,'w') would produce, i.e. 0o666 & ~umask.
-    # _write_destination preserves final symlinks by selecting their target.
     try:
         target_mode = os.stat(file_path).st_mode & 0o7777
     except FileNotFoundError:
         target_mode = 0o666 & ~_UMASK
     os.makedirs(directory, exist_ok=True)
-    # Selection produced an absolute target spelling with no unresolved '..'.
-    # The standard allocator is therefore no longer given a literal operand
-    # whose traversal its internal abspath() could change.
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=f".{os.path.basename(file_path)}.", suffix=".tmp",
-        dir=directory, text=True)
+    # The directory is opened once, and both the temporary file and the
+    # replacement happen inside that open directory: the open *is* the kernel's
+    # resolution of it.  Handing the directory's name to the standard allocator
+    # instead lets its internal abspath() collapse '..' or a link lexically, so
+    # the temporary file lands in a different directory from the destination.
+    directory_fd = private_files.open_directory(directory)
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(content)
-            f.flush()
-            # os.fsync(f.fileno())
-            # Apply permissions to the still-open temp, after buffered writes.
-            _apply_destination_permissions(
-                file_path, f.fileno(), tmp_path, target_mode)
-        os.replace(tmp_path, file_path)
-    except Exception:
+        descriptor = private_files.create_exclusive_at(
+            directory_fd, temporary, 0o600)
         try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            # The write failed, but another cleanup path may already have
-            # removed the temp file; preserve the original write exception.
-            pass
+            private_files.write(descriptor, content.encode('utf-8'))
+            _apply_destination_permissions(
+                file_path, descriptor,
+                os.path.join(directory, temporary), target_mode)
+        finally:
+            private_files.close(descriptor)
+        private_files.replace_at(directory_fd, temporary, name)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            private_files.unlink_at(directory_fd, temporary)
         raise
+    finally:
+        private_files.close(directory_fd)
 
 
 def _stale_file_error(file_path: str, action: str,
