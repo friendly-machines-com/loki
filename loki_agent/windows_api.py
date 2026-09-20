@@ -339,13 +339,17 @@ def final_path_from_handle(handle) -> str:
                      wintypes.DWORD)
     size = get_final(handle, None, 0, VOLUME_NAME_DOS)
     if not size:
-        raise WindowsApiError("GetFinalPathNameByHandleW sizing failed",
-                              status=ctypes.get_last_error())
+        status = ctypes.get_last_error()
+        raise WindowsApiError(
+            f"GetFinalPathNameByHandleW sizing failed: {status}",
+            status=status)
     buffer = ctypes.create_unicode_buffer(size + 1)
     written = get_final(handle, buffer, size + 1, VOLUME_NAME_DOS)
     if not written:
-        raise WindowsApiError("GetFinalPathNameByHandleW failed",
-                              status=ctypes.get_last_error())
+        status = ctypes.get_last_error()
+        raise WindowsApiError(
+            f"GetFinalPathNameByHandleW failed: {status}",
+            status=status)
     return _strip_extended_prefix(buffer.value)
 
 
