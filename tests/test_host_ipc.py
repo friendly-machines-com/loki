@@ -8,12 +8,74 @@ is EOF, and the reference/spawn/validation contract the child depends on.
 """
 
 import asyncio
+import contextlib
+import ctypes
 import os
 import socket
 import unittest
 from unittest import mock
 
 from loki_agent import host_ipc
+from loki_agent import windows_subprocesses
+
+
+@contextlib.contextmanager
+def mocked_named_pipe(server_handle, *, client_handle=0x22, connect_error=None,
+                      open_error=None):
+    """The Win32 calls ``windows_subprocesses.pipe()`` makes, with state.
+
+    The named-pipe pair is Windows-only in effect but depends only on
+    declarations, like the anonymous pair above, so its creation attributes
+    and failure paths are exercised on the same host that runs the rest.
+    """
+    state = {"created": [], "closed": [], "connected": [], "last_error": 0}
+
+    def named_pipe(address, mode, pipe_mode, instances, obsize, ibsize,
+                   timeout, attributes):
+        state["created"].append({
+            "address": address, "mode": mode, "pipe_mode": pipe_mode,
+            "instances": instances,
+            "inherit": attributes._obj.bInheritHandle})
+        return server_handle
+
+    def connect(server, overlapped):
+        state["connected"].append(server)
+        if connect_error is not None:
+            state["last_error"] = connect_error
+            return 0
+        return 1
+
+    def convert(sddl, revision, output, size):
+        state["sddl"] = sddl
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0x5EC
+        return 1
+
+    def bound(library, symbol, *signature):
+        return {
+            "CreateNamedPipeW": named_pipe,
+            "ConnectNamedPipe": connect,
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW": convert,
+            "LocalFree": lambda *args: None,
+        }[symbol]
+
+    def open_client(*args, **kwargs):
+        if open_error is not None:
+            raise open_error
+        return client_handle
+
+    with mock.patch.object(windows_subprocesses.api, "bind",
+                           side_effect=bound), \
+            mock.patch.object(windows_subprocesses.api, "current_user_sid",
+                              return_value="S-1-5-21-9"), \
+            mock.patch.object(windows_subprocesses.api, "open_with_access",
+                              side_effect=open_client) as opened, \
+            mock.patch.object(windows_subprocesses.api, "close_handle",
+                              side_effect=state["closed"].append), \
+            mock.patch.object(ctypes, "get_last_error",
+                              side_effect=lambda: state["last_error"],
+                              create=True):
+        state["opened"] = opened
+        yield state
 
 
 class PairConfirmationTests(unittest.TestCase):
@@ -78,6 +140,36 @@ class PrivatePipePairTests(unittest.TestCase):
         # child request-write 0x11 and child response-read 0x12 keep inherit.
         self.assertEqual(cleared, [0x10, 0x13])
 
+        # The worker's stdio pair: the end the child reads is created without
+        # overlapped I/O, its partner is the front's overlapped write end, and
+        # the pipe is created with our own descriptor -- the default one
+        # grants Everyone read -- and refuses remote clients.
+        with mocked_named_pipe(0x30) as state:
+            server, client = windows_subprocesses.pipe(
+                overlapped=(False, True), duplex=True)
+        self.assertEqual((server, client), (0x30, 0x22))
+        created_pipe = state["created"][0]
+        self.assertTrue(
+            created_pipe["address"].startswith(r"\\.\pipe\loki-worker-"))
+        self.assertEqual(created_pipe["instances"], 1)
+        self.assertEqual(created_pipe["mode"] & 0x40000000, 0)  # not overlapped
+        self.assertEqual(created_pipe["mode"] & 0x00080000, 0x00080000)
+        self.assertEqual(created_pipe["pipe_mode"] & 0x8, 0x8)
+        self.assertEqual(created_pipe["inherit"], 0)
+        self.assertEqual(state["sddl"],
+                         "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-9)")
+        self.assertEqual(state["opened"].call_args.kwargs["flags"],
+                         0x40000000)
+        self.assertEqual(state["connected"], [0x30])
+        self.assertEqual(state["closed"], [])
+
+        # The stdout pair is the mirror image: the front's read end is the
+        # overlapped one, the child's write end is not.
+        with mocked_named_pipe(0x31) as state:
+            windows_subprocesses.pipe(overlapped=(True, False))
+        self.assertEqual(state["created"][0]["mode"] & 0x40000000, 0x40000000)
+        self.assertEqual(state["opened"].call_args.kwargs["flags"], 0)
+
     def test_second_pipe_failure_closes_the_first_pipe(self):
         closed = []
         with mock.patch.object(
@@ -90,6 +182,17 @@ class PrivatePipePairTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 host_ipc._private_pipe_pair()
         self.assertEqual(closed, [0x10, 0x11])
+
+        # Same for the named pair: a client that cannot open leaves no server
+        # behind, and a connect the kernel refuses closes both ends.
+        with mocked_named_pipe(0x30, open_error=OSError("no client")) as state:
+            with self.assertRaises(OSError):
+                windows_subprocesses.pipe(overlapped=(True, False))
+        self.assertEqual(state["closed"], [0x30])
+        with mocked_named_pipe(0x30, connect_error=5) as state:
+            with self.assertRaises(windows_subprocesses.api.WindowsApiError):
+                windows_subprocesses.pipe(overlapped=(True, False))
+        self.assertEqual(state["closed"], [0x30, 0x22])
 
     def test_inheritance_failure_closes_all_four_ends(self):
         closed = []
@@ -242,103 +345,6 @@ class PipeEndpointTests(unittest.TestCase):
             return
         # POSIX path: spawn_kwargs flattens this to pass_fds.
         self.assertEqual(host_ipc.handles(4), (4,))
-
-
-class WorkerStdioPipeTests(unittest.TestCase):
-    """The ACP worker's stdio pipes, with the Windows calls mocked.
-
-    Same contract as the credential channel's pair: only the child's ends
-    stay inheritable, and every partial-failure path closes everything it
-    created.
-    """
-
-    def test_only_the_child_ends_stay_inheritable(self):
-        created = iter([(0x20, 0x21), (0x22, 0x23)])
-        cleared = []
-        with mock.patch.object(host_ipc.windows_api, "create_pipe",
-                               side_effect=lambda: next(created)), \
-                mock.patch.object(host_ipc.windows_api,
-                                  "clear_handle_inheritance",
-                                  side_effect=cleared.append):
-            front, child = host_ipc.worker_stdio()
-
-        # front is (stdout_read, stdin_write); child is
-        # (stdin_read, stdout_write).
-        self.assertEqual(front, (0x22, 0x21))
-        self.assertEqual(child, (0x20, 0x23))
-        # The front's stdout-read 0x22 and stdin-write 0x21 are cleared; the
-        # child's stdin-read 0x20 and stdout-write 0x23 keep inherit.
-        self.assertEqual(cleared, [0x22, 0x21])
-
-    def test_second_pipe_failure_closes_the_first_pipe(self):
-        closed = []
-        with mock.patch.object(
-                host_ipc.windows_api, "create_pipe",
-                side_effect=[(0x20, 0x21), OSError("no more handles")]), \
-                mock.patch.object(host_ipc.windows_api,
-                                  "clear_handle_inheritance"), \
-                mock.patch.object(host_ipc.windows_api, "close_handle",
-                                  side_effect=closed.append):
-            with self.assertRaises(OSError):
-                host_ipc.worker_stdio()
-        self.assertEqual(closed, [0x20, 0x21])
-
-    def test_inheritance_failure_closes_all_four_ends(self):
-        closed = []
-        with mock.patch.object(
-                host_ipc.windows_api, "create_pipe",
-                side_effect=[(0x20, 0x21), (0x22, 0x23)]), \
-                mock.patch.object(
-                    host_ipc.windows_api, "clear_handle_inheritance",
-                    side_effect=[None, OSError("cannot clear")]), \
-                mock.patch.object(host_ipc.windows_api, "close_handle",
-                                  side_effect=closed.append):
-            with self.assertRaises(OSError):
-                host_ipc.worker_stdio()
-        self.assertEqual(closed, [0x20, 0x21, 0x22, 0x23])
-
-
-class StdioWriterTests(unittest.IsolatedAsyncioTestCase):
-    """The front's stdin writer: EOF is its handle closing, exactly once."""
-
-    def writer(self, write_file):
-        sink = host_ipc._HandleWriter(0xBB, asyncio.get_running_loop())
-        sink.start()
-        return host_ipc._StdioWriter(sink)
-
-    async def test_wait_closed_stops_the_thread_and_closes_the_handle(self):
-        written = []
-        closed = []
-        with mock.patch.object(host_ipc.windows_api, "write_file",
-                               side_effect=lambda handle, data: (
-                                   written.append(bytes(data)),
-                                   len(data))[1]), \
-                mock.patch.object(host_ipc.windows_api, "close_handle",
-                                  side_effect=closed.append):
-            writer = self.writer(None)
-            writer.write(b"last message")
-            await writer.drain()
-            await writer.wait_closed()
-
-        self.assertEqual(written, [b"last message"])
-        self.assertEqual(closed, [0xBB])
-        # The flush thread stopped; a release after wait_closed is a no-op.
-        writer.release()
-        self.assertEqual(closed, [0xBB])
-
-    async def test_release_closes_without_wait_closed(self):
-        # Teardown that never reached wait_closed must still release the
-        # handle -- this is the path that closes stdin for a worker whose
-        # reader died first.
-        closed = []
-        with mock.patch.object(host_ipc.windows_api, "write_file") as write, \
-                mock.patch.object(host_ipc.windows_api, "close_handle",
-                                  side_effect=closed.append):
-            writer = self.writer(None)
-            writer.release()
-            writer.release()
-        write.assert_not_called()
-        self.assertEqual(closed, [0xBB])
 
 
 class HandleWriterTests(unittest.IsolatedAsyncioTestCase):

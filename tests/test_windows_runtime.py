@@ -209,6 +209,7 @@ class IsolationSeamTests(unittest.TestCase):
 
         from loki_agent import host_ipc
         from loki_agent import runtime_isolation
+        from loki_agent import windows_subprocesses
 
         class Delegation:
             owner_child = (7,)
@@ -217,39 +218,26 @@ class IsolationSeamTests(unittest.TestCase):
             def child_arguments(self):
                 return ['--session-owner-fd', 'r=7']
 
-        front = (0x30, 0x31)
-        child = (0x32, 0x33)
-
         with mock.patch.object(runtime_isolation.windows_runtime,
                                'required_workspace',
                                return_value='/recorded/work') as gate, \
-                mock.patch.object(runtime_isolation.host_ipc,
-                                  'worker_stdio',
-                                  return_value=(front, child)) as pipes, \
                 mock.patch.object(host_ipc, 'handles',
                                   side_effect=lambda end: tuple(end)), \
-                mock.patch.object(host_ipc, 'WorkerStdio',
-                                  return_value=mock.Mock()) as streams, \
-                mock.patch.object(runtime_isolation.windows_runtime,
-                                  'launch',
-                                  return_value=mock.Mock()) as launch:
+                mock.patch.object(windows_subprocesses,
+                                  'create_worker_process',
+                                  new=mock.AsyncMock(return_value='worker')) as spawn:
             worker = asyncio.run(runtime_isolation.start_worker(
                 '/session/cwd', {'SAFE': 'value'}, Delegation()))
         gate.assert_called_once_with('/session/cwd')
-        pipes.assert_called_once_with()
-        streams.assert_called_once_with(*front)
-        self.assertIs(worker._process, launch.return_value)
-        self.assertEqual(launch.call_args.args[0], sys.argv[0])
-        arguments = launch.call_args.args[1]
-        self.assertEqual(arguments[:3],
-                         ['--worker', '--session-owner-fd', 'r=7'])
-        self.assertEqual(arguments[3], '--stdout-null-handle')
-        self.assertEqual(int(arguments[4]), launch.call_args.args[4][-1])
-        self.assertEqual(launch.call_args.kwargs['stdio'], child)
-        self.assertEqual(launch.call_args.kwargs['current_directory'],
-                         os.getcwd())
-        # The workspace crosses as the container key only.
-        self.assertEqual(launch.call_args.args[3], '/recorded/work')
+        self.assertEqual(worker, 'worker')
+        # The workspace crosses as the container key only; the ambient cwd is
+        # the front's, exactly as the POSIX spawn inherits it by omission.
+        spawn.assert_awaited_once_with(
+            workspace='/recorded/work',
+            environment={'SAFE': 'value'},
+            arguments=['--worker', '--session-owner-fd', 'r=7'],
+            inherited_handles=[7, 9],
+            current_directory=os.getcwd())
 
 
 class LaunchTests(unittest.TestCase):

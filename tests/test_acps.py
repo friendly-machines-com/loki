@@ -180,6 +180,20 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await channel.close()
         released.assert_called_once_with(channel.process)
 
+    async def test_a_dead_worker_fails_the_pending_request(self):
+        # A worker that exits without answering must fail the request that
+        # waits on it, not leave the caller waiting for a reply that cannot
+        # arrive.
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "pass",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        channel = acp.WorkerChannel("dying", process, lambda message: None)
+        try:
+            with self.assertRaises(acps.TransportError):
+                await asyncio.wait_for(channel.request("session/new", {}), 10)
+        finally:
+            await channel.close()
+
 
 class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_denied_workspace_fails_closed_and_releases_delegation(self):

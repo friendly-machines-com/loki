@@ -659,13 +659,52 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_spawn_is_piped_delegated_and_sessioned(self):
         spawned = {}
 
+        class Endpoint:
+            def __init__(self, *handles):
+                self._handles = handles
+
+            def handles(self):
+                return self._handles
+
         class Delegation:
+            owner_child = Endpoint(7)
+            credential_child = Endpoint(9)
+
             def child_arguments(self):
                 return ["--session-owner-fd", "7",
                         "--credential-capability-fd", "9"]
 
             def child_spawn_kwargs(self):
                 return {"pass_fds": (7, 9)}
+
+        if os.name == "nt":
+            # The same spawn, contained: the session cwd keys the container,
+            # the delegation ends cross as handles, and the ambient cwd stays
+            # the front's.
+            from loki_agent import windows_subprocesses
+
+            async def spawn(**kwargs):
+                spawned["kwargs"] = kwargs
+                return object()
+
+            with mock.patch.object(
+                    runtime_isolation.windows_runtime, "required_workspace",
+                    return_value="/recorded/work") as gate, \
+                    mock.patch.object(windows_subprocesses,
+                                      "create_worker_process", new=spawn):
+                await runtime_isolation.start_worker(
+                    "/work", {"SAFE": "value"}, Delegation())
+
+            self.assertEqual(gate.call_args.args, ("/work",))
+            kwargs = spawned["kwargs"]
+            self.assertEqual(kwargs["workspace"], "/recorded/work")
+            self.assertEqual(kwargs["environment"], {"SAFE": "value"})
+            self.assertEqual(kwargs["arguments"], [
+                "--worker", "--session-owner-fd", "7",
+                "--credential-capability-fd", "9"])
+            self.assertEqual(kwargs["inherited_handles"], [7, 9])
+            self.assertEqual(kwargs["current_directory"], os.getcwd())
+            return
 
         async def spawn(*args, **kwargs):
             spawned["args"] = args
@@ -693,6 +732,88 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["env"], {"SAFE": "value"})
         self.assertEqual(kwargs["pass_fds"], (7, 9))
         self.assertTrue(kwargs["start_new_session"])
+
+    async def test_worker_stdio_ends_are_handed_over_and_released(self):
+        # The contained worker's stdio: the child's ends are the only ones
+        # marked inheritable and the only ones named as its standard handles,
+        # the front keeps the complementary ends, and the front's copies of the
+        # child's ends do not outlive the launch -- otherwise the worker's exit
+        # could never be seen as end of file.  Windows-only in effect,
+        # exercised here with the Win32 and launcher calls mocked.
+        from loki_agent import windows_runtime
+        from loki_agent import windows_subprocesses
+
+        async def exercise(launch_error=None):
+            transport = object.__new__(
+                windows_subprocesses.ContainedWorkerTransport)
+            transport._loop = asyncio.get_running_loop()
+            transport._exit_task = None
+            transport._closed = True
+            contained = mock.Mock(pid=4242, returncode=None)
+            contained.wait = mock.AsyncMock(return_value=0)
+            closed = []
+            error = None
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    windows_subprocesses, "pipe",
+                    side_effect=[(11, 12), (13, 14)]))
+                inherit = stack.enter_context(mock.patch.object(
+                    windows_subprocesses.api, "set_handle_information"))
+                stack.enter_context(mock.patch.object(
+                    windows_subprocesses.api, "close_handle",
+                    side_effect=closed.append))
+                null = stack.enter_context(mock.patch.object(
+                    windows_runtime, "worker_stdout_null"))
+                if launch_error is None:
+                    call = stack.enter_context(mock.patch.object(
+                        windows_runtime, "launch", return_value=contained))
+                else:
+                    call = stack.enter_context(mock.patch.object(
+                        windows_runtime, "launch", side_effect=launch_error))
+                null.return_value.__enter__.return_value = 101
+                try:
+                    transport._start(
+                        args=None, shell=False,
+                        stdin=windows_subprocesses.PIPE,
+                        stdout=windows_subprocesses.PIPE, stderr=None,
+                        bufsize=0, workspace="/work",
+                        environment={"SAFE": "value"},
+                        arguments=["--worker", "--session-owner-fd", "r=7"],
+                        inherited_handles=[7, 9], current_directory="/cwd")
+                except BaseException as raised:  # noqa: BLE001 - asserted below
+                    error = raised
+                finally:
+                    if transport._exit_task is not None:
+                        transport._exit_task.cancel()
+            return transport, inherit, call, closed, error
+
+        transport, inherit, call, closed, error = await exercise()
+        self.assertIsNone(error)
+
+        # stdin is (child_read=11, front_write=12); stdout is
+        # (front_read=13, child_write=14).
+        self.assertEqual(inherit.call_args_list,
+                         [mock.call(11, 1, 1), mock.call(14, 1, 1)])
+        self.assertEqual(call.call_args.kwargs["stdio"], (11, 14))
+        self.assertEqual(call.call_args.args[1],
+                         ["--worker", "--session-owner-fd", "r=7",
+                          "--stdout-null-handle", "101"])
+        self.assertEqual(call.call_args.args[4], [7, 9, 101])
+        self.assertEqual(call.call_args.args[3], "/work")
+        self.assertEqual(call.call_args.kwargs["current_directory"], "/cwd")
+        self.assertCountEqual(closed, [11, 14])
+        self.assertEqual(transport._proc.pid, 4242)
+        self.assertEqual(transport._proc.stdin.handle, 12)
+        self.assertEqual(transport._proc.stdout.handle, 13)
+        with mock.patch.object(windows_subprocesses.api, "close_handle"):
+            transport._proc.stdin.close()
+            transport._proc.stdout.close()
+
+        # A launch that fails hands nothing over and releases every end.
+        _transport, _inherit, _call, closed, error = await exercise(
+            OSError("launch failed"))
+        self.assertIsInstance(error, OSError)
+        self.assertCountEqual(closed, [11, 12, 13, 14])
 
 
 if __name__ == "__main__":

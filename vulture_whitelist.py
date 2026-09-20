@@ -53,6 +53,26 @@ ESCAPE
 _.clear_screen
 _.__stdout__
 
+# Vendored asyncio protocol/transport surface in windows_subprocesses: these
+# are called by the event loop, by StreamWriter and by the copied base class,
+# never by a Loki call site.  `_log_traceback` is the CPython attribute set on
+# the stdin close waiter so an unawaited wait_closed() logs no traceback.
+_.connection_made
+_.connection_lost
+_.data_received
+_.eof_received
+_.pause_writing
+_.resume_writing
+_.set_protocol
+_.get_protocol
+_.is_closing
+_.pipe_data_received
+_.pipe_connection_lost
+_.process_exited
+_._drain_helper
+_._get_close_waiter
+_._log_traceback
+
 # False positives: base-class callbacks and destructuring targets.
 _.handle_starttag
 _.handle_endtag
