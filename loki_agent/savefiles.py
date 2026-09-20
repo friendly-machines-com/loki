@@ -30,7 +30,12 @@ def chat_log_filename(chat_id: str) -> str:
 
 
 def ensure_chat_log_dir(chat_log_dir: str) -> None:
-    os.makedirs(chat_log_dir, exist_ok=True)
+    from . import runtime_isolation
+
+    # A contained worker's first create here can be refused transiently even
+    # though the same call succeeds immediately after; the seam carries the
+    # measured evidence and the causes already excluded.
+    runtime_isolation.make_directory(chat_log_dir)
 
 
 def new_chat_log_path(chat_log_dir: str) -> str:
