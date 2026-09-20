@@ -75,6 +75,50 @@ def set_dacl_sddl(path: str, sddl: str) -> None:
         local_free(descriptor)
 
 
+def set_handle_dacl_sddl(handle, sddl: str) -> None:
+    """Set the DACL of the object ``handle`` names, as ``set_dacl_sddl`` would.
+
+    The handle-relative counterpart of ``set_dacl_sddl``: the same descriptor
+    conversion and the same protected-flag rule, applied to the object the
+    handle names.  Keeping both here means a grant that goes through a handle
+    cannot drift from one that goes through a pathname.
+    """
+    convert = bind(
+        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    get_dacl = bind("advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
+                    ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.POINTER(wintypes.BOOL))
+    set_info = bind("advapi32", "SetSecurityInfo", wintypes.DWORD,
+                    ctypes.c_void_p, ctypes.c_int, wintypes.DWORD,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p)
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+
+    descriptor, dacl = ctypes.c_void_p(), ctypes.c_void_p()
+    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise WindowsApiError(f"invalid security descriptor: {sddl!r}")
+    try:
+        present = wintypes.BOOL()
+        defaulted = wintypes.BOOL()
+        if not get_dacl(descriptor, ctypes.byref(present),
+                        ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise WindowsApiError("GetSecurityDescriptorDacl failed")
+        if not present.value or not dacl.value:
+            raise WindowsApiError("security descriptor carries no explicit DACL")
+        flags = DACL_SECURITY_INFORMATION
+        if 'P' in sddl.split('(', 1)[0][2:]:
+            flags |= PROTECTED_DACL_SECURITY_INFORMATION
+        status = set_info(handle, SE_FILE_OBJECT, flags, None, None, dacl, None)
+        if status != ERROR_SUCCESS:
+            raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}")
+    finally:
+        local_free(descriptor)
+
+
 def create_app_container_profile(name: str) -> str:
     """Create the profile and return its package SID."""
     create = bind("userenv", "CreateAppContainerProfile", ctypes.c_long,

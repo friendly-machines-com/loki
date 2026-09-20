@@ -18,6 +18,7 @@ from unittest import mock
 
 from loki_agent import windows_acl
 from loki_agent import windows_api
+from loki_agent import windows_containers
 from loki_agent import windows_setup
 from loki_agent import windows_state
 
@@ -267,6 +268,81 @@ class ProtectedPathTests(unittest.TestCase):
         self.assertEqual(
             windows_state.protected_path_errors(
                 os.path.join(self.root, "elsewhere")), [])
+
+
+class HandlePathTests(unittest.TestCase):
+    """The check bound to the ACL write asks the write's own handle."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = temporary.name
+        self.config = os.path.join(self.root, "loki")
+        self.credentials = os.path.join(self.config, "credentials")
+        self.state = os.path.join(self.root, "state")
+        for target, attribute in ((self.config, "loki_config_dir"),
+                                  (self.state, "loki_state_dir"),
+                                  (self.credentials, "credential_directory")):
+            patch = mock.patch.object(
+                windows_setup.paths, attribute, return_value=target)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _named_by_handle(self, path):
+        return mock.patch.object(
+            windows_api, "final_path_from_handle", return_value=path)
+
+    def test_refuses_the_credential_directory_through_the_handle(self):
+        with self._named_by_handle(self.credentials):
+            errors = windows_state.handle_path_errors(
+                object(), self.credentials)
+        self.assertTrue(errors)
+
+    def test_allows_an_unrelated_directory_through_the_handle(self):
+        elsewhere = os.path.join(self.root, "elsewhere")
+        with self._named_by_handle(elsewhere):
+            self.assertEqual(
+                windows_state.handle_path_errors(object(), elsewhere), [])
+
+
+class GrantHandleTests(unittest.TestCase):
+    """A grant reads and writes the DACL through the handle it was given."""
+
+    EXISTING = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;" + OTHER_SID + ")"
+
+    def setUp(self):
+        self.backend = windows_setup.WindowsBackend({})
+
+    def test_reads_and_writes_the_same_handle(self):
+        handle = object()
+        with mock.patch.object(
+                windows_api, "handle_dacl_sddl",
+                return_value=self.EXISTING) as read, \
+                mock.patch.object(
+                    windows_containers, "set_handle_dacl_sddl") as write:
+            self.backend._grant_path(
+                handle, "/work", windows_setup.Access.READ_WRITE, PACKAGE_SID)
+        read.assert_called_once_with(handle)
+        self.assertIs(write.call_args.args[0], handle)
+
+    def test_an_unchanged_dacl_is_not_rewritten(self):
+        handle = object()
+        unchanged = windows_setup.add_package_ace(
+            self.EXISTING, PACKAGE_SID, windows_setup.Access.READ)
+        with mock.patch.object(
+                windows_api, "handle_dacl_sddl", return_value=unchanged), \
+                mock.patch.object(
+                    windows_containers, "set_handle_dacl_sddl") as write:
+            self.backend._grant_path(
+                handle, "/work", windows_setup.Access.READ, PACKAGE_SID)
+        write.assert_not_called()
+
+    def test_refuses_an_object_with_no_dacl(self):
+        with mock.patch.object(
+                windows_api, "handle_dacl_sddl", return_value=None):
+            with self.assertRaises(windows_api.WindowsApiError):
+                self.backend._grant_path(
+                    object(), "/work", windows_setup.Access.READ, PACKAGE_SID)
 
 
 class SecretWarningTests(unittest.TestCase):

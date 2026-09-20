@@ -60,6 +60,7 @@ from .windows_state import (
     add_package_ace,
     build_plan,
     entry_grants,
+    handle_path_errors,
     ledger_entry,
     ledger_path,
     load_ledger,
@@ -94,15 +95,24 @@ class WindowsBackend:
                 raise
             return windows_api.derive_app_container_sid(name)
 
-    def _grant_path(self, path: str, access: Access, package: str) -> None:
-        current = windows_api.dacl_sddl(path)
+    def _grant_path(self, handle, path: str, access: Access, package: str) -> None:
+        """Append the package's ACE to the DACL of the object ``handle`` names.
+
+        The DACL is read and written through that same handle, so the object
+        edited is the object the containment check judged -- not merely a name
+        that resolved to it a moment earlier.
+        """
+        current = windows_api.handle_dacl_sddl(handle)
+        if current is None:
+            raise windows_api.WindowsApiError(
+                f"{path} has no DACL to extend")
         updated = add_package_ace(current, package, access)
         # Do not rewrite a DACL this edit did not change.  The write is the
         # expensive part (inherited ACEs propagate), and setup is re-runnable:
         # re-applying an existing configuration must not re-touch the runtime
         # tree.  Same rule as _ungrant_path below.
         if updated != current:
-            windows_containers.set_dacl_sddl(path, updated)
+            windows_containers.set_handle_dacl_sddl(handle, updated)
 
     def _ungrant_path(self, path: str, package: str) -> None:
         current = windows_api.dacl_sddl(path)
@@ -160,8 +170,22 @@ class WindowsBackend:
                     self._ungrant_path(change.path, package)
                     checks.append(Check(f"ungrant {change.path}", "pass"))
             for grant in definition.grants:
-                self._grant_path(grant.path, grant.access, package)
-                checks.append(Check(f"grant {grant.path}", "pass", grant.access.value))
+                # One handle names the directory for the containment check, the
+                # DACL read and the DACL write.  The plan above is a pre-flight
+                # on transient handles; this is the check that the write is
+                # bound to, so a junction swapped in since planning cannot turn
+                # a refused path into a granted one.
+                handle = windows_api.open_directory_for_acl(grant.path)
+                try:
+                    errors = handle_path_errors(
+                        handle, grant.path, grant.access)
+                    if errors:
+                        raise windows_api.WindowsApiError("; ".join(errors))
+                    self._grant_path(handle, grant.path, grant.access, package)
+                finally:
+                    windows_api.close_handle(handle)
+                checks.append(
+                    Check(f"grant {grant.path}", "pass", grant.access.value))
             self._record_entry(key, ledger_entry(
                 definition.workspace, checked_plan.profile, definition.grants))
         except (windows_api.WindowsApiError, OSError, ValueError) as error:

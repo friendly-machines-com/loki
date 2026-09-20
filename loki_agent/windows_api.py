@@ -294,6 +294,31 @@ def open_directory_handle(path: str):
     return handle
 
 
+def open_directory_for_acl(path: str):
+    """Open ``path`` to judge and then re-ACL the *same* object.
+
+    Unlike ``open_directory_handle`` this requests ``WRITE_DAC`` and
+    ``READ_CONTROL`` -- the rights needed to read and replace the object's
+    DACL through the handle -- and it withholds ``FILE_SHARE_DELETE``, so no
+    later open may rename or unlink the directory while this handle lives.
+    Whatever the caller judges through the handle is therefore the object whose
+    DACL it goes on to write: a junction swapped into ``path`` afterwards
+    cannot move the operation to a different object.
+    """
+    create_file = bind("kernel32", "CreateFileW", ctypes.c_void_p,
+                       wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p)
+    handle = create_file(
+        path, WRITE_DAC | READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, None)
+    if handle is None or handle == INVALID_HANDLE_VALUE:
+        raise WindowsApiError(f"CreateFileW({path!r}) for ACL failed",
+                              status=ctypes.get_last_error())
+    return handle
+
+
 def final_path_from_handle(handle) -> str:
     """The canonical DOS path of the object behind ``handle``.
 
@@ -647,6 +672,8 @@ ACCESS_SYSTEM_SECURITY = 0x01000000
 FILE_WRITE_DATA = 0x00000002
 FILE_APPEND_DATA = 0x00000004
 OPEN_EXISTING = 3
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
 FILE_SHARE_ALL = 0x00000007
 # FILE_FLAG_BACKUP_SEMANTICS lets CreateFileW open a directory, which the
 # credential tree and the workspace both are.

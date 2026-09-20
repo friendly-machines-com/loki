@@ -61,6 +61,13 @@ class RecoveryTests(unittest.TestCase):
             mock.patch.object(self.backend, '_ensure_profile', return_value=SID),
             mock.patch.object(api, 'dacl_sddl', side_effect=self.descriptors.__getitem__),
             mock.patch.object(containers, 'set_dacl_sddl', side_effect=self.descriptors.__setitem__),
+            # The grant is checked, read and written through one handle; this
+            # host has no handles, so the path itself stands in for it.
+            mock.patch.object(api, 'final_path_from_handle', side_effect=lambda handle: handle),
+            mock.patch.object(api, 'open_directory_for_acl', side_effect=lambda path: path),
+            mock.patch.object(api, 'close_handle'),
+            mock.patch.object(api, 'handle_dacl_sddl', side_effect=self.descriptors.__getitem__),
+            mock.patch.object(containers, 'set_handle_dacl_sddl', side_effect=lambda handle, sddl: self.descriptors.__setitem__(handle, sddl)),
         ]
         for patch in patches:
             patch.start()
@@ -222,3 +229,30 @@ class InheritanceTests(unittest.TestCase):
                     containers, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]):
                 containers.set_dacl_sddl('/work', sddl)
             self.assertEqual(set_named.call_args.args[2], expected)
+
+    def test_handle_setter_requests_disabling_inheritance_like_the_named_one(self):
+        # The handle-relative grant must carry the same protected-flag rule as
+        # the pathname one, or a re-applied grant could drop DACL protection.
+        for sddl, expected in [('D:AI(A;;FR;;;SY)', 4), ('D:P(A;;FR;;;SY)', 4 | 0x80000000)]:
+            set_info = mock.Mock(return_value=0)
+
+            def convert(text, revision, output, length):
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 10
+                return 1
+
+            def get_dacl(descriptor, present, output, defaulted):
+                ctypes.cast(present, ctypes.POINTER(ctypes.wintypes.BOOL))[0] = True
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 11
+                return 1
+            functions = {
+                'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
+                'GetSecurityDescriptorDacl': get_dacl,
+                'SetSecurityInfo': set_info,
+                'LocalFree': lambda *args: None,
+            }
+            handle = object()
+            with self.subTest(sddl=sddl), mock.patch.object(
+                    containers, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]):
+                containers.set_handle_dacl_sddl(handle, sddl)
+            self.assertEqual(set_info.call_args.args[0], handle)
+            self.assertEqual(set_info.call_args.args[2], expected)

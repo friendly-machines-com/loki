@@ -103,15 +103,8 @@ def _canonical_or_absolute(path: str) -> str:
         return os.path.normcase(os.path.abspath(path))
 
 
-def protected_path_errors(path: str, access: Access = Access.READ_WRITE) -> list[str]:
-    """Reject overlap with private data; trusted code may be read, not written.
-
-    Both sides are canonicalised from an open handle, so an alias (junction or
-    symlink) is seen through.  This is decided here and the ACL is applied
-    later; closing that window needs the same handle retained through the ACL
-    write, which the backend does not do yet.
-    """
-    target = _canonical_or_absolute(path)
+def _protected_reasons(target: str, path: str, access: Access) -> list[str]:
+    """Overlap verdict for an already-canonical ``target`` spelling."""
     reasons = []
     for tree in _runtime_trees(include_code=access is Access.READ_WRITE):
         protected = _canonical_or_absolute(tree)
@@ -123,6 +116,29 @@ def protected_path_errors(path: str, access: Access = Access.READ_WRITE) -> list
         elif _contains(protected, target):
             reasons.append(f"{path} is inside {tree}, which Loki never grants")
     return reasons
+
+
+def protected_path_errors(path: str, access: Access = Access.READ_WRITE) -> list[str]:
+    """Reject overlap with private data; trusted code may be read, not written.
+
+    Both sides are canonicalised from an open handle, so an alias (junction or
+    symlink) is seen through.  This decides only; the backend re-asks through
+    the same handle it re-ACLs, via ``handle_path_errors``.
+    """
+    return _protected_reasons(_canonical_or_absolute(path), path, access)
+
+
+def handle_path_errors(handle, path: str,
+                       access: Access = Access.READ_WRITE) -> list[str]:
+    """Overlap verdict for the object ``handle`` already names.
+
+    The target's canonical spelling is read from the open handle, so the object
+    judged here is exactly the object whose DACL the caller can then read and
+    write through that handle.  A name swapped afterwards cannot redirect the
+    decision to a different object.
+    """
+    target = os.path.normcase(windows_api.final_path_from_handle(handle))
+    return _protected_reasons(target, path, access)
 
 
 def _contains(parent: str, child: str) -> bool:
