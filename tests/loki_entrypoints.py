@@ -92,6 +92,25 @@ def configure_container(environment: dict, cwd: str) -> None:
     _report_workspace_access(cwd)
 
 
+def _powershell_sddl(path: str) -> str:
+    """The same object's SDDL as PowerShell renders it, SACL included.
+
+    ``label_sddl`` reads the mandatory label directly; this is the independent
+    second opinion, because a single reader that mis-parses would otherwise be
+    its own evidence for what the label says.
+    """
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             f"(Get-Acl -LiteralPath '{path}').Sddl"],
+            capture_output=True, text=True, timeout=60)
+    except OSError as error:
+        return f"<{type(error).__name__}: {error}>"
+    if result.returncode != 0:
+        return f"<exit {result.returncode}: {result.stderr.strip()}>"
+    return result.stdout.strip()
+
+
 def _report_workspace_access(workspace: str) -> None:
     """Print the descriptor a contained worker will meet in ``workspace``.
 
@@ -116,7 +135,8 @@ def _report_workspace_access(workspace: str) -> None:
             except Exception as error:  # noqa: BLE001 - diagnostic only
                 label = f"<{type(error).__name__}: {error}>"
             print(f"[workspace access] {path} exists="
-                  f"{os.path.exists(path)} dacl={sddl} label={label}")
+                  f"{os.path.exists(path)} dacl={sddl} label={label} "
+                  f"acl={_powershell_sddl(path)}")
     except Exception as error:  # noqa: BLE001 - never fail a test for this
         print(f"[workspace access] unavailable: "
               f"{type(error).__name__}: {error}")
