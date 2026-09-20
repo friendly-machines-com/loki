@@ -275,19 +275,25 @@ VOLUME_NAME_DOS = 0x00000000
 
 
 def open_directory_handle(path: str):
-    """Open ``path`` to query its identity: no access requested, no lock held.
+    """Open ``path`` to query its identity: attribute read, no lock held.
 
-    ``desired_access`` of 0 asks for nothing beyond the open, and the share
-    mode lets other processes keep writing, deleting or replacing the object
-    while the handle lives -- which is what makes it safe to hold one across a
-    check.  ``FILE_FLAG_BACKUP_SEMANTICS`` is what opens a directory at all.
+    ``FILE_READ_ATTRIBUTES`` is the whole ask, and it is required:
+    ``GetFinalPathNameByHandleW`` fails with ``ERROR_ACCESS_DENIED`` on a
+    handle opened with no access, which killed the containment gate at startup
+    with "GetFinalPathNameByHandleW sizing failed".  It is not ``GENERIC_READ``
+    and not ``READ_CONTROL``: the workspace grant is Modify (``0x1301BF``),
+    which allows attribute reads but not ``READ_CONTROL``, so the contained
+    runtime can still open its own workspace.  The share mode lets other
+    processes write, delete or replace the object while the handle lives, so
+    this is still not a lock.  ``FILE_FLAG_BACKUP_SEMANTICS`` is what opens a
+    directory at all.
     """
     create_file = bind("kernel32", "CreateFileW", ctypes.c_void_p,
                        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p)
-    handle = create_file(path, 0, FILE_SHARE_ALL, None, OPEN_EXISTING,
-                         FILE_FLAG_BACKUP_SEMANTICS, None)
+    handle = create_file(path, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, None,
+                         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) failed",
                               status=ctypes.get_last_error())

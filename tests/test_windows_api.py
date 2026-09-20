@@ -562,6 +562,24 @@ class FileAccessTests(unittest.TestCase):
         self.assertEqual(caught.exception.status,
                          windows_api.ERROR_ACCESS_DENIED)
 
+    def test_the_identity_open_asks_for_attribute_read_only(self):
+        # ``GetFinalPathNameByHandleW`` fails on a handle opened with no access,
+        # so the identity open must request FILE_READ_ATTRIBUTES -- but not
+        # GENERIC_READ or READ_CONTROL, which the workspace's Modify grant does
+        # not include and which the contained runtime therefore lacks.
+        calls = {}
+
+        def create_file(path, access, share, *rest):
+            calls.update(access=access, share=share)
+            return 77
+
+        with mock.patch.object(windows_api, "bind", return_value=create_file):
+            self.assertEqual(windows_api.open_directory_handle("/x"), 77)
+        self.assertEqual(calls["access"], windows_api.FILE_READ_ATTRIBUTES)
+        self.assertEqual(calls["share"], windows_api.FILE_SHARE_ALL)
+        self.assertEqual(calls["access"] & windows_api.READ_CONTROL, 0)
+        self.assertEqual(calls["access"] & windows_api.GENERIC_READ, 0)
+
 
 class HandleRelativeFileDeclarationTests(unittest.TestCase):
     """Layout and values the handle-relative credential operations rely on."""
