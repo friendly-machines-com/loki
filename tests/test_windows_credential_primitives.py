@@ -1,8 +1,9 @@
-"""Native exercises of the production Windows credential primitives.
+"""Native exercises of Loki's production Windows primitives.
 
 The portable tests pin the declarations and the logic around the calls; this is
 the only place the calls themselves execute, so the diagnostics are printed and
-the assertions state what a stock Windows box actually does.
+the assertions state what a stock Windows box actually does.  It covers the
+credential-storage primitives and the handle-bound setup grant primitives.
 
 This is a separate file from ``test_windows_primitives`` because that file is
 copied and run on its own by the standard-user probe, which stages it without
@@ -27,6 +28,8 @@ from loki_agent import credential_storages  # noqa: E402
 from loki_agent import private_files  # noqa: E402
 from loki_agent import windows_acl  # noqa: E402
 from loki_agent import windows_api  # noqa: E402
+from loki_agent import windows_containers  # noqa: E402
+from loki_agent import windows_state  # noqa: E402
 
 
 @unittest.skipUnless(os.name == 'nt', 'requires native Windows Python')
@@ -184,6 +187,73 @@ class CredentialPrimitiveTests(unittest.TestCase):
                 _private_files_windows.close(handle)
         finally:
             _private_files_windows.close(directory)
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires native Windows Python')
+class GrantHandlePrimitiveTests(unittest.TestCase):
+    """Native checks of the handle-bound setup grant primitives.
+
+    The portable tests in ``test_windows_setup`` substitute these calls; this is
+    where ``open_directory_for_acl``, ``handle_dacl_sddl`` and
+    ``set_handle_dacl_sddl`` actually run.  A grant binds the containment check,
+    the DACL read and the DACL write to one handle so a junction swapped into
+    the operand cannot move the decision or the write to a different object.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.target = self.root / 'target'
+        self.target.mkdir()
+        self.package = windows_api.derive_app_container_sid('loki-grant-probe')
+
+    def test_the_handle_identifies_and_pins_its_directory(self):
+        handle = windows_api.open_directory_for_acl(str(self.target))
+        try:
+            self.assertEqual(
+                os.path.normcase(windows_api.final_path_from_handle(handle)),
+                os.path.normcase(str(self.target)))
+            self.assertIsNotNone(windows_api.handle_dacl_sddl(handle))
+            # FILE_SHARE_DELETE is withheld, so while the handle lives the
+            # directory cannot be renamed out from under the object the check
+            # judged and the DACL write will name.
+            moved = self.root / 'moved'
+            with self.assertRaises(OSError) as refused:
+                os.rename(self.target, moved)
+            print(json.dumps({'operation': 'rename_while_pinned',
+                              'winerror': getattr(refused.exception,
+                                                  'winerror', None)}),
+                  flush=True)
+            self.assertTrue(self.target.is_dir())
+        finally:
+            windows_api.close_handle(handle)
+
+    def test_a_grant_reads_and_writes_the_dacl_of_its_handle(self):
+        handle = windows_api.open_directory_for_acl(str(self.target))
+        try:
+            current = windows_api.handle_dacl_sddl(handle)
+            updated = windows_state.add_package_ace(
+                current, self.package, windows_state.Access.READ_WRITE)
+            windows_containers.set_handle_dacl_sddl(handle, updated)
+        finally:
+            windows_api.close_handle(handle)
+        on_disk = windows_api.dacl_sddl(str(self.target))
+        print(json.dumps({'operation': 'grant_through_handle', 'sddl': on_disk}),
+              flush=True)
+        self.assertTrue(windows_acl.names_package(on_disk, self.package))
+
+    def test_a_protected_dacl_stays_protected_through_the_handle(self):
+        # The handle setter must carry the same protected-flag rule as the
+        # pathname setter, or re-applying a grant could drop DACL protection.
+        protected = "D:P(A;OICI;FA;;;%s)" % windows_api.current_user_sid()
+        handle = windows_api.open_directory_for_acl(str(self.target))
+        try:
+            windows_containers.set_handle_dacl_sddl(handle, protected)
+        finally:
+            windows_api.close_handle(handle)
+        header = windows_api.dacl_sddl(str(self.target)).split('(', 1)[0]
+        self.assertIn('P', header)
 
 
 if __name__ == '__main__':
