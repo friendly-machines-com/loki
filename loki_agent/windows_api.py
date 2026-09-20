@@ -340,12 +340,22 @@ def final_path_from_handle(handle) -> str:
     if not written:
         raise WindowsApiError("GetFinalPathNameByHandleW failed",
                               status=ctypes.get_last_error())
-    final = buffer.value
-    if final.startswith("\\?\\UNC\\"):
-        return "\\" + final[len("\\?\\UNC\\"):]
-    if final.startswith("\\?\\"):
-        return final[len("\\?\\"):]
-    return final
+    return _strip_extended_prefix(buffer.value)
+
+
+def _strip_extended_prefix(path: str) -> str:
+    """Map a ``VOLUME_NAME_DOS`` handle path to the plain DOS namespace.
+
+    ``GetFinalPathNameByHandleW`` returns an extended-length path (a UNC one
+    for a share); the names Loki compares never carry that prefix, so it is
+    removed before any comparison.  Getting this wrong is invisible off
+    Windows, so the cases are pinned on every host in ``test_windows_api``.
+    """
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[len("\\\\?\\UNC\\"):]
+    if path.startswith("\\\\?\\"):
+        return path[len("\\\\?\\"):]
+    return path
 
 
 def label_sddl(path: str) -> str:

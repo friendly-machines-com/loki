@@ -55,6 +55,28 @@ class FlagValueTests(unittest.TestCase):
         self.assertEqual(windows_api.KF_FLAG_NO_PACKAGE_REDIRECTION, 0x00010000)
 
 
+class ExtendedPathTests(unittest.TestCase):
+    """GetFinalPathNameByHandleW returns a prefixed path; comparisons do not.
+
+    The prefix literals are easy to get a backslash wrong, and the mistake
+    changes nothing off Windows, so the shapes are pinned on every host.
+    """
+
+    def test_the_extended_length_prefix_is_stripped(self):
+        self.assertEqual(
+            windows_api._strip_extended_prefix('\\\\?\\C:\\work'),
+            'C:\\work')
+
+    def test_a_unc_share_keeps_its_double_leading_backslash(self):
+        self.assertEqual(
+            windows_api._strip_extended_prefix('\\\\?\\UNC\\server\\share'),
+            '\\\\server\\share')
+
+    def test_a_plain_path_is_returned_unchanged(self):
+        self.assertEqual(
+            windows_api._strip_extended_prefix('C:\\work'), 'C:\\work')
+
+
 class DeclarationSafetyTests(unittest.TestCase):
     def test_same_signature_may_be_declared_again(self):
         key = ("test-library", "Repeated")
