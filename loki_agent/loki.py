@@ -1089,37 +1089,32 @@ def _resolve_path(path: str, base_dir: str = None) -> str:
     return os.path.join(base_dir or current_cwd(), path)
 
 
-def _file_state_key(file_path: str, expected_stat=None) -> str | None:
-    # A Read supplies the stat obtained for that read, not a later observation
-    # of the link. This name is a cache key, never a replacement destination.
-    recording_read = expected_stat is not None
-    key = os.path.realpath(file_path)
-    if expected_stat is None:
-        try:
-            expected_stat = os.stat(file_path)
-        except FileNotFoundError:
-            return key
-        except OSError:
-            return file_path
-    try:
-        if os.path.samestat(expected_stat, os.stat(key)):
-            return key
-    except OSError:
-        pass
-    # Magic fd links can describe an inode with no corresponding pathname.
-    # An unverified alias must not authorize replacing a later entry at that
-    # name. Hook invalidation may still discard its literal key conservatively.
-    return None if recording_read else file_path
+def _file_key(file_path: str) -> str:
+    """The name a read-before-write record is kept under.
+
+    Case-folded, and nothing else.  Not ``realpath`` (it walks and opens every
+    ancestor, which a contained runtime is refused outside its granted
+    workspace, and it does not pin anything), and not ``normpath`` either:
+    collapsing '..' lexically changes which object the name denotes wherever a
+    link is involved.  The name is already anchored by the caller to the fixed
+    logical cwd, so folding case and separators is all that is needed for one
+    file to have one key.  Identity by ``(st_dev, st_ino)`` is deliberately not
+    used: on volumes that report no file index (fat, exFAT, some shares and
+    filters) two unrelated files share ``st_ino`` 0 and would share a key.
+
+    What actually detects a replaced file is the observation recorded under
+    this key, compared in ``_stale_file_error``.
+    """
+    return os.path.normcase(file_path)
 
 
 def _existing_target(file_path: str, observed_stat) -> str:
-    # The caller must first validate the complete operand with a kernel lookup.
-    # Only then obtain a spelling for the selected target, checking that the
-    # spelling still refers to the observed object. Never normalize first.
-    target = os.path.realpath(file_path, strict=True)
-    if not os.path.samestat(observed_stat, os.stat(target)):
+    # The caller has already validated this operand with a kernel lookup.  The
+    # operand is used as given: a resolved spelling is a different name for the
+    # same object, and it can denote something else by the time it is opened.
+    if not os.path.samestat(observed_stat, os.stat(file_path)):
         raise OSError("path changed during target selection")
-    return target
+    return file_path
 
 
 def display_path(path: str) -> str:
@@ -1339,9 +1334,12 @@ def _atomic_write_text(file_path: str, content: str):
         raise
 
 
-def _stale_file_error(file_path: str, action: str) -> str | None:
-    observed = file_state.get(file_path)
-    if file_path not in file_state:
+def _stale_file_error(file_path: str, action: str,
+                      file_key=None) -> str | None:
+    if file_key is None:
+        file_key = _file_key(file_path)
+    observed = file_state.get(file_key)
+    if file_key not in file_state:
         return (
             f"Error: {file_path} has not been read. Read it before "
             f"{action}.")
@@ -2184,7 +2182,7 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
         return f"Error: {file_path} is a directory, not a file"
     try:
         st = os.stat(file_path)
-        state_key = _file_state_key(file_path, expected_stat=st)
+        file_key = _file_key(file_path)
     except FileNotFoundError:
         return f"Error: File not found: {file_path}"
     except IsADirectoryError:
@@ -2193,8 +2191,7 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
         return f"Error: {e}"
 
     def remember(observation):
-        if state_key is not None:
-            file_state[state_key] = observation
+        file_state[file_key] = observation
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
@@ -2276,16 +2273,17 @@ def run_write(file_path: str, content: str) -> str:
         file_path = _write_destination(_resolve_path(file_path))
     except Exception as error:
         return f"Error: {error}"
-    if os.path.exists(file_path) and file_path not in file_state:
+    file_key = _file_key(file_path)
+    if os.path.exists(file_path) and file_key not in file_state:
         return (f"Error: You must Read {file_path} before overwriting it. "
                 "Read it first, then retry the Write.")
-    if file_path in file_state:
-        stale_error = _stale_file_error(file_path, "overwriting it")
+    if file_key in file_state:
+        stale_error = _stale_file_error(file_path, "overwriting it", file_key)
         if stale_error:
             return stale_error
     try:
         _atomic_write_text(file_path, content)
-        file_state[file_path] = _content_observation(content)
+        file_state[file_key] = _content_observation(content)
         return f"Successfully wrote to {file_path}"
     except Exception as e:
         return f"Error: {e}"
@@ -2300,7 +2298,8 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
         file_path = _write_destination(_resolve_path(file_path))
     except Exception as error:
         return f"Error: {error}"
-    if file_path not in file_state:
+    file_key = _file_key(file_path)
+    if file_key not in file_state:
         return f"Error: You must Read {file_path} before editing it."
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -2310,7 +2309,7 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
     except Exception as e:
         return f"Error: {e}"
 
-    stale_error = _stale_file_error(file_path, "editing it")
+    stale_error = _stale_file_error(file_path, "editing it", file_key)
     if stale_error:
         return stale_error
 
@@ -2330,7 +2329,7 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
 
     try:
         _atomic_write_text(file_path, new_data)
-        file_state[file_path] = _content_observation(new_data)
+        file_state[file_key] = _content_observation(new_data)
         return f"Successfully edited {file_path} ({count} replacement{'s' if count != 1 else ''})."
     except Exception as e:
         return f"Error: {e}"
@@ -2834,8 +2833,7 @@ def _invalidate_hook_file_state(invocation):
         file_state.clear()
         return
     for path in invocation.changed_paths:
-        file_state.pop(
-            _file_state_key(_resolve_path(path, invocation.cwd)), None)
+        file_state.pop(_file_key(_resolve_path(path, invocation.cwd)), None)
 
 
 def _read_default_notes(invocation):
