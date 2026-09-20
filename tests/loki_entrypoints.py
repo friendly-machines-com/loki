@@ -89,6 +89,33 @@ def configure_container(environment: dict, cwd: str) -> None:
         raise RuntimeError(
             f"loki-setup --configure failed for {cwd!r}: "
             f"{result.stdout}{result.stderr}")
+    _report_workspace_access(cwd)
+
+
+def _report_workspace_access(workspace: str) -> None:
+    """Print the descriptor a contained worker will meet in ``workspace``.
+
+    A failed session reports only the Win32 error, so this prints what the
+    error does not say: the package SID this workspace derives, whether it is
+    granted on the workspace at all, whether that grant is inheritable, and
+    whether ``.loki`` already exists with a descriptor of its own.
+    """
+    try:
+        from loki_agent import windows_api, windows_state
+
+        package = windows_api.derive_app_container_sid(
+            windows_state.profile_name_for(workspace))
+        print(f"[workspace access] package={package}")
+        for path in (workspace, os.path.join(workspace, ".loki")):
+            try:
+                sddl = windows_api.dacl_sddl(path)
+            except Exception as error:  # noqa: BLE001 - diagnostic only
+                sddl = f"<{type(error).__name__}: {error}>"
+            print(f"[workspace access] {path} exists="
+                  f"{os.path.exists(path)} dacl={sddl}")
+    except Exception as error:  # noqa: BLE001 - never fail a test for this
+        print(f"[workspace access] unavailable: "
+              f"{type(error).__name__}: {error}")
 
 
 def loki_command() -> list[str]:
