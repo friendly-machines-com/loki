@@ -438,10 +438,20 @@ class Worker:
             self.session.shell_cwd = cwd
         else:
             self.session.shell_cwd = cwd
-            loki.new_chat_log(os.path.join(
-                loki.CHAT_LOG_DIR,
-                loki.chat_log_filename(session_id),
-            ))
+            try:
+                loki.new_chat_log(os.path.join(
+                    loki.CHAT_LOG_DIR,
+                    loki.chat_log_filename(session_id),
+                ))
+            except OSError as error:
+                # A refused write here is the first thing a session does, and
+                # the descriptors that look benign from outside are met from
+                # inside this process; record what it saw before failing.
+                if os.name == "nt":
+                    from . import windows_runtime
+                    windows_runtime.report_write_failure(
+                        "chat-log", getattr(error, "filename", None), error)
+                raise
 
         # Await discovery so a resumed subscription uses fresh exact-slug
         # request data before any config choice or prompt becomes available.
