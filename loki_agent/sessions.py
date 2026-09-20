@@ -18,8 +18,7 @@ from .response_headers import Store
 
 def conversation_id_for_path(path: str) -> str:
     """Return a stable, non-secret identity for one persistent conversation."""
-    real_path = os.path.realpath(path)
-    name = os.path.basename(real_path)
+    name = os.path.basename(path)
     if name.startswith("chat-") and name.endswith(".json"):
         chat_id = name[len("chat-"):-len(".json")]
         # Terminal chats use a bare UUID; ACP-created chats use "loki-UUID".
@@ -32,7 +31,7 @@ def conversation_id_for_path(path: str) -> str:
             pass
     # Explicitly named chat files still need the same partition after resume.
     # uuid5 avoids sending the absolute path itself to the model service.
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, real_path))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, path))
 
 
 @dataclass

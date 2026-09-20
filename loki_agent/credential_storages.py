@@ -186,8 +186,7 @@ class JsonCredentialStorage:
 
     def __init__(self, directory=None):
         self.directory = (
-            paths.credential_directory()
-            if directory is None else os.path.abspath(directory))
+            paths.credential_directory() if directory is None else directory)
 
     @property
     def file_path(self):
