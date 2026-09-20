@@ -352,12 +352,11 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
     child_environment["TEMP"] = scratch
     child_environment["TMP"] = scratch
     # The image is this process's own interpreter or executable, never the
-    # string the caller used to start it: in a frozen build sys.argv[0] can be
-    # a relative name or a symlink, and the child's cwd is whatever the
-    # caller stated, which need not be where that string would resolve.  A
-    # source script is passed to the interpreter as an absolute path.
+    # string the caller used to start it.  A source script is passed to that
+    # interpreter by the name given, and the child's cwd is the caller's, so
+    # the name resolves the same way for both.
     if not getattr(sys, "frozen", False):
-        arguments = [os.path.abspath(executable), *arguments]
+        arguments = [executable, *arguments]
     executable = sys.executable
     logger.debug(
         "runtime launch: executable=%r arguments=%r sys.argv[0]=%r "

@@ -42,10 +42,10 @@ def worker_command() -> list[str]:
     """The command that starts this program again as a worker.
 
     ``sys.executable`` is the image: the bootloader in a frozen build, and the
-    interpreter for a source script, which is then handed its own launcher as
-    an absolute path.  ``sys.argv[0]`` is only the name the caller typed --
-    possibly relative, possibly a symlink -- and must not be used as an
-    executable.
+    interpreter for a source script, which is then handed its own launcher by
+    the name the caller typed.  That name is used as a script argument, never
+    as an executable, and it resolves against the process's cwd -- which is
+    fixed and inherited by the child, so it names the same file for both.
 
     The contained Windows launch re-derives the same re-entry from
     ``sys.argv[0]`` and ``"--worker"`` (``launch`` applies the frozen/source
@@ -54,7 +54,7 @@ def worker_command() -> list[str]:
     if getattr(sys, "frozen", False):
         command = [sys.executable, "--worker"]
     else:
-        command = [sys.executable, os.path.abspath(sys.argv[0]), "--worker"]
+        command = [sys.executable, sys.argv[0], "--worker"]
     logger.debug(
         "worker command: %r (sys.argv[0]=%r sys.executable=%r frozen=%r)",
         command, sys.argv[0], sys.executable, getattr(sys, "frozen", False))
