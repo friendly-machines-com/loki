@@ -104,9 +104,8 @@ class Session:
         self.session_toolsets = toolsets
         self.session_state = dict(state)
         self.conversation_id = conversation_id_for_path(path)
-        # The path as given: resolving it walks and opens the parent
-        # directories, which a contained runtime is refused outside its
-        # granted workspace.
+        # The path as given: Loki never normalises or resolves a filesystem
+        # operand -- never, for any purpose.
         self.chat_log_path = path if path else None
         self.chat_log_dirty = False
         self.last_instructed_agent_mode = None

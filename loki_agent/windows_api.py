@@ -297,9 +297,8 @@ def open_directory_handle(path: str):
 def final_path_from_handle(handle) -> str:
     """The canonical DOS path of the object behind ``handle``.
 
-    ``GetFinalPathNameByHandleW`` answers from the open object: no ancestor is
-    walked and no name is resolved again, so this works where ``realpath``
-    cannot, and cannot be redirected by a rename between the check and the use.
+    The answer comes from the object the handle names, so no name is resolved
+    and no ancestor is walked, and a rename between two calls cannot change it.
     ``VOLUME_NAME_DOS`` is requested so the answer is in the same namespace a
     user-supplied path uses, and the extended-length prefix is stripped because
     the paths compared here never carry it.

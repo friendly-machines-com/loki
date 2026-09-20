@@ -77,11 +77,11 @@ def _runtime_trees(include_code: bool = True) -> list[str]:
 
 
 def _final_path(path: str) -> str:
-    """The object's canonical path, asked of the kernel about an open handle.
+    """The canonical path of an object, read from that object's open handle.
 
-    Not ``realpath``: that resolves per component, and an answer derived from
-    the object itself is cheaper and cannot be redirected by a rename during
-    the check.
+    Loki never resolves or normalises a name -- never, for any purpose.  Where
+    an answer about identity is needed it is asked of the object itself, so no
+    name is rewritten and a rename between two calls cannot change the answer.
     """
     handle = windows_api.open_directory_handle(path)
     try:

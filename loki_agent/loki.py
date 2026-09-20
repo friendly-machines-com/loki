@@ -1092,26 +1092,29 @@ def _resolve_path(path: str, base_dir: str = None) -> str:
 def _file_key(file_path: str) -> str:
     """The name a read-before-write record is kept under.
 
-    Case-folded, and nothing else.  Not ``realpath`` (it walks and opens every
-    ancestor, which a contained runtime is refused outside its granted
-    workspace, and it does not pin anything), and not ``normpath`` either:
-    collapsing '..' lexically changes which object the name denotes wherever a
-    link is involved.  The name is already anchored by the caller to the fixed
-    logical cwd, so folding case and separators is all that is needed for one
-    file to have one key.  Identity by ``(st_dev, st_ino)`` is deliberately not
-    used: on volumes that report no file index (fat, exFAT, some shares and
-    filters) two unrelated files share ``st_ino`` 0 and would share a key.
+    Loki never normalises or resolves a filesystem operand -- never, for any
+    purpose, including this one.  A name is what the caller wrote, anchored by
+    the caller to the fixed logical cwd; rewriting it substitutes a different
+    name for a possibly different object, which is not what any caller asked
+    for.  ``realpath``, ``abspath`` and ``normpath`` all do that rewriting.
+    Case and separators are folded so one name has one key, and nothing else is
+    done to it.
 
-    What actually detects a replaced file is the observation recorded under
-    this key, compared in ``_stale_file_error``.
+    Identity by ``(st_dev, st_ino)`` is not used either: on volumes that report
+    no file index (fat, exFAT, some shares and filters) two unrelated files
+    share ``st_ino`` 0 and would share a key.
+
+    What detects a replaced file is the observation recorded under this key,
+    compared in ``_stale_file_error``.
     """
     return os.path.normcase(file_path)
 
 
 def _existing_target(file_path: str, observed_stat) -> str:
-    # The caller has already validated this operand with a kernel lookup.  The
-    # operand is used as given: a resolved spelling is a different name for the
-    # same object, and it can denote something else by the time it is opened.
+    # The caller has already validated this operand with a kernel lookup, and
+    # the operand is used as given: Loki never normalises or resolves an
+    # operand, so no ``realpath``/``abspath``/``normpath`` here or anywhere
+    # along this path.
     if not os.path.samestat(observed_stat, os.stat(file_path)):
         raise OSError("path changed during target selection")
     return file_path
@@ -5423,10 +5426,9 @@ def resolve_chat_log_path(resume_arg: str) -> str:
 
 
 def new_chat_log(filename):
-    # ``filename`` is composed from the runtime's own chat-log root, not
-    # supplied as an operand, so there is nothing to select: resolving it walks
-    # and opens every ancestor, which a contained worker is refused outside its
-    # granted workspace.
+    # ``filename`` is composed from the runtime's own chat-log root and is used
+    # as given: Loki never normalises or resolves a filesystem operand, on any
+    # platform, for any reason.
     session = current_session()
     session.conversation_id = conversation_id_for_path(filename)
     session.transcript_items = initial_transcript_items()
