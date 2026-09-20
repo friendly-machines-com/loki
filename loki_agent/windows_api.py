@@ -274,10 +274,12 @@ def dacl_sddl(path: str) -> str:
 def label_sddl(path: str) -> str:
     """Return ``path``'s mandatory integrity label as SDDL text.
 
-    An empty string means the object carries no label, which the mandatory
-    policy treats as medium integrity: a low-integrity AppContainer is then
-    refused writes there whatever the DACL grants.  This is why the label is
-    read alongside the DACL rather than instead of it.
+    An empty string means the object carries no label.  That an unlabeled
+    object is what refuses a low-integrity AppContainer a write is *not*
+    established: the AppContainer fixture's workspace is unlabeled as well
+    (``private_dacl`` writes no ``S:`` section) and a contained child creates
+    ``.loki`` there.  So the label is recorded beside the DACL, not treated as
+    the explanation for a denial until a case shows it.
     """
     get_named = bind(
         "advapi32", "GetNamedSecurityInfoW", wintypes.DWORD,
