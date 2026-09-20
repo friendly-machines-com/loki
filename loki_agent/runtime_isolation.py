@@ -29,7 +29,6 @@ __all__ = [
     "close_runtime_process",
     "configured_workspace",
     "isolate_runtime",
-    "make_directory",
     "preflight",
     "prepare_runtime_scratch",
     "start_runtime",
@@ -115,14 +114,6 @@ if sys.platform == "win32":
         return windows_runtime.launch(
             executable, command[1:], environment, workspace, inherited,
             current_directory=os.getcwd())
-
-    def make_directory(path) -> int:
-        """Create a directory the runtime needs, tolerating a transient refusal.
-
-        Windows only: ``windows_runtime.make_directory`` carries the measured
-        evidence for the retry and the list of causes already excluded.
-        """
-        return windows_runtime.make_directory(path)
 
     async def start_worker(cwd, environment, delegation):
         """The ACP worker, contained like the terminal runtime.
@@ -222,11 +213,6 @@ else:
             # escape channel through TIOCSTI or terminal signals.
             start_new_session=True,
         )
-
-    def make_directory(path) -> int:
-        """Create a directory the runtime needs; POSIX needs no retry."""
-        os.makedirs(path, exist_ok=True)
-        return 1
 
     def close_runtime_process(process) -> None:
         # An asyncio subprocess owns its transport; waiting has closed it.

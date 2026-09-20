@@ -12,7 +12,6 @@ from contextlib import contextmanager
 import logging
 import os
 import sys
-import time
 from ctypes import wintypes
 
 from . import windows_api as api
@@ -241,50 +240,6 @@ def _try_create_child(parent):
     return "created"
 
 
-TRANSIENT_CREATE_ATTEMPTS = 4
-TRANSIENT_CREATE_DELAY = 0.05
-
-
-def make_directory(path):
-    """Create ``path`` and its parents, retrying a transient refusal.
-
-    Why: in the build leg a contained worker's *first* attempt to create
-    ``<workspace>\\.loki`` (or the chat-log directory under it) is refused with
-    WinError 5, while the identical call succeeds moments later in the same
-    process -- the failure report records exactly that: ``mkdir`` returning
-    ERROR_ALREADY_EXISTS (183) where the failure was ACCESS_DENIED, a fresh
-    child of the parent created successfully right after, and the target
-    existing.  The refusal is therefore transient rather than a permission, and
-    a bounded retry is the treatment that makes the runtime's behaviour match
-    what the filesystem actually permits.
-
-    Already checked, and excluded, before this was added: the workspace's DACL
-    and its inheritance (two independent readings, ours and ``Get-Acl``), the
-    mandatory label of the workspace, of the state directory and of the process
-    token, the process's integrity level, the ownership and the parent chain,
-    and the mkdir semantics on an existing path.  Also checked: only the worker
-    creates these directories -- the ACP front only reads chat logs -- so no
-    second process races it.
-
-    Limit: `TRANSIENT_CREATE_ATTEMPTS` attempts, `TRANSIENT_CREATE_DELAY`
-    apart; any other error and a refusal on the last attempt are re-raised
-    unchanged.  Retrying unboundedly would hide a real refusal.
-    """
-    for attempt in range(1, TRANSIENT_CREATE_ATTEMPTS + 1):
-        try:
-            os.makedirs(path, exist_ok=True)
-        except PermissionError:
-            if attempt == TRANSIENT_CREATE_ATTEMPTS:
-                raise
-            time.sleep(TRANSIENT_CREATE_DELAY)
-        else:
-            if attempt > 1:
-                print(f"runtime-access: created {path!r} after {attempt} "
-                      f"attempts", file=sys.stderr, flush=True)
-            return attempt
-    raise AssertionError("unreachable")
-
-
 def ensure_runtime_temp():
     """Create the scratch directory if it is missing.
 
@@ -297,7 +252,7 @@ def ensure_runtime_temp():
         raise RuntimeIsolationError("Missing Windows container launch workspace")
     directory = scratch_directory(workspace)
     try:
-        make_directory(directory)
+        os.makedirs(directory, exist_ok=True)
     except OSError as error:
         report_runtime_access(workspace, directory, error)
         raise RuntimeIsolationError(

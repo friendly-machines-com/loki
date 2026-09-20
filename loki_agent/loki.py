@@ -1313,11 +1313,7 @@ def _atomic_write_text(file_path: str, content: str):
         target_mode = os.stat(file_path).st_mode & 0o7777
     except FileNotFoundError:
         target_mode = 0o666 & ~_UMASK
-    from . import runtime_isolation
-
-    # Retried on Windows for the same transient first-create refusal the
-    # directory seam records.
-    runtime_isolation.make_directory(directory)
+    os.makedirs(directory, exist_ok=True)
     # Selection produced an absolute target spelling with no unresolved '..'.
     # The standard allocator is therefore no longer given a literal operand
     # whose traversal its internal abspath() could change.
@@ -5439,11 +5435,7 @@ def new_chat_log(filename):
     session.reasoning_effort_preference = None
     dirname = os.path.dirname(filename)
     if dirname:
-        from . import runtime_isolation
-
-        # Retried on Windows: a contained worker's first create can be refused
-        # transiently; see runtime_isolation.make_directory.
-        runtime_isolation.make_directory(dirname)
+        os.makedirs(dirname, exist_ok=True)
     session.chat_log_path = filename
     session.session_state = {"shell_cwd": session.shell_cwd}
     descriptor = active_connection_descriptor()
