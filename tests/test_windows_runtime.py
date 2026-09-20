@@ -200,60 +200,20 @@ class IsolationSeamTests(unittest.TestCase):
         self.assertEqual(launch.call_args.kwargs['current_directory'],
                          os.getcwd())
 
-    def test_worker_cwd_is_the_front_cwd_not_the_session_workspace(self):
-        # The invariant this pins: the worker's ACTUAL cwd is inherited from
-        # the front, exactly as the POSIX spawn inherits it by omission.  The
-        # session cwd gates and keys the container; it must never become the
-        # ambient directory the contained process resolves against.
+    def test_worker_uses_the_contained_transport(self):
         import asyncio
-
-        from loki_agent import host_ipc
-        from loki_agent import runtime_isolation
-
-        class Delegation:
-            owner_child = (7,)
-            credential_child = (9,)
-
-            def child_arguments(self):
-                return ['--session-owner-fd', 'r=7']
-
-        front = (0x30, 0x31)
-        child = (0x32, 0x33)
-
-        with mock.patch.object(runtime_isolation.windows_runtime,
-                               'required_workspace',
-                               return_value='/recorded/work') as gate, \
-                mock.patch.object(runtime_isolation.host_ipc,
-                                  'worker_stdio',
-                                  return_value=(front, child)) as pipes, \
-                mock.patch.object(host_ipc, 'handles',
-                                  side_effect=lambda end: tuple(end)), \
-                mock.patch.object(host_ipc, 'WorkerStdio',
-                                  return_value=mock.Mock()) as streams, \
-                mock.patch.object(runtime_isolation.windows_runtime,
-                                  'launch',
-                                  return_value=mock.Mock()) as launch:
+        from loki_agent import runtime_isolation, windows_workers
+        delegation = object()
+        with mock.patch.object(windows_workers, 'start_worker',
+                               new=mock.AsyncMock()) as launch:
             worker = asyncio.run(runtime_isolation.start_worker(
-                '/session/cwd', {'SAFE': 'value'}, Delegation()))
-        gate.assert_called_once_with('/session/cwd')
-        pipes.assert_called_once_with()
-        streams.assert_called_once_with(*front)
-        self.assertIs(worker._process, launch.return_value)
-        self.assertEqual(launch.call_args.args[0], sys.argv[0])
-        arguments = launch.call_args.args[1]
-        self.assertEqual(arguments[:3],
-                         ['--worker', '--session-owner-fd', 'r=7'])
-        self.assertEqual(arguments[3], '--stdout-null-handle')
-        self.assertEqual(int(arguments[4]), launch.call_args.args[4][-1])
-        self.assertEqual(launch.call_args.kwargs['stdio'], child)
-        self.assertEqual(launch.call_args.kwargs['current_directory'],
-                         os.getcwd())
-        # The workspace crosses as the container key only.
-        self.assertEqual(launch.call_args.args[3], '/recorded/work')
+                '/workspace', {'SAFE': 'value'}, delegation))
+        launch.assert_awaited_once_with('/workspace', {'SAFE': 'value'}, delegation)
+        self.assertIs(worker, launch.return_value)
 
 
 class LaunchTests(unittest.TestCase):
-    def exercise(self, contained):
+    def exercise(self, contained, package="package", assigned=True):
         events = []
         information = api.ProcessInformation(11, 12, 13, 14)
 
@@ -271,7 +231,7 @@ class LaunchTests(unittest.TestCase):
 
             def call(*args):
                 events.append(symbol)
-                return 1
+                return 0 if symbol == 'AssignProcessToJobObject' and not assigned else 1
             return call
 
         with mock.patch.dict('sys.modules', {'msvcrt': types.SimpleNamespace(
@@ -282,20 +242,23 @@ class LaunchTests(unittest.TestCase):
                 mock.patch.object(api, 'create_process_in_app_container',
                                   return_value=information) as create, \
                 mock.patch.object(api, 'open_process_token', return_value=22), \
-                mock.patch.object(api, 'token_is_app_container', return_value=contained), \
-                mock.patch.object(api, 'token_app_container_sid', return_value='package'), \
+                mock.patch.object(api, 'token_is_app_container', side_effect=lambda token:
+                                  (events.append('check_app'), contained)[1]), \
+                mock.patch.object(api, 'token_app_container_sid', side_effect=lambda token:
+                                  (events.append('check_package'), package)[1]), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True), \
                 mock.patch.object(api, 'resume_thread',
                                   side_effect=lambda *args: events.append('resume')), \
                 mock.patch.object(api, 'terminate_process',
                                   side_effect=lambda *args: events.append('terminate')), \
                 mock.patch.object(api, 'close_handle') as close:
-            if contained:
+            if contained and package == "package" and assigned:
                 process = runtime.launch('loki.py', ['--runtime'], {'SAFE': 'value'},
                                          '/work', [40, 41],
                                          current_directory='/work')
                 process.close()
             else:
-                with self.assertRaises(RuntimeIsolationError):
+                with self.assertRaises((RuntimeIsolationError, api.WindowsApiError)):
                     runtime.launch('loki.py', ['--runtime'], {'SAFE': 'value'},
                                    '/work', [40, 41],
                                    current_directory='/work')
@@ -314,11 +277,23 @@ class LaunchTests(unittest.TestCase):
 
     def test_verified_child_is_assigned_before_resume(self):
         events = self.exercise(True)
+        self.assertLess(events.index('check_app'), events.index('AssignProcessToJobObject'))
+        self.assertLess(events.index('check_package'), events.index('AssignProcessToJobObject'))
         self.assertLess(events.index('AssignProcessToJobObject'), events.index('resume'))
         self.assertNotIn('terminate', events)
 
     def test_wrong_token_is_terminated_without_resume(self):
         events = self.exercise(False)
+        self.assertIn('terminate', events)
+        self.assertNotIn('resume', events)
+
+    def test_wrong_package_is_terminated_without_resume(self):
+        events = self.exercise(True, package="other")
+        self.assertIn('terminate', events)
+        self.assertNotIn('resume', events)
+
+    def test_failed_job_assignment_is_terminated_without_resume(self):
+        events = self.exercise(True, assigned=False)
         self.assertIn('terminate', events)
         self.assertNotIn('resume', events)
 

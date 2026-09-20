@@ -194,11 +194,20 @@ class ContainedProcess:
 
     kill = terminate
 
+    def close_job(self):
+        # Kill-on-close applies even after the root exits. Detach ownership
+        # before closing, so the exit observer and teardown can both call it.
+        job, self.job = self.job, None
+        if job is not None:
+            api.close_handle(job)
+
     def close(self):
-        # Closing the job also kills descendants left after the root exits.
-        api.close_handle(self.job)
-        api.close_handle(self.information.hThread)
-        api.close_handle(self.information.hProcess)
+        self.close_job()
+        for name in ("hThread", "hProcess"):
+            handle = getattr(self.information, name)
+            setattr(self.information, name, None)
+            if handle:
+                api.close_handle(handle)
 
 
 def launch(executable, arguments, environment, workspace, inherited_handles,

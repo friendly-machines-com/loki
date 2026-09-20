@@ -171,14 +171,14 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
             async def wait(self):
                 return 0
 
-        released = mock.Mock()
+        released = mock.AsyncMock()
         with mock.patch.object(
                 acp.runtime_isolation, "close_runtime_process",
                 new=released):
             channel = acp.WorkerChannel(
                 "session", Process(), lambda message: None, None)
             await channel.close()
-        released.assert_called_once_with(channel.process)
+        released.assert_awaited_once_with(channel.process)
 
 
 class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):

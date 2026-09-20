@@ -97,7 +97,7 @@ class CredentialSupervisor:
                     await delegation.close()
                 finally:
                     if process is not None:
-                        runtime_isolation.close_runtime_process(process)
+                        await runtime_isolation.close_runtime_process(process)
 
 
 @dataclass
