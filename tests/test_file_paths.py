@@ -94,35 +94,30 @@ class FilePathTests(unittest.TestCase):
         with mock.patch.object(loki, '_file_observation',
                                side_effect=redirect_after_observation):
             self.assertIn('same contents', loki.run_read(str(alias)))
-        self.assertIn(str(original), loki.file_state)
-        self.assertNotIn(str(other), loki.file_state)
+        # Authorization is per spelling: the record names the alias the caller
+        # read, and nothing recorded a read of the other name.
+        self.assertIn(loki._file_key(str(alias)), loki.file_state)
+        self.assertNotIn(loki._file_key(str(other)), loki.file_state)
         self.assertIn('You must Read', loki.run_write(str(other), 'wrong'))
         self.assertEqual(other.read_text(), 'same contents')
 
-    def test_unverified_read_key_does_not_authorize_alias_replacement(self):
-        original = self.project / 'original'
-        other = self.project / 'other'
+    def test_a_replaced_alias_is_caught_by_what_was_read(self):
+        # Authorization is per spelling, and what it authorises is decided by
+        # the observation recorded at the read: a replacement whose contents
+        # are not the contents that were read is refused, while a byte-identical
+        # replacement clobbers nothing and is allowed.
         alias = self.project / 'alias'
+        original = self.project / 'original'
         original.write_text('same contents')
-        other.write_text('same contents')
         alias.symlink_to('original')
-        state_key = loki._file_state_key
-
-        def redirect_during_key_selection(path, expected_stat=None):
-            alias.unlink()
-            alias.symlink_to('other')
-            key = state_key(path, expected_stat=expected_stat)
-            alias.unlink()
-            alias.symlink_to('original')
-            return key
-
-        with mock.patch.object(loki, '_file_state_key',
-                               side_effect=redirect_during_key_selection):
-            self.assertIn('same contents', loki.run_read(str(alias)))
+        self.assertIn('same contents', loki.run_read(str(alias)))
         alias.unlink()
+        alias.write_text('different contents')
+        self.assertIn('changed on disk', loki.run_write(str(alias), 'wrong'))
+        self.assertEqual(alias.read_text(), 'different contents')
         alias.write_text('same contents')
-        self.assertIn('You must Read', loki.run_write(str(alias), 'wrong'))
-        self.assertEqual(alias.read_text(), 'same contents')
+        self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
+        self.assertEqual(alias.read_text(), 'updated')
 
     def test_cd_keeps_selected_directory_when_alias_changes(self):
         first = self.project / 'first'
@@ -220,9 +215,11 @@ class FilePathTests(unittest.TestCase):
         hard_link = self.project / 'hard-link'
         os.link(target, hard_link)
         original_inode = target.stat().st_ino
-        # Read through one spelling, edit through another: existing alias
-        # sharing in the read-before-write cache must remain available.
+        # Authorization is per spelling: a read of the target does not
+        # authorise writing the alias, and the alias must be read as such.
         loki.run_read(str(target))
+        self.assertIn('You must Read', loki.run_edit(str(alias), 'old', 'edited'))
+        self.assertIn('old', loki.run_read(str(alias)))
         self.assertIn('Successfully', loki.run_edit(str(alias), 'old', 'edited'))
         self.assertTrue(alias.is_symlink())
         # Windows readlink reports a \\?\ absolute path, so compare identity.

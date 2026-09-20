@@ -1110,14 +1110,36 @@ def _file_key(file_path: str) -> str:
     return os.path.normcase(file_path)
 
 
+_MAX_LINK_DEPTH = 8
+
+
+def _follow_final_link(file_path: str) -> str:
+    """The name to replace: an existing final symlink's target, else the name.
+
+    Following a final symlink is the one thing a write must do with a name:
+    editors' atomic saves replace the link's target and leave the link, and
+    replacing the link instead breaks pnpm-style links, shared configuration
+    and git's view of the file (a typechange from symlink to regular file).
+    Loki still never normalises or resolves a *path*: this reads the link
+    itself with ``readlink`` and joins at most ``_MAX_LINK_DEPTH`` of them, so
+    no ancestor of the operand is opened and no other component is rewritten.
+    """
+    target = file_path
+    for _ in range(_MAX_LINK_DEPTH):
+        if not os.path.islink(target):
+            return target
+        link = os.readlink(target)
+        target = (link if os.path.isabs(link)
+                  else os.path.join(os.path.dirname(target), link))
+    raise OSError(f"too many levels of symbolic links: {file_path}")
+
+
 def _existing_target(file_path: str, observed_stat) -> str:
-    # The caller has already validated this operand with a kernel lookup, and
-    # the operand is used as given: Loki never normalises or resolves an
-    # operand, so no ``realpath``/``abspath``/``normpath`` here or anywhere
-    # along this path.
-    if not os.path.samestat(observed_stat, os.stat(file_path)):
+    """The name to replace, verified against the object the caller observed."""
+    target = _follow_final_link(file_path)
+    if not os.path.samestat(observed_stat, os.stat(target)):
         raise OSError("path changed during target selection")
-    return file_path
+    return target
 
 
 def display_path(path: str) -> str:
@@ -1299,8 +1321,10 @@ def _write_destination(file_path: str) -> str:
 
 
 def _atomic_write_text(file_path: str, content: str):
-    # file_path is the already-selected replacement name. Resolving it here
-    # would choose a target again after the caller's read/staleness checks.
+    file_path = _follow_final_link(file_path)
+    # A final symlink is followed so its target is replaced and the link stays,
+    # the same rule as the write tools apply; callers that already selected a
+    # target hand one that is not itself a link.
     directory = os.path.dirname(file_path) or '.'
     # Capture the desired final mode BEFORE writing so a write/replace failure
     # can never leave the public path's mode corrupted. For an existing file we
@@ -2272,12 +2296,15 @@ def run_write(file_path: str, content: str) -> str:
         return "Error: file_path is required"
     if content is None:
         return "Error: content is required"
+    operand = _resolve_path(file_path)
+    # Authorization is per spelling: the record is looked up under the name the
+    # caller wrote, not under the target an existing final symlink resolves to.
+    file_key = _file_key(operand)
     try:
-        file_path = _write_destination(_resolve_path(file_path))
+        file_path = _write_destination(operand)
     except Exception as error:
         return f"Error: {error}"
-    file_key = _file_key(file_path)
-    if os.path.exists(file_path) and file_key not in file_state:
+    if os.path.exists(operand) and file_key not in file_state:
         return (f"Error: You must Read {file_path} before overwriting it. "
                 "Read it first, then retry the Write.")
     if file_key in file_state:
@@ -2297,11 +2324,13 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
         return "Error: file_path is required"
     if old_string == new_string:
         return "Error: new_string must be different from old_string"
+    operand = _resolve_path(file_path)
+    # Authorization is per spelling: looked up under the name the caller wrote.
+    file_key = _file_key(operand)
     try:
-        file_path = _write_destination(_resolve_path(file_path))
+        file_path = _write_destination(operand)
     except Exception as error:
         return f"Error: {error}"
-    file_key = _file_key(file_path)
     if file_key not in file_state:
         return f"Error: You must Read {file_path} before editing it."
     try:
