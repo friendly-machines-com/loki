@@ -28,7 +28,6 @@ import socket
 import stat
 import uuid
 import shutil
-import shlex
 from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from pprint import pformat
@@ -5432,12 +5431,21 @@ def change_shell_cwd_from_text(arg_text: str, text_writer=None) -> bool:
 
 
 def _parse_cd_arg_text(arg_text: str) -> str:
-    if not arg_text.strip():
-        return ""
-    parts = shlex.split(arg_text)
-    if len(parts) != 1:
-        raise ValueError("expected zero or one directory argument")
-    return parts[0]
+    """The directory operand: the text as given, with one quote layer removed.
+
+    The callers already pass everything after the command name, so this is one
+    literal path, not a shell word list.  It used to be ``shlex.split``, which
+    tokenises in POSIX mode, where a backslash escapes the next character: it
+    ate every separator of a Windows path, so ``/cd D:\\a\\b`` stat'd
+    ``D:ab``.  Nothing here may interpret escaping or split on whitespace; the
+    only affordance kept is one layer of matching surrounding quotes, for a
+    path typed with spaces out of habit.
+    """
+    target = arg_text.strip()
+    if (len(target) >= 2 and target[0] == target[-1]
+            and target[0] in ("'", '"')):
+        target = target[1:-1]
+    return target
 
 
 def chat_log_filename(chat_id: str) -> str:

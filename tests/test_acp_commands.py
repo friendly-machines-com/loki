@@ -107,6 +107,21 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.text.startswith("cd: "))
         self.assertIn("/no/such/place", outcome.text)
 
+    async def test_cd_operand_is_a_literal_path(self):
+        # The operand is the rest of the line, a literal path -- not a shell
+        # word list.  POSIX tokenising used to eat the separators, so a
+        # Windows path reached change_shell_cwd as C:worksub.
+        self.assertEqual(
+            loki._parse_cd_arg_text(r"C:\work\sub"), r"C:\work\sub")
+        # One layer of matching quotes is still removed, and nothing else.
+        self.assertEqual(loki._parse_cd_arg_text('"a b"'), "a b")
+
+        _session = self._install("/tmp")
+
+        outcome = await acp_commands.run(r"/cd C:\work\sub", _session)
+
+        self.assertNotIn("C:worksub", outcome.text)
+
     async def test_ps_lists_jobs(self):
         _session = self._install("/tmp")
         with mock.patch.object(loki, "run_jobs", return_value="no jobs"):
