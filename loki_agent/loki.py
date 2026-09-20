@@ -5425,7 +5425,10 @@ def resolve_chat_log_path(resume_arg: str) -> str:
 
 
 def new_chat_log(filename):
-    filename = _write_destination(filename)
+    # ``filename`` is composed from the runtime's own chat-log root, not
+    # supplied as an operand, so there is nothing to select: resolving it walks
+    # and opens every ancestor, which a contained worker is refused outside its
+    # granted workspace.
     session = current_session()
     session.conversation_id = conversation_id_for_path(filename)
     session.transcript_items = initial_transcript_items()

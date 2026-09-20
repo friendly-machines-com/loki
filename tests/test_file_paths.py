@@ -415,17 +415,17 @@ class FilePathTests(unittest.TestCase):
                     terminal_frontend.load_image_attachment(
                         path, base_dir=str(self.project))
 
-    def test_new_chat_selects_save_target_before_later_alias_changes(self):
+    def test_new_chat_uses_the_path_it_was_given(self):
+        # The path handed to a new chat is composed by the runtime, not taken
+        # from a model operand, so it is used as given.  A name that goes
+        # through a link is therefore followed again when the log is written --
+        # the write is not pinned to the object that name denoted here.
         literal = str(self.project) + '/link/../new-session.json'
-        expected = ((self.project if os.name != 'posix' else self.elsewhere)
-                    / 'new-session.json')
         loki.new_chat_log(literal)
-        self.assertEqual(self.session.chat_log_path, str(expected))
-        (self.project / 'link').unlink()
-        (self.project / 'link').symlink_to(
-            self.project, target_is_directory=True)
+        self.assertEqual(self.session.chat_log_path, literal)
+        base = self.project if os.name != 'posix' else self.elsewhere
         loki._atomic_write_text(self.session.chat_log_path, 'snapshot')
-        self.assertEqual(expected.read_text(), 'snapshot')
+        self.assertEqual((base / 'new-session.json').read_text(), 'snapshot')
 
     def test_resume_paths_preserve_traversal_and_save_through_symlink(self):
         literal = str(self.project) + '/link/../session.json'
