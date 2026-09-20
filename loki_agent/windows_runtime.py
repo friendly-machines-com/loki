@@ -157,7 +157,10 @@ def report_runtime_access(workspace, directory, error):
     print(json.dumps(report), file=sys.stderr, flush=True)
 
 
-def report_write_failure(operation, path, error):
+def report_write_failure(operation, path, error, traceback_text=None):
+    # The error text names a path, not the call that used it.
+    if traceback_text:
+        print(traceback_text, file=sys.stderr, flush=True)
     """Report a refused write from inside the container, beside the paths.
 
     A refusal is the one moment the descriptor, this process's integrity level

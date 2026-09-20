@@ -448,9 +448,12 @@ class Worker:
                 # the descriptors that look benign from outside are met from
                 # inside this process; record what it saw before failing.
                 if os.name == "nt":
+                    import traceback
+
                     from . import windows_runtime
                     windows_runtime.report_write_failure(
-                        "chat-log", getattr(error, "filename", None), error)
+                        "chat-log", getattr(error, "filename", None), error,
+                        traceback.format_exc())
                 raise
 
         # Await discovery so a resumed subscription uses fresh exact-slug
