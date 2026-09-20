@@ -34,6 +34,7 @@ from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
 from loki_agent import savefiles
 from loki_agent import terminals
+from loki_agent import windows_api
 from loki_endpoints import assume_endpoints_approved
 
 
@@ -5585,7 +5586,16 @@ class SubagentLaunchTests(unittest.TestCase):
                     str(loki.host_ipc.reference(owner_child)),
                 ]))
             self.assertEqual(status, 2)
-            self.assertEqual(owner_child.handles(), ())
+            # ``_close_descriptors`` closes the endpoint it parsed out of the
+            # argv reference -- a second PipeEndpoint over the same handle
+            # numbers -- so the caller's ``owner_child`` still records those
+            # numbers and ``handles()`` keeps reporting them.  What proves the
+            # handle was closed, as ``os.fstat`` proves it on POSIX below, is
+            # asking the OS whether it is still open.
+            handles = owner_child.handles()
+            self.assertTrue(handles)
+            for handle in handles:
+                self.assertFalse(windows_api.handle_is_open(handle))
             loki.host_ipc.close_end(owner_parent)
             return
         read_fd, write_fd = os.pipe()
