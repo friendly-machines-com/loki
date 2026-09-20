@@ -73,6 +73,11 @@ _._drain_helper
 _._get_close_waiter
 _._log_traceback
 
+# Read by the workspace-access diagnostic in tests/loki_entrypoints.py, which
+# is outside the vulture paths: the mandatory label is what a low-integrity
+# AppContainer meets before the DACL, so the diagnostic has to print it.
+label_sddl
+
 # False positives: base-class callbacks and destructuring targets.
 _.handle_starttag
 _.handle_endtag

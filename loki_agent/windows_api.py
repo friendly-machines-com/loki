@@ -160,6 +160,11 @@ def known_folder(folder_id: str, flags: int = KF_FLAG_DEFAULT) -> str:
 PROFILE_ALREADY_EXISTS = 0x800700B7
 
 DACL_SECURITY_INFORMATION = 0x00000004
+# LABEL_SECURITY_INFORMATION asks for the mandatory integrity label.  The
+# label, not the DACL, is what a low-integrity AppContainer meets first: an
+# object with no label is treated as medium, and no-write-up then refuses a
+# write the DACL grants.
+LABEL_SECURITY_INFORMATION = 0x00000010
 PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 SE_FILE_OBJECT = 1
 # SE_OBJECT_TYPE for kernel objects (processes, threads, jobs, ...), used when
@@ -262,6 +267,35 @@ def dacl_sddl(path: str) -> str:
                               status=status)
     try:
         return _sddl_from_descriptor(descriptor, DACL_SECURITY_INFORMATION)
+    finally:
+        local_free(descriptor)
+
+
+def label_sddl(path: str) -> str:
+    """Return ``path``'s mandatory integrity label as SDDL text.
+
+    An empty string means the object carries no label, which the mandatory
+    policy treats as medium integrity: a low-integrity AppContainer is then
+    refused writes there whatever the DACL grants.  This is why the label is
+    read alongside the DACL rather than instead of it.
+    """
+    get_named = bind(
+        "advapi32", "GetNamedSecurityInfoW", wintypes.DWORD,
+        wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p))
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+
+    descriptor = ctypes.c_void_p()
+    status = get_named(path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+                       None, None, None, None, ctypes.byref(descriptor))
+    if status != ERROR_SUCCESS:
+        raise WindowsApiError(
+            f"GetNamedSecurityInfoW({path!r}) failed: {status}", status=status)
+    try:
+        return _sddl_from_descriptor(descriptor, LABEL_SECURITY_INFORMATION)
     finally:
         local_free(descriptor)
 

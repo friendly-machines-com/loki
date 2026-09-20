@@ -111,8 +111,12 @@ def _report_workspace_access(workspace: str) -> None:
                 sddl = windows_api.dacl_sddl(path)
             except Exception as error:  # noqa: BLE001 - diagnostic only
                 sddl = f"<{type(error).__name__}: {error}>"
+            try:
+                label = windows_api.label_sddl(path)
+            except Exception as error:  # noqa: BLE001 - diagnostic only
+                label = f"<{type(error).__name__}: {error}>"
             print(f"[workspace access] {path} exists="
-                  f"{os.path.exists(path)} dacl={sddl}")
+                  f"{os.path.exists(path)} dacl={sddl} label={label}")
     except Exception as error:  # noqa: BLE001 - never fail a test for this
         print(f"[workspace access] unavailable: "
               f"{type(error).__name__}: {error}")
