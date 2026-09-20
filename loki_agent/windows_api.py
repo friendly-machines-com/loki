@@ -741,6 +741,31 @@ def token_is_app_container(token) -> bool:
     return bool(value.value)
 
 
+TOKEN_INTEGRITY_LEVEL = 25
+
+
+def token_integrity_level(token) -> str:
+    """The integrity level SID of ``token``, as text.
+
+    The process's own level is half of what the mandatory policy decides on;
+    the other half is the object's label.  A low-integrity process writing to
+    an object labelled (or defaulted) higher is refused whatever its DACL
+    grants, so a report of what a contained process met has to name both.
+    """
+    get_info = _get_token_information()
+    size = wintypes.DWORD()
+    get_info(token, TOKEN_INTEGRITY_LEVEL, None, 0, ctypes.byref(size))
+    if not size.value:
+        raise WindowsApiError(
+            "GetTokenInformation(TokenIntegrityLevel) sizing failed")
+    buffer = ctypes.create_string_buffer(size.value)
+    if not get_info(token, TOKEN_INTEGRITY_LEVEL, buffer, size.value,
+                    ctypes.byref(size)):
+        raise WindowsApiError(
+            "GetTokenInformation(TokenIntegrityLevel) failed")
+    return sid_text(ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0])
+
+
 def token_app_container_sid(token) -> str:
     """Return ``token``'s AppContainer package SID as a string.
 

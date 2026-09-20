@@ -120,6 +120,43 @@ def scratch_directory(workspace):
     return os.path.join(workspace, SCRATCH_DIRECTORY)
 
 
+def report_runtime_access(workspace, directory, error):
+    """Report, from inside the container, what it meets where it must write.
+
+    The workspace's DACL and label and this process's own integrity level are
+    the inputs that decide whether a contained write can succeed, and none of
+    them is visible from outside.  Recorded, not asserted: one line on stderr,
+    which is this process's log channel.
+    """
+    import json
+
+    report = {
+        "runtime-access": "scratch",
+        "directory": directory,
+        "created": os.path.isdir(directory),
+        "error": (None if error is None
+                  else f"{type(error).__name__}: {error}"),
+    }
+    state = os.path.join(workspace, SCRATCH_DIRECTORY.split(os.sep)[0])
+    for name, path in (("workspace", workspace), ("state", state)):
+        entry = {"exists": os.path.exists(path)}
+        for key, call in (("dacl", api.dacl_sddl), ("label", api.label_sddl)):
+            try:
+                entry[key] = call(path)
+            except Exception as problem:  # noqa: BLE001 - recording only
+                entry[key] = f"<{type(problem).__name__}: {problem}>"
+        report[name] = entry
+    try:
+        token = api.open_process_token(api.current_process_handle())
+        try:
+            report["integrity"] = api.token_integrity_level(token)
+        finally:
+            api.close_handle(token)
+    except Exception as problem:  # noqa: BLE001 - recording only
+        report["integrity"] = f"<{type(problem).__name__}: {problem}>"
+    print(json.dumps(report), file=sys.stderr, flush=True)
+
+
 def ensure_runtime_temp():
     """Create the scratch directory if it is missing.
 
@@ -134,9 +171,11 @@ def ensure_runtime_temp():
     try:
         os.makedirs(directory, exist_ok=True)
     except OSError as error:
+        report_runtime_access(workspace, directory, error)
         raise RuntimeIsolationError(
             f"could not create the runtime scratch directory "
             f"{directory!r}: {error}") from error
+    report_runtime_access(workspace, directory, None)
 
 
 # Layouts used by the native fixture in tests/test_windows_appcontainers.py.
