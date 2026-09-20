@@ -178,8 +178,10 @@ def report_write_failure(operation, path, error):
         "error": f"{type(error).__name__}: {error}",
     }
     parent = os.path.dirname(path or "")
-    for name, candidate in (("parent", parent),
+    for name, candidate in (("target", path), ("parent", parent),
                             ("grandparent", os.path.dirname(parent))):
+        if candidate is None:
+            continue
         entry = {"path": candidate, "exists": os.path.exists(candidate)}
         for key, call in (("dacl", api.dacl_sddl), ("label", api.label_sddl)):
             try:
