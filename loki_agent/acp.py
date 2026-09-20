@@ -68,8 +68,6 @@ class WorkerChannel:
         self._next_request_id = 0
         self._write_lock = asyncio.Lock()
         self._closed = False
-        self._close_task = None
-        self._delegation_close_task = None
         self._reader_task = asyncio.create_task(
             self._read_messages(),
             name=f"acp-worker-reader-{session_id}",
@@ -102,10 +100,6 @@ class WorkerChannel:
             return await future
         finally:
             self._pending.pop(request_id, None)
-            if future.done() and not future.cancelled():
-                # A write failure can win the race with the reply future's
-                # channel-failure exception. Both belong to this request.
-                future.exception()
 
     async def _read_messages(self):
         failure = None
@@ -113,9 +107,10 @@ class WorkerChannel:
             while True:
                 raw = await self.process.stdout.readline()
                 if not raw:
+                    return_code = await self.process.wait()
                     failure = acps.TransportError(
-                        f"worker for {self.session_id} closed stdout "
-                        f"(exit status {self.process.returncode})")
+                        f"worker for {self.session_id} exited "
+                        f"with status {return_code}")
                     break
                 try:
                     message = json.loads(raw.decode("utf-8"))
@@ -133,7 +128,7 @@ class WorkerChannel:
                 request_id = message.get("id")
                 if request_id is not None:
                     future = self._pending.get(str(request_id))
-                    if future is None or future.done():
+                    if future is None:
                         # Internal worker replies are never client messages.
                         # A late reply can legitimately arrive after its
                         # caller was cancelled; discard it.
@@ -160,75 +155,46 @@ class WorkerChannel:
                 f"worker channel for {self.session_id} failed: {error}")
         finally:
             self._closed = True
+            if self.credential_delegation is not None:
+                self.credential_delegation.revoke_now()
+                await self.credential_delegation.close()
+                self.credential_delegation = None
             failure = failure or acps.TransportError(
                 f"worker for {self.session_id} closed")
-            # A failed credential teardown must never leave callers waiting
-            # for a reply from a dead protocol channel.
             for future in list(self._pending.values()):
                 if not future.done():
                     future.set_exception(failure)
-            await self._close_delegation()
-
-    async def _close_delegation(self):
-        if self._delegation_close_task is None and self.credential_delegation is not None:
-            delegation = self.credential_delegation
-            self.credential_delegation = None
-
-            async def release():
-                try:
-                    delegation.revoke_now()
-                finally:
-                    await delegation.close()
-            self._delegation_close_task = asyncio.create_task(release())
-        if self._delegation_close_task is not None:
-            await asyncio.shield(self._delegation_close_task)
 
     async def close(self):
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close())
-        await asyncio.shield(self._close_task)
-
-    async def _close(self):
-        self._closed = True
-        try:
-            # The front's peer may be alive but not reading. Graceful flush
-            # gets a deadline; it cannot prevent process termination forever.
+        if not self._closed:
+            self._closed = True
             if self.process.stdin is not None:
                 self.process.stdin.close()
                 with contextlib.suppress(
-                        BrokenPipeError, ConnectionError, OSError,
-                        asyncio.TimeoutError):
-                    await asyncio.wait_for(self.process.stdin.wait_closed(), 2)
-        finally:
+                        BrokenPipeError, ConnectionError, OSError):
+                    await self.process.stdin.wait_closed()
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            self.process.terminate()
             try:
-                try:
-                    await asyncio.wait_for(self.process.wait(), timeout=2)
-                except asyncio.TimeoutError:
-                    self.process.terminate()
-                    try:
-                        await asyncio.wait_for(self.process.wait(), timeout=2)
-                    except asyncio.TimeoutError:
-                        self.process.kill()
-                        await asyncio.wait_for(self.process.wait(), timeout=2)
-            finally:
-                try:
-                    if not self._reader_task.done():
-                        # Root exit can precede delivery of its final buffered
-                        # output. Allow EOF to drain before aborting the reader.
-                        try:
-                            await asyncio.wait_for(asyncio.shield(self._reader_task), 2)
-                        except asyncio.TimeoutError:
-                            self._reader_task.cancel()
-                        except (asyncio.CancelledError, acps.TransportError):
-                            pass
-                    with contextlib.suppress(
-                            asyncio.CancelledError, acps.TransportError):
-                        await self._reader_task
-                finally:
-                    try:
-                        await runtime_isolation.close_runtime_process(self.process)
-                    finally:
-                        await self._close_delegation()
+                await asyncio.wait_for(self.process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                self.process.kill()
+                await self.process.wait()
+        if not self._reader_task.done():
+            self._reader_task.cancel()
+        with contextlib.suppress(
+                asyncio.CancelledError, acps.TransportError):
+            await self._reader_task
+        # The platform process is released only after the reader has stopped:
+        # on Windows this closes the stdio threads, the front pipe handles
+        # and the job whose close kills any descendants.  POSIX subprocesses
+        # own their transport and need nothing here.
+        runtime_isolation.close_runtime_process(self.process)
+        if self.credential_delegation is not None:
+            await self.credential_delegation.close()
+            self.credential_delegation = None
 
 
 class Front:
@@ -268,14 +234,10 @@ class Front:
             channels = list(self.workers.values())
             self.workers.clear()
             if channels:
-                results = await asyncio.gather(
+                await asyncio.gather(
                     *(channel.close() for channel in channels),
                     return_exceptions=True,
                 )
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.error("Worker shutdown failed", exc_info=(
-                            type(result), result, result.__traceback__))
 
     def _start_task(self, coroutine, *, name: str):
         task = asyncio.create_task(coroutine, name=name)
@@ -580,20 +542,10 @@ class Front:
             finally:
                 if process is None:
                     await delegation.close()
-            try:
-                delegation.child_spawned()
-                channel = WorkerChannel(
-                    session_id, process, self.write, delegation)
-            except BaseException:
-                try:
-                    process.kill()
-                    await asyncio.wait_for(process.wait(), 2)
-                finally:
-                    try:
-                        await runtime_isolation.close_runtime_process(process)
-                    finally:
-                        await delegation.close()
-                raise
+                else:
+                    delegation.child_spawned()
+            channel = WorkerChannel(
+                session_id, process, self.write, delegation)
             prepared = await channel.request(
                 "session/prepare_open",
                 {

@@ -62,6 +62,7 @@ def worker_command() -> list[str]:
 
 
 if sys.platform == "win32":
+    from . import windows_api
     from . import windows_runtime
     from .runtime_isolations import RuntimeIsolationError
 
@@ -115,17 +116,93 @@ if sys.platform == "win32":
             executable, command[1:], environment, workspace, inherited,
             current_directory=os.getcwd())
 
-    async def start_worker(cwd, environment, delegation):
-        from . import windows_workers
-        return await windows_workers.start_worker(cwd, environment, delegation)
+    class _ContainedWorker:
+        """An asyncio-``Process``-shaped view of one contained ACP worker.
 
-    async def close_runtime_process(process) -> None:
-        from . import windows_workers
-        if isinstance(process, windows_workers.Worker):
-            await process.close()
-        else:
-            # The terminal runtime has no parent-side stdio transports.
+        ``stdin``/``stdout`` are the front's pipe streams, so the worker
+        channel code is transport-neutral; ``wait``/``terminate``/``kill``
+        and ``returncode`` delegate to the native process and its
+        kill-on-close job; ``close`` releases the stdio threads, both front
+        pipe handles and the native handles.
+        """
+
+        def __init__(self, process, stdio):
+            self._process = process
+            self._stdio = stdio
+            self.stdin = stdio.stdin
+            self.stdout = stdio.stdout
+
+        @property
+        def returncode(self):
+            return self._process.returncode
+
+        async def wait(self):
+            return await self._process.wait()
+
+        def terminate(self):
+            self._process.terminate()
+
+        kill = terminate
+
+        def close(self):
+            self._stdio.close()
+            self._process.close()
+
+    async def start_worker(cwd, environment, delegation):
+        """The ACP worker, contained like the terminal runtime.
+
+        The session cwd is the workspace: its container must already be
+        recorded (``loki-setup``), and the launch refuses otherwise, so an
+        editor pointing at an unconfigured directory gets a denied session
+        rather than an unprotected worker.  The worker's stdin/stdout are two
+        anonymous pipes -- handle possession is the authorization, exactly as
+        for the credential channel -- and it re-proves containment at its own
+        gate before the frontend loads.
+        """
+        workspace = windows_runtime.required_workspace(cwd)
+        front, child = host_ipc.worker_stdio()
+        process = None
+        try:
+            inherited = [*host_ipc.handles(delegation.owner_child),
+                         *host_ipc.handles(delegation.credential_child)]
+            # The worker's actual cwd is the front's at spawn.  It must
+            # never be derived from the session cwd: the session directory
+            # is protocol-supplied state, and the workspace is the one
+            # directory model-directed tools can write, so as the ambient
+            # directory it would turn every relative open, DLL search and
+            # executable name into model-writable resolution.
+            with windows_runtime.worker_stdout_null() as null_handle:
+                process = windows_runtime.launch(
+                    sys.argv[0],
+                    ["--worker", *delegation.child_arguments(),
+                     "--stdout-null-handle", str(null_handle)],
+                    environment, workspace, [*inherited, null_handle],
+                    stdio=child, current_directory=os.getcwd())
+        except BaseException:
+            try:
+                # Even failure to release the front's temporary NUL copy
+                # must unwind a launch that has already succeeded.
+                if process is not None:
+                    try:
+                        process.terminate()
+                    finally:
+                        process.close()
+            finally:
+                for handle in (*front, *child):
+                    windows_api.close_handle(handle)
+            raise
+        try:
+            stdio = host_ipc.WorkerStdio(*front)
+        except BaseException:
+            process.terminate()
             process.close()
+            for handle in (*front, *child):
+                windows_api.close_handle(handle)
+            raise
+        return _ContainedWorker(process, stdio)
+
+    def close_runtime_process(process) -> None:
+        process.close()
 
 else:
     from . import runtime_isolations
@@ -188,6 +265,6 @@ else:
             start_new_session=True,
         )
 
-    async def close_runtime_process(process) -> None:
+    def close_runtime_process(process) -> None:
         # An asyncio subprocess owns its transport; waiting has closed it.
         return None

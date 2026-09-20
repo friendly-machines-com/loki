@@ -185,6 +185,42 @@ def _private_pipe_pair():
     return (request_read, request_write), (response_read, response_write)
 
 
+def worker_stdio():
+    """Two anonymous pipes carrying a spawned worker's stdin and stdout.
+
+    Returns ``(front, child)``: ``front`` is ``(stdout_read, stdin_write)``
+    -- the ends the spawning process reads replies from and writes requests
+    to -- and ``child`` is ``(stdin_read, stdout_write)``, the ends a
+    contained child receives as its standard handles.  Only the child's ends
+    stay inheritable, so they can be named in the launch's explicit handle
+    list while the front's ends can never leak into any child.
+
+    Same shape and same authority as the credential channel: no name, so
+    nothing else can connect, squat or race, and possession of the inherited
+    handle is the authorization.
+
+    Defined outside the platform branch because it depends only on
+    ``windows_api``'s import-safe declarations; calling it off Windows raises
+    the same ``WindowsUnavailableError`` any other Windows call does.
+    """
+    stdin_read, stdin_write = windows_api.create_pipe()
+    try:
+        stdout_read, stdout_write = windows_api.create_pipe()
+    except BaseException:
+        windows_api.close_handle(stdin_read)
+        windows_api.close_handle(stdin_write)
+        raise
+    try:
+        windows_api.clear_handle_inheritance(stdout_read)
+        windows_api.clear_handle_inheritance(stdin_write)
+    except BaseException:
+        for handle in (stdin_read, stdin_write,
+                       stdout_read, stdout_write):
+            windows_api.close_handle(handle)
+        raise
+    return (stdout_read, stdin_write), (stdin_read, stdout_write)
+
+
 class PipeEndpoint:
     """One side of a Windows anonymous-pipe channel.
 
@@ -353,6 +389,42 @@ class _HandleWriter:
                 # Closing a handle under a live writer is worse than failing.
                 raise RuntimeError("handle writer thread did not stop")
             self.thread = None
+
+
+class _StdioWriter:
+    """The front's stdin writer over one handle, closing only that handle.
+
+    Mirrors the half of an asyncio subprocess ``PIPE`` the parent writes.
+    ``close`` stops accepting work; ``wait_closed`` stops the flush thread
+    and closes the handle, which is the child's stdin EOF.  The handle is
+    closed exactly once however teardown runs, so a channel torn down
+    without ``wait_closed`` can still release it.
+    """
+
+    def __init__(self, sink: _HandleWriter):
+        self._sink = sink
+        self._handle = sink.handle
+        self._handle_open = True
+
+    def write(self, data) -> None:
+        self._sink.write(data)
+
+    async def drain(self) -> None:
+        await self._sink.drain()
+
+    def close(self) -> None:
+        self._sink.close()
+
+    async def wait_closed(self) -> None:
+        self.close()
+        self._sink.stop_and_join()
+        self.release()
+
+    def release(self) -> None:
+        """Close the write handle now, at most once."""
+        if self._handle_open:
+            self._handle_open = False
+            windows_api.close_handle(self._handle)
 
 
 async def _feed_reader(reader: "asyncio.StreamReader", queue) -> None:
@@ -561,3 +633,42 @@ else:
                     return
         finally:
             source.stop()
+
+    class WorkerStdio:
+        """The front's ends of a spawned worker's anonymous-pipe stdio.
+
+        ``stdout`` is an :class:`asyncio.StreamReader` fed by a handle-reader
+        thread; ``stdin`` is a ``StreamWriter`` shape over a handle-writer
+        thread.  The two directions close independently, like the two halves
+        of an asyncio subprocess ``PIPE``: closing ``stdin`` is the worker's
+        EOF while its final replies may still be unread on ``stdout``.
+        Threads are the agreed transport for anonymous pipes: their handles
+        support no overlapped I/O, so the proactor loop cannot take them.
+
+        ``close`` releases both threads and both handles exactly once, for
+        teardown paths that never reached ``stdin.wait_closed()``.
+        """
+
+        def __init__(self, stdout_read, stdin_write):
+            from . import handle_reader
+
+            loop = asyncio.get_running_loop()
+            self._read_handle = stdout_read
+            self._source = handle_reader.HandleReader(
+                None, loop, asyncio.Queue(), eof_sentinel=True,
+                handle=stdout_read)
+            self._source.start()
+            self.stdout = asyncio.StreamReader()
+            self._pump = loop.create_task(
+                _feed_reader(self.stdout, self._source.queue),
+                name="loki-worker-stdout")
+            self._sink = _HandleWriter(stdin_write, loop)
+            self._sink.start()
+            self.stdin = _StdioWriter(self._sink)
+
+        def close(self) -> None:
+            self._source.stop()
+            if not self._pump.done():
+                self._pump.cancel()
+            self.stdin.release()
+            windows_api.close_handle(self._read_handle)

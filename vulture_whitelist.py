@@ -53,15 +53,6 @@ ESCAPE
 _.clear_screen
 _.__stdout__
 
-# Public asyncio.Protocol callbacks invoked by the stdlib pipe transports
-# (windows_workers._Reader and _Writer), not by Loki call sites.
-_.connection_made
-_.connection_lost
-_.data_received
-_.eof_received
-_.pause_writing
-_.resume_writing
-
 # False positives: base-class callbacks and destructuring targets.
 _.handle_starttag
 _.handle_endtag

@@ -290,7 +290,7 @@ def launch_patches(spawn):
                           return_value=None),
         mock.patch.object(runtime_isolation, "start_runtime", new=spawn),
         mock.patch.object(runtime_isolation, "close_runtime_process",
-                          new=mock.AsyncMock()),
+                          new=lambda process: None),
     ]
 
 
