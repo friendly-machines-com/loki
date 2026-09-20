@@ -104,8 +104,10 @@ class Session:
         self.session_toolsets = toolsets
         self.session_state = dict(state)
         self.conversation_id = conversation_id_for_path(path)
-        # Write through the real path, not a symlink naming it.
-        self.chat_log_path = os.path.realpath(path) if path else None
+        # The path as given: resolving it walks and opens the parent
+        # directories, which a contained runtime is refused outside its
+        # granted workspace.
+        self.chat_log_path = path if path else None
         self.chat_log_dirty = False
         self.last_instructed_agent_mode = None
 
