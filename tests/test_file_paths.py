@@ -424,26 +424,32 @@ class FilePathTests(unittest.TestCase):
         loki._atomic_write_text(self.session.chat_log_path, 'snapshot')
         self.assertEqual((base / 'new-session.json').read_text(), 'snapshot')
 
-    def test_resume_paths_preserve_traversal_and_save_through_symlink(self):
+    def test_resume_writes_through_the_path_it_was_given(self):
+        # A resumed session stores the path it was handed and writes through
+        # that name.  Whatever the name denotes at write time is what is
+        # written: a link redirected after load is followed, and the write is
+        # not pinned to the object the name denoted when the log was loaded.
+        # Containment is unaffected -- the container's grants still bound where
+        # a write can land.
         literal = str(self.project) + '/link/../session.json'
         resolved = savefiles.resolve_chat_log_path(
             literal, str(self.project), str(self.root / 'logs'), loki._resolve_path)
         self.assertEqual(resolved, literal)
-        # POSIX follows the link into elsewhere; Windows resolves `..`
-        # lexically into the project.
+        # POSIX applies `..` in the name through the kernel and lands in
+        # elsewhere; Windows cancels it lexically and lands in the project.
         base = self.project if os.name != 'posix' else self.elsewhere
         alias = base / 'session.json'
         alias.symlink_to('actual.json')
         (base / 'actual.json').write_text('old')
         self.session.replace_transcript([], [], {}, {}, resolved)
+        self.assertEqual(self.session.chat_log_path, literal)
         loki._atomic_write_text(self.session.chat_log_path, 'new')
         self.assertTrue(alias.is_symlink())
         self.assertEqual((base / 'actual.json').read_text(), 'new')
-        # Resumed sessions already retain the selected save target. Do not
-        # change that policy if the original alias is later redirected.
+        # Redirecting the link afterwards redirects later writes.
         (base / 'other.json').write_text('unrelated')
         alias.unlink()
         alias.symlink_to('other.json')
         loki._atomic_write_text(self.session.chat_log_path, 'saved again')
-        self.assertEqual((base / 'actual.json').read_text(), 'saved again')
-        self.assertEqual((base / 'other.json').read_text(), 'unrelated')
+        self.assertEqual((base / 'other.json').read_text(), 'saved again')
+        self.assertEqual((base / 'actual.json').read_text(), 'new')
