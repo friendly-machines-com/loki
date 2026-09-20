@@ -194,6 +194,11 @@ def report_write_failure(operation, path, error, traceback_text=None):
         report[name] = entry
     report["can_create_child"] = _try_create_child(parent)
     if path:
+        # The directory the runtime must create inside is the one whose label
+        # differs from the workspace's, so ask about it separately.
+        report["can_create_child_in_target"] = _try_create_child(path)
+        report["makedirs_child"] = _attempt(lambda: os.makedirs(
+            os.path.join(path, "chats"), exist_ok=True))
         report["stat"] = _attempt(lambda: os.stat(path))
         report["isdir"] = os.path.isdir(path)
         report["mkdir"] = _attempt(lambda: os.mkdir(path))
