@@ -1647,6 +1647,15 @@ class WindowsPrimitiveTests(unittest.TestCase):
             capture_output=True, text=True, timeout=15)
         record = {'probe': 'path-semantics', 'alias_exists': alias.exists(),
                   'alias_is_dir': os.path.isdir(alias)}
+        # _follow_final_link gates on os.path.islink, and reads the target with
+        # os.readlink.  Record both for a directory junction -- whether one is
+        # seen as a link at all, and whether readlink leaks the NT \??\ prefix
+        # that would confuse the Python-level join.
+        record['islink_alias'] = os.path.islink(alias)
+        try:
+            record['readlink_alias'] = os.readlink(str(alias))
+        except OSError as error:
+            record['readlink_error'] = str(error)
         record['realpath_alias'] = os.path.realpath(str(alias))
         record['dotdot_plain'] = os.path.realpath(str(real / 'child' / '..'))
         record['dotdot_through_alias'] = os.path.realpath(

@@ -246,6 +246,24 @@ class FilePathTests(unittest.TestCase):
         self.assertTrue(alias.is_symlink())
         self.assertEqual(target.read_text(), 'written')
 
+    def test_chained_final_symlink_replaces_the_terminus(self):
+        # _follow_final_link follows a chain hop by hop, so a write through a
+        # chain replaces the terminus and leaves every link a link.  A single
+        # readlink would instead have clobbered the intermediate link.
+        target = self.project / 'target'
+        intermediate = self.project / 'intermediate'
+        alias = self.project / 'alias'
+        target.write_text('old')
+        intermediate.symlink_to('target')
+        alias.symlink_to('intermediate')
+        self.assertIn('old', loki.run_read(str(alias)))
+        self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
+        self.assertTrue(alias.is_symlink())
+        self.assertTrue(intermediate.is_symlink())
+        self.assertEqual(target.read_text(), 'updated')
+        self.assertEqual(os.path.realpath(intermediate),
+                         os.path.realpath(target))
+
     def test_dangling_final_symlink_creates_target_and_preserves_link(self):
         alias = self.project / 'alias'
         alias.symlink_to('../elsewhere/new/subdir/target')
