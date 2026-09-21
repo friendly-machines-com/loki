@@ -97,15 +97,21 @@ def _grant_failure(sddl: str, package: str, access: Access) -> str:
             f"{access.value} ({required:#x})")
 
 
-def probe_containment(workspace: str) -> list[Check]:
+def probe_containment(workspace: str, expected_package: str) -> list[Check]:
     """Check, from inside the container, that this process is contained.
+
+    ``expected_package`` is the package SID the launcher verified this
+    process's token against before resuming it.  The child must not re-derive
+    it: that needs ``GetFinalPathNameByHandleW`` on the workspace, which an
+    AppContainer token is denied (``ERROR_ACCESS_DENIED``), and re-deriving it
+    was what made the gate fail at startup.
 
     Read-only in effect: each denial is attempted and then closed without being
     used, and nothing is read or written.  A granted path is opened too, as a
     positive control -- a process denied *everything* would otherwise make every
     denial below look like success.
     """
-    checks = _identity_checks(workspace)
+    checks = _identity_checks(expected_package)
     checks.append(_reachable(
         "workspace reachable", workspace,
         windows_api.GENERIC_READ | windows_api.GENERIC_WRITE,
@@ -202,13 +208,8 @@ def _credential_file_checks(asset: str, label: str) -> list[Check]:
     return checks
 
 
-def _identity_checks(workspace: str) -> list[Check]:
+def _identity_checks(expected_package: str) -> list[Check]:
     """Check the process token, before asking about anything on disk."""
-    try:
-        expected = windows_api.derive_app_container_sid(
-            profile_name_for(workspace))
-    except windows_api.WindowsApiError as error:
-        return [Check("package SID", "fail", str(error))]
     try:
         token = windows_api.open_process_token(
             windows_api.current_process_handle())
@@ -230,11 +231,11 @@ def _identity_checks(workspace: str) -> list[Check]:
         except windows_api.WindowsApiError as error:
             checks.append(Check("package SID", "fail", str(error)))
         else:
-            matches = package == expected
+            matches = package == expected_package
             checks.append(Check(
                 "package SID", "pass" if matches else "fail",
                 package if matches
-                else f"token has {package}, expected {expected}"))
+                else f"token has {package}, expected {expected_package}"))
         return checks
     finally:
         windows_api.close_handle(token)

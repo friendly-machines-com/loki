@@ -50,10 +50,6 @@ class ProbeContainmentTests(unittest.TestCase):
                               return_value=True),
             mock.patch.object(windows_api, "token_app_container_sid",
                               return_value=PACKAGE),
-            mock.patch.object(windows_api, "derive_app_container_sid",
-                              return_value=PACKAGE),
-            mock.patch.object(windows_verify, "profile_name_for",
-                              return_value="profile"),
             mock.patch.object(paths, "credential_directory",
                               return_value=CREDENTIALS),
             mock.patch.object(windows_api, "open_with_access",
@@ -88,7 +84,7 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def checks(self):
         return {check.name: check
-                for check in windows_verify.probe_containment(WORKSPACE)}
+                for check in windows_verify.probe_containment(WORKSPACE, PACKAGE)}
 
     def test_happy_path_reports_every_check_as_passing(self):
         self.happy()

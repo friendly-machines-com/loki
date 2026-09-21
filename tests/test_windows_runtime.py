@@ -90,13 +90,27 @@ class GateTests(unittest.TestCase):
                 runtime.verify_runtime()
         probe.assert_not_called()
 
+    def test_runtime_requires_expected_package_sid(self):
+        # The child compares its token against the SID the launcher verified it
+        # against; with no SID there is nothing to compare, so it refuses
+        # rather than deriving one (which the container cannot do).
+        with mock.patch.dict(
+                os.environ, {runtime.WORKSPACE_ENV: '/work'}, clear=True), \
+                mock.patch.object(runtime.windows_verify, 'probe_containment') as probe:
+            with self.assertRaisesRegex(
+                    RuntimeIsolationError, 'package SID'):
+                runtime.verify_runtime()
+        probe.assert_not_called()
+
     def test_runtime_runs_probe_and_refuses_denial_failure(self):
-        with mock.patch.dict(os.environ, {runtime.WORKSPACE_ENV: '/work'}), \
+        with mock.patch.dict(
+                os.environ, {runtime.WORKSPACE_ENV: '/work',
+                             runtime.PACKAGE_ENV: 'S-1-15-2-1-2-3'}), \
                 mock.patch.object(runtime.windows_verify, 'probe_containment',
                                   return_value=[Check('credentials', 'fail')]) as probe:
             with self.assertRaises(RuntimeIsolationError):
                 runtime.verify_runtime()
-        probe.assert_called_once_with('/work')
+        probe.assert_called_once_with('/work', 'S-1-15-2-1-2-3')
 
 
 class ScratchTests(unittest.TestCase):
@@ -317,6 +331,7 @@ class LaunchTests(unittest.TestCase):
             scratch = os.path.join('/work', runtime.SCRATCH_DIRECTORY)
             self.assertEqual(create.call_args.kwargs['environment'], {
                 'SAFE': 'value', runtime.WORKSPACE_ENV: '/work',
+                runtime.PACKAGE_ENV: 'package',
                 'TEMP': scratch, 'TMP': scratch})
             self.assertEqual(create.call_args.kwargs['current_directory'],
                              '/work')

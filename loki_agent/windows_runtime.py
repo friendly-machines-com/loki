@@ -20,6 +20,9 @@ from . import windows_verify
 from .runtime_isolations import RuntimeIsolationError
 
 WORKSPACE_ENV = "LOKI_CONTAINER_WORKSPACE"
+# The package SID the launcher verified the child's token against, for the
+# child's own gate to compare against -- see verify_runtime.
+PACKAGE_ENV = "LOKI_CONTAINER_PACKAGE_SID"
 
 # The contained runtime's scratch directory, relative to the workspace.  It is
 # inside the granted tree on purpose; see ensure_runtime_temp.
@@ -88,14 +91,24 @@ def required_workspace(path):
     line, so its worker launch resolves the same ledger entry, profile and
     read-only verification the terminal gate uses -- and refuses identically
     when no container is configured.
+
+    This runs uncontained, so asking the kernel to identify the workspace is
+    allowed; a path that cannot be identified is a refusal like any other, not
+    a raw Windows error.
     """
-    workspace = state.canonical_workspace(path)
+    try:
+        workspace = state.canonical_workspace(path)
+        profile = state.profile_name_for(workspace)
+        key = state.workspace_key(workspace)
+    except api.WindowsApiError as error:
+        raise RuntimeIsolationError(
+            f"Cannot identify the workspace {path!r}: {error}") from error
     ledger = state.load_ledger()
-    entry = ledger.get("workspaces", {}).get(state.workspace_key(workspace))
+    entry = ledger.get("workspaces", {}).get(key)
     if not isinstance(entry, dict) or not entry.get("grants"):
         raise RuntimeIsolationError(
             f"No Windows container configured for {workspace!r}; run loki-setup.")
-    if entry.get("profile") != state.profile_name_for(workspace):
+    if entry.get("profile") != profile:
         raise RuntimeIsolationError("Windows container ledger profile mismatch")
     require_checks(windows_verify.verify_workspace(ledger, workspace))
     return workspace
@@ -105,7 +118,13 @@ def verify_runtime():
     workspace = os.environ.get(WORKSPACE_ENV)
     if not workspace:
         raise RuntimeIsolationError("Missing Windows container launch workspace")
-    require_checks(windows_verify.probe_containment(workspace))
+    # The launcher already checked this process's token against this SID before
+    # resuming it.  Re-deriving it here would need GetFinalPathNameByHandleW on
+    # the workspace, which an AppContainer token is denied.
+    package = os.environ.get(PACKAGE_ENV)
+    if not package:
+        raise RuntimeIsolationError("Missing Windows container package SID")
+    require_checks(windows_verify.probe_containment(workspace, package))
 
 
 def scratch_directory(workspace):
@@ -345,6 +364,7 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
     package = api.derive_app_container_sid(state.profile_name_for(workspace))
     child_environment = dict(environment)
     child_environment[WORKSPACE_ENV] = workspace
+    child_environment[PACKAGE_ENV] = package
     # Scratch inside the granted workspace: the profile TEMP holds no package
     # grant and is shared with every other process running as the user.  The
     # contained runtime recreates the directory if it is missing.

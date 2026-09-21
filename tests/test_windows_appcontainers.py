@@ -1243,7 +1243,8 @@ def runtime_gate(manifest_path):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from loki_agent import windows_verify
     os.environ['XDG_CONFIG_HOME'] = manifest['config_home']
-    checks = windows_verify.probe_containment(manifest['workspace'])
+    checks = windows_verify.probe_containment(
+        manifest['workspace'], manifest['package'])
     for check in checks:
         print(json.dumps({'check': check.name, 'status': check.status,
                           'detail': check.detail}), flush=True)
@@ -2531,8 +2532,8 @@ class AppContainerTests(unittest.TestCase):
         root = Path(temporary.name)
         workspace = root / 'workspace'
         workspace.mkdir()
-        # Derive the profile from the workspace with the shipped rule, or the
-        # gate's first check (token package SID vs derived SID) cannot match.
+        # Derive the profile from the workspace with the shipped rule: the
+        # profile must be the one setup would record for this workspace.
         name = windows_state.profile_name_for(str(workspace))
         sid = HANDLE()
         native.hresult(native.profile(name, name, name, None, 0, C.byref(sid)))
@@ -2595,7 +2596,8 @@ class AppContainerTests(unittest.TestCase):
 
         def run(config_home):
             manifest.write_text(json.dumps({'workspace': str(workspace),
-                                            'config_home': str(config_home)}))
+                                            'config_home': str(config_home),
+                                            'package': package}))
             log = root / (config_home.name + '.log')
             code = native.launch([sys.executable, '-I', '-u', __file__,
                                   '--runtime-gate', str(manifest)],
