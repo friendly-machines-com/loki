@@ -533,6 +533,13 @@ def conpty_interactive_probe(root, stage):
             if wait_for(process.process, 0) == 0:
                 break
             time.sleep(0.01)
+        # The loop breaks as soon as the child exits, so the child's final
+        # flush can still be sitting in the pipe when the snapshot below is
+        # taken.  Drain once more and re-note: anything read here was written
+        # before close_pseudo, which is the boundary this snapshot measures.
+        drain()
+        for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
+            note(marker)
         if not timings:
             timings['first_byte_ms'] = None
         for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
