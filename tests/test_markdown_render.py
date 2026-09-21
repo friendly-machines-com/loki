@@ -546,17 +546,35 @@ class TerminalWiringTests(unittest.TestCase):
         self.assertIn("\\x9b", streamed)
         self.assertIn(f"{BOLD}bold{RESET}", streamed)
 
-    def test_multiline_tool_error_is_readable_but_controls_are_not_raw(self):
-        output = self.replay(
-            [{
-                "type": "tool_error",
-                "result": "first\x1b]0;owned\x07\nsecond\u009b",
-            }],
-            StyledTerminal(),
-        )
+    def test_multiline_tool_result_is_readable_but_controls_are_not_raw(self):
+        with mock.patch.object(terminal_frontend, "computer", "nova"):
+            output = self.replay(
+                [{
+                    "type": "tool_result",
+                    "name": "Bash",
+                    "is_error": True,
+                    "content": "first\x1b]0;owned\x07\nsecond\u009b",
+                }],
+                StyledTerminal(),
+            )
 
         self.assertEqual(
-            output, "first^[]0;owned^G\nsecond\\x9b\n")
+            output, "nova: Tool error: 'Bash'\nfirst^[]0;owned^G\nsecond\\x9b\n")
+
+    def test_a_successful_tool_result_is_labelled(self):
+        with mock.patch.object(terminal_frontend, "computer", "nova"):
+            output = self.replay(
+                [{
+                    "type": "tool_result",
+                    "name": "Read",
+                    "is_error": False,
+                    "content": "file contents",
+                }],
+                StyledTerminal(),
+            )
+
+        self.assertEqual(
+            output, "nova: Tool result: 'Read'\nfile contents\n")
 
     def test_tool_name_and_arguments_are_programming_representations(self):
         output = self.replay(

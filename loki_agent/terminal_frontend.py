@@ -326,10 +326,16 @@ def _terminal_agent_event(event: dict):
         print(" with invalid args:")
         _print_tool_args(event["args"])
         terminal.reset_colors_and_flags()
-    elif kind == "tool_error":
-        terminal.set_background_color(ERROR_COLOR)
-        terminal.write_text(event["result"], multiline=True)
-        terminal.reset_colors_and_flags()
+    elif kind == "tool_result":
+        # The canonical result event.  ``tool_error`` carries only the failure
+        # content and no name, and ACP drops it for the same reason: printing
+        # it as well would duplicate the error now that a result is shown.  It
+        # is still emitted, so a mode that hides tool calls can show failures.
+        label = "Tool error" if event.get("is_error") else "Tool result"
+        print(f"{computer}: {label}: ", end="")
+        terminal.write_text(repr(event["name"]))
+        print()
+        terminal.write_text(str(event["content"]), multiline=True)
         print()
 
 
