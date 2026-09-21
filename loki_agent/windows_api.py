@@ -1079,7 +1079,11 @@ def create_process_in_app_container(executable, arguments, package_sid,
                 if not key or '=' in key or '\0' in key or '\0' in value:
                     raise ValueError("invalid child environment entry")
                 entries[key] = f"{key}={value}"
-            ordered = [entries[name] for name in sorted(entries, key=str.upper)]
+            # Sort the full entries, not the keys: the per-drive entries begin
+            # with '=' (0x3d), which sorts before every letter, so they come
+            # first on their own.  Sorting the keys would place "C:" among the
+            # ordinary "C..." names and misorder the block.
+            ordered = sorted(entries.values(), key=str.upper)
             environment_block = ctypes.create_unicode_buffer(
                 '\0'.join(ordered) + '\0\0')
             flags |= 0x400  # CREATE_UNICODE_ENVIRONMENT
