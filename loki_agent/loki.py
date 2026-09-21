@@ -1274,12 +1274,12 @@ def _format_bash_result(stdout: str, stderr: str, exit_code: int | None,
         parts.append(f"exit_code: {exit_code}")
     if no_output_expected:
         parts.append("no_output_expected: true")
-    parts.extend([
-        "[stdout]",
-        stdout if stdout else "(empty)",
-        "[stderr]",
-        stderr if stderr else "(empty)",
-    ])
+    # The whole result is assembled after the process exits, so an empty stream
+    # is left out rather than announced: no placeholder and no blank line.
+    if stdout:
+        parts.extend(["[stdout]", stdout])
+    if stderr:
+        parts.extend(["[stderr]", stderr])
     return _truncate_text("\n".join(parts), BASH_MAX_OUTPUT_CHARS)
 
 
@@ -2123,7 +2123,7 @@ class JobManager:
             return f"Error: unknown job id {job_id!r}"
         stdout = _read_spool_tail(job.stdout_path, tail_chars)
         stderr = _read_spool_tail(job.stderr_path, tail_chars)
-        return "\n".join([
+        parts = [
             f"job_id: {job.id}",
             f"status: {job.status}",
             f"pid: {job.pid}",
@@ -2134,11 +2134,14 @@ class JobManager:
             f"finished_at: {job.finished_at_iso}",
             f"stdout_path: {job.stdout_path}",
             f"stderr_path: {job.stderr_path}",
-            "[stdout_tail]",
-            stdout if stdout else "(empty)",
-            "[stderr_tail]",
-            stderr if stderr else "(empty)",
-        ])
+        ]
+        # A snapshot, not a stream: an empty tail is left out, like a tool
+        # result's empty stream.
+        if stdout:
+            parts.extend(["[stdout_tail]", stdout])
+        if stderr:
+            parts.extend(["[stderr_tail]", stderr])
+        return "\n".join(parts)
 
     def stop_job(self, job_id: str, force: bool = False) -> str:
         job = self._get_job(job_id)
@@ -3534,12 +3537,10 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
     ]
     if exit_code is not None:
         parts.append(f"exit_code: {exit_code}")
-    parts.extend([
-        "[stdout]",
-        stdout_text if stdout_text else "(empty)",
-        "[stderr]",
-        stderr_text if stderr_text else "(empty)",
-    ])
+    if stdout_text:
+        parts.extend(["[stdout]", stdout_text])
+    if stderr_text:
+        parts.extend(["[stderr]", stderr_text])
     return "\n".join(parts)
 
 
