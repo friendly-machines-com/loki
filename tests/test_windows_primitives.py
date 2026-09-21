@@ -179,6 +179,9 @@ def conpty_probe(root):
     peek.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
                      C.POINTER(ULONG), C.POINTER(ULONG)]
     peek.restype = W.BOOL
+    wait_many = kernel.WaitForMultipleObjects
+    wait_many.argtypes = [ULONG, C.POINTER(HANDLE), W.BOOL, ULONG]
+    wait_many.restype = ULONG
 
     def pair():
         read, write = HANDLE(), HANDLE()
@@ -260,23 +263,36 @@ def conpty_probe(root):
                     return False
                 output.extend(buffer.raw[:transferred.value])
 
-        # Service the channel while the child runs: the session paints its
-        # output as it arrives, and the final frame clears the screen.
-        while kernel.WaitForSingleObject(process.process, 0) != 0:
-            if not drain_channel():
+        # Wait on the channel and the child together: the pipe signals when
+        # output is available (or the write end closes) and the process when it
+        # exits, so the loop is event-driven instead of sampling every 5 ms.
+        handles = (HANDLE * 2)(output_read, process.process)
+        while True:
+            signalled = wait_many(2, handles, False, 10_000)
+            if signalled == 0:
+                if not drain_channel():
+                    break
+            elif signalled == 1:
+                # The child exited; its final write may already be in the pipe.
+                drain_channel()
                 break
-            time.sleep(0.005)
+            else:
+                break
         exit_code = ULONG()
         kernel.GetExitCodeProcess(process.process, C.byref(exit_code))
         record['exit_code'] = exit_code.value
         # Then close the session and drain its final frame until it breaks.
         close_pseudo(hpc)
         closed = True
+        # The pty's write end closes with the session, so the pipe signals
+        # (data or break) rather than needing a polling window.
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
+            remaining = max(1, round((deadline - time.monotonic()) * 1000))
+            if kernel.WaitForSingleObject(output_read, remaining) != 0:
+                break
             if not drain_channel():
                 break
-            time.sleep(0.005)
         record['saw_marker'] = b'conpty-ok' in output
         record['output'] = output.decode('utf-8', 'replace')
     except OSError as error:
@@ -396,6 +412,9 @@ def conpty_interactive_probe(root, stage):
     peek.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
                      C.POINTER(ULONG), C.POINTER(ULONG)]
     peek.restype = W.BOOL
+    wait_many = kernel.WaitForMultipleObjects
+    wait_many.argtypes = [ULONG, C.POINTER(HANDLE), W.BOOL, ULONG]
+    wait_many.restype = ULONG
     wait_for = kernel.WaitForSingleObject
     wait_for.argtypes = [HANDLE, ULONG]
     wait_for.restype = ULONG
@@ -500,10 +519,11 @@ def conpty_interactive_probe(root, stage):
 
         replied = []
         resize_sent = False
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if not drain():
-                break
+        handles = (HANDLE * 2)(output_read, process.process)
+
+        def service():
+            """React once the channel has been read."""
+            nonlocal resize_sent
             for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
                 note(marker)
             # Both stages read a line back: ``text`` proves blind input, and
@@ -530,13 +550,30 @@ def conpty_interactive_probe(root, stage):
                 if b'\x1b[6n' in chunked and b'6n' not in replied:
                     if send(b'\x1b[24;80R'):
                         replied.append(b'6n')
-            if wait_for(process.process, 0) == 0:
+
+        # Wait on the channel and the child together: the pipe signals when
+        # output is available (or the write end closes) and the process when it
+        # exits, so the loop is event-driven instead of sampling every 10 ms.
+        deadline = time.monotonic() + 8
+        while True:
+            remaining = round((deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
                 break
-            time.sleep(0.01)
-        # The loop breaks as soon as the child exits, so the child's final
-        # flush can still be sitting in the pipe when the snapshot below is
-        # taken.  Drain once more and re-note: anything read here was written
-        # before close_pseudo, which is the boundary this snapshot measures.
+            signalled = wait_many(2, handles, False, remaining)
+            if signalled == 0:
+                if not drain():
+                    break
+                service()
+            elif signalled == 1:
+                # The child exited; its final write may already be in the pipe.
+                drain()
+                service()
+                break
+            else:
+                break
+        # A timeout can leave the child's last write in the pipe; drain once
+        # more before snapshotting.  Anything read here was written before
+        # close_pseudo, which is the boundary this snapshot measures.
         drain()
         for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
             note(marker)
@@ -555,11 +592,15 @@ def conpty_interactive_probe(root, stage):
         before_close = bytes(output)
         close_pseudo(hpc)
         closed = True
+        # The pty's write end closes with the session, so the pipe signals
+        # (data or break) rather than needing a polling window.
         stop = time.monotonic() + 3
         while time.monotonic() < stop:
+            remaining = max(1, round((stop - time.monotonic()) * 1000))
+            if wait_for(output_read, remaining) != 0:
+                break
             if not drain():
                 break
-            time.sleep(0.01)
         record['markers_before_close'] = {
             marker: marker.encode() in before_close
             for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:')}
