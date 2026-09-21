@@ -229,6 +229,24 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
         finally:
             windows_api.close_handle(handle)
 
+    def test_the_identity_open_reaches_the_final_path_uncontained(self):
+        # The deciding experiment for the contained gate's
+        # "GetFinalPathNameByHandleW sizing failed: 5".  The runtime opens its
+        # workspace with FILE_READ_ATTRIBUTES only (open_directory_handle), not
+        # with the grant handle's READ_CONTROL|WRITE_DAC.  If this call
+        # succeeds here, outside any container, the access mask is not the
+        # cause and the AppContainer token is; if it raises, the status in the
+        # message names the right the query needs.
+        handle = windows_api.open_directory_handle(str(self.target))
+        try:
+            final = windows_api.final_path_from_handle(handle)
+        finally:
+            windows_api.close_handle(handle)
+        print(json.dumps({'operation': 'identity_open_final_path',
+                          'final': final}), flush=True)
+        self.assertEqual(
+            os.path.normcase(final), os.path.normcase(str(self.target)))
+
     def test_a_grant_reads_and_writes_the_dacl_of_its_handle(self):
         handle = windows_api.open_directory_for_acl(str(self.target))
         try:
