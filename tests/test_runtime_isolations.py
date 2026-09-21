@@ -121,6 +121,9 @@ class UnshareSelectionTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "the POSIX enforcement seam (unshare, /proc); the "
+                     "Windows side is test_runtime_gate")
 class LinuxIsolationTests(unittest.TestCase):
     """The POSIX enforcement seam of the isolation property.
 
@@ -139,6 +142,8 @@ class LinuxIsolationTests(unittest.TestCase):
     """
 
     def test_runtime_rebinds_cwd_through_credential_cover(self):
+        # Windows side: test_windows_runtime.IsolationSeamTests
+        # .test_runtime_cwd_is_the_supervisor_cwd_not_the_workspace.
         with tempfile.TemporaryDirectory() as directory:
             credentials = os.path.join(directory, "credentials")
             os.mkdir(credentials)
@@ -185,6 +190,8 @@ print(json.dumps({
             self.assertTrue(result["relative_hidden"])
 
     def test_runtime_hides_only_its_credential_directory_and_drops_caps(self):
+        # Windows side:
+        # test_windows_appcontainers.AppContainerTests.test_runtime_gate.
         with tempfile.TemporaryDirectory() as directory:
             credentials = os.path.join(directory, "credentials")
             os.mkdir(credentials)
