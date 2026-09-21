@@ -305,11 +305,13 @@ def open_directory_for_acl(path: str):
 
     Unlike ``open_directory_handle`` this requests ``WRITE_DAC`` and
     ``READ_CONTROL`` -- the rights needed to read and replace the object's
-    DACL through the handle -- and it withholds ``FILE_SHARE_DELETE``, so no
-    later open may rename or unlink the directory while this handle lives.
-    Whatever the caller judges through the handle is therefore the object whose
-    DACL it goes on to write: a junction swapped into ``path`` afterwards
-    cannot move the operation to a different object.
+    DACL through the handle -- and shares ``READ | WRITE`` without ``DELETE``.
+    Withholding DELETE does not pin the name: the directory can still be
+    renamed while this handle is open (measured on Windows Server 2025), so the
+    binding that matters is the handle itself.  Whatever the caller judges
+    through the handle is the object whose DACL it goes on to write, and a
+    junction swapped into ``path`` afterwards cannot move the operation to a
+    different object.
     """
     create_file = bind("kernel32", "CreateFileW", ctypes.c_void_p,
                        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
