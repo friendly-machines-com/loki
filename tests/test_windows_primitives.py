@@ -266,9 +266,16 @@ def conpty_probe(root):
         # Wait on the channel and the child together: the pipe signals when
         # output is available (or the write end closes) and the process when it
         # exits, so the loop is event-driven instead of sampling every 5 ms.
+        # Deadlined like the interactive probe's: a handle that reports
+        # signalled while the channel holds nothing would otherwise spin here,
+        # with the wait's own timeout never applying.
         handles = (HANDLE * 2)(output_read, process.process)
+        deadline = time.monotonic() + 10
         while True:
-            signalled = wait_many(2, handles, False, 10_000)
+            remaining = round((deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
+                break
+            signalled = wait_many(2, handles, False, remaining)
             if signalled == 0:
                 if not drain_channel():
                     break
