@@ -712,7 +712,8 @@ class TerminalEntrypointContractTests(unittest.TestCase):
         else:
             from loki_agent import windows_runtime
             for name, value in (("configured_workspace", "/workspace"),
-                                ("verify_runtime", None)):
+                                ("verify_runtime", None),
+                                ("ensure_runtime_temp", None)):
                 patcher = mock.patch.object(
                     windows_runtime, name, return_value=value)
                 self.windows_steps[name] = patcher.start()
