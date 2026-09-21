@@ -194,8 +194,8 @@ class ReplayFidelityTests(unittest.TestCase):
             {"type": "future_event_kind", "anything": True},
         ]
         terminal_text = "\n\n".join(
-            "".join(text for _kind, text in block)
-            for block in ResumeTranscriptRenderer(
+            "".join(text for _kind, text in segments)
+            for _block_kind, segments in ResumeTranscriptRenderer(
                 assistant_label="Assistant").presentation(events))
         replay_blocks = replays.classify_transcript(events)
         replay_text = "\n".join(b[1] for b in replay_blocks)

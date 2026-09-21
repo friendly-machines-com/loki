@@ -167,9 +167,14 @@ class _ResumeTranscriptPresenter:
 
     def write(self, events):
         blocks = self.renderer.presentation(events)
-        for block_index, block in enumerate(blocks):
+        for block_index, (block_kind, block) in enumerate(blocks):
             if block_index:
                 print("\n\n", end="")
+            if block_kind == "tool_call":
+                # The same colour the live handler puts on a tool call, so a
+                # resumed turn shows what the live one did.  Results stay
+                # plain, matching the live handler.
+                terminal.set_foreground_color(TOOL_CALL_COLOR)
             for kind, text in block:
                 if kind == "literal":
                     print(text, end="")
@@ -184,6 +189,8 @@ class _ResumeTranscriptPresenter:
                 else:
                     raise AssertionError(
                         f"unknown transcript presentation kind {kind!r}")
+            if block_kind == "tool_call":
+                terminal.reset_colors_and_flags()
         if blocks:
             print()
         print("----")

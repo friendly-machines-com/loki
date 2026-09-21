@@ -228,11 +228,11 @@ class ResumeTranscriptRenderer:
                 "assistant_markdown" if role == "assistant"
                 else "user_text" if role == "user"
                 else "text")
-            blocks.append([
+            blocks.append(("message", [
                 label_segment,
                 ("literal", ": "),
                 (content_kind, text),
-            ])
+            ]))
         for content in item.get("content", []):
             if not isinstance(content, dict):
                 continue
@@ -243,29 +243,29 @@ class ResumeTranscriptRenderer:
                 "audio": "[Audio content]",
             }.get(content.get("type"))
             if marker:
-                blocks.append([("literal", marker)])
+                blocks.append(("message", [("literal", marker)]))
         return blocks
 
     @staticmethod
     def _tool_call_blocks(item: dict):
         name = formats.tool_call_name(item) or "<unknown>"
         if item.get("execution", "client") != "client":
-            return [[
+            return [("provider", [
                 ("literal", "Provider tool call: "),
                 ("program_atom", name),
                 ("literal", "\n"),
                 ("text", pformat(item, width=100)),
-            ]]
+            ])]
         try:
             input_value = formats.tool_call_input(item)
         except formats.TranscriptFormatError:
             input_value = item.get("arguments", item.get("input", {}))
-        return [[
+        return [("tool_call", [
             ("literal", "Tool call: "),
             ("program_atom", name),
             ("literal", "\n"),
             ("text", texts.format_tool_args(input_value)),
-        ]]
+        ])]
 
     @staticmethod
     def _tool_result_blocks(item: dict):
@@ -278,7 +278,8 @@ class ResumeTranscriptRenderer:
         ]
         if text:
             block.extend([("literal", "\n"), ("text", text)])
-        return [block]
+        return [("tool_error" if item.get("is_error") else "tool_result",
+                 block)]
 
     @staticmethod
     def _reasoning_blocks(item: dict):
@@ -286,10 +287,10 @@ class ResumeTranscriptRenderer:
         summary = value.get("summary") if isinstance(value, dict) else None
         if not summary:
             return []
-        return [[
+        return [("reasoning", [
             ("literal", "Reasoning summary:\n"),
             ("text", pformat(summary, width=100)),
-        ]]
+        ])]
 
     @staticmethod
     def _native_item_blocks(item: dict, response_protocol=None):
@@ -298,25 +299,25 @@ class ResumeTranscriptRenderer:
             or item.get("provider")
             or response_protocol
             or "unknown")
-        return [[
+        return [("provider_item", [
             ("literal", "[Provider-specific transcript item: "),
             ("program_atom", provider),
             ("literal", "]\n"),
             ("text", pformat(item.get("value"), width=100)),
-        ]]
+        ])]
 
     @staticmethod
     def _provider_tool_result_blocks(item: dict, response_protocol=None):
         provider = response_protocol or "provider"
         call_id = item.get("call_id") or "<unknown>"
-        return [[
+        return [("provider", [
             ("literal", "Provider tool result ("),
             ("program_atom", provider),
             ("literal", "): "),
             ("program_atom", call_id),
             ("literal", "\n"),
             ("text", pformat(item.get("content"), width=100)),
-        ]]
+        ])]
 
     @staticmethod
     def _provider_operation_blocks(item: dict, response_protocol=None):
@@ -335,7 +336,7 @@ class ResumeTranscriptRenderer:
                 ("literal", "\nProvider operation result:\n"),
                 ("text", pformat(item.get("output"), width=100)),
             ])
-        return [block]
+        return [("provider", block)]
 
     def _response_blocks(self, event: dict):
         label = event.get("model") or self.assistant_label
@@ -343,10 +344,10 @@ class ResumeTranscriptRenderer:
         for code in formats.provider_notice_codes(event):
             text = formats.provider_notice_text(code)
             if text is not None:
-                blocks.append([
+                blocks.append(("notice", [
                     ("literal", "\u24d8 "),
                     ("text", text),
-                ])
+                ]))
         status = event.get("status", "completed")
         if status != "completed":
             block = [
@@ -360,7 +361,7 @@ class ResumeTranscriptRenderer:
                     ("literal", "\n"),
                     ("text", pformat(detail, width=100)),
                 ])
-            blocks.append(block)
+            blocks.append(("status", block))
         for item in event.get("items", []):
             item_type = item.get("type")
             if item_type == "message":
@@ -383,12 +384,12 @@ class ResumeTranscriptRenderer:
                 rendered = self._provider_operation_blocks(
                     item, response_protocol=event.get("protocol"))
             else:
-                rendered = [[
+                rendered = [("other", [
                     ("literal", "[Model response item: "),
                     ("atom", str(item_type or "unknown")),
                     ("literal", "]\n"),
                     ("text", pformat(item, width=100)),
-                ]]
+                ])]
             blocks.extend(rendered)
         return blocks
 
@@ -403,12 +404,12 @@ class ResumeTranscriptRenderer:
             return self._response_blocks(item)
         if item_type == "tool_result":
             return self._tool_result_blocks(item)
-        return [[
+        return [("other", [
             ("literal", "[Session event: "),
             ("atom", str(item_type or "unknown")),
             ("literal", "]\n"),
             ("text", pformat(item, width=100)),
-        ]]
+        ])]
 
     def presentation(self, events: list):
         blocks = []

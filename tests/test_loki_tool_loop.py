@@ -2673,8 +2673,8 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         # Join a resume presentation the way a text front-end would; the
         # terminal front-end walks the same segments itself.
         return "\n\n".join(
-            "".join(text for _kind, text in block)
-            for block in renderer.presentation(events))
+            "".join(text for _kind, text in segments)
+            for _block_kind, segments in renderer.presentation(events))
 
     def test_resume_renderer_replays_visible_conversation_without_metadata_dump(self):
         items = [
