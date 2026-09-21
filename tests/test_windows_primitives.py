@@ -509,10 +509,12 @@ def conpty_interactive_probe(root, stage):
             # Both stages read a line back: ``text`` proves blind input, and
             # ``text-reply`` proves input alongside the mode responses.  Without
             # a line the child blocks in readline, and teardown then closes the
-            # pseudoconsole under a live client.
-            if stage in ('text', 'text-reply') and 'MARK1_ms' in timings and (
-                    'input_written' not in record):
-                send(b'probe-key\r\n')
+            # pseudoconsole under a live client.  Tracked separately from
+            # ``input_written``, which the mode responses already set.
+            if (stage in ('text', 'text-reply') and 'MARK1_ms' in timings
+                    and 'line_sent' not in record):
+                if send(b'probe-key\r\n'):
+                    record['line_sent'] = True
             if stage == 'resize' and not resize_sent and b'SIZE:' in output:
                 status = resize_pseudo(hpc, Coord(120, 30))
                 record['resize_hresult'] = '0x%08x' % (
