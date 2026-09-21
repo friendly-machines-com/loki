@@ -276,7 +276,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                                    return_value=directory_fd), \
                     mock.patch.object(self.storage, '_open_lock_at',
                                       return_value=lock_fd), \
-                    mock.patch.object(asyncio, 'get_running_loop',
+                    mock.patch.object(file_locks, 'try_lock_exclusive',
                                       side_effect=RuntimeError('setup failed')):
                 with self.assertRaisesRegex(RuntimeError, 'setup failed'):
                     await self.storage.store_openai_login(tokens())

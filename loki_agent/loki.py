@@ -210,8 +210,6 @@ BASH_MAX_TIMEOUT_MS = 600000
 BASH_MAX_OUTPUT_CHARS = 10_000_000
 GLOB_MAX_RESULTS = 100
 GREP_DEFAULT_HEAD_LIMIT = 250
-SEARCH_TIMEOUT_S = 30
-SUBAGENT_TIMEOUT_S = 600
 # Each process may own two children, and only three descendant generations
 # may exist. Thus one root process can have at most 2 + 4 + 8 active
 # descendants instead of allowing recursive Agent calls to grow without bound.
@@ -1851,7 +1849,7 @@ class JobManager:
         finally:
             await self._close_credential_capability(job)
 
-    async def run_foreground(self, command, display_command: str, timeout_ms: int,
+    async def run_foreground(self, command, display_command: str, timeout_ms: int | None,
                              description: str = "", shell: bool = False,
                              output_chars: int = BASH_MAX_OUTPUT_CHARS,
                              env: dict | None = None, cwd: str = None,
@@ -1913,7 +1911,8 @@ class JobManager:
 
         try:
             done, _pending = await asyncio.wait(
-                watchers, timeout=timeout_ms / 1000,
+                watchers,
+                timeout=timeout_ms / 1000 if timeout_ms is not None else None,
                 return_when=asyncio.FIRST_COMPLETED)
         except BaseException:
             # Any unwind of the owning Python task must not orphan the process
@@ -2008,7 +2007,7 @@ class JobManager:
 
         return _format_bash_result(stdout, stderr, job.exit_code)
 
-    async def run_exec(self, argv: list[str], timeout_ms: int, description: str = "",
+    async def run_exec(self, argv: list[str], timeout_ms: int | None = None, description: str = "",
                        output_chars: int = BASH_MAX_OUTPUT_CHARS,
                        env: dict | None = None, cwd: str = None,
                        cancel_event: asyncio.Event | None = None,
@@ -2404,12 +2403,10 @@ async def run_glob_async(
     args = [rg, '--files', '--color=never', '--glob', pattern, root]
     start = time.perf_counter()
     job, status, stdout, stderr = await current_job_manager().run_exec(
-        args, SEARCH_TIMEOUT_S * 1000, description=f"Glob {pattern!r}",
+        args, description=f"Glob {pattern!r}",
         cancel_event=cancel_event)
     if status == "cancelled":
         return "Error: glob search was cancelled by the user"
-    if status == "timed_out":
-        return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
     duration_ms = int((time.perf_counter() - start) * 1000)
     stderr = stderr.strip()
     if job.exit_code not in [0, 1]:
@@ -2533,12 +2530,10 @@ async def run_grep_async(pattern: str, path: str = None, glob: str = None,
 
     start = time.perf_counter()
     job, status, stdout, stderr = await current_job_manager().run_exec(
-        args, SEARCH_TIMEOUT_S * 1000, description=f"Grep {pattern!r}",
+        args, description=f"Grep {pattern!r}",
         cancel_event=cancel_event)
     if status == "cancelled":
         return "Error: grep search was cancelled by the user"
-    if status == "timed_out":
-        return f"Error: ripgrep timed out after {SEARCH_TIMEOUT_S}s"
     duration_ms = int((time.perf_counter() - start) * 1000)
     stderr = stderr.strip()
     if job.exit_code not in [0, 1]:
@@ -3723,7 +3718,7 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
 
     try:
         job, status, stdout, stderr = await manager.run_exec(
-            argv, SUBAGENT_TIMEOUT_S * 1000,
+            argv,
             description=description or "subagent task",
             env=_subagent_env(reasoning_effort), cwd=os.getcwd(),
             cancel_event=cancel_event,
@@ -3734,10 +3729,6 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         return f"Error: {error}"
     if status == "cancelled":
         return "Error: subagent was cancelled by the user"
-    if status == "timed_out":
-        result = _format_subagent_result(agent_type, description, "timed_out",
-                                         job.exit_code, stdout, stderr)
-        return f"Error: subagent timed out after {SUBAGENT_TIMEOUT_S}s for {description or 'task'}\n{result}"
     result = _format_subagent_result(agent_type, description, "completed",
                                      job.exit_code, stdout, stderr)
     if job.exit_code != 0:

@@ -30,7 +30,6 @@ from .credential_errors import CredentialStorageError
 FORMAT_VERSION = 1
 MAX_CREDENTIAL_FILE_BYTES = 1024 * 1024
 LOCK_RETRY_DELAY_S = 0.05
-LOCK_TIMEOUT_S = 60
 OPENAI_RECORD_TYPE = "openai-chatgpt-oauth"
 OPENAI_CREDENTIAL_KEY = (
     authentications.CredentialRef.openai_subscription().encode())
@@ -391,8 +390,6 @@ class JsonCredentialStorage:
         try:
             lock_fd = self._open_lock_at(directory_fd)
             try:
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + LOCK_TIMEOUT_S
                 acquired = False
                 try:
                     while True:
@@ -401,9 +398,6 @@ class JsonCredentialStorage:
                             acquired = True
                             break
                         except BlockingIOError:
-                            if loop.time() >= deadline:
-                                raise CredentialStorageError(
-                                    "timed out waiting for credential lock")
                             await asyncio.sleep(LOCK_RETRY_DELAY_S)
                     yield directory_fd, self._read_document_at(directory_fd)
                 finally:
