@@ -170,11 +170,13 @@ class _ResumeTranscriptPresenter:
         for block_index, (block_kind, block) in enumerate(blocks):
             if block_index:
                 print("\n\n", end="")
+            styled = False
             if block_kind == "tool_call":
-                # The same colour the live handler puts on a tool call, so a
-                # resumed turn shows what the live one did.  Results stay
-                # plain, matching the live handler.
                 terminal.set_foreground_color(TOOL_CALL_COLOR)
+                styled = True
+            elif block_kind == "tool_error":
+                terminal.set_background_color(ERROR_COLOR)
+                styled = True
             for kind, text in block:
                 if kind == "literal":
                     print(text, end="")
@@ -189,7 +191,7 @@ class _ResumeTranscriptPresenter:
                 else:
                     raise AssertionError(
                         f"unknown transcript presentation kind {kind!r}")
-            if block_kind == "tool_call":
+            if styled:
                 terminal.reset_colors_and_flags()
         if blocks:
             print()
@@ -339,10 +341,15 @@ def _terminal_agent_event(event: dict):
         # it as well would duplicate the error now that a result is shown.  It
         # is still emitted, so a mode that hides tool calls can show failures.
         label = "Tool error" if event.get("is_error") else "Tool result"
+        if event.get("is_error"):
+            terminal.set_background_color(ERROR_COLOR)
         print(f"{computer}: {label}: ", end="")
         terminal.write_text(repr(event["name"]))
         print()
         terminal.write_text(str(event["content"]), multiline=True)
+        if event.get("is_error"):
+            # Reset precedes the newline so terminal scroll-fill stays neutral.
+            terminal.reset_colors_and_flags()
         print()
 
 
