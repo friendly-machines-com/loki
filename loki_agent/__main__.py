@@ -66,7 +66,7 @@ def main() -> int:
         except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError,
                 ValueError) as error:
             return _report_security_error(error)
-        if not configure_logging():
+        if not configure_logging(contained=True):
             return 2
         from .terminal_frontend import main as terminal_main
         return terminal_main(args, owner_fd, capability_fd)
@@ -82,7 +82,7 @@ def main() -> int:
             protect_credential_process()
         except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError) as error:
             return _report_security_error(error)
-        if not configure_logging():
+        if not configure_logging(contained=True):
             return 2
         from .subagents import main as subagent_main
         return subagent_main(sys.argv[2:])

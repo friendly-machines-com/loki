@@ -108,6 +108,22 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
             self.assertIn('DEBUG|loki_agent.formats|Unknown', text)
             self.assertNotIn('other trace', text)
 
+    def test_a_contained_runtime_ignores_the_invoker_config(self):
+        # It cannot be assumed able to read the file the invoker names, nor to
+        # write the handlers' targets; it says so and uses stderr.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'trace.log'
+            config = Path(directory) / 'logging.ini'
+            config.write_text(CONFIG.format(path=str(log)))
+            result = self.run_code(
+                "from loki_agent.diagnostics import configure_logging\n"
+                "assert configure_logging(contained=True)\n",
+                LOKI_LOG_CONFIG=str(config), LOKI_TRACE='1')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('Logging configuration ignored', result.stderr)
+            self.assertFalse(log.exists())
+
     def test_repeated_setup_does_not_duplicate(self):
         result = self.run_code(EMIT.replace(
             "report_unknown('test'", "configure_logging()\nreport_unknown('test'"),
@@ -138,11 +154,12 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
                 self.assertIn('Logging configuration error:', result.stderr)
                 self.assertNotIn('Traceback', result.stderr)
 
-    def test_real_headless_supervisor_and_runtime_load_ini(self):
+    def test_real_headless_supervisor_loads_ini_and_the_runtime_falls_back(self):
         with tempfile.TemporaryDirectory() as directory:
-            # The contained runtime reads this config and writes the trace it
-            # names, so both live inside the granted workspace.  The temp root
-            # is created private (0o700, honoured on Windows), which carries no
+            # The supervisor is uncontained and loads this config, writing the
+            # trace it names; the contained runtime refuses any configuration
+            # the invoker names and logs to stderr instead.  The temp root is
+            # created private (0o700, honoured on Windows), which carries no
             # package ACE and so is invisible to the container.
             workspace = os.path.join(directory, "workspace")
             os.makedirs(workspace)
@@ -174,8 +191,9 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
                 cwd=workspace, env=environment, capture_output=True,
                 text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertGreaterEqual(
-                len(list(Path(workspace).glob('trace-*'))), 2)
+            self.assertIn("Logging configuration ignored", result.stderr)
+            self.assertEqual(
+                len(list(Path(workspace).glob('trace-*'))), 1)
 
     def test_relative_filename_is_preserved_in_environment_snapshot(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:

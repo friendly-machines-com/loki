@@ -174,7 +174,7 @@ def main() -> int:
             runtime_isolation.isolate_runtime()
             runtime_isolation.prepare_runtime_scratch()
             protect_credential_process()
-            if not configure_logging():
+            if not configure_logging(contained=True):
                 return 2
             write = _protocol_output(null_fd)
     except (ValueError, getopt.GetoptError, OSError) as error:

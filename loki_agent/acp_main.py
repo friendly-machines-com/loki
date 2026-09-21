@@ -70,7 +70,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        if not configure_logging():
+        if not configure_logging(contained=True):
             return 2
         from .subagents import main as subagent_main
         return subagent_main(sys.argv[2:])

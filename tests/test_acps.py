@@ -575,7 +575,7 @@ class FrontWorkerTests(unittest.TestCase):
         configure_container(env, workspace)
         return env
 
-    def test_ini_logging_reaches_real_front_and_worker(self):
+    def test_ini_logging_reaches_the_front_not_the_contained_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             config = os.path.join(directory, "logging.ini")
             # The handler arg is a Python literal that fileConfig evals, so the
@@ -608,11 +608,14 @@ args=(%r + str(__import__('os').getpid()), 'a')
             with mock.patch.object(
                     self, "_front_env", side_effect=relative_config_env):
                 self.test_initialize_new_session_prompt_roundtrip()
-            # File handlers open during configuration, even without a record.
-            # The front and separately execed worker must both load the INI.
+            # The front is uncontained and loads the INI.  The separately
+            # execed worker is contained: it refuses any configuration the
+            # invoker names (it cannot be assumed able to read it or write its
+            # handlers' targets) and logs to stderr instead, so only the front
+            # opens a trace file.
             traces = [name for name in os.listdir(directory)
                       if name.startswith("trace-")]
-            self.assertGreaterEqual(len(traces), 2)
+            self.assertEqual(len(traces), 1)
 
     def test_initialize_new_session_prompt_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
