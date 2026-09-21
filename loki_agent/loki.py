@@ -262,8 +262,22 @@ else:
             raise
         if sddl is not None:
             windows_api.set_named_dacl(tmp_path, sddl)
-LOCAL_LOKI_DIR = os.path.join(STARTUP_CWD, ".loki")
-CHAT_LOG_DIR = os.path.join(LOCAL_LOKI_DIR, "chats")
+
+
+def chat_log_dir_for(workspace: str) -> str:
+    """The chat-log root for a session whose workspace is ``workspace``.
+
+    A transcript lives in its workspace, not in the directory the process
+    happened to start in.  An ACP client names the session's ``cwd`` and the
+    agent must use it regardless of where the subprocess was spawned (Agent
+    Client Protocol, Session Setup) -- which is also the only tree a contained
+    runtime may write on Windows.  The terminal has no protocol cwd, so its
+    workspace is the startup directory and ``CHAT_LOG_DIR`` is that case.
+    """
+    return os.path.join(workspace, ".loki", "chats")
+
+
+CHAT_LOG_DIR = chat_log_dir_for(STARTUP_CWD)
 JOB_TAIL_CHARS = 20_000
 
 WEBFETCH_TIMEOUT_S = 30

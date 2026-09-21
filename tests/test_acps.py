@@ -1474,6 +1474,8 @@ class SessionRestoreTests(unittest.TestCase):
                 front.wait(timeout=5)
 
     def test_resume_continues_without_replaying_history(self):
+        from loki_agent import loki
+
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._env(tmpdir)
             saved_id = self._create_saved_session(env, tmpdir)
@@ -1532,7 +1534,8 @@ class SessionRestoreTests(unittest.TestCase):
                 front.wait(timeout=5)
 
             saved_path = os.path.join(
-                tmpdir, ".loki", "chats", f"chat-{saved_id}.json")
+                loki.chat_log_dir_for(_configured_workspace(tmpdir)),
+                f"chat-{saved_id}.json")
             with open(saved_path, encoding="utf-8") as stream:
                 persisted = stream.read()
             self.assertIn("remember this", persisted)
@@ -2094,17 +2097,16 @@ class WorkerSessionContractTests(unittest.TestCase):
 
         old_session = loki._DEFAULT_SESSION
         old_credentials = loki.CREDENTIALS
-        old_chat_dir = loki.CHAT_LOG_DIR
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 saved_cwd = os.path.join(tmpdir, "saved-cwd")
                 requested_cwd = os.path.join(tmpdir, "requested-cwd")
-                chat_dir = os.path.join(tmpdir, "chats")
+                # The saved log lives in the workspace the client names.
+                chat_dir = loki.chat_log_dir_for(requested_cwd)
                 os.mkdir(saved_cwd)
                 os.mkdir(requested_cwd)
-                os.mkdir(chat_dir)
+                os.makedirs(chat_dir)
                 loki.CREDENTIALS = CredentialStore({})
-                loki.CHAT_LOG_DIR = chat_dir
 
                 for stored_cwd in (saved_cwd, "invalid\x00cwd"):
                     blob = formats.new_log_blob(
@@ -2137,7 +2139,6 @@ class WorkerSessionContractTests(unittest.TestCase):
         finally:
             loki._DEFAULT_SESSION = old_session
             loki.CREDENTIALS = old_credentials
-            loki.CHAT_LOG_DIR = old_chat_dir
 
     def test_subscription_option_and_resume_use_brokered_credential(self):
         from loki_agent import formats, http_client, loki, models
@@ -2212,10 +2213,8 @@ class WorkerSessionContractTests(unittest.TestCase):
             ))
         old_session = loki._DEFAULT_SESSION
         old_credentials = loki.CREDENTIALS
-        old_chat_dir = loki.CHAT_LOG_DIR
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                loki.CHAT_LOG_DIR = os.path.join(tmpdir, "chats")
                 loki.CREDENTIALS = CredentialInventory(
                     {}, {credential})
                 requests = []
@@ -2395,7 +2394,6 @@ class WorkerSessionContractTests(unittest.TestCase):
         finally:
             loki._DEFAULT_SESSION = old_session
             loki.CREDENTIALS = old_credentials
-            loki.CHAT_LOG_DIR = old_chat_dir
 
     def test_restore_accepts_equivalent_client_cwd(self):
         from unittest import mock
@@ -2407,15 +2405,16 @@ class WorkerSessionContractTests(unittest.TestCase):
 
         old_session = loki._DEFAULT_SESSION
         old_credentials = loki.CREDENTIALS
-        old_chat_dir = loki.CHAT_LOG_DIR
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 saved_cwd = os.path.join(tmpdir, "saved-cwd")
                 client_cwd = os.path.join(tmpdir, "client-cwd")
                 os.mkdir(saved_cwd)
                 os.symlink(saved_cwd, client_cwd)
-                chat_dir = os.path.join(tmpdir, "chats")
-                os.mkdir(chat_dir)
+                # The saved log lives in the workspace the client names -- here
+                # a symlink to the saved directory.
+                chat_dir = loki.chat_log_dir_for(client_cwd)
+                os.makedirs(chat_dir)
                 descriptor = ConnectionDescriptor(
                     provider_id="saved-provider",
                     provider_name="Saved Provider",
@@ -2446,7 +2445,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                 loki.CREDENTIALS = CredentialStore({
                     "SAVED_API_KEY": "secret",
                 })
-                loki.CHAT_LOG_DIR = chat_dir
                 worker = Worker(session, lambda message: None)
                 with mock.patch(
                         "loki_agent.acp_worker.modelsdev.ensure_index",
@@ -2472,7 +2470,6 @@ class WorkerSessionContractTests(unittest.TestCase):
         finally:
             loki._DEFAULT_SESSION = old_session
             loki.CREDENTIALS = old_credentials
-            loki.CHAT_LOG_DIR = old_chat_dir
 
     def test_new_sessions_get_distinct_persistent_logs_with_empty_catalog(self):
         from unittest import mock
@@ -2483,11 +2480,9 @@ class WorkerSessionContractTests(unittest.TestCase):
 
         old_session = loki._DEFAULT_SESSION
         old_credentials = loki.CREDENTIALS
-        old_chat_dir = loki.CHAT_LOG_DIR
         paths = []
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                loki.CHAT_LOG_DIR = os.path.join(tmpdir, "chats")
                 loki.CREDENTIALS = CredentialStore({})
                 for number in range(2):
                     session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
@@ -2517,14 +2512,13 @@ class WorkerSessionContractTests(unittest.TestCase):
                 # Session paths are stored through os.path.realpath; compare
                 # resolved directories, or a differently-spelled temp path
                 # (Windows short names) fails on spelling alone.
-                log_dir = os.path.realpath(loki.CHAT_LOG_DIR)
+                log_dir = os.path.realpath(loki.chat_log_dir_for(tmpdir))
                 self.assertTrue(all(
                     os.path.realpath(os.path.dirname(path)) == log_dir
                     for path in paths))
         finally:
             loki._DEFAULT_SESSION = old_session
             loki.CREDENTIALS = old_credentials
-            loki.CHAT_LOG_DIR = old_chat_dir
 
     def test_provider_failure_is_an_acp_request_failure(self):
         from loki_agent import formats, loki, protocols

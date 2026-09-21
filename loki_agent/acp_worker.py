@@ -402,7 +402,8 @@ class Worker:
                     code=acps.INVALID_PARAMS,
                 )
             path = os.path.join(
-                loki.CHAT_LOG_DIR, loki.chat_log_filename(session_id))
+                loki.chat_log_dir_for(cwd),
+                loki.chat_log_filename(session_id))
             if not os.path.isfile(path):
                 raise acps.TransportError(
                     f"no saved session named {session_id!r}",
@@ -440,7 +441,7 @@ class Worker:
             self.session.shell_cwd = cwd
             try:
                 loki.new_chat_log(os.path.join(
-                    loki.CHAT_LOG_DIR,
+                    loki.chat_log_dir_for(cwd),
                     loki.chat_log_filename(session_id),
                 ))
             except OSError as error:

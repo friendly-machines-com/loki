@@ -31,7 +31,7 @@ from .connections import (
     connection_display_fields,
 )
 from .credentials import CredentialStore
-from .loki import CHAT_LOG_DIR
+from .loki import CHAT_LOG_DIR, chat_log_dir_for
 from .runtime_isolation import RuntimeIsolationError
 
 logger = logging.getLogger(__name__)
@@ -621,19 +621,24 @@ class Front:
         return result
 
     def list_sessions(self, params: dict) -> dict:
-        cwd_filter = params.get("cwd")
-        if cwd_filter is not None:
-            if (not isinstance(cwd_filter, str)
-                    or not os.path.isabs(cwd_filter)):
+        requested = params.get("cwd")
+        cwd_filter = None
+        if requested is not None:
+            if (not isinstance(requested, str)
+                    or not os.path.isabs(requested)):
                 raise acps.TransportError(
                     "session/list cwd must be an absolute path",
                     code=acps.INVALID_PARAMS,
                 )
             # Case-folded names are compared, nothing is asked of the
             # filesystem: Loki never resolves or normalises an operand.
-            cwd_filter = os.path.normcase(cwd_filter)
+            cwd_filter = os.path.normcase(requested)
+        # Sessions live in the workspace the client names; with no filter, in
+        # this process's own workspace, the directory it was started in.
+        root = (chat_log_dir_for(requested) if requested is not None
+                else CHAT_LOG_DIR)
         entries = []
-        for path in savefiles.filtered_chat_log_paths("", CHAT_LOG_DIR):
+        for path in savefiles.filtered_chat_log_paths("", root):
             try:
                 with open(path, "r", encoding="utf-8") as file_obj:
                     blob = json.load(file_obj)
