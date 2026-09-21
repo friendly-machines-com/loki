@@ -208,26 +208,39 @@ class GrantHandlePrimitiveTests(unittest.TestCase):
         self.target.mkdir()
         self.package = windows_api.derive_app_container_sid('loki-grant-probe')
 
-    def test_the_handle_identifies_and_pins_its_directory(self):
+    def test_the_handle_keeps_naming_its_directory_across_a_rename(self):
+        # The handle binds the check, the DACL read and the DACL write to the
+        # object, not to the name.  Withholding FILE_SHARE_DELETE does not stop
+        # a directory being renamed -- measured: os.rename succeeds while the
+        # handle is open -- so what closes the check/apply race is that the
+        # handle still names the object the check judged.  Rename the target,
+        # put a decoy at the name the handle was opened with, then write a DACL
+        # through the handle: the moved original must change, the decoy must
+        # not.
         handle = windows_api.open_directory_for_acl(str(self.target))
         try:
             self.assertEqual(
                 os.path.normcase(windows_api.final_path_from_handle(handle)),
                 os.path.normcase(str(self.target)))
-            self.assertIsNotNone(windows_api.handle_dacl_sddl(handle))
-            # FILE_SHARE_DELETE is withheld, so while the handle lives the
-            # directory cannot be renamed out from under the object the check
-            # judged and the DACL write will name.
+            current = windows_api.handle_dacl_sddl(handle)
             moved = self.root / 'moved'
-            with self.assertRaises(OSError) as refused:
-                os.rename(self.target, moved)
-            print(json.dumps({'operation': 'rename_while_pinned',
-                              'winerror': getattr(refused.exception,
-                                                  'winerror', None)}),
-                  flush=True)
-            self.assertTrue(self.target.is_dir())
+            os.rename(self.target, moved)
+            self.target.mkdir()
+            updated = windows_state.add_package_ace(
+                current, self.package, windows_state.Access.READ_WRITE)
+            windows_containers.set_handle_dacl_sddl(handle, updated)
+            self.assertEqual(
+                os.path.normcase(windows_api.final_path_from_handle(handle)),
+                os.path.normcase(str(moved)))
         finally:
             windows_api.close_handle(handle)
+        moved_dacl = windows_api.dacl_sddl(str(moved))
+        decoy_dacl = windows_api.dacl_sddl(str(self.target))
+        print(json.dumps({'operation': 'dacl_after_rename',
+                          'moved': moved_dacl, 'decoy': decoy_dacl}),
+              flush=True)
+        self.assertTrue(windows_acl.names_package(moved_dacl, self.package))
+        self.assertFalse(windows_acl.names_package(decoy_dacl, self.package))
 
     def test_the_identity_open_reaches_the_final_path_uncontained(self):
         # The deciding experiment for the contained gate's
