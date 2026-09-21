@@ -167,17 +167,23 @@ class EntrypointTests(unittest.TestCase):
         def isolate():
             calls.append('isolate')
 
+        def scratch():
+            calls.append('scratch')
+
         def protect():
             calls.append('protect')
             return True
 
         with mock.patch.object(entry.runtime_isolation, 'isolate_runtime',
                                side_effect=isolate), \
+                mock.patch.object(entry.runtime_isolation,
+                                  'prepare_runtime_scratch',
+                                  side_effect=scratch), \
                 mock.patch.object(entry, 'protect_credential_process',
                                   side_effect=protect):
             entry._protect_runtime()
 
-        self.assertEqual(calls, ['isolate', 'protect'])
+        self.assertEqual(calls, ['isolate', 'scratch', 'protect'])
 
 
 @unittest.skipUnless(sys.platform == "win32",
