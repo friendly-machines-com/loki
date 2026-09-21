@@ -221,8 +221,9 @@ class IsolationSeamTests(unittest.TestCase):
         self.assertEqual(launch.call_args.args[1],
                          ['--runtime', '--', '--headless'])
         self.assertEqual(launch.call_args.args[3], '/recorded/work')
-        self.assertEqual(launch.call_args.kwargs['environment'],
-                         {'SAFE': 'value'})
+        # ``environment`` is positional too: launch(executable, arguments,
+        # environment, workspace, inherited, ...).
+        self.assertEqual(launch.call_args.args[2], {'SAFE': 'value'})
         self.assertEqual(launch.call_args.kwargs['current_directory'],
                          os.getcwd())
 
