@@ -218,6 +218,18 @@ def conpty_probe(root):
             raise C.WinError(C.get_last_error())
         startup = SharedStartupInfo()
         startup.startup.cb = C.sizeof(SharedStartupInfo)
+        # STARTF_USESTDHANDLES with null handles.  Without it, CreateProcessW
+        # duplicates this process's standard handles into a console child (the
+        # old compatibility path, which applies because bInheritHandles is
+        # FALSE and the flags carry no CREATE_NEW_CONSOLE / CREATE_NO_WINDOW /
+        # DETACHED_PROCESS).  A redirected parent then sends the child's text
+        # to its own pipe instead of the pseudoconsole, and the child's stdin
+        # is the parent's, not the pty's.  Workaround from microsoft/terminal
+        # discussion 15814; the STARTUPINFO page does not describe this case.
+        startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
+        startup.startup.stdin = None
+        startup.startup.stdout = None
+        startup.startup.stderr = None
         startup.attributes = attributes
         command = '"%s" /d /c echo conpty-ok' % os.path.join(
             os.environ.get('SystemRoot', 'C:\\Windows'), 'System32',
@@ -272,6 +284,11 @@ def conpty_probe(root):
         record['winerror'] = getattr(error, 'winerror', None)
     finally:
         if process.process:
+            if kernel.WaitForSingleObject(process.process, 0) != 0:
+                # A live client blocks or deadlocks ClosePseudoConsole; end it
+                # before the session is torn down.
+                kernel.TerminateProcess(process.process, 1)
+                kernel.WaitForSingleObject(process.process, 1000)
             kernel.CloseHandle(process.process)
         if process.thread:
             kernel.CloseHandle(process.thread)
@@ -421,6 +438,18 @@ def conpty_interactive_probe(root, stage):
             raise C.WinError(C.get_last_error())
         startup = SharedStartupInfo()
         startup.startup.cb = C.sizeof(SharedStartupInfo)
+        # STARTF_USESTDHANDLES with null handles.  Without it, CreateProcessW
+        # duplicates this process's standard handles into a console child (the
+        # old compatibility path, which applies because bInheritHandles is
+        # FALSE and the flags carry no CREATE_NEW_CONSOLE / CREATE_NO_WINDOW /
+        # DETACHED_PROCESS).  A redirected parent then sends the child's text
+        # to its own pipe instead of the pseudoconsole, and the child's stdin
+        # is the parent's, not the pty's.  Workaround from microsoft/terminal
+        # discussion 15814; the STARTUPINFO page does not describe this case.
+        startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
+        startup.startup.stdin = None
+        startup.startup.stdout = None
+        startup.startup.stderr = None
         startup.attributes = attributes
         command = '"%s" -I -u "%s" --conpty-child %s' % (
             sys.executable, Path(__file__).resolve(), stage)
@@ -477,7 +506,11 @@ def conpty_interactive_probe(root, stage):
                 break
             for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
                 note(marker)
-            if stage == 'text' and 'MARK1_ms' in timings and (
+            # Both stages read a line back: ``text`` proves blind input, and
+            # ``text-reply`` proves input alongside the mode responses.  Without
+            # a line the child blocks in readline, and teardown then closes the
+            # pseudoconsole under a live client.
+            if stage in ('text', 'text-reply') and 'MARK1_ms' in timings and (
                     'input_written' not in record):
                 send(b'probe-key\r\n')
             if stage == 'resize' and not resize_sent and b'SIZE:' in output:
@@ -527,6 +560,11 @@ def conpty_interactive_probe(root, stage):
         record['winerror'] = getattr(error, 'winerror', None)
     finally:
         if process.process:
+            if kernel.WaitForSingleObject(process.process, 0) != 0:
+                # A live client blocks or deadlocks ClosePseudoConsole; end it
+                # before the session is torn down.
+                kernel.TerminateProcess(process.process, 1)
+                kernel.WaitForSingleObject(process.process, 1000)
             kernel.CloseHandle(process.process)
         if process.thread:
             kernel.CloseHandle(process.thread)

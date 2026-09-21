@@ -1026,12 +1026,20 @@ def create_process_in_app_container(executable, arguments, package_sid,
                 raise WindowsApiError(
                     "UpdateProcThreadAttribute(HANDLE_LIST) failed")
         if pseudoconsole is not None:
-            # The value is the HPCON itself; the pseudoconsole then supplies the
-            # child's standard handles, so STARTF_USESTDHANDLES is not set.
+            # lpValue is the HPCON value itself, not its address: that is the
+            # form the documented ConPTY sample passes.  The generic
+            # UpdateProcThreadAttribute wording ("a pointer to the attribute
+            # value") reads the other way; the sample for this attribute is the
+            # contract.  Note also that a pseudoconsole does not reliably
+            # supply a child's standard handles when the parent's are
+            # redirected -- the parent's are duplicated into a console child
+            # unless STARTF_USESTDHANDLES with null handles suppresses it
+            # (microsoft/terminal discussion 15814).  A caller that needs that
+            # must pass standard_handles as nulls, not leave them unset.
             hpcon = ctypes.c_void_p(pseudoconsole)
             if not update(attribute_list, 0,
                           PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                          ctypes.byref(hpcon), ctypes.sizeof(hpcon),
+                          hpcon, ctypes.sizeof(hpcon),
                           None, None):
                 raise WindowsApiError(
                     "UpdateProcThreadAttribute(PSEUDOCONSOLE) failed")
