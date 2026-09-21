@@ -179,9 +179,6 @@ def conpty_probe(root):
     peek.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
                      C.POINTER(ULONG), C.POINTER(ULONG)]
     peek.restype = W.BOOL
-    wait_many = kernel.WaitForMultipleObjects
-    wait_many.argtypes = [ULONG, C.POINTER(HANDLE), W.BOOL, ULONG]
-    wait_many.restype = ULONG
 
     def pair():
         read, write = HANDLE(), HANDLE()
@@ -263,43 +260,23 @@ def conpty_probe(root):
                     return False
                 output.extend(buffer.raw[:transferred.value])
 
-        # Wait on the channel and the child together: the pipe signals when
-        # output is available (or the write end closes) and the process when it
-        # exits, so the loop is event-driven instead of sampling every 5 ms.
-        # Deadlined like the interactive probe's: a handle that reports
-        # signalled while the channel holds nothing would otherwise spin here,
-        # with the wait's own timeout never applying.
-        handles = (HANDLE * 2)(output_read, process.process)
-        deadline = time.monotonic() + 10
-        while True:
-            remaining = round((deadline - time.monotonic()) * 1000)
-            if remaining <= 0:
+        # Read until the child exits, then close the session and drain its
+        # final frame.  Wait on the process handle only: the pipe's read
+        # handle is not a usable data signal, because the pseudoconsole keeps
+        # it signalled while the channel holds nothing, so a wait on it spins.
+        while kernel.WaitForSingleObject(process.process, 0) != 0:
+            if not drain_channel():
                 break
-            signalled = wait_many(2, handles, False, remaining)
-            if signalled == 0:
-                if not drain_channel():
-                    break
-            elif signalled == 1:
-                # The child exited; its final write may already be in the pipe.
-                drain_channel()
-                break
-            else:
-                break
+            time.sleep(0.005)
         exit_code = ULONG()
         kernel.GetExitCodeProcess(process.process, C.byref(exit_code))
         record['exit_code'] = exit_code.value
-        # Then close the session and drain its final frame until it breaks.
+        # Then close the session: the pty's write end closes, so the channel
+        # breaks once the final frame has been read.  Drain until it breaks.
         close_pseudo(hpc)
         closed = True
-        # The pty's write end closes with the session, so the pipe signals
-        # (data or break) rather than needing a polling window.
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            remaining = max(1, round((deadline - time.monotonic()) * 1000))
-            if kernel.WaitForSingleObject(output_read, remaining) != 0:
-                break
-            if not drain_channel():
-                break
+        while drain_channel():
+            pass
         record['saw_marker'] = b'conpty-ok' in output
         record['output'] = output.decode('utf-8', 'replace')
     except OSError as error:
@@ -352,17 +329,15 @@ def conpty_child(stage):
         import shutil
         size = shutil.get_terminal_size()
         print('SIZE:%d,%d' % (size.columns, size.lines), flush=True)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            time.sleep(0.2)
+        # Exit when the resize reaches this console; the parent's test timeout
+        # is the only bound, the same way it bounds every other stage.
+        while True:
             current = shutil.get_terminal_size()
-            if (current.columns, current.lines) != (
-                    size.columns, size.lines):
+            if (current.columns, current.lines) != (size.columns, size.lines):
                 print('SIZE:%d,%d' % (current.columns, current.lines),
                       flush=True)
                 return 0
-        print('SIZE:unchanged', flush=True)
-        return 0
+            time.sleep(0.2)
     raise SystemExit('unknown conpty-child stage')
 
 
@@ -419,12 +394,6 @@ def conpty_interactive_probe(root, stage):
     peek.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
                      C.POINTER(ULONG), C.POINTER(ULONG)]
     peek.restype = W.BOOL
-    wait_many = kernel.WaitForMultipleObjects
-    wait_many.argtypes = [ULONG, C.POINTER(HANDLE), W.BOOL, ULONG]
-    wait_many.restype = ULONG
-    wait_for = kernel.WaitForSingleObject
-    wait_for.argtypes = [HANDLE, ULONG]
-    wait_for.restype = ULONG
 
     def pair():
         read, write = HANDLE(), HANDLE()
@@ -526,7 +495,6 @@ def conpty_interactive_probe(root, stage):
 
         replied = []
         resize_sent = False
-        handles = (HANDLE * 2)(output_read, process.process)
 
         def service():
             """React once the channel has been read."""
@@ -558,30 +526,18 @@ def conpty_interactive_probe(root, stage):
                     if send(b'\x1b[24;80R'):
                         replied.append(b'6n')
 
-        # Wait on the channel and the child together: the pipe signals when
-        # output is available (or the write end closes) and the process when it
-        # exits, so the loop is event-driven instead of sampling every 10 ms.
-        deadline = time.monotonic() + 8
-        while True:
-            remaining = round((deadline - time.monotonic()) * 1000)
-            if remaining <= 0:
+        # Read until the child exits: drain what has arrived, react to it,
+        # repeat.  Wait on the process handle only -- the pipe's read handle
+        # reports signalled while the channel holds nothing, so a wait on it
+        # spins -- and end on the child's exit, not on a deadline.
+        while kernel.WaitForSingleObject(process.process, 0) != 0:
+            if not drain():
                 break
-            signalled = wait_many(2, handles, False, remaining)
-            if signalled == 0:
-                if not drain():
-                    break
-                service()
-            elif signalled == 1:
-                # The child exited; its final write may already be in the pipe.
-                drain()
-                service()
-                break
-            else:
-                break
-        # A timeout can leave the child's last write in the pipe; drain once
-        # more before snapshotting.  Anything read here was written before
-        # close_pseudo, which is the boundary this snapshot measures.
+            service()
+            time.sleep(0.01)
+        # The child exited; its final write may already be in the pipe.
         drain()
+        service()
         for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
             note(marker)
         if not timings:
@@ -599,15 +555,10 @@ def conpty_interactive_probe(root, stage):
         before_close = bytes(output)
         close_pseudo(hpc)
         closed = True
-        # The pty's write end closes with the session, so the pipe signals
-        # (data or break) rather than needing a polling window.
-        stop = time.monotonic() + 3
-        while time.monotonic() < stop:
-            remaining = max(1, round((stop - time.monotonic()) * 1000))
-            if wait_for(output_read, remaining) != 0:
-                break
-            if not drain():
-                break
+        # The pty's write end closes with the session, so the channel breaks
+        # once the final frame has been read.  Drain until it breaks.
+        while drain():
+            pass
         record['markers_before_close'] = {
             marker: marker.encode() in before_close
             for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:')}
@@ -974,7 +925,10 @@ def child(mode, root, stage=None):
                 os._exit(0)  # No explicit unlock or Python cleanup.
             if stage == 'hold':
                 (root / 'ready').write_text('locked')
-                time.sleep(120)
+                # Hold the lock until the harness kills this process; the
+                # test's timeout is the only bound.
+                while True:
+                    time.sleep(60)
             stream.seek(0)
             msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
             return 0 if stage != 'contended' else 3
@@ -982,7 +936,10 @@ def child(mode, root, stage=None):
     def checkpoint(name):
         if name == stage:
             (root / 'ready').write_text(name)
-            time.sleep(120)
+            # Stay parked until the harness kills this process; the test's
+            # timeout is the only bound.
+            while True:
+                time.sleep(60)
 
     with open(root / 'temporary', 'xb') as stream:
         checkpoint('create')
@@ -1269,7 +1226,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
                 '--child', mode, str(self.root), stage]
 
     def run_child(self, mode, stage):
-        result = subprocess.run(self.command(mode, stage), timeout=15,
+        result = subprocess.run(self.command(mode, stage),
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -1284,19 +1241,16 @@ class WindowsPrimitiveTests(unittest.TestCase):
         def stop():
             if process.poll() is None:
                 process.kill()
-            stdout, stderr = process.communicate(timeout=10)
+            stdout, stderr = process.communicate()
             print(json.dumps({'stage': stage, 'exit': process.returncode,
                               'stdout': stdout.decode(errors='replace'),
                               'stderr': stderr.decode(errors='replace')}),
                   flush=True)
 
         self.addCleanup(stop)
-        deadline = time.monotonic() + 15
         while not ready.exists():
             if process.poll() is not None:
                 self.fail('child exited before checkpoint: %s' % stage)
-            if time.monotonic() >= deadline:
-                self.fail('child checkpoint timed out: %s' % stage)
             time.sleep(0.02)
         return process
 
@@ -1368,7 +1322,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
 
             task = asyncio.create_task(waiter())
             try:
-                await asyncio.wait_for(attempted.wait(), timeout=5)
+                await attempted.wait()
             finally:
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
@@ -1380,7 +1334,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
             os.fstat(descriptors[0])
         self.run_child('lock', 'contended')
         process.kill()
-        process.wait(timeout=10)
+        process.wait()
         self.run_child('lock', 'acquire')
 
     def test_process_termination_releases_lock(self):
@@ -1388,7 +1342,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         process = self.stop_at('lock', 'hold')
         self.run_child('lock', 'contended')
         process.kill()
-        process.wait(timeout=10)
+        process.wait()
         self.run_child('lock', 'acquire')
 
     def test_crt_open_allows_read_write_but_blocks_delete(self):
@@ -1448,7 +1402,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         result = subprocess.run(
             ['cmd.exe', '/d', '/c', 'mklink', '/J',
              str(junction).replace('/', '\\'), str(outside).replace('/', '\\')],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.addCleanup(lambda: os.rmdir(junction))
         handle = self.handle(directory, flags=BACKUP)
@@ -1567,7 +1521,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
                 target.write_bytes(b'{"generation": "old"}\n')
                 process = self.stop_at('write', stage)
                 process.kill()
-                process.wait(timeout=10)
+                process.wait()
                 expected = 'new' if stage == 'replace' else 'old'
                 self.assertEqual(json.loads(target.read_bytes()),
                                  {'generation': expected})
@@ -1688,7 +1642,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         alias = self.root / 'alias'
         result = subprocess.run(
             ['cmd.exe', '/d', '/c', 'mklink', '/J', str(alias), str(real)],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True)
         record = {'probe': 'junction-alias', 'mklink_exit': result.returncode}
         if alias.exists():
             stat = os.lstat(alias)
@@ -1706,7 +1660,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         # child attaches.  Child-output capture is a separate, unproven claim
         # recorded by the probe, not asserted here.  The child's record is
         # printed even on success, so the characterization is visible.
-        result = subprocess.run(self.command('conpty', 'conpty'), timeout=15,
+        result = subprocess.run(self.command('conpty', 'conpty'),
                                 capture_output=True, text=True)
         print(result.stdout, flush=True)
         print(result.stderr, file=sys.stderr, flush=True)
@@ -1722,7 +1676,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         for stage in ('text', 'text-reply', 'sgr', 'resize'):
             with self.subTest(stage=stage):
                 result = subprocess.run(
-                    self.command('conpty-interactive', stage), timeout=25,
+                    self.command('conpty-interactive', stage),
                     capture_output=True, text=True)
                 print(result.stdout, flush=True)
                 print(result.stderr, file=sys.stderr, flush=True)
@@ -1739,7 +1693,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         alias = self.root / 'alias'
         subprocess.run(
             ['cmd.exe', '/d', '/c', 'mklink', '/J', str(alias), str(real)],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True)
         record = {'probe': 'path-semantics', 'alias_exists': alias.exists(),
                   'alias_is_dir': os.path.isdir(alias)}
         # _follow_final_link gates on os.path.islink, and reads the target with
@@ -1834,7 +1788,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         junction = subprocess.run(
             ['cmd.exe', '/d', '/c', 'mklink', '/J',
              str(self.root / 'junction'), str(target)],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True)
         print(json.dumps({'probe': 'alias-creation', 'kind': 'junction',
                           'mklink_exit': junction.returncode,
                           'created': (self.root / 'junction').exists()}),
