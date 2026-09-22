@@ -5122,7 +5122,7 @@ class SubagentLaunchTests(unittest.TestCase):
             "runtime_config", "credential_authority", "job_manager"])
         old_argv = sys.argv[:]
 
-        async def scenario(tmpdir, parent_entrypoint):
+        async def in_process(tmpdir, parent_entrypoint):
             session = loki.current_session()
             session.credential_authority = (
                 authentications.CredentialBroker())
@@ -5138,14 +5138,52 @@ class SubagentLaunchTests(unittest.TestCase):
             return await loki.run_agent_async(
                 "recursive launch", "inspect this")
 
+        def headless(tmpdir):
+            # The terminal subagent re-proves containment, so on Windows it
+            # must be spawned from a real contained runtime, which only the
+            # headless entrypoint establishes.  The DUMMY provider emits one
+            # Agent tool call, and the resulting subagent's "ok" comes back in
+            # the final answer.
+            workspace = os.path.join(tmpdir, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+            env = child_environment(
+                HOME=tmpdir,
+                XDG_CONFIG_HOME=os.path.join(tmpdir, "config"),
+                XDG_STATE_HOME=os.path.join(tmpdir, "state"),
+                TERM="dumb",
+                LOKI_PROVIDER="dummy",
+                LOKI_API_BASE="http://dummy.invalid/v1",
+                LOKI_MODEL="dummy-model",
+                LOKI_DUMMY_REPLY="ok",
+                LOKI_DUMMY_TOOL_CALL=json.dumps({
+                    "name": "Agent",
+                    "arguments": {
+                        "description": "recursive launch",
+                        "prompt": "inspect this",
+                        "subagent_type": "Explore",
+                    },
+                }),
+            )
+            configure_container(env, workspace)
+            result = subprocess.run(
+                [entrypoint("loki"), "--headless", "--prompt",
+                 "inspect this"],
+                cwd=workspace, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ok", result.stdout)
+            self.assertNotIn("Error:", result.stdout)
+
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 for parent_entrypoint in ("loki", "loki-acp"):
                     with self.subTest(entrypoint=parent_entrypoint):
-                        result = asyncio.run(
-                            scenario(tmpdir, parent_entrypoint))
-                        self.assertNotIn("Error:", result)
-                        self.assertIn("ok", result)
+                        if os.name == "nt" and parent_entrypoint == "loki":
+                            headless(tmpdir)
+                        else:
+                            result = asyncio.run(
+                                in_process(tmpdir, parent_entrypoint))
+                            self.assertNotIn("Error:", result)
+                            self.assertIn("ok", result)
         finally:
             sys.argv = old_argv
             restore_loki_state(saved)
