@@ -908,6 +908,152 @@ def terminate_process(process, exit_code: int = 1) -> None:
         raise WindowsApiError("TerminateProcess failed")
 
 
+class Coord(ctypes.Structure):
+    """COORD: a console cell coordinate (x is columns, y is rows)."""
+
+    _fields_ = [("x", ctypes.c_int16), ("y", ctypes.c_int16)]
+
+
+def pseudoconsole_create(cols, rows, input_handle, output_handle):
+    """Create a pseudoconsole; return its ``HPCON`` handle.
+
+    ``input_handle`` is the read end of the host's input pipe (host writes
+    child input into the write end); ``output_handle`` is the write end of the
+    host's output pipe (host reads the rendered child output from the read
+    end).  The pseudoconsole keeps its own copies, so the caller must close
+    the ends it passed after the child is created.
+    """
+    create = bind("kernel32", "CreatePseudoConsole", ctypes.c_long,
+                  Coord, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                  ctypes.POINTER(ctypes.c_void_p))
+    hpc = ctypes.c_void_p()
+    status = create(Coord(cols, rows), input_handle, output_handle, 0,
+                    ctypes.byref(hpc))
+    if status < 0:
+        raise WindowsApiError(
+            "CreatePseudoConsole failed", status=status & 0xffffffff)
+    return hpc
+
+
+def pseudoconsole_resize(hpc, cols, rows) -> None:
+    """Resize the pseudoconsole; the child's console observes the new size."""
+    resize = bind("kernel32", "ResizePseudoConsole", ctypes.c_long,
+                  ctypes.c_void_p, Coord)
+    status = resize(hpc, Coord(cols, rows))
+    if status < 0:
+        raise WindowsApiError(
+            "ResizePseudoConsole failed", status=status & 0xffffffff)
+
+
+def pseudoconsole_close(hpc) -> None:
+    """Close the pseudoconsole.  The attached client must have exited first."""
+    bind("kernel32", "ClosePseudoConsole", None, ctypes.c_void_p)(hpc)
+
+
+def peek_named_pipe(handle) -> int:
+    """Bytes available to read on ``handle`` without consuming them, or 0."""
+    peek = bind("kernel32", "PeekNamedPipe", wintypes.BOOL,
+                ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD))
+    available = wintypes.DWORD()
+    if not peek(handle, None, 0, None, ctypes.byref(available), None):
+        return 0
+    return available.value
+
+
+def wait_for_single_object(handle, milliseconds: int) -> int:
+    """``WaitForSingleObject``: returns 0 when signalled, 258 on timeout."""
+    wait = bind("kernel32", "WaitForSingleObject", wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD)
+    return wait(handle, milliseconds)
+
+
+def get_exit_code_process(handle) -> int:
+    """``GetExitCodeProcess``; ``259`` means the process is still running."""
+    get = bind("kernel32", "GetExitCodeProcess", wintypes.BOOL,
+               ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
+    code = wintypes.DWORD()
+    if not get(handle, ctypes.byref(code)):
+        raise WindowsApiError("GetExitCodeProcess failed")
+    return code.value
+
+
+def create_process_with_pseudoconsole(executable, arguments, hpc, *,
+                                      environment=None,
+                                      current_directory=None):
+    """Create ``executable`` attached to the pseudoconsole ``hpc``.
+
+    A plain console child (no AppContainer): the pseudoconsole supplies the
+    child's standard handles.  ``STARTF_USESTDHANDLES`` with null handles is
+    set so ``CreateProcessW`` does not duplicate this process's redirected
+    handles into the child (microsoft/terminal discussion 15814).
+    """
+    initialize = bind("kernel32", "InitializeProcThreadAttributeList",
+                      wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD,
+                      wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t))
+    update = bind("kernel32", "UpdateProcThreadAttribute", wintypes.BOOL,
+                  ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t,
+                  ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                  ctypes.c_void_p)
+    delete = bind("kernel32", "DeleteProcThreadAttributeList", None,
+                  ctypes.c_void_p)
+    create = bind("kernel32", "CreateProcessW", wintypes.BOOL,
+                  wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
+                  ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
+                  ctypes.c_void_p, wintypes.LPCWSTR,
+                  ctypes.POINTER(StartupInfoEx),
+                  ctypes.POINTER(ProcessInformation))
+
+    size = ctypes.c_size_t()
+    # The sizing call is documented to fail with ERROR_INSUFFICIENT_BUFFER
+    # while filling in the required size; only a wrong error is a defect.
+    initialize(None, 1, 0, ctypes.byref(size))
+    if ctypes.get_last_error() != 122 or not size.value:
+        raise WindowsApiError("InitializeProcThreadAttributeList sizing failed")
+    storage = ctypes.create_string_buffer(size.value)
+    attributes = ctypes.cast(storage, ctypes.c_void_p)
+    initialized = False
+    try:
+        if not initialize(attributes, 1, 0, ctypes.byref(size)):
+            raise WindowsApiError("InitializeProcThreadAttributeList failed")
+        initialized = True
+        # The value is the HPCON itself, not its address (the documented call
+        # passes the handle, not a pointer to it).  hpc is already a c_void_p
+        # holding that handle, so it is passed as-is; re-wrapping it in
+        # c_void_p would try to convert a c_void_p into a pointer and fail.
+        if not update(attributes, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                      hpc, ctypes.sizeof(ctypes.c_void_p),
+                      None, None):
+            raise WindowsApiError(
+                "UpdateProcThreadAttribute(PSEUDOCONSOLE) failed")
+
+        startup = StartupInfoEx()
+        startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
+        startup.lpAttributeList = attributes
+        startup.StartupInfo.dwFlags = 0x100  # STARTF_USESTDHANDLES
+        # hStdInput/hStdOutput/hStdError stay NULL; the pseudoconsole supplies
+        # them, and null handles keep the compatibility path from duplicating
+        # the parent's redirected handles into the child.
+        information = ProcessInformation()
+        command_line = ctypes.create_unicode_buffer(
+            subprocess.list2cmdline([executable, *arguments]))
+        flags = EXTENDED_STARTUPINFO_PRESENT
+        block = environment_block(environment, current_directory)
+        if block is not None:
+            flags |= CREATE_UNICODE_ENVIRONMENT
+        if not create(executable, command_line, None, None, False, flags,
+                      block, current_directory, ctypes.byref(startup),
+                      ctypes.byref(information)):
+            raise WindowsApiError(
+                "CreateProcessW failed: "
+                f"{ctypes.get_last_error()}")
+        return information
+    finally:
+        if initialized:
+            delete(attributes)
+
+
 def _drive_of(path: str) -> str:
     """The ``X:`` drive of ``path``, or ``""``.
 
