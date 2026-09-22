@@ -1069,10 +1069,14 @@ if "--worker" in sys.argv:
                         self.assertFalse(report["value_present"])
                         self.assertTrue(report["after_present"])
                     if sys.platform.startswith("linux"):
-                        # Linux overwrites in place and covers the directory with a
-                        # tmpfs; both are Linux mechanisms.  The Windows isolation
-                        # evidence is the AppContainer gate exercised by
-                        # test_windows_runtime and test_runtime_gate.
+                        # Linux overwrites the credential record in place and
+                        # covers the directory with a tmpfs; both are Linux
+                        # mechanisms.  The tmpfs cover is containment, whose
+                        # Windows counterpart is the AppContainer gate exercised
+                        # by test_windows_runtime and test_runtime_gate.  The
+                        # in-place overwrite is a scrub-in-place detail: Windows
+                        # removes the record instead (see report_environment),
+                        # so it has no counterpart assertion here.
                         self.assertTrue(front_report["filler_present"])
                         self.assertTrue(front_report["after_follows_filler"])
                         self.assertFalse(worker_report["filler_present"])
