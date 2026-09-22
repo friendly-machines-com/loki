@@ -509,6 +509,24 @@ class PtyCliUsageTests(unittest.TestCase):
                 f"output captured: {output!r}")
         return exit_code, output
 
+    def _assert_usage_exits_before_overlay(self, cli_args, expected_exit):
+        # The usage path must return before initialize_terminal_overlay, so it
+        # cannot have entered TUI mode.  In-process with a mock, so it runs on
+        # every platform; the byte-level escape check is POSIX-only because the
+        # pty is transparent there, while ConPTY's pipe carries conhost's own
+        # frame regardless of what Loki wrote.
+        import asyncio
+        from unittest import mock
+
+        from loki_agent import terminal_frontend
+
+        with mock.patch.object(
+                terminal_frontend, "initialize_terminal_overlay") as overlay:
+            exit_code = asyncio.run(
+                terminal_frontend._run_frontend(list(cli_args)))
+        self.assertEqual(exit_code, expected_exit)
+        overlay.assert_not_called()
+
     def test_help_and_arg_errors_leave_terminal_untouched(self):
         # Invariants only: the expected exit code, help actually printing
         # something, a bad option being named back to the user, and not a
@@ -519,13 +537,15 @@ class PtyCliUsageTests(unittest.TestCase):
         ]
         for cli_args, expected_exit in cases:
             with self.subTest(args=cli_args):
+                self._assert_usage_exits_before_overlay(cli_args, expected_exit)
                 with tempfile.TemporaryDirectory() as cwd:
                     exit_code, output = self._run_cli(cwd, *cli_args)
                 self.assertEqual(exit_code, expected_exit)
-                self.assertNotIn(
-                    b"\x1b", output,
-                    "usage exits must not emit escape sequences; got: "
-                    f"{output!r}")
+                if sys.platform != "win32":
+                    self.assertNotIn(
+                        b"\x1b", output,
+                        "usage exits must not emit escape sequences; got: "
+                        f"{output!r}")
                 if expected_exit == 0:
                     self.assertTrue(output, "help printed nothing")
                 else:
@@ -536,13 +556,16 @@ class PtyCliUsageTests(unittest.TestCase):
 
     def test_argument_error_represents_supplied_terminal_controls(self):
         attack = "\x1b]777;LOKI_OPTION_ATTACK\x07"
+        self._assert_usage_exits_before_overlay(
+            ["--not-an-option-" + attack], 2)
         with tempfile.TemporaryDirectory() as cwd:
             exit_code, output = self._run_cli(
                 cwd, "--not-an-option-" + attack)
 
         self.assertEqual(exit_code, 2)
         self.assertNotIn(attack.encode(), output)
-        self.assertNotIn(b"\x1b", output)
+        if sys.platform != "win32":
+            self.assertNotIn(b"\x1b", output)
         self.assertIn(b"\\x1b", output)
 
 
