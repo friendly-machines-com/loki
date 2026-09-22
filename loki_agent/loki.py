@@ -3555,9 +3555,12 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
 
 def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
     source_environ = os.environ if environ is None else environ
+    # LOKI_DUMMY_TOOL_CALL makes the DUMMY provider emit a tool call instead of
+    # text; a subagent that inherited it would emit the same call and recurse,
+    # so it is the parent's test directive, never the subagent's.
     env = {
         name: value for name, value in source_environ.items()
-        if not is_credential_name(name)
+        if not is_credential_name(name) and name != "LOKI_DUMMY_TOOL_CALL"
     }
     # Subagents receive only non-secret provider configuration. The request
     # credential travels through a fresh capability socket, never through
@@ -5165,6 +5168,39 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
                                 "timed out waiting for "
                                 "LOKI_DUMMY_STREAM_GATE")
                         await asyncio.sleep(0.01)
+        # A test hook that makes the canned reply a tool call instead of text,
+        # so a test can drive the model/tool loop through a real tool execution
+        # with the DUMMY provider.  The value is a JSON object with a ``name``
+        # and an optional ``arguments`` object.  It fires only while the
+        # transcript contains no tool call yet, so the loop's follow-up model
+        # call gets the ordinary text reply instead of the call again.
+        tool_call_spec = os.environ.get("LOKI_DUMMY_TOOL_CALL")
+        if tool_call_spec and not formats.response_tool_calls(transcript_items):
+            try:
+                spec = json.loads(tool_call_spec)
+            except json.JSONDecodeError as error:
+                raise protocols.ProtocolError(
+                    f"LOKI_DUMMY_TOOL_CALL is invalid JSON: {error}"
+                ) from error
+            if (not isinstance(spec, dict)
+                    or not isinstance(spec.get("name"), str)):
+                raise protocols.ProtocolError(
+                    "LOKI_DUMMY_TOOL_CALL must be an object with a "
+                    "string 'name'")
+            arguments = spec.get("arguments", {})
+            if not isinstance(arguments, dict):
+                raise protocols.ProtocolError(
+                    "LOKI_DUMMY_TOOL_CALL 'arguments' must be an object")
+            return formats.DecodedTurn(
+                [formats.tool_call_item(
+                    "dummy-tool-call", spec["name"], arguments)],
+                {
+                    "protocol": "dummy",
+                    "provider_id": "dummy",
+                    "model": current_model(),
+                    "response": {},
+                },
+            )
         return formats.DecodedTurn(
             [formats.message_item("assistant", reply)],
             {
