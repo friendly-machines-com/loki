@@ -9,28 +9,20 @@ import json
 import os
 import pathlib
 import re
-import select
 import shutil
-import signal
-import struct
 import sys
 import tempfile
 import time
 import unittest
 
-if sys.platform != "win32":
-    import fcntl
-    import pty
-    import termios
-else:
-    # The whole module drives a real pty; without one there is nothing to run.
-    fcntl = None
-    pty = None
-    termios = None
-
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-LOKI = ROOT / "loki.py"
+# The ``--pty-child`` process runs this file as a script with the tests
+# directory as ``sys.path[0]``; make the package importable there too.
+sys.path.insert(0, str(ROOT))
+
+from loki_agent import pty_backend  # noqa: E402
+from loki_entrypoints import (child_environment, configure_container,  # noqa: E402
+                              entrypoint)
 
 REPLY = "**boldword** and `codeword` done"
 BOLD_RUN = b"\x1b[1mboldword\x1b[0m"
@@ -174,27 +166,17 @@ class _SgrStreamTracker:
             start = k + 1
 
 
-def _set_size(fd):
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-
-
-def _read_with_timeout(master, total=4.0):
+def _read_with_timeout(handle, total=4.0):
     """Drain the pty; reset the deadline on each arriving chunk."""
     buf = b""
     deadline = time.time() + total
     while time.time() < deadline:
         remaining = max(0.05, deadline - time.time())
-        r, _, _ = select.select([master], [], [], min(0.2, remaining))
-        if not r:
+        chunk = handle.read(65536, min(0.2, remaining))
+        if not chunk:
             if buf:
                 break  # quiesced
             continue
-        try:
-            chunk = os.read(master, 65536)
-        except OSError:
-            break
-        if not chunk:
-            break
         buf += chunk
         deadline = time.time() + 0.5
     return buf
@@ -217,73 +199,50 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
     if raw_file_data is not None:
         pathlib.Path(tmpdir, "attack.bin").write_bytes(raw_file_data)
     gate = os.path.join(tmpdir, "release-stream") if stream_chunks else None
-    pid, master = pty.fork()
-    if pid == 0:  # child: real tty on stdin/stdout, hermetic dirs
-        try:
-            _set_size(0)
-            os.chdir(tmpdir)
-            env = {
-                "HOME": tmpdir,
-                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
-                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
-                "PATH": os.environ.get("PATH", ""),
-                "TERM": "xterm",
-                "LOKI_PROVIDER": "dummy",
-                "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_DUMMY_REPLY": (
-                    "".join(stream_chunks) if stream_chunks
-                    else REPLY if reply is None else reply),
-                "LOKI_STREAM": "1" if stream else "0",
-            }
-            if stream_chunks:
-                env["LOKI_DUMMY_STREAM_CHUNKS"] = json.dumps(stream_chunks)
-                env["LOKI_DUMMY_STREAM_GATE"] = gate
-            os.execve(str(LOKI), [str(LOKI)], env)
-        except Exception:
-            pass
-        os._exit(127)
+    env = {
+        "HOME": tmpdir,
+        "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
+        "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+        "PATH": os.environ.get("PATH", ""),
+        "TERM": "xterm",
+        "LOKI_PROVIDER": "dummy",
+        "LOKI_API_BASE": "http://dummy.invalid/v1",
+        "LOKI_DUMMY_REPLY": (
+            "".join(stream_chunks) if stream_chunks
+            else REPLY if reply is None else reply),
+        "LOKI_STREAM": "1" if stream else "0",
+    }
+    if stream_chunks:
+        env["LOKI_DUMMY_STREAM_CHUNKS"] = json.dumps(stream_chunks)
+        env["LOKI_DUMMY_STREAM_GATE"] = gate
+    env = child_environment(**env)
+    configure_container(env, tmpdir)
+    handle = pty_backend.spawn_pty(
+        [entrypoint("loki")], env=env, cwd=tmpdir)
 
     collected = b""
     before_stream_release = b""
     try:
-        _set_size(master)
-        collected += _read_with_timeout(master, 6.0)  # startup banner
+        collected += _read_with_timeout(handle, 6.0)  # startup banner
 
-        os.write(master, initial_input + b"\r")
-        reply_output = _read_with_timeout(master, 4.0)
+        handle.write(initial_input + b"\r")
+        reply_output = _read_with_timeout(handle, 4.0)
         collected += reply_output
         if gate:
             before_stream_release = reply_output
             for queued_input in queued_inputs or []:
-                os.write(master, queued_input.encode() + b"\r")
-                queued_output = _read_with_timeout(master, 2.0)
+                handle.write(queued_input.encode() + b"\r")
+                queued_output = _read_with_timeout(handle, 2.0)
                 collected += queued_output
                 before_stream_release += queued_output
             pathlib.Path(gate).touch()
-            collected += _read_with_timeout(master, 4.0)
+            collected += _read_with_timeout(handle, 4.0)
 
-        os.write(master, b"/quit\r")
-        collected += _read_with_timeout(master, 2.0)
-        for _ in range(40):
-            try:
-                done_pid, status = os.waitpid(pid, os.WNOHANG)
-            except OSError:
-                break
-            if done_pid:
-                break
-            time.sleep(0.1)
+        handle.write(b"/quit\r")
+        collected += _read_with_timeout(handle, 2.0)
     finally:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.kill(pid, sig)
-            except OSError:
-                break
-            time.sleep(0.2)
-        try:
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
-        os.close(master)
+        handle.terminate()
+        handle.close()
         shutil.rmtree(tmpdir, ignore_errors=True)
     return collected, before_stream_release
 
@@ -456,53 +415,30 @@ class PtyCliUsageTests(unittest.TestCase):
     """
 
     def _run_cli(self, cwd, *cli_args):
-        pid, master = pty.fork()
-        if pid == 0:  # child: pty on stdin/stdout, hermetic dirs
-            try:
-                _set_size(0)
-                os.chdir(cwd)
-                env = {
-                    "HOME": cwd,
-                    "XDG_CONFIG_HOME": os.path.join(cwd, "config"),
-                    "XDG_STATE_HOME": os.path.join(cwd, "state"),
-                    "PATH": os.environ.get("PATH", ""),
-                    "TERM": "xterm",
-                }
-                os.execve(
-                    str(LOKI), [str(LOKI), *cli_args], env)
-            except Exception:
-                pass
-            os._exit(127)
+        env = child_environment(
+            HOME=cwd,
+            XDG_CONFIG_HOME=os.path.join(cwd, "config"),
+            XDG_STATE_HOME=os.path.join(cwd, "state"),
+            PATH=os.environ.get("PATH", ""),
+            TERM="xterm",
+        )
+        configure_container(env, cwd)
+        handle = pty_backend.spawn_pty(
+            [entrypoint("loki"), *cli_args], env=env, cwd=cwd)
         output = b""
         exit_code = None
         try:
-            _set_size(master)
-            output = _read_with_timeout(master, 4.0)
-            status = None
+            output = _read_with_timeout(handle, 4.0)
             # Bounded wait: a usage-path regression that waits for input
             # instead of exiting must FAIL the test, not hang the suite.
             for _ in range(50):  # up to 5s
-                try:
-                    done_pid, status = os.waitpid(pid, os.WNOHANG)
-                except OSError:
-                    break
-                if done_pid:
+                exit_code = handle.poll()
+                if exit_code is not None:
                     break
                 time.sleep(0.1)
-            if status is not None:
-                exit_code = os.waitstatus_to_exitcode(status)
         finally:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.kill(pid, sig)
-                except OSError:
-                    break
-                time.sleep(0.2)
-            try:
-                os.waitpid(pid, 0)
-            except OSError:
-                pass
-            os.close(master)
+            handle.terminate()
+            handle.close()
         if exit_code is None:
             self.fail(
                 f"loki{tuple(cli_args)!r} never exited on the usage path; "
@@ -569,6 +505,84 @@ class PtyCliUsageTests(unittest.TestCase):
         self.assertIn(b"\\x1b", output)
 
 
+def _pty_child(argv):
+    """Entrypoint the Ctrl+C tests spawn on the pty.
+
+    Modes: ``isig`` reports whether interrupt processing is enabled before and
+    after ``TerminalMode``; ``cancel-flag`` / ``cancel-event`` read one key and
+    report whether it set ``cancel_requested`` / ``cancel_event``.
+    """
+    import asyncio
+
+    sys.path.insert(0, str(ROOT))
+    from loki_agent import terminals as _terminals
+
+    mode = argv[0]
+
+    if mode == "isig":
+        tmode = _terminals.TerminalMode(0, enabled=True)
+        tmode.__enter__()
+        sys.stdout.buffer.write(
+            b"ISIG_SET\n"
+            if _terminals.interrupt_processing_enabled(0)
+            else b"ISIG_CLEAR\n")
+        sys.stdout.buffer.flush()
+        tmode.__exit__(None, None, None)
+        sys.stdout.buffer.write(
+            b"RESTORED_ISIG_SET\n"
+            if _terminals.interrupt_processing_enabled(0)
+            else b"RESTORED_ISIG_CLEAR\n")
+        sys.stdout.buffer.flush()
+        time.sleep(0.5)
+        return 0
+
+    async def read_cancel(clear_event):
+        tmode = _terminals.TerminalMode(0, enabled=True)
+        tmode.__enter__()
+        reader = _terminals.AsyncKeyReader(0)
+        key_kind = None
+        async with reader:
+            if clear_event:
+                reader.cancel_event.clear()
+            try:
+                key = await asyncio.wait_for(reader.read_key(), timeout=3.0)
+                key_kind = key.kind
+            except asyncio.TimeoutError:
+                pass
+        tmode.__exit__(None, None, None)
+        return reader, key_kind
+
+    if mode == "cancel-flag":
+        async def main():
+            reader, key_kind = await read_cancel(False)
+            if reader.cancel_requested and key_kind == "CTRL_C":
+                sys.stdout.buffer.write(b"CANCEL_SET\n")
+            else:
+                sys.stdout.buffer.write(
+                    f"CANCEL_NOT_SET key={key_kind}\n".encode())
+            sys.stdout.buffer.write(
+                b"CANCEL_SET\n" if reader.cancel_requested
+                else b"CANCEL_NOT_SET\n")
+            sys.stdout.buffer.flush()
+            time.sleep(0.3)
+        asyncio.run(main())
+        return 0
+
+    if mode == "cancel-event":
+        async def main():
+            reader, key_kind = await read_cancel(True)
+            if key_kind == "CTRL_C" and reader.cancel_event.is_set():
+                sys.stdout.buffer.write(b"EVENT_SET\n")
+            else:
+                sys.stdout.buffer.write(b"EVENT_NOT_SET\n")
+            sys.stdout.buffer.flush()
+            time.sleep(0.2)
+        asyncio.run(main())
+        return 0
+
+    raise SystemExit(f"unknown pty-child mode: {mode!r}")
+
+
 class PtyCtrlCTests(unittest.TestCase):
     """Ctrl+C must reach the reader as byte 0x03, not become SIGINT.
 
@@ -579,42 +593,19 @@ class PtyCtrlCTests(unittest.TestCase):
     ISIG-clearing behavior of TerminalMode end to end.
     """
 
-    def test_terminal_mode_clears_isig(self):
-        # Direct: enter TerminalMode on a fresh pty and inspect lflag bits.
-        pid, master = pty.fork()
-        if pid == 0:
-            # Child: never returns from this block.
-            try:
-                import sys as _sys
-                import termios as _termios
-                import time as _time
-                from loki_agent import terminals as _terminals
+    def _spawn_child(self, mode):
+        return pty_backend.spawn_pty(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--pty-child", mode])
 
-                mode = _terminals.TerminalMode(0, enabled=True)
-                mode.__enter__()
-                attrs = _termios.tcgetattr(0)
-                _sys.stdout.buffer.write(
-                    b"ISIG_SET\n" if attrs[3] & _termios.ISIG
-                    else b"ISIG_CLEAR\n")
-                _sys.stdout.buffer.flush()
-                mode.__exit__(None, None, None)
-                attrs = _termios.tcgetattr(0)
-                _sys.stdout.buffer.write(
-                    b"RESTORED_ISIG_SET\n" if attrs[3] & _termios.ISIG
-                    else b"RESTORED_ISIG_CLEAR\n")
-                _sys.stdout.buffer.flush()
-                _time.sleep(0.5)
-            except Exception:
-                pass
-            os._exit(0)
+    def test_terminal_mode_clears_isig(self):
+        # Direct: enter TerminalMode on a fresh pty and inspect the flag.
+        handle = self._spawn_child("isig")
         try:
-            out = _read_with_timeout(master, 4.0)
+            out = _read_with_timeout(handle, 4.0)
         finally:
-            try:
-                os.waitpid(pid, 0)
-            except OSError:
-                pass
-            os.close(master)
+            handle.terminate()
+            handle.close()
         self.assertIn(b"ISIG_CLEAR", out)
         self.assertNotIn(b"ISIG_SET\n", out.replace(b"ISIG_CLEAR", b""))
         self.assertIn(b"RESTORED_ISIG_SET", out)
@@ -622,55 +613,14 @@ class PtyCtrlCTests(unittest.TestCase):
     def test_ctrl_c_sets_cancel_flag_in_reader(self):
         # End to end: with ISIG clear, a 0x03 byte written to the pty is
         # seen by AsyncKeyReader as CTRL_C and sets cancel_requested.
-        pid, master = pty.fork()
-        if pid == 0:
-            try:
-                import sys as _sys
-                import asyncio as _asyncio
-                import time as _time
-                from loki_agent import terminals as _terminals
-
-                async def _main():
-                    mode = _terminals.TerminalMode(0, enabled=True)
-                    mode.__enter__()
-                    reader = _terminals.AsyncKeyReader(0)
-                    key_kind = None
-                    async with reader:
-                        # Drive the reader the way the real loop does; the
-                        # flag is set inside read_key's parse, not by the
-                        # byte arriving alone.
-                        try:
-                            key = await _asyncio.wait_for(
-                                reader.read_key(), timeout=3.0)
-                            key_kind = key.kind
-                        except _asyncio.TimeoutError:
-                            pass
-                    mode.__exit__(None, None, None)
-                    if reader.cancel_requested and key_kind == "CTRL_C":
-                        _sys.stdout.buffer.write(b"CANCEL_SET\n")
-                    else:
-                        _sys.stdout.buffer.write(
-                            f"CANCEL_NOT_SET key={key_kind}\n".encode())
-                    _sys.stdout.buffer.write(
-                        b"CANCEL_SET\n" if reader.cancel_requested
-                        else b"CANCEL_NOT_SET\n")
-                    _sys.stdout.buffer.flush()
-                    _time.sleep(0.3)
-                _asyncio.run(_main())
-            except Exception:
-                pass
-            os._exit(0)
+        handle = self._spawn_child("cancel-flag")
         try:
-            _set_size(master)
-            _read_with_timeout(master, 1.0)  # let child reach its wait
-            os.write(master, b"\x03")
-            out = _read_with_timeout(master, 4.0)
+            _read_with_timeout(handle, 1.0)  # let child reach its wait
+            handle.write(b"\x03")
+            out = _read_with_timeout(handle, 4.0)
         finally:
-            try:
-                os.waitpid(pid, 0)
-            except OSError:
-                pass
-            os.close(master)
+            handle.terminate()
+            handle.close()
         self.assertIn(b"CANCEL_SET", out)
         self.assertNotIn(b"CANCEL_NOT_SET", out)
 
@@ -684,53 +634,21 @@ class PtyTurnCancelTests(unittest.TestCase):
     """
 
     def test_ctrl_c_sets_reader_event_after_read_key(self):
-        pid, master = pty.fork()
-        if pid == 0:
-            try:
-                import sys as _sys
-                import asyncio as _asyncio
-                import time as _time
-                from loki_agent import terminals as _terminals
-
-                async def _main():
-                    mode = _terminals.TerminalMode(0, enabled=True)
-                    mode.__enter__()
-                    reader = _terminals.AsyncKeyReader(0)
-                    key_kind = None
-                    async with reader:
-                        reader.cancel_event.clear()
-                        try:
-                            key = await _asyncio.wait_for(
-                                reader.read_key(), timeout=3.0)
-                            key_kind = key.kind
-                        except _asyncio.TimeoutError:
-                            pass
-                    mode.__exit__(None, None, None)
-                    if (key_kind == "CTRL_C"
-                            and reader.cancel_event.is_set()):
-                        _sys.stdout.buffer.write(b"EVENT_SET\n")
-                    else:
-                        _sys.stdout.buffer.write(b"EVENT_NOT_SET\n")
-                    _sys.stdout.buffer.flush()
-                    _time.sleep(0.2)
-                _asyncio.run(_main())
-            except Exception:
-                pass
-            os._exit(0)
+        handle = pty_backend.spawn_pty(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--pty-child", "cancel-event"])
         try:
-            _set_size(master)
-            _read_with_timeout(master, 1.0)
-            os.write(master, b"\x03")
-            out = _read_with_timeout(master, 4.0)
+            _read_with_timeout(handle, 1.0)
+            handle.write(b"\x03")
+            out = _read_with_timeout(handle, 4.0)
         finally:
-            try:
-                os.waitpid(pid, 0)
-            except OSError:
-                pass
-            os.close(master)
+            handle.terminate()
+            handle.close()
         self.assertIn(b"EVENT_SET", out)
         self.assertNotIn(b"EVENT_NOT_SET", out)
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--pty-child"]:
+        raise SystemExit(_pty_child(sys.argv[2:]))
     unittest.main()
