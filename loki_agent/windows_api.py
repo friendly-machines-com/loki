@@ -658,6 +658,7 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 # Process creation flags, from
 # https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
 CREATE_SUSPENDED = 0x00000004
+CREATE_UNICODE_ENVIRONMENT = 0x00000400
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 
 # PROC_THREAD_ATTRIBUTE_* (winbase.h).  The names map to these values, not to
@@ -918,6 +919,42 @@ def _drive_of(path: str) -> str:
     return ""
 
 
+def environment_block(environment: dict, current_directory=None):
+    """Encode ``environment`` as the Unicode block ``CreateProcessW`` accepts.
+
+    The supplied block replaces the inherited one, and Windows does not
+    propagate the per-drive current-directory entries into it; a block that
+    omits the entry for the drive holding the child's current directory is
+    rejected with ``ERROR_ENVVAR_NOT_FOUND`` (203).  Carry over any the parent
+    already holds, set the child's own directory for its drive, and sort the
+    whole block (the system expects a sorted environment; '=' sorts before
+    letters, so the drive entries come first on their own).
+
+    Returns a ``ctypes`` unicode buffer ready for ``lpEnvironment``, or
+    ``None`` if ``environment`` is ``None``.
+    """
+    if environment is None:
+        return None
+    entries = {}
+    for entry in drive_environment_entries():
+        name = entry.split("=", 2)[1]
+        entries[name] = entry
+    if current_directory:
+        drive = _drive_of(current_directory)
+        if drive:
+            entries[drive] = f"={drive}={current_directory}"
+    for key, value in environment.items():
+        if not key or '=' in key or '\0' in key or '\0' in value:
+            raise ValueError("invalid child environment entry")
+        entries[key] = f"{key}={value}"
+    # Sort the full entries, not the keys: the per-drive entries begin
+    # with '=' (0x3d), which sorts before every letter, so they come
+    # first on their own.  Sorting the keys would place "C:" among the
+    # ordinary "C..." names and misorder the block.
+    ordered = sorted(entries.values(), key=str.upper)
+    return ctypes.create_unicode_buffer('\0'.join(ordered) + '\0\0')
+
+
 def drive_environment_entries() -> list:
     """The ``=X:=...`` per-drive current-directory entries of this process.
 
@@ -1057,38 +1094,11 @@ def create_process_in_app_container(executable, arguments, package_sid,
         command_line = ctypes.create_unicode_buffer(
             subprocess.list2cmdline([executable, *arguments]))
         flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT
-        environment_block = None
-        if environment is not None:
-            # The supplied block replaces the inherited one, and Windows does
-            # not propagate the per-drive current-directory entries into it; a
-            # block that omits the entry for the drive holding the child's
-            # current directory is rejected with ERROR_ENVVAR_NOT_FOUND (203).
-            # Carry over any the parent already holds, set the child's own
-            # directory for its drive, and sort the whole block by name (the
-            # system expects a sorted environment; '=' sorts before letters,
-            # so the drive entries come first on their own).
-            entries = {}
-            for entry in drive_environment_entries():
-                name = entry.split("=", 2)[1]
-                entries[name] = entry
-            if current_directory:
-                drive = _drive_of(current_directory)
-                if drive:
-                    entries[drive] = f"={drive}={current_directory}"
-            for key, value in environment.items():
-                if not key or '=' in key or '\0' in key or '\0' in value:
-                    raise ValueError("invalid child environment entry")
-                entries[key] = f"{key}={value}"
-            # Sort the full entries, not the keys: the per-drive entries begin
-            # with '=' (0x3d), which sorts before every letter, so they come
-            # first on their own.  Sorting the keys would place "C:" among the
-            # ordinary "C..." names and misorder the block.
-            ordered = sorted(entries.values(), key=str.upper)
-            environment_block = ctypes.create_unicode_buffer(
-                '\0'.join(ordered) + '\0\0')
-            flags |= 0x400  # CREATE_UNICODE_ENVIRONMENT
+        block = environment_block(environment, current_directory)
+        if block is not None:
+            flags |= CREATE_UNICODE_ENVIRONMENT
         if not create(executable, command_line, None, None,
-                      bool(inherited_handles), flags, environment_block,
+                      bool(inherited_handles), flags, block,
                       current_directory, ctypes.byref(startup),
                       ctypes.byref(information)):
             raise WindowsApiError(
