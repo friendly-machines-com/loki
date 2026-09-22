@@ -84,14 +84,15 @@ if sys.platform == "win32":
         """Windows-only entrypoint checks; ``None`` means continue."""
         import getopt
 
-        from .terminal_frontend import USAGE, parse_cli_args
+        from .terminal_frontend import USAGE, _print_repr_line, parse_cli_args
 
         try:
             options, positional = parse_cli_args(arguments)
             if positional:
                 raise getopt.GetoptError("unexpected positional arguments")
         except getopt.GetoptError as error:
-            print(f"loki: {error}\n{USAGE}", file=sys.stderr)
+            _print_repr_line("loki: ", str(error), file=sys.stderr)
+            print(USAGE, end='', file=sys.stderr)
             return 2
         if any(name in ("-h", "--help") for name, _ in options):
             print(USAGE, end="")
