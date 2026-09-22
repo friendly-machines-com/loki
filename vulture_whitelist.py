@@ -35,6 +35,9 @@ _.message_count
 _.retained_characters
 _.has_custom_hooks
 _._mode
+# The Ctrl+C tests assert through this seam that TerminalMode really cleared
+# interrupt processing; production has no caller, only test_pty_ui does.
+interrupt_processing_enabled
 # The field partition is asserted against the dataclass by
 # tests/test_connections.py rather than read by production code.
 DISPLAYED_CONNECTION_FIELDS

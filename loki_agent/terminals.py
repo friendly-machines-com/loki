@@ -895,6 +895,23 @@ def _control_character_byte(value):
     return byte
 
 
+def interrupt_processing_enabled(fd: int) -> bool:
+    """Whether the terminal converts Ctrl+C into a signal before the reader.
+
+    POSIX calls it ``ISIG``; Windows calls it ``ENABLE_PROCESSED_INPUT``.  With
+    it set, a Ctrl+C never reaches the byte reader, so ``cancel_requested``
+    cannot fire between tool calls.  ``TerminalMode`` clears it on both
+    platforms.
+    """
+    if os.name != "posix":
+        return host_terminal_windows.processed_input_enabled(fd)
+    try:
+        attrs = termios.tcgetattr(fd)
+    except (termios.error, OSError, TypeError, ValueError):
+        return False
+    return bool(attrs[3] & termios.ISIG)
+
+
 def terminal_control_bytes(fd: int):
     """Return configured character-erase, word-erase, and interrupt bytes."""
     if os.name != "posix":

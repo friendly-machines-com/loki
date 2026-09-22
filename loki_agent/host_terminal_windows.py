@@ -139,3 +139,13 @@ def control_bytes(fallbacks):
     query, so the caller's documented defaults stand.
     """
     return fallbacks
+
+
+def processed_input_enabled(fd: int) -> bool:
+    """Whether ``ENABLE_PROCESSED_INPUT`` is set on ``fd``'s console.
+
+    This is the Windows analogue of POSIX ``ISIG``: with the flag set, Ctrl+C
+    becomes a ``CTRL_C_EVENT`` before the byte reaches a reader; with it clear
+    the byte arrives as ``0x03``.  ``RawMode`` clears it.
+    """
+    return bool(_console_mode(_handle(fd)) & ENABLE_PROCESSED_INPUT)
