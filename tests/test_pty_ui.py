@@ -1,8 +1,10 @@
 """End-to-end UI test: run the real loki_agent TUI under a pty with the
 dummy provider (no network) and assert on what the terminal actually shows.
 
-The assertions check the SGR runs (bold / cyan) as raw byte substrings of
-what was written to the tty.
+The assertions parse the byte stream and check what the escapes *mean* --
+which text was emitted bold, which was emitted cyan, whether any OSC-777
+control sequence was emitted -- rather than matching exact escape bytes,
+because a ConPTY pipe rewrites SGR spellings while preserving their meaning.
 """
 
 import json
@@ -25,8 +27,6 @@ from loki_entrypoints import (child_environment, configure_container,  # noqa: E
                               entrypoint)
 
 REPLY = "**boldword** and `codeword` done"
-BOLD_RUN = b"\x1b[1mboldword\x1b[0m"
-CODE_RUN = b"\x1b[36mcodeword\x1b[0m"
 
 
 class _SgrStreamTracker:
@@ -50,6 +50,7 @@ class _SgrStreamTracker:
         self.text = []      # printable characters, in emission order
         self.states = []    # (bold, fg) per character
         self.unterminated = 0
+        self.osc_payloads = []  # decoded OSC payloads, in emission order
 
     # -- SGR -----------------------------------------------------------
 
@@ -107,12 +108,19 @@ class _SgrStreamTracker:
             j = i + 2
             while j < n:
                 if data[j] == 0x07:                      # BEL terminator
-                    return j + 1
+                    end = j + 1
+                    break
                 if data[j] == 0x1B and j + 1 < n and data[j + 1] == 0x5C:
-                    return j + 2                          # ST terminator
+                    end = j + 2                          # ST terminator
+                    break
                 j += 1
-            self.unterminated += 1
-            return n
+            else:
+                self.unterminated += 1
+                return n
+            if c == 0x5D:  # OSC: keep the payload for the control-sequence check
+                self.osc_payloads.append(
+                    data[i + 2:j].decode("ascii", "replace"))
+            return end
         j = i + 1
         while j < n and 0x20 <= data[j] <= 0x2F:  # charset/intermediates
             j += 1
@@ -164,6 +172,18 @@ class _SgrStreamTracker:
             if ok:
                 return True
             start = k + 1
+
+    def osc_param_emitted(self, first_param: str) -> bool:
+        """True if any recorded OSC payload's first parameter is `first_param`.
+
+        An OSC payload is the bytes between the ``ESC ]`` introducer and its
+        terminator; the first parameter is everything before the first ``;``
+        (or the whole payload when there is no separator).
+        """
+        for payload in self.osc_payloads:
+            if payload.split(";", 1)[0] == first_param:
+                return True
+        return False
 
 
 def _read_with_timeout(handle, total=4.0):
@@ -252,9 +272,18 @@ class PtyUiTests(unittest.TestCase):
     def _assert_styled_output(self, output):
         # The reply must be styled, i.e. the SGR runs around the words are
         # actually written to the tty. This is the assertion the old
-        # streaming path could not pass: it printed raw markdown.
-        self.assertIn(BOLD_RUN, output)
-        self.assertIn(CODE_RUN, output)
+        # streaming path could not pass: it printed raw markdown. Asserted
+        # semantically (was this text emitted with bold / cyan active?)
+        # rather than as exact escape bytes, because a ConPTY pipe rewrites
+        # SGR spellings while preserving their meaning.
+        tracker = _SgrStreamTracker()
+        tracker.feed(output)
+        self.assertTrue(
+            tracker.printed_with("boldword", bold=True),
+            "boldword was never emitted with bold active")
+        self.assertTrue(
+            tracker.printed_with("codeword", fg="cyan"),
+            "codeword was never emitted with cyan foreground")
 
     def test_batch_reply_is_styled_on_tty(self):
         output, _before_release = run_loki_pty_reply(stream=False)
@@ -277,9 +306,15 @@ class PtyUiTests(unittest.TestCase):
         )
 
         for output in [batch, streamed]:
-            self.assertNotIn(attack.encode(), output)
+            tracker = _SgrStreamTracker()
+            tracker.feed(output)
             self.assertIn(visible, output)
-            self.assertIn(BOLD_RUN, output)
+            self.assertFalse(
+                tracker.osc_param_emitted("777"),
+                "the OSC-777 model control must be escaped, not executed")
+            self.assertTrue(
+                tracker.printed_with("boldword", bold=True),
+                "boldword was never emitted with bold active")
 
     def test_pasted_terminal_controls_are_displayed_not_executed(self):
         attack = b"\x1b]777;LOKI_INPUT_ATTACK\x07"
@@ -292,11 +327,15 @@ class PtyUiTests(unittest.TestCase):
         output, _before_release = run_loki_pty_reply(
             stream=False, initial_input=pasted)
 
-        self.assertNotIn(attack, output)
+        tracker = _SgrStreamTracker()
+        tracker.feed(output)
         self.assertIn(
             b"first^[]777;LOKI_INPUT_ATTACK^G^I\r\nnext",
             output,
         )
+        self.assertFalse(
+            tracker.osc_param_emitted("777"),
+            "the pasted OSC-777 control must be displayed, not executed")
 
     def test_explicit_bang_command_output_is_terminal_safe(self):
         attack = b"\x1b]777;LOKI_COMMAND_OUTPUT\x07"
@@ -307,8 +346,12 @@ class PtyUiTests(unittest.TestCase):
             raw_file_data=attack,
         )
 
-        self.assertNotIn(attack, output)
+        tracker = _SgrStreamTracker()
+        tracker.feed(output)
         self.assertIn(b"^[]777;LOKI_COMMAND_OUTPUT^G", output)
+        self.assertFalse(
+            tracker.osc_param_emitted("777"),
+            "the bang-command OSC-777 output must be escaped, not executed")
 
     def test_status_bar_shows_api_and_mode(self):
         # Regression for the frontend split dropping the status text
