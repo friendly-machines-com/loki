@@ -12,6 +12,7 @@ import asyncio
 import getopt
 import os
 import sys
+import uuid
 from dataclasses import dataclass
 
 from . import credential_capabilities
@@ -29,6 +30,8 @@ Options:
   -p, --prompt TEXT       prompt text (default: read stdin)
       --shell-cwd PATH    logical working directory inherited from the owner
       --subagent-depth N  delegated generation, starting at 1
+      --root-conversation-id UUID
+                          persistent root conversation of the agent tree
       --session-owner-fd FD
                           owner-lifetime descriptor
       --credential-capability-fd FD
@@ -50,6 +53,7 @@ class SubagentOptions:
     prompt: str | None = None
     shell_cwd: str | None = None
     subagent_depth: int | None = None
+    root_conversation_id: str | None = None
     session_owner_fd: int | None = None
     credential_capability_fd: int | None = None
     help: bool = False
@@ -99,6 +103,7 @@ def parse_args(args) -> SubagentOptions:
             "prompt=",
             "shell-cwd=",
             "subagent-depth=",
+            "root-conversation-id=",
             "session-owner-fd=",
             "credential-capability-fd=",
             "help",
@@ -112,6 +117,7 @@ def parse_args(args) -> SubagentOptions:
         "prompt": None,
         "shell_cwd": None,
         "subagent_depth": None,
+        "root_conversation_id": None,
         "session_owner_fd": None,
         "credential_capability_fd": None,
         "help": False,
@@ -123,6 +129,8 @@ def parse_args(args) -> SubagentOptions:
             values["shell_cwd"] = option_value
         elif option_name == "--subagent-depth":
             values["subagent_depth"] = _subagent_depth(option_value)
+        elif option_name == "--root-conversation-id":
+            values["root_conversation_id"] = str(uuid.UUID(option_value))
         elif option_name == "--session-owner-fd":
             values["session_owner_fd"] = _descriptor(
                 option_value, "session owner")
@@ -204,11 +212,13 @@ async def async_main(args) -> int:
     owner_fd = options.session_owner_fd
     capability_fd = options.credential_capability_fd
     depth = options.subagent_depth
-    if owner_fd is None or capability_fd is None or depth is None:
+    if (owner_fd is None or capability_fd is None or depth is None
+            or options.root_conversation_id is None):
         _close_descriptors(options)
         print(
             "Configuration error: subagent runtimes require a delegated "
-            "depth plus both the session owner and credential capability "
+            "depth and root conversation ID plus both the session owner "
+            "and credential capability "
             "descriptors.",
             file=sys.stderr,
         )
@@ -217,7 +227,9 @@ async def async_main(args) -> int:
     runtime = None
     session = _core.current_session()
     previous_depth = session.subagent_depth
+    previous_root = session.delegated_root_conversation_id
     session.subagent_depth = depth
+    session.delegated_root_conversation_id = options.root_conversation_id
     try:
         try:
             runtime = await credential_runtimes.CredentialRuntime.connect(
@@ -281,6 +293,7 @@ async def async_main(args) -> int:
         return 0 if completed else 1
     finally:
         session.subagent_depth = previous_depth
+        session.delegated_root_conversation_id = previous_root
         try:
             await session.response_headers.save_on_exit()
         finally:

@@ -78,6 +78,12 @@ class Session:
     agent_mode: str = "normal"
     last_instructed_agent_mode: str | None = None
 
+    # Only internal subagents inherit an agent-tree identity. Roots derive it
+    # from conversation_id, so new/load operations follow persistent chat
+    # identity rather than process lifetime. Subagents are not resumable and
+    # receive this non-secret ID explicitly from their owner, not saved logs.
+    delegated_root_conversation_id: str | None = None
+
     # Delegation depth is runtime ownership state, not transcript state. Root
     # terminal and ACP sessions start at zero; an internal subagent entrypoint
     # installs the explicit depth delegated by its parent.
@@ -91,6 +97,10 @@ class Session:
             self.shell_cwd = os.getcwd()
         if not self.previous_shell_cwd:
             self.previous_shell_cwd = self.shell_cwd
+
+    @property
+    def root_conversation_id(self) -> str:
+        return self.delegated_root_conversation_id or self.conversation_id
 
     @property
     def model(self) -> str:

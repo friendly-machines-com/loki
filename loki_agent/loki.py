@@ -3672,6 +3672,8 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
         agent_type,
         '--subagent-depth',
         str(depth + 1),
+        '--root-conversation-id',
+        current_session().root_conversation_id,
         '--prompt',
         prompt,
         '--shell-cwd',
@@ -4588,6 +4590,21 @@ def _codex_turn_state_for_request(
     return CodexTurnState()
 
 
+def _prepare_codex_session_headers(headers, session):
+    # Codex 0.144.1 uses persistent agent-tree identity for session-id, and
+    # individual thread identity for both thread-id and x-client-request-id.
+    # These are not per-request UUIDs or the ephemeral turn-state token.
+    owned = {
+        "session-id": session.root_conversation_id,
+        "thread-id": session.conversation_id,
+        "x-client-request-id": session.conversation_id,
+    }
+    for name in list(headers):
+        if str(name).lower() in owned:
+            del headers[name]
+    headers.update(owned)
+
+
 def _prepare_codex_turn_headers(headers, turn_state):
     if turn_state is None:
         return
@@ -4701,6 +4718,8 @@ async def async_provider_request(
     # Copy so the per-call idempotency key below does not mutate the cached
     # provider headers shared across requests.
     base_headers = dict(base_headers)
+    if turn_state is not None:
+        _prepare_codex_session_headers(base_headers, current_session())
 
     retry_attempts = HTTP_RETRY_MAX_ATTEMPTS
     request_timeout = WEBFETCH_TIMEOUT_S
@@ -5033,6 +5052,8 @@ async def async_chat_stream_request(
     base_headers = dict(
         request_headers if request_headers is not None
         else (config.chat_provider.headers if config else {}))
+    if turn_state is not None:
+        _prepare_codex_session_headers(base_headers, current_session())
     base_headers.setdefault("Accept", "text/event-stream")
     kind = config.chat_provider.kind if config else None
     idempotency_header = (

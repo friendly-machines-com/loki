@@ -5077,6 +5077,9 @@ class SubagentLaunchTests(unittest.TestCase):
         try:
             if "--subagent-depth" not in args:
                 args = [*args, "--subagent-depth", "1"]
+            if "--root-conversation-id" not in args:
+                args = [*args, "--root-conversation-id",
+                        loki.current_session().root_conversation_id]
             return await subagents.async_main([
                 *args,
                 "--session-owner-fd", str(loki.host_ipc.reference(owner_end)),
@@ -5111,6 +5114,8 @@ class SubagentLaunchTests(unittest.TestCase):
                 "Explore",
                 "--subagent-depth",
                 str(depth + 1),
+                "--root-conversation-id",
+                loki.current_session().root_conversation_id,
                 "--prompt",
                 "inspect this",
                 "--shell-cwd",
@@ -5702,6 +5707,38 @@ class SubagentLaunchTests(unittest.TestCase):
 
         self.assertEqual(status, 2)
 
+    def test_subagent_tree_identity_is_installed_forwarded_and_restored(self):
+        saved = save_loki_state([
+            "credential_authority", "CREDENTIALS", "runtime_config",
+            "reasoning_effort_preference",
+        ])
+        root = "35b2d314-fdfb-466f-bbd6-4f479fc82eb4"
+        session = loki.current_session()
+        previous_root = session.delegated_root_conversation_id
+        thread = session.conversation_id
+
+        async def run(*args):
+            self.assertEqual(session.root_conversation_id, root)
+            self.assertEqual(session.conversation_id, thread)
+            argv = loki._subagent_argv("Explore", "nested search")
+            nested = subagents.parse_args(argv[2:])
+            self.assertEqual(nested.root_conversation_id, root)
+            raise RuntimeError("failed child")
+
+        try:
+            with mock.patch.object(
+                    subagents._core, "build_config_from_env",
+                    return_value=loki.make_runtime_config(
+                        "dummy://local", protocols.DUMMY, model="dummy")), \
+                    mock.patch.object(subagents, "run_cli_async", new=run):
+                with self.assertRaisesRegex(RuntimeError, "failed child"):
+                    asyncio.run(self._run_delegated_subagent([
+                        "Explore", "--root-conversation-id", root,
+                    ]))
+            self.assertEqual(session.delegated_root_conversation_id, previous_root)
+        finally:
+            restore_loki_state(saved)
+
     def test_subagent_cli_applies_explicit_shell_cwd(self):
         saved = save_loki_state([
             "credential_authority", "CREDENTIALS", "runtime_config",
@@ -5842,6 +5879,94 @@ class RequestTimeCredentialTests(unittest.TestCase):
             openai_request_profile=_codex_model("gpt-5-codex"),
         ))
 
+    def _assert_codex_identity(self, headers):
+        session = loki.current_session()
+        self.assertEqual(headers["session-id"], session.root_conversation_id)
+        self.assertEqual(headers["thread-id"], session.conversation_id)
+        self.assertEqual(headers["x-client-request-id"], session.conversation_id)
+
+    def test_codex_identity_headers_match_projected_requests(self):
+        requests = []
+        response = {"object": "response", "status": "completed", "output": []}
+
+        async def buffered(method, url, **kwargs):
+            requests.append(kwargs)
+            return http_client.HttpResponse(
+                url, 200, "OK", {}, json.dumps(response).encode())
+
+        @contextlib.asynccontextmanager
+        async def streaming(method, url, **kwargs):
+            requests.append(kwargs)
+
+            async def body():
+                yield ("data: " + json.dumps({
+                    "type": "response.completed", "response": response,
+                }) + "\n\n").encode()
+
+            yield http_client.HttpStreamResponse(
+                url, 200, "OK", {"content-type": "text/event-stream"}, body())
+
+        session = loki.current_session()
+        for stream in (False, True):
+            for root in (None, "35b2d314-fdfb-466f-bbd6-4f479fc82eb4"):
+                with self.subTest(stream=stream, delegated_root=root):
+                    self._install_subscription(stream=stream)
+                    provider = loki.current_config().chat_provider
+                    provider.headers.update({
+                        "SESSION-ID": "untrusted",
+                        "Thread-Id": "untrusted",
+                        "X-Client-Request-ID": "untrusted",
+                    })
+                    original_headers = dict(provider.headers)
+                    with mock.patch.object(
+                            session, "delegated_root_conversation_id", root), \
+                            mock.patch.object(
+                                http_client, "async_http_request", new=buffered), \
+                            mock.patch.object(
+                                http_client, "async_http_stream", new=streaming):
+                        for _ in range(2):
+                            asyncio.run(loki.async_chat_completion(
+                                [formats.message_item("user", "hello")], tools=[]))
+                            request = requests[-1]
+                            headers = request["headers_in"]
+                            self._assert_codex_identity(headers)
+                            payload = json.loads(request["body"])
+                            self.assertEqual(
+                                headers["thread-id"], payload["prompt_cache_key"])
+                            for name in (
+                                    "SESSION-ID", "Thread-Id", "X-Client-Request-ID"):
+                                self.assertNotIn(name, headers)
+                    self.assertEqual(provider.headers, original_headers)
+
+    def test_codex_identity_headers_are_not_added_to_other_requests(self):
+        requests = []
+
+        async def request(method, url, **kwargs):
+            requests.append(kwargs["headers_in"])
+            return http_client.HttpResponse(url, 200, "OK", {}, b"{}")
+
+        async def streamed(url, payload, headers, *args, **kwargs):
+            requests.append(headers)
+            return protocols.ProviderResponse({})
+
+        with mock.patch.object(http_client, "async_http_request", new=request), \
+                mock.patch.object(
+                    loki, "_async_chat_stream_request_once", new=streamed):
+            self._install_subscription()
+            asyncio.run(loki.async_provider_request(
+                "GET", authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL))
+            loki.apply_runtime_config(loki.make_runtime_config(
+                "https://api.example.test/v1/responses",
+                protocols.OPENAI_RESPONSES, model="public-model"))
+            asyncio.run(loki.async_provider_request(
+                "POST", loki.current_config().chat_provider.chat_url, {}))
+            asyncio.run(loki.async_chat_stream_request(
+                loki.current_config().chat_provider.chat_url, {}))
+
+        for headers in requests:
+            for name in ("session-id", "thread-id", "x-client-request-id"):
+                self.assertNotIn(name, headers)
+
     def test_buffered_401_refreshes_once_with_same_idempotency_key(self):
         self._install_subscription()
         calls = []
@@ -5865,6 +5990,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         first_headers = calls[0][2]["headers_in"]
         second_headers = calls[1][2]["headers_in"]
+        self._assert_codex_identity(first_headers)
+        self._assert_codex_identity(second_headers)
         self.assertEqual(
             first_headers["Authorization"], "Bearer access-old")
         self.assertEqual(
@@ -6003,6 +6130,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 {"input": []}))
 
         self.assertEqual(result.payload, {})
+        self._assert_codex_identity(calls[0])
+        self._assert_codex_identity(calls[1])
         self.assertEqual(
             calls[0]["Authorization"], "Bearer access-old")
         self.assertEqual(
@@ -6238,6 +6367,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         self.assertEqual(first, "first turn done")
         self.assertEqual(second, "second turn done")
+        for headers in requests:
+            self._assert_codex_identity(headers)
         self.assertEqual(responses, [])
         self.assertEqual(
             [
