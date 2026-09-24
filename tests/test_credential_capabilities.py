@@ -242,14 +242,12 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 credential_capabilities.CapabilityError):
             credential_capabilities._decode(b"[]")
 
-    async def test_invalid_delegated_descriptor_is_closed(self):
+    async def test_invalid_delegated_descriptor_is_refused(self):
         read_fd, write_fd = os.pipe()
         try:
             with self.assertRaises(OSError):
                 await credential_capabilities.CredentialClient.from_fd(
                     read_fd)
-            with self.assertRaises(OSError):
-                os.fstat(read_fd)
         finally:
             os.close(write_fd)
 

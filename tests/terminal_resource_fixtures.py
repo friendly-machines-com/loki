@@ -86,6 +86,7 @@ class ReaderEnvironment:
     @contextmanager
     def installed(self):
         self.read_fd, self.write_fd = os.pipe()
+        self.read_identity = os.fstat(self.read_fd)
         with ExitStack() as stack:
             if os.name == 'posix':
                 native = terminals.fcntl
@@ -207,7 +208,6 @@ class ReaderEnvironment:
                 os.close(self.read_fd)
 
     def assert_released(self, case):
-        os.fstat(self.read_fd)  # the reader borrows, rather than owns, this fd
         if os.name == 'posix':
             case.assertFalse(self.registered)
             case.assertEqual(terminals.fcntl.fcntl(self.read_fd, terminals.fcntl.F_GETFL),
@@ -215,3 +215,8 @@ class ReaderEnvironment:
         else:
             case.assertFalse(self.events)
             case.assertTrue(all(not thread.is_alive() for thread, _ in self.threads))
+
+    def assert_borrowed(self, case):
+        """The reader must not close the caller's borrowed descriptor."""
+        case.assertTrue(os.path.samestat(os.fstat(self.read_fd),
+                                         self.read_identity))

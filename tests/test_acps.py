@@ -503,12 +503,15 @@ class QuarantineTests(unittest.TestCase):
             "import sys, os, json\n"
             "from loki_agent import acps\n"
             "null = os.open(os.devnull, os.O_WRONLY)\n"
+            "identity = os.fstat(null)\n"
             "saved = os.dup(1)\n"
             "acps.quarantine_stdout(null)\n"
+            # quarantine_stdout only dup2s the descriptor; the caller's fd must
+            # still be the same object, or the close below would hit another.
+            "assert os.path.samestat(os.fstat(null), identity)\n"
             "write = acps.make_writer(saved)\n"
             "write(acps.response(1, result={'ok': True}))\n"
             "print('stray output')\n"
-            "os.fstat(null)\n"
             "os.close(null)\n"
         )
         proc = subprocess.run(

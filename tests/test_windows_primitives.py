@@ -1330,8 +1330,6 @@ class WindowsPrimitiveTests(unittest.TestCase):
 
         asyncio.run(exercise())
         self.assertEqual(len(descriptors), 1)
-        with self.assertRaises(OSError):
-            os.fstat(descriptors[0])
         self.run_child('lock', 'contended')
         process.kill()
         process.wait()

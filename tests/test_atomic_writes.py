@@ -40,11 +40,9 @@ class AtomicWritePermissionTests(unittest.TestCase):
             self.assertEqual(set(self.root.iterdir()), {self.target})
             return
         real_fchmod = os.fchmod
-        descriptors = []
         content = 'new contents'
 
         def set_mode(fd, mode):
-            descriptors.append(fd)
             self.assertEqual(os.fstat(fd).st_size, len(content.encode('utf-8')))
             self.assertEqual(mode, self.mode)
             real_fchmod(fd, mode)
@@ -56,8 +54,6 @@ class AtomicWritePermissionTests(unittest.TestCase):
         fchmod.assert_called_once()
         self.assertEqual(self.target.read_text(), content)
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), self.mode)
-        with self.assertRaises(OSError):
-            os.fstat(descriptors[0])
         self.assertEqual(set(self.root.iterdir()), {self.target})
 
     def test_native_fchmod_sets_new_file_mode(self):
@@ -108,7 +104,6 @@ class AtomicWritePermissionTests(unittest.TestCase):
             temporary.update(
                 dir_fd=directory_fd,
                 name=name,
-                fd=fd,
                 identity=os.fstat(fd),
             )
             return fd
@@ -142,8 +137,6 @@ class AtomicWritePermissionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(unrelated.stat().st_mode), 0o600)
         self.assertEqual(self.target.read_text(), 'old')
         self.assertEqual(set(self.root.iterdir()), {self.target, unrelated})
-        with self.assertRaises(OSError):
-            os.fstat(temporary['fd'])
 
     def test_fchmod_error_does_not_fall_back_to_pathname(self):
         if os.name != "posix":

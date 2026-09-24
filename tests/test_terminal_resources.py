@@ -162,7 +162,7 @@ class ByteReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     try:
                         with self.assertRaises((OSError, RuntimeError)):
                             await reader.__aexit__(None, None, None)
-                        os.fstat(environment.read_fd)
+                        environment.assert_borrowed(self)
                         if stage == 'stop':
                             if os.name == 'posix':
                                 self.assertTrue(environment.registered)
