@@ -356,23 +356,94 @@ class EscapeSequenceParserTests(unittest.TestCase):
         self.assertFalse(parser.active)
 
 
+DEFAULT_CONTROL_BYTES = (
+    frozenset((0x08, 0x7f)), frozenset((0x17,)), frozenset((0x03,)),
+)
+
+
+class TerminalControlBytesTests(unittest.TestCase):
+    """Native settings policy, plus settings-to-reader wiring on each host."""
+
+    def native_cases(self):
+        if terminals.os.name != 'posix':
+            # The Windows backend has no configurable VINTR/VERASE/VWERASE.
+            # Exercise it unmodified; do not manufacture Unix settings there.
+            yield 'console defaults', None, None, DEFAULT_CONTROL_BYTES
+            return
+
+        def attrs(values):
+            indices = (terminals.termios.VERASE, terminals.termios.VWERASE, terminals.termios.VINTR)
+            cc = [b'\0'] * (max(*indices, terminals.termios.VMIN, terminals.termios.VTIME) + 1)
+            for index, value in zip(indices, values):
+                cc[index] = value
+            return [0, 0, 0, 0, 0, 0, cc]
+
+        for values, numbers in (
+            ((b'\x08', b'\x17', b'\x03'), (0x08, 0x17, 0x03)),
+            ((b'\x7f', b'\x17', b'\x03'), (0x7f, 0x17, 0x03)),
+            ((b'\x15', b'\x16', b'\x18'), (0x15, 0x16, 0x18)),
+            ((0x7f, 0x17, 0x18), (0x7f, 0x17, 0x18)),
+        ):
+            yield repr(values), attrs(values), 0xff, tuple(frozenset((n,)) for n in numbers)
+
+        # Retain the original invalid/disabled combination, then distinguish
+        # per-field fallback from incorrectly discarding all valid settings.
+        yield 'invalid and disabled', attrs((b'invalid', b'\x15', b'\x15')), 0x15, DEFAULT_CONTROL_BYTES
+        valid = (0x08, 0x17, 0x18)
+        for index, name in enumerate(('erase', 'word erase', 'interrupt')):
+            for bad in (b'invalid', b'', None, -1, 256, 0x15):
+                values = list(valid)
+                values[index] = bad
+                expected = [frozenset((n,)) for n in valid]
+                expected[index] = DEFAULT_CONTROL_BYTES[index]
+                yield f'{name}={bad!r}', attrs(values), 0x15, tuple(expected)
+
+        for disabled in (OSError('PC_VDISABLE unavailable'), None, 999):
+            yield f'disable query {disabled!r}', attrs((0, 255, 0x18)), disabled, (
+                DEFAULT_CONTROL_BYTES[0], DEFAULT_CONTROL_BYTES[1], frozenset((0x18,)))
+        yield 'termios error', terminals.termios.error(25, 'not a tty'), 0xff, DEFAULT_CONTROL_BYTES
+        yield 'malformed attributes', [], 0xff, DEFAULT_CONTROL_BYTES
+        yield 'missing control entries', [0, 0, 0, 0, 0, 0, []], 0xff, DEFAULT_CONTROL_BYTES
+
+    @contextlib.contextmanager
+    def native_settings(self, attributes, disabled):
+        with contextlib.ExitStack() as stack:
+            if terminals.os.name == 'posix':
+                stack.enter_context(mock.patch.object(
+                    terminals.termios, 'tcgetattr',
+                    **({'side_effect': attributes} if isinstance(attributes, Exception)
+                       else {'return_value': attributes})))
+                stack.enter_context(mock.patch.object(
+                    terminals.os, 'fpathconf',
+                    **({'side_effect': disabled} if isinstance(disabled, Exception)
+                       else {'return_value': disabled})))
+            yield
+
+    def test_native_settings_selection_and_fallback_policy(self):
+        for name, attributes, disabled, expected in self.native_cases():
+            with self.subTest(case=name), self.native_settings(attributes, disabled):
+                self.assertEqual(terminals.terminal_control_bytes(123), expected)
+
+    def test_native_settings_reach_reader_actions(self):
+        for name, attributes, disabled, expected in self.native_cases():
+            with self.subTest(case=name), self.native_settings(attributes, disabled):
+                # Neither terminal_control_bytes nor the constructor is mocked:
+                # this catches broken wiring despite either unit passing alone.
+                reader = terminals.AsyncKeyReader(fd=123)
+                for values, kind in zip(expected, ('BACKSPACE', 'BACKSPACE_WORD', 'CTRL_C')):
+                    for byte in sorted(values):
+                        self.assertEqual(feed_bytes(reader, bytes((byte,))), [terminals.KeyEvent(kind)])
+                self.assertTrue(reader.cancel_requested)
+                self.assertTrue(reader.cancel_event.is_set())
+
+
 class AsyncKeyReaderTests(unittest.TestCase):
-    def tty_attrs(
-            self, erase=b"\x7f", word_erase=b"\x17",
-            interrupt=b"\x03"):
-        cc = [b"\0"] * (
-            max(
-                terminals.termios.VERASE,
-                terminals.termios.VWERASE,
-                terminals.termios.VINTR,
-                terminals.termios.VMIN,
-                terminals.termios.VTIME,
-            ) + 1
-        )
-        cc[terminals.termios.VERASE] = erase
-        cc[terminals.termios.VWERASE] = word_erase
-        cc[terminals.termios.VINTR] = interrupt
-        return [0, 0, 0, 0, 0, 0, cc]
+    """Decode bytes/escapes against supplied settings, without a terminal."""
+
+    def setUp(self):
+        settings = mock.patch.object(terminals, 'terminal_control_bytes', return_value=DEFAULT_CONTROL_BYTES)
+        self.control_settings = settings.start()
+        self.addCleanup(settings.stop)
 
     def test_decodes_text_ascii_and_utf8(self):
         reader = terminals.AsyncKeyReader(fd=0)
@@ -382,15 +453,7 @@ class AsyncKeyReaderTests(unittest.TestCase):
         self.assertEqual(feed_bytes(reader, bytes([0xa9])), [terminals.KeyEvent("TEXT", "\u00e9")])
 
     def test_decodes_control_keys(self):
-        control_bytes = (
-            terminals.FALLBACK_BACKSPACE_BYTES,
-            terminals.FALLBACK_BACKSPACE_WORD_BYTES,
-            terminals.FALLBACK_INTERRUPT_BYTES,
-        )
-        with mock.patch.object(
-                terminals, "terminal_control_bytes",
-                return_value=control_bytes):
-            reader = terminals.AsyncKeyReader(fd=0)
+        reader = terminals.AsyncKeyReader(fd=0)
 
         events = feed_bytes(reader, b"\x03\x04\r\n\x7f\x08\x17")
 
@@ -408,14 +471,12 @@ class AsyncKeyReaderTests(unittest.TestCase):
         )
 
     def test_uses_configured_interrupt_byte(self):
-        attrs = self.tty_attrs(interrupt=b"\x18")
-        with (
-            mock.patch.object(
-                terminals.termios, "tcgetattr", return_value=attrs),
-            mock.patch.object(
-                terminals.os, "fpathconf", return_value=0xff),
-        ):
-            reader = terminals.AsyncKeyReader(fd=123)
+        self.control_settings.return_value = (
+            DEFAULT_CONTROL_BYTES[0], DEFAULT_CONTROL_BYTES[1], frozenset((0x18,)))
+        reader = terminals.AsyncKeyReader(fd=123)
+        self.assertNotIn(terminals.KeyEvent('CTRL_C'), feed_bytes(reader, b'\x03'))
+        self.assertFalse(reader.cancel_requested)
+        self.assertFalse(reader.cancel_event.is_set())
 
         self.assertEqual(
             feed_bytes(reader, b"\x18"),
@@ -425,89 +486,24 @@ class AsyncKeyReaderTests(unittest.TestCase):
         self.assertTrue(reader.cancel_event.is_set())
 
     def test_uses_configured_character_and_word_erase_bytes(self):
-        cases = [
-            (b"\x08", b"\x17"),
-            (b"\x7f", b"\x17"),
-            (b"\x15", b"\x16"),
-            (0x7f, 0x17),
-        ]
-        for erase, word_erase in cases:
+        for erase, word_erase in ((0x08, 0x17), (0x7f, 0x17), (0x15, 0x16)):
             with self.subTest(erase=erase, word_erase=word_erase):
-                attrs = self.tty_attrs(erase, word_erase)
-                with (
-                    mock.patch.object(
-                        terminals.termios, "tcgetattr", return_value=attrs),
-                    mock.patch.object(
-                        terminals.os, "fpathconf", return_value=0xff),
-                ):
-                    reader = terminals.AsyncKeyReader(fd=123)
-
-                erase_byte = (
-                    erase if isinstance(erase, int) else erase[0])
-                word_erase_byte = (
-                    word_erase
-                    if isinstance(word_erase, int)
-                    else word_erase[0]
-                )
+                self.control_settings.return_value = (
+                    frozenset((erase,)), frozenset((word_erase,)), DEFAULT_CONTROL_BYTES[2])
+                reader = terminals.AsyncKeyReader(fd=123)
                 self.assertEqual(
-                    feed_bytes(
-                        reader, bytes((erase_byte, word_erase_byte))),
-                    [
-                        terminals.KeyEvent("BACKSPACE"),
-                        terminals.KeyEvent("BACKSPACE_WORD"),
-                    ],
+                    feed_bytes(reader, bytes((erase, word_erase))),
+                    [terminals.KeyEvent("BACKSPACE"), terminals.KeyEvent("BACKSPACE_WORD")],
                 )
 
     def test_character_erase_wins_if_both_values_are_equal(self):
-        attrs = self.tty_attrs(b"\x15", b"\x15")
-        with (
-            mock.patch.object(
-                terminals.termios, "tcgetattr", return_value=attrs),
-            mock.patch.object(
-                terminals.os, "fpathconf", return_value=0xff),
-        ):
-            reader = terminals.AsyncKeyReader(fd=123)
+        self.control_settings.return_value = (
+            frozenset((0x15,)), frozenset((0x15,)), DEFAULT_CONTROL_BYTES[2])
+        reader = terminals.AsyncKeyReader(fd=123)
 
         self.assertEqual(
             feed_bytes(reader, b"\x15"),
             [terminals.KeyEvent("BACKSPACE")],
-        )
-
-    def test_invalid_or_disabled_values_use_independent_fallbacks(self):
-        attrs = self.tty_attrs(
-            b"invalid", b"\x15", interrupt=b"\x15")
-        with (
-            mock.patch.object(
-                terminals.termios, "tcgetattr", return_value=attrs),
-            mock.patch.object(
-                terminals.os, "fpathconf", return_value=0x15),
-        ):
-            reader = terminals.AsyncKeyReader(fd=123)
-
-        self.assertEqual(
-            feed_bytes(reader, b"\x08\x7f\x17\x03"),
-            [
-                terminals.KeyEvent("BACKSPACE"),
-                terminals.KeyEvent("BACKSPACE"),
-                terminals.KeyEvent("BACKSPACE_WORD"),
-                terminals.KeyEvent("CTRL_C"),
-            ],
-        )
-
-    def test_termios_error_uses_control_fallbacks(self):
-        error = terminals.termios.error(25, "not a tty")
-        with mock.patch.object(
-                terminals.termios, "tcgetattr", side_effect=error):
-            reader = terminals.AsyncKeyReader(fd=123)
-
-        self.assertEqual(
-            feed_bytes(reader, b"\x08\x7f\x17\x03"),
-            [
-                terminals.KeyEvent("BACKSPACE"),
-                terminals.KeyEvent("BACKSPACE"),
-                terminals.KeyEvent("BACKSPACE_WORD"),
-                terminals.KeyEvent("CTRL_C"),
-            ],
         )
 
     def test_decodes_known_escape_sequences(self):
@@ -720,20 +716,19 @@ class AsyncKeyReaderTests(unittest.TestCase):
         )
 
     def test_kitty_csi_u_uses_configured_interrupt_character(self):
-        attrs = self.tty_attrs(interrupt=b"\x18")
-        with (
-            mock.patch.object(
-                terminals.termios, "tcgetattr", return_value=attrs),
-            mock.patch.object(
-                terminals.os, "fpathconf", return_value=0xff),
-        ):
-            reader = terminals.AsyncKeyReader(fd=123)
+        self.control_settings.return_value = (
+            DEFAULT_CONTROL_BYTES[0], DEFAULT_CONTROL_BYTES[1], frozenset((0x18,)))
+        reader = terminals.AsyncKeyReader(fd=123)
 
         self.assertEqual(feed_bytes(reader, b"\x1b[99;5u"), [])
+        self.assertFalse(reader.cancel_requested)
+        self.assertFalse(reader.cancel_event.is_set())
         self.assertEqual(
             feed_bytes(reader, b"\x1b[120;5u"),
             [terminals.KeyEvent("CTRL_C")],
         )
+        self.assertTrue(reader.cancel_requested)
+        self.assertTrue(reader.cancel_event.is_set())
 
     def test_decodes_kitty_text_repeat_and_ignores_release(self):
         reader = terminals.AsyncKeyReader(fd=0)
