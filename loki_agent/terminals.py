@@ -758,8 +758,11 @@ class AsyncByteReader:
         self.old_flags = None
         self._reader_registered = False
         self._windows_reader = None
+        self._stopping = False
 
     def _on_readable(self):
+        if self._stopping:
+            return
         try:
             data = os.read(self.fd, 4096)
         except BlockingIOError:
@@ -770,48 +773,48 @@ class AsyncByteReader:
         self.queue.put_nowait(data)
 
     async def __aenter__(self):
+        if self.loop is not None:
+            raise RuntimeError("byte reader still owns resources")
         self.loop = asyncio.get_running_loop()
-        if os.name != "posix":
-            # The reader's thread only reads and posts; every field on this
-            # object stays owned by the loop thread.  The rules are in
-            # host_terminal_windows.Reader.
-            self._windows_reader = handle_reader.HandleReader(
-                self.fd, self.loop, self.queue)
-            self._windows_reader.start()
-            return self
-        self.old_flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        self._stopping = False
         try:
-            fcntl.fcntl(
-                self.fd, fcntl.F_SETFL, self.old_flags | os.O_NONBLOCK)
-            self.loop.add_reader(self.fd, self._on_readable)
-            self._reader_registered = True
+            if os.name != "posix":
+                # The existing handle reader owns its thread/event, not the
+                # borrowed input handle. All delivery happens on this loop.
+                self._windows_reader = handle_reader.HandleReader(
+                    self.fd, self.loop, self.queue)
+                self._windows_reader.start()
+            else:
+                self.old_flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+                fcntl.fcntl(
+                    self.fd, fcntl.F_SETFL, self.old_flags | os.O_NONBLOCK)
+                # Also unregister if installation takes effect then raises.
+                self._reader_registered = True
+                self.loop.add_reader(self.fd, self._on_readable)
         except BaseException:
-            try:
-                self._restore_flags()
-            finally:
-                self.loop = None
+            await self.__aexit__(*sys.exc_info())
             raise
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        # Deactivate callbacks before restoring blocking fd flags. Retain the
+        # loop/reader when release fails so a later exit can finish cleanup.
+        self._stopping = True
         if self._windows_reader is not None:
-            # stop() signals, joins and then closes; nothing here may touch the
-            # reader before it returns.
-            try:
-                self._windows_reader.stop()
-            finally:
-                self._windows_reader = None
-                self.loop = None
+            self._windows_reader.stop()
+            self._windows_reader = None
+            self.loop = None
             return
         try:
-            if self._reader_registered and self.loop is not None:
+            if self._reader_registered:
                 self.loop.remove_reader(self.fd)
                 self._reader_registered = False
         finally:
             try:
                 self._restore_flags()
             finally:
-                self.loop = None
+                if not self._reader_registered and self.old_flags is None:
+                    self.loop = None
 
     def _restore_flags(self):
         if self.old_flags is None:
@@ -821,7 +824,7 @@ class AsyncByteReader:
 
     async def read(self):
         item = await self.queue.get()
-        if isinstance(item, OSError):
+        if isinstance(item, Exception):
             raise item
         return item
 
@@ -1544,7 +1547,9 @@ class AsyncKeyReader:
         self.paste_bytes = bytearray()
         self.eof = False
         self.loop = None
-        self._resources = None
+        self._reader_entered = False
+        self._resize_registered = False
+        self._watching_resize = False
         self.cancel_requested = False
         # Event-driven counterpart of cancel_requested.  Set in _feed_byte,
         # which runs inside read_key(), which runs as a task on the same
@@ -1558,52 +1563,53 @@ class AsyncKeyReader:
         self.mode_cycle_requested = False
 
     def _on_resize(self):
-        self.pending.append(KeyEvent("RESIZE"))
-        self.byte_reader.queue.put_nowait(KEY_READER_WAKE)
+        if self._watching_resize:
+            self.pending.append(KeyEvent("RESIZE"))
+            self.byte_reader.queue.put_nowait(KEY_READER_WAKE)
+
+    def _start_resize_watch(self):
+        self._resize_registered = True
+        try:
+            self.loop.add_signal_handler(signal.SIGWINCH, self._on_resize)
+        except (NotImplementedError, RuntimeError):
+            # Preserve the existing optional-signal-support behavior.
+            self._resize_registered = False
+            return
+        self._watching_resize = True
+
+    def _stop_resize_watch(self):
+        self._watching_resize = False
+        if self._resize_registered:
+            self.loop.remove_signal_handler(signal.SIGWINCH)
+            self._resize_registered = False
 
     async def __aenter__(self):
+        if self.loop is not None:
+            raise RuntimeError("key reader still owns resources")
         self.loop = asyncio.get_running_loop()
-        resources = contextlib.AsyncExitStack()
         try:
-            await resources.enter_async_context(self.byte_reader)
+            # Retain ownership even when an inner failed entry cannot finish
+            # rolling back. Cleanup is idempotent at every concrete owner.
+            self._reader_entered = True
+            await self.byte_reader.__aenter__()
             if self.watch_resize:
-                try:
-                    self.loop.add_signal_handler(
-                        signal.SIGWINCH, self._on_resize)
-                except (NotImplementedError, RuntimeError):
-                    # Some event loops/platforms do not expose signal
-                    # handlers; the prompt remains usable without live resize
-                    # events.
-                    pass
-                else:
-                    resources.callback(self._remove_resize_handler)
+                self._start_resize_watch()
         except BaseException:
-            try:
-                await resources.__aexit__(*sys.exc_info())
-            finally:
-                self.loop = None
+            await self.__aexit__(*sys.exc_info())
             raise
-        self._resources = resources
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        resources = self._resources
-        self._resources = None
         try:
-            if resources is not None:
-                await resources.__aexit__(exc_type, exc, tb)
+            self._stop_resize_watch()
         finally:
-            self.loop = None
-
-    def _remove_resize_handler(self):
-        if self.loop is None:
-            return
-        try:
-            self.loop.remove_signal_handler(signal.SIGWINCH)
-        except (NotImplementedError, RuntimeError):
-            # Match the add path: absence of signal-handler support is not a
-            # terminal-state cleanup failure.
-            pass
+            try:
+                if self._reader_entered:
+                    await self.byte_reader.__aexit__(exc_type, exc, tb)
+                    self._reader_entered = False
+            finally:
+                if not self._reader_entered and not self._resize_registered:
+                    self.loop = None
 
     def _emit_text_byte(self, byte: int):
         text = self.decoder.decode(bytes([byte]), final=False)
@@ -2178,29 +2184,30 @@ class InputSession:
         self._producer = None
         self._mode = None
         self._modal = None
-        self._resources = None
+        self._reader_entered = False
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
         self.history_provider = history_provider
 
     async def __aenter__(self):
-        resources = contextlib.AsyncExitStack()
+        if self._mode is not None or self._reader_entered or self._producer is not None:
+            raise RuntimeError("input session still owns resources")
         try:
-            self._mode = resources.enter_context(
-                TerminalMode(self.fd, self.interactive))
-            await resources.enter_async_context(self.reader)
-            self._producer = asyncio.create_task(self._produce())
-        except BaseException:
+            self._mode = TerminalMode(self.fd, self.interactive)
+            self._mode.__enter__()
+            self._reader_entered = True
+            await self.reader.__aenter__()
+            producer = self._produce()
             try:
-                await resources.__aexit__(*sys.exc_info())
-            finally:
-                self._mode = None
+                self._producer = asyncio.create_task(producer)
+            except BaseException:
+                producer.close()
+                raise
+        except BaseException:
+            await self.__aexit__(*sys.exc_info())
             raise
-        self._resources = resources
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        resources = self._resources
-        self._resources = None
         try:
             try:
                 if self._producer is not None:
@@ -2210,15 +2217,21 @@ class InputSession:
                     except (asyncio.CancelledError, EOFError):
                         pass
                     finally:
-                        self._producer = None
+                        if self._producer.done():
+                            self._producer = None
             finally:
                 self.user_messages.discard_pending_messages()
         finally:
             try:
-                if resources is not None:
-                    await resources.__aexit__(*sys.exc_info())
+                if self._reader_entered:
+                    await self.reader.__aexit__(exc_type, exc, tb)
+                    self._reader_entered = False
             finally:
-                self._mode = None
+                # An exit stack consumes failed callbacks. Keep concrete
+                # ownership until each exit succeeds, allowing cleanup retry.
+                if self._mode is not None:
+                    self._mode.__exit__(exc_type, exc, tb)
+                    self._mode = None
 
     async def _produce(self):
         while True:

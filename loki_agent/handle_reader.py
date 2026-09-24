@@ -25,6 +25,8 @@ is load-bearing:
    already running.
 7. The thread is a daemon only as a backstop for a path that never reaches
    teardown.  Normal shutdown stops and joins it explicitly.
+8. Delivery is gated on the loop thread once shutdown begins, including posts
+   already queued before stop(). A failed join cannot keep delivering bytes.
 
 Import-safe off Windows: nothing is bound until ``start``, which only a
 Windows caller reaches.
@@ -63,21 +65,36 @@ class HandleReader:
         self.handle = None
         self.stop_event = None
         self.thread = None
+        self._accepting = False
 
     def start(self) -> None:
         if sys.platform != "win32":
             raise windows_api.WindowsUnavailableError(
                 "the handle reader is available on Windows only")
+        if self.stop_event is not None or self.thread is not None:
+            raise RuntimeError("handle reader still owns resources")
         if self._explicit_handle is not None:
             self.handle = self._explicit_handle
         else:
             self.handle = _handle(self.fd)
-        self.stop_event = _CreateEventW(None, True, False, None)
-        if not self.stop_event:
-            raise OSError(ctypes.get_last_error(), "CreateEventW")
-        self.thread = threading.Thread(
-            target=self._run, name="loki-handle-reader", daemon=True)
-        self.thread.start()
+        try:
+            event = _CreateEventW(None, True, False, None)
+            if not event:
+                raise OSError(ctypes.get_last_error(), "CreateEventW")
+            self.stop_event = event
+            self.thread = threading.Thread(
+                target=self._run, name="loki-handle-reader", daemon=True)
+            self._accepting = True
+            self.thread.start()
+        except BaseException as error:
+            if (isinstance(error, RuntimeError) and self.thread is not None
+                    and self.thread.ident is None):
+                # Thread.start's refusal path has no thread to join. Other
+                # interruptions may race native startup: retain that ownership
+                # rather than close an event a starting thread could still use.
+                self.thread = None
+            self.stop()
+            raise
 
     def _run(self) -> None:
         buffer = ctypes.create_string_buffer(4096)
@@ -134,23 +151,39 @@ class HandleReader:
 
     def _post(self, data: bytes) -> None:
         try:
-            self.loop.call_soon_threadsafe(self.queue.put_nowait, data)
+            self.loop.call_soon_threadsafe(self._deliver, data)
         except RuntimeError:
             # The loop is closed; teardown is already in progress.
             pass
 
+    def _deliver(self, data: bytes) -> None:
+        # Runs on the owning loop. A post queued before stop() must not deliver
+        # input after shutdown has begun, even when joining the thread fails.
+        if self._accepting:
+            self.queue.put_nowait(data)
+
     def stop(self) -> None:
-        if self.stop_event:
-            _SetEvent(self.stop_event)
-        if self.thread is not None:
-            self.thread.join(timeout=2)
-            if self.thread.is_alive():
-                # Closing the event under a live thread is worse than failing.
-                raise RuntimeError("handle reader thread did not stop")
-            self.thread = None
-        if self.stop_event:
-            _CloseHandle(self.stop_event)
-            self.stop_event = None
+        self._accepting = False
+        try:
+            if self.stop_event and not _SetEvent(self.stop_event):
+                raise OSError(ctypes.get_last_error(), "SetEvent")
+        finally:
+            try:
+                if self.thread is not None:
+                    try:
+                        self.thread.join(timeout=2)
+                    finally:
+                        if self.thread.ident is not None and not self.thread.is_alive():
+                            self.thread = None
+                    if self.thread is not None:
+                        raise RuntimeError("handle reader thread did not stop")
+            finally:
+                # No event is closed under a live thread. A failed close also
+                # retains ownership, so the caller can retry rather than leak.
+                if self.thread is None and self.stop_event:
+                    if not _CloseHandle(self.stop_event):
+                        raise OSError(ctypes.get_last_error(), "CloseHandle")
+                    self.stop_event = None
 
 
 # The calls are declared once through ``windows_api.bind`` (one binding per

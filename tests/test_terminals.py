@@ -49,97 +49,8 @@ def feed_bytes(reader, data):
 
 
 class TerminalResourceSafetyTests(unittest.TestCase):
-    def test_byte_reader_restores_flags_when_registration_fails(self):
-        old_flags = 0x10
-        written_flags = []
-
-        class FailingLoop:
-            def add_reader(self, fd, callback):
-                raise RuntimeError("reader registration failed")
-
-        def fake_fcntl(fd, command, value=None):
-            if command == terminals.fcntl.F_GETFL:
-                return old_flags
-            self.assertEqual(command, terminals.fcntl.F_SETFL)
-            written_flags.append(value)
-
-        async def exercise():
-            reader = terminals.AsyncByteReader(123)
-            with (
-                mock.patch.object(
-                    terminals.asyncio, "get_running_loop",
-                    return_value=FailingLoop()),
-                mock.patch.object(
-                    terminals.fcntl, "fcntl", side_effect=fake_fcntl),
-            ):
-                with self.assertRaisesRegex(
-                        RuntimeError, "registration failed"):
-                    await reader.__aenter__()
-            self.assertIsNone(reader.loop)
-            self.assertIsNone(reader.old_flags)
-
-        asyncio.run(exercise())
-
-        self.assertEqual(
-            written_flags,
-            [old_flags | terminals.os.O_NONBLOCK, old_flags],
-        )
-
-    def test_byte_reader_restores_flags_when_removal_fails(self):
-        old_flags = 0x10
-        written_flags = []
-
-        class FailingLoop:
-            def remove_reader(self, fd):
-                raise RuntimeError("reader removal failed")
-
-        async def exercise():
-            reader = terminals.AsyncByteReader(123)
-            reader.loop = FailingLoop()
-            reader.old_flags = old_flags
-            reader._reader_registered = True
-            with mock.patch.object(
-                    terminals.fcntl, "fcntl",
-                    side_effect=lambda fd, command, value: (
-                        written_flags.append(value))):
-                with self.assertRaisesRegex(RuntimeError, "removal failed"):
-                    await reader.__aexit__(None, None, None)
-            self.assertIsNone(reader.loop)
-            self.assertIsNone(reader.old_flags)
-
-        asyncio.run(exercise())
-
-        self.assertEqual(written_flags, [old_flags])
-
-    def test_key_reader_rolls_back_byte_reader_after_resize_setup_error(self):
-        calls = []
-
-        class RecordingByteReader:
-            async def __aenter__(self):
-                calls.append("byte enter")
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                calls.append("byte exit")
-
-        class FailingLoop:
-            def add_signal_handler(self, signum, callback):
-                raise OSError("resize registration failed")
-
-        async def exercise():
-            reader = terminals.AsyncKeyReader(123, watch_resize=True)
-            reader.byte_reader = RecordingByteReader()
-            with mock.patch.object(
-                    terminals.asyncio, "get_running_loop",
-                    return_value=FailingLoop()):
-                with self.assertRaisesRegex(
-                        OSError, "resize registration failed"):
-                    await reader.__aenter__()
-            self.assertIsNone(reader.loop)
-
-        asyncio.run(exercise())
-
-        self.assertEqual(calls, ["byte enter", "byte exit"])
+    # Native mode/reader ownership is covered by the shared tests in
+    # test_terminal_resources. These tests isolate InputSession's ordering.
 
     def test_input_session_restores_mode_when_reader_setup_fails(self):
         calls = []
@@ -174,11 +85,11 @@ class TerminalResourceSafetyTests(unittest.TestCase):
             ):
                 await session.__aenter__()
             self.assertIsNone(session._mode)
-            self.assertIsNone(session._resources)
+            self.assertIsNone(session._producer)
 
         asyncio.run(exercise())
 
-        self.assertEqual(calls, ["mode enter", "reader enter", "mode exit"])
+        self.assertEqual(calls, ["mode enter", "reader enter", "reader exit", "mode exit"])
 
     def test_input_session_restores_mode_when_reader_cleanup_fails(self):
         calls = []
@@ -218,7 +129,7 @@ class TerminalResourceSafetyTests(unittest.TestCase):
                         RuntimeError, "reader cleanup failed"):
                     await session.__aexit__(None, None, None)
             self.assertIsNone(session._mode)
-            self.assertIsNone(session._resources)
+            self.assertIsNone(session._producer)
 
         asyncio.run(exercise())
 
@@ -870,8 +781,10 @@ class AsyncKeyReaderTests(unittest.TestCase):
         async def scenario():
             reader = terminals.AsyncKeyReader(fd=0)
             reader.byte_reader = WakeByteReader()
+            # This test isolates wakeup decoding, not watcher registration.
+            reader._watching_resize = True
             reader._on_resize()
-            resize = await reader.read_key()
+            resize = await asyncio.wait_for(reader.read_key(), 1)
             reader.byte_reader.queue.put_nowait(b"x")
             text = await reader.read_key()
             return resize, text
