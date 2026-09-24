@@ -378,6 +378,97 @@ class JobOwnershipContractTests(unittest.TestCase):
                 # A closed socket has no handle.
                 self.assertEqual(end.fileno(), -1)
 
+    def test_session_owned_job_does_not_hold_the_end_the_runtime_keeps(self):
+        """Closing the runtime's end reaches the job, so no copy leaked to it.
+
+        The runtime keeps one end of the channel and hands the other to the
+        job.  A read on the handed end returns only once every write end of
+        the pipe is closed, so closing the runtime's end and watching the job
+        observe that proves the job holds no write end of that pipe.  A job
+        holding the kept end would keep the pipe open and never be revoked.
+        """
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            script = (
+                "import asyncio, sys\n"
+                "from loki_agent import host_ipc\n"
+                "async def main():\n"
+                "    end = host_ipc.child_endpoint(\n"
+                "        sys.argv[sys.argv.index('--session-owner-fd') + 1])\n"
+                "    await host_ipc.watch_closed(end)\n"
+                "    print('closed', flush=True)\n"
+                "asyncio.run(main())\n"
+            )
+            job = await manager.run_background_exec(
+                [sys.executable, "-c", script],
+                cwd=os.path.dirname(os.path.dirname(__file__)),
+                session_owned=True,
+            )
+            try:
+                manager._close_owner_signal(job)
+                deadline = asyncio.get_running_loop().time() + 5
+                while True:
+                    reported = loki._read_spool_tail(job.stdout_path)
+                    if "closed" in reported:
+                        return reported
+                    if asyncio.get_running_loop().time() >= deadline:
+                        self.fail(
+                            "the job did not observe the owner end close")
+                    await asyncio.sleep(0.01)
+            finally:
+                await manager.close_session_owned()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reported = asyncio.run(scenario(tmpdir))
+
+        self.assertIn("closed", reported)
+
+    def test_command_spawned_by_a_job_does_not_hold_the_job_owner_end(self):
+        """A command the job spawns holds no write end of the job's channel.
+
+        Closing the runtime's end must reach the job while the command it
+        spawned is still alive.  If the command held a write end of that pipe,
+        the job's read would stay blocked and revocation would never reach it.
+        """
+        async def scenario(tmpdir):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            script = (
+                "import asyncio, sys, tempfile\n"
+                "from loki_agent import host_ipc, loki\n"
+                "async def main():\n"
+                "    end = host_ipc.child_endpoint(\n"
+                "        sys.argv[sys.argv.index('--session-owner-fd') + 1])\n"
+                "    manager = loki.JobManager(tempfile.mkdtemp())\n"
+                "    command = await manager.run_background_exec(\n"
+                "        [sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "    await host_ipc.watch_closed(end)\n"
+                "    command.process.kill()\n"
+                "    print('closed', flush=True)\n"
+                "asyncio.run(main())\n"
+            )
+            job = await manager.run_background_exec(
+                [sys.executable, "-c", script],
+                cwd=os.path.dirname(os.path.dirname(__file__)),
+                session_owned=True,
+            )
+            try:
+                manager._close_owner_signal(job)
+                deadline = asyncio.get_running_loop().time() + 5
+                while True:
+                    reported = loki._read_spool_tail(job.stdout_path)
+                    if "closed" in reported:
+                        return reported
+                    if asyncio.get_running_loop().time() >= deadline:
+                        self.fail("a command held the job's owner end")
+                    await asyncio.sleep(0.01)
+            finally:
+                await manager.close_session_owned()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reported = asyncio.run(scenario(tmpdir))
+
+        self.assertIn("closed", reported)
+
     def test_cancelling_owner_task_reaps_foreground_process(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
@@ -472,64 +563,6 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertTrue(metadata["session_owned"])
         self.assertEqual(metadata["status"], "owner_closed")
         self.assertIsNotNone(ordinary.process.returncode)
-
-    def test_delegated_credential_end_is_not_inherited_by_child_command(self):
-        async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
-            credential = authentications.CredentialRef.environment(
-                "EXAMPLE_API_KEY")
-            broker = authentications.CredentialBroker()
-            broker.install_static(credential, "delegated-secret")
-            session = loki.current_session()
-            old_authority = session.credential_authority
-            session.credential_authority = broker
-            probe_code = (
-                "import sys\n"
-                "from loki_agent import host_ipc\n"
-                "try:\n"
-                "    host_ipc.child_endpoint(sys.argv[1])\n"
-                "except (OSError, ValueError):\n"
-                "    print('closed')\n"
-                "else:\n"
-                "    print('inherited')\n"
-            )
-            script = (
-                "import asyncio,subprocess,sys\n"
-                "from loki_agent import authentications\n"
-                "from loki_agent import credential_capabilities, host_ipc\n"
-                "async def main():\n"
-                "    client = await "
-                "credential_capabilities.CredentialClient.from_fd(\n"
-                "        host_ipc.child_endpoint(sys.argv[-1]))\n"
-                "    lease = await client.lease("
-                "authentications.CredentialRef.environment("
-                "'EXAMPLE_API_KEY'))\n"
-                "    probe = subprocess.check_output([\n"
-                f"        sys.executable, '-c', {probe_code!r},\n"
-                "        sys.argv[-1]], stderr=subprocess.STDOUT, text=True)\n"
-                "    print(lease.value)\n"
-                "    print(probe.strip())\n"
-                "    await client.close()\n"
-                "asyncio.run(main())\n"
-            )
-            try:
-                return await manager.run_exec(
-                    [sys.executable, "-c", script],
-                    10_000,
-                    cwd=os.path.dirname(os.path.dirname(__file__)),
-                    credential_refs={credential},
-                )
-            finally:
-                session.credential_authority = old_authority
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            job, status, stdout, stderr = asyncio.run(scenario(tmpdir))
-
-        self.assertEqual(status, "completed", stderr)
-        self.assertEqual(job.exit_code, 0, stderr)
-        self.assertIn("delegated-secret", stdout)
-        self.assertIn("closed", stdout)
-        self.assertNotIn("inherited", stdout)
 
     def test_bash_timeout_is_a_failed_tool_result(self):
         async def scenario(tmpdir):

@@ -452,30 +452,41 @@ class ExternalHookTests(unittest.TestCase):
             "external.transform",
         )
 
-    def test_external_hook_does_not_inherit_unlisted_descriptors(self):
-        read_fd, write_fd = os.pipe()
+    def test_hook_command_holds_only_its_standard_descriptors(self):
+        """A hook child holds nothing beyond its own standard descriptors.
+
+        The parent holds an *inheritable* descriptor, as the runtime does: its
+        own owner and capability descriptors reached it that way.  Without one,
+        nothing could cross and the assertion could not fail, because Python's
+        descriptors are non-inheritable by default.  The child enumerates the
+        descriptors *it* holds, so the claim is about its own table rather than
+        a query against a number the parent owns.
+        """
+        runtime_read, runtime_write = os.pipe()
+        os.set_inheritable(runtime_read, True)
         script = (
             "import json, os, sys\n"
-            "try:\n"
-            "    os.fstat(int(sys.argv[1]))\n"
-            "except OSError:\n"
-            "    json.dump({'owner_fd': 'closed'}, sys.stdout)\n"
-            "else:\n"
-            "    json.dump({'owner_fd': 'inherited'}, sys.stdout)\n"
+            "held = []\n"
+            "for fd in range(0, 4096):\n"
+            "    try:\n"
+            "        os.fstat(fd)\n"
+            "    except OSError:\n"
+            "        continue\n"
+            "    held.append(fd)\n"
+            "json.dump({'held': held}, sys.stdout)\n"
         )
         try:
             with tempfile.TemporaryDirectory() as directory:
                 result = asyncio.run(tool_runtime._run_hook_command(
-                    [sys.executable, "-c", script, str(read_fd)],
+                    [sys.executable, "-c", script],
                     {},
                     directory,
                     1000,
                 ))
         finally:
-            os.close(read_fd)
-            os.close(write_fd)
-
-        self.assertEqual(result, {"owner_fd": "closed"})
+            os.close(runtime_read)
+            os.close(runtime_write)
+        self.assertEqual(result, {"held": [0, 1, 2]})
 
     def test_external_post_hook_can_only_append_note(self):
         script = (
