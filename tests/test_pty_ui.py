@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 # The ``--pty-child`` process runs this file as a script with the tests
@@ -212,7 +213,9 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
     populated for a genuine dummy-provider delta stream, and is captured while
     the provider is still blocked before producing its remaining deltas.
     """
-    tmpdir = tempfile.mkdtemp(prefix="loki-pty-test-")
+    root = tempfile.mkdtemp(prefix="loki-pty-test-")
+    tmpdir = os.path.join(root, "workspace")
+    os.mkdir(tmpdir)
     if create_image:
         pathlib.Path(tmpdir, "image.png").write_bytes(
             b"\x89PNG\r\n\x1a\npayload")
@@ -220,9 +223,9 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
         pathlib.Path(tmpdir, "attack.bin").write_bytes(raw_file_data)
     gate = os.path.join(tmpdir, "release-stream") if stream_chunks else None
     env = {
-        "HOME": tmpdir,
-        "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
-        "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
+        "HOME": root,
+        "XDG_CONFIG_HOME": os.path.join(root, "config"),
+        "XDG_STATE_HOME": os.path.join(root, "state"),
         "PATH": os.environ.get("PATH", ""),
         "TERM": "xterm",
         "LOKI_PROVIDER": "dummy",
@@ -236,13 +239,13 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
         env["LOKI_DUMMY_STREAM_CHUNKS"] = json.dumps(stream_chunks)
         env["LOKI_DUMMY_STREAM_GATE"] = gate
     env = child_environment(**env)
-    configure_container(env, tmpdir)
-    handle = pty_backend.spawn_pty(
-        [entrypoint("loki")], env=env, cwd=tmpdir)
-
+    handle = None
     collected = b""
     before_stream_release = b""
     try:
+        configure_container(env, tmpdir)
+        handle = pty_backend.spawn_pty(
+            [entrypoint("loki")], env=env, cwd=tmpdir)
         collected += _read_with_timeout(handle, 6.0)  # startup banner
 
         handle.write(initial_input + b"\r")
@@ -261,10 +264,48 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
         handle.write(b"/quit\r")
         collected += _read_with_timeout(handle, 2.0)
     finally:
-        handle.terminate()
-        handle.close()
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            if handle is not None:
+                handle.terminate()
+                handle.close()
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
     return collected, before_stream_release
+
+
+class PtyFixtureTests(unittest.TestCase):
+    def test_private_trees_are_outside_the_granted_workspace(self):
+        module = sys.modules[__name__]
+        for cli in (False, True):
+            with self.subTest(cli=cli):
+                configured = []
+
+                def configure(env, workspace):
+                    self.assertTrue(os.path.isdir(workspace))
+                    for key in ('XDG_CONFIG_HOME', 'XDG_STATE_HOME'):
+                        self.assertNotEqual(os.path.commonpath([workspace, env[key]]),
+                                            workspace)
+                    configured.append(workspace)
+
+                def spawn(arguments, *, env, cwd):
+                    self.assertEqual(configured, [cwd])
+                    if not cli:
+                        self.assertTrue(pathlib.Path(cwd, 'image.png').is_file())
+                        self.assertTrue(pathlib.Path(cwd, 'attack.bin').is_file())
+                    return mock.Mock(poll=mock.Mock(return_value=0))
+
+                with (
+                    mock.patch.object(module, 'configure_container', side_effect=configure),
+                    mock.patch.object(module, 'entrypoint', return_value='/installed/loki'),
+                    mock.patch.object(module, '_read_with_timeout', return_value=b''),
+                    mock.patch.object(pty_backend, 'spawn_pty', side_effect=spawn),
+                ):
+                    if cli:
+                        with tempfile.TemporaryDirectory() as root:
+                            PtyCliUsageTests()._run_cli(root, '--help')
+                    else:
+                        run_loki_pty_reply(False, create_image=True, raw_file_data=b'test')
+                self.assertFalse(os.path.exists(configured[0]))
 
 
 class PtyUiTests(unittest.TestCase):
@@ -465,9 +506,11 @@ class PtyCliUsageTests(unittest.TestCase):
             PATH=os.environ.get("PATH", ""),
             TERM="xterm",
         )
-        configure_container(env, cwd)
+        workspace = os.path.join(cwd, "workspace")
+        os.makedirs(workspace, exist_ok=True)
+        configure_container(env, workspace)
         handle = pty_backend.spawn_pty(
-            [entrypoint("loki"), *cli_args], env=env, cwd=cwd)
+            [entrypoint("loki"), *cli_args], env=env, cwd=workspace)
         output = b""
         exit_code = None
         try:
