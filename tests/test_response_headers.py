@@ -327,7 +327,9 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(cancel=cancel):
                 child = await self.start_child(
                     sys.executable, '-c',
-                    'import time; print("ready", flush=True); time.sleep(60)',
+                    'import sys, time; '
+                    "sys.stdout.buffer.write(b'ready\\n'); "
+                    'sys.stdout.buffer.flush(); time.sleep(60)',
                     cwd=self.workspace, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE)
                 self.assertEqual(await asyncio.wait_for(child.stdout.readline(), 5), b'ready\n')
