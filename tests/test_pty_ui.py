@@ -596,7 +596,8 @@ def _pty_child(argv):
 
     ``mode-rollback`` and ``resize``/``resize-cancel`` verify native resource
     restoration and resize delivery. ``isig`` checks interrupt processing;
-    ``cancel-flag``/``cancel-event`` report the effect of one input key.
+    ``cancel-flag``/``cancel-event`` report the effect of one input key;
+    ``control-settings`` checks native settings through real input and actions.
     """
     import asyncio
 
@@ -611,6 +612,35 @@ def _pty_child(argv):
         native = _terminals.host_terminal_windows
         return (native._console_mode(native._handle(0)), native._GetConsoleCP(),
                 native._console_mode(native._GetStdHandle(native.STD_OUTPUT_HANDLE)))
+
+    if mode == 'control-settings':
+        async def read_controls():
+            before = terminal_state()
+            try:
+                if os.name == 'posix':
+                    native = _terminals.termios
+                    configured = native.tcgetattr(0)
+                    for index, value in ((native.VERASE, b'\x15'), (native.VWERASE, b'\x16'),
+                                         (native.VINTR, b'\x18')):
+                        configured[6][index] = value
+                    native.tcsetattr(0, native.TCSANOW, configured)
+                # Read the actual host settings before raw mode, without
+                # replacing either acquisition or the reader constructor.
+                reader = _terminals.AsyncKeyReader(0)
+                with _terminals.TerminalMode(0, enabled=True):
+                    async with reader:
+                        print('CONTROL_READY', flush=True)
+                        events = [await asyncio.wait_for(reader.read_key(), 5) for _ in range(3)]
+                        assert [event.kind for event in events] == ['BACKSPACE', 'BACKSPACE_WORD', 'CTRL_C'], events
+                        assert reader.cancel_requested and reader.cancel_event.is_set()
+            finally:
+                if os.name == 'posix':
+                    native.tcsetattr(0, native.TCSANOW, before)
+            assert terminal_state() == before, 'control test changed terminal settings'
+            print('CONTROL_ACTIONS_OK', flush=True)
+
+        asyncio.run(read_controls())
+        return 0
 
     if mode == 'mode-rollback':
         before = terminal_state()
@@ -757,6 +787,20 @@ class PtyResourceTests(unittest.TestCase):
             output += handle.read(4096, timeout=0.1)
         self.assertIn(marker, output, output.decode(errors='replace'))
         return output
+
+    def test_native_control_settings_drive_reader_actions(self):
+        handle = pty_backend.spawn_pty([
+            sys.executable, str(pathlib.Path(__file__).resolve()), '--pty-child', 'control-settings'])
+        try:
+            output = self.read_marker(handle, b'', b'CONTROL_READY')
+            # POSIX has configurable control characters; the Windows console
+            # uses its actual defaults. Both must drive the same reader actions.
+            handle.write(b'\x15\x16\x18' if os.name == 'posix' else b'\x08\x17\x03')
+            self.read_marker(handle, output, b'CONTROL_ACTIONS_OK')
+        finally:
+            if handle.poll() is None:
+                handle.terminate()
+            handle.close()
 
     def test_native_resize_and_shutdown_without_keyboard_input(self):
         for mode in ('resize', 'resize-cancel'):
