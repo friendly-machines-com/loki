@@ -83,7 +83,7 @@ from .loki import (
     user_prompt_history,
 )
 from .terminals import (
-    input_session, restore_output_area_after_input, terminal)
+    input_session, restore_output_area_after_input, terminal, terminal_output_mode)
 
 
 logger = logging.getLogger(__name__)
@@ -1352,14 +1352,15 @@ async def _run_frontend(args) -> int:
                 await manager.close_session_owned()
 
     exit_status = 1
-    try:
-        # Setup lives inside the try so a partial setup failure still runs
-        # clean_up() in the finally: the terminal is restored before the
-        # exception surfaces, not left half-initialized.
-        initialize_terminal_overlay(terminal)
-        exit_status = await run_with_session_cleanup()
-    finally:
-        clean_up()
+    output_settings = terminal_output_mode()
+    with output_settings:
+        try:
+            # Output mode must outlive InputSession: overlay restoration emits
+            # VT sequences too. A partial setup still needs that restoration.
+            initialize_terminal_overlay(terminal)
+            exit_status = await run_with_session_cleanup()
+        finally:
+            clean_up()
     if exit_status == 0 and cleanup_failed:
         return 1
     return exit_status

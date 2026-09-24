@@ -826,6 +826,13 @@ class AsyncByteReader:
         return item
 
 
+def terminal_output_mode():
+    """Own output settings across overlay setup, input, and overlay teardown."""
+    if os.name == "posix":
+        return contextlib.nullcontext()
+    return host_terminal_windows.OutputMode()
+
+
 class TerminalMode:
     def __init__(self, fd: int, enabled: bool):
         self.fd = fd
@@ -834,10 +841,17 @@ class TerminalMode:
         self._windows_mode = None
 
     def __enter__(self):
+        if self.old_attrs is not None or self._windows_mode is not None:
+            raise RuntimeError("terminal mode still owns settings")
         if self.enabled:
             if os.name != "posix":
                 self._windows_mode = host_terminal_windows.RawMode(self.fd)
-                self._windows_mode.__enter__()
+                try:
+                    self._windows_mode.__enter__()
+                except BaseException:
+                    if not self._windows_mode.needs_restore:
+                        self._windows_mode = None
+                    raise
                 return self
             self.old_attrs = termios.tcgetattr(self.fd)
             new_attrs = self.old_attrs.copy()
@@ -865,10 +879,8 @@ class TerminalMode:
 
     def restore(self):
         if self._windows_mode is not None:
-            try:
-                self._windows_mode.restore()
-            finally:
-                self._windows_mode = None
+            self._windows_mode.restore()
+            self._windows_mode = None
             return
         if self.old_attrs is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)

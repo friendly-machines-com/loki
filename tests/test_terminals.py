@@ -49,43 +49,6 @@ def feed_bytes(reader, data):
 
 
 class TerminalResourceSafetyTests(unittest.TestCase):
-    def test_terminal_mode_rolls_back_when_mode_change_fails(self):
-        cc = [b"\0"] * (
-            max(terminals.termios.VMIN, terminals.termios.VTIME) + 1)
-        old_attrs = [
-            getattr(terminals.termios, "IXON", 0),
-            0,
-            0,
-            terminals.termios.ICANON
-            | terminals.termios.ECHO
-            | terminals.termios.ISIG,
-            0,
-            0,
-            cc,
-        ]
-        applied_attrs = []
-
-        def fake_tcsetattr(fd, when, attrs):
-            applied_attrs.append(attrs)
-            if len(applied_attrs) == 1:
-                raise OSError("mode change failed")
-
-        mode = terminals.TerminalMode(123, enabled=True)
-        with (
-            mock.patch.object(
-                terminals.termios, "tcgetattr", return_value=old_attrs),
-            mock.patch.object(
-                terminals.termios, "tcsetattr",
-                side_effect=fake_tcsetattr),
-            self.assertRaisesRegex(OSError, "mode change failed"),
-        ):
-            mode.__enter__()
-
-        self.assertEqual(len(applied_attrs), 2)
-        self.assertEqual(applied_attrs[0][0], old_attrs[0])
-        self.assertEqual(applied_attrs[1], old_attrs)
-        self.assertIsNone(mode.old_attrs)
-
     def test_byte_reader_restores_flags_when_registration_fails(self):
         old_flags = 0x10
         written_flags = []

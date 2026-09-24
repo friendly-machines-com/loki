@@ -3,7 +3,7 @@
 Only what differs from a POSIX tty lives here; ``terminals`` keeps the reader
 state machine and the rendering.
 
-* **Output needs nothing.**  Loki writes through Python's console stream, which
+* **Output** uses Python's console stream, which
   uses ``WriteConsoleW`` (PEP 528), so the console code page never enters the
   output path.  The one output-side change is
   ``ENABLE_VIRTUAL_TERMINAL_PROCESSING``, so the ANSI sequences this frontend
@@ -91,45 +91,101 @@ def _set_console_mode(handle, mode: int) -> None:
     _check(_SetConsoleMode(handle, mode), "SetConsoleMode")
 
 
-def _enable_virtual_terminal_output() -> None:
-    """Let ANSI sequences reach the screen; a no-op when output is redirected."""
-    handle = _GetStdHandle(STD_OUTPUT_HANDLE)
-    mode = wintypes.DWORD()
-    if not _GetConsoleMode(handle, ctypes.byref(mode)):
-        return
-    _set_console_mode(handle, mode.value | ENABLE_PROCESSED_OUTPUT
-                      | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+class OutputMode:
+    """Keep VT output enabled until the frontend has reset its overlay."""
+
+    def __init__(self):
+        self.handle = None
+        self.old_mode = None
+
+    def __enter__(self):
+        if self.old_mode is not None:
+            raise RuntimeError("output mode still owns settings")
+        self.handle = _GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = wintypes.DWORD()
+        if _GetConsoleMode(self.handle, ctypes.byref(mode)):
+            enabled = mode.value | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            if enabled == mode.value:
+                return self
+            self.old_mode = mode.value
+            try:
+                _set_console_mode(self.handle, enabled)
+            except BaseException:
+                self.restore()
+                raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.restore()
+
+    def restore(self):
+        if self.old_mode is not None:
+            _set_console_mode(self.handle, self.old_mode)
+            self.old_mode = None
 
 
 class RawMode:
-    """Raw console input for one interactive session, restored on exit."""
+    """Own changes to console settings, never the borrowed console handles."""
 
     def __init__(self, fd: int):
         self.fd = fd
         self.handle = None
+        self.output_handle = None
         self.old_mode = None
         self.old_cp = None
+        self.old_output_mode = None
+
+    @property
+    def needs_restore(self):
+        return any(value is not None for value in (
+            self.old_mode, self.old_cp, self.old_output_mode))
 
     def __enter__(self):
+        if self.needs_restore:
+            raise RuntimeError("console settings are already owned")
         self.handle = _handle(self.fd)
-        self.old_mode = _console_mode(self.handle)
-        _set_console_mode(self.handle, raw_input_mode(self.old_mode))
-        self.old_cp = _GetConsoleCP()
-        if self.old_cp != CP_UTF8:
-            _SetConsoleCP(CP_UTF8)
-        _enable_virtual_terminal_output()
+        old_mode = _console_mode(self.handle)
+        old_cp = _check(_GetConsoleCP(), "GetConsoleCP")
+        self.output_handle = _GetStdHandle(STD_OUTPUT_HANDLE)
+        output = wintypes.DWORD()
+        # Redirected output has no console mode to change or restore.
+        has_output_mode = _GetConsoleMode(self.output_handle, ctypes.byref(output))
+        try:
+            # Record before each setter: an operation that fails after changing
+            # state still needs rollback. Reading snapshots alone owns nothing.
+            self.old_mode = old_mode
+            _set_console_mode(self.handle, raw_input_mode(old_mode))
+            if old_cp != CP_UTF8:
+                self.old_cp = old_cp
+                _check(_SetConsoleCP(CP_UTF8), "SetConsoleCP")
+            enabled_output = output.value | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            if has_output_mode and output.value != enabled_output:
+                self.old_output_mode = output.value
+                _set_console_mode(self.output_handle, enabled_output)
+        except BaseException:
+            self.restore()
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb):
         self.restore()
 
     def restore(self) -> None:
-        if self.old_cp is not None:
-            _SetConsoleCP(self.old_cp)
-            self.old_cp = None
-        if self.old_mode is not None:
-            _set_console_mode(self.handle, self.old_mode)
-            self.old_mode = None
+        # Independent restorations all run. Failed operations keep their
+        # snapshots for retry; nested finally blocks preserve exception chains.
+        try:
+            if self.old_output_mode is not None:
+                _set_console_mode(self.output_handle, self.old_output_mode)
+                self.old_output_mode = None
+        finally:
+            try:
+                if self.old_cp is not None:
+                    _check(_SetConsoleCP(self.old_cp), "SetConsoleCP")
+                    self.old_cp = None
+            finally:
+                if self.old_mode is not None:
+                    _set_console_mode(self.handle, self.old_mode)
+                    self.old_mode = None
 
 
 def control_bytes(fallbacks):

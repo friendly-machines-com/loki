@@ -592,11 +592,11 @@ class PtyCliUsageTests(unittest.TestCase):
 
 
 def _pty_child(argv):
-    """Entrypoint the Ctrl+C tests spawn on the pty.
+    """Component-test child on the host's real PTY or ConPTY.
 
-    Modes: ``isig`` reports whether interrupt processing is enabled before and
-    after ``TerminalMode``; ``cancel-flag`` / ``cancel-event`` read one key and
-    report whether it set ``cancel_requested`` / ``cancel_event``.
+    ``mode-rollback`` verifies native mode restoration; ``isig`` checks
+    interrupt processing;
+    ``cancel-flag``/``cancel-event`` report the effect of one input key.
     """
     import asyncio
 
@@ -604,6 +604,40 @@ def _pty_child(argv):
     from loki_agent import terminals as _terminals
 
     mode = argv[0]
+
+    def terminal_state():
+        if os.name == 'posix':
+            return _terminals.termios.tcgetattr(0)
+        native = _terminals.host_terminal_windows
+        return (native._console_mode(native._handle(0)), native._GetConsoleCP(),
+                native._console_mode(native._GetStdHandle(native.STD_OUTPUT_HANDLE)))
+
+    if mode == 'mode-rollback':
+        before = terminal_state()
+        native = _terminals.termios if os.name == 'posix' else _terminals.host_terminal_windows
+        name = 'tcsetattr' if os.name == 'posix' else '_SetConsoleMode'
+        setter = getattr(native, name)
+        first = True
+
+        def fail_after_change(*args):
+            nonlocal first
+            result = setter(*args)
+            if first:
+                first = False
+                assert terminal_state() != before, 'native setter did not change terminal state'
+                raise OSError('injected failure after native mode change')
+            return result
+
+        with mock.patch.object(native, name, new=fail_after_change):
+            try:
+                _terminals.TerminalMode(0, enabled=True).__enter__()
+            except OSError:
+                pass
+            else:
+                raise AssertionError('mode setup did not fail')
+        assert terminal_state() == before, 'failed entry changed terminal state'
+        print('ROLLBACK_RESTORED', flush=True)
+        return 0
 
     if mode == "isig":
         tmode = _terminals.TerminalMode(0, enabled=True)
@@ -667,6 +701,25 @@ def _pty_child(argv):
         return 0
 
     raise SystemExit(f"unknown pty-child mode: {mode!r}")
+
+
+class PtyResourceTests(unittest.TestCase):
+    def read_marker(self, handle, output, marker):
+        deadline = time.monotonic() + 7
+        while marker not in output and time.monotonic() < deadline:
+            output += handle.read(4096, timeout=0.1)
+        self.assertIn(marker, output, output.decode(errors='replace'))
+        return output
+
+    def test_failed_mode_entry_restores_real_terminal_settings(self):
+        handle = pty_backend.spawn_pty([
+            sys.executable, str(pathlib.Path(__file__).resolve()), '--pty-child', 'mode-rollback'])
+        try:
+            self.read_marker(handle, b'', b'ROLLBACK_RESTORED')
+        finally:
+            if handle.poll() is None:
+                handle.terminate()
+            handle.close()
 
 
 class PtyCtrlCTests(unittest.TestCase):
