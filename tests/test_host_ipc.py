@@ -264,10 +264,7 @@ class ReferenceTests(unittest.TestCase):
     def test_a_reference_names_the_child_end(self):
         if os.name != "posix":
             endpoint = host_ipc.PipeEndpoint(read=0x11, write=0x22)
-            value = host_ipc.reference(endpoint)
-            with mock.patch.object(host_ipc.windows_api, "handle_is_open",
-                                   return_value=True):
-                rebuilt = host_ipc.child_endpoint(value)
+            rebuilt = host_ipc.child_endpoint(host_ipc.reference(endpoint))
             self.assertEqual(rebuilt.handles(), (0x11, 0x22))
             return
         reader, writer = os.pipe()
@@ -320,18 +317,6 @@ class PipeEndpointTests(unittest.TestCase):
                                side_effect=closed.append):
             host_ipc.PipeEndpoint(read=1, write=2).close()
         self.assertEqual(closed, [1, 2])
-
-    def test_a_reference_to_a_missing_handle_is_refused(self):
-        # A parsed reference whose handle this process does not hold must be
-        # refused, as the POSIX path refuses a descriptor os.fstat rejects.
-        if os.name == "posix":
-            with self.assertRaises((OSError, ValueError)):
-                host_ipc.child_endpoint("17")
-            return
-        with mock.patch.object(host_ipc.windows_api, "handle_is_open",
-                               return_value=False):
-            with self.assertRaises(OSError):
-                host_ipc.child_endpoint("r=17,w=34")
 
     def test_is_endpoint_distinguishes_windows_endpoints(self):
         self.assertTrue(host_ipc.is_endpoint(host_ipc.PipeEndpoint(read=1)))

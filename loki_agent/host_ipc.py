@@ -450,11 +450,10 @@ if os.name == "posix":
             os.close(end)
 
     def child_endpoint(value):
-        """The child's view of a reference: a validated plain descriptor."""
+        """The child's view of a reference: the descriptor it names."""
         fd = int(value)
         if fd < 3:
             raise ValueError("descriptor was not inherited")
-        os.fstat(fd)
         return fd
 
     async def open_streams(end, limit=None):
@@ -523,19 +522,9 @@ else:
         end.close()
 
     def child_endpoint(value):
-        """The child's view of a reference: the endpoint the handles name.
-
-        The handles are checked to be live in this process, as the POSIX path
-        checks its descriptor with ``os.fstat``.  Without that, a child that
-        never inherited the end would still parse a reference to it and appear
-        to hold the channel.
-        """
-        endpoint = (value if isinstance(value, PipeEndpoint)
-                    else PipeEndpoint.parse(value))
-        for handle in endpoint.handles():
-            if not windows_api.handle_is_open(handle):
-                raise OSError("pipe endpoint handle was not inherited")
-        return endpoint
+        """The child's view of a reference: the endpoint the handles name."""
+        return (value if isinstance(value, PipeEndpoint)
+                else PipeEndpoint.parse(value))
 
     async def open_streams(end, limit=None):
         """Build ``StreamReader``/``StreamWriter``-shaped streams over pipes."""

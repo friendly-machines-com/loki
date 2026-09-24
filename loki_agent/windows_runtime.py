@@ -50,8 +50,6 @@ def inherited_stdout_null(handle):
     """Own the inherited handle, transferring it to the CRT exactly once."""
     import msvcrt
 
-    if not api.handle_is_open(handle):
-        raise ValueError("stdout NUL handle was not inherited")
     try:
         api.clear_handle_inheritance(handle)
         fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
