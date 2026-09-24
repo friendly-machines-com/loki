@@ -49,7 +49,7 @@ def feed_bytes(reader, data):
 
 
 class TerminalResourceSafetyTests(unittest.TestCase):
-    # Native mode/reader ownership is covered by the shared tests in
+    # Native mode/reader/watcher ownership is covered by the shared tests in
     # test_terminal_resources. These tests isolate InputSession's ordering.
 
     def test_input_session_restores_mode_when_reader_setup_fails(self):

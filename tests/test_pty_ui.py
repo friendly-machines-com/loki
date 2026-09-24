@@ -594,8 +594,8 @@ class PtyCliUsageTests(unittest.TestCase):
 def _pty_child(argv):
     """Component-test child on the host's real PTY or ConPTY.
 
-    ``mode-rollback`` verifies native mode restoration; ``isig`` checks
-    interrupt processing;
+    ``mode-rollback`` and ``resize``/``resize-cancel`` verify native resource
+    restoration and resize delivery. ``isig`` checks interrupt processing;
     ``cancel-flag``/``cancel-event`` report the effect of one input key.
     """
     import asyncio
@@ -637,6 +637,53 @@ def _pty_child(argv):
                 raise AssertionError('mode setup did not fail')
         assert terminal_state() == before, 'failed entry changed terminal state'
         print('ROLLBACK_RESTORED', flush=True)
+        return 0
+
+    if mode in ('resize', 'resize-cancel'):
+        async def resized():
+            before = terminal_state()
+            reader = _terminals.AsyncKeyReader(0, watch_resize=True, output_fd=1)
+            stable = asyncio.Event()
+
+            async def watch():
+                with _terminals.TerminalMode(0, enabled=True):
+                    async with reader:
+                        print('RESIZE_READY', flush=True)
+                        event = await asyncio.wait_for(reader.read_key(), 5)
+                        assert event.kind == 'RESIZE', event
+                        size = os.get_terminal_size(1)
+                        assert size == (100, 35), size
+                        try:
+                            event = await asyncio.wait_for(reader.read_key(), 0.35)
+                        except asyncio.TimeoutError:
+                            pass
+                        else:
+                            raise AssertionError(f'unexpected event at unchanged size: {event}')
+                        print('RESIZE_STABLE', flush=True)
+                        stable.set()
+                        if mode == 'resize-cancel':
+                            await asyncio.Future()
+
+            task = asyncio.create_task(watch())
+            if mode == 'resize-cancel':
+                await asyncio.wait_for(stable.wait(), 6)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                await task
+            assert terminal_state() == before, 'exit changed terminal state'
+            print('RESIZE_STOPPED', flush=True)
+            # Parent resizes again after STOPPED; no input thread/subscription
+            # may deliver a notification into the closed reader.
+            await asyncio.sleep(0.5)
+            assert not reader.pending, reader.pending
+            assert reader.byte_reader.queue.empty()
+            print('RESIZE_QUIET', flush=True)
+
+        asyncio.run(resized())
         return 0
 
     if mode == "isig":
@@ -710,6 +757,24 @@ class PtyResourceTests(unittest.TestCase):
             output += handle.read(4096, timeout=0.1)
         self.assertIn(marker, output, output.decode(errors='replace'))
         return output
+
+    def test_native_resize_and_shutdown_without_keyboard_input(self):
+        for mode in ('resize', 'resize-cancel'):
+            with self.subTest(mode=mode):
+                handle = pty_backend.spawn_pty([
+                    sys.executable, str(pathlib.Path(__file__).resolve()), '--pty-child', mode])
+                try:
+                    output = self.read_marker(handle, b'', b'RESIZE_READY')
+                    handle.set_size(100, 35)
+                    output = self.read_marker(handle, output, b'RESIZE_STOPPED')
+                    self.assertIn(b'RESIZE_STABLE', output)
+                    handle.set_size(110, 40)
+                    output = self.read_marker(handle, output, b'RESIZE_QUIET')
+                    self.assertNotIn(b'Traceback', output)
+                finally:
+                    if handle.poll() is None:
+                        handle.terminate()
+                    handle.close()
 
     def test_failed_mode_entry_restores_real_terminal_settings(self):
         handle = pty_backend.spawn_pty([

@@ -329,6 +329,52 @@ class InputSessionOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KeyReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resize_setup_failure_unwinds_real_byte_reader(self):
+        loop = asyncio.get_running_loop()
+        with ReaderEnvironment(loop).installed() as environment:
+            reader = terminals.AsyncKeyReader(environment.read_fd, watch_resize=True, output_fd=1)
+            operation = 'add_signal_handler' if os.name == 'posix' else 'call_later'
+            with (
+                mock.patch.object(terminals.os, 'get_terminal_size', return_value=os.terminal_size((80, 24))),
+                mock.patch.object(loop, operation, side_effect=OSError('resize installation failed')),
+                self.assertRaisesRegex(OSError, 'resize installation failed'),
+            ):
+                await reader.__aenter__()
+            environment.assert_released(self)
+            await reader.__aexit__(None, None, None)
+
+    async def test_failed_resize_removal_still_closes_input_and_can_be_retried(self):
+        loop = asyncio.get_running_loop()
+        with (
+            ReaderEnvironment(loop).installed() as environment,
+            mock.patch.object(terminals.os, 'get_terminal_size', return_value=os.terminal_size((80, 24))),
+        ):
+            reader = terminals.AsyncKeyReader(environment.read_fd, watch_resize=True, output_fd=1)
+            await reader.__aenter__()
+            if os.name == 'posix':
+                fault = mock.patch.object(loop, 'remove_signal_handler', side_effect=OSError('remove watcher'))
+            else:
+                timer = reader._resize_timer
+                cancel = type(timer).cancel
+
+                def fail_cancel(handle):
+                    if handle is timer:
+                        raise OSError('remove watcher')
+                    return cancel(handle)
+
+                fault = mock.patch.object(type(timer), 'cancel', new=fail_cancel)
+            try:
+                loop.call_soon(reader._on_resize)
+                with fault, self.assertRaisesRegex(OSError, 'remove watcher'):
+                    await reader.__aexit__(None, None, None)
+                environment.assert_released(self)
+                await asyncio.sleep(0)
+                self.assertFalse(reader.pending)
+                self.assertTrue(reader.byte_reader.queue.empty())
+            finally:
+                await reader.__aexit__(None, None, None)
+            self.assertIsNone(reader.loop)
+
     async def test_failed_reader_shutdown_remains_owned_by_key_reader(self):
         loop = asyncio.get_running_loop()
         with ReaderEnvironment(loop).installed() as environment:

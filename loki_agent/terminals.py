@@ -1530,6 +1530,7 @@ class AsyncKeyReader:
                  use_terminfo: bool = False, output_fd=None):
         self.fd = fd
         self.watch_resize = watch_resize
+        self.output_fd = output_fd
         (
             self.backspace_bytes,
             self.backspace_word_bytes,
@@ -1549,6 +1550,8 @@ class AsyncKeyReader:
         self.loop = None
         self._reader_entered = False
         self._resize_registered = False
+        self._resize_timer = None
+        self._resize_size = None
         self._watching_resize = False
         self.cancel_requested = False
         # Event-driven counterpart of cancel_requested.  Set in _feed_byte,
@@ -1568,17 +1571,43 @@ class AsyncKeyReader:
             self.byte_reader.queue.put_nowait(KEY_READER_WAKE)
 
     def _start_resize_watch(self):
-        self._resize_registered = True
-        try:
-            self.loop.add_signal_handler(signal.SIGWINCH, self._on_resize)
-        except (NotImplementedError, RuntimeError):
-            # Preserve the existing optional-signal-support behavior.
-            self._resize_registered = False
-            return
+        if os.name == "posix":
+            self._resize_registered = True
+            try:
+                self.loop.add_signal_handler(signal.SIGWINCH, self._on_resize)
+            except (NotImplementedError, RuntimeError):
+                # Preserve the existing optional-signal-support behavior.
+                self._resize_registered = False
+                return
+        else:
+            if self.output_fd is None:
+                self.output_fd = sys.stdout.fileno()
+            self._resize_size = os.get_terminal_size(self.output_fd)
+            self._resize_timer = self.loop.call_later(0.1, self._poll_resize)
         self._watching_resize = True
+
+    def _poll_resize(self):
+        if not self._watching_resize:
+            return
+        self._resize_timer = None
+        try:
+            size = os.get_terminal_size(self.output_fd)
+            if size != self._resize_size:
+                self._resize_size = size
+                self._on_resize()
+            self._resize_timer = self.loop.call_later(0.1, self._poll_resize)
+        except Exception as error:
+            # A detached/failed console must wake the consumer, not leave a
+            # silently dead timer while it waits forever for keyboard input.
+            self._watching_resize = False
+            self.byte_reader.queue.put_nowait(error)
 
     def _stop_resize_watch(self):
         self._watching_resize = False
+        if self._resize_timer is not None:
+            self._resize_timer.cancel()
+            self._resize_timer = None
+        self._resize_size = None
         if self._resize_registered:
             self.loop.remove_signal_handler(signal.SIGWINCH)
             self._resize_registered = False
@@ -1608,7 +1637,7 @@ class AsyncKeyReader:
                     await self.byte_reader.__aexit__(exc_type, exc, tb)
                     self._reader_entered = False
             finally:
-                if not self._reader_entered and not self._resize_registered:
+                if not self._reader_entered and not self._resize_registered and self._resize_timer is None:
                     self.loop = None
 
     def _emit_text_byte(self, byte: int):
