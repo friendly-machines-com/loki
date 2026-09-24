@@ -410,7 +410,7 @@ class SavedConnectionAuthorizationTests(
                     elicitation["params"]["message"],
                 )
                 self.assertIn(
-                    ROOT,
+                    json.dumps(ROOT, ensure_ascii=True),
                     elicitation["params"]["message"],
                 )
 
