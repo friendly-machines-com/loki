@@ -655,6 +655,71 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_supervisor_releases_process_after_success_error_and_cancellation(self):
+        from process_lifecycle_fixtures import process_lifecycle
+
+        for outcome in ('success', 'error', 'cancel'):
+            with self.subTest(outcome=outcome):
+                async with process_lifecycle('loki') as fixture:
+                    if outcome != 'success':
+                        fixture.supervisor.environment.update({
+                            'LOKI_STREAM': '1',
+                            'LOKI_DUMMY_STREAM_CHUNKS': '["alive", "done"]',
+                            'LOKI_DUMMY_STREAM_GATE': os.path.join(fixture.workspace, 'release'),
+                        })
+                    entered = asyncio.Event()
+                    start_runtime = runtime_isolation.start_runtime
+
+                    async def launch(*args, **kwargs):
+                        process = fixture.record_process(await start_runtime(*args, **kwargs))
+                        wait = process.wait
+                        first_wait = True
+
+                        async def observed_wait():
+                            nonlocal first_wait
+                            if first_wait:
+                                first_wait = False
+                                if outcome != 'success':
+                                    # Witness a real child past its containment
+                                    # gate and talking to the credential broker.
+                                    await fixture.ready.wait()
+                                    self.assertIsNone(process.returncode)
+                                entered.set()
+                                if outcome == 'error':
+                                    raise OSError('injected wait failure')
+                                if outcome == 'cancel':
+                                    # Hold the supervisor at a cancellable wait;
+                                    # the real child and its resources stay live.
+                                    await asyncio.Future()
+                            else:
+                                self.assertIsNone(fixture.delegations[0].owner_parent)
+                            return await wait()
+
+                        process.wait = observed_wait
+                        return process
+
+                    with mock.patch.object(runtime_isolation, 'start_runtime', new=launch):
+                        arguments = ['--headless', '--prompt', 'hello',
+                                     '--shell-cwd', fixture.workspace]
+                        task = asyncio.create_task(fixture.supervisor.run_terminal_runtime(
+                            fixture.launcher, arguments))
+                        try:
+                            await asyncio.wait_for(entered.wait(), 10)
+                            if outcome == 'cancel':
+                                task.cancel()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await asyncio.wait_for(task, 10)
+                            elif outcome == 'error':
+                                with self.assertRaisesRegex(OSError, 'injected wait failure'):
+                                    await asyncio.wait_for(task, 10)
+                            else:
+                                self.assertEqual(await asyncio.wait_for(task, 10), 0)
+                        finally:
+                            if not task.done():
+                                task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                    await fixture.assert_released(self)
+
     async def test_owner_closes_even_when_transport_close_fails(self):
         class Owner:
             closed = False

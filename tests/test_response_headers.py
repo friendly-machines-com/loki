@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest import mock
 from loki_entrypoints import configure_container, entrypoint
@@ -302,6 +303,64 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         loki._DEFAULT_SESSION = self.session
         self.addCleanup(setattr, loki, "_DEFAULT_SESSION", self.previous)
 
+    async def start_child(self, *arguments, **options):
+        child = await asyncio.create_subprocess_exec(*arguments, **options)
+        # Registered after the directory cleanup, hence run before it. A
+        # timed-out communicate() cancels readers, not the child process.
+        self.addAsyncCleanup(self.stop_child, child)
+        return child
+
+    async def stop_child(self, child):
+        if child.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                child.terminate()
+        try:
+            await asyncio.wait_for(child.communicate(), 5)
+        except asyncio.TimeoutError:
+            if child.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    child.kill()
+            await asyncio.wait_for(child.communicate(), 5)
+
+    async def test_child_cleanup_reaps_after_timeout_or_cancellation(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                child = await self.start_child(
+                    sys.executable, '-c',
+                    'import time; print("ready", flush=True); time.sleep(60)',
+                    cwd=self.workspace, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE)
+                self.assertEqual(await asyncio.wait_for(child.stdout.readline(), 5), b'ready\n')
+                communication = asyncio.create_task(child.communicate())
+                if cancel:
+                    await asyncio.sleep(0)
+                    communication.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await communication
+                else:
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await asyncio.wait_for(communication, 0.01)
+                await self.stop_child(child)
+                self.assertIsNotNone(child.returncode)
+        # On Windows the live children would keep this directory in use.
+        os.rmdir(self.workspace)
+
+    async def test_child_cleanup_escalates_and_drains_after_terminate_timeout(self):
+        child = mock.Mock(returncode=None)
+
+        async def communicate():
+            if child.kill.called:
+                child.returncode = 1
+                return b'', b''
+            raise asyncio.TimeoutError
+
+        child.communicate = mock.AsyncMock(side_effect=communicate)
+        await self.stop_child(child)
+        child.terminate.assert_called_once_with()
+        child.kill.assert_called_once_with()
+        self.assertEqual(child.communicate.await_count, 2)
+        self.assertEqual(child.returncode, 1)
+
     async def server(self, responses):
         async def serve(reader, writer):
             try:
@@ -367,7 +426,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_KEY": "test-key-not-for-recording",
         })
         configure_container(environment, self.workspace)
-        child = await asyncio.create_subprocess_exec(
+        child = await self.start_child(
             entrypoint("loki"), "--headless", "--prompt", "Say ok",
             cwd=self.workspace, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -378,7 +437,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["endpoints"][0]["headers"]["x-remaining"]["value"], "12")
         self.assertNotIn("test-key-not-for-recording", snapshot.read_text())
         self.assertNotIn("secret-cookie", snapshot.read_text())
-        child = await asyncio.create_subprocess_exec(
+        child = await self.start_child(
             entrypoint("loki"), "status", "--json",
             cwd=self.workspace, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -403,7 +462,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_API_KEY": "test-key",
         })
         configure_container(environment, self.workspace)
-        child = await asyncio.create_subprocess_exec(
+        child = await self.start_child(
             entrypoint("loki-acp"), cwd=self.workspace, env=environment,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
@@ -432,9 +491,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             output, errors = await asyncio.wait_for(child.communicate(), 10)
             self.assertEqual(child.returncode, 0, errors.decode())
         finally:
-            if child.returncode is None:
-                child.kill()
-                await child.communicate()
+            await self.stop_child(child)
         snapshot = Path(self.directory.name) / "loki" / "response-headers.json"
         saved = json.loads(snapshot.read_text())
         self.assertEqual(saved["endpoints"][0]["headers"]["x-remaining"]["value"], "11")

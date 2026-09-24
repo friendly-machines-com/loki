@@ -149,10 +149,11 @@ if sys.platform == "win32":
             current_directory=os.getcwd())
 
     def close_runtime_process(process) -> None:
-        # A contained worker's transport owns its pipes, its native process
-        # handles and its job object, and releases them when the worker has
-        # exited and its pipes are drained.  Nothing is left for the caller.
-        return None
+        # Terminal runtimes hand native ownership to the supervisor. ACP
+        # workers instead hand it to their transport; the front must not close
+        # those handles underneath the transport's exit observer.
+        if isinstance(process, windows_runtime.ContainedProcess):
+            process.close()
 
 else:
     from . import runtime_isolations

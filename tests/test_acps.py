@@ -149,36 +149,30 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(channel.credential_delegation)
 
     async def test_close_releases_the_platform_process(self):
-        # On Windows the platform process owns the stdio threads, the front
-        # pipe handles and the kill-on-close job; close must hand it back to
-        # the platform seam after the reader has stopped.
-        class Output:
-            async def readline(self):
-                return b""
+        from process_lifecycle_fixtures import process_lifecycle
 
-        class Stdin:
-            def close(self):
-                pass
-
-            async def wait_closed(self):
-                pass
-
-        class Process:
-            stdout = Output()
-            stdin = Stdin()
-            returncode = 0
-
-            async def wait(self):
-                return 0
-
-        released = mock.Mock()
-        with mock.patch.object(
-                acp.runtime_isolation, "close_runtime_process",
-                new=released):
-            channel = acp.WorkerChannel(
-                "session", Process(), lambda message: None, None)
-            await channel.close()
-        released.assert_called_once_with(channel.process)
+        async with process_lifecycle('loki-acp') as fixture:
+            delegation = await fixture.supervisor.delegate()
+            process = fixture.record_process(await acp.runtime_isolation.start_worker(
+                fixture.workspace, fixture.supervisor.environment, delegation))
+            delegation.child_spawned()
+            channel = acp.WorkerChannel('session', process, lambda message: None, delegation)
+            try:
+                # A reply proves that the real worker passed its startup gate
+                # and established its delegated runtime, not just that it spawned.
+                self.assertEqual(await asyncio.wait_for(
+                    channel.request('session/cancel', {}), 10), {})
+            finally:
+                await asyncio.wait_for(channel.close(), 10)
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(channel._reader_task.done())
+            self.assertTrue(process.stdout.at_eof())
+            self.assertTrue(process.stdin.is_closing())
+            self.assertIsNone(channel.credential_delegation)
+            await fixture.assert_released(self)
+            # Repeated caller cleanup must not compete with transport ownership.
+            await asyncio.wait_for(channel.close(), 10)
+            await fixture.assert_released(self)
 
     async def test_a_dead_worker_fails_the_pending_request(self):
         # A worker that exits without answering must fail the request that

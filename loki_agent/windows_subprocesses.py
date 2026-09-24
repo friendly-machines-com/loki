@@ -303,7 +303,7 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
 
         self._pid = self._proc.pid
         self._extra['subprocess'] = self._proc
-        self._loop.create_task(self._connect_pipes(waiter))
+        self._connect_task = self._loop.create_task(self._connect_pipes(waiter))
 
     def _start(self, args, shell, stdin, stdout, stderr, bufsize, **kwargs):
         raise NotImplementedError
@@ -675,14 +675,19 @@ class ContainedWorkerTransport(BaseSubprocessTransport):
         self._exit_task = self._loop.create_task(self._watch_exit())
 
     async def _watch_exit(self):
-        returncode = await self._proc.wait()
-        self._process_exited(returncode)
+        try:
+            returncode = await self._proc.wait()
+            self._process_exited(returncode)
+        finally:
+            if self._closed:
+                self._release()
 
     def close(self):
         super().close()
-        if self._exit_task is not None and not self._exit_task.done():
-            self._exit_task.cancel()
-        self._release()
+        # close() requests termination, but the observer must still publish
+        # the exit. Releasing handles or cancelling it here strands waiters.
+        if self._exit_task is None or self._exit_task.done():
+            self._release()
 
     def _call_connection_lost(self, exc):
         proc = self._proc
@@ -712,7 +717,21 @@ async def create_worker_process(*, workspace, environment, arguments,
     except (SystemExit, KeyboardInterrupt):
         raise
     except BaseException:
-        transport.close()
-        await transport._wait()
+        # Cancelling the caller cancels the waiter, not pipe attachment. Join
+        # attachment cleanup before returning so it cannot publish late pipes.
+        proc = transport._proc
+        transport._connect_task.cancel()
+        try:
+            await transport._connect_task
+        finally:
+            transport.close()
+            try:
+                # Attachment may have been cancelled before its coroutine
+                # started, in which case it never took ownership of these.
+                if proc is not None:
+                    for raw_pipe in (proc.stdin, proc.stdout):
+                        raw_pipe.close()
+            finally:
+                await transport._exit_task
         raise
     return Process(transport, protocol, loop)
