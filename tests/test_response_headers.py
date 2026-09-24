@@ -322,29 +322,44 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                     child.kill()
             await asyncio.wait_for(child.communicate(), 5)
 
-    async def test_child_cleanup_reaps_after_timeout_or_cancellation(self):
-        for cancel in (False, True):
-            with self.subTest(cancel=cancel):
-                child = await self.start_child(
-                    sys.executable, '-c',
-                    'import sys, time; '
-                    "sys.stdout.buffer.write(b'ready\\n'); "
-                    'sys.stdout.buffer.flush(); time.sleep(60)',
-                    cwd=self.workspace, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE)
-                self.assertEqual(await asyncio.wait_for(child.stdout.readline(), 5), b'ready\n')
-                communication = asyncio.create_task(child.communicate())
-                if cancel:
-                    await asyncio.sleep(0)
-                    communication.cancel()
-                    with self.assertRaises(asyncio.CancelledError):
-                        await communication
-                else:
-                    with self.assertRaises(asyncio.TimeoutError):
-                        await asyncio.wait_for(communication, 0.01)
-                await self.stop_child(child)
+    async def test_child_cleanup_reaps_after_timeout_cancellation_or_assertion(self):
+        for outcome in ('timeout', 'cancel', 'assertion'):
+            with self.subTest(outcome=outcome):
+                expected_error = (
+                    self.assertRaisesRegex(AssertionError, 'injected readiness assertion')
+                    if outcome == 'assertion' else contextlib.nullcontext())
+                with expected_error:
+                    # Write the readiness byte by byte through the buffer, so
+                    # the child interpreter's stdout text mode cannot turn it
+                    # into a different line ending than the test expects.
+                    child = await self.start_child(
+                        sys.executable, '-c',
+                        'import sys, time; '
+                        "sys.stdout.buffer.write(b'ready\\n'); "
+                        'sys.stdout.buffer.flush(); time.sleep(60)',
+                        cwd=self.workspace, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE)
+                    try:
+                        line = await asyncio.wait_for(child.stdout.readline(), 5)
+                        self.assertEqual(line, b'ready\n')
+                        self.assertIsNone(child.returncode)
+                        if outcome == 'assertion':
+                            self.fail('injected readiness assertion')
+                        communication = asyncio.create_task(child.communicate())
+                        if outcome == 'cancel':
+                            await asyncio.sleep(0)
+                            communication.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await communication
+                        else:
+                            with self.assertRaises(asyncio.TimeoutError):
+                                await asyncio.wait_for(communication, 0.01)
+                    finally:
+                        # Registered test cleanup runs too late for this
+                        # method's rmdir, especially after a failed subtest.
+                        await self.stop_child(child)
                 self.assertIsNotNone(child.returncode)
-        # On Windows the live children would keep this directory in use.
+        # On Windows a child still using this cwd would prevent removal.
         os.rmdir(self.workspace)
 
     async def test_child_cleanup_escalates_and_drains_after_terminate_timeout(self):
