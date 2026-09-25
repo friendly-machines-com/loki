@@ -68,6 +68,28 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
 PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
 
+# Access masks, process rights and security-information flags (winnt.h), named
+# for the same reason.
+SE_FILE_OBJECT = 1
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+READ_CONTROL = 0x00020000
+WRITE_DAC = 0x00040000
+WRITE_OWNER = 0x00080000
+SYNCHRONIZE = 0x00100000
+FILE_WRITE_DATA = 0x00000002
+FILE_APPEND_DATA = 0x00000004
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+PROCESS_TERMINATE = 0x0001
+PROCESS_VM_OPERATION = 0x0008
+PROCESS_VM_READ = 0x0010
+PROCESS_VM_WRITE = 0x0020
+PROCESS_DUP_HANDLE = 0x0040
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_QUERY = 0x0008
+DACL_SECURITY_INFORMATION = 0x00000004
+PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+
 
 class SecurityCapabilities(C.Structure):
     _fields_ = [('sid', HANDLE), ('capabilities', HANDLE),
@@ -249,8 +271,10 @@ class AppContainers(NativeCalls):
             if not present.value or not acl.value:
                 raise ValueError('probe requires an explicit non-null DACL')
             # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION.
-            error = self.set_security(str(path), 1, 4 | 0x80000000,
-                                      None, None, acl, None)
+            error = self.set_security(
+                str(path), SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None, None, acl, None)
             if error:
                 raise C.WinError(error)
         finally:
@@ -921,9 +945,10 @@ def verify_task_route(report_path, owner, native=None, api=None):
                            % payload['credential_access'])
     if native is not None and api is not None:
         handle = native.check(native.open_process(
-            0x1000 | 0x100000 | 1, False, payload['pid']))
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+            | PROCESS_TERMINATE, False, payload['pid']))
         try:
-            token = api.token(handle, 8)
+            token = api.token(handle, TOKEN_QUERY)
             try:
                 snapshot = api.snapshot(token)
             finally:
@@ -1289,17 +1314,18 @@ def attempts(native, manifest):
 
     denied('read', lambda: (secret / 'read').read_bytes())
     denied('truncate', lambda: (secret / 'truncate').write_bytes(b'changed'))
-    denied('native-read-right', lambda: open_rights(secret / 'read', 0x80000000))
-    denied('native-write-right', lambda: open_rights(secret / 'truncate', 2))
+    denied('native-read-right', lambda: open_rights(secret / 'read', GENERIC_READ))
+    denied('native-write-right', lambda: open_rights(secret / 'truncate',
+                                                     FILE_WRITE_DATA))
     denied('native-hardlink-read', lambda: open_rights(
-        workspace / 'alias', 0x80000000))
+        workspace / 'alias', GENERIC_READ))
     denied('native-junction-read', lambda: open_rights(
-        workspace / 'junction' / 'read', 0x80000000))
+        workspace / 'junction' / 'read', GENERIC_READ))
 
-    denied('append-right', lambda: open_rights(secret / 'read', 4))
-    denied('write-dacl-right', lambda: open_rights(secret / 'regrant', 0x40000))
-    denied('write-owner-right', lambda: open_rights(secret / 'regrant', 0x80000))
-    denied('trusted-script-write', lambda: open_rights(__file__, 0x40000000))
+    denied('append-right', lambda: open_rights(secret / 'read', FILE_APPEND_DATA))
+    denied('write-dacl-right', lambda: open_rights(secret / 'regrant', WRITE_DAC))
+    denied('write-owner-right', lambda: open_rights(secret / 'regrant', WRITE_OWNER))
+    denied('trusted-script-write', lambda: open_rights(__file__, GENERIC_WRITE))
     denied('delete', lambda: (secret / 'delete').unlink())
     replacement = workspace / 'replacement'
     replacement.write_bytes(b'changed')
@@ -1310,10 +1336,11 @@ def attempts(native, manifest):
     denied('regrant-directory-dacl', lambda: native.acl(secret, grant))
     denied('rename-directory', lambda: os.rename(secret, workspace / 'stolen'))
 
-    for name, rights in [('broker-memory-read', 0x10),
-                         ('broker-memory-write', 0x20 | 8),
-                         ('broker-handle-duplication', 0x40),
-                         ('broker-dacl-write', 0x40000)]:
+    for name, rights in [('broker-memory-read', PROCESS_VM_READ),
+                         ('broker-memory-write',
+                          PROCESS_VM_WRITE | PROCESS_VM_OPERATION),
+                         ('broker-handle-duplication', PROCESS_DUP_HANDLE),
+                         ('broker-dacl-write', WRITE_DAC)]:
         def open_broker(rights=rights):
             handle = native.check(native.open_process(rights, False,
                                                       manifest['broker_pid']))
@@ -2664,8 +2691,8 @@ class AppContainerTests(unittest.TestCase):
             # directory is refused by mandatory policy whatever the DACL grants
             # -- the same write-up distinction the escape probes record, and the
             # reason a granted create right can still read as denied.
-            label_handle = native.open(credentials, access=0x20000,
-                                       flags=0x02000000)  # READ_CONTROL|BACKUP
+            label_handle = native.open(credentials, access=READ_CONTROL,
+                                       flags=FILE_FLAG_BACKUP_SEMANTICS)
             try:
                 directory_label = native.mandatory_label(label_handle)
             finally:
@@ -2834,7 +2861,7 @@ class AppContainerTests(unittest.TestCase):
         # container modifying a broker-created file cannot be interpreted
         # without them.
         (workspace / 'existing-medium').write_bytes(b'MEDIUM')
-        handle = native.open(workspace / 'existing-medium', access=0x20000)
+        handle = native.open(workspace / 'existing-medium', access=READ_CONTROL)
         try:
             created_label = native.mandatory_label(handle)
         finally:
@@ -2874,9 +2901,10 @@ class AppContainerTests(unittest.TestCase):
         api = escape_helpers['Escapes'](native, primitives, ExtendedStartups, ProcessInfos)
         # Kernel identity plus real memory/handle controls prove the target and
         # helpers work for the unrestricted same-user broker before denial tests.
-        process = native.check(native.open_process(0x1000, False, peer.pid))
+        process = native.check(native.open_process(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, peer.pid))
         try:
-            token = api.token(process, 8)
+            token = api.token(process, TOKEN_QUERY)
             try:
                 snapshot = api.snapshot(token)
                 self.assertEqual(snapshot['user'], owner)
@@ -3055,7 +3083,7 @@ class AppContainerTests(unittest.TestCase):
                     for path in reports[1:]:
                         pid = int(path.read_text())
                         handle = native.check(native.open_process(
-                            0x1000 | 0x100000 | 1, False, pid))
+                            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, pid))
                         member = W.BOOL()
                         try:
                             native.check(native.in_job(handle, job, C.byref(member)))
@@ -3117,7 +3145,7 @@ class AppContainerTests(unittest.TestCase):
                 self.assertEqual(payload['broker_pid'], sub_broker.pid)
                 for pid in payload['tree_pids']:
                     handle = native.check(native.open_process(
-                        0x1000 | 0x100000 | 1, False, pid))
+                        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, pid))
                     member = W.BOOL()
                     try:
                         # No job handle crosses the process boundary: membership
@@ -3132,7 +3160,7 @@ class AppContainerTests(unittest.TestCase):
                     self.assertEqual(native.wait(handle, 0), 258)
                 # Kill the disposable broker without executing any of its code.
                 broker_handle = native.check(native.open_process(
-                    0x1000 | 0x100000 | 1, False, sub_broker.pid))
+                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, sub_broker.pid))
                 try:
                     native.check(native.terminate(broker_handle, 1))
                     sub_broker.wait(timeout=10)
@@ -3184,7 +3212,7 @@ class AppContainerTests(unittest.TestCase):
                         (directory / 'race-pids').read_text().split()]
                 survivors = []
                 for pid in pids:
-                    handle = native.open_process(0x1000 | 0x100000 | 1, False, pid)
+                    handle = native.open_process(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, pid)
                     if not handle:
                         continue
                     try:
@@ -3212,7 +3240,7 @@ class AppContainerTests(unittest.TestCase):
             """Inspect a witness process only while verifiably still running."""
             try:
                 handle = native.check(native.open_process(
-                    0x1000 | 0x100000 | 1, False, payload['pid']))
+                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, payload['pid']))
             except OSError:
                 return None
             try:
