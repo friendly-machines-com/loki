@@ -15,11 +15,10 @@ import ctypes
 from ctypes import wintypes
 
 from .windows_api import (
-    DACL_SECURITY_INFORMATION,
     ERROR_SUCCESS,
-    PROTECTED_DACL_SECURITY_INFORMATION,
     SDDL_REVISION_1,
     SE_FILE_OBJECT,
+    SecurityInformation,
     WindowsApiError,
     bind,
     sid_text,
@@ -63,9 +62,9 @@ def set_dacl_sddl(path: str, sddl: str) -> None:
             raise WindowsApiError("GetSecurityDescriptorDacl failed")
         if not present.value or not dacl.value:
             raise WindowsApiError("security descriptor carries no explicit DACL")
-        flags = DACL_SECURITY_INFORMATION
+        flags = SecurityInformation.DACL_SECURITY_INFORMATION
         if 'P' in sddl.split('(', 1)[0][2:]:
-            flags |= PROTECTED_DACL_SECURITY_INFORMATION
+            flags |= SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION
         status = set_named(
             path, SE_FILE_OBJECT, flags, None, None, dacl, None)
         if status != ERROR_SUCCESS:
@@ -109,9 +108,9 @@ def set_handle_dacl_sddl(handle, sddl: str) -> None:
             raise WindowsApiError("GetSecurityDescriptorDacl failed")
         if not present.value or not dacl.value:
             raise WindowsApiError("security descriptor carries no explicit DACL")
-        flags = DACL_SECURITY_INFORMATION
+        flags = SecurityInformation.DACL_SECURITY_INFORMATION
         if 'P' in sddl.split('(', 1)[0][2:]:
-            flags |= PROTECTED_DACL_SECURITY_INFORMATION
+            flags |= SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION
         status = set_info(handle, SE_FILE_OBJECT, flags, None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}")

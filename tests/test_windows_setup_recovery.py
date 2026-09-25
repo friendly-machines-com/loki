@@ -208,7 +208,12 @@ class RulesTests(unittest.TestCase):
 
 class InheritanceTests(unittest.TestCase):
     def test_only_protected_sddl_requests_disabling_inheritance(self):
-        for sddl, expected in [('D:AI(A;;FR;;;SY)', 4), ('D:P(A;;FR;;;SY)', 4 | 0x80000000)]:
+        for sddl, expected in [
+                ('D:AI(A;;FR;;;SY)',
+                 api.SecurityInformation.DACL_SECURITY_INFORMATION),
+                ('D:P(A;;FR;;;SY)',
+                 api.SecurityInformation.DACL_SECURITY_INFORMATION
+                 | api.SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION)]:
             set_named = mock.Mock(return_value=0)
 
             def convert(text, revision, output, length):
@@ -233,7 +238,12 @@ class InheritanceTests(unittest.TestCase):
     def test_handle_setter_requests_disabling_inheritance_like_the_named_one(self):
         # The handle-relative grant must carry the same protected-flag rule as
         # the pathname one, or a re-applied grant could drop DACL protection.
-        for sddl, expected in [('D:AI(A;;FR;;;SY)', 4), ('D:P(A;;FR;;;SY)', 4 | 0x80000000)]:
+        for sddl, expected in [
+                ('D:AI(A;;FR;;;SY)',
+                 api.SecurityInformation.DACL_SECURITY_INFORMATION),
+                ('D:P(A;;FR;;;SY)',
+                 api.SecurityInformation.DACL_SECURITY_INFORMATION
+                 | api.SecurityInformation.PROTECTED_DACL_SECURITY_INFORMATION)]:
             set_info = mock.Mock(return_value=0)
 
             def convert(text, revision, output, length):

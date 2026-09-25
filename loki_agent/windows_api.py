@@ -164,13 +164,20 @@ def known_folder(folder_id: str,
 # interpreters when CreateAppContainerProfile is called for an existing name.
 PROFILE_ALREADY_EXISTS = 0x800700B7
 
-DACL_SECURITY_INFORMATION = 0x00000004
-# LABEL_SECURITY_INFORMATION asks for the mandatory integrity label.  The
-# label, not the DACL, is what a low-integrity AppContainer meets first: an
-# object with no label is treated as medium, and no-write-up then refuses a
-# write the DACL grants.
-LABEL_SECURITY_INFORMATION = 0x00000010
-PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+
+# SECURITY_INFORMATION (winnt.h): which parts of a security descriptor a call
+# asks for (or sets).
+class SecurityInformation(enum.IntFlag):
+    DACL_SECURITY_INFORMATION = 0x00000004
+    # LABEL_SECURITY_INFORMATION asks for the mandatory integrity label.  The
+    # label, not the DACL, is what a low-integrity AppContainer meets first: an
+    # object with no label is treated as medium, and no-write-up then refuses a
+    # write the DACL grants.
+    LABEL_SECURITY_INFORMATION = 0x00000010
+    PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+    OWNER_SECURITY_INFORMATION = 0x00000001
+
+
 SE_FILE_OBJECT = 1
 # SE_OBJECT_TYPE for kernel objects (processes, threads, jobs, ...), used when
 # a process object's DACL is replaced rather than a file's.
@@ -276,13 +283,13 @@ def dacl_sddl(path: str) -> str:
                       ctypes.c_void_p)
 
     descriptor = ctypes.c_void_p()
-    status = get_named(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+    status = get_named(path, SE_FILE_OBJECT, SecurityInformation.DACL_SECURITY_INFORMATION,
                        None, None, None, None, ctypes.byref(descriptor))
     if status != ERROR_SUCCESS:
         raise WindowsApiError(f"GetNamedSecurityInfoW({path!r}) failed: {status}",
                               status=status)
     try:
-        return _sddl_from_descriptor(descriptor, DACL_SECURITY_INFORMATION)
+        return _sddl_from_descriptor(descriptor, SecurityInformation.DACL_SECURITY_INFORMATION)
     finally:
         local_free(descriptor)
 
@@ -406,13 +413,13 @@ def label_sddl(path: str) -> str:
                       ctypes.c_void_p)
 
     descriptor = ctypes.c_void_p()
-    status = get_named(path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+    status = get_named(path, SE_FILE_OBJECT, SecurityInformation.LABEL_SECURITY_INFORMATION,
                        None, None, None, None, ctypes.byref(descriptor))
     if status != ERROR_SUCCESS:
         raise WindowsApiError(
             f"GetNamedSecurityInfoW({path!r}) failed: {status}", status=status)
     try:
-        return _sddl_from_descriptor(descriptor, LABEL_SECURITY_INFORMATION)
+        return _sddl_from_descriptor(descriptor, SecurityInformation.LABEL_SECURITY_INFORMATION)
     finally:
         local_free(descriptor)
 
@@ -428,7 +435,7 @@ def handle_owner_sid(handle) -> str:
                       ctypes.c_void_p)
     owner = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
-    status = get(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+    status = get(handle, SE_FILE_OBJECT, SecurityInformation.OWNER_SECURITY_INFORMATION,
                  ctypes.byref(owner), None, None, None,
                  ctypes.byref(descriptor))
     if status != ERROR_SUCCESS:
@@ -453,7 +460,7 @@ def handle_dacl_sddl(handle, object_type: int = SE_FILE_OBJECT):
                       ctypes.c_void_p)
     dacl = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
-    status = get(handle, object_type, DACL_SECURITY_INFORMATION,
+    status = get(handle, object_type, SecurityInformation.DACL_SECURITY_INFORMATION,
                  None, None, ctypes.byref(dacl), None,
                  ctypes.byref(descriptor))
     if status != ERROR_SUCCESS:
@@ -462,7 +469,7 @@ def handle_dacl_sddl(handle, object_type: int = SE_FILE_OBJECT):
     try:
         if not dacl.value:
             return None
-        return _sddl_from_descriptor(descriptor, DACL_SECURITY_INFORMATION)
+        return _sddl_from_descriptor(descriptor, SecurityInformation.DACL_SECURITY_INFORMATION)
     finally:
         local_free(descriptor)
 
@@ -505,7 +512,7 @@ def set_handle_dacl(handle, sddl: str, object_type: int = SE_FILE_OBJECT) -> Non
             raise WindowsApiError("GetSecurityDescriptorDacl failed")
         if not present.value or not dacl.value:
             raise WindowsApiError("the descriptor has no DACL to apply")
-        status = set_info(handle, object_type, DACL_SECURITY_INFORMATION,
+        status = set_info(handle, object_type, SecurityInformation.DACL_SECURITY_INFORMATION,
                           None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}",
@@ -550,7 +557,7 @@ def set_named_dacl(path: str, sddl: str) -> None:
             raise WindowsApiError("GetSecurityDescriptorDacl failed")
         if not present.value or not dacl.value:
             raise WindowsApiError("the descriptor has no DACL to apply")
-        status = set_named(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        status = set_named(path, SE_FILE_OBJECT, SecurityInformation.DACL_SECURITY_INFORMATION,
                            None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(
@@ -1306,7 +1313,6 @@ FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 FILE_READ_ATTRIBUTES = 0x00000080
 FILE_RENAME_INFORMATION = 10
 FILE_DISPOSITION_INFO = 4
-OWNER_SECURITY_INFORMATION = 0x00000001
 # NTSTATUS values.  ``NtCreateFile`` returns these directly; the caller
 # translates the ones it can name to the OSError the storage protocol expects.
 STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
