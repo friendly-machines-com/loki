@@ -213,7 +213,7 @@ def close(handle) -> None:
 def open_directory(path: str):
     try:
         handle = windows_api.open_with_access(
-            path, windows_api.GENERIC_READ,
+            path, windows_api.AccessMask.GENERIC_READ,
             flags=(windows_api.FILE_FLAG_BACKUP_SEMANTICS
                    | windows_api.FILE_OPEN_REPARSE_POINT))
     except windows_api.WindowsApiError as error:
@@ -237,7 +237,7 @@ def open_read_at(directory, name: str):
     _check_name(name)
     return _open_relative(
         directory, name,
-        windows_api.GENERIC_READ | windows_api.SYNCHRONIZE,
+        windows_api.AccessMask.GENERIC_READ | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.FILE_OPEN, _NON_DIRECTORY)
 
 
@@ -255,8 +255,9 @@ def create_exclusive_at(directory, name: str, mode: int):
     # handle it was given before writing anything.
     return _open_relative(
         directory, name,
-        windows_api.GENERIC_WRITE | windows_api.FILE_READ_ATTRIBUTES
-        | windows_api.SYNCHRONIZE,
+        windows_api.AccessMask.GENERIC_WRITE
+        | windows_api.AccessMask.FILE_READ_ATTRIBUTES
+        | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.FILE_CREATE, _NON_DIRECTORY,
         windows_api.FILE_ATTRIBUTE_NORMAL)
 
@@ -265,8 +266,10 @@ def open_lock_file_at(directory, name: str, mode: int):
     _check_name(name)
     return _open_relative(
         directory, name,
-        windows_api.GENERIC_READ | windows_api.GENERIC_WRITE
-        | windows_api.FILE_READ_ATTRIBUTES | windows_api.SYNCHRONIZE,
+        windows_api.AccessMask.GENERIC_READ
+        | windows_api.AccessMask.GENERIC_WRITE
+        | windows_api.AccessMask.FILE_READ_ATTRIBUTES
+        | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.FILE_OPEN_IF, _NON_DIRECTORY)
 
 
@@ -279,7 +282,7 @@ def replace_at(directory, temporary: str, name: str) -> None:
     # names the object even if its entry has been swapped meanwhile.
     source = _open_relative(
         directory, temporary,
-        windows_api.DELETE | windows_api.SYNCHRONIZE,
+        windows_api.AccessMask.DELETE | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.FILE_OPEN, _NON_DIRECTORY)
     try:
         try:
@@ -296,7 +299,7 @@ def unlink_at(directory, name: str) -> None:
     # target; delete is disposition-on-close, performed when the handle closes.
     target = _open_relative(
         directory, name,
-        windows_api.DELETE | windows_api.SYNCHRONIZE,
+        windows_api.AccessMask.DELETE | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.FILE_OPEN, _NON_DIRECTORY)
     try:
         try:
@@ -316,7 +319,7 @@ def describe(handle) -> FileFacts:
 def describe_path(path: str) -> FileFacts:
     try:
         handle = windows_api.open_with_access(
-            path, windows_api.GENERIC_READ,
+            path, windows_api.AccessMask.GENERIC_READ,
             flags=(windows_api.FILE_FLAG_BACKUP_SEMANTICS
                    | windows_api.FILE_OPEN_REPARSE_POINT))
     except windows_api.WindowsApiError as error:

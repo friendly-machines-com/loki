@@ -114,11 +114,12 @@ def probe_containment(workspace: str, expected_package: str) -> list[Check]:
     checks = _identity_checks(expected_package)
     checks.append(_reachable(
         "workspace reachable", workspace,
-        windows_api.GENERIC_READ | windows_api.GENERIC_WRITE,
+        windows_api.AccessMask.GENERIC_READ
+        | windows_api.AccessMask.GENERIC_WRITE,
         "the workspace opens read-write"))
     checks.extend(_credential_checks())
     checks.append(_denied(
-        "cannot rewrite a DACL", workspace, windows_api.WRITE_DAC,
+        "cannot rewrite a DACL", workspace, windows_api.AccessMask.WRITE_DAC,
         "requesting WRITE_DAC on a granted path is denied"))
     return checks
 
@@ -128,18 +129,20 @@ def probe_containment(workspace: str, expected_package: str) -> list[Check]:
 # because a container that could delete the directory or rewrite its DACL would
 # defeat the store without ever reading a token.
 _CREDENTIAL_DIRECTORY_PROBES = (
-    ("credentials unlistable", windows_api.GENERIC_READ,
+    ("credentials unlistable", windows_api.AccessMask.GENERIC_READ,
      "listing the credential directory is denied"),
     # Creating an entry is the claim that still holds on a fresh install, when
     # there is no credential file to open.  A directory's FILE_WRITE_DATA is
     # FILE_ADD_FILE, so the open tests create rights without creating anything.
-    ("cannot create credentials", windows_api.FILE_WRITE_DATA,
+    ("cannot create credentials", windows_api.AccessMask.FILE_WRITE_DATA,
      "creating an entry in the credential directory is denied"),
-    ("credential directory not deletable", windows_api.DELETE,
+    ("credential directory not deletable", windows_api.AccessMask.DELETE,
      "the credential directory cannot be opened to delete it"),
-    ("credential directory DACL not rewritable", windows_api.WRITE_DAC,
+    ("credential directory DACL not rewritable",
+     windows_api.AccessMask.WRITE_DAC,
      "the credential directory cannot be opened to rewrite its DACL"),
-    ("credential directory owner not rewritable", windows_api.WRITE_OWNER,
+    ("credential directory owner not rewritable",
+     windows_api.AccessMask.WRITE_OWNER,
      "the credential directory cannot be opened to change its owner"),
 )
 
@@ -148,15 +151,15 @@ _CREDENTIAL_DIRECTORY_PROBES = (
 # cannot write, truncate, delete or re-own anything: the access check happens
 # at open, so each entry measures permission without performing the act.
 _CREDENTIAL_FILE_PROBES = (
-    ("not writable", windows_api.GENERIC_WRITE,
+    ("not writable", windows_api.AccessMask.GENERIC_WRITE,
      "cannot be opened for write"),
-    ("not appendable", windows_api.FILE_APPEND_DATA,
+    ("not appendable", windows_api.AccessMask.FILE_APPEND_DATA,
      "cannot be opened for append"),
-    ("not deletable", windows_api.DELETE,
+    ("not deletable", windows_api.AccessMask.DELETE,
      "cannot be opened to delete it"),
-    ("DACL not rewritable", windows_api.WRITE_DAC,
+    ("DACL not rewritable", windows_api.AccessMask.WRITE_DAC,
      "cannot be opened to rewrite its DACL"),
-    ("owner not rewritable", windows_api.WRITE_OWNER,
+    ("owner not rewritable", windows_api.AccessMask.WRITE_OWNER,
      "cannot be opened to change its owner"),
 )
 
@@ -189,7 +192,7 @@ def _credential_checks() -> list[Check]:
 
 def _credential_file_checks(asset: str, label: str) -> list[Check]:
     """Denials for one credential file, or a pass when it does not exist yet."""
-    error = _attempt(asset, windows_api.GENERIC_READ)
+    error = _attempt(asset, windows_api.AccessMask.GENERIC_READ)
     if error is not None and error.status in (
             windows_api.ERROR_FILE_NOT_FOUND,
             windows_api.ERROR_PATH_NOT_FOUND):

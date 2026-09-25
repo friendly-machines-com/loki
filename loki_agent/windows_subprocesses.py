@@ -45,8 +45,6 @@ FILE_FLAG_OVERLAPPED = 0x40000000
 FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
 PIPE_WAIT = 0x00000000
 PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
-GENERIC_READ = 0x80000000
-GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
 ERROR_PIPE_BUSY = 231
 ERROR_PIPE_CONNECTED = 535
@@ -78,11 +76,11 @@ def pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
 
     if duplex:
         openmode = PIPE_ACCESS_DUPLEX
-        access = GENERIC_READ | GENERIC_WRITE
+        access = api.AccessMask.GENERIC_READ | api.AccessMask.GENERIC_WRITE
         obsize, ibsize = bufsize, bufsize
     else:
         openmode = PIPE_ACCESS_INBOUND
-        access = GENERIC_WRITE
+        access = api.AccessMask.GENERIC_WRITE
         obsize, ibsize = 0, bufsize
     openmode |= FILE_FLAG_FIRST_PIPE_INSTANCE
     if overlapped[0]:

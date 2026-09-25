@@ -25,7 +25,8 @@ class ExclusiveLockTests(unittest.TestCase):
             self.addCleanup(directory.cleanup)
             path = os.path.join(directory.name, "lock")
             open(path, "wb").close()
-            rights = windows_api.GENERIC_READ | windows_api.GENERIC_WRITE
+            rights = (windows_api.AccessMask.GENERIC_READ
+                      | windows_api.AccessMask.GENERIC_WRITE)
             first = windows_api.open_with_access(path, rights, flags=0)
             second = windows_api.open_with_access(path, rights, flags=0)
             self.addCleanup(windows_api.close_handle, first)

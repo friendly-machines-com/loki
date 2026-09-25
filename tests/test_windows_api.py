@@ -498,7 +498,8 @@ class FileAccessTests(unittest.TestCase):
         with mock.patch.object(windows_api, "bind",
                                return_value=lambda *arguments: 77):
             self.assertEqual(
-                windows_api.open_with_access("/x", windows_api.GENERIC_READ),
+                windows_api.open_with_access(
+                    "/x", windows_api.AccessMask.GENERIC_READ),
                 77)
 
     def test_an_invalid_handle_raises_with_the_win32_status(self):
@@ -511,7 +512,8 @@ class FileAccessTests(unittest.TestCase):
                                   return_value=windows_api.ERROR_ACCESS_DENIED,
                                   create=True):
             with self.assertRaises(windows_api.WindowsApiError) as caught:
-                windows_api.open_with_access("/x", windows_api.GENERIC_READ)
+                windows_api.open_with_access(
+                    "/x", windows_api.AccessMask.GENERIC_READ)
         self.assertEqual(caught.exception.status,
                          windows_api.ERROR_ACCESS_DENIED)
 
@@ -528,10 +530,13 @@ class FileAccessTests(unittest.TestCase):
 
         with mock.patch.object(windows_api, "bind", return_value=create_file):
             self.assertEqual(windows_api.open_directory_handle("/x"), 77)
-        self.assertEqual(calls["access"], windows_api.FILE_READ_ATTRIBUTES)
+        self.assertEqual(calls["access"],
+                         windows_api.AccessMask.FILE_READ_ATTRIBUTES)
         self.assertEqual(calls["share"], windows_api.FILE_SHARE_ALL)
-        self.assertEqual(calls["access"] & windows_api.READ_CONTROL, 0)
-        self.assertEqual(calls["access"] & windows_api.GENERIC_READ, 0)
+        self.assertEqual(calls["access"] & windows_api.AccessMask.READ_CONTROL,
+                         0)
+        self.assertEqual(calls["access"] & windows_api.AccessMask.GENERIC_READ,
+                         0)
 
 
 class HandleRelativeFileDeclarationTests(unittest.TestCase):

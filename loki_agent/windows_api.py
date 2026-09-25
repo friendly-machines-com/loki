@@ -315,8 +315,9 @@ def open_directory_handle(path: str):
                        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p)
-    handle = create_file(path, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, None,
-                         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None)
+    handle = create_file(path, AccessMask.FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_ALL, None, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) failed",
                               status=ctypes.get_last_error())
@@ -341,7 +342,8 @@ def open_directory_for_acl(path: str):
                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p)
     handle = create_file(
-        path, WRITE_DAC | READ_CONTROL | FILE_READ_ATTRIBUTES,
+        path, (AccessMask.WRITE_DAC | AccessMask.READ_CONTROL
+               | AccessMask.FILE_READ_ATTRIBUTES),
         FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
@@ -713,27 +715,33 @@ PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 # File access for the containment probe.  The probe *asks* for rights it must be
 # denied and treats the refusal as the pass; it never reads or writes.
 #
-# ACCESS_MASK values (winnt.h) are declared once, here, because two read-only
-# modules compare them: ``windows_verify`` requests them from inside the
-# container, and ``windows_state`` evaluates DACL rights against them.  A value
-# that named one right in two places could let the two disagree about what a
-# grant means.
-GENERIC_READ = 0x80000000
-GENERIC_WRITE = 0x40000000
-FILE_GENERIC_READ = 0x00120089
-FILE_GENERIC_WRITE = 0x00120116
-FILE_GENERIC_EXECUTE = 0x001200A0
-FILE_ALL_ACCESS = 0x001F01FF
-DELETE = 0x00010000
-READ_CONTROL = 0x00020000
-WRITE_DAC = 0x00040000
-WRITE_OWNER = 0x00080000
-SYNCHRONIZE = 0x00100000
-ACCESS_SYSTEM_SECURITY = 0x01000000
-# A directory's FILE_WRITE_DATA is FILE_ADD_FILE and its FILE_APPEND_DATA is
-# FILE_ADD_SUBDIRECTORY; the probe requests the former to test create denial.
-FILE_WRITE_DATA = 0x00000002
-FILE_APPEND_DATA = 0x00000004
+# ACCESS_MASK values (winnt.h): the rights a security descriptor grants, and the
+# rights a CreateFileW open asks for.  Declared once because read-only modules
+# compare them: ``windows_verify`` requests them from inside the container, and
+# ``windows_state`` evaluates DACL rights against them.
+
+
+class AccessMask(enum.IntFlag):
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_GENERIC_READ = 0x00120089
+    FILE_GENERIC_WRITE = 0x00120116
+    FILE_GENERIC_EXECUTE = 0x001200A0
+    FILE_ALL_ACCESS = 0x001F01FF
+    DELETE = 0x00010000
+    READ_CONTROL = 0x00020000
+    WRITE_DAC = 0x00040000
+    WRITE_OWNER = 0x00080000
+    SYNCHRONIZE = 0x00100000
+    ACCESS_SYSTEM_SECURITY = 0x01000000
+    # A directory's FILE_WRITE_DATA is FILE_ADD_FILE and its FILE_APPEND_DATA is
+    # FILE_ADD_SUBDIRECTORY; the probe requests the former to test create
+    # denial.
+    FILE_WRITE_DATA = 0x00000002
+    FILE_APPEND_DATA = 0x00000004
+    FILE_READ_ATTRIBUTES = 0x00000080
+
+
 OPEN_EXISTING = 3
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1325,7 +1333,6 @@ FILE_OPEN_IF = 3
 FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
-FILE_READ_ATTRIBUTES = 0x00000080
 FILE_RENAME_INFORMATION = 10
 FILE_DISPOSITION_INFO = 4
 # NTSTATUS values.  ``NtCreateFile`` returns these directly; the caller

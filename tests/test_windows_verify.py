@@ -26,7 +26,8 @@ CREDENTIAL_FILE = os.path.join(CREDENTIALS, paths.CREDENTIAL_FILE_NAME)
 CREDENTIAL_LOCK = os.path.join(CREDENTIALS, paths.CREDENTIAL_LOCK_FILE_NAME)
 CONFIG = "/config"
 STATE = "/state"
-WORKSPACE_RW = windows_api.GENERIC_READ | windows_api.GENERIC_WRITE
+WORKSPACE_RW = (windows_api.AccessMask.GENERIC_READ
+                | windows_api.AccessMask.GENERIC_WRITE)
 
 # A protected-tree DACL that names no package SID.
 NO_PACKAGE = f"D:PAI(A;OICI;FA;;;{OTHER})"
@@ -115,24 +116,24 @@ class ProbeContainmentTests(unittest.TestCase):
 
         self.assertEqual(self.attempts, [
             (WORKSPACE, WORKSPACE_RW),
-            (CREDENTIALS, windows_api.GENERIC_READ),
-            (CREDENTIALS, windows_api.FILE_WRITE_DATA),
-            (CREDENTIALS, windows_api.DELETE),
-            (CREDENTIALS, windows_api.WRITE_DAC),
-            (CREDENTIALS, windows_api.WRITE_OWNER),
-            (CREDENTIAL_FILE, windows_api.GENERIC_READ),
-            (CREDENTIAL_FILE, windows_api.GENERIC_WRITE),
-            (CREDENTIAL_FILE, windows_api.FILE_APPEND_DATA),
-            (CREDENTIAL_FILE, windows_api.DELETE),
-            (CREDENTIAL_FILE, windows_api.WRITE_DAC),
-            (CREDENTIAL_FILE, windows_api.WRITE_OWNER),
-            (CREDENTIAL_LOCK, windows_api.GENERIC_READ),
-            (CREDENTIAL_LOCK, windows_api.GENERIC_WRITE),
-            (CREDENTIAL_LOCK, windows_api.FILE_APPEND_DATA),
-            (CREDENTIAL_LOCK, windows_api.DELETE),
-            (CREDENTIAL_LOCK, windows_api.WRITE_DAC),
-            (CREDENTIAL_LOCK, windows_api.WRITE_OWNER),
-            (WORKSPACE, windows_api.WRITE_DAC)])
+            (CREDENTIALS, windows_api.AccessMask.GENERIC_READ),
+            (CREDENTIALS, windows_api.AccessMask.FILE_WRITE_DATA),
+            (CREDENTIALS, windows_api.AccessMask.DELETE),
+            (CREDENTIALS, windows_api.AccessMask.WRITE_DAC),
+            (CREDENTIALS, windows_api.AccessMask.WRITE_OWNER),
+            (CREDENTIAL_FILE, windows_api.AccessMask.GENERIC_READ),
+            (CREDENTIAL_FILE, windows_api.AccessMask.GENERIC_WRITE),
+            (CREDENTIAL_FILE, windows_api.AccessMask.FILE_APPEND_DATA),
+            (CREDENTIAL_FILE, windows_api.AccessMask.DELETE),
+            (CREDENTIAL_FILE, windows_api.AccessMask.WRITE_DAC),
+            (CREDENTIAL_FILE, windows_api.AccessMask.WRITE_OWNER),
+            (CREDENTIAL_LOCK, windows_api.AccessMask.GENERIC_READ),
+            (CREDENTIAL_LOCK, windows_api.AccessMask.GENERIC_WRITE),
+            (CREDENTIAL_LOCK, windows_api.AccessMask.FILE_APPEND_DATA),
+            (CREDENTIAL_LOCK, windows_api.AccessMask.DELETE),
+            (CREDENTIAL_LOCK, windows_api.AccessMask.WRITE_DAC),
+            (CREDENTIAL_LOCK, windows_api.AccessMask.WRITE_OWNER),
+            (WORKSPACE, windows_api.AccessMask.WRITE_DAC)])
 
     def test_an_opened_handle_and_the_token_are_closed(self):
         self.happy()
@@ -162,21 +163,21 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_a_listable_credential_directory_fails(self):
         self.happy()
-        self.allow(CREDENTIALS, windows_api.GENERIC_READ)
+        self.allow(CREDENTIALS, windows_api.AccessMask.GENERIC_READ)
 
         self.assertEqual(
             self.checks()["credentials unlistable"].status, "fail")
 
     def test_a_creatable_credential_directory_fails(self):
         self.happy()
-        self.allow(CREDENTIALS, windows_api.FILE_WRITE_DATA)
+        self.allow(CREDENTIALS, windows_api.AccessMask.FILE_WRITE_DATA)
 
         self.assertEqual(
             self.checks()["cannot create credentials"].status, "fail")
 
     def test_a_deletable_credential_directory_fails(self):
         self.happy()
-        self.allow(CREDENTIALS, windows_api.DELETE)
+        self.allow(CREDENTIALS, windows_api.AccessMask.DELETE)
 
         self.assertEqual(
             self.checks()["credential directory not deletable"].status,
@@ -184,7 +185,7 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_a_rewritable_credential_directory_dacl_fails(self):
         self.happy()
-        self.allow(CREDENTIALS, windows_api.WRITE_DAC)
+        self.allow(CREDENTIALS, windows_api.AccessMask.WRITE_DAC)
 
         self.assertEqual(
             self.checks()["credential directory DACL not rewritable"].status,
@@ -192,7 +193,7 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_a_rewritable_credential_directory_owner_fails(self):
         self.happy()
-        self.allow(CREDENTIALS, windows_api.WRITE_OWNER)
+        self.allow(CREDENTIALS, windows_api.AccessMask.WRITE_OWNER)
 
         self.assertEqual(
             self.checks()["credential directory owner not rewritable"].status,
@@ -200,35 +201,35 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_a_granted_credential_read_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_FILE, windows_api.GENERIC_READ)
+        self.allow(CREDENTIAL_FILE, windows_api.AccessMask.GENERIC_READ)
 
         self.assertEqual(
             self.checks()["credential file unreadable"].status, "fail")
 
     def test_a_granted_credential_write_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_FILE, windows_api.GENERIC_WRITE)
+        self.allow(CREDENTIAL_FILE, windows_api.AccessMask.GENERIC_WRITE)
 
         self.assertEqual(
             self.checks()["credential file not writable"].status, "fail")
 
     def test_a_granted_credential_append_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_FILE, windows_api.FILE_APPEND_DATA)
+        self.allow(CREDENTIAL_FILE, windows_api.AccessMask.FILE_APPEND_DATA)
 
         self.assertEqual(
             self.checks()["credential file not appendable"].status, "fail")
 
     def test_a_granted_credential_delete_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_FILE, windows_api.DELETE)
+        self.allow(CREDENTIAL_FILE, windows_api.AccessMask.DELETE)
 
         self.assertEqual(
             self.checks()["credential file not deletable"].status, "fail")
 
     def test_a_granted_credential_dacl_write_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_FILE, windows_api.WRITE_DAC)
+        self.allow(CREDENTIAL_FILE, windows_api.AccessMask.WRITE_DAC)
 
         self.assertEqual(
             self.checks()["credential file DACL not rewritable"].status,
@@ -236,7 +237,7 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_a_granted_credential_owner_write_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_FILE, windows_api.WRITE_OWNER)
+        self.allow(CREDENTIAL_FILE, windows_api.AccessMask.WRITE_OWNER)
 
         self.assertEqual(
             self.checks()["credential file owner not rewritable"].status,
@@ -244,28 +245,28 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_a_readable_credential_lock_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_LOCK, windows_api.GENERIC_READ)
+        self.allow(CREDENTIAL_LOCK, windows_api.AccessMask.GENERIC_READ)
 
         self.assertEqual(
             self.checks()["credential lock unreadable"].status, "fail")
 
     def test_a_granted_credential_lock_write_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_LOCK, windows_api.GENERIC_WRITE)
+        self.allow(CREDENTIAL_LOCK, windows_api.AccessMask.GENERIC_WRITE)
 
         self.assertEqual(
             self.checks()["credential lock not writable"].status, "fail")
 
     def test_a_deletable_credential_lock_fails(self):
         self.happy()
-        self.allow(CREDENTIAL_LOCK, windows_api.DELETE)
+        self.allow(CREDENTIAL_LOCK, windows_api.AccessMask.DELETE)
 
         self.assertEqual(
             self.checks()["credential lock not deletable"].status, "fail")
 
     def test_an_absent_credential_lock_skips_the_direction_probes(self):
         self.happy()
-        self.deny(CREDENTIAL_LOCK, windows_api.GENERIC_READ,
+        self.deny(CREDENTIAL_LOCK, windows_api.AccessMask.GENERIC_READ,
                   status=windows_api.ERROR_FILE_NOT_FOUND)
 
         checks = self.checks()
@@ -275,11 +276,11 @@ class ProbeContainmentTests(unittest.TestCase):
         self.assertEqual(
             [attempt for attempt in self.attempts
              if attempt[0] == CREDENTIAL_LOCK],
-            [(CREDENTIAL_LOCK, windows_api.GENERIC_READ)])
+            [(CREDENTIAL_LOCK, windows_api.AccessMask.GENERIC_READ)])
 
     def test_an_absent_credential_file_skips_the_direction_probes(self):
         self.happy()
-        self.deny(CREDENTIAL_FILE, windows_api.GENERIC_READ,
+        self.deny(CREDENTIAL_FILE, windows_api.AccessMask.GENERIC_READ,
                   status=windows_api.ERROR_FILE_NOT_FOUND)
 
         checks = self.checks()
@@ -292,18 +293,18 @@ class ProbeContainmentTests(unittest.TestCase):
         self.assertEqual(
             [attempt for attempt in self.attempts
              if attempt[0] == CREDENTIAL_FILE],
-            [(CREDENTIAL_FILE, windows_api.GENERIC_READ)])
+            [(CREDENTIAL_FILE, windows_api.AccessMask.GENERIC_READ)])
 
     def test_an_unexpected_credential_file_error_is_not_a_pass(self):
         self.happy()
-        self.deny(CREDENTIAL_FILE, windows_api.GENERIC_READ, status=87)
+        self.deny(CREDENTIAL_FILE, windows_api.AccessMask.GENERIC_READ, status=87)
 
         self.assertEqual(
             self.checks()["credential file unreadable"].status, "fail")
 
     def test_a_granted_write_dac_fails(self):
         self.happy()
-        self.allow(WORKSPACE, windows_api.WRITE_DAC)
+        self.allow(WORKSPACE, windows_api.AccessMask.WRITE_DAC)
 
         self.assertEqual(
             self.checks()["cannot rewrite a DACL"].status, "fail")
@@ -320,7 +321,7 @@ class ProbeContainmentTests(unittest.TestCase):
 
     def test_an_unexpected_error_is_not_reported_as_a_pass(self):
         self.happy()
-        self.deny(CREDENTIALS, windows_api.GENERIC_READ, status=87)
+        self.deny(CREDENTIALS, windows_api.AccessMask.GENERIC_READ, status=87)
 
         self.assertEqual(
             self.checks()["credentials unlistable"].status, "fail")

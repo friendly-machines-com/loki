@@ -31,20 +31,20 @@ from . import windows_api
 # here to the file rights the kernel maps them to, so an ACE that literally
 # stores ``GR`` is judged by the access it actually confers.
 _RIGHTS = {
-    "FA": windows_api.FILE_ALL_ACCESS,
-    "FR": windows_api.FILE_GENERIC_READ,
-    "FW": windows_api.FILE_GENERIC_WRITE,
-    "FX": windows_api.FILE_GENERIC_EXECUTE,
-    "GA": windows_api.FILE_ALL_ACCESS,
-    "GR": windows_api.FILE_GENERIC_READ,
-    "GW": windows_api.FILE_GENERIC_WRITE,
-    "GX": windows_api.FILE_GENERIC_EXECUTE,
-    "RC": windows_api.READ_CONTROL,
-    "SD": windows_api.DELETE,
-    "WD": windows_api.WRITE_DAC,
-    "WO": windows_api.WRITE_OWNER,
-    "SY": windows_api.SYNCHRONIZE,
-    "AS": windows_api.ACCESS_SYSTEM_SECURITY,
+    "FA": windows_api.AccessMask.FILE_ALL_ACCESS,
+    "FR": windows_api.AccessMask.FILE_GENERIC_READ,
+    "FW": windows_api.AccessMask.FILE_GENERIC_WRITE,
+    "FX": windows_api.AccessMask.FILE_GENERIC_EXECUTE,
+    "GA": windows_api.AccessMask.FILE_ALL_ACCESS,
+    "GR": windows_api.AccessMask.FILE_GENERIC_READ,
+    "GW": windows_api.AccessMask.FILE_GENERIC_WRITE,
+    "GX": windows_api.AccessMask.FILE_GENERIC_EXECUTE,
+    "RC": windows_api.AccessMask.READ_CONTROL,
+    "SD": windows_api.AccessMask.DELETE,
+    "WD": windows_api.AccessMask.WRITE_DAC,
+    "WO": windows_api.AccessMask.WRITE_OWNER,
+    "SY": windows_api.AccessMask.SYNCHRONIZE,
+    "AS": windows_api.AccessMask.ACCESS_SYSTEM_SECURITY,
 }
 
 
