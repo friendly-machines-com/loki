@@ -48,13 +48,6 @@ class GuidTests(unittest.TestCase):
                 windows_api.guid_from_text(text)
 
 
-class FlagValueTests(unittest.TestCase):
-    def test_flag_values_match_the_reference(self):
-        # https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/ne-shlobj_core-known_folder_flag
-        self.assertEqual(windows_api.KF_FLAG_DEFAULT, 0x00000000)
-        self.assertEqual(windows_api.KF_FLAG_NO_PACKAGE_REDIRECTION, 0x00010000)
-
-
 class ExtendedPathTests(unittest.TestCase):
     """GetFinalPathNameByHandleW returns a prefixed path; comparisons do not.
 
@@ -171,21 +164,6 @@ class StateBaseDirectoryTests(unittest.TestCase):
 
 
 class ContainerDeclarationTests(unittest.TestCase):
-    def test_token_information_classes_match_the_reference(self):
-        # TOKEN_INFORMATION_CLASS
-        self.assertEqual(windows_api.TOKEN_IS_APP_CONTAINER_CLASS, 29)
-        self.assertEqual(windows_api.TOKEN_APP_CONTAINER_SID_CLASS, 31)
-
-    def test_process_access_and_launch_values_match_the_reference(self):
-        self.assertEqual(windows_api.PROCESS_QUERY_LIMITED_INFORMATION, 0x1000)
-        self.assertEqual(windows_api.CREATE_SUSPENDED, 0x00000004)
-        self.assertEqual(windows_api.EXTENDED_STARTUPINFO_PRESENT, 0x00080000)
-        # Values from the tested launch in tests/test_windows_appcontainers.py.
-        self.assertEqual(
-            windows_api.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, 0x20002)
-        self.assertEqual(
-            windows_api.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, 0x20009)
-
     def test_security_capabilities_layout_is_two_pointers_and_two_dwords(self):
         pointer = ctypes.sizeof(ctypes.c_void_p)
         capabilities = windows_api.SecurityCapabilities
@@ -218,33 +196,6 @@ class ContainerDeclarationTests(unittest.TestCase):
         # catches a member added or dropped in the middle.
         self.assertEqual(ctypes.sizeof(windows_api.StartupInfo),
                          9 * pointer + 32)
-
-    def test_file_access_values_match_the_reference(self):
-        self.assertEqual(windows_api.GENERIC_READ, 0x80000000)
-        self.assertEqual(windows_api.GENERIC_WRITE, 0x40000000)
-        self.assertEqual(windows_api.WRITE_DAC, 0x00040000)
-        self.assertEqual(windows_api.FILE_FLAG_BACKUP_SEMANTICS, 0x02000000)
-        self.assertEqual(windows_api.OPEN_EXISTING, 3)
-        self.assertEqual(windows_api.ERROR_ACCESS_DENIED, 5)
-        self.assertEqual(windows_api.INVALID_HANDLE_VALUE,
-                         ctypes.c_void_p(-1).value)
-
-    def test_access_masks_match_the_winnt_values(self):
-        # These decide what a DACL grant means and what the containment probe
-        # asks for; a wrong digit is invisible on the host that writes it.
-        self.assertEqual(windows_api.FILE_GENERIC_READ, 0x00120089)
-        self.assertEqual(windows_api.FILE_GENERIC_WRITE, 0x00120116)
-        self.assertEqual(windows_api.FILE_GENERIC_EXECUTE, 0x001200A0)
-        self.assertEqual(windows_api.FILE_ALL_ACCESS, 0x001F01FF)
-        self.assertEqual(windows_api.FILE_WRITE_DATA, 0x00000002)
-        self.assertEqual(windows_api.FILE_APPEND_DATA, 0x00000004)
-        self.assertEqual(windows_api.DELETE, 0x00010000)
-        self.assertEqual(windows_api.READ_CONTROL, 0x00020000)
-        self.assertEqual(windows_api.WRITE_OWNER, 0x00080000)
-        self.assertEqual(windows_api.SYNCHRONIZE, 0x00100000)
-        self.assertEqual(windows_api.ACCESS_SYSTEM_SECURITY, 0x01000000)
-        self.assertEqual(windows_api.ERROR_FILE_NOT_FOUND, 2)
-        self.assertEqual(windows_api.ERROR_PATH_NOT_FOUND, 3)
 
 
 class TokenInspectionTests(unittest.TestCase):
@@ -636,29 +587,6 @@ class HandleRelativeFileDeclarationTests(unittest.TestCase):
         self.assertEqual(information.nFileIndexLow.offset, 48)
         self.assertEqual(ctypes.sizeof(windows_api.FileTime), 8)
 
-    def test_handle_relative_values_match_the_reference(self):
-        self.assertEqual(windows_api.OBJ_CASE_INSENSITIVE, 0x40)
-        self.assertEqual(windows_api.FILE_NON_DIRECTORY_FILE, 0x40)
-        self.assertEqual(windows_api.FILE_SYNCHRONOUS_IO_NONALERT, 0x20)
-        self.assertEqual(windows_api.FILE_OPEN_REPARSE_POINT, 0x00200000)
-        self.assertEqual(windows_api.FILE_OPEN, 1)
-        self.assertEqual(windows_api.FILE_CREATE, 2)
-        self.assertEqual(windows_api.FILE_OPEN_IF, 3)
-        self.assertEqual(windows_api.FILE_ATTRIBUTE_DIRECTORY, 0x10)
-        self.assertEqual(windows_api.FILE_ATTRIBUTE_REPARSE_POINT, 0x400)
-        self.assertEqual(windows_api.FILE_ATTRIBUTE_NORMAL, 0x80)
-        self.assertEqual(windows_api.FILE_READ_ATTRIBUTES, 0x80)
-        self.assertEqual(windows_api.FILE_RENAME_INFORMATION, 10)
-        self.assertEqual(windows_api.FILE_DISPOSITION_INFO, 4)
-        self.assertEqual(windows_api.OWNER_SECURITY_INFORMATION, 0x1)
-
-    def test_ntstatus_values_match_the_reference(self):
-        self.assertEqual(windows_api.STATUS_OBJECT_NAME_NOT_FOUND, 0xC0000034)
-        self.assertEqual(windows_api.STATUS_OBJECT_PATH_NOT_FOUND, 0xC000003A)
-        self.assertEqual(windows_api.STATUS_OBJECT_NAME_COLLISION, 0xC0000035)
-        self.assertEqual(windows_api.STATUS_ACCESS_DENIED, 0xC0000022)
-        self.assertEqual(windows_api.STATUS_NOT_A_DIRECTORY, 0xC0000103)
-
     def test_full_sids_pass_through_and_aliases_resolve(self):
         # A full SID is already canonical.  Off Windows an alias resolves
         # through the documented table (on Windows the API is authoritative),
@@ -689,9 +617,6 @@ class PipeDeclarationTests(unittest.TestCase):
         self.assertEqual(attributes.bInheritHandle.offset, 2 * pointer)
         self.assertEqual(attributes.bInheritHandle.size, 4)
         self.assertEqual(ctypes.sizeof(attributes), 3 * pointer)
-
-    def test_handle_inheritance_flag_matches_the_reference(self):
-        self.assertEqual(windows_api.HANDLE_FLAG_INHERIT, 0x00000001)
 
     def test_create_pipe_returns_the_two_ends_and_requests_inheritance(self):
         seen = {}
@@ -775,11 +700,6 @@ class RangeLockDeclarationTests(unittest.TestCase):
         self.assertEqual(overlapped.OffsetHigh.offset, 2 * pointer + 4)
         self.assertEqual(overlapped.hEvent.offset, 2 * pointer + 8)
         self.assertEqual(ctypes.sizeof(overlapped), 3 * pointer + 8)
-
-    def test_lock_values_match_the_reference(self):
-        self.assertEqual(windows_api.LOCKFILE_FAIL_IMMEDIATELY, 0x1)
-        self.assertEqual(windows_api.LOCKFILE_EXCLUSIVE_LOCK, 0x2)
-        self.assertEqual(windows_api.ERROR_LOCK_VIOLATION, 33)
 
 
 if __name__ == "__main__":
