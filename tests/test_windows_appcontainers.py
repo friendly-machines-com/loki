@@ -90,6 +90,12 @@ TOKEN_QUERY = 0x0008
 DACL_SECURITY_INFORMATION = 0x00000004
 PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 
+# Access rights written into the SDDL the probes build.  SDDL's rights field
+# takes a hex number or an alias, so these are formatted in rather than written
+# as literal text.
+FILE_TRAVERSE = 0x00000020   # FILE_EXECUTE; traverse for a directory
+FILE_MODIFY = 0x001301BF     # the documented Modify mask the setup writes
+
 
 class SecurityCapabilities(C.Structure):
     _fields_ = [('sid', HANDLE), ('capabilities', HANDLE),
@@ -2668,11 +2674,12 @@ class AppContainerTests(unittest.TestCase):
              '/T', '/Q'], capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         # Traverse only for the package on the disposable root, never inherited.
-        native.acl(root, private_dacl(owner) + '(A;;0x20;;;%s)' % package)
+        native.acl(root, private_dacl(owner) +
+                   '(A;;0x%X;;;%s)' % (FILE_TRAVERSE, package))
         # Exactly the level setup writes: Modify excludes WRITE_DAC, which the
         # gate then asserts is absent; FA would grant it and fail the gate.
         native.acl(workspace, private_dacl(owner) +
-                   '(A;OICI;0x1301BF;;;%s)' % package)
+                   '(A;OICI;0x%X;;;%s)' % (FILE_MODIFY, package))
 
         def credential_tree(label, tokens=b'FAKE-CREDENTIAL',
                             directory_ace='', file_ace=''):
@@ -2682,7 +2689,8 @@ class AppContainerTests(unittest.TestCase):
             # Traverse only on the parents, never inherited; the credential
             # directory and file keep no package ACE. Without traverse a denial
             # would surface as not-found rather than access-denied.
-            traverse = private_dacl(owner) + '(A;;0x20;;;%s)' % package
+            traverse = private_dacl(owner) + '(A;;0x%X;;;%s)' % (
+                FILE_TRAVERSE, package)
             native.acl(home, traverse)
             native.acl(home / 'loki', traverse)
             native.acl(credentials, private_dacl(owner) + directory_ace)
@@ -2803,9 +2811,10 @@ class AppContainerTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
-        # Remove inherited package grants before making the private targets.
+        # Remove inherited package grants before making the private targets:
+        # traverse only, not inherited.
         native.acl(root, private_dacl(owner) +
-                   '(A;;0x20;;;%s)' % package)  # traverse only, not inherited
+                   '(A;;0x%X;;;%s)' % (FILE_TRAVERSE, package))
         secret = root / 'credentials'
         secret.mkdir()
         names = ('read', 'truncate', 'delete', 'replace', 'regrant')
