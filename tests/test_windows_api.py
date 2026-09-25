@@ -316,7 +316,7 @@ class AppContainerLaunchTests(unittest.TestCase):
 
         capabilities_calls = [
             call for call in seen["attributes"]
-            if call[1] == windows_api.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES]
+            if call[1] == windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES]
         self.assertEqual(len(capabilities_calls), 1)
         flags, attribute, value, size = capabilities_calls[0]
         self.assertEqual(flags, 0, "dwFlags must precede the attribute id")
@@ -379,8 +379,8 @@ class AppContainerLaunchTests(unittest.TestCase):
         self.assertTrue(seen["inherit"])
         self.assertEqual(
             [attribute for _, attribute in seen["attributes"]],
-            [windows_api.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-             windows_api.PROC_THREAD_ATTRIBUTE_HANDLE_LIST])
+            [windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+             windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST])
 
     def test_pseudoconsole_adds_a_third_attribute(self):
         seen = {"attributes": [], "counts": []}
@@ -427,9 +427,9 @@ class AppContainerLaunchTests(unittest.TestCase):
                          "list and the pseudoconsole")
         self.assertEqual(
             [attribute for _, attribute in seen["attributes"]],
-            [windows_api.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-             windows_api.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-             windows_api.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE])
+            [windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+             windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+             windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE])
 
     def test_environment_block_carries_the_drive_entries_first(self):
         seen = {}

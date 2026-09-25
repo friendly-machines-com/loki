@@ -709,13 +709,15 @@ class JobObjectLimits(enum.IntFlag):
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
 
-# PROC_THREAD_ATTRIBUTE_* (winbase.h).  The names map to these values, not to
-# the bare enumerators.
-PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
-PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
-# The attribute value is the HPCON itself, and the pseudoconsole then supplies
-# the child's standard handles.
-PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+# PROC_THREAD_ATTRIBUTE_* (winbase.h): one attribute id per
+# UpdateProcThreadAttribute call, never combined.  The names map to these
+# values, not to the bare enumerators.
+class ProcThreadAttribute(enum.IntEnum):
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
+    # The attribute value is the HPCON itself, and the pseudoconsole then
+    # supplies the child's standard handles.
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 
 # File access for the containment probe.  The probe *asks* for rights it must be
 # denied and treats the refusal as the pass; it never reads or writes.
@@ -1101,7 +1103,8 @@ def create_process_with_pseudoconsole(executable, arguments, hpc, *,
         # passes the handle, not a pointer to it).  hpc is already a c_void_p
         # holding that handle, so it is passed as-is; re-wrapping it in
         # c_void_p would try to convert a c_void_p into a pointer and fail.
-        if not update(attributes, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+        if not update(attributes, 0,
+                      ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                       hpc, ctypes.sizeof(ctypes.c_void_p),
                       None, None):
             raise WindowsApiError(
@@ -1275,7 +1278,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
         initialized = True
         capabilities = SecurityCapabilities(sid, None, 0, 0)
         if not update(attribute_list, 0,
-                      PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                      ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
                       ctypes.byref(capabilities),
                       ctypes.sizeof(capabilities), None, None):
             raise WindowsApiError(
@@ -1284,7 +1287,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
             handle_array = (ctypes.c_void_p * len(inherited_handles))(
                 *inherited_handles)
             if not update(attribute_list, 0,
-                          PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                          ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                           ctypes.cast(handle_array, ctypes.c_void_p),
                           ctypes.sizeof(handle_array), None, None):
                 raise WindowsApiError(
@@ -1302,7 +1305,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
             # must pass standard_handles as nulls, not leave them unset.
             hpcon = ctypes.c_void_p(pseudoconsole)
             if not update(attribute_list, 0,
-                          PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                          ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                           hpcon, ctypes.sizeof(hpcon),
                           None, None):
                 raise WindowsApiError(
