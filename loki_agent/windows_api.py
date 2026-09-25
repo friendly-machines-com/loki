@@ -1508,8 +1508,12 @@ def flush_file(handle) -> None:
 # one-byte range at zero has to be stated explicitly.  Contention is reported
 # as ERROR_LOCK_VIOLATION, not as a blocking wait.
 
-LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
-LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+# LOCKFILE_* (winnt.h): how LockFileEx is to behave while another holds a range.
+class LockFlags(enum.IntFlag):
+    LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+    LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+
+
 ERROR_LOCK_VIOLATION = 33
 
 

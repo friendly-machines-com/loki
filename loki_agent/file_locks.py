@@ -27,8 +27,8 @@ def try_lock_exclusive(token) -> None:
         try:
             windows_api.lock_file(
                 token,
-                windows_api.LOCKFILE_EXCLUSIVE_LOCK
-                | windows_api.LOCKFILE_FAIL_IMMEDIATELY)
+                windows_api.LockFlags.LOCKFILE_EXCLUSIVE_LOCK
+                | windows_api.LockFlags.LOCKFILE_FAIL_IMMEDIATELY)
         except windows_api.WindowsApiError as error:
             # LockFileEx reports contention as ERROR_LOCK_VIOLATION, not as
             # EACCES and not as a blocking call.

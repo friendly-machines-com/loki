@@ -82,8 +82,8 @@ class ExclusiveLockTests(unittest.TestCase):
 
         lock.assert_called_once_with(
             0x1234,
-            windows_api.LOCKFILE_EXCLUSIVE_LOCK
-            | windows_api.LOCKFILE_FAIL_IMMEDIATELY)
+            windows_api.LockFlags.LOCKFILE_EXCLUSIVE_LOCK
+            | windows_api.LockFlags.LOCKFILE_FAIL_IMMEDIATELY)
         unlock.assert_called_once_with(0x1234)
 
 
