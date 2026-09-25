@@ -1368,9 +1368,15 @@ class NtCreateOptions(enum.IntFlag):
     FILE_OPEN_REPARSE_POINT = 0x00200000
 
 
-FILE_OPEN = 1
-FILE_CREATE = 2
-FILE_OPEN_IF = 3
+# NtCreateFile's CreateDisposition (ntifs.h): one of these, not a set.  The
+# Win32 counterpart is FileCreateDisposition.
+class NtCreateDisposition(enum.IntEnum):
+    FILE_SUPERSEDE = 0
+    FILE_OPEN = 1
+    FILE_CREATE = 2
+    FILE_OPEN_IF = 3
+    FILE_OVERWRITE = 4
+    FILE_OVERWRITE_IF = 5
 
 
 # FILE_ATTRIBUTE_* (winnt.h): the attribute bits of a file.  Read back from

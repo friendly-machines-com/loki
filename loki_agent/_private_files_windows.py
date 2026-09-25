@@ -240,7 +240,7 @@ def open_read_at(directory, name: str):
     return _open_relative(
         directory, name,
         windows_api.AccessMask.GENERIC_READ | windows_api.AccessMask.SYNCHRONIZE,
-        windows_api.FILE_OPEN, _NON_DIRECTORY)
+        windows_api.NtCreateDisposition.FILE_OPEN, _NON_DIRECTORY)
 
 
 def create_exclusive_at(directory, name: str, mode: int):
@@ -260,7 +260,7 @@ def create_exclusive_at(directory, name: str, mode: int):
         windows_api.AccessMask.GENERIC_WRITE
         | windows_api.AccessMask.FILE_READ_ATTRIBUTES
         | windows_api.AccessMask.SYNCHRONIZE,
-        windows_api.FILE_CREATE, _NON_DIRECTORY,
+        windows_api.NtCreateDisposition.FILE_CREATE, _NON_DIRECTORY,
         windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
 
 
@@ -272,7 +272,7 @@ def open_lock_file_at(directory, name: str, mode: int):
         | windows_api.AccessMask.GENERIC_WRITE
         | windows_api.AccessMask.FILE_READ_ATTRIBUTES
         | windows_api.AccessMask.SYNCHRONIZE,
-        windows_api.FILE_OPEN_IF, _NON_DIRECTORY)
+        windows_api.NtCreateDisposition.FILE_OPEN_IF, _NON_DIRECTORY)
 
 
 # -- publish and remove ---------------------------------------------------
@@ -285,7 +285,7 @@ def replace_at(directory, temporary: str, name: str) -> None:
     source = _open_relative(
         directory, temporary,
         windows_api.AccessMask.DELETE | windows_api.AccessMask.SYNCHRONIZE,
-        windows_api.FILE_OPEN, _NON_DIRECTORY)
+        windows_api.NtCreateDisposition.FILE_OPEN, _NON_DIRECTORY)
     try:
         try:
             windows_api.nt_rename(source, directory, name)
@@ -302,7 +302,7 @@ def unlink_at(directory, name: str) -> None:
     target = _open_relative(
         directory, name,
         windows_api.AccessMask.DELETE | windows_api.AccessMask.SYNCHRONIZE,
-        windows_api.FILE_OPEN, _NON_DIRECTORY)
+        windows_api.NtCreateDisposition.FILE_OPEN, _NON_DIRECTORY)
     try:
         try:
             windows_api.set_delete_disposition(target)

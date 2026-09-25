@@ -36,6 +36,11 @@ _.CREATE_NEW
 _.CREATE_ALWAYS
 _.OPEN_ALWAYS
 _.TRUNCATE_EXISTING
+# NtCreateDisposition is the complete CreateDisposition set; Loki uses OPEN,
+# CREATE and OPEN_IF.
+_.FILE_SUPERSEDE
+_.FILE_OVERWRITE
+_.FILE_OVERWRITE_IF
 _.cb
 _.lpAttributeList
 _.dwFlags
