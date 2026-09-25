@@ -57,6 +57,17 @@ Guids = escape_helpers['Guids']
 HANDLE = C.c_void_p
 ULONG = C.c_uint32
 
+# CreateProcessW / UpdateProcThreadAttribute / SetInformationJobObject values.
+# Named here because this file is staged without the package and cannot import
+# them from windows_api.
+CREATE_SUSPENDED = 0x00000004
+CREATE_UNICODE_ENVIRONMENT = 0x00000400
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+STARTF_USESTDHANDLES = 0x00000100
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
+PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
+
 
 class SecurityCapabilities(C.Structure):
     _fields_ = [('sid', HANDLE), ('capabilities', HANDLE),
@@ -368,12 +379,12 @@ class AppContainers(NativeCalls):
         job = None
         try:
             capabilities = SecurityCapabilities(sid, None, 0, 0)
-            self.check(self.update(attributes, 0, 0x20009,
+            self.check(self.update(attributes, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
                                    C.byref(capabilities), C.sizeof(capabilities),
                                    None, None))
             job = self.check(self.create_job(None, None))
             limits = ExtendedLimits()
-            limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             self.check(self.set_job(job, 9, C.byref(limits), C.sizeof(limits)))
             with open(output, 'wb', buffering=0) as log, open(os.devnull, 'rb') as null:
                 log_handle = msvcrt.get_osfhandle(log.fileno())
@@ -394,11 +405,11 @@ class AppContainers(NativeCalls):
                 os.set_handle_inheritable(handles[0], True)
                 os.set_handle_inheritable(handles[1], True)
                 try:
-                    self.check(self.update(attributes, 0, 0x20002, handles,
+                    self.check(self.update(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles,
                                            C.sizeof(handles), None, None))
                     startup = ExtendedStartups()
                     startup.startup.cb = C.sizeof(startup)
-                    startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
+                    startup.startup.flags = STARTF_USESTDHANDLES
                     startup.startup.stdin = child_stdin
                     startup.startup.stdout = child_stdout
                     startup.startup.stderr = log_handle
@@ -406,8 +417,14 @@ class AppContainers(NativeCalls):
                     text = C.create_unicode_buffer(subprocess.list2cmdline(command))
                     # Start suspended: no target code executes before assignment
                     # to the kill-on-close job. There is no unsandboxed fallback.
+                    flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
+                    if environment is not None:
+                        # A supplied block is UTF-16; without this flag
+                        # CreateProcessW reads it as ANSI and rejects it, which
+                        # is a 203 on every variant rather than a missing entry.
+                        flags |= CREATE_UNICODE_ENVIRONMENT
                     self.check(self.create_process(
-                        command[0], text, None, None, True, 0x80000 | 4,
+                        command[0], text, None, None, True, flags,
                         environment, str(workspace), C.byref(startup),
                         C.byref(process)))
                 finally:
@@ -1697,7 +1714,7 @@ class EscapeResultTests(unittest.TestCase):
         api.create_as_user = mock.Mock(return_value=0)
         api.create_with_token = mock.Mock(return_value=0)
         startup, child = ExtendedStartups(), ProcessInfos()
-        creation_flags = 0x80000 | 4
+        creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
         with mock.patch('builtins.print'):
             api.launch_as_user(9, 'exe', 'cmd', startup, child, creation_flags)
             api.launch_with_token(9, 'exe', 'cmd', startup, child, creation_flags)
@@ -1752,8 +1769,8 @@ class EscapeResultTests(unittest.TestCase):
         self.assertEqual(startup.cb, C.sizeof(startup))
         # EXTENDED_STARTUPINFO_PRESENT must be clear for a plain STARTUPINFO;
         # CREATE_SUSPENDED must stay set so nothing runs uninspected.
-        self.assertEqual(flags & 0x80000, 0)
-        self.assertEqual(flags & 4, 4)
+        self.assertEqual(flags & EXTENDED_STARTUPINFO_PRESENT, 0)
+        self.assertEqual(flags & CREATE_SUSPENDED, CREATE_SUSPENDED)
 
     def test_token_launch_extended_sets_extended_startupinfo_flag(self):
         api = self.impersonation_free_api()
@@ -1763,8 +1780,9 @@ class EscapeResultTests(unittest.TestCase):
                                   create=True):
             api.token_launch(creator, 0xB, 'python.exe', 'user', 'pkg')
         flags = creator.call_args.args[5]
-        self.assertEqual(flags & 0x80000, 0x80000)
-        self.assertEqual(flags & 4, 4)
+        self.assertEqual(flags & EXTENDED_STARTUPINFO_PRESENT,
+                         EXTENDED_STARTUPINFO_PRESENT)
+        self.assertEqual(flags & CREATE_SUSPENDED, CREATE_SUSPENDED)
 
     def test_caller_token_launch_reports_refusal_with_caller_privileges(self):
         # The unrestricted control must report the caller's own privileges so

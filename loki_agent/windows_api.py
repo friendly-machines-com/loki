@@ -660,6 +660,10 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 CREATE_SUSPENDED = 0x00000004
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+STARTF_USESTDHANDLES = 0x00000100
+
+# SetInformationJobObject's JOB_OBJECT_LIMIT_* (winnt.h).
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
 # PROC_THREAD_ATTRIBUTE_* (winbase.h).  The names map to these values, not to
 # the bare enumerators 2 and 9.  The tested launch in
@@ -1031,7 +1035,7 @@ def create_process_with_pseudoconsole(executable, arguments, hpc, *,
         startup = StartupInfoEx()
         startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
         startup.lpAttributeList = attributes
-        startup.StartupInfo.dwFlags = 0x100  # STARTF_USESTDHANDLES
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
         # hStdInput/hStdOutput/hStdError stay NULL; the pseudoconsole supplies
         # them, and null handles keep the compatibility path from duplicating
         # the parent's redirected handles into the child.
@@ -1233,7 +1237,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
         startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
         startup.lpAttributeList = attribute_list
         if standard_handles is not None:
-            startup.StartupInfo.dwFlags = 0x100  # STARTF_USESTDHANDLES
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
             (startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput,
              startup.StartupInfo.hStdError) = standard_handles
         information = ProcessInformation()

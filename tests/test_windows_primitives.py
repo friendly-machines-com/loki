@@ -112,6 +112,7 @@ class FileIdInfo(C.Structure):
 
 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+STARTF_USESTDHANDLES = 0x00000100
 
 
 class Coord(C.Structure):
@@ -226,7 +227,7 @@ def conpty_probe(root):
         # to its own pipe instead of the pseudoconsole, and the child's stdin
         # is the parent's, not the pty's.  Workaround from microsoft/terminal
         # discussion 15814; the STARTUPINFO page does not describe this case.
-        startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
+        startup.startup.flags = STARTF_USESTDHANDLES
         startup.startup.stdin = None
         startup.startup.stdout = None
         startup.startup.stderr = None
@@ -441,7 +442,7 @@ def conpty_interactive_probe(root, stage):
         # to its own pipe instead of the pseudoconsole, and the child's stdin
         # is the parent's, not the pty's.  Workaround from microsoft/terminal
         # discussion 15814; the STARTUPINFO page does not describe this case.
-        startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
+        startup.startup.flags = STARTF_USESTDHANDLES
         startup.startup.stdin = None
         startup.startup.stdout = None
         startup.startup.stderr = None
