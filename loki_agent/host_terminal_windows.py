@@ -27,6 +27,7 @@ state machine and the rendering.
 from __future__ import annotations
 
 import ctypes
+import enum
 import msvcrt
 from ctypes import wintypes
 
@@ -34,13 +35,22 @@ from ctypes import wintypes
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
-ENABLE_PROCESSED_OUTPUT = 0x0001
-ENABLE_PROCESSED_INPUT = 0x0001
-ENABLE_LINE_INPUT = 0x0002
-ENABLE_ECHO_INPUT = 0x0004
-ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
-ENABLE_EXTENDED_FLAGS = 0x0080
+# GetConsoleMode/SetConsoleMode take one DWORD of *either* input modes or output
+# modes, depending on whether the handle is an input or a screen-buffer handle;
+# the same numbers mean different things in the two sets.  Documented values:
+# https://learn.microsoft.com/en-us/windows/console/setconsolemode
+class ConsoleInputMode(enum.IntFlag):
+    ENABLE_PROCESSED_INPUT = 0x0001
+    ENABLE_LINE_INPUT = 0x0002
+    ENABLE_ECHO_INPUT = 0x0004
+    ENABLE_EXTENDED_FLAGS = 0x0080
+    ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+
+
+class ConsoleOutputMode(enum.IntFlag):
+    ENABLE_PROCESSED_OUTPUT = 0x0001
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
 
 CP_UTF8 = 65001
 STD_OUTPUT_HANDLE = -11
@@ -67,9 +77,10 @@ _GetStdHandle.restype = wintypes.HANDLE
 
 def raw_input_mode(mode: int) -> int:
     """The console input mode that makes reads byte-oriented and unbuffered."""
-    return ((mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT
-                      | ENABLE_PROCESSED_INPUT))
-            | ENABLE_VIRTUAL_TERMINAL_INPUT)
+    return ((mode & ~(ConsoleInputMode.ENABLE_LINE_INPUT
+                      | ConsoleInputMode.ENABLE_ECHO_INPUT
+                      | ConsoleInputMode.ENABLE_PROCESSED_INPUT))
+            | ConsoleInputMode.ENABLE_VIRTUAL_TERMINAL_INPUT)
 
 
 def _handle(fd: int):
@@ -105,7 +116,8 @@ class OutputMode:
         self.handle = _GetStdHandle(STD_OUTPUT_HANDLE)
         mode = wintypes.DWORD()
         if _GetConsoleMode(self.handle, ctypes.byref(mode)):
-            enabled = mode.value | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            enabled = (mode.value | ConsoleOutputMode.ENABLE_PROCESSED_OUTPUT
+                       | ConsoleOutputMode.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
             if enabled == mode.value:
                 return self
             self.old_mode = mode.value
@@ -159,7 +171,9 @@ class RawMode:
             if old_cp != CP_UTF8:
                 self.old_cp = old_cp
                 _check(_SetConsoleCP(CP_UTF8), "SetConsoleCP")
-            enabled_output = output.value | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            enabled_output = (output.value
+                              | ConsoleOutputMode.ENABLE_PROCESSED_OUTPUT
+                              | ConsoleOutputMode.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
             if has_output_mode and output.value != enabled_output:
                 self.old_output_mode = output.value
                 _set_console_mode(self.output_handle, enabled_output)
@@ -205,4 +219,5 @@ def processed_input_enabled(fd: int) -> bool:
     becomes a ``CTRL_C_EVENT`` before the byte reaches a reader; with it clear
     the byte arrives as ``0x03``.  ``RawMode`` clears it.
     """
-    return bool(_console_mode(_handle(fd)) & ENABLE_PROCESSED_INPUT)
+    return bool(_console_mode(_handle(fd))
+                & ConsoleInputMode.ENABLE_PROCESSED_INPUT)

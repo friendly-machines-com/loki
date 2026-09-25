@@ -14,6 +14,9 @@ status_text
 
 # Windows constants tested against the native API; ctypes reads these fields.
 PROCESS_QUERY_LIMITED_INFORMATION
+# ConsoleInputMode is complete for the modes Loki deals with; raw_input_mode
+# leaves ENABLE_EXTENDED_FLAGS alone, and the terminal test sets it.
+_.ENABLE_EXTENDED_FLAGS
 # TokenAccess and ProcessAccess are complete sets; production reads only some
 # members, the escape probes request the rest on tokens and processes they open
 # themselves.
