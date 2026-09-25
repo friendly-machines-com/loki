@@ -41,8 +41,6 @@ PIPE = subprocess.PIPE
 
 PIPE_ACCESS_DUPLEX = 0x00000003
 PIPE_ACCESS_INBOUND = 0x00000001
-FILE_FLAG_OVERLAPPED = 0x40000000
-FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
 PIPE_WAIT = 0x00000000
 PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
 OPEN_EXISTING = 3
@@ -82,10 +80,10 @@ def pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
         openmode = PIPE_ACCESS_INBOUND
         access = api.AccessMask.GENERIC_WRITE
         obsize, ibsize = 0, bufsize
-    openmode |= FILE_FLAG_FIRST_PIPE_INSTANCE
+    openmode |= api.FileFlags.FILE_FLAG_FIRST_PIPE_INSTANCE
     if overlapped[0]:
-        openmode |= FILE_FLAG_OVERLAPPED
-    client_flags = FILE_FLAG_OVERLAPPED if overlapped[1] else 0
+        openmode |= api.FileFlags.FILE_FLAG_OVERLAPPED
+    client_flags = (api.FileFlags.FILE_FLAG_OVERLAPPED if overlapped[1] else 0)
 
     # The pipe name is not a control: the ends are connected here and only the
     # child's inherited handle reaches the child.  The DACL nevertheless keeps

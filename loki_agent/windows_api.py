@@ -317,7 +317,7 @@ def open_directory_handle(path: str):
                        ctypes.c_void_p)
     handle = create_file(path, AccessMask.FILE_READ_ATTRIBUTES,
                          FileShareMode.FILE_SHARE_ALL, None, OPEN_EXISTING,
-                         FILE_FLAG_BACKUP_SEMANTICS, None)
+                         FileFlags.FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) failed",
                               status=ctypes.get_last_error())
@@ -346,7 +346,7 @@ def open_directory_for_acl(path: str):
                | AccessMask.FILE_READ_ATTRIBUTES),
         FileShareMode.FILE_SHARE_READ | FileShareMode.FILE_SHARE_WRITE,
         None, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS, None)
+        FileFlags.FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) for ACL failed",
                               status=ctypes.get_last_error())
@@ -752,9 +752,23 @@ class FileShareMode(enum.IntFlag):
 
 
 OPEN_EXISTING = 3
+
+
+# FILE_FLAG_* (winnt.h).  CreateFileW's dwFlagsAndAttributes takes these *and*
+# the FILE_ATTRIBUTE_* values in one DWORD -- two disjoint families in a single
+# parameter, so the same field is written here with a FILE_FLAG_* member and
+# read back later as a FILE_ATTRIBUTE_* one.  The function page names both in
+# its dwFlagsAndAttributes description:
+# https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+#
 # FILE_FLAG_BACKUP_SEMANTICS lets CreateFileW open a directory, which the
 # credential tree and the workspace both are.
-FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+class FileFlags(enum.IntFlag):
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OVERLAPPED = 0x40000000
+    FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+
+
 ERROR_FILE_NOT_FOUND = 2
 ERROR_PATH_NOT_FOUND = 3
 ERROR_ACCESS_DENIED = 5
@@ -843,7 +857,7 @@ def current_process_handle():
 
 
 def open_with_access(path, desired_access, creation=OPEN_EXISTING,
-                     flags=FILE_FLAG_BACKUP_SEMANTICS,
+                     flags=FileFlags.FILE_FLAG_BACKUP_SEMANTICS,
                      share_mode=FileShareMode.FILE_SHARE_ALL):
     """Open ``path`` requesting ``desired_access``, returning the handle.
 

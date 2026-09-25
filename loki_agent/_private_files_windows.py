@@ -214,7 +214,7 @@ def open_directory(path: str):
     try:
         handle = windows_api.open_with_access(
             path, windows_api.AccessMask.GENERIC_READ,
-            flags=(windows_api.FILE_FLAG_BACKUP_SEMANTICS
+            flags=(windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS
                    | windows_api.FILE_OPEN_REPARSE_POINT))
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
@@ -320,7 +320,7 @@ def describe_path(path: str) -> FileFacts:
     try:
         handle = windows_api.open_with_access(
             path, windows_api.AccessMask.GENERIC_READ,
-            flags=(windows_api.FILE_FLAG_BACKUP_SEMANTICS
+            flags=(windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS
                    | windows_api.FILE_OPEN_REPARSE_POINT))
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
