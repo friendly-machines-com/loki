@@ -407,3 +407,53 @@ class LaunchTests(unittest.TestCase):
 
     def test_piped_child_receives_caller_handles_and_duplicated_stderr(self):
         self.exercise_stdio()
+
+
+@unittest.skipUnless(sys.platform == "win32",
+                     "the contained launch is Windows-only")
+class LaunchEnvironmentTests(unittest.TestCase):
+    """Reproduce the contained launch with controlled environments.
+
+    The pty tests fail ``CreateProcessW failed: 203`` when the TUI front starts
+    its runtime, and the environment that launch is given is the suspect.  This
+    runs the real ``windows_runtime.launch`` with the reduced environment those
+    tests use, plus one variant adding each variable the broker restores from
+    its profile, and records start/winerror per variant.  Recorded, not
+    asserted: a failure here is the measurement, and the assertion belongs to
+    whatever fix follows.
+    """
+
+    def test_environment_variants(self):
+        import json
+        from loki_entrypoints import child_environment, configure_container
+        record = {"probe": "launch-environment-203"}
+        with tempfile.TemporaryDirectory(prefix="loki-launch-env-") as root:
+            workspace = os.path.join(root, "workspace")
+            os.makedirs(workspace)
+            reduced = child_environment(
+                HOME=root,
+                XDG_CONFIG_HOME=os.path.join(root, "config"),
+                XDG_STATE_HOME=os.path.join(root, "state"),
+                PATH=os.environ.get("PATH", ""))
+            configure_container(reduced, workspace)
+            variants = {"reduced": dict(reduced)}
+            for name in ("USERPROFILE", "LOCALAPPDATA", "APPDATA",
+                         "PROGRAMDATA", "PROGRAMFILES"):
+                if os.environ.get(name):
+                    variants["with_" + name] = {**reduced, name: os.environ[name]}
+            variants["full_process"] = dict(os.environ)
+            for label, environment in variants.items():
+                try:
+                    process = runtime.launch(
+                        sys.executable, ["-c", "pass"], environment,
+                        workspace, [], current_directory=os.getcwd())
+                except Exception as error:
+                    record[label] = {
+                        "started": False,
+                        "winerror": getattr(error, "winerror", None),
+                        "error": type(error).__name__}
+                else:
+                    record[label] = {"started": True}
+                    process.close()
+        print(json.dumps(record), flush=True)
+        self.assertTrue(record)

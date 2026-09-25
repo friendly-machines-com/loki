@@ -349,7 +349,8 @@ class AppContainers(NativeCalls):
         return bytes(data)
 
     def launch(self, command, sid, workspace, output, observe=None,
-               deadline=None, extra_handles=(), stdio=None):
+               deadline=None, extra_handles=(), stdio=None,
+               environment=None):
         """Run one contained child under one monotonic budget.
 
         The deadline is fixed before the observer runs--an explicit one, or
@@ -407,7 +408,8 @@ class AppContainers(NativeCalls):
                     # to the kill-on-close job. There is no unsandboxed fallback.
                     self.check(self.create_process(
                         command[0], text, None, None, True, 0x80000 | 4,
-                        None, str(workspace), C.byref(startup), C.byref(process)))
+                        environment, str(workspace), C.byref(startup),
+                        C.byref(process)))
                 finally:
                     os.set_handle_inheritable(handles[0], False)
                     os.set_handle_inheritable(handles[1], False)
@@ -748,6 +750,73 @@ def pipe_stdio_probe(native, sid, workspace, output):
     finally:
         for handle in (stdin_read, stdin_write, stdout_read, stdout_write):
             native.check(native.close(handle))
+
+
+def environment_203_probe(native, sid, workspace, output):
+    """Which environment the contained ``CreateProcessW`` requires.
+
+    Production passes an explicit environment block to the AppContainer launch,
+    and ``ERROR_ENVVAR_NOT_FOUND`` (203) appears when that block omits something
+    the call needs; the broker works only because its own block was restored
+    from the loaded profile.  This varies the explicit block and records
+    start/winerror per variant, so the needed variable can be named rather than
+    guessed.  The drive entries the broker already holds are carried into every
+    block, to isolate the normal variables from the per-drive ones.
+    """
+    get_strings = native.bind(native.kernel, 'GetEnvironmentStringsW', HANDLE)
+    free_strings = native.bind(native.kernel, 'FreeEnvironmentStringsW',
+                               W.BOOL, HANDLE)
+    drive_entries = []
+    pointer = get_strings()
+    if pointer:
+        try:
+            address = pointer
+            while True:
+                entry = C.wstring_at(address)
+                if not entry:
+                    break
+                if entry.startswith('='):
+                    drive_entries.append(entry)
+                address += len(entry.encode('utf-16-le', 'surrogatepass')) + 2
+        finally:
+            free_strings(pointer)
+    names = ('SystemRoot', 'SystemDrive', 'USERPROFILE', 'LOCALAPPDATA',
+             'APPDATA', 'PROGRAMDATA', 'PROGRAMFILES', 'TEMP', 'TMP')
+
+    def entries(wanted):
+        chosen = list(drive_entries)
+        for name in wanted:
+            value = os.environ.get(name)
+            if value:
+                chosen.append('%s=%s' % (name, value))
+        return chosen
+
+    def block(chosen):
+        return C.create_unicode_buffer('\0'.join(chosen) + '\0\0')
+
+    minimal = ('SystemRoot', 'SystemDrive')
+    buffers = {
+        'full_broker': block(entries(names)),
+        'drive_only': block(list(drive_entries)),
+        'minimal': block(entries(minimal)),
+    }
+    for name in names:
+        buffers['add_' + name] = block(entries((*minimal, name)))
+    record = {'probe': 'appcontainer-environment-203',
+              'drive_entries': [entry.split('=', 2)[1]
+                                for entry in drive_entries]}
+    command = [sys.executable, '-I', '-u', '-c', 'pass']
+    for label, environment in [('inherited', None), *buffers.items()]:
+        try:
+            code = native.launch(
+                command, sid, workspace, output,
+                environment=None if environment is None
+                else C.cast(environment, HANDLE))
+            record[label] = {'started': True, 'exit_code': code}
+        except OSError as error:
+            record[label] = {'started': False,
+                             'winerror': getattr(error, 'winerror', None)}
+    return record
 
 
 def scratch_probe(native, sid, workspace, report_path):
@@ -2716,6 +2785,12 @@ class AppContainerTests(unittest.TestCase):
             native, sid, workspace, root / 'inherited-nul.log')
         print(json.dumps(nul_result), flush=True)
         self.assertEqual(nul_result['outcome'], 'native-and-crt-writes-succeeded')
+        # Which environment the contained launch actually requires: the pty
+        # tests fail 203 there, and the broker works only because its block was
+        # restored from the profile.  Recorded, not asserted.
+        environment_result = environment_203_probe(
+            native, sid, workspace, root / 'environment-203.log')
+        print(json.dumps(environment_result), flush=True)
         # The contained runtime's scratch directory lives inside the granted
         # workspace and the runtime creates it itself, so the child -- not the
         # broker -- must be able to create it and write there.
