@@ -1358,9 +1358,16 @@ def create_process_in_app_container(executable, arguments, package_sid,
 # native ``NtSetInformationFile`` / ``SetFileInformationByHandle`` as measured.
 
 OBJ_CASE_INSENSITIVE = 0x00000040
-FILE_NON_DIRECTORY_FILE = 0x00000040
-FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
-FILE_OPEN_REPARSE_POINT = 0x00200000
+
+
+# NtCreateFile's CreateOptions (ntifs.h).  Distinct from FILE_FLAG_*, which goes
+# to CreateFileW's dwFlagsAndAttributes: these are the NT call's own options.
+class NtCreateOptions(enum.IntFlag):
+    FILE_NON_DIRECTORY_FILE = 0x00000040
+    FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+    FILE_OPEN_REPARSE_POINT = 0x00200000
+
+
 FILE_OPEN = 1
 FILE_CREATE = 2
 FILE_OPEN_IF = 3

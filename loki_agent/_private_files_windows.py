@@ -166,8 +166,9 @@ def _open_relative(directory, name, desired_access, disposition, options,
 
 # FILE_SYNCHRONOUS_IO_NONALERT makes every read/write return synchronously, so
 # the storage never has to wait on an IO_STATUS_BLOCK it did not provide.
-_SYNCHRONOUS = windows_api.FILE_SYNCHRONOUS_IO_NONALERT
-_NO_FOLLOW = windows_api.FILE_NON_DIRECTORY_FILE | windows_api.FILE_OPEN_REPARSE_POINT
+_SYNCHRONOUS = windows_api.NtCreateOptions.FILE_SYNCHRONOUS_IO_NONALERT
+_NO_FOLLOW = (windows_api.NtCreateOptions.FILE_NON_DIRECTORY_FILE
+              | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT)
 _NON_DIRECTORY = _NO_FOLLOW | _SYNCHRONOUS
 
 
@@ -216,7 +217,7 @@ def open_directory(path: str):
         handle = windows_api.open_with_access(
             path, windows_api.AccessMask.GENERIC_READ,
             flags=(windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS
-                   | windows_api.FILE_OPEN_REPARSE_POINT))
+                   | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT))
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
     try:
@@ -322,7 +323,7 @@ def describe_path(path: str) -> FileFacts:
         handle = windows_api.open_with_access(
             path, windows_api.AccessMask.GENERIC_READ,
             flags=(windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS
-                   | windows_api.FILE_OPEN_REPARSE_POINT))
+                   | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT))
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
     try:
