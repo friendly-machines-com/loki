@@ -114,7 +114,7 @@ class ConfigBaseDirectoryTests(unittest.TestCase):
 
         known.assert_called_once_with(
             windows_api.FOLDERID_LOCAL_APP_DATA,
-            windows_api.KF_FLAG_NO_PACKAGE_REDIRECTION)
+            windows_api.KnownFolderFlags.KF_FLAG_NO_PACKAGE_REDIRECTION)
 
     def test_redirected_local_app_data_is_refused(self):
         redirected = "\\\\server\\share\\Local"

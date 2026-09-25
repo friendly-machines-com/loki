@@ -82,10 +82,13 @@ def guid_from_text(text: str) -> Guids:
 # locations it does not use stay out so the dead-code gate stays meaningful.
 FOLDERID_LOCAL_APP_DATA = "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}"
 
+
 # KF_FLAG values, from
 # https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/ne-shlobj_core-known_folder_flag
-KF_FLAG_DEFAULT = 0x00000000
-KF_FLAG_NO_PACKAGE_REDIRECTION = 0x00010000
+class KnownFolderFlags(enum.IntFlag):
+    KF_FLAG_DEFAULT = 0x00000000
+    KF_FLAG_NO_PACKAGE_REDIRECTION = 0x00010000
+
 
 _libraries = {}
 _signatures = {}
@@ -127,7 +130,8 @@ def co_task_mem_free(pointer) -> None:
     bind("ole32", "CoTaskMemFree", None, ctypes.c_void_p)(pointer)
 
 
-def known_folder(folder_id: str, flags: int = KF_FLAG_DEFAULT) -> str:
+def known_folder(folder_id: str,
+                 flags: int = KnownFolderFlags.KF_FLAG_DEFAULT) -> str:
     """Resolve a KNOWNFOLDERID to its current path for the calling user.
 
     ``hToken`` is NULL, which is the documented way to ask for the current

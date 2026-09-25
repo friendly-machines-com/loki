@@ -79,7 +79,7 @@ def _windows_local_app_data() -> str:
         # Resolve the same path whether or not the caller is packaged or inside
         # an AppContainer, so the credential directory cannot move with the
         # calling context.
-        windows_api.KF_FLAG_NO_PACKAGE_REDIRECTION)
+        windows_api.KnownFolderFlags.KF_FLAG_NO_PACKAGE_REDIRECTION)
     if resolved.startswith("\\\\"):
         # Folder redirection to a share cannot provide the private-directory
         # property credential storage depends on, so refuse rather than create
