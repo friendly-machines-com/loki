@@ -14,13 +14,22 @@ status_text
 
 # Windows constants tested against the native API; ctypes reads these fields.
 PROCESS_QUERY_LIMITED_INFORMATION
-# TokenAccess is a complete set; production reads only TOKEN_QUERY, the escape
-# probes request the rest on tokens they open themselves.
+# TokenAccess and ProcessAccess are complete sets; production reads only some
+# members, the escape probes request the rest on tokens and processes they open
+# themselves.
 _.TOKEN_ASSIGN_PRIMARY
 _.TOKEN_DUPLICATE
 _.TOKEN_IMPERSONATE
 _.TOKEN_ADJUST_PRIVILEGES
 _.TOKEN_ADJUST_DEFAULT
+ProcessAccess
+_.PROCESS_TERMINATE
+_.PROCESS_VM_OPERATION
+_.PROCESS_VM_READ
+_.PROCESS_VM_WRITE
+_.PROCESS_DUP_HANDLE
+_.PROCESS_CREATE_PROCESS
+_.PROCESS_QUERY_LIMITED_INFORMATION
 _.cb
 _.lpAttributeList
 _.dwFlags

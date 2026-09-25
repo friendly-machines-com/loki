@@ -674,9 +674,18 @@ def canonical_sid(text: str) -> str:
 TOKEN_IS_APP_CONTAINER_CLASS = 29
 TOKEN_APP_CONTAINER_SID_CLASS = 31
 
+
 # PROCESS_ACCESS_RIGHTS, from
 # https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights
-PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+class ProcessAccess(enum.IntFlag):
+    PROCESS_TERMINATE = 0x0001
+    PROCESS_VM_OPERATION = 0x0008
+    PROCESS_VM_READ = 0x0010
+    PROCESS_VM_WRITE = 0x0020
+    PROCESS_DUP_HANDLE = 0x0040
+    PROCESS_CREATE_PROCESS = 0x0080
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
 
 # Process creation flags, from
 # https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
