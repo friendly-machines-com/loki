@@ -307,9 +307,11 @@ class AppContainerLaunchTests(unittest.TestCase):
         self.assertTrue(seen["deleted"])
         self.assertTrue(seen["freed"])
         self.assertFalse(seen["inherit"])
-        self.assertTrue(seen["flags"] & windows_api.CREATE_SUSPENDED)
         self.assertTrue(
-            seen["flags"] & windows_api.EXTENDED_STARTUPINFO_PRESENT)
+            seen["flags"] & windows_api.CreateProcessFlags.CREATE_SUSPENDED)
+        self.assertTrue(
+            seen["flags"]
+            & windows_api.CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT)
         self.assertIn("loki.exe", seen["command_line"])
 
         capabilities_calls = [

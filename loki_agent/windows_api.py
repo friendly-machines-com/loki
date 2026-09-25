@@ -689,10 +689,15 @@ class ProcessAccess(enum.IntFlag):
 
 # Process creation flags, from
 # https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
-CREATE_SUSPENDED = 0x00000004
-CREATE_UNICODE_ENVIRONMENT = 0x00000400
-EXTENDED_STARTUPINFO_PRESENT = 0x00080000
-STARTF_USESTDHANDLES = 0x00000100
+class CreateProcessFlags(enum.IntFlag):
+    CREATE_SUSPENDED = 0x00000004
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400
+    EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+
+
+class StartupInfoFlags(enum.IntFlag):
+    STARTF_USESTDHANDLES = 0x00000100
+
 
 # SetInformationJobObject's JOB_OBJECT_LIMIT_* (winnt.h).
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -1066,17 +1071,17 @@ def create_process_with_pseudoconsole(executable, arguments, hpc, *,
         startup = StartupInfoEx()
         startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
         startup.lpAttributeList = attributes
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+        startup.StartupInfo.dwFlags = StartupInfoFlags.STARTF_USESTDHANDLES
         # hStdInput/hStdOutput/hStdError stay NULL; the pseudoconsole supplies
         # them, and null handles keep the compatibility path from duplicating
         # the parent's redirected handles into the child.
         information = ProcessInformation()
         command_line = ctypes.create_unicode_buffer(
             subprocess.list2cmdline([executable, *arguments]))
-        flags = EXTENDED_STARTUPINFO_PRESENT
+        flags = CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT
         block = environment_block(environment, current_directory)
         if block is not None:
-            flags |= CREATE_UNICODE_ENVIRONMENT
+            flags |= CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT
         if not create(executable, command_line, None, None, False, flags,
                       block, current_directory, ctypes.byref(startup),
                       ctypes.byref(information)):
@@ -1268,16 +1273,17 @@ def create_process_in_app_container(executable, arguments, package_sid,
         startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
         startup.lpAttributeList = attribute_list
         if standard_handles is not None:
-            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+            startup.StartupInfo.dwFlags = StartupInfoFlags.STARTF_USESTDHANDLES
             (startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput,
              startup.StartupInfo.hStdError) = standard_handles
         information = ProcessInformation()
         command_line = ctypes.create_unicode_buffer(
             subprocess.list2cmdline([executable, *arguments]))
-        flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT
+        flags = (CreateProcessFlags.CREATE_SUSPENDED
+                 | CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT)
         block = environment_block(environment, current_directory)
         if block is not None:
-            flags |= CREATE_UNICODE_ENVIRONMENT
+            flags |= CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT
         if not create(executable, command_line, None, None,
                       bool(inherited_handles), flags, block,
                       current_directory, ctypes.byref(startup),
