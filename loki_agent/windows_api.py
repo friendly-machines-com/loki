@@ -316,7 +316,7 @@ def open_directory_handle(path: str):
                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p)
     handle = create_file(path, AccessMask.FILE_READ_ATTRIBUTES,
-                         FILE_SHARE_ALL, None, OPEN_EXISTING,
+                         FileShareMode.FILE_SHARE_ALL, None, OPEN_EXISTING,
                          FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) failed",
@@ -344,7 +344,8 @@ def open_directory_for_acl(path: str):
     handle = create_file(
         path, (AccessMask.WRITE_DAC | AccessMask.READ_CONTROL
                | AccessMask.FILE_READ_ATTRIBUTES),
-        FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING,
+        FileShareMode.FILE_SHARE_READ | FileShareMode.FILE_SHARE_WRITE,
+        None, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) for ACL failed",
@@ -742,10 +743,15 @@ class AccessMask(enum.IntFlag):
     FILE_READ_ATTRIBUTES = 0x00000080
 
 
+# FILE_SHARE_* (winnt.h): CreateFileW's dwShareMode -- what other opens may do
+# with the object while this handle is held.
+class FileShareMode(enum.IntFlag):
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_ALL = 0x00000007
+
+
 OPEN_EXISTING = 3
-FILE_SHARE_READ = 0x00000001
-FILE_SHARE_WRITE = 0x00000002
-FILE_SHARE_ALL = 0x00000007
 # FILE_FLAG_BACKUP_SEMANTICS lets CreateFileW open a directory, which the
 # credential tree and the workspace both are.
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -838,7 +844,7 @@ def current_process_handle():
 
 def open_with_access(path, desired_access, creation=OPEN_EXISTING,
                      flags=FILE_FLAG_BACKUP_SEMANTICS,
-                     share_mode=FILE_SHARE_ALL):
+                     share_mode=FileShareMode.FILE_SHARE_ALL):
     """Open ``path`` requesting ``desired_access``, returning the handle.
 
     The containment probe uses this to request rights it must not have, so a
@@ -1432,8 +1438,8 @@ def nt_create_file(directory, name, desired_access, disposition, options,
     handle = ctypes.c_void_p()
     status = create(ctypes.byref(handle), desired_access,
                     ctypes.byref(attributes_block), ctypes.byref(io),
-                    None, attributes, FILE_SHARE_ALL, disposition, options,
-                    None, 0)
+                    None, attributes, FileShareMode.FILE_SHARE_ALL,
+                    disposition, options, None, 0)
     if status < 0:
         raise WindowsApiError(
             f"NtCreateFile({name!r}) failed: 0x{status & 0xffffffff:08x}",

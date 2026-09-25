@@ -532,7 +532,8 @@ class FileAccessTests(unittest.TestCase):
             self.assertEqual(windows_api.open_directory_handle("/x"), 77)
         self.assertEqual(calls["access"],
                          windows_api.AccessMask.FILE_READ_ATTRIBUTES)
-        self.assertEqual(calls["share"], windows_api.FILE_SHARE_ALL)
+        self.assertEqual(calls["share"],
+                         windows_api.FileShareMode.FILE_SHARE_ALL)
         self.assertEqual(calls["access"] & windows_api.AccessMask.READ_CONTROL,
                          0)
         self.assertEqual(calls["access"] & windows_api.AccessMask.GENERIC_READ,
