@@ -590,6 +590,337 @@ def conpty_interactive_probe(root, stage):
     return 0
 
 
+PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+CREATE_UNICODE_ENVIRONMENT = 0x00000400
+STARTF_USESTDHANDLES = 0x00000100
+FILE_TYPE_CHAR = 0x0002
+FILE_TYPE_PIPE = 0x0003
+STD_INPUT_HANDLE = -10
+STD_OUTPUT_HANDLE = -11
+
+
+class ProbeSecurityAttributes(C.Structure):
+    """SECURITY_ATTRIBUTES for a pipe whose child end must be inheritable."""
+
+    _fields_ = [('length', ULONG), ('descriptor', C.c_void_p),
+                ('inherit', W.BOOL)]
+
+
+def environment_203_probe(root):
+    """Record CreateProcessW's ERROR_ENVVAR_NOT_FOUND (203) rule.
+
+    A supplied environment block must carry the per-drive ``=X:=`` entry for
+    the drive holding the child's current directory; production builds it in
+    ``windows_api.environment_block``.  This measures the rule directly instead
+    of inferring it: launch ``cmd.exe`` from this directory with the block
+    whole, with every ``=X:`` entry removed, and with only this drive's entry
+    removed, recording success/winerror for each.
+    """
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    get_strings = kernel.GetEnvironmentStringsW
+    get_strings.argtypes = []
+    get_strings.restype = C.c_void_p
+    free_strings = kernel.FreeEnvironmentStringsW
+    free_strings.argtypes = [C.c_void_p]
+    free_strings.restype = W.BOOL
+    create_process = kernel.CreateProcessW
+    create_process.argtypes = [W.LPCWSTR, W.LPWSTR, C.c_void_p, C.c_void_p,
+                               W.BOOL, ULONG, C.c_void_p, W.LPCWSTR,
+                               C.POINTER(ProbeStartupInfo),
+                               C.POINTER(ProbeProcessInfo)]
+    create_process.restype = W.BOOL
+    wait = kernel.WaitForSingleObject
+    wait.argtypes = [HANDLE, ULONG]
+    wait.restype = ULONG
+    close = kernel.CloseHandle
+    close.argtypes = [HANDLE]
+    close.restype = W.BOOL
+
+    pointer = get_strings()
+    entries = []
+    if pointer:
+        address = pointer
+        while True:
+            entry = C.wstring_at(address)
+            if not entry:
+                break
+            entries.append(entry)
+            address += (len(entry) + 1) * C.sizeof(C.c_wchar)
+        free_strings(pointer)
+    drive = os.path.splitdrive(str(root))[0].upper()
+    command = C.create_unicode_buffer('%s /d /c exit 0' % os.path.join(
+        os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'cmd.exe'))
+
+    def create(chosen):
+        block = C.create_unicode_buffer(
+            '\0'.join(sorted(chosen, key=str.upper)) + '\0\0')
+        startup = ProbeStartupInfo()
+        startup.cb = C.sizeof(ProbeStartupInfo)
+        startup.flags = STARTF_USESTDHANDLES
+        process = ProbeProcessInfo()
+        # A plain STARTUPINFOW: EXTENDED_STARTUPINFO_PRESENT here would make
+        # CreateProcessW reject the call with ERROR_INVALID_PARAMETER (87)
+        # before it ever looks at the environment.
+        started = create_process(
+            None, command, None, None, False,
+            CREATE_UNICODE_ENVIRONMENT,
+            C.cast(block, C.c_void_p), str(root),
+            C.byref(startup), C.byref(process))
+        if started:
+            wait(process.process, 5000)
+            close(process.thread)
+            close(process.process)
+        return bool(started), C.get_last_error()
+
+    record = {
+        'probe': 'environment-203',
+        'cwd': str(root),
+        'drive': drive,
+        'drive_entries': [entry.split('=', 2)[1] for entry in entries
+                          if entry.startswith('=')],
+    }
+    variants = {
+        'whole': list(entries),
+        'no_drive_entries': [entry for entry in entries
+                             if not entry.startswith('=')],
+        'omit_current_drive': [entry for entry in entries
+                               if not entry.startswith('=' + drive + '=')],
+        # What production builds: the process block plus the entry for the
+        # directory the child will start in.
+        'with_current_drive': [*entries, '=' + drive + '=' + str(root)],
+    }
+    # The reduced environment the pty tests hand the front: a handful of
+    # variables, the loader's bootstrap ones, and nothing else.  Recording it
+    # separates "the block's contents" from "the flags/AppContainer path" as
+    # the cause of the 203.
+    reduced = [entry for entry in (
+        *('%s=%s' % (name, os.environ[name])
+          for name in ('SystemRoot', 'SystemDrive', 'PATH')
+          if name in os.environ),
+        'HOME=' + str(root),
+        'XDG_CONFIG_HOME=' + str(root / 'config'),
+        'XDG_STATE_HOME=' + str(root / 'state'),
+        'LOKI_PROVIDER=dummy',
+        'LOKI_API_BASE=http://dummy.invalid/v1',
+        'LOKI_MODEL=dummy-model')]
+    variants['reduced_with_current_drive'] = [*reduced,
+                                              '=' + drive + '=' + str(root)]
+    variants['reduced_no_drive'] = list(reduced)
+    for label, chosen in variants.items():
+        started, error = create(chosen)
+        record[label] = {'started': started, 'winerror': error}
+    print(json.dumps(record), flush=True)
+    return 0
+
+
+def conpty_split_stdio_child():
+    """Report stdin/stdout kinds, then write two newline-delimited records.
+
+    Launched by ``conpty_split_stdio_probe`` on a pseudoconsole with its stdout
+    separately inherited.  Uses ``os.write`` so the bytes on the pipe are
+    exactly what a line-delimited protocol would receive.
+    """
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    get_std = kernel.GetStdHandle
+    get_std.argtypes = [C.c_int]
+    get_std.restype = HANDLE
+    get_file_type = kernel.GetFileType
+    get_file_type.argtypes = [HANDLE]
+    get_file_type.restype = ULONG
+    stdin_type = get_file_type(get_std(STD_INPUT_HANDLE))
+    stdout_type = get_file_type(get_std(STD_OUTPUT_HANDLE))
+    record = {
+        'probe': 'conpty-split-stdio-child',
+        'stdin_file_type': stdin_type,
+        'stdout_file_type': stdout_type,
+        'stdin_is_console': stdin_type == FILE_TYPE_CHAR,
+        'stdout_is_pipe': stdout_type == FILE_TYPE_PIPE,
+    }
+    os.write(1, (json.dumps(record) + '\n').encode('utf-8'))
+    os.write(1, b'{"probe": "conpty-split-stdio-child", "record": 2}\n')
+    return 0
+
+
+def conpty_split_stdio_probe(root):
+    """Attach a child to ConPTY while its stdout is a separate inherited pipe.
+
+    The ACP console fixture needs a real console on stdin while the protocol
+    JSON keeps its own pipe on stdout.  This checks that topology is reachable
+    with documented calls before any launcher or test changes: attach the child
+    to a pseudoconsole, pass a separate stdout pipe in the explicit handle
+    list, and record whether its stdin is a console and its stdout is a pipe
+    carrying exact newline-delimited bytes, while the pty output drains
+    separately.
+    """
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    create_pipe = kernel.CreatePipe
+    create_pipe.argtypes = [C.POINTER(HANDLE), C.POINTER(HANDLE),
+                            C.POINTER(ProbeSecurityAttributes), ULONG]
+    create_pipe.restype = W.BOOL
+    create_pseudo = kernel.CreatePseudoConsole
+    create_pseudo.argtypes = [Coord, HANDLE, HANDLE, ULONG, C.POINTER(HANDLE)]
+    create_pseudo.restype = C.c_long
+    close_pseudo = kernel.ClosePseudoConsole
+    close_pseudo.argtypes = [HANDLE]
+    close_pseudo.restype = None
+    initialize = kernel.InitializeProcThreadAttributeList
+    initialize.argtypes = [C.c_void_p, ULONG, ULONG, C.POINTER(C.c_size_t)]
+    initialize.restype = W.BOOL
+    update = kernel.UpdateProcThreadAttribute
+    update.argtypes = [C.c_void_p, ULONG, C.c_size_t, C.c_void_p, C.c_size_t,
+                       C.c_void_p, C.c_void_p]
+    update.restype = W.BOOL
+    delete = kernel.DeleteProcThreadAttributeList
+    delete.argtypes = [C.c_void_p]
+    delete.restype = None
+    create_process = kernel.CreateProcessW
+    create_process.argtypes = [W.LPCWSTR, W.LPWSTR, C.c_void_p, C.c_void_p,
+                               W.BOOL, ULONG, C.c_void_p, W.LPCWSTR,
+                               C.POINTER(ProbeStartupInfo),
+                               C.POINTER(ProbeProcessInfo)]
+    create_process.restype = W.BOOL
+    read_file = kernel.ReadFile
+    read_file.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
+                          C.c_void_p]
+    read_file.restype = W.BOOL
+    peek = kernel.PeekNamedPipe
+    peek.argtypes = [HANDLE, C.c_void_p, ULONG, C.POINTER(ULONG),
+                     C.POINTER(ULONG), C.POINTER(ULONG)]
+    peek.restype = W.BOOL
+    wait = kernel.WaitForSingleObject
+    wait.argtypes = [HANDLE, ULONG]
+    wait.restype = ULONG
+    close = kernel.CloseHandle
+    close.argtypes = [HANDLE]
+    close.restype = W.BOOL
+    get_exit = kernel.GetExitCodeProcess
+    get_exit.argtypes = [HANDLE, C.POINTER(ULONG)]
+    get_exit.restype = W.BOOL
+    terminate = kernel.TerminateProcess
+    terminate.argtypes = [HANDLE, ULONG]
+    terminate.restype = W.BOOL
+
+    def pair(inheritable=False):
+        security = ProbeSecurityAttributes(
+            C.sizeof(ProbeSecurityAttributes), None, 1 if inheritable else 0)
+        read, write = HANDLE(), HANDLE()
+        if not create_pipe(C.byref(read), C.byref(write),
+                           C.byref(security), 0):
+            raise C.WinError(C.get_last_error())
+        return read, write
+
+    input_read, input_write = pair()
+    output_read, output_write = pair()
+    stdout_read, stdout_write = pair(inheritable=True)
+    hpc = HANDLE()
+    record = {'probe': 'conpty-split-stdio'}
+    status = create_pseudo(Coord(80, 24), input_read, output_write, 0,
+                           C.byref(hpc))
+    if status < 0:
+        for handle in (input_read, input_write, output_read, output_write,
+                       stdout_read, stdout_write):
+            close(handle)
+        record.update({'created': False,
+                       'hresult': '0x%08x' % (status & 0xffffffff)})
+        print(json.dumps(record), flush=True)
+        return 0
+    record['created'] = True
+    attributes = None
+    closed = False
+    process = ProbeProcessInfo()
+    inherited = (HANDLE * 1)(stdout_write)
+
+    def drain(handle, sink):
+        available, transferred = ULONG(), ULONG()
+        while True:
+            if not peek(handle, None, 0, None, C.byref(available), None):
+                return False
+            if not available.value:
+                return True
+            buffer = C.create_string_buffer(available.value)
+            if not read_file(handle, buffer, available.value,
+                             C.byref(transferred), None):
+                return False
+            sink.extend(buffer.raw[:transferred.value])
+
+    try:
+        size = C.c_size_t()
+        initialize(None, 2, 0, C.byref(size))
+        if C.get_last_error() != 122 or not size.value:
+            raise C.WinError(C.get_last_error())
+        storage = C.create_string_buffer(size.value)
+        attributes = C.cast(storage, C.c_void_p)
+        if not initialize(attributes, 2, 0, C.byref(size)):
+            raise C.WinError(C.get_last_error())
+        if not update(attributes, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                      C.cast(hpc, C.c_void_p), C.sizeof(hpc), None, None):
+            raise C.WinError(C.get_last_error())
+        if not update(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                      C.cast(inherited, C.c_void_p), C.sizeof(HANDLE),
+                      None, None):
+            raise C.WinError(C.get_last_error())
+        startup = SharedStartupInfo()
+        startup.startup.cb = C.sizeof(SharedStartupInfo)
+        startup.startup.flags = STARTF_USESTDHANDLES
+        startup.startup.stdin = None
+        startup.startup.stdout = stdout_write
+        startup.startup.stderr = None
+        startup.attributes = attributes
+        command = C.create_unicode_buffer('"%s" "%s" --conpty-stdio-child' % (
+            sys.executable, str(Path(__file__).resolve())))
+        if not create_process(None, command, None, None, True,
+                              EXTENDED_STARTUPINFO_PRESENT, None, str(root),
+                              C.byref(startup.startup),
+                              C.byref(process)):
+            raise C.WinError(C.get_last_error())
+        # The pseudoconsole keeps its copies; release ours so a broken pipe
+        # shows when the child exits.
+        close(input_read)
+        close(output_write)
+        close(stdout_write)
+        pty_output = bytearray()
+        raw = bytearray()
+        deadline = time.time() + 10
+        while wait(process.process, 0) != 0 and time.time() < deadline:
+            drain(output_read, pty_output)
+            drain(stdout_read, raw)
+            time.sleep(0.005)
+        drain(stdout_read, raw)
+        drain(output_read, pty_output)
+        exit_code = ULONG()
+        get_exit(process.process, C.byref(exit_code))
+        record['exit_code'] = exit_code.value
+        close_pseudo(hpc)
+        closed = True
+        while drain(output_read, pty_output):
+            pass
+        lines = [line for line in bytes(raw).split(b'\n') if line]
+        record['stdout_line_count'] = len(lines)
+        record['stdout_bytes'] = bytes(raw).decode('utf-8', 'replace')
+        record['first_record'] = json.loads(lines[0]) if lines else None
+        record['pty_output'] = bytes(pty_output).decode('utf-8', 'replace')
+    except OSError as error:
+        record['error'] = str(error)
+        record['winerror'] = getattr(error, 'winerror', None)
+    finally:
+        if process.process:
+            if wait(process.process, 0) != 0:
+                terminate(process.process, 1)
+                wait(process.process, 1000)
+            close(process.process)
+        if process.thread:
+            close(process.thread)
+        if not closed:
+            close_pseudo(hpc)
+        if attributes is not None:
+            delete(attributes)
+        close(input_write)
+        close(output_read)
+        close(stdout_read)
+    print(json.dumps(record), flush=True)
+    return 0
+
+
 def mandatory_label_sid(sacl_address):
     """Return the address of the mandatory-label SID inside a SACL, or None.
 
@@ -874,6 +1205,12 @@ def child(mode, root, stage=None):
 
     if mode == 'conpty-interactive':
         return conpty_interactive_probe(root, stage)
+
+    if mode == 'environment-203':
+        return environment_203_probe(root)
+
+    if mode == 'conpty-split-stdio':
+        return conpty_split_stdio_probe(root)
 
     if mode == 'second-user-create':
         # Create the credential directory exactly as the storage does: a
@@ -1681,6 +2018,34 @@ class WindowsPrimitiveTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0,
                                  result.stdout + result.stderr)
 
+    def test_environment_203_characterization(self):
+        # Recorded: does CreateProcessW reject a block that omits the drive
+        # entry for the child's current directory, and accept the whole block?
+        # This is the rule behind the reduced-env runtime-launch failure, not a
+        # Loki behaviour; the record carries the winerror for each variant.
+        result = subprocess.run(self.command('environment-203', ''),
+                                capture_output=True, text=True)
+        print(result.stdout, flush=True)
+        print(result.stderr, file=sys.stderr, flush=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_conpty_split_stdio_capability(self):
+        # The ACP console fixture needs console stdin with the protocol on its
+        # own stdout pipe.  Establish that topology before changing any
+        # launcher: stdin must be a console, stdout a pipe, and the records on
+        # that pipe exactly newline-delimited.
+        result = subprocess.run(self.command('conpty-split-stdio', ''),
+                                capture_output=True, text=True)
+        print(result.stdout, flush=True)
+        print(result.stderr, file=sys.stderr, flush=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(record.get('created'), record)
+        first = record.get('first_record') or {}
+        self.assertTrue(first.get('stdin_is_console'), record)
+        self.assertTrue(first.get('stdout_is_pipe'), record)
+        self.assertEqual(record.get('stdout_line_count'), 2)
+
     def test_path_resolution_semantics(self):
         # What Windows resolves for a directory junction, `..`, and identity:
         # the file_paths expectations have to be written from this, not from
@@ -1813,6 +2178,8 @@ if __name__ == '__main__':
         sys.exit(child(*sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == '--conpty-child':
         sys.exit(conpty_child(sys.argv[2]))
+    if len(sys.argv) > 1 and sys.argv[1] == '--conpty-stdio-child':
+        sys.exit(conpty_split_stdio_child())
     if len(sys.argv) > 1 and sys.argv[1] == '--standard-user':
         if len(sys.argv) != 3 or os.name != 'nt':
             raise RuntimeError('--standard-user requires native Windows and a SID')
