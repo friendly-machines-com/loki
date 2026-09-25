@@ -451,7 +451,8 @@ class LaunchEnvironmentTests(unittest.TestCase):
                     record[label] = {
                         "started": False,
                         "winerror": getattr(error, "winerror", None),
-                        "error": type(error).__name__}
+                        "error": type(error).__name__,
+                        "message": str(error)}
                 else:
                     record[label] = {"started": True}
                     process.close()

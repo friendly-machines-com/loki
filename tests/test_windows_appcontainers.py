@@ -802,6 +802,15 @@ def environment_203_probe(native, sid, workspace, output):
     }
     for name in names:
         buffers['add_' + name] = block(entries((*minimal, name)))
+    # Every explicit block above omits the per-drive entry, because the broker
+    # itself holds none.  Inheriting the block succeeded, so add the entry for
+    # the child's directory as the discriminator: if these start, an explicit
+    # AppContainer block requires it even though a plain CreateProcessW does not.
+    drive = os.path.splitdrive(str(workspace))[0].upper()
+    if drive:
+        drive_entry = '=' + drive + '=' + str(workspace)
+        buffers['full_broker_plus_drive'] = block([*entries(names), drive_entry])
+        buffers['minimal_plus_drive'] = block([*entries(minimal), drive_entry])
     record = {'probe': 'appcontainer-environment-203',
               'drive_entries': [entry.split('=', 2)[1]
                                 for entry in drive_entries]}
