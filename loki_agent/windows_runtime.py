@@ -363,6 +363,13 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
     child_environment = dict(environment)
     child_environment[WORKSPACE_ENV] = workspace
     child_environment[PACKAGE_ENV] = package
+    # LOCALAPPDATA is needed in this block: with the terminal tests' reduced
+    # environment the launch is refused with ERROR_ENVVAR_NOT_FOUND (203), and
+    # with LOCALAPPDATA added the same launch starts.  Measured on Windows by
+    # tests/test_windows_runtime.LaunchEnvironmentTests.
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data and "LOCALAPPDATA" not in child_environment:
+        child_environment["LOCALAPPDATA"] = local_app_data
     # Scratch inside the granted workspace: the profile TEMP holds no package
     # grant and is shared with every other process running as the user.  The
     # contained runtime recreates the directory if it is missing.

@@ -335,10 +335,17 @@ class LaunchTests(unittest.TestCase):
                                    '/work', [40, 41],
                                    current_directory='/work')
             scratch = os.path.join('/work', runtime.SCRATCH_DIRECTORY)
-            self.assertEqual(create.call_args.kwargs['environment'], {
+            expected = {
                 'SAFE': 'value', runtime.WORKSPACE_ENV: '/work',
                 runtime.PACKAGE_ENV: 'package',
-                'TEMP': scratch, 'TMP': scratch})
+                'TEMP': scratch, 'TMP': scratch}
+            # The AppContainer start resolves the package's state under
+            # %LOCALAPPDATA% from the block it is given, so the launch supplies
+            # it when the caller's environment does not (measured on Windows:
+            # tests/test_windows_runtime.LaunchEnvironmentTests).
+            if os.environ.get('LOCALAPPDATA'):
+                expected['LOCALAPPDATA'] = os.environ['LOCALAPPDATA']
+            self.assertEqual(create.call_args.kwargs['environment'], expected)
             self.assertEqual(create.call_args.kwargs['current_directory'],
                              '/work')
             self.assertEqual(create.call_args.kwargs['inherited_handles'],
