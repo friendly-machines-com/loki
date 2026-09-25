@@ -21,12 +21,13 @@ class RawInputModeTests(unittest.TestCase):
         original = (host_terminal_windows.ENABLE_LINE_INPUT
                     | host_terminal_windows.ENABLE_ECHO_INPUT
                     | host_terminal_windows.ENABLE_PROCESSED_INPUT
-                    | 0x0080)
+                    | host_terminal_windows.ENABLE_EXTENDED_FLAGS)
 
         mode = host_terminal_windows.raw_input_mode(original)
 
         self.assertEqual(
-            mode, 0x0080 | host_terminal_windows.ENABLE_VIRTUAL_TERMINAL_INPUT)
+            mode, host_terminal_windows.ENABLE_EXTENDED_FLAGS
+            | host_terminal_windows.ENABLE_VIRTUAL_TERMINAL_INPUT)
 
     def test_other_bits_are_left_alone(self):
         mode = host_terminal_windows.raw_input_mode(0x0000)

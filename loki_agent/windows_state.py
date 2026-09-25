@@ -44,6 +44,12 @@ class Access(enum.Enum):
     READ_WRITE = "read-write"
 
 
+# SDDL rights text: read plus execute (traverse on a directory), and the
+# documented Modify mask.
+READ_SDDL_RIGHTS = "FRFX"
+MODIFY_SDDL_RIGHTS = "0x1301BF"
+
+
 def access_sddl(access: Access) -> str:
     """Return the DACL rights for a level.
 
@@ -53,7 +59,7 @@ def access_sddl(access: Access) -> str:
     ``FA``, because ``FA`` would also hand over ``WRITE_DAC`` and let a tool
     rewrite the DACL and lock the owner out of their own directory.
     """
-    return "FRFX" if access is Access.READ else "0x1301BF"
+    return READ_SDDL_RIGHTS if access is Access.READ else MODIFY_SDDL_RIGHTS
 
 
 def access_mask(access: Access) -> int:
