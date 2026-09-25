@@ -43,7 +43,6 @@ PIPE_ACCESS_DUPLEX = 0x00000003
 PIPE_ACCESS_INBOUND = 0x00000001
 PIPE_WAIT = 0x00000000
 PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
-OPEN_EXISTING = 3
 ERROR_PIPE_BUSY = 231
 ERROR_PIPE_CONNECTED = 535
 ERROR_ACCESS_DENIED = 5
@@ -114,7 +113,7 @@ def pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
                                           status=status)
         try:
             client = api.open_with_access(address, access,
-                                          creation=OPEN_EXISTING,
+                                          creation=api.FileCreateDisposition.OPEN_EXISTING,
                                           flags=client_flags,
                                           share_mode=0)
         except api.WindowsApiError:

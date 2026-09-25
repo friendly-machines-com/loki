@@ -30,6 +30,12 @@ _.PROCESS_VM_WRITE
 _.PROCESS_DUP_HANDLE
 _.PROCESS_CREATE_PROCESS
 _.PROCESS_QUERY_LIMITED_INFORMATION
+# FileCreateDisposition is the complete dwCreationDisposition set; Loki opens
+# with OPEN_EXISTING only.
+_.CREATE_NEW
+_.CREATE_ALWAYS
+_.OPEN_ALWAYS
+_.TRUNCATE_EXISTING
 _.cb
 _.lpAttributeList
 _.dwFlags

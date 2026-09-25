@@ -316,7 +316,8 @@ def open_directory_handle(path: str):
                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p)
     handle = create_file(path, AccessMask.FILE_READ_ATTRIBUTES,
-                         FileShareMode.FILE_SHARE_ALL, None, OPEN_EXISTING,
+                         FileShareMode.FILE_SHARE_ALL, None,
+                         FileCreateDisposition.OPEN_EXISTING,
                          FileFlags.FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) failed",
@@ -345,7 +346,7 @@ def open_directory_for_acl(path: str):
         path, (AccessMask.WRITE_DAC | AccessMask.READ_CONTROL
                | AccessMask.FILE_READ_ATTRIBUTES),
         FileShareMode.FILE_SHARE_READ | FileShareMode.FILE_SHARE_WRITE,
-        None, OPEN_EXISTING,
+        None, FileCreateDisposition.OPEN_EXISTING,
         FileFlags.FILE_FLAG_BACKUP_SEMANTICS, None)
     if handle is None or handle == INVALID_HANDLE_VALUE:
         raise WindowsApiError(f"CreateFileW({path!r}) for ACL failed",
@@ -751,7 +752,13 @@ class FileShareMode(enum.IntFlag):
     FILE_SHARE_ALL = 0x00000007
 
 
-OPEN_EXISTING = 3
+# CreateFileW's dwCreationDisposition (winnt.h): one of these, not a set.
+class FileCreateDisposition(enum.IntEnum):
+    CREATE_NEW = 1
+    CREATE_ALWAYS = 2
+    OPEN_EXISTING = 3
+    OPEN_ALWAYS = 4
+    TRUNCATE_EXISTING = 5
 
 
 # FILE_FLAG_* (winnt.h).  CreateFileW's dwFlagsAndAttributes takes these *and*
@@ -856,7 +863,8 @@ def current_process_handle():
     return bind("kernel32", "GetCurrentProcess", ctypes.c_void_p)()
 
 
-def open_with_access(path, desired_access, creation=OPEN_EXISTING,
+def open_with_access(path, desired_access,
+                     creation=FileCreateDisposition.OPEN_EXISTING,
                      flags=FileFlags.FILE_FLAG_BACKUP_SEMANTICS,
                      share_mode=FileShareMode.FILE_SHARE_ALL):
     """Open ``path`` requesting ``desired_access``, returning the handle.
