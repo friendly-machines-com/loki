@@ -1364,9 +1364,18 @@ FILE_OPEN_REPARSE_POINT = 0x00200000
 FILE_OPEN = 1
 FILE_CREATE = 2
 FILE_OPEN_IF = 3
-FILE_ATTRIBUTE_DIRECTORY = 0x00000010
-FILE_ATTRIBUTE_NORMAL = 0x00000080
-FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
+
+# FILE_ATTRIBUTE_* (winnt.h): the attribute bits of a file.  Read back from
+# BY_HANDLE_FILE_INFORMATION.dwFileAttributes, and given at creation in
+# CreateFileW's dwFlagsAndAttributes -- the same DWORD that carries FILE_FLAG_*,
+# two disjoint families in one parameter.
+class FileAttribute(enum.IntFlag):
+    FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
+
 FILE_RENAME_INFORMATION = 10
 FILE_DISPOSITION_INFO = 4
 # NTSTATUS values.  ``NtCreateFile`` returns these directly; the caller
@@ -1445,7 +1454,7 @@ def nt_create_file(directory, name, desired_access, disposition, options,
     """Open or create ``name`` relative to the directory handle ``directory``.
 
     ``name`` is one path component; the caller checks that.  ``attributes`` is
-    the FILE_ATTRIBUTE_* to give a created file and is ignored for an open.
+    the FileAttribute to give a created file and is ignored for an open.
     Returns the handle.  Raises :class:`WindowsApiError` with the NTSTATUS in
     ``status`` so the caller can translate it.
     """

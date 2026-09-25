@@ -899,7 +899,8 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         from loki_agent import _private_files_windows
 
         information = windows_api.ByHandleFileInformation()
-        information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
+        information.dwFileAttributes = (
+            windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
         owner = "S-1-5-21-1-2-3-1001"
         patches = self._created_file_mocks(
             information, owner, self._private_sddl(owner))
@@ -942,7 +943,8 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
         from loki_agent import _private_files_windows
 
         information = windows_api.ByHandleFileInformation()
-        information.dwFileAttributes = windows_api.FILE_ATTRIBUTE_NORMAL
+        information.dwFileAttributes = (
+            windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
         information.nFileSizeLow = 1234
         owner = "S-1-5-21-1-2-3-1001"
         with mock.patch.object(windows_api, "by_handle_file_information",
@@ -984,7 +986,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
 
         information = windows_api.ByHandleFileInformation()
         information.dwFileAttributes = (
-            windows_api.FILE_ATTRIBUTE_REPARSE_POINT)
+            windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT)
         with mock.patch.object(windows_api, "by_handle_file_information",
                                return_value=information), \
                 mock.patch.object(windows_api, "handle_owner_sid",

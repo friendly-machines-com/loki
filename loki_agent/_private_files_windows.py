@@ -140,14 +140,15 @@ def _facts_from_handle(handle) -> FileFacts:
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
     attributes = information.dwFileAttributes
-    directory = bool(attributes & windows_api.FILE_ATTRIBUTE_DIRECTORY)
+    directory = bool(
+        attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY)
     return FileFacts(
         # Windows has no device/pipe distinction here; a non-directory is the
         # regular-file equivalent, and a reparse point is refused separately.
         regular=not directory,
         directory=directory,
         reparse_point=bool(
-            attributes & windows_api.FILE_ATTRIBUTE_REPARSE_POINT),
+            attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT),
         size=(information.nFileSizeHigh << 32) | information.nFileSizeLow,
         owned_by_current_user=(owner == current_user),
         group_or_other_access=_is_shared(dacl, owner, inheritable=directory),
@@ -196,7 +197,7 @@ def fsync(handle) -> None:
         information = windows_api.by_handle_file_information(handle)
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
-    if information.dwFileAttributes & windows_api.FILE_ATTRIBUTE_DIRECTORY:
+    if information.dwFileAttributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
         return
     try:
         windows_api.flush_file(handle)
@@ -227,7 +228,7 @@ def open_directory(path: str):
     # Only the mechanism is checked here: a root has to be a directory at
     # all.  Whether a reparse-point directory is acceptable is policy, and
     # the caller decides it from describe() on the returned handle.
-    if not attributes & windows_api.FILE_ATTRIBUTE_DIRECTORY:
+    if not attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
         windows_api.close_handle(handle)
         raise NotADirectoryError(path)
     return handle
@@ -259,7 +260,7 @@ def create_exclusive_at(directory, name: str, mode: int):
         | windows_api.AccessMask.FILE_READ_ATTRIBUTES
         | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.FILE_CREATE, _NON_DIRECTORY,
-        windows_api.FILE_ATTRIBUTE_NORMAL)
+        windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
 
 
 def open_lock_file_at(directory, name: str, mode: int):
