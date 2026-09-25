@@ -52,11 +52,15 @@ def child_environment(**values) -> dict:
     """A reduced environment that a Windows executable can still start in.
 
     The point of a reduced env is to control what the entrypoint sees, not to
-    omit ``SystemRoot``, which the Windows loader needs before any Python runs.
+    omit ``SystemRoot``, which the Windows loader needs before any Python runs,
+    nor ``LOCALAPPDATA``, which the contained launch the entrypoint performs
+    needs in its own block -- without it that ``CreateProcessW`` is refused
+    with ``ERROR_ENVVAR_NOT_FOUND`` (203).  Both come from this process, so the
+    entrypoint still sees a controlled environment.
     """
     environment = dict(values)
     if os.name == "nt":
-        for name in ("SystemRoot", "SystemDrive"):
+        for name in ("SystemRoot", "SystemDrive", "LOCALAPPDATA"):
             if name in os.environ:
                 environment.setdefault(name, os.environ[name])
     return environment
