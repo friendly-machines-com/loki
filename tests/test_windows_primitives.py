@@ -95,6 +95,16 @@ LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 FILE_ID_INFO_CLASS = 18
 FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 
+# NT create/open values (winternl.h / ntifs.h) used by the handle-relative
+# probes.
+OBJ_CASE_INSENSITIVE = 0x00000040
+FILE_NON_DIRECTORY_FILE = 0x00000040
+FILE_OPEN = 0x00000001
+FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+SYNCHRONIZE = 0x00100000
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+OPEN_EXISTING = 3
+
 
 class Overlapped(C.Structure):
     """OVERLAPPED: the offset a LockFileEx range starts at."""
@@ -1019,12 +1029,12 @@ class NativeCalls:
         return result
 
     def open(self, path, access=GENERIC_READ, share=SHARE_ALL, flags=0):
-        handle = self.create(str(path), access, share, None, 3, flags, None)
+        handle = self.create(str(path), access, share, None, OPEN_EXISTING, flags, None)
         if handle == C.c_void_p(-1).value:
             raise C.WinError(C.get_last_error())
         return handle
 
-    def relative(self, directory, name, options=0x40 | 0x200000):
+    def relative(self, directory, name, options=FILE_NON_DIRECTORY_FILE | OPEN_REPARSE):
         # FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT. Neither this
         # leaf flag nor RootDirectory forbids intermediate reparse traversal.
         encoded = name.encode('utf-16-le')
@@ -1032,14 +1042,15 @@ class NativeCalls:
         string = UnicodeStrings(len(encoded), len(encoded) + 2,
                                 C.cast(text, HANDLE))
         attrs = ObjectAttributes(C.sizeof(ObjectAttributes), directory,
-                                 C.pointer(string), 0x40, None, None)
+                                 C.pointer(string), OBJ_CASE_INSENSITIVE, None, None)
         io = IoStatuses()
         result = HANDLE()
         # Synchronous handle for CRT binary reads; SYNCHRONIZE access is
-        # required with FILE_SYNCHRONOUS_IO_NONALERT (0x20).
-        status = self.ntcreate(C.byref(result), GENERIC_READ | 0x100000,
+        # required with FILE_SYNCHRONOUS_IO_NONALERT.
+        status = self.ntcreate(C.byref(result), GENERIC_READ | SYNCHRONIZE,
                                C.byref(attrs), C.byref(io), None, 0, SHARE_ALL,
-                               1, options | 0x20, None, 0)
+                               FILE_OPEN, options | FILE_SYNCHRONOUS_IO_NONALERT,
+                               None, 0)
         if status < 0:
             raise OSError('NtCreateFile NTSTATUS=0x%08x' % (status & 0xffffffff))
         return result.value
@@ -1746,15 +1757,15 @@ class WindowsPrimitiveTests(unittest.TestCase):
             self.native.relative(handle, 'junction\\child')), b'outside')
         # FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT opens the junction
         # itself. Use GetFileInformationByHandleEx(FileAttributeTagInfo).
-        leaf = self.native.relative(handle, 'junction', 1 | 0x200000)
+        leaf = self.native.relative(handle, 'junction', FILE_OPEN | OPEN_REPARSE)
         try:
             query = self.native.bind(
                 self.native.kernel, 'GetFileInformationByHandleEx', W.BOOL,
                 HANDLE, C.c_int, HANDLE, ULONG)
             attributes = (ULONG * 2)()
             self.native.check(query(leaf, 9, attributes, C.sizeof(attributes)))
-            self.assertTrue(attributes[0] & 0x400)
-            self.assertEqual(attributes[1], 0xa0000003)  # mount point tag
+            self.assertTrue(attributes[0] & FILE_ATTRIBUTE_REPARSE_POINT)
+            self.assertEqual(attributes[1], IO_REPARSE_TAG_MOUNT_POINT)
         finally:
             self.native.check(self.native.close(leaf))
 
