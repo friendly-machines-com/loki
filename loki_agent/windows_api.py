@@ -1357,7 +1357,10 @@ def create_process_in_app_container(executable, arguments, package_sid,
 # Win32 form returned ERROR_INVALID_PARAMETER -- so rename and delete use the
 # native ``NtSetInformationFile`` / ``SetFileInformationByHandle`` as measured.
 
-OBJ_CASE_INSENSITIVE = 0x00000040
+# OBJECT_ATTRIBUTES.Attributes (ntdef.h): the attribute bits the NT object calls
+# take in that struct.  Named Nt* to keep it clear of the struct below.
+class NtObjectAttributes(enum.IntFlag):
+    OBJ_CASE_INSENSITIVE = 0x00000040
 
 
 # NtCreateFile's CreateOptions (ntifs.h).  Distinct from FILE_FLAG_*, which goes
@@ -1483,7 +1486,7 @@ def nt_create_file(directory, name, desired_access, disposition, options,
                            ctypes.cast(text, ctypes.c_void_p))
     attributes_block = ObjectAttributes(
         ctypes.sizeof(ObjectAttributes), directory, ctypes.pointer(string),
-        OBJ_CASE_INSENSITIVE, None, None)
+        NtObjectAttributes.OBJ_CASE_INSENSITIVE, None, None)
     io = IoStatusBlock()
     handle = ctypes.c_void_p()
     status = create(ctypes.byref(handle), desired_access,
