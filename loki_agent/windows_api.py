@@ -666,8 +666,7 @@ STARTF_USESTDHANDLES = 0x00000100
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
 # PROC_THREAD_ATTRIBUTE_* (winbase.h).  The names map to these values, not to
-# the bare enumerators 2 and 9.  The tested launch in
-# tests/test_windows_appcontainers.py passes 0x20002 and 0x20009.
+# the bare enumerators.
 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
 PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x20009
 # The attribute value is the HPCON itself, and the pseudoconsole then supplies
