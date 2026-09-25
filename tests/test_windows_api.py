@@ -676,7 +676,7 @@ class PipeDeclarationTests(unittest.TestCase):
                                return_value=set_information):
             windows_api.clear_handle_inheritance(0x33)
         self.assertEqual(
-            seen, [(0x33, windows_api.HANDLE_FLAG_INHERIT, 0)])
+            seen, [(0x33, windows_api.HandleFlags.HANDLE_FLAG_INHERIT, 0)])
 
     def test_set_handle_information_failure_raises_with_the_win32_status(self):
         with mock.patch.object(
@@ -686,7 +686,7 @@ class PipeDeclarationTests(unittest.TestCase):
                                   return_value=6, create=True):
             with self.assertRaises(windows_api.WindowsApiError) as caught:
                 windows_api.set_handle_information(
-                    1, windows_api.HANDLE_FLAG_INHERIT, 0)
+                    1, windows_api.HandleFlags.HANDLE_FLAG_INHERIT, 0)
         self.assertEqual(caught.exception.status, 6)
 
 

@@ -648,10 +648,12 @@ class ContainedWorkerTransport(BaseSubprocessTransport):
             api.close_handle(front_write)
             raise
         try:
-            api.set_handle_information(child_read, api.HANDLE_FLAG_INHERIT,
-                                       api.HANDLE_FLAG_INHERIT)
-            api.set_handle_information(child_write, api.HANDLE_FLAG_INHERIT,
-                                       api.HANDLE_FLAG_INHERIT)
+            api.set_handle_information(
+                child_read, api.HandleFlags.HANDLE_FLAG_INHERIT,
+                api.HandleFlags.HANDLE_FLAG_INHERIT)
+            api.set_handle_information(
+                child_write, api.HandleFlags.HANDLE_FLAG_INHERIT,
+                api.HandleFlags.HANDLE_FLAG_INHERIT)
             with windows_runtime.worker_stdout_null() as null_handle:
                 contained = windows_runtime.launch(
                     sys.argv[0],

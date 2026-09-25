@@ -1562,7 +1562,9 @@ def unlock_file(handle) -> None:
 # and would give the structure the wrong layout in the portable tests that pin
 # it -- the same trap the other structures above avoid.
 
-HANDLE_FLAG_INHERIT = 0x00000001
+# HANDLE_FLAG_* (winbase.h): what SetHandleInformation may change about a handle.
+class HandleFlags(enum.IntFlag):
+    HANDLE_FLAG_INHERIT = 0x00000001
 
 
 class SecurityAttributes(ctypes.Structure):
@@ -1614,4 +1616,4 @@ def set_handle_information(handle, mask: int, flags: int) -> None:
 
 def clear_handle_inheritance(handle) -> None:
     """Clear ``HANDLE_FLAG_INHERIT`` so the end cannot leak into a child."""
-    set_handle_information(handle, HANDLE_FLAG_INHERIT, 0)
+    set_handle_information(handle, HandleFlags.HANDLE_FLAG_INHERIT, 0)
