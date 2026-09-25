@@ -107,6 +107,15 @@ def identity_matches(snapshot, owner, package):
             snapshot['package'] == package)
 
 
+# CreateProcessAsUserW and CreateProcessWithTokenW both document that hToken
+# must carry these three access rights; the caller's SE_IMPERSONATE_NAME
+# privilege is a separate requirement.
+TOKEN_ASSIGN_PRIMARY = 0x0001
+TOKEN_DUPLICATE = 0x0002
+TOKEN_IMPERSONATE = 0x0004
+TOKEN_QUERY = 0x0008
+
+
 def caller_token_launch(api, executable):
     """Unrestricted same-user control for the plain CreateProcessWithTokenW form.
 
@@ -125,14 +134,15 @@ def caller_token_launch(api, executable):
     absence of SE_IMPERSONATE_NAME is visible in the result.  A created child
     stays suspended, is inspected, and is terminated without ever running.
     """
-    own = api.token(api.n.current_process(), 8)
+    own = api.token(api.n.current_process(), TOKEN_QUERY)
     try:
         caller = api.snapshot(own)
     finally:
         api.close(own)
-    source = api.token(api.n.current_process(), 8 | 2)
+    source = api.token(api.n.current_process(), TOKEN_QUERY | TOKEN_DUPLICATE)
     try:
-        primary = api.clone(source, 8 | 2 | 1)
+        primary = api.clone(source, TOKEN_QUERY | TOKEN_DUPLICATE
+                            | TOKEN_ASSIGN_PRIMARY)
     finally:
         api.close(source)
     try:
@@ -543,9 +553,14 @@ try {
                                       flags, None, None,
                                       info, C.byref(child))
 
-    def token_launch(self, launcher, rights, executable, owner, package,
+    def token_launch(self, launcher, executable, owner, package,
                      plain=False):
         """Launch through a token-based creator using a fresh primary duplicate.
+
+        The duplicate is granted the access both creators document for their
+        ``hToken`` -- ``TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY``
+        -- so the caller no longer supplies a mask.  ``SE_IMPERSONATE_NAME`` is
+        a caller privilege, not a token right.
 
         Duplication and creation denial are reported at their named stage and
         only for documented denial errors; other failures are probe errors.
@@ -560,11 +575,14 @@ try {
         """
         print(json.dumps({'probe': 'token-launch', 'phase': 'duplicate'}),
               flush=True)
-        source = self.token(self.n.current_process(), 8 | 2)
+        source = self.token(self.n.current_process(),
+                            TOKEN_QUERY | TOKEN_DUPLICATE)
         try:
             primary = HANDLE()
-            self.n.check(self.duplicate(source, rights, None, 2, 1,
-                                        C.byref(primary)))
+            self.n.check(self.duplicate(
+                source,
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+                None, 2, 1, C.byref(primary)))
         finally:
             self.close(source)
         try:
@@ -794,11 +812,12 @@ def impersonation(api, manifest, classify):
     Microsoft directs shutting the process down if RevertToSelf fails; this
     child exits nonzero so the parent reports a protocol error, never denial.
     """
-    source = api.token(api.n.current_process(), 8 | 2)
+    source = api.token(api.n.current_process(), TOKEN_QUERY | TOKEN_DUPLICATE)
     try:
         duplicate = HANDLE()
-        # SecurityImpersonation level, impersonation type, TOKEN_QUERY|IMPERSONATE.
-        api.n.check(api.duplicate(source, 8 | 4, None, 2, 2, C.byref(duplicate)))
+        # SecurityImpersonation level, impersonation type.
+        api.n.check(api.duplicate(source, TOKEN_QUERY | TOKEN_IMPERSONATE, None,
+                                  2, 2, C.byref(duplicate)))
         try:
             before = api.snapshot(duplicate)
             baseline = classify('impersonation-baseline-read',
@@ -1085,7 +1104,6 @@ def probe(api, manifest, script, manifest_path, classify):
     run('thread-token-impersonation',
         lambda: api.impersonation_launch(script, manifest_path),
         ('impersonated-contained', 'access-denied'))
-    primary_rights = 8 | 2 | 1  # TOKEN_QUERY|DUPLICATE|ASSIGN_PRIMARY
     for name, launcher, plain in [
             ('create-process-as-user', api.launch_as_user, False),
             # CreateProcessWithTokenW is probed with a plain STARTUPINFOW.
@@ -1099,7 +1117,7 @@ def probe(api, manifest, script, manifest_path, classify):
             ('create-process-with-token-plain',
              api.launch_with_token, True)]:
         def token_launcher(launcher=launcher, plain=plain):
-            return api.token_launch(launcher, primary_rights, sys.executable,
+            return api.token_launch(launcher, sys.executable,
                                     owner, package, plain=plain)
         run(name, token_launcher, ('access-denied', 'contained'))
 

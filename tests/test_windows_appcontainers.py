@@ -1679,7 +1679,7 @@ class EscapeResultTests(unittest.TestCase):
                     mock.patch('builtins.print'), \
                     mock.patch.object(C, 'get_last_error', return_value=error,
                                       create=True):
-                result = api.token_launch(creator, 0xB, 'python.exe', 'user',
+                result = api.token_launch(creator, 'python.exe', 'user',
                                           'pkg')
             self.assertEqual(result['phase'], 'create')
             self.assertEqual(result['winerror'], error)
@@ -1795,7 +1795,7 @@ class EscapeResultTests(unittest.TestCase):
         with mock.patch('builtins.print'), \
                 mock.patch.object(C, 'get_last_error', return_value=5,
                                   create=True):
-            api.token_launch(creator, 0xB, 'python.exe', 'user', 'pkg',
+            api.token_launch(creator, 'python.exe', 'user', 'pkg',
                              plain=True)
         startup, flags = creator.call_args.args[3], creator.call_args.args[5]
         self.assertIsInstance(startup, escape_helpers['PlainStartups'])
@@ -1811,7 +1811,7 @@ class EscapeResultTests(unittest.TestCase):
         with mock.patch('builtins.print'), \
                 mock.patch.object(C, 'get_last_error', return_value=5,
                                   create=True):
-            api.token_launch(creator, 0xB, 'python.exe', 'user', 'pkg')
+            api.token_launch(creator, 'python.exe', 'user', 'pkg')
         flags = creator.call_args.args[5]
         self.assertEqual(flags & EXTENDED_STARTUPINFO_PRESENT,
                          EXTENDED_STARTUPINFO_PRESENT)
@@ -1860,7 +1860,7 @@ class EscapeResultTests(unittest.TestCase):
         api.retire = mock.Mock()
         creator = mock.Mock(return_value=1)
         with mock.patch('builtins.print'):
-            result = api.token_launch(creator, 0xB, 'python.exe', 'user', 'pkg')
+            result = api.token_launch(creator, 'python.exe', 'user', 'pkg')
         self.assertEqual(result['outcome'], 'contained')
         self.assertEqual(api.created, 1)
         api.retire.assert_called_once()
