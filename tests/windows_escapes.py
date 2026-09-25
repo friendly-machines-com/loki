@@ -114,6 +114,28 @@ TOKEN_ASSIGN_PRIMARY = 0x0001
 TOKEN_DUPLICATE = 0x0002
 TOKEN_IMPERSONATE = 0x0004
 TOKEN_QUERY = 0x0008
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+TOKEN_ADJUST_DEFAULT = 0x0080
+
+# Process access rights (winnt.h).  Distinct from the token rights above even
+# where the numeric value coincides (0x20, 0x80).
+PROCESS_TERMINATE = 0x0001
+PROCESS_VM_OPERATION = 0x0008
+PROCESS_VM_READ = 0x0010
+PROCESS_VM_WRITE = 0x0020
+PROCESS_DUP_HANDLE = 0x0040
+PROCESS_CREATE_PROCESS = 0x0080
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SYNCHRONIZE = 0x00100000
+WRITE_DAC = 0x00040000
+
+# Creation flags / attribute ids / ShellExecute mask bits.
+CREATE_SUSPENDED = 0x00000004
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+PROC_THREAD_ATTRIBUTE_PARENT_PROCESS = 0x00020000
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+SEE_MASK_NOASYNC = 0x00000100
+SEE_MASK_FLAG_NO_UI = 0x00000400
 
 
 def caller_token_launch(api, executable):
@@ -163,7 +185,7 @@ def caller_token_launch(api, executable):
         with ExitStack() as cleanup:
             cleanup.callback(api.close, child.thread)
             cleanup.callback(api.retire, child.process)
-            token = api.token(child.process, 8)
+            token = api.token(child.process, TOKEN_QUERY)
             cleanup.callback(api.close, token)
             result['child'] = api.snapshot(token)
             result['outcome'] = 'created-suspended-and-terminated'
@@ -341,7 +363,7 @@ class Escapes:
 
     def peer_memory(self, target):
         print(json.dumps({'probe': 'peer-memory', 'phase': 'open-process'}), flush=True)
-        process = self.n.check(self.n.open_process(0x10, False, target['pid']))
+        process = self.n.check(self.n.open_process(PROCESS_VM_READ, False, target['pid']))
         try:
             # Acquiring this protected right already violates the fixture's
             # expected boundary. Later read errors must not become denial passes.
@@ -360,7 +382,7 @@ class Escapes:
 
     def peer_handle(self, target):
         print(json.dumps({'probe': 'peer-handle', 'phase': 'open-process'}), flush=True)
-        process = self.n.check(self.n.open_process(0x40, False, target['pid']))
+        process = self.n.check(self.n.open_process(PROCESS_DUP_HANDLE, False, target['pid']))
         handle = HANDLE()
         try:
             success = self.duplicate_handle(process, target['file_handle'],
@@ -387,8 +409,9 @@ class Escapes:
         with ExitStack() as cleanup:
             cleanup.callback(self.n.delete_attributes, buffer)
             handle = HANDLE(parent)
-            self.n.check(self.n.update(buffer, 0, 0x20000, C.byref(handle),
-                                       C.sizeof(handle), None, None))
+            self.n.check(self.n.update(
+                buffer, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, C.byref(handle),
+                C.sizeof(handle), None, None))
             startup = self.startup_type()
             startup.startup.cb = C.sizeof(startup)
             startup.attributes = C.cast(buffer, HANDLE)
@@ -396,13 +419,14 @@ class Escapes:
             command = C.create_unicode_buffer(subprocess.list2cmdline(
                 [executable, '-I', '-c', 'pass']))
             self.n.check(self.n.create_process(
-                executable, command, None, None, False, 0x80000 | 4,
+                executable, command, None, None, False,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 None, None, C.byref(startup), C.byref(child)))
             self.created += 1
             cleanup.callback(self.close, child.thread)
             cleanup.callback(self.retire, child.process)
             # Inspect before executing any child code, even if it escaped.
-            token = self.token(child.process, 8)
+            token = self.token(child.process, TOKEN_QUERY)
             cleanup.callback(self.close, token)
             snapshot = self.snapshot(token)
             return {'outcome': ('contained' if identity_matches(
@@ -412,7 +436,7 @@ class Escapes:
     def inspect_witness(self, process, report, owner, package):
         with ExitStack() as cleanup:
             cleanup.callback(self.retire, process)
-            token = self.token(process, 8)
+            token = self.token(process, TOKEN_QUERY)
             cleanup.callback(self.close, token)
             # Kernel-query result, not just a witness assertion of identity.
             snapshot = self.snapshot(token)
@@ -435,7 +459,8 @@ class Escapes:
         try:
             info = ShellInfos()
             info.size = C.sizeof(info)
-            info.mask = 0x40 | 0x100 | 0x400
+            info.mask = (SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+                         | SEE_MASK_FLAG_NO_UI)
             info.verb = 'open'
             info.file = executable
             info.parameters = subprocess.list2cmdline(
@@ -519,7 +544,9 @@ try {
             raise RuntimeError('unexpected WMI creation result: %r' % reply)
         # QUERY_LIMITED_INFORMATION | SYNCHRONIZE | TERMINATE. Failure here is
         # an uninspectable successful launch, NOT evidence WMI denied creation.
-        process = self.n.open_process(0x1000 | 0x100000 | 1, False, reply['pid'])
+        process = self.n.open_process(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+            | PROCESS_TERMINATE, False, reply['pid'])
         if not process:
             error = C.get_last_error()
             raise RuntimeError('WMI created pid %s; inspection failed: %s' %
@@ -593,7 +620,7 @@ try {
             else:
                 startup = self.startup_type()
                 startup.startup.cb = C.sizeof(startup)
-                flags = 0x80000 | 4
+                flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
             child = self.process_type()
             command = C.create_unicode_buffer(subprocess.list2cmdline(
                 [executable, '-I', '-c', 'pass']))
@@ -625,7 +652,7 @@ try {
             with ExitStack() as cleanup:
                 cleanup.callback(self.close, child.thread)
                 cleanup.callback(self.retire, child.process)
-                token = self.token(child.process, 8)
+                token = self.token(child.process, TOKEN_QUERY)
                 cleanup.callback(self.close, token)
                 snapshot = self.snapshot(token)
                 return {'outcome': ('contained' if identity_matches(
@@ -881,7 +908,7 @@ def impersonation(api, manifest, classify):
 
 def witness(api, manifest, report, classify):
     import os
-    token = api.token(api.n.current_process(), 8)
+    token = api.token(api.n.current_process(), TOKEN_QUERY)
     try:
         snapshot = api.snapshot(token)
     finally:
@@ -926,13 +953,13 @@ def probe(api, manifest, script, manifest_path, classify):
         return api.n.check(api.n.open_process(rights, False, manifest['broker_pid']))
 
     def broker_access():
-        api.close(broker_handle(0x80))
+        api.close(broker_handle(PROCESS_CREATE_PROCESS))
     run('broker-create-process-access', broker_access)
 
     def broker_parent():
         print(json.dumps({'probe': 'alternate-broker-parent',
                           'phase': 'open-parent'}), flush=True)
-        parent = broker_handle(0x80)
+        parent = broker_handle(PROCESS_CREATE_PROCESS)
         try:
             print(json.dumps({'probe': 'alternate-broker-parent',
                               'phase': 'create-suspended'}), flush=True)
@@ -944,9 +971,10 @@ def probe(api, manifest, script, manifest_path, classify):
         api.n.current_process(), sys.executable, owner, package), ('contained',))
 
     def broker_token():
-        process = broker_handle(0x1000)
+        process = broker_handle(PROCESS_QUERY_LIMITED_INFORMATION)
         try:
-            token = api.token(process, 8 | 2 | 1)
+            token = api.token(process, TOKEN_QUERY | TOKEN_DUPLICATE
+                              | TOKEN_ASSIGN_PRIMARY)
             api.close(token)
         finally:
             api.close(process)
@@ -955,7 +983,9 @@ def probe(api, manifest, script, manifest_path, classify):
     target = manifest['peer']
     run('peer-memory-read', lambda: api.peer_memory(target))
     run('peer-handle-duplication', lambda: api.peer_handle(target))
-    for name, rights in [('memory-write', 0x20 | 8), ('dacl-write', 0x40000)]:
+    for name, rights in [('memory-write',
+                          PROCESS_VM_WRITE | PROCESS_VM_OPERATION),
+                         ('dacl-write', WRITE_DAC)]:
         def peer_access(rights=rights):
             process = api.n.check(api.n.open_process(rights, False, target['pid']))
             api.close(process)
@@ -964,7 +994,8 @@ def probe(api, manifest, script, manifest_path, classify):
     def peer_parent():
         print(json.dumps({'probe': 'alternate-peer-parent', 'phase': 'open-parent'}),
               flush=True)
-        parent = api.n.check(api.n.open_process(0x80, False, target['pid']))
+        parent = api.n.check(api.n.open_process(
+            PROCESS_CREATE_PROCESS, False, target['pid']))
         try:
             return api.alternate_parent(parent, sys.executable, owner, package)
         finally:
@@ -973,10 +1004,12 @@ def probe(api, manifest, script, manifest_path, classify):
 
     def peer_token():
         print(json.dumps({'probe': 'peer-token', 'phase': 'open-process'}), flush=True)
-        process = api.n.check(api.n.open_process(0x1000, False, target['pid']))
+        process = api.n.check(api.n.open_process(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, target['pid']))
         try:
             print(json.dumps({'probe': 'peer-token', 'phase': 'open-token'}), flush=True)
-            token = api.token(process, 8 | 2 | 1)
+            token = api.token(process, TOKEN_QUERY | TOKEN_DUPLICATE
+                              | TOKEN_ASSIGN_PRIMARY)
             try:
                 snapshot = api.snapshot(token)
                 return {'outcome': 'token-acquired', 'token': snapshot}
@@ -990,13 +1023,13 @@ def probe(api, manifest, script, manifest_path, classify):
 
     # A fresh duplicate for every mutation: failed experiments cannot alter the
     # token used by later filesystem checks or the ordinary descendant control.
-    source = api.token(api.n.current_process(), 8 | 2)
+    source = api.token(api.n.current_process(), TOKEN_QUERY | TOKEN_DUPLICATE)
     try:
         before = api.snapshot(source)
         print(json.dumps({'worker_token_snapshot': before}), flush=True)
 
         def duplicate_control():
-            clone = api.clone(source, 8)
+            clone = api.clone(source, TOKEN_QUERY)
             try:
                 after = api.snapshot(clone)
                 return {'outcome': 'unchanged' if after == before else 'changed',
@@ -1010,7 +1043,7 @@ def probe(api, manifest, script, manifest_path, classify):
                           'SeImpersonatePrivilege', 'SeAssignPrimaryTokenPrivilege',
                           'SeTcbPrivilege', 'SeCreateTokenPrivilege'):
             def enable(privilege=privilege):
-                clone = api.clone(source, 8 | 0x20)
+                clone = api.clone(source, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES)
                 try:
                     request = TokenPrivileges()
                     request.count = 1
@@ -1043,7 +1076,7 @@ def probe(api, manifest, script, manifest_path, classify):
             privilege = 'SeIncreaseWorkingSetPrivilege'
             if before['privileges'].get(privilege) != 0:
                 raise RuntimeError('present-disabled privilege control unavailable')
-            clone = api.clone(source, 8 | 0x20)
+            clone = api.clone(source, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES)
             try:
                 request = TokenPrivileges()
                 request.count = 1
@@ -1076,7 +1109,7 @@ def probe(api, manifest, script, manifest_path, classify):
 
         def change_user():
             with ExitStack() as cleanup:
-                clone = api.clone(source, 8 | 0x80)
+                clone = api.clone(source, TOKEN_QUERY | TOKEN_ADJUST_DEFAULT)
                 cleanup.callback(api.close, clone)
                 sid = HANDLE()
                 api.n.check(api.parse_sid('S-1-5-18', C.byref(sid)))
