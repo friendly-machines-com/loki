@@ -399,7 +399,7 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
     handed_off = False
     try:
         limits = _ExtendedLimits()
-        limits.basic.flags = api.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        limits.basic.flags = api.JobObjectLimits.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         _checked(set_job(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)),
                  "SetInformationJobObject")
         # Duplicate stdio rather than changing inheritance on the parent's fds.

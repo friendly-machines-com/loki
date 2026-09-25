@@ -703,8 +703,11 @@ class StartupInfoFlags(enum.IntFlag):
     STARTF_USESTDHANDLES = 0x00000100
 
 
-# SetInformationJobObject's JOB_OBJECT_LIMIT_* (winnt.h).
-JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+# SetInformationJobObject's JOB_OBJECT_LIMIT_* (winnt.h): which limits the
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION struct is setting.
+class JobObjectLimits(enum.IntFlag):
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
 
 # PROC_THREAD_ATTRIBUTE_* (winbase.h).  The names map to these values, not to
 # the bare enumerators.
