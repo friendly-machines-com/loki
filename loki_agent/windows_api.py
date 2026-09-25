@@ -22,6 +22,7 @@ Two rules keep this module safe to share rather than copied around:
 from __future__ import annotations
 
 import ctypes
+import enum
 import subprocess
 import sys
 from ctypes import wintypes
@@ -172,7 +173,18 @@ SE_FILE_OBJECT = 1
 SE_KERNEL_OBJECT = 6
 SDDL_REVISION_1 = 1
 ERROR_SUCCESS = 0
-TOKEN_QUERY = 0x0008
+
+
+# TOKEN_ACCESS_RIGHTS (winnt.h): the rights a caller requests on a token handle.
+class TokenAccess(enum.IntFlag):
+    TOKEN_ASSIGN_PRIMARY = 0x0001
+    TOKEN_DUPLICATE = 0x0002
+    TOKEN_IMPERSONATE = 0x0004
+    TOKEN_QUERY = 0x0008
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_ADJUST_DEFAULT = 0x0080
+
+
 TOKEN_USER_CLASS = 1
 
 
@@ -198,7 +210,7 @@ def current_user_sid() -> str:
     close = bind("kernel32", "CloseHandle", wintypes.BOOL, ctypes.c_void_p)
 
     token = ctypes.c_void_p()
-    if not open_token(get_current_process(), TOKEN_QUERY,
+    if not open_token(get_current_process(), TokenAccess.TOKEN_QUERY,
                       ctypes.byref(token)):
         raise WindowsApiError("OpenProcessToken failed")
     try:
@@ -814,7 +826,7 @@ def open_with_access(path, desired_access, creation=OPEN_EXISTING,
     return handle
 
 
-def open_process_token(process, rights: int = TOKEN_QUERY):
+def open_process_token(process, rights: int = TokenAccess.TOKEN_QUERY):
     """Open ``process``'s token for the requested rights.
 
     ``process`` is a handle the caller already holds; opening a child created
