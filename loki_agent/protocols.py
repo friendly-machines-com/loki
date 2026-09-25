@@ -16,6 +16,7 @@ AUTO = "auto"
 
 _REASONING_PROTOCOLS = {
     "anthropic": ANTHROPIC_MESSAGES,
+    "deepseek": OPENAI_CHAT,
     "openai": OPENAI_RESPONSES,
     "openai-subscription": OPENAI_RESPONSES,
     "openrouter": OPENAI_CHAT,
@@ -249,7 +250,7 @@ class Provider:
                     payload["reasoning"] = {
                         "effort": reasoning_effort,
                     }
-                elif self.provider_id in _ZAI_PROVIDERS:
+                elif self.provider_id == "deepseek" or self.provider_id in _ZAI_PROVIDERS:
                     payload["thinking"] = {
                         "type": (
                             "disabled"
