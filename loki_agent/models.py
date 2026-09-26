@@ -33,6 +33,7 @@ from . import endpoint_pins
 from . import http_client
 from . import openai_models
 from . import protocols
+from . import usages
 from .credentials import (
     CredentialInventory,
     CredentialStore,
@@ -354,8 +355,10 @@ def _openai_subscription_model_entries(
             "attachment": "image" in modalities,
             "structured_output": False,
             "open_weights": False,
-            # The full catalog entry stops here. Only request-relevant fields
-            # may cross selection, resume, ACP, and subagent boundaries.
+            # Keep only validated request profiles and display-only capacity;
+            # never propagate the full authenticated catalog/application prompts.
+            "limit": {"context": (
+                usages.token_count(model.get("context_window")))},
             _LOKI_OPENAI_REQUEST_PROFILE_KEY: request_profile,
             _LOKI_REASONING_EFFORT_PROFILE_KEY:
                 reasoning_effort_profile,
@@ -405,6 +408,18 @@ def openai_request_profile(provider_entry, model_entry):
         if isinstance(profile, openai_models.CodexModelRequestProfile)
         else None
     )
+
+
+def context_capacity(provider_entry, model_entry):
+    """The selected leaf's advertised window, not output/compaction budgets."""
+    limits = model_entry.get("limit")
+    if not isinstance(limits, dict):
+        return None
+    source = (
+        "openai-subscription"
+        if provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
+            _OPENAI_SUBSCRIPTION_SENTINEL) else "models.dev")
+    return usages.catalog_capacity(limits.get("context"), source)
 
 
 def reasoning_effort_profile(

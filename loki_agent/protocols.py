@@ -443,6 +443,10 @@ class Provider:
         )
         if self.kind != DUMMY:
             payload["stream"] = True
+        if self.kind == OPENAI_CHAT:
+            # This is the Chat protocol's opt-in, not a provider identity
+            # check. Usage decoding remains valid for unknown providers too.
+            payload["stream_options"] = {"include_usage": True}
         return payload
 
     def stream_accumulator(self, on_text_delta=None):

@@ -378,18 +378,37 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         return await async_chat_completion(
             items, active_tools, True, False, **kwargs)
 
+    def redraw_status():
+        try:
+            terminals.redraw_status_bar()
+        except (AssertionError, OSError):
+            # A display failure must not interrupt the response/tool loop.
+            pass
+
+    def on_response(turn, event):
+        _remember_session_toolset(active_tools)
+        current_session().context_snapshot(live=True)
+        redraw_status()
+
+    def on_event(event):
+        if event.get("type") in ("tool_result", "response_cancelled", "max_loops"):
+            redraw_status()
+        _terminal_agent_event(event)
+
+    # The user/mode input has already been appended: the old report is stale
+    # during this request, even before the first response or tool result.
+    redraw_status()
     return await run_tool_loop_async(
         transcript_items,
         allowed=mode_tools if read_only else None,
         chat_fn=chat_fn,
-        on_event=_terminal_agent_event,
+        on_event=on_event,
         cancel_check=cancel_check,
         stream_chat=True,
         report_timing=True,
         cancel_event=cancel_event,
         reasoning_effort=reasoning_effort,
-        on_response=lambda turn, event: _remember_session_toolset(
-            active_tools),
+        on_response=on_response,
     )
 
 
@@ -405,6 +424,7 @@ def _status_fields(activity):
         "api": _status_api_base(),
         "model": displayed_model,
         "effort": _core.reasoning_effort_status_text(),
+        "context": current_session().context_snapshot().text,
         "turn": "running" if activity.turn_running else "idle",
         "queued_messages": activity.queued_messages,
         "queued_images": activity.queued_images,
@@ -418,10 +438,11 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
     remote = 'Remote: API: {}, Model: {}'.format(
         fields["api"], fields["model"])
     if fields["effort"] is not None:
-        remote += ', Effort: {}; /model, /effort, /status, /account'.format(
-            fields["effort"])
-    else:
-        remote += '; /model, /status, /account'
+        remote += ', Effort: {}'.format(fields["effort"])
+    remote += ', Context: {}; /model'.format(fields["context"])
+    if fields["effort"] is not None:
+        remote += ', /effort'
+    remote += ', /status, /account'
     return (
         remote + '\n'
         'Local: CWD: {}, turn: {}, queued messages: {}, queued images: {}, '
@@ -444,9 +465,12 @@ def _write_status_text():
     if fields["effort"] is not None:
         print(", Effort: ", end="")
         terminal.write_text(fields["effort"])
-        print("; /model, /effort, /status, /account\nLocal: CWD: ", end="")
-    else:
-        print("; /model, /status, /account\nLocal: CWD: ", end="")
+    print(", Context: ", end="")
+    terminal.write_text(fields["context"])
+    print("; /model", end="")
+    if fields["effort"] is not None:
+        print(", /effort", end="")
+    print(", /status, /account\nLocal: CWD: ", end="")
     terminal.write_text(fields["cwd"])
     print(", turn: ", end="")
     for label, value, active in (

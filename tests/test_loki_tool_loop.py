@@ -2051,7 +2051,7 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(loki.current_config().model_status, "deprecated")
         self.assertIn(
-            "Model: old-model (deprecated); /model", terminal_frontend.status_text())
+            "Model: old-model (deprecated), Context: unknown; /model", terminal_frontend.status_text())
         self.assertEqual(
             saved["session_state"]["connection"]["model_status"],
             "deprecated",
@@ -2248,7 +2248,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         self.assertEqual(
             saved["session_state"]["reasoning_effort"], "high")
         self.assertIn(
-            "Effort: high; /model, /effort",
+            "Effort: high, Context: unknown; /model, /effort",
             terminal_frontend.status_text(),
         )
 
@@ -2486,7 +2486,7 @@ class StatusTextTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
-        self.assertIn("Model: none; /model", text)
+        self.assertIn("Model: none, Context: unknown; /model", text)
         self.assertNotIn("Model: ;", text)
 
     def test_activity_status_redraws_only_for_changed_counts(self):
@@ -2538,7 +2538,8 @@ class StatusTextTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "Remote: API: example.test:8443/base/path, Model: model-x; "
+            "Remote: API: example.test:8443/base/path, Model: model-x, "
+            "Context: unknown; "
             "/model, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
             "queued messages: 2, queued images: 1, "
@@ -2589,7 +2590,7 @@ class StatusTextTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
-        self.assertIn("Model: old-model (deprecated); /model", text)
+        self.assertIn("Model: old-model (deprecated), Context: unknown; /model", text)
 
 
 class TerminalOverlayLifecycleTests(unittest.TestCase):

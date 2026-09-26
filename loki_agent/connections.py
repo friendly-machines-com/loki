@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from . import models
 from . import openai_models
 from . import protocols
+from .usages import ContextCapacity
 from .authentications import CredentialRef
 from .credentials import is_credential_name
 
@@ -42,6 +43,7 @@ UNDISPLAYED_CONNECTION_FIELDS = {
         "subscription request shape, implied by the credential-scoped "
         "ChatGPT connection"),
     "reasoning_effort_profile": "model capability metadata",
+    "context_capacity": "display-only model capacity metadata",
 }
 
 
@@ -116,6 +118,7 @@ class ConnectionDescriptor:
     auth_scheme: str | None = None
     model_status: str | None = None
     stream: bool = False
+    context_capacity: ContextCapacity | None = None
     prompt_cache: bool = False
     openai_request_profile: (
         openai_models.CodexModelRequestProfile | None) = None
@@ -123,6 +126,10 @@ class ConnectionDescriptor:
         models.ReasoningEffortProfile | None) = None
 
     def __post_init__(self):
+        if (self.context_capacity is not None
+                and not isinstance(self.context_capacity, ContextCapacity)):
+            raise ConnectionDescriptorError(
+                "connection context capacity has the wrong type")
         subscription = (
             self.provider_id == "openai-subscription"
             and self.protocol == "openai_responses"
@@ -169,6 +176,9 @@ class ConnectionDescriptor:
             "auth_scheme": self.auth_scheme,
             "model_status": self.model_status,
             "stream": self.stream,
+            "context_capacity": (
+                self.context_capacity.to_dict()
+                if self.context_capacity is not None else None),
             "prompt_cache": self.prompt_cache,
             "openai_request_profile": (
                 self.openai_request_profile.to_dict()
@@ -182,6 +192,13 @@ class ConnectionDescriptor:
     def from_dict(cls, value):
         if not isinstance(value, dict):
             raise ConnectionDescriptorError("saved connection must be an object")
+        raw_capacity = value.get("context_capacity")
+        try:
+            context_capacity = (
+                ContextCapacity.from_dict(raw_capacity)
+                if raw_capacity is not None else None)
+        except ValueError as error:
+            raise ConnectionDescriptorError(str(error)) from error
         max_tokens = value.get("max_tokens", 4096)
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise ConnectionDescriptorError(
@@ -258,6 +275,7 @@ class ConnectionDescriptor:
             model_status=_optional_string(
                 value.get("model_status"), "model_status"),
             stream=stream,
+            context_capacity=context_capacity,
             prompt_cache=prompt_cache,
             openai_request_profile=openai_request_profile,
             reasoning_effort_profile=reasoning_effort_profile,

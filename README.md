@@ -170,7 +170,7 @@ protocol.
 
 All explicit connection settings are Loki-namespaced: `LOKI_API_BASE`,
 `LOKI_PROVIDER`, `LOKI_MODEL`, `LOKI_API_KEY`, `LOKI_MODELS_URL`,
-`LOKI_MAX_TOKENS`, `LOKI_AUTH_HEADER`, `LOKI_AUTH_SCHEME`,
+`LOKI_MAX_TOKENS`, `LOKI_CONTEXT_WINDOW`, `LOKI_AUTH_HEADER`, `LOKI_AUTH_SCHEME`,
 `LOKI_ANTHROPIC_VERSION`, and `LOKI_STREAM`. `LOKI_PROMPT_CACHE` controls
 Anthropic Messages prompt-cache metadata.
 Loki never chooses the first model returned by a provider. A new explicit
@@ -204,7 +204,36 @@ protocol-confirmed final response before adding it to the session or executing
 tool calls. Interrupted transport output is shown but is not invented as a
 completed assistant response. If a server ignores the request and returns
 ordinary JSON, Loki accepts that same response without resending the inference
-request. If the server rejects streaming, set `LOKI_STREAM=0`.
+request. Chat streaming requests include `stream_options.include_usage` so
+compatible servers can return token usage. If the server rejects streaming or
+that option, set `LOKI_STREAM=0`; Loki does not automatically retry inference
+with a different request shape.
+
+The Remote status row shows `Context: 37%`: the latest server-reported input
+plus output tokens divided by the selected model's context window, rounded to
+an integer. Cached input is included; cache and reasoning breakdowns are not
+counted twice. This is one exchange's reported usage, **not cumulative session
+consumption or an exact count of the next prompt**. `*` marks a historical or
+incomplete observation, or history appended since that observation; `unknown` means
+usage or capacity is unknown. Tool results are not counted until a subsequent
+server response measures them. Child-agent usage does not inflate the parent's
+percentage.
+
+Capacity comes from the selected provider/model's models.dev `limit.context`,
+or the authenticated ChatGPT catalog's `context_window`. A positive integer
+`LOKI_CONTEXT_WINDOW` overrides catalog capacity for selections made with that
+startup configuration, including custom endpoints. It is display-only, unlike
+`LOKI_MAX_TOKENS` (the output setting); no output reserve, safety buffer, local
+tokenizer, overflow prediction, or automatic compaction is applied. Saved
+connections retain capacity metadata, and saved response events reconstruct
+historical observations on resume.
+
+ACP sends standard `usage_update` counts when usage and capacity are known.
+Emacs agent-shell can show an integer percentage in its header/modeline with
+`agent-shell-show-context-usage-indicator` set to `'detailed`. ACP's basic update
+has no unknown/reset or freshness field, so clients may retain their last report
+when new usage or capacity is unavailable. Loading a session restores its usage
+display; ACP resume does not replay historical notifications.
 
 Tool input is validated before execution. When validation identifies one of a
 small set of unambiguous representation mistakes, Loki repairs a copy of the

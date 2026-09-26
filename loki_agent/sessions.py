@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .response_headers import Store
+from .usages import ContextTracker
 
 
 def conversation_id_for_path(path: str) -> str:
@@ -57,6 +58,7 @@ class Session:
     credential_authority: Any = None
 
     transcript_items: list = field(default_factory=list)
+    context_usage: ContextTracker = field(default_factory=ContextTracker)
     session_todos: list = field(default_factory=list)
     session_toolsets: list = field(default_factory=list)
 
@@ -107,6 +109,20 @@ class Session:
         if self.runtime_config is None:
             return ""
         return self.runtime_config.model
+
+    def context_snapshot(self, *, live=False):
+        config = self.runtime_config
+        if config is None:
+            identity, capacity = None, None
+        else:
+            provider = config.chat_provider
+            identity = (
+                provider.kind, provider.provider_id or provider.provider_name,
+                provider.chat_url, config.model,
+            )
+            capacity = config.context_capacity
+        return self.context_usage.snapshot(
+            self.transcript_items, identity, capacity, live=live)
 
     def replace_transcript(self, transcript, todos, toolsets, state, path):
         self.transcript_items = transcript

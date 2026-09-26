@@ -223,7 +223,7 @@ def provider_operation_item(call_id, name, input_value, output=None, *,
 
 
 def model_response_event(protocol, items, *, provider=None, endpoint=None,
-                         model=None,
+                         model=None, requested_model=None,
                          status="completed", stop_reason=None, usage=None,
                          end_turn=None, protocol_data=None):
     event = {
@@ -235,6 +235,7 @@ def model_response_event(protocol, items, *, provider=None, endpoint=None,
     _put_optional(event, "provider", provider)
     _put_optional(event, "endpoint", endpoint)
     _put_optional(event, "model", model)
+    _put_optional(event, "requested_model", requested_model)
     _put_optional(event, "stop_reason", stop_reason)
     _put_optional(event, "usage", usage)
     _put_optional(event, "end_turn", end_turn)
@@ -280,6 +281,7 @@ class DecodedTurn:
                 or self.metadata.get("provider_name")),
             endpoint=self.metadata.get("endpoint"),
             model=self.metadata.get("model"),
+            requested_model=self.metadata.get("requested_model"),
             status=status,
             stop_reason=self.metadata.get("stop_reason"),
             usage=self.metadata.get("usage"),
@@ -511,7 +513,8 @@ def _validate_response(event, index):
     if any(not isinstance(item, dict) for item in items):
         raise TranscriptFormatError(
             f"event {index} model_response items must be objects")
-    for field_name in ["provider", "endpoint", "model", "status"]:
+    for field_name in [
+            "provider", "endpoint", "model", "requested_model", "status"]:
         value = event.get(field_name)
         if value is not None and not isinstance(value, str):
             raise TranscriptFormatError(

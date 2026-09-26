@@ -15,13 +15,14 @@ The field inventory below is from ``ModelInfo`` in
   ``supports_parallel_tool_calls``, ``supports_reasoning_summaries``,
   ``default_reasoning_level``, ``default_reasoning_summary``,
   ``support_verbosity``, and ``default_verbosity``;
+* display-only, outside the request profile: ``context_window``;
 * known but unused: ``description``, ``shell_type``, ``supported_in_api``,
   ``priority``, ``additional_speed_tiers``, ``service_tiers``,
   ``default_service_tier``, ``availability_nux``, ``upgrade``,
   ``base_instructions``, ``model_messages``,
   ``include_skills_usage_instructions``, ``apply_patch_tool_type``,
   ``web_search_tool_type``, ``truncation_policy``,
-  ``supports_image_detail_original``, ``context_window``,
+  ``supports_image_detail_original``,
   ``max_context_window``, ``auto_compact_token_limit``, ``comp_hash``,
   ``effective_context_window_percent``, ``experimental_supported_tools``,
   ``supports_search_tool``, ``auto_review_model_override``, ``tool_mode``,

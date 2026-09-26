@@ -42,6 +42,24 @@ def agent_message_chunk(session_id: str, text: str) -> dict:
     }
 
 
+def context_usage(session_id, snapshot):
+    """ACP carries counts; presentation and integer rounding belong to clients.
+
+    Unknown is not zero. ACP usage_update has no unknown/reset representation,
+    so clients retain their last report until another usable observation.
+    """
+    if snapshot.usage is None or snapshot.capacity is None:
+        return None
+    return {
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "usage_update",
+            "used": snapshot.usage.used,
+            "size": snapshot.capacity.tokens,
+        },
+    }
+
+
 def tool_call(session_id: str, tool_call_id: str, title: str, kind: str,
               status: str = "in_progress") -> dict:
     return {

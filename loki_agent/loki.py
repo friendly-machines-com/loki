@@ -47,6 +47,7 @@ from . import endpoint_pins
 from . import savefiles
 from . import sse
 from . import tool_runtime
+from . import usages
 from .connections import ConnectionDescriptor
 from .credentials import (
     CredentialInventory,
@@ -390,6 +391,7 @@ class RuntimeConfig:
     auth_spec: authentications.AuthSpec | None = None
     model_status: str | None = None
     stream: bool = False
+    context_capacity: usages.ContextCapacity | None = None
     reasoning_effort_profile: (
         modelsdev.ReasoningEffortProfile | None) = None
 
@@ -473,7 +475,7 @@ def make_runtime_config(
         auth_header=None, auth_scheme=None, provider_id=None,
         provider_name=None, credential_ref=None, model_status=None,
         stream=False, prompt_cache=False, openai_request_profile=None,
-        reasoning_effort_profile=None):
+        reasoning_effort_profile=None, context_capacity=None):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -481,6 +483,9 @@ def make_runtime_config(
     reinstall_provider() which reuses this to rebuild the Provider from the
     current config plus per-model overrides.
     """
+    if (context_capacity is not None
+            and not isinstance(context_capacity, usages.ContextCapacity)):
+        raise ValueError("context_capacity must be ContextCapacity or null")
     if (reasoning_effort_profile is not None
             and not isinstance(
                 reasoning_effort_profile,
@@ -527,7 +532,19 @@ def make_runtime_config(
         model_status=model_status,
         stream=stream,
         reasoning_effort_profile=reasoning_effort_profile,
+        context_capacity=context_capacity,
     )
+
+
+def _context_capacity_setting(credentials, fallback=None):
+    value = credentials.get("LOKI_CONTEXT_WINDOW")
+    if not value:
+        return fallback
+    try:
+        return usages.ContextCapacity(int(value), "configured")
+    except ValueError as error:
+        raise ValueError(
+            "LOKI_CONTEXT_WINDOW must be a positive integer") from error
 
 
 def _available_environment_credential(credentials, names):
@@ -625,6 +642,7 @@ def build_config_from_env(
             provider_name="Explicit LOKI_* connection",
             stream=_bool_setting("LOKI_STREAM", False, credentials),
             prompt_cache=False,
+            context_capacity=_context_capacity_setting(credentials),
         )
 
     # Never infer credential ownership from the wire protocol. An explicitly
@@ -670,6 +688,7 @@ def build_config_from_env(
         ),
         openai_request_profile=openai_request_profile,
         reasoning_effort_profile=reasoning_effort_profile,
+        context_capacity=_context_capacity_setting(credentials),
     )
 
 
@@ -767,6 +786,11 @@ def config_from_connection_descriptor(
         prompt_cache=prompt_cache,
         openai_request_profile=openai_request_profile,
         reasoning_effort_profile=reasoning_effort_profile,
+        context_capacity=_context_capacity_setting(
+            credentials,
+            descriptor.context_capacity
+            if config_model == descriptor.model
+            and resolved_provider_kind == descriptor.protocol else None),
     )
 
 
@@ -795,10 +819,17 @@ def reconcile_connection_descriptor(descriptor, catalog):
             descriptor.reasoning_effort_profile,
             catalog,
         ))
+    capacity = descriptor.context_capacity
+    provider = catalog.get(modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID)
+    if (provider is not None
+            and (capacity is None or capacity.source != "configured")):
+        capacity = modelsdev.context_capacity(
+            provider, provider["models"][descriptor.model])
     return replace(
         descriptor,
         openai_request_profile=profile,
         reasoning_effort_profile=reasoning_effort_profile,
+        context_capacity=capacity,
     )
 
 
@@ -886,6 +917,8 @@ def config_from_modelsdev_selection(
             provider_entry, model_entry),
         reasoning_effort_profile=modelsdev.reasoning_effort_profile(
             provider_id, provider_entry, model_entry),
+        context_capacity=_context_capacity_setting(
+            credentials, modelsdev.context_capacity(provider_entry, model_entry)),
     )
 
 
@@ -918,6 +951,7 @@ def connection_descriptor_from_config(
         prompt_cache=provider.prompt_cache,
         openai_request_profile=provider.openai_request_profile,
         reasoning_effort_profile=config.reasoning_effort_profile,
+        context_capacity=config.context_capacity,
     )
 
 
@@ -943,7 +977,8 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
                        credential_ref=_UNSET, auth_scheme=_UNSET,
                        model_status=_UNSET, stream=None, prompt_cache=None,
                        openai_request_profile=_UNSET,
-                       reasoning_effort_profile=_UNSET):
+                       reasoning_effort_profile=_UNSET,
+                       context_capacity=_UNSET):
     """Rebuild and swap RUNTIME_CONFIG (and its Provider) mid-session.
 
     Overrides default to the current runtime config, so a bare call reinstates
@@ -1053,6 +1088,9 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             else current_provider.prompt_cache),
         openai_request_profile=new_openai_request_profile,
         reasoning_effort_profile=new_reasoning_effort_profile,
+        context_capacity=(
+            (current.context_capacity if same_catalog_entry else None)
+            if context_capacity is _UNSET else context_capacity),
     ))
 
 
@@ -3626,6 +3664,10 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
             env.pop('LOKI_OPENAI_REQUEST_PROFILE', None)
         env.pop('LOKI_RESPONSES_LITE', None)
         env['LOKI_MAX_TOKENS'] = str(provider.max_tokens)
+        if config.context_capacity is not None:
+            env['LOKI_CONTEXT_WINDOW'] = str(config.context_capacity.tokens)
+        else:
+            env.pop('LOKI_CONTEXT_WINDOW', None)
         if provider.kind == protocols.ANTHROPIC_MESSAGES:
             env['LOKI_ANTHROPIC_VERSION'] = provider.headers[
                 "anthropic-version"]
@@ -5333,6 +5375,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     turn.metadata["endpoint"] = (
         provider.chat_url)
     turn.metadata["model"] = effective_model
+    turn.metadata["requested_model"] = current_model()
     turn.metadata["protocol"] = current_config().chat_provider.kind
     if notice_codes:
         protocol_data = copy.deepcopy(

@@ -536,8 +536,10 @@ class Worker:
             loki.save_chat_log()
         # ACP load reconstructs the client's view; resume reconstructs only
         # the agent's context and must not emit historical session updates.
+        self.session.context_snapshot()
         if pending.open_method == "session/load":
             self._replay_transcript()
+            self._publish_context_usage()
         return {
             "configOptions": self.config_options(),
             # The front emits these as available_commands_update after the
@@ -767,6 +769,12 @@ class Worker:
         stop_reason = self._stop_reason(events)
         return {"stopReason": stop_reason}
 
+    def _publish_context_usage(self, *, live=False):
+        update = acp_events.context_usage(
+            self.session_id, self.session.context_snapshot(live=live))
+        if update is not None:
+            self.write(acps.notification("session/update", update))
+
     async def _run_turn(self, on_event, reasoning_effort):
         try:
             if not loki.current_model():
@@ -790,6 +798,10 @@ class Worker:
                 return await loki.async_chat_completion(
                     items, loki.TOOLS, True, False, **kwargs)
 
+            def on_response(turn, event):
+                loki.mark_chat_log_dirty()
+                self._publish_context_usage(live=True)
+
             await loki.run_tool_loop_async(
                 self.session.transcript_items,
                 chat_fn=chat_fn,
@@ -797,7 +809,7 @@ class Worker:
                 cancel_check=cancel_check,
                 cancel_event=self.cancel_event,
                 stream_chat=True,
-                on_response=lambda turn, event: loki.mark_chat_log_dirty(),
+                on_response=on_response,
                 reasoning_effort=reasoning_effort,
             )
         finally:
