@@ -618,14 +618,14 @@ class ProbeSecurityAttributes(C.Structure):
 
 
 def environment_203_probe(root):
-    """Record CreateProcessW's ERROR_ENVVAR_NOT_FOUND (203) rule.
+    """Record what a plain CreateProcessW does with a supplied block.
 
-    A supplied environment block must carry the per-drive ``=X:=`` entry for
-    the drive holding the child's current directory; production builds it in
-    ``windows_api.environment_block``.  This measures the rule directly instead
-    of inferring it: launch ``cmd.exe`` from this directory with the block
-    whole, with every ``=X:`` entry removed, and with only this drive's entry
-    removed, recording success/winerror for each.
+    Loki builds ``lpEnvironment`` itself (``windows_api.environment_block``),
+    so this measures what such a block must contain: launch ``cmd.exe`` from
+    this directory with the process's own block whole, with every ``=X:`` entry
+    removed, with this drive's entry omitted, with one added back, and with the
+    reduced environment the pty tests hand the front, with and without a drive
+    entry.  A drive entry is not required by this call: every variant starts.
     """
     kernel = C.WinDLL('kernel32', use_last_error=True)
     get_strings = kernel.GetEnvironmentStringsW
@@ -697,7 +697,9 @@ def environment_203_probe(root):
         'omit_current_drive': [entry for entry in entries
                                if not entry.startswith('=' + drive + '=')],
         # What production builds: the process block plus the entry for the
-        # directory the child will start in.
+        # directory the child will start in (kept as a variant so the drive
+        # entry's effect stays visible even though production no longer adds
+        # one).
         'with_current_drive': [*entries, '=' + drive + '=' + str(root)],
     }
     # The reduced environment the pty tests hand the front: a handful of

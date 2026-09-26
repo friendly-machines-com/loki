@@ -295,10 +295,7 @@ class AppContainerLaunchTests(unittest.TestCase):
         }
         with mock.patch.object(
                 windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
-                mock.patch.object(
-                    windows_api, "drive_environment_entries",
-                    return_value=[]):
+                side_effect=lambda library, symbol, *rest: fakes[symbol]):
             information = windows_api.create_process_in_app_container(
                 "loki.exe", ["--runtime", "x"], "S-1-15-2-1")
 
@@ -367,10 +364,7 @@ class AppContainerLaunchTests(unittest.TestCase):
         }
         with mock.patch.object(
                 windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
-                mock.patch.object(
-                    windows_api, "drive_environment_entries",
-                    return_value=[]):
+                side_effect=lambda library, symbol, *rest: fakes[symbol]):
             windows_api.create_process_in_app_container(
                 "loki.exe", ["--runtime"], "S-1-15-2-1",
                 inherited_handles=[0x11])
@@ -414,10 +408,7 @@ class AppContainerLaunchTests(unittest.TestCase):
         }
         with mock.patch.object(
                 windows_api, "bind",
-                side_effect=lambda library, symbol, *rest: fakes[symbol]), \
-                mock.patch.object(
-                    windows_api, "drive_environment_entries",
-                    return_value=[]):
+                side_effect=lambda library, symbol, *rest: fakes[symbol]):
             windows_api.create_process_in_app_container(
                 "loki.exe", ["--runtime"], "S-1-15-2-1",
                 inherited_handles=[0x11], pseudoconsole=0x1234)
@@ -431,7 +422,7 @@ class AppContainerLaunchTests(unittest.TestCase):
              windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
              windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE])
 
-    def test_environment_block_carries_the_drive_entries_first(self):
+    def test_environment_block_carries_the_given_variables_only(self):
         seen = {}
 
         def convert_sid(string_sid, out):
@@ -466,31 +457,24 @@ class AppContainerLaunchTests(unittest.TestCase):
             "CreateProcessW": create,
         }
 
-        def run(drive_entries, current_directory):
-            with mock.patch.object(
-                    windows_api, "bind",
-                    side_effect=lambda library, symbol, *rest: fakes[symbol]), \
-                    mock.patch.object(
-                        windows_api, "drive_environment_entries",
-                        return_value=drive_entries):
-                windows_api.create_process_in_app_container(
-                    "loki.exe", ["--runtime"], "S-1-15-2-1",
-                    environment={"Path": "C:\\bin"},
-                    current_directory=current_directory)
-            # wchar_t is 2 bytes on Windows and 4 on this host.
-            width = ctypes.sizeof(ctypes.c_wchar)
-            encoding = "utf-16-le" if width == 2 else "utf-32-le"
-            return seen["environment"].decode(encoding)
-
-        # A drive entry the parent already holds is carried over.
-        text = run(["=C:=C:\\work"], None)
-        self.assertTrue(text.startswith("=C:=C:\\work\0"), repr(text))
-        self.assertIn("Path=C:\\bin", text)
-        # With none to carry, the child's own drive is set from its current
-        # directory -- the block element the reference says must be supplied.
-        text = run([], "D:\\work\\ws")
-        self.assertTrue(text.startswith("=D:=D:\\work\\ws\0"), repr(text))
-        self.assertIn("Path=C:\\bin", text)
+        with mock.patch.object(
+                windows_api, "bind",
+                side_effect=lambda library, symbol, *rest: fakes[symbol]):
+            windows_api.create_process_in_app_container(
+                "loki.exe", ["--runtime"], "S-1-15-2-1",
+                environment={"Path": "C:\\bin", "LOCALAPPDATA": "C:\\local"},
+                current_directory="D:\\work\\ws")
+        # wchar_t is 2 bytes on Windows and 4 on this host.
+        width = ctypes.sizeof(ctypes.c_wchar)
+        encoding = "utf-16-le" if width == 2 else "utf-32-le"
+        text = seen["environment"].decode(encoding)
+        # The block is the given variables, sorted, and nothing else: no
+        # per-drive entry -- a plain CreateProcessW starts without one
+        # (tests/test_windows_primitives.py, environment_203_probe).  Trailing
+        # NULs are padding from the decoded buffer, so compare what is there.
+        self.assertIn("LOCALAPPDATA=C:\\local\0Path=C:\\bin", text)
+        self.assertNotIn("=" + "D:", text.split("\0", 1)[0])
+        self.assertTrue(text.startswith("LOCALAPPDATA="), repr(text))
 
 
 class FileAccessTests(unittest.TestCase):

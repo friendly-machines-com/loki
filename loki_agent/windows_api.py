@@ -1136,27 +1136,12 @@ def create_process_with_pseudoconsole(executable, arguments, hpc, *,
             delete(attributes)
 
 
-def _drive_of(path: str) -> str:
-    """The ``X:`` drive of ``path``, or ``""``.
-
-    Stated here rather than with ``os.path.splitdrive`` so the value does not
-    depend on which platform's path rules the calling host happens to use.
-    """
-    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
-        return path[:2].upper()
-    return ""
-
-
 def environment_block(environment: dict, current_directory=None):
     """Encode ``environment`` as the Unicode block ``CreateProcessW`` accepts.
 
-    The supplied block replaces the inherited one, and Windows does not
-    propagate the per-drive current-directory entries into it; a block that
-    omits the entry for the drive holding the child's current directory is
-    rejected with ``ERROR_ENVVAR_NOT_FOUND`` (203).  Carry over any the parent
-    already holds, set the child's own directory for its drive, and sort the
-    whole block (the system expects a sorted environment; '=' sorts before
-    letters, so the drive entries come first on their own).
+    The supplied block replaces the inherited one, so every variable the child
+    needs must be in it.  Sorted by upper case, which is the order the system
+    expects.
 
     Returns a ``ctypes`` unicode buffer ready for ``lpEnvironment``, or
     ``None`` if ``environment`` is ``None``.
@@ -1164,53 +1149,12 @@ def environment_block(environment: dict, current_directory=None):
     if environment is None:
         return None
     entries = {}
-    for entry in drive_environment_entries():
-        name = entry.split("=", 2)[1]
-        entries[name] = entry
-    if current_directory:
-        drive = _drive_of(current_directory)
-        if drive:
-            entries[drive] = f"={drive}={current_directory}"
     for key, value in environment.items():
         if not key or '=' in key or '\0' in key or '\0' in value:
             raise ValueError("invalid child environment entry")
         entries[key] = f"{key}={value}"
-    # Sort the full entries, not the keys: the per-drive entries begin
-    # with '=' (0x3d), which sorts before every letter, so they come
-    # first on their own.  Sorting the keys would place "C:" among the
-    # ordinary "C..." names and misorder the block.
     ordered = sorted(entries.values(), key=str.upper)
     return ctypes.create_unicode_buffer('\0'.join(ordered) + '\0\0')
-
-
-def drive_environment_entries() -> list:
-    """The ``=X:=...`` per-drive current-directory entries of this process.
-
-    Windows keeps a hidden environment entry per drive recording that drive's
-    current directory.  A supplied environment block that omits the entry for
-    the drive holding the child's current directory is rejected by
-    ``CreateProcessW`` with ``ERROR_ENVVAR_NOT_FOUND`` (203), so they are read
-    from this process's block and placed at the front of the child's.
-    """
-    get = bind("kernel32", "GetEnvironmentStringsW", ctypes.c_void_p)
-    free = bind("kernel32", "FreeEnvironmentStringsW", wintypes.BOOL,
-                ctypes.c_void_p)
-    pointer = get()
-    if not pointer:
-        return []
-    entries = []
-    try:
-        address = pointer
-        while True:
-            text = ctypes.wstring_at(address)
-            if not text:
-                break
-            if text.startswith("="):
-                entries.append(text)
-            address += (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
-    finally:
-        free(pointer)
-    return entries
 
 
 def create_process_in_app_container(executable, arguments, package_sid,

@@ -807,31 +807,14 @@ def environment_203_probe(native, sid, workspace, output):
     the call needs; the broker works only because its own block was restored
     from the loaded profile.  This varies the explicit block and records
     start/winerror per variant, so the needed variable can be named rather than
-    guessed.  The drive entries the broker already holds are carried into every
-    block, to isolate the normal variables from the per-drive ones.
+    guessed.  ``add_LOCALAPPDATA`` is the one that starts; nothing else in the
+    list substitutes for it.
     """
-    get_strings = native.bind(native.kernel, 'GetEnvironmentStringsW', HANDLE)
-    free_strings = native.bind(native.kernel, 'FreeEnvironmentStringsW',
-                               W.BOOL, HANDLE)
-    drive_entries = []
-    pointer = get_strings()
-    if pointer:
-        try:
-            address = pointer
-            while True:
-                entry = C.wstring_at(address)
-                if not entry:
-                    break
-                if entry.startswith('='):
-                    drive_entries.append(entry)
-                address += len(entry.encode('utf-16-le', 'surrogatepass')) + 2
-        finally:
-            free_strings(pointer)
     names = ('SystemRoot', 'SystemDrive', 'USERPROFILE', 'LOCALAPPDATA',
              'APPDATA', 'PROGRAMDATA', 'PROGRAMFILES', 'TEMP', 'TMP')
 
     def entries(wanted):
-        chosen = list(drive_entries)
+        chosen = []
         for name in wanted:
             value = os.environ.get(name)
             if value:
@@ -844,23 +827,11 @@ def environment_203_probe(native, sid, workspace, output):
     minimal = ('SystemRoot', 'SystemDrive')
     buffers = {
         'full_broker': block(entries(names)),
-        'drive_only': block(list(drive_entries)),
         'minimal': block(entries(minimal)),
     }
     for name in names:
         buffers['add_' + name] = block(entries((*minimal, name)))
-    # Every explicit block above omits the per-drive entry, because the broker
-    # itself holds none.  Inheriting the block succeeded, so add the entry for
-    # the child's directory as the discriminator: if these start, an explicit
-    # AppContainer block requires it even though a plain CreateProcessW does not.
-    drive = os.path.splitdrive(str(workspace))[0].upper()
-    if drive:
-        drive_entry = '=' + drive + '=' + str(workspace)
-        buffers['full_broker_plus_drive'] = block([*entries(names), drive_entry])
-        buffers['minimal_plus_drive'] = block([*entries(minimal), drive_entry])
-    record = {'probe': 'appcontainer-environment-203',
-              'drive_entries': [entry.split('=', 2)[1]
-                                for entry in drive_entries]}
+    record = {'probe': 'appcontainer-environment-203'}
     command = [sys.executable, '-I', '-u', '-c', 'pass']
     for label, environment in [('inherited', None), *buffers.items()]:
         try:
