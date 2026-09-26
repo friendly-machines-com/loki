@@ -107,9 +107,11 @@ class ExplicitConnectionOption:
 
 @dataclass(frozen=True)
 class ReasoningEffortProfile:
-    """Exact selectable effort values for one provider/model leaf."""
+    """Exact selectable effort values for one provider/model leaf, and which of
+    them is used when the user has not selected one."""
 
     values: tuple[str, ...]
+    default: str | None = None
 
     def __post_init__(self):
         if (not isinstance(self.values, tuple)
@@ -128,15 +130,12 @@ class ReasoningEffortProfile:
         return isinstance(value, str) and value in self.values
 
     def to_dict(self):
-        # Read and write the encoding already emitted by the original
-        # reasoning feature, but do not retain its duplicated default or
-        # presentation descriptions as runtime state.
         return {
             "options": [
                 {"value": value, "description": None}
                 for value in self.values
             ],
-            "default_value": None,
+            "default_value": self.default,
         }
 
     @classmethod
@@ -153,7 +152,10 @@ class ReasoningEffortProfile:
                 raise ValueError(
                     "reasoning effort option must be an object")
             values.append(option.get("value"))
-        return cls(tuple(values))
+        default = value.get("default_value")
+        if not isinstance(default, str) or not default:
+            default = None
+        return cls(tuple(values), default=default)
 
 
 def validate_reasoning_effort(value, field_name="reasoning effort") -> str:
@@ -231,12 +233,13 @@ def _codex_reasoning_effort_profile(model, request_profile):
         values.append(validate_reasoning_effort(
             level.get("effort"), "OpenAI Codex reasoning effort"))
     return (
-        ReasoningEffortProfile(tuple(values))
+        ReasoningEffortProfile(
+            tuple(values), default=request_profile.default_reasoning_level)
         if values else None
     )
 
 
-def _modelsdev_reasoning_effort_profile(model):
+def _modelsdev_reasoning_effort_profile(model, default=None):
     if not isinstance(model, dict):
         raise ValueError("models.dev model must be an object")
     controls = model.get("reasoning_options")
@@ -257,11 +260,19 @@ def _modelsdev_reasoning_effort_profile(model):
     if not isinstance(values, list) or not values:
         raise ValueError(
             "models.dev reasoning effort values must be a non-empty array")
-    return ReasoningEffortProfile(tuple(
-        validate_reasoning_effort(
-            value, "models.dev reasoning effort value")
-        for value in values
-    ))
+    model_default = effort_controls[0].get("default")
+    chosen_default = (
+        model_default
+        if isinstance(model_default, str) and model_default
+        else default)
+    return ReasoningEffortProfile(
+        tuple(
+            validate_reasoning_effort(
+                value, "models.dev reasoning effort value")
+            for value in values
+        ),
+        default=chosen_default,
+    )
 
 
 def _openai_subscription_model_entries(
@@ -411,7 +422,8 @@ def reasoning_effort_profile(
             else None
         )
     try:
-        return _modelsdev_reasoning_effort_profile(model_entry)
+        default = protocols.default_reasoning_effort(provider_id)
+        return _modelsdev_reasoning_effort_profile(model_entry, default=default)
     except ValueError:
         # Malformed optional metadata must not make an otherwise usable model
         # disappear. It merely cannot authorize an effort selector/request.

@@ -14,23 +14,62 @@ OPENAI_RESPONSES = "openai_responses"
 DUMMY = "dummy"
 AUTO = "auto"
 
-_REASONING_PROTOCOLS = {
-    "anthropic": ANTHROPIC_MESSAGES,
-    "deepseek": OPENAI_CHAT,
-    "openai": OPENAI_RESPONSES,
-    "openai-subscription": OPENAI_RESPONSES,
-    "openrouter": OPENAI_CHAT,
-    "zai": OPENAI_CHAT,
-    "zai-coding-plan": OPENAI_CHAT,
-    "zhipuai": OPENAI_CHAT,
-    "zhipuai-coding-plan": OPENAI_CHAT,
+
+@dataclass(frozen=True)
+class ReasoningProviderSpec:
+    """One provider's reasoning contract: which protocol carries it, how the
+    request spells it, and the effort level to use when none is asked for."""
+
+    protocol: str
+    default_effort: str | None = None
+    # "openai", "openrouter", "thinking_toggle", "anthropic",
+    # "openai_subscription"
+    wire_format: str = "openai"
+
+
+_REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
+    "anthropic": ReasoningProviderSpec(
+        protocol=ANTHROPIC_MESSAGES,
+        wire_format="anthropic",
+    ),
+    "deepseek": ReasoningProviderSpec(
+        protocol=OPENAI_CHAT,
+        default_effort="high",
+        wire_format="thinking_toggle",
+    ),
+    "openai": ReasoningProviderSpec(
+        protocol=OPENAI_RESPONSES,
+        wire_format="openai",
+    ),
+    "openai-subscription": ReasoningProviderSpec(
+        protocol=OPENAI_RESPONSES,
+        wire_format="openai_subscription",
+    ),
+    "openrouter": ReasoningProviderSpec(
+        protocol=OPENAI_CHAT,
+        wire_format="openrouter",
+    ),
+    "zai": ReasoningProviderSpec(
+        protocol=OPENAI_CHAT,
+        default_effort="medium",
+        wire_format="thinking_toggle",
+    ),
+    "zai-coding-plan": ReasoningProviderSpec(
+        protocol=OPENAI_CHAT,
+        default_effort="medium",
+        wire_format="thinking_toggle",
+    ),
+    "zhipuai": ReasoningProviderSpec(
+        protocol=OPENAI_CHAT,
+        default_effort="medium",
+        wire_format="thinking_toggle",
+    ),
+    "zhipuai-coding-plan": ReasoningProviderSpec(
+        protocol=OPENAI_CHAT,
+        default_effort="medium",
+        wire_format="thinking_toggle",
+    ),
 }
-_ZAI_PROVIDERS = frozenset({
-    "zai",
-    "zai-coding-plan",
-    "zhipuai",
-    "zhipuai-coding-plan",
-})
 
 # Wire protocols this client can actually speak. Single source of truth:
 # consumers reference this instead of re-listing the constants, so adding a
@@ -113,7 +152,14 @@ def openai_response_model_header(headers):
 
 def reasoning_effort_supported(provider_id, protocol) -> bool:
     """Whether Loki implements this provider's effort request contract."""
-    return _REASONING_PROTOCOLS.get(provider_id) == protocol
+    spec = _REASONING_SPECS.get(provider_id)
+    return spec is not None and spec.protocol == protocol
+
+
+def default_reasoning_effort(provider_id: str | None) -> str | None:
+    """The effort level this provider is asked for when none is selected."""
+    spec = _REASONING_SPECS.get(provider_id)
+    return spec.default_effort if spec else None
 
 
 def _codex_reasoning_parameter(profile, reasoning_effort=None):
@@ -246,11 +292,13 @@ class Provider:
             if tools is not None:
                 payload["tools"] = tools
             if reasoning_effort is not None:
-                if self.provider_id == "openrouter":
+                spec = _REASONING_SPECS.get(self.provider_id)
+                wire_format = spec.wire_format if spec else None
+                if wire_format == "openrouter":
                     payload["reasoning"] = {
                         "effort": reasoning_effort,
                     }
-                elif self.provider_id == "deepseek" or self.provider_id in _ZAI_PROVIDERS:
+                elif wire_format == "thinking_toggle":
                     payload["thinking"] = {
                         "type": (
                             "disabled"

@@ -114,11 +114,21 @@ def reasoning_effort_default_text() -> str | None:
         return None
     preference = current_reasoning_effort_preference()
     name = "Model default"
-    provider = current_config().chat_provider
-    if provider.provider_id == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID:
-        default = provider.openai_request_profile.default_reasoning_level
-        if default is not None:
-            name += f" ({default})"
+
+    # The profile's own default is what a request without a selection uses;
+    # with none, fall back to what the provider declares (the model catalog
+    # for a subscription, the provider spec otherwise).
+    default = profile.default
+    if default is None:
+        provider = current_config().chat_provider
+        if (provider.provider_id == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
+                and provider.openai_request_profile is not None):
+            default = provider.openai_request_profile.default_reasoning_level
+        else:
+            default = protocols.default_reasoning_effort(provider.provider_id)
+
+    if default is not None:
+        name += f" ({default})"
     if preference is not None and not profile.supports(preference):
         name += f" - preferred {preference} is unavailable"
     return name
