@@ -206,7 +206,9 @@ class UsageReadTests(unittest.IsolatedAsyncioTestCase):
             context(request=_Request(response(payload))))
 
         self.assertIn("Plan: plus", result.lines)
-        self.assertTrue(any("56% used" in line for line in result.lines))
+        self.assertIn(
+            "  Primary window: 56% used, 44% remaining; window: 5 hours; "
+            "resets in 1 hour 0 minutes", result.lines)
         self.assertIn("Banked limit resets: 3 available", result.lines)
 
     async def test_missing_windows_is_graceful(self):

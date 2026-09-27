@@ -112,7 +112,7 @@ def _window_line(label: str, window) -> str | None:
     line = f"  {label}: {used:g}% used, {100 - used:g}% remaining"
     minutes = _window_minutes(window)
     if minutes is not None:
-        line += f" - {_duration(minutes)}"
+        line += f"; window: {_duration(minutes)}"
     reset = window.get("reset_after_seconds")
     if not isinstance(reset, (int, float)) or isinstance(reset, bool):
         reset = window.get("resets_in_seconds")

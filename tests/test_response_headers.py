@@ -90,10 +90,11 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         document = self.store.snapshot()
         before = json.dumps(document)
         text = response_headers.render(document)
-        self.assertIn("Main subscription bucket: 56% used, 44% remaining - 7 days", text)
-        self.assertIn("GPT-5.3-Codex-Spark: 0% used, 100% remaining - 5 hours", text)
-        self.assertIn("GPT-5.3-Codex-Spark: 0% used, 100% remaining - 7 days", text)
+        self.assertIn("Main subscription bucket: 56% used, 44% remaining; window: 7 days", text)
+        self.assertIn("GPT-5.3-Codex-Spark: 0% used, 100% remaining; window: 5 hours", text)
+        self.assertIn("GPT-5.3-Codex-Spark: 0% used, 100% remaining; window: 7 days", text)
         self.assertEqual(text.count("% remaining"), 3)
+        self.assertEqual(text.count("reset time unknown"), 3)
         self.assertIn("'x-codex-primary-used-percent': '56'", text)
         self.assertEqual(json.dumps(document), before)
         document["endpoints"][0]["endpoint"] = "https://other.example/chat"
@@ -116,7 +117,7 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             "x-codex-new-primary-window-minutes": "60",
         })
         text = response_headers.render(self.store.snapshot())
-        self.assertIn("12.5% used, 87.5% remaining - 1 hour", text)
+        self.assertIn("12.5% used, 87.5% remaining; window: 1 hour", text)
         self.assertNotIn("\x1b", text)
         self.assertIn("Model\\x1b[2J\\nspoof", text)
 
@@ -141,13 +142,108 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             })
         with mock.patch.object(response_headers.time, "time_ns", return_value=2):
             self.codex_observer()(200, {"date": "later"})
-        self.assertIn("7 days [retained observation]", response_headers.render(
-            self.store.snapshot()))
+        self.assertIn(
+            "window: 7 days; reset time unknown [retained observation]",
+            response_headers.render(self.store.snapshot()))
         with mock.patch.object(response_headers.time, "time_ns", return_value=3):
             self.codex_observer()(200, {"x-codex-primary-used-percent": "57"})
         text = response_headers.render(self.store.snapshot())
         self.assertNotIn("Subscription quota", text)
         self.assertIn("'x-codex-primary-used-percent': '57'", text)
+
+    async def test_codex_reset_dates_and_countdowns_are_window_specific(self):
+        start = 1704067200  # 2024-01-01 00:00:00 UTC
+        with mock.patch.object(response_headers.time, "time_ns",
+                               return_value=start * 10**9):
+            self.codex_observer()(200, {
+                "x-codex-primary-used-percent": "54",
+                "x-codex-primary-window-minutes": "10080",
+                "x-codex-primary-reset-at": str(start + 3 * 86400 + 4 * 3600),
+                "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+                "x-codex-bengalfox-primary-used-percent": "0",
+                "x-codex-bengalfox-primary-window-minutes": "300",
+                "x-codex-bengalfox-primary-reset-at": str(start + 7200),
+                "x-codex-bengalfox-secondary-used-percent": "0",
+                "x-codex-bengalfox-secondary-window-minutes": "10080",
+                "x-codex-bengalfox-secondary-reset-at": str(start + 86400),
+            })
+        document = self.store.snapshot()
+        before = json.dumps(document)
+        with mock.patch.object(response_headers.time, "time", return_value=start + 3600):
+            text = response_headers.render(document)
+        self.assertIn(
+            "Main subscription bucket: 54% used, 46% remaining; window: 7 days; "
+            "resets at 2024-01-04 04:00:00 UTC (in 3 days 3 hours)", text)
+        self.assertIn(
+            "GPT-5.3-Codex-Spark: 0% used, 100% remaining; window: 5 hours; "
+            "resets at 2024-01-01 02:00:00 UTC (in 1 hour)", text)
+        self.assertIn(
+            "GPT-5.3-Codex-Spark: 0% used, 100% remaining; window: 7 days; "
+            "resets at 2024-01-02 00:00:00 UTC (in 23 hours)", text)
+        self.assertEqual(json.dumps(document), before)
+
+    async def test_saved_retained_reset_ages_without_resetting_reported_usage(self):
+        start = 1704067200
+        observer = self.codex_observer()
+        with mock.patch.object(response_headers.time, "time_ns",
+                               return_value=start * 10**9):
+            observer(200, {
+                "x-codex-primary-used-percent": "54",
+                "x-codex-primary-window-minutes": "10080",
+                "x-codex-primary-reset-at": str(start + 7200),
+            })
+        with mock.patch.object(response_headers.time, "time_ns",
+                               return_value=(start + 60) * 10**9):
+            observer(200, {"date": "a later response without quota headers"})
+        await self.store.save()
+        document = response_headers.Store(self.path).snapshot()
+        for elapsed, expected in (
+                (3600, "resets at 2024-01-01 02:00:00 UTC (in 1 hour)"),
+                (7199.5, "resets at 2024-01-01 02:00:00 UTC (in 1 second)"),
+                (7200, "reported reset at 2024-01-01 02:00:00 UTC has passed; "
+                 "use /account to refresh"),
+                (86400, "reported reset at 2024-01-01 02:00:00 UTC has passed; "
+                 "use /account to refresh")):
+            with self.subTest(elapsed=elapsed), mock.patch.object(
+                    response_headers.time, "time", return_value=start + elapsed):
+                text = response_headers.render(document)
+                self.assertIn(expected + " [retained observation]", text)
+                self.assertIn("54% used, 46% remaining; window: 7 days", text)
+                self.assertNotIn("resets in 0", text)
+
+    async def test_reset_must_match_usage_observation_even_in_same_clock_tick(self):
+        for newer in (
+                {"x-codex-primary-used-percent": "54",
+                 "x-codex-primary-window-minutes": "10080"},
+                {"x-codex-primary-reset-at": "1704074401"}):
+            with self.subTest(newer=newer), mock.patch.object(
+                    response_headers.time, "time_ns", return_value=1704067200 * 10**9):
+                observer = self.codex_observer()
+                observer(200, {
+                    "x-codex-primary-used-percent": "54",
+                    "x-codex-primary-window-minutes": "10080",
+                    "x-codex-primary-reset-at": "1704074400",
+                })
+                observer(200, newer)
+                with mock.patch.object(response_headers.time, "time", return_value=1704067200):
+                    text = response_headers.render(self.store.snapshot())
+                self.assertIn("window: 7 days; reset time unknown", text)
+                self.assertNotIn("resets at", text)
+
+    async def test_bad_reset_headers_leave_quota_readable(self):
+        for reset in ("", "NaN", "inf", "tomorrow", "1.5", "-1", "0",
+                      "9" * 100, "1704074400000", "1704074400\x1b[2J"):
+            with self.subTest(reset=reset):
+                self.codex_observer()(200, {
+                    "x-codex-primary-used-percent": "54",
+                    "x-codex-primary-window-minutes": "10080",
+                    "x-codex-primary-reset-at": reset,
+                })
+                text = response_headers.render(self.store.snapshot())
+                self.assertIn(
+                    "54% used, 46% remaining; window: 7 days; reset time unknown", text)
+                self.assertNotIn("resets at", text)
+                self.assertNotIn("\x1b", text)
 
     async def test_secrets_redacted_in_memory_disk_and_loaded_snapshots(self):
         # Independent protocol examples: removing a name from the production

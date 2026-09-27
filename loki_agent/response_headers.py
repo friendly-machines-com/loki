@@ -276,7 +276,43 @@ class Store:
                   file=sys.stderr)
 
 
-def _codex_quota_summary(entry):
+def _time_remaining(seconds):
+    # Round up rather than saying a future reset is zero seconds away.
+    seconds = math.ceil(seconds)
+    parts = []
+    for size, unit in ((86400, "day"), (3600, "hour"),
+                       (60, "minute"), (1, "second")):
+        amount, seconds = divmod(seconds, size)
+        if amount:
+            parts.append(f"{amount} {unit}{'' if amount == 1 else 's'}")
+        if len(parts) == 2:
+            break
+    return " ".join(parts)
+
+
+def _codex_reset_text(headers, name, observed_id, now):
+    observation = headers.get(name)
+    # A retained reset from another response is not evidence about this
+    # percentage/window pair, even if their timestamps share a clock tick.
+    if observation is None or observation.get("observed_id") != observed_id:
+        return "reset time unknown"
+    try:
+        # Codex x-*-{primary,secondary}-reset-at is Unix epoch seconds, as
+        # parsed in codex-rs/codex-api/src/rate_limits.rs and consumed by its
+        # tui/src/status/rate_limits.rs. It is not a duration or milliseconds.
+        reset = int(observation["value"])
+        if reset <= 0:
+            return "reset time unknown"
+        stamp = datetime.fromtimestamp(reset, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, OverflowError, OSError):
+        return "reset time unknown"
+    if reset <= now:
+        return f"reported reset at {stamp} has passed; use /account to refresh"
+    return f"resets at {stamp} (in {_time_remaining(reset - now)})"
+
+
+def _codex_quota_summary(entry, now):
     # These header meanings belong to this endpoint, not a models.dev label.
     if entry["endpoint"] != "https://chatgpt.com/backend-api/codex/responses":
         return []
@@ -321,12 +357,12 @@ def _codex_quota_summary(entry):
         else:
             amount, unit = minutes, "minute"
         duration = f"{amount} {unit}{'' if amount == 1 else 's'}"
-        retained = (
-            used_observation["observed_at_ns"] != latest["observed_at_ns"]
-            or name not in latest["header_names"]
-            or window_name not in latest["header_names"])
+        retained = used_id != latest.get("observed_id")
+        reset_text = _codex_reset_text(
+            headers, f"{prefix}-{window}-reset-at", used_id, now)
         text = (f"  {label}: {used:g}% used, {100 - used:g}% remaining"
-                f" - {duration}" + (" [retained observation]" if retained else ""))
+                f"; window: {duration}; {reset_text}"
+                + (" [retained observation]" if retained else ""))
         rows.append((bucket or "", window, text))
     return ["Subscription quota (last observed):"] + [
         text for _, _, text in sorted(rows)] if rows else []
@@ -335,6 +371,7 @@ def _codex_quota_summary(entry):
 def render(document):
     if not document["endpoints"]:
         return "No HTTP chat response headers observed yet."
+    now = time.time()
     lines = []
     for entry in document["endpoints"]:
         latest = entry["latest"]
@@ -353,7 +390,7 @@ def render(document):
                 f"[{stamp}; HTTP {observation['status']}; "
                 f"model {ascii(observation['model'])}{retained}]")
         lines.append("")
-        summary = _codex_quota_summary(entry)
+        summary = _codex_quota_summary(entry, now)
         if summary:
             lines.extend(summary)
         lines.append("")

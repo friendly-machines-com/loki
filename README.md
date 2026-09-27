@@ -204,36 +204,16 @@ protocol-confirmed final response before adding it to the session or executing
 tool calls. Interrupted transport output is shown but is not invented as a
 completed assistant response. If a server ignores the request and returns
 ordinary JSON, Loki accepts that same response without resending the inference
-request. Chat streaming requests include `stream_options.include_usage` so
-compatible servers can return token usage. If the server rejects streaming or
-that option, set `LOKI_STREAM=0`; Loki does not automatically retry inference
-with a different request shape.
+request. If the server rejects streaming, set `LOKI_STREAM=0`.
 
-The Remote status row shows `Context: 37%`: the latest server-reported input
-plus output tokens divided by the selected model's context window, rounded to
-an integer. Cached input is included; cache and reasoning breakdowns are not
-counted twice. This is one exchange's reported usage, **not cumulative session
-consumption or an exact count of the next prompt**. `*` marks a historical or
-incomplete observation, or history appended since that observation; `unknown` means
-usage or capacity is unknown. Tool results are not counted until a subsequent
-server response measures them. Child-agent usage does not inflate the parent's
-percentage.
+The Remote row's `Context: 37%` shows the last reported context usage, not an
+exact count of the next prompt. `*` marks an older or incomplete measurement;
+`unknown` means usage or capacity is unavailable. To override the model's
+context capacity, set `LOKI_CONTEXT_WINDOW` to a positive token count. This
+changes the display only, not the model's limits.
 
-Capacity comes from the selected provider/model's models.dev `limit.context`,
-or the authenticated ChatGPT catalog's `context_window`. A positive integer
-`LOKI_CONTEXT_WINDOW` overrides catalog capacity for selections made with that
-startup configuration, including custom endpoints. It is display-only, unlike
-`LOKI_MAX_TOKENS` (the output setting); no output reserve, safety buffer, local
-tokenizer, overflow prediction, or automatic compaction is applied. Saved
-connections retain capacity metadata, and saved response events reconstruct
-historical observations on resume.
-
-ACP sends standard `usage_update` counts when usage and capacity are known.
-Emacs agent-shell can show an integer percentage in its header/modeline with
-`agent-shell-show-context-usage-indicator` set to `'detailed`. ACP's basic update
-has no unknown/reset or freshness field, so clients may retain their last report
-when new usage or capacity is unavailable. Loading a session restores its usage
-display; ACP resume does not replay historical notifications.
+In Emacs agent-shell, set `agent-shell-show-context-usage-indicator` to
+`'detailed` to show a context percentage in the header/modeline.
 
 Tool input is validated before execution. When validation identifies one of a
 small set of unambiguous representation mistakes, Loki repairs a copy of the
@@ -451,13 +431,11 @@ saved observations without starting an inference runtime. The standalone command
 has no active connection and shows all saved connections unless filtered by URL.
 To try a provider,
 select it normally and send a short prompt; both successful and error responses
-are collected automatically. For the ChatGPT Codex endpoint, readable status also
-shows a plain-text subscription summary above the raw headers: used/remaining
-percentages and the reported window duration for each bucket. Zero-length or
-invalid windows are omitted, retained observations are marked, and usage/window
-values from different responses are not combined. These are reported quota
-percentages, not token counts or billing balances. JSON and saved observations
-remain unchanged; the summary is derived only for display.
+are collected automatically. For ChatGPT subscriptions, `/status` also shows
+last-reported quota usage and reset times when available. `window: 7 days` is
+the allowance's duration, not time remaining. `[retained observation]` marks
+older data; use `/account` for a live lookup. Subscription quotas are separate
+from the conversation's context usage.
 
 Identity is the inference endpoint URL plus the existing non-secret credential
 reference. Provider IDs/names are optional informational labels, independent of
