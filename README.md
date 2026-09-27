@@ -27,19 +27,14 @@ Supports Anthropic and OpenAI protocols.
 ## How to run
 
 On POSIX, requires Python 3.11.10 or later (on the 3.12 branch, 3.12.4 or
-later). On Windows, requires Python 3.12.4 or later: the 3.11 fix exists only
-in source-only releases, so no supported 3.11 can be installed there. Earlier
-releases in those branches are excluded because Windows did not yet honor
-`mkdir(..., mode=0o700)`.
+later). On Windows, requires Python 3.12.4 or later.
 
 Run it in a VM or container.
 
 On Windows there is no VM requirement: ``loki-setup`` configures an
-AppContainer for a workspace and the runtimes it starts run inside it.  The
-contained runtime's ``TEMP`` and ``TMP`` point at ``<workspace>\.loki\tmp``,
-which it creates at startup if it is missing and never removes; the tools that
-use it may delete it between runs, and removing its contents is the user's
-business.
+AppContainer for a workspace. ``TEMP`` and ``TMP`` point at
+``<workspace>\.loki\tmp``. Loki creates this directory when needed but does not
+clean it up automatically; you can remove its contents between runs.
 
 ```
 export LOKI_API_KEY=xxx
@@ -55,9 +50,9 @@ before starting a Loki session:
 ./loki.py auth login openai
 ```
 
-The default authorization-code flow prints a URL, attempts to open it in a
-browser, and listens only on localhost ports 1455 or 1457 for the PKCE
-callback. On a headless or remote machine, use OpenAI's device-code flow:
+Login prints a URL and attempts to open it in a browser. It needs localhost
+port 1455 or 1457 to receive the login confirmation. On a headless or remote
+machine, use device-code login:
 
 ```
 ./loki.py auth login openai --device-code
@@ -65,16 +60,13 @@ callback. On a headless or remote machine, use OpenAI's device-code flow:
 
 Device-code login must be enabled for the ChatGPT account or workspace.
 `./loki.py auth status openai` reports the stored login without displaying
-tokens, and `./loki.py auth logout openai` removes it locally. Logout prevents
-new supervisors from loading the credential. A supervisor that was already
-running can continue using its cached access token until it next needs a
-refresh; neither that cached token nor a token already leased to a request can
-be recalled locally, and both remain subject to server-side expiry.
+tokens, and `./loki.py auth logout openai` removes it locally. Logout does not
+immediately revoke access in already-running sessions; close those sessions
+as well.
 
 Loki stores subscription tokens in
 `$XDG_CONFIG_HOME/loki/credentials/tokens.json` (normally
-`~/.config/loki/credentials/tokens.json`). Loki requests mode 0700 when
-creating the credential directory and mode 0600 for token files.
+`~/.config/loki/credentials/tokens.json`).
 
 No desktop credential service or message bus is required.
 
@@ -86,79 +78,22 @@ image is limited to 20 MiB and is snapshotted when `/image` is entered, so a
 later change to the file does not change the conversation. The selected
 provider and model must support image input.
 
-At startup Loki captures the environment and removes variables ending in
-`_KEY`, `_TOKEN`, or `_PAT` from the environment inherited by tools. The
-Linux and macOS startup paths also overwrite each such variable's original
-process-startup record with same-length `x` bytes while preserving its
-terminating NUL and the framing of later records. This removes the credential
-from Linux `/proc/PID/environ` and macOS `KERN_PROCARGS2` inspection. The
-macOS path uses the documented `_NSGetEnviron()` interface and refuses to
-write unless every target record is within the initial main-thread stack.
-Every public entrypoint first becomes a credential-owning supervisor. For the
-terminal and headless interfaces it starts a separate runtime through the same
-executable; the ACP front starts one runtime worker per session. A runtime
-receives only a sanitized environment, an owner-lifetime pipe, and an
-anonymous socket capability restricted to the brokered credentials it may
-request. Losing either supervisor channel cancels the runtime. Subagents
-receive a fresh capability restricted to the current provider, and nested
-subagents get a newly relayed capability rather than inheriting their parent's
-descriptor. Rotating refresh tokens stay in the top-level broker; delegated
-processes can lease an access token but cannot obtain the refresh token.
+Loki reads credentials at startup and removes variables ending in `_KEY`,
+`_TOKEN`, or `_PAT` from the environment inherited by tools and hooks. On Linux,
+Loki also hides `$XDG_CONFIG_HOME/loki/credentials` from tools and subagents.
+These protections do not replace the VM or container needed to isolate tool
+activity. An interrupted credential refresh may require logging in again.
 
-The supervisor/runtime split also gives persistent credentials a pathname
-boundary. Every supervisor creates Loki's dedicated
-`$XDG_CONFIG_HOME/loki/credentials` directory before starting a runtime. On
-Linux, each runtime enters a private user and mount namespace before importing
-the agent core and covers that directory with an empty read-only filesystem.
-Tools and nested subagents inherit the covered view; only the supervisor
-retains the original view needed to load and later update credentials.
-Runtimes then discard their namespace capabilities and enable
-`NO_NEW_PRIVS`, so they cannot remove the cover mount. This is not a general
-sandbox: Loki still expects the surrounding VM or container described above
-to confine arbitrary tool activity.
+## Models and connections
 
-OpenAI refresh tokens may rotate. Before sending one, the supervisor
-atomically changes its stored record to a refresh-in-progress tombstone that
-does not contain the refresh token. A crash, cancellation after possible
-delivery, or ambiguous HTTP result therefore requires a new login instead of
-allowing another Loki process to replay the old token. Only a provably
-pre-delivery transport failure restores the old active record.
+The `/model` picker uses models.dev and shows providers for which credentials
+were supplied at startup, such as `OPENROUTER_API_KEY`. Deprecated models remain
+selectable but are labeled in the picker and status bar.
 
-Ordinary commands and hooks are started with other descriptors closed.
-Credential-owning supervisors and credential-consuming runtimes also make
-themselves non-dumpable on Linux, so same-UID tool children cannot inspect
-their memory or open descriptors through ptrace-governed `/proc` interfaces.
-
-The `/model` picker fetches models.dev lazily and shows only providers for
-which a captured credential is available. Provider-specific variables such as
-`OPENROUTER_API_KEY` can therefore be supplied by the VM/container launcher
-without also exposing them to ordinary tool subprocesses. Deprecated catalog
-entries remain selectable but are labeled in the picker and status bar.
-Models.dev omits the OpenAI Platform endpoint because its native JavaScript
-SDK supplies that default internally. When the catalog entry exactly matches
-the canonical OpenAI provider signature, Loki supplies
-`https://api.openai.com/v1` and labels the provider
-`OpenAI Platform API [endpoint supplied by Loki]`. A changed signature or
-non-OpenAI endpoint is rejected rather than receiving `OPENAI_API_KEY`.
-For a stored ChatGPT login, Loki also constructs the separate provider
-`OpenAI ChatGPT subscription [endpoint supplied by Loki]`, using the private
-ChatGPT Codex Responses endpoint and the brokered subscription credential.
-Its selectable models come only from that account's authenticated ChatGPT
-Codex model catalog; Loki does not copy OpenAI Platform models from models.dev
-into the subscription provider. Subscription authorization is permitted only
-for the exact ChatGPT Codex Responses URL and the model-list request with
-Loki's pinned, tested Codex compatibility level. The separate `/account`
-usage and limit-reset endpoints are declared by their own control module and
-authorized through their own URL set, so inference code cannot reach them and
-an account-control defect cannot widen where the inference credential is sent.
-The authenticated account's
-picker-visible models remain authoritative; Loki does not silently remove
-models based on their request metadata. Models advertising Responses-Lite
-are sent with that protocol's header, all-turn reasoning context, developer
-input items, and namespaced client-function tools; the selected framing is
-stored with the connection so resume, ACP, and delegated subagents agree.
-Subscription authorization is never attached to the models.dev catalog
-request or to the OpenAI Platform API.
+`OpenAI Platform API` uses API billing. `OpenAI ChatGPT subscription` uses your
+saved ChatGPT login and lists the models available to that account; these may
+differ from the Platform API models. Subscription credentials are not sent to
+models.dev or the Platform API.
 
 Loki does not select a built-in provider connection at startup. Without an
 explicit `LOKI_API_BASE` or a saved session connection, it starts disconnected
@@ -180,31 +115,14 @@ appears in `/model` as `Explicit LOKI_* connection`, so it can be selected
 again after switching to a catalog provider or while models.dev is
 unavailable.
 
-For catalog models whose exact provider/model entry exposes a verified
-reasoning-effort control, `/effort` displays and selects the provider's exact
-advertised values. `Model default` is the initial setting and omits an effort
-override
-for ordinary providers; ChatGPT subscription requests retain their
-authenticated catalog default. An explicit selection is a conversation
-preference: after switching to a model which does not support it, Loki uses
-that model's default without coercion and restores the selection if a later
-model supports it. The selected value is fixed for every provider request in
-one logical tool turn.
+Use `/effort` to select reasoning effort when the selected model supports it.
+The initial setting is `Model default`. Your preference is remembered across
+model changes: unsupported models use their default, and a later compatible
+model restores your preference. ACP clients also offer an effort selector;
+changes made during a response apply to the next turn.
 
-ACP sessions expose the same selector as a `thought_level` session config
-option. The complete option list is returned after model or effort changes,
-so clients such as emacs-agent-shell can add, remove, or refresh their
-reasoning selector as the model changes. An ACP effort change accepted while
-a response is running applies to the next logical turn.
-
-Streaming is disabled by default because compatible servers are not required
-to implement it. Set `LOKI_STREAM=1` to request streaming for the selected
-connection. Loki streams assistant text as it arrives but waits for a
-protocol-confirmed final response before adding it to the session or executing
-tool calls. Interrupted transport output is shown but is not invented as a
-completed assistant response. If a server ignores the request and returns
-ordinary JSON, Loki accepts that same response without resending the inference
-request. If the server rejects streaming, set `LOKI_STREAM=0`.
+Set `LOKI_STREAM=1` to display assistant text as it arrives. Streaming is
+disabled by default. If the server rejects it, set `LOKI_STREAM=0`.
 
 The Remote row's `Context: 37%` shows the last reported context usage, not an
 exact count of the next prompt. `*` marks an older or incomplete measurement;
@@ -212,18 +130,10 @@ exact count of the next prompt. `*` marks an older or incomplete measurement;
 context capacity, set `LOKI_CONTEXT_WINDOW` to a positive token count. This
 changes the display only, not the model's limits.
 
-In Emacs agent-shell, set `agent-shell-show-context-usage-indicator` to
-`'detailed` to show a context percentage in the header/modeline.
+## Tool hooks
 
-Tool input is validated before execution. When validation identifies one of a
-small set of unambiguous representation mistakes, Loki repairs a copy of the
-input, validates the result again, and reports the adjustment to both the user
-and model. The original provider tool call is never rewritten. Supported
-repairs are optional `null` omission, JSON-encoded arrays, an empty-object
-placeholder for an array, a bare string for a string array, and degenerate
-Markdown auto-links in explicitly marked filesystem-path fields. Other invalid
-input is rejected with a path-by-path retry message. A repaired call is
-executed at most once.
+Loki checks tool input before execution, corrects some unambiguous formatting
+mistakes, and reports any corrections. Other invalid calls are rejected.
 
 Loki also supports trusted external tool hooks. Set `LOKI_HOOKS` to an explicit
 JSON configuration path, or place user-owned configuration at
@@ -290,47 +200,28 @@ preserves the outcome and tells the model that the tool had already executed.
 Commands are argv arrays, not shell strings; stdout is reserved for the single
 JSON response, while stderr remains diagnostic. Hook subprocesses receive a
 minimal environment without Loki API credentials. A hook configured with
-`workspace_side_effects: true` must return `changed_paths`, or Loki
-conservatively invalidates all remembered file state.
+`workspace_side_effects: true` must return `changed_paths` listing the files it
+changed.
 
-Chat logs are session savefiles. They persist the selected model, its known
-catalog status, protocol, concrete endpoints, and other session state, but
-never credential values.
-The v4 savefile is an editable ordered event stream. Direct messages, complete
-model responses, and tool results are the only event types. Each model response
-contains its originating protocol and ordered canonical output items; common
-text, media, and function-call meaning is represented once, while native
-continuation data such as Anthropic thinking signatures and OpenAI Responses
-reasoning remains attached to that response. There are no positional call
-ranges or external provenance records.
+## Saved sessions
 
-Every request is a pure projection of the complete current event stream into
-the selected wire protocol. Changing `/model` does not convert or rewrite the
-savefile: portable history is projected to the new protocol, native
-continuation data is replayed only to the same provider endpoint and model,
-and foreign continuation-only data remains stored but is omitted. Unknown
-ordered provider output is printed on stderr, retained for its originating
-connection, and omitted from foreign projections rather than synthesized as
-dialogue. Each distinct tool schema snapshot is stored once and never inserted
-into model-visible history. Older savefile schemas are intentionally not
-migrated.
-Resuming an authenticated connection requires the same credential variable to
-be supplied again. Credentialless connections resume without inventing a
-credential. Loki asks for confirmation before sending either kind of
-connection to the saved endpoints. A temporarily unavailable credential does
-not remove the saved connection.
-`LOKI_*` config initializes new sessions; on resumed sessions it is a runtime
-override and does not replace the saved connection. A successful `/model`
-selection does replace the session's saved connection.
+Chat logs save the conversation, selected model, connection settings, and other
+session state, but not credential values. Use `./loki.py --resume` to choose a
+saved chat, or `./loki.py --resume LOG` to open a specific log. Older savefile
+formats are not migrated automatically.
 
-During ordinary chat/tool turns, prompt history is append-only and tool
-definitions contain no changing date text. Direct Anthropic API connections
-default to automatic ephemeral prompt caching. Other Anthropic-compatible
-servers receive cache metadata only when `LOKI_PROMPT_CACHE=1`; set
-`LOKI_PROMPT_CACHE=0` to disable it explicitly. OpenAI-compatible servers can
-apply their own automatic prefix cache to the same stable tools, instructions,
-and history. A later operator instruction, such as the context update produced
-by `/cd`, can still invalidate the instruction-and-history portion of a cache.
+Changing `/model` preserves the conversation, though provider-specific reasoning
+data may not transfer to the new model. To resume an authenticated connection,
+supply its credentials again. Loki asks for confirmation before using saved
+endpoints. Missing credentials do not erase the saved connection.
+
+`LOKI_*` settings initialize new sessions. On resume they temporarily override
+the saved connection; selecting a model with `/model` updates the saved choice.
+
+Direct Anthropic API connections enable prompt caching by default. For other
+Anthropic-compatible servers, enable it with `LOKI_PROMPT_CACHE=1`. Set
+`LOKI_PROMPT_CACHE=0` to disable it. Cache reuse depends on the provider and can
+be affected by changes to the conversation or working directory.
 
 ## Diagnostic logging
 
@@ -339,16 +230,10 @@ payloads and tracebacks) are hidden. User-facing errors and hook stderr remain
 visible. Enable Loki DEBUG logging to stderr with `LOKI_TRACE=1 ./loki.py` or
 `LOKI_TRACE=1 ./loki-acp`.
 
-For standard Python logging configuration, set
-`LOKI_LOG_CONFIG=/absolute/path/to/logging.ini`. Loki loads it with stdlib
-`logging.config.fileConfig(..., disable_existing_loggers=False)`. This takes
-precedence over `LOKI_TRACE`; an unreadable or invalid file fails startup. There
-is no implicit file discovery or filename rewriting: Loki passes the environment
-value unchanged to `fileConfig()`, without expanding `~` or collapsing `..`.
-Each supervisor, runtime, ACP worker and subagent loads it after security
-initialization and before session cwd changes. Relative filenames rely on the
-launch paths preserving the invoker's process cwd. The file must remain
-accessible in each process's isolated filesystem view.
+For more control, set `LOKI_LOG_CONFIG=/absolute/path/to/logging.ini` to a
+standard Python logging INI file. This takes precedence over `LOKI_TRACE`;
+an unreadable or invalid file prevents startup. Use an absolute path accessible
+to Loki and its subagents; Loki does not expand `~` in this setting.
 
 The following standard INI configuration sends warnings to stderr and only
 provider-format DEBUG diagnostics to a file. Change `loki_agent.formats` to
@@ -398,85 +283,57 @@ args=('/tmp/loki-trace-' + str(__import__('os').getpid()) + '.log', 'a', 'utf-8'
 format=%(asctime)s %(levelname)s %(name)s[%(process)d]: %(message)s
 ```
 
-In agent-shell, stderr is displayed in Notices even when the client's ACP
-logging toggle is off. Use a file destination to collect verbose traces without
-those notices. Never configure ACP logging to stdout: it is reserved for the
-protocol and ordinary stdout is discarded after initialization. Subagent stderr
-is captured by its job rather than necessarily appearing in ACP Notices.
+In agent-shell, stderr appears in Notices even when its ACP logging toggle is
+off. Use a file destination to avoid verbose notices. Never send ACP logs to
+stdout, which is reserved for communication with the editor. Subagent stderr
+is available through its job output.
 
-Logging configuration is **trusted executable configuration**: `fileConfig`
-evaluates handler constructors and arguments. Do not accept it from a model or
-remote client. Handler file paths are relative to each process's working
-directory, not to the INI file. Use absolute paths and private directories for
-trace files; payload traces may contain conversation content and unrecognized
-provider secrets. Logging does not redact arbitrary payloads. Standard file
-handlers do not coordinate multiple processes; do not share a rotating file
-handler across workers. Normal UI, hook output, and frontend-rendered errors
-are not controlled by logger levels.
+Logging configuration can execute code. Use only a configuration you trust,
+not one supplied by a model or remote client. Log paths are relative to the
+process's working directory, not the INI file; prefer absolute paths in private
+directories. Traces may contain conversation content and provider secrets, so
+review them before sharing. Give each process its own log file, as in the
+example, rather than sharing a rotating log. Logger levels do not hide ordinary
+UI messages, hook output, or user-facing errors.
 
 ## HTTP response status
 
-`/status` in the terminal shows last-observed HTTP chat response headers for the
-current endpoint and credential reference only, merged with saved observations.
-`/status all` explicitly shows all known connections. Add `--json` to either
-command for JSON output. With no active HTTP connection, `/status` reports that
-rather than falling back to all connections. Neither view is globally live:
-other runtimes' unsaved observations are not visible, even for the same endpoint.
-`/status save` explicitly saves all this runtime's pending observations. These
-commands do not make provider requests or send the observations to a model.
+`/status` shows the last observed HTTP response headers for the current
+connection. Use `/status all` for all known connections, or add `--json` for
+JSON output. These commands use saved and locally observed data, not a live
+provider lookup.
 
-Outside a session, use `./loki.py status`, `./loki.py status --json`, or
-`./loki.py status --endpoint https://example.com/v1/chat/completions` to inspect
-saved observations without starting an inference runtime. The standalone command
-has no active connection and shows all saved connections unless filtered by URL.
-To try a provider,
-select it normally and send a short prompt; both successful and error responses
-are collected automatically. For ChatGPT subscriptions, `/status` also shows
-last-reported quota usage and reset times when available. `window: 7 days` is
-the allowance's duration, not time remaining. `[retained observation]` marks
-older data; use `/account` for a live lookup. Subscription quotas are separate
-from the conversation's context usage.
+Outside a session, use `./loki.py status` or `./loki.py status --json` to inspect
+all saved connections. Filter by endpoint with
+`./loki.py status --endpoint https://example.com/v1/chat/completions`.
 
-Identity is the inference endpoint URL plus the existing non-secret credential
-reference. Provider IDs/names are optional informational labels, independent of
-models.dev. URL userinfo, queries, and fragments are discarded; query-selected
-endpoints therefore share observations. Scheme/host casing and default ports are
-normalized, but endpoint paths remain distinct. A credential reference identifies
-a configured credential slot, not a verified account: replacing its credential
-continues the same observations.
+For ChatGPT subscriptions, status also shows last-reported quota usage and
+reset times when available. `window: 7 days` is the allowance's duration, not
+time remaining. `[retained observation]` marks older data. Subscription quotas
+are separate from the conversation's context usage.
 
-Each header name has one last-observed value, timestamp, HTTP status, and model.
-Headers absent from a later response are retained and marked as such. There is
-no history. Each terminal/headless runtime, ACP worker, and subagent keeps its own
-in-memory observations and saves on orderly exit, with no periodic or per-request
-writes. Independent writers merge by observation time under a bounded file lock.
-An older process exiting later cannot replace newer observations. Wall-clock
-accuracy affects ordering between processes. Crashes or forced termination can
-lose pending observations. Other live workers' unsaved memory is not visible to
-`/status` or the standalone command; `/status save` only flushes this runtime.
+Observations are saved on normal exit; use `/status save` to save them sooner.
+Other running sessions' unsaved data is not visible, and a crash can lose
+unsaved observations. Replacing a credential with another account can leave
+old status data visible; use `/account` for a live lookup.
 
-The snapshot is `$XDG_STATE_HOME/loki/response-headers.json` (normally
+Saved status is at `$XDG_STATE_HOME/loki/response-headers.json` (normally
 `~/.local/state/loki/response-headers.json`; on Windows,
-`%LOCALAPPDATA%\loki\response-headers.json`), written by atomic replacement with
-mode 0600. Only response headers are observed, never request headers. Known
-secret-bearing fields (cookies, authorization/API keys, session tokens, and
-Codex routing state) retain their names but have values replaced by `[redacted]`
-before entering diagnostic memory. Token-budget and rate-limit fields remain
-intact. This is a name-based filter, not a guarantee that arbitrary provider
-headers contain no secrets; do not publish the snapshot unreviewed. Values are
-escaped for terminal display and never replayed as request headers. Invalid snapshots
-are reported rather than overwritten; remove the file manually to start over.
-This is best-effort diagnostic state, not credential storage or durable accounting.
+`%LOCALAPPDATA%\loki\response-headers.json`). Known secret headers are redacted,
+but review the file before sharing it: providers may send other sensitive
+information. If the file is invalid, Loki reports an error; remove it manually
+to start over. This is diagnostic data, not a billing record.
 
-`/account` is separate from the saved observations above. It makes live,
-provider-dependent account requests. Running the entry performs no request; it
-only lists the controls the active connection supports, and every action is
-explicitly selected. Redeeming is irreversible and is never automatic.
-Current controls: the OpenAI ChatGPT subscription exposes `usage` (current
-usage windows and banked reset count) and `resets` (banked limit-reset credits,
-with redemption); OpenRouter and DeepSeek expose `balance` (per-key spend limit
-and prepaid credit, or prepaid account balance). Each control may reach only
-the endpoints it declares, under its own authorization rule. `/status` stays
-offline and merely points at `/account` when the connection supports live data.
-`/account` results are not written to the response-header snapshot.
+## Account controls
+
+`/account` lists the controls supported by the active connection. Selecting a
+control makes a live provider request:
+
+* OpenAI ChatGPT subscription: `usage` shows usage windows and available resets;
+  `resets` lists banked limit-reset credits and lets you redeem them.
+* OpenRouter: `balance` shows the key's spend limit and prepaid credit.
+* DeepSeek: `balance` shows prepaid account balance.
+
+Redeeming a reset is irreversible and never automatic. Account results are not
+saved to the response-header file.
 
