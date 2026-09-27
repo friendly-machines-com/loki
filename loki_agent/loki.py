@@ -109,13 +109,10 @@ def effective_reasoning_effort() -> str | None:
     )
 
 
-def reasoning_effort_default_text() -> str | None:
+def reasoning_effort_default() -> str | None:
     profile = current_reasoning_effort_profile()
     if profile is None:
         return None
-    preference = current_reasoning_effort_preference()
-    name = "Model default"
-
     # The profile's own default is what a request without a selection uses;
     # with none, fall back to what the provider declares (the model catalog
     # for a subscription, the provider spec otherwise).
@@ -127,7 +124,16 @@ def reasoning_effort_default_text() -> str | None:
             default = provider.openai_request_profile.default_reasoning_level
         else:
             default = protocols.default_reasoning_effort(provider.provider_id)
+    return default
 
+
+def reasoning_effort_default_text() -> str | None:
+    profile = current_reasoning_effort_profile()
+    if profile is None:
+        return None
+    preference = current_reasoning_effort_preference()
+    name = "Model default"
+    default = reasoning_effort_default()
     if default is not None:
         name += f" ({default})"
     if preference is not None and not profile.supports(preference):
@@ -136,13 +142,9 @@ def reasoning_effort_default_text() -> str | None:
 
 
 def reasoning_effort_status_text() -> str | None:
-    profile = current_reasoning_effort_profile()
-    preference = current_reasoning_effort_preference()
-    return (
-        preference
-        if profile is not None and profile.supports(preference)
-        else reasoning_effort_default_text()
-    )
+    if current_reasoning_effort_profile() is None:
+        return None
+    return effective_reasoning_effort() or reasoning_effort_default() or "unknown"
 
 
 def current_transcript() -> list:

@@ -734,7 +734,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 loki.current_reasoning_effort_preference(), "high")
             self.assertIn(
                 "preferred high is unavailable",
-                loki.reasoning_effort_status_text(),
+                loki.reasoning_effort_default_text(),
             )
 
             loki.apply_runtime_config(unsupported)
@@ -750,10 +750,34 @@ class RuntimeConfigTests(unittest.TestCase):
             self.assertIsNone(loki.effective_reasoning_effort())
             self.assertEqual(
                 loki.reasoning_effort_status_text(),
-                "Model default",
+                "unknown",
             )
         finally:
             restore_loki_state(saved)
+
+    def test_effort_status_shows_only_the_active_value(self):
+        config = loki.make_runtime_config(
+            "https://api.z.ai/api/paas/v4/chat/completions",
+            protocols.OPENAI_CHAT, model="model", provider_id="zai",
+            reasoning_effort_profile=modelsdev.ReasoningEffortProfile(
+                ("low", "medium", "high")),
+        )
+        session = loki.Session(runtime_config=config)
+        with mock.patch.object(loki, "_DEFAULT_SESSION", session):
+            for preference, expected in (
+                    (None, "medium"), ("high", "high"), ("unavailable", "medium")):
+                with self.subTest(preference=preference):
+                    session.reasoning_effort_preference = preference
+                    self.assertEqual(loki.reasoning_effort_status_text(), expected)
+                    text = terminal_frontend.status_text()
+                    self.assertIn(f"Effort: {expected}, Context:", text)
+                    self.assertNotIn("Model default", text)
+                    self.assertNotIn("preferred", text)
+            self.assertIn("Model default (medium)", loki.reasoning_effort_default_text())
+            session.reasoning_effort_preference = None
+            config.reasoning_effort_profile = modelsdev.ReasoningEffortProfile(
+                ("low", "medium", "high"), default="low")
+            self.assertEqual(loki.reasoning_effort_status_text(), "low")
 
     def test_delegated_config_reconstructs_reasoning_profile(self):
         profile = _effort_profile("low", "high")
