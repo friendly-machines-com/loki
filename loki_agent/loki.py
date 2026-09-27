@@ -2435,13 +2435,16 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
         return f"Error: {e}"
 
 
-def run_glob(pattern: str, path: str = None) -> str:
-    return asyncio.run(run_glob_async(pattern, path))
+def run_glob(pattern: str, path: str = None, *,
+             hidden: bool = False, no_ignore: bool = False) -> str:
+    return asyncio.run(run_glob_async(
+        pattern, path, hidden=hidden, no_ignore=no_ignore))
 
 
 async def run_glob_async(
         pattern: str, path: str = None,
-        cancel_event: asyncio.Event | None = None) -> str:
+        cancel_event: asyncio.Event | None = None, *,
+        hidden: bool = False, no_ignore: bool = False) -> str:
     if not pattern:
         return "Error: pattern is required"
     rg = _find_rg_binary()
@@ -2450,7 +2453,12 @@ async def run_glob_async(
     root = _resolve_path(path) if path else current_cwd()
     if not os.path.isdir(root):
         return f"Error: {root} is not a directory"
-    args = [rg, '--files', '--color=never', '--glob', pattern, root]
+    args = [rg, '--files', '--color=never']
+    if hidden:
+        args.append('--hidden')
+    if no_ignore:
+        args.append('--no-ignore')
+    args.extend(['--glob', pattern, root])
     start = time.perf_counter()
     job, status, stdout, stderr = await current_job_manager().run_exec(
         args, description=f"Glob {pattern!r}",
@@ -2476,7 +2484,15 @@ async def run_glob_async(
     matches.sort(key=mtime_or_zero, reverse=True)
     matches = matches[:GLOB_MAX_RESULTS]
     if not matches:
-        return f"No files matched pattern {pattern!r} in {root}"
+        result = f"No files matched pattern {pattern!r} in {root}"
+        hints = []
+        if not hidden:
+            hints.append("hidden paths are excluded by default (set hidden=true to include)")
+        if not no_ignore:
+            hints.append("ignore rules are respected (set no_ignore=true to bypass)")
+        if hints:
+            result += "\nNote: " + "; ".join(hints) + "."
+        return result
     return "\n".join([
         f"duration_ms: {duration_ms}",
         f"num_files: {num_files}",
@@ -2673,13 +2689,17 @@ def _handle_edit(args: dict) -> str:
 
 
 def _handle_glob(args: dict) -> str:
-    return run_glob(args["pattern"], args.get("path"))
+    return run_glob(args["pattern"], args.get("path"),
+                    hidden=args.get("hidden", False),
+                    no_ignore=args.get("no_ignore", False))
 
 
 async def _handle_glob_async(args: dict, extra_context=None) -> str:
     return await run_glob_async(
         args["pattern"], args.get("path"),
-        cancel_event=(extra_context or {}).get("cancel_event"))
+        cancel_event=(extra_context or {}).get("cancel_event"),
+        hidden=args.get("hidden", False),
+        no_ignore=args.get("no_ignore", False))
 
 
 def _handle_grep(args: dict) -> str:
@@ -4308,7 +4328,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "Glob",
-            "description": "Fast file pattern matching. Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\". Returns matching file paths sorted by modification time.",
+            "description": "Fast file pattern matching. Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\". Returns matching file paths sorted by modification time. Hidden paths and paths excluded by ignore rules (such as .gitignore) are skipped by default. Set hidden=true and no_ignore=true independently to override these exclusions; hidden, ignored directories may require both, even when explicitly named in the pattern.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -4319,6 +4339,16 @@ TOOLS = [
                             "Plain filesystem directory path. Defaults to "
                             "the current Loki cwd. Omit it for the default; "
                             "do not pass null, undefined, Markdown, or a URL."),
+                    },
+                    "hidden": {
+                        "type": "boolean",
+                        "description": "Include hidden files and directories. Does not bypass ignore rules. Defaults to false.",
+                        "default": False,
+                    },
+                    "no_ignore": {
+                        "type": "boolean",
+                        "description": "Bypass ignore rules, including .gitignore and .ignore. Does not include hidden paths by itself. Defaults to false.",
+                        "default": False,
                     },
                 },
                 "required": ["pattern"]
