@@ -19,6 +19,7 @@ import time
 import secrets
 import urllib.parse
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from . import file_locks, paths, private_files
 
@@ -290,6 +291,32 @@ def _time_remaining(seconds):
     return " ".join(parts)
 
 
+def _retry_after_text(observation, now):
+    value = observation["value"].strip(" \t")
+    try:
+        if re.fullmatch(r"[0-9]+", value):
+            # Delay-seconds are relative to this header's original response,
+            # not the latest response or the time /status is inspected.
+            retry_at = observation["observed_at_ns"] / 1e9 + int(value)
+        else:
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                return "Retry-After: unrecognized value; see raw header above."
+            date = parsedate_to_datetime(value)
+            # The obsolete HTTP asctime format has no explicit timezone.
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            retry_at = date.timestamp()
+        stamp = datetime.fromtimestamp(retry_at, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, OverflowError, OSError, TypeError):
+        return "Retry-After: unrecognized value; see raw header above."
+    if retry_at <= now:
+        return (f"Retry-After: reported retry time {stamp} has passed; "
+                "availability has not been rechecked.")
+    return (f"Retry-After: server requested waiting until {stamp} "
+            f"(in {_time_remaining(retry_at - now)})")
+
+
 def _codex_reset_text(headers, name, observed_id, now):
     observation = headers.get(name)
     # A retained reset from another response is not evidence about this
@@ -390,6 +417,12 @@ def render(document):
                 f"[{stamp}; HTTP {observation['status']}; "
                 f"model {ascii(observation['model'])}{retained}]")
         lines.append("")
+        retry_after = entry["headers"].get("retry-after")
+        if retry_after is not None:
+            retry_text = _retry_after_text(retry_after, now)
+            if "retry-after" not in latest["header_names"]:
+                retry_text += " [retained observation]"
+            lines.append(retry_text)
         summary = _codex_quota_summary(entry, now)
         if summary:
             lines.extend(summary)

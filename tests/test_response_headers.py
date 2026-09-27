@@ -70,6 +70,57 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries[0]["latest"]["header_names"], ["x-remaining"])
         self.assertIn("retained", response_headers.render(self.store.snapshot()))
 
+    async def test_retry_after_seconds_preserves_raw_and_counts_down(self):
+        with mock.patch.object(response_headers.time, "time_ns", return_value=1_000_000_000):
+            self.observe(headers={"Retry-After": "34323"}, status=429)
+        document = self.store.snapshot()
+        original = json.dumps(document, sort_keys=True)
+        with mock.patch.object(response_headers.time, "time", return_value=1):
+            text = response_headers.render(document)
+        self.assertIn("'retry-after': '34323'", text)
+        self.assertIn("until 1970-01-01 09:32:04 UTC (in 9 hours 32 minutes)", text)
+        with mock.patch.object(response_headers.time, "time", return_value=34323):
+            self.assertIn("(in 1 second)", response_headers.render(document))
+        self.assertEqual(json.dumps(document, sort_keys=True), original)
+
+    async def test_retry_after_http_dates(self):
+        for value in ("Thu, 01 Jan 1970 00:02:00 GMT",
+                      "Thursday, 01-Jan-70 00:02:00 GMT",
+                      "Thu Jan  1 00:02:00 1970"):
+            with self.subTest(value=value):
+                self.observe(headers={"retry-after": value}, status=429)
+                with mock.patch.object(response_headers.time, "time", return_value=60):
+                    text = response_headers.render(self.store.snapshot())
+                self.assertIn("until 1970-01-01 00:02:00 UTC (in 1 minute)", text)
+
+    async def test_retry_after_retained_saved_and_expired(self):
+        with mock.patch.object(response_headers.time, "time_ns", return_value=1_000_000_000):
+            self.observe(headers={"retry-after": "120"}, status=429)
+        with mock.patch.object(response_headers.time, "time_ns", return_value=30_000_000_000):
+            self.observe(headers={"x-other": "yes"})
+        await self.store.save()
+        document = response_headers.Store(self.path).snapshot()
+        with mock.patch.object(response_headers.time, "time", return_value=120.5):
+            text = response_headers.render(document)
+        self.assertIn("00:02:01 UTC (in 1 second) [retained observation]", text)
+        with mock.patch.object(response_headers.time, "time", return_value=121):
+            text = response_headers.render(document)
+        self.assertIn("00:02:01 UTC has passed", text)
+        self.assertIn("availability has not been rechecked", text)
+
+    async def test_retry_after_zero_invalid_and_overflow(self):
+        with mock.patch.object(response_headers.time, "time_ns", return_value=1_000_000_000):
+            self.observe(headers={"retry-after": "0"}, status=429)
+        with mock.patch.object(response_headers.time, "time", return_value=1):
+            self.assertIn("has passed", response_headers.render(self.store.snapshot()))
+        for value in ("", "-1", "+1", "1.5", "NaN", "soon", "9" * 400,
+                      "Thu, 99 Jan 1970 00:00:00 GMT", "120\n", "\x1b[31m"):
+            with self.subTest(value=value):
+                self.observe(headers={"retry-after": value}, status=429)
+                text = response_headers.render(self.store.snapshot())
+                self.assertIn("Retry-After: unrecognized value", text)
+                self.assertIn(ascii(value), text)
+
     def codex_observer(self):
         return self.store.observer(
             "https://chatgpt.com/backend-api/codex/responses",
