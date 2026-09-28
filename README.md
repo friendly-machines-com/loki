@@ -197,6 +197,25 @@ model-visible note and workspace paths it changed:
 Post-hooks cannot replace the real tool result or cause automatic
 re-execution. A pre-hook error denies execution by default. A post-hook error
 preserves the outcome and tells the model that the tool had already executed.
+
+For user-facing terminal and ACP turns, an optional `turn_end` section runs
+once after the entire model/tool loop (including cancellation or failure), not
+once per model response. It does not run for Explore subagent turns or local
+commands. For example:
+
+```json
+{"turn_end": [{"id": "notify", "command": ["/home/me/bin/loki-notify"]}]}
+```
+
+Each command receives `{"event":"turn_end","reason":"completed",
+"cwd":"...","text":"..."}` on stdin. `reason` may also be `cancelled`,
+`error`, or `max_loops`; `text` is the last returned assistant text, if any.
+Hooks run in order; their JSON stdout is validated but cannot change the
+completed turn. Failures are reported to stderr and do not change the result.
+There is **no default timeout** for turn-end hooks; set a positive `timeout_ms`
+on an entry if a limit is desired. With no `turn_end` entries, no hook process
+is started. Turn-end entries do not accept `tools`, `on_error`, or
+`workspace_side_effects`.
 Commands are argv arrays, not shell strings; stdout is reserved for the single
 JSON response, while stderr remains diagnostic. Hook subprocesses receive a
 minimal environment without Loki API credentials. A hook configured with

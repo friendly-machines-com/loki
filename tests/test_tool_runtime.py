@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import copy
 import json
 import os
@@ -1071,6 +1072,73 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
                 formats.TranscriptFormatError,
                 "execution metadata must be an object"):
             formats.load_log_blob(malformed)
+
+
+class TurnEndHookTests(unittest.TestCase):
+    def test_no_hooks_do_not_start_subprocess_or_build_payload(self):
+        with mock.patch.object(loki, "TOOL_HOOK_PIPELINE",
+                               tool_runtime.ToolHookPipeline()):
+            with mock.patch.object(tool_runtime.asyncio,
+                                   "create_subprocess_exec") as spawn:
+                asyncio.run(loki.run_turn_end_hooks_async([], "hello"))
+                spawn.assert_not_called()
+
+    def test_turn_end_command_has_no_default_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "hooks.json")
+            output = os.path.join(directory, "payload.json")
+            with open(config_path, "w", encoding="utf-8") as stream:
+                json.dump({"turn_end": [{
+                    "id": "record",
+                    "command": [sys.executable, "-c",
+                                "import json,os,sys,time; time.sleep(.05); "
+                                "payload=json.load(sys.stdin); "
+                                "payload['child_cwd']=os.getcwd(); "
+                                "json.dump(payload, open(sys.argv[1], 'w')); "
+                                "print('{}')", output],
+                }]}, stream)
+            pipeline = tool_runtime.load_hook_pipeline(config_path)
+            self.assertIsNone(pipeline.turn_end_hooks[0].timeout_ms)
+            with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
+                with mock.patch.object(loki, "current_cwd", return_value=directory):
+                    asyncio.run(loki.run_turn_end_hooks_async(
+                        [{"type": "max_loops"}], "last text"))
+            with open(output, encoding="utf-8") as stream:
+                payload = json.load(stream)
+            self.assertEqual(payload["cwd"], directory)
+            self.assertEqual(payload["child_cwd"], directory)
+            self.assertEqual(payload["event"], "turn_end")
+            self.assertEqual(payload["reason"], "max_loops")
+            self.assertEqual(payload["text"], "last text")
+
+    def test_turn_end_timeout_and_failure_do_not_change_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "hooks.json")
+            with open(config_path, "w", encoding="utf-8") as stream:
+                json.dump({"turn_end": [{
+                    "id": "slow", "command": [sys.executable, "-c",
+                                             "import time; time.sleep(1)"],
+                    "timeout_ms": 20,
+                }]}, stream)
+            pipeline = tool_runtime.load_hook_pipeline(config_path)
+            with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
+                with mock.patch("sys.stderr") as stderr:
+                    asyncio.run(loki.run_turn_end_hooks_async(
+                        [{"type": "response_cancelled"}]))
+                self.assertTrue(stderr.write.called)
+
+    def test_turn_end_rejects_tool_options_and_duplicate_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "hooks.json")
+            for value in (
+                    {"turn_end": [{"id": "x", "command": ["true"],
+                                   "tools": ["Bash"]}]},
+                    {"pre_tool_call": [{"id": "x", "command": ["true"]}],
+                     "turn_end": [{"id": "x", "command": ["true"]}]}):
+                with open(config_path, "w", encoding="utf-8") as stream:
+                    json.dump(value, stream)
+                with self.assertRaises(tool_runtime.HookConfigurationError):
+                    tool_runtime.load_hook_pipeline(config_path)
 
 
 if __name__ == "__main__":

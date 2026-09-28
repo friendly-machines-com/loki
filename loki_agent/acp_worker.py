@@ -750,19 +750,26 @@ class Worker:
                     self.session_id, event, mapper_state):
                 self.write(acps.notification("session/update", update))
 
+        turn_text = ""
+        turn_failed = False
         try:
-            await self._run_turn(on_event, reasoning_effort)
-        except BaseException:
-            if not self.cancel_event.is_set():
-                raise
-            if not any(
-                    event.get("type") == "response_cancelled"
-                    for event in events):
-                on_event({
-                    "type": "response_cancelled",
-                    "partial": False,
-                    "saved": False,
-                })
+            try:
+                turn_text = await self._run_turn(on_event, reasoning_effort) or ""
+            except BaseException:
+                if not self.cancel_event.is_set():
+                    turn_failed = True
+                    raise
+                if not any(
+                        event.get("type") == "response_cancelled"
+                        for event in events):
+                    on_event({
+                        "type": "response_cancelled",
+                        "partial": False,
+                        "saved": False,
+                    })
+        finally:
+            await loki.run_turn_end_hooks_async(
+                events, turn_text, failed=turn_failed)
         failure = self._turn_failure(events)
         if failure:
             raise TurnFailure(failure)
@@ -802,7 +809,7 @@ class Worker:
                 loki.mark_chat_log_dirty()
                 self._publish_context_usage(live=True)
 
-            await loki.run_tool_loop_async(
+            return await loki.run_tool_loop_async(
                 self.session.transcript_items,
                 chat_fn=chat_fn,
                 on_event=on_event,

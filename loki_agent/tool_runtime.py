@@ -580,6 +580,7 @@ class ToolHookPipeline:
         self.pre_hooks = []
         self.gate_hooks = []
         self.post_hooks = []
+        self.turn_end_hooks = []
 
     def add_pre(self, hook_id, callback, on_error="deny", matcher=None):
         self.pre_hooks.append(RegisteredHook(
@@ -595,7 +596,20 @@ class ToolHookPipeline:
 
     @property
     def has_custom_hooks(self):
-        return bool(self.pre_hooks or self.gate_hooks or self.post_hooks)
+        return bool(self.pre_hooks or self.gate_hooks or self.post_hooks
+                    or self.turn_end_hooks)
+
+    async def finish_turn(self, payload):
+        # A completed turn cannot be denied or rolled back. Hook failures are
+        # diagnostic only, and no payload is built when this list is empty.
+        for hook in self.turn_end_hooks:
+            try:
+                await _run_hook_command(
+                    hook.command, payload, payload["cwd"], hook.timeout_ms,
+                    stderr_reporter=hook.stderr_reporter)
+            except Exception as error:
+                print(f"Turn-end hook {hook.hook_id!r} failed: "
+                      f"{type(error).__name__}: {error}", file=sys.stderr)
 
     @staticmethod
     def _record_side_effects(invocation, decision):
@@ -830,11 +844,13 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
             stdin_task, stdout_task, stderr_task, return_exceptions=True)
 
     try:
-        _stdin_result, stdout, stderr, returncode = await asyncio.wait_for(
-            asyncio.gather(
-                stdin_task, stdout_task, stderr_task, process.wait()),
-            timeout=timeout_ms / 1000,
-        )
+        operation = asyncio.gather(
+            stdin_task, stdout_task, stderr_task, process.wait())
+        if timeout_ms is None:
+            _stdin_result, stdout, stderr, returncode = await operation
+        else:
+            _stdin_result, stdout, stderr, returncode = await asyncio.wait_for(
+                operation, timeout=timeout_ms / 1000)
     except asyncio.TimeoutError as error:
         await terminate()
         raise HookExecutionError(
@@ -971,9 +987,11 @@ def _external_hook_from_dict(
         raise HookConfigurationError(
             f"{path}.command must be a nonempty argv list")
     timeout_ms = value.get("timeout_ms", default_timeout)
-    if (not isinstance(timeout_ms, int)
-            or isinstance(timeout_ms, bool)
-            or timeout_ms < 1):
+    if ((timeout_ms is None and default_timeout is not None)
+            or (timeout_ms is not None and
+                (not isinstance(timeout_ms, int)
+                 or isinstance(timeout_ms, bool)
+                 or timeout_ms < 1))):
         raise HookConfigurationError(
             f"{path}.timeout_ms must be a positive integer")
     side_effects = value.get("workspace_side_effects", False)
@@ -994,6 +1012,17 @@ def _external_hook_from_dict(
     ), on_error
 
 
+def _turn_end_hook_from_dict(value, path, stderr_reporter=None):
+    if not isinstance(value, dict):
+        raise HookConfigurationError(f"{path} must be an object")
+    if "tools" in value or "workspace_side_effects" in value or "on_error" in value:
+        raise HookConfigurationError(
+            f"{path} does not support tools, workspace_side_effects, or on_error")
+    hook, _ = _external_hook_from_dict(
+        value, path, None, stderr_reporter=stderr_reporter)
+    return hook
+
+
 def load_hook_pipeline(path, stderr_reporter=None):
     try:
         with open(path, "r", encoding="utf-8") as stream:
@@ -1004,7 +1033,7 @@ def load_hook_pipeline(path, stderr_reporter=None):
     if not isinstance(config, dict):
         raise HookConfigurationError(
             "hook configuration must be an object")
-    allowed = {"pre_tool_call", "pre_tool_gate", "post_tool_call"}
+    allowed = {"pre_tool_call", "pre_tool_gate", "post_tool_call", "turn_end"}
     unexpected = sorted(set(config) - allowed)
     if unexpected:
         raise HookConfigurationError(
@@ -1057,6 +1086,16 @@ def load_hook_pipeline(path, stderr_reporter=None):
                     on_error=on_error or "continue",
                     matcher=hook.matches,
                 )
+    values = config.get("turn_end", [])
+    if not isinstance(values, list):
+        raise HookConfigurationError("turn_end must be a list")
+    for index, value in enumerate(values):
+        hook = _turn_end_hook_from_dict(
+            value, f"turn_end[{index}]", stderr_reporter)
+        if hook.hook_id in seen_ids:
+            raise HookConfigurationError(f"duplicate hook id {hook.hook_id!r}")
+        seen_ids.add(hook.hook_id)
+        pipeline.turn_end_hooks.append(hook)
     return pipeline
 
 

@@ -354,7 +354,8 @@ def _terminal_agent_event(event: dict):
 
 
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
-                                  cancel_event: asyncio.Event | None = None) -> str:
+                                  cancel_event: asyncio.Event | None = None,
+                                  turn_events=None) -> str:
     reasoning_effort = _core.effective_reasoning_effort()
     read_only = current_agent_mode() in ("explore", "plan")
     mode_tools = (
@@ -391,6 +392,8 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         redraw_status()
 
     def on_event(event):
+        if turn_events is not None:
+            turn_events.append(event)
         if event.get("type") in ("tool_result", "response_cancelled", "max_loops"):
             redraw_status()
         _terminal_agent_event(event)
@@ -1230,17 +1233,23 @@ async def async_main(args) -> int:
             _terminal_activity.set_queued_images(0)
             mark_chat_log_dirty()
 
+            turn_events = [] if _core.TOOL_HOOK_PIPELINE.turn_end_hooks else None
+            turn_text = ""
+            turn_failed = False
             _terminal_activity.set_turn_running(True)
             try:
                 # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
                 # earlier prompt or turn must not poison the next model call.
                 session.reader.cancel_requested = False
                 session.reader.cancel_event.clear()
-                await run_terminal_turn_async(
+                turn_text = await run_terminal_turn_async(
                     current_transcript(),
                     cancel_check=lambda: session.reader.cancel_requested,
-                    cancel_event=session.reader.cancel_event)
+                    cancel_event=session.reader.cancel_event,
+                    turn_events=turn_events)
             except KeyboardInterrupt:
+                if turn_events is not None:
+                    turn_events.append({"type": "response_cancelled"})
                 terminal.reset_colors_and_flags()
                 print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
                 # Keep the provider response.  Complete every outstanding call
@@ -1255,13 +1264,18 @@ async def async_main(args) -> int:
                     ))
                 mark_chat_log_dirty()
                 continue
+            except BaseException:
+                turn_failed = True
+                raise
             finally:
-                _terminal_activity.set_turn_running(False)
-                # A turn can append user, response, and tool-result state even
-                # when it is cancelled or fails. Persist that state before
-                # another prompt can be accepted; whole-process cleanup is
-                # only a fallback for later termination.
-                save_chat_log()
+                try:
+                    # Persist the final transcript before notifying external code.
+                    save_chat_log()
+                    if turn_events is not None:
+                        await _core.run_turn_end_hooks_async(
+                            turn_events, turn_text, failed=turn_failed)
+                finally:
+                    _terminal_activity.set_turn_running(False)
 
         pending_images.clear()
         _terminal_activity.set_queued_images(0)
