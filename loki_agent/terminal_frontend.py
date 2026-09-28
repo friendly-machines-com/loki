@@ -327,6 +327,8 @@ def _terminal_agent_event(event: dict):
         terminal.write_text(repr(event["name"]))
         print(" with args:")
         _print_tool_args(event["args"])
+        if event.get("cwd") is not None:
+            _print_repr_line("  Shell CWD: ", event["cwd"])
         terminal.reset_colors_and_flags()
     elif kind == "tool_rejected":
         terminal.set_foreground_color(TOOL_CALL_COLOR)
@@ -334,6 +336,8 @@ def _terminal_agent_event(event: dict):
         terminal.write_text(repr(event["name"]))
         print(" with invalid args:")
         _print_tool_args(event["args"])
+        if event.get("cwd") is not None:
+            _print_repr_line("  Shell CWD: ", event["cwd"])
         terminal.reset_colors_and_flags()
     elif kind == "tool_result":
         # The canonical result event.  ``tool_error`` carries only the failure

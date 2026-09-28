@@ -112,6 +112,8 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
         command = args.get("command") if isinstance(args, dict) else None
         if command:
             title = f"{name}: {command}"
+        if event.get("cwd") is not None:
+            title += f" (cwd: {event['cwd']})"
         return [tool_call(
             session_id, call_id, title,
             TOOL_KINDS.get(name, "other"))]
@@ -134,10 +136,13 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
             return []
         announced.add(call_id)
         name = event.get("name") or "tool"
+        title = f"{name}: not executed"
+        if event.get("cwd") is not None:
+            title += f" (cwd: {event['cwd']})"
         return [tool_call(
             session_id,
             call_id,
-            f"{name}: not executed",
+            title,
             TOOL_KINDS.get(name, "other"),
             status="failed",
         )]

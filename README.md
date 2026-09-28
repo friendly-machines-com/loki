@@ -132,6 +132,11 @@ changes the display only, not the model's limits.
 
 ## Tool hooks
 
+Tool-call output shows the session shell cwd separately from the model-supplied
+arguments; Bash runs in that directory, and relative file paths are resolved
+against it. The ACP tool-call title also shows the cwd. Background Jobs and
+JobStatus report the cwd captured at launch.
+
 Loki checks tool input before execution, corrects some unambiguous formatting
 mistakes, and reports any corrections. Other invalid calls are rejected.
 
@@ -208,8 +213,10 @@ commands. For example:
 ```
 
 Each command receives `{"event":"turn_end","reason":"completed",
-"cwd":"...","text":"..."}` on stdin. `reason` may also be `cancelled`,
-`error`, or `max_loops`; `text` is the last returned assistant text, if any.
+"cwd":"...","text":"..."}` on stdin. `cwd` is the session shell cwd
+at turn end and is also the hook subprocess's working directory. `reason` may
+also be `cancelled`, `error`, or `max_loops`; `text` is the last returned
+assistant text, if any.
 Hooks run in order; their JSON stdout is validated but cannot change the
 completed turn. Failures are reported to stderr and do not change the result.
 There is **no default timeout** for turn-end hooks; set a positive `timeout_ms`

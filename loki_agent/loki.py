@@ -1538,6 +1538,7 @@ class Job:
     stderr_path: str
     metadata_path: str
     started_at_iso: str
+    cwd: str | None = None
     process: asyncio.subprocess.Process | None = field(default=None, repr=False)
     pid: int | None = None
     pgid: int | None = None
@@ -1616,6 +1617,7 @@ class JobManager:
         return {
             "id": job.id,
             "command": job.command,
+            "cwd": job.cwd,
             "argv": job.argv,
             "shell": job.shell,
             "description": job.description,
@@ -1745,6 +1747,7 @@ class JobManager:
             stderr_path=stderr_path,
             metadata_path=metadata_path,
             started_at_iso=_now_iso(),
+            cwd=cwd or current_cwd(),
             timeout_ms=timeout_ms,
             session_owned=session_owned,
         )
@@ -1803,7 +1806,7 @@ class JobManager:
                         stderr=stderr_file,
                         close_fds=True,
                         env=env,
-                        cwd=cwd or current_cwd(),
+                        cwd=job.cwd,
                         **host_process.spawn_kwargs(),
                     )
                 else:
@@ -1817,7 +1820,7 @@ class JobManager:
                         stderr=stderr_file,
                         close_fds=True,
                         env=env,
-                        cwd=cwd or current_cwd(),
+                        cwd=job.cwd,
                         **host_process.spawn_kwargs(),
                         **host_ipc.spawn_kwargs(child_ends),
                     )
@@ -2012,7 +2015,8 @@ class JobManager:
 
     async def run_shell(self, command: str, timeout: int = None, description: str = "",
                         run_in_background: bool = False,
-                        cancel_event: asyncio.Event | None = None) -> str:
+                        cancel_event: asyncio.Event | None = None,
+                        cwd: str | None = None) -> str:
         if command is None:
             return "Error: command is required"
         if command.strip() == "":
@@ -2020,9 +2024,10 @@ class JobManager:
 
         timeout_ms = int(timeout) if timeout else BASH_DEFAULT_TIMEOUT_MS
         timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
+        cwd = cwd or current_cwd()
 
         if run_in_background:
-            job = await self._spawn(command, command, description, True, None, True, cwd=current_cwd())
+            job = await self._spawn(command, command, description, True, None, True, cwd=cwd)
             try:
                 asyncio.get_running_loop().create_task(self._monitor_background_job(job))
             except RuntimeError:
@@ -2031,6 +2036,7 @@ class JobManager:
                 pass
             return "\n".join([
                 f"Started background job {job.id}",
+                f"cwd: {job.cwd}",
                 f"pid: {job.pid}",
                 f"pgid: {job.pgid}",
                 f"status: {job.status}",
@@ -2040,7 +2046,7 @@ class JobManager:
 
         job, status, stdout, stderr = await self.run_foreground(
             command, command, timeout_ms, description=description, shell=True,
-            cwd=current_cwd(), cancel_event=cancel_event)
+            cwd=cwd, cancel_event=cancel_event)
         if status == "cancelled":
             return _tool_result(
                 False,
@@ -2176,7 +2182,8 @@ class JobManager:
         for job in jobs:
             lines.append(
                 f"{job.id}. status={job.status} pid={job.pid} exit={job.exit_code} "
-                f"started={job.started_at_iso} command={job.command!r}"
+                f"started={job.started_at_iso} cwd={job.cwd!r} "
+                f"command={job.command!r}"
             )
         return "\n".join(lines)
 
@@ -2193,6 +2200,7 @@ class JobManager:
             f"pgid: {job.pgid}",
             f"exit_code: {job.exit_code}",
             f"signal: {job.signal}",
+            f"cwd: {job.cwd}",
             f"started_at: {job.started_at_iso}",
             f"finished_at: {job.finished_at_iso}",
             f"stdout_path: {job.stdout_path}",
@@ -2240,11 +2248,12 @@ def run_bash(command: str, timeout: int = None, description: str = "",
 
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
                          run_in_background: bool = False,
-                         cancel_event: asyncio.Event | None = None) -> str:
+                         cancel_event: asyncio.Event | None = None,
+                         cwd: str | None = None) -> str:
     return await current_job_manager().run_shell(
         command, timeout=timeout, description=description,
         run_in_background=run_in_background,
-        cancel_event=cancel_event)
+        cancel_event=cancel_event, cwd=cwd)
 
 
 def run_jobs() -> str:
@@ -2672,7 +2681,8 @@ async def _handle_bash_async(args: dict, extra_context=None) -> str:
                                 description=args.get("description", ""),
                                 run_in_background=args.get("run_in_background", False),
                                 cancel_event=(extra_context or {}).get("cancel_event")
-                                if isinstance(extra_context, dict) else None)
+                                if isinstance(extra_context, dict) else None,
+                                cwd=(extra_context or {}).get("tool_cwd"))
 
 
 def _handle_read(args: dict) -> str:
@@ -2998,6 +3008,7 @@ async def execute_tool_call_async(
             "name": fn_name,
             "call_id": call_id,
             "args": _raw_tool_arguments(call),
+            "cwd": current_cwd(),
         })
         return result, None
     call_kind = call.get("tool_kind", "function")
@@ -3012,6 +3023,7 @@ async def execute_tool_call_async(
             "name": fn_name,
             "call_id": call_id,
             "args": _raw_tool_arguments(call),
+            "cwd": current_cwd(),
         })
         return result, None
 
@@ -3093,12 +3105,15 @@ async def execute_tool_call_async(
                 "call_id": invocation.call_id,
                 "args": copy.deepcopy(
                     invocation.effective_arguments),
+                "cwd": invocation.cwd,
             })
+            execution_context = dict(extra_context or {})
+            execution_context["tool_cwd"] = invocation.cwd
             result = await dispatch_tool_async(
                 fn_name,
                 invocation.effective_arguments,
                 allowed=allowed,
-                extra_context=extra_context,
+                extra_context=execution_context,
             )
             outcome = tool_runtime.ToolOutcome(
                 "success" if result["ok"] else "tool_error",
@@ -3133,6 +3148,7 @@ async def execute_tool_call_async(
             "call_id": invocation.call_id,
             "args": copy.deepcopy(
                 invocation.effective_arguments),
+            "cwd": invocation.cwd,
         })
     result = _tool_result(outcome.ok, outcome.content)
     return result, _execution_metadata(
@@ -3727,6 +3743,7 @@ def _subagent_credential_refs():
 def _format_started_background_job(job: Job, kind: str = "job") -> str:
     return "\n".join([
         f"Started background {kind} {job.id}",
+        f"cwd: {job.cwd}",
         f"pid: {job.pid}",
         f"pgid: {job.pgid}",
         f"status: {job.status}",

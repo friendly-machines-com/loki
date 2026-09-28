@@ -595,6 +595,16 @@ class TerminalWiringTests(unittest.TestCase):
         self.assertIn("\\nnext", output)
         self.assertIn("\u6a21\u578b", output)
 
+    def test_tool_call_shows_shell_cwd_without_terminal_escapes(self):
+        with mock.patch.object(terminal_frontend, "computer", "nova"):
+            output = self.replay([{
+                "type": "tool_call", "name": "Bash",
+                "args": {"command": "pwd"},
+                "cwd": "/tmp/work\x1b]0;owned\x07",
+            }], StyledTerminal())
+        self.assertIn("  Shell CWD: '/tmp/work\\x1b]0;owned\\x07'", output)
+        self.assertNotIn("\x1b]0;owned\x07", output)
+
     def test_multiline_tool_argument_breaks_only_at_newlines(self):
         long_line = "x" * 200
         # `computer` is captured from socket.gethostname() at import time and

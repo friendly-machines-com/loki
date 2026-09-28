@@ -719,6 +719,32 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
             [event["type"] for event in events],
             ["tool_input_repaired", "tool_call"],
         )
+        self.assertEqual(events[-1]["cwd"], loki.current_cwd())
+
+    def test_bash_uses_the_cwd_shown_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            initial = loki.current_cwd()
+            pipeline = tool_runtime.ToolHookPipeline()
+
+            def change_session_cwd(invocation):
+                loki.current_session().shell_cwd = directory
+
+            pipeline.add_pre("change-cwd", change_session_cwd)
+            events = []
+            call = formats.tool_call_item(
+                "call_cwd", "Bash", {"command": "pwd"})
+            try:
+                with mock.patch.object(loki, "run_bash_async",
+                                       new_callable=mock.AsyncMock,
+                                       return_value="done") as run_bash:
+                    asyncio.run(loki.execute_tool_call_async(
+                        call, hook_pipeline=pipeline, on_event=events.append))
+                shown_cwd = next(event["cwd"] for event in events
+                                 if event["type"] == "tool_call")
+                self.assertEqual(shown_cwd, initial)
+                self.assertEqual(run_bash.await_args.kwargs["cwd"], shown_cwd)
+            finally:
+                loki.current_session().shell_cwd = initial
 
     def test_path_autolink_is_repaired_only_for_execution(self):
         call = formats.tool_call_item(
@@ -1072,6 +1098,25 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
                 formats.TranscriptFormatError,
                 "execution metadata must be an object"):
             formats.load_log_blob(malformed)
+
+
+class JobCwdVisibilityTests(unittest.TestCase):
+    def test_job_metadata_and_status_show_launch_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = loki.JobManager(directory)
+            job = loki.Job(
+                id="1", command="pwd", argv=None, shell=True,
+                description="show cwd", background=True,
+                spool_dir=directory,
+                stdout_path=os.path.join(directory, "stdout"),
+                stderr_path=os.path.join(directory, "stderr"),
+                metadata_path=os.path.join(directory, "job.json"),
+                started_at_iso="now", cwd=directory, status="exited",
+            )
+            manager.jobs[job.id] = job
+            self.assertEqual(manager._job_metadata(job)["cwd"], directory)
+            self.assertIn(f"cwd: {directory}", manager.job_status("1"))
+            self.assertIn(f"cwd={directory!r}", manager.list_jobs())
 
 
 class TurnEndHookTests(unittest.TestCase):

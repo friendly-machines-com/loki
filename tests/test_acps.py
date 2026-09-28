@@ -1144,10 +1144,12 @@ class EventMapperTests(unittest.TestCase):
         call = acp_events.map_event("s", {"type": "tool_call",
                                           "name": "Bash",
                                           "call_id": "call_1",
+                                          "cwd": "/tmp/work",
                                           "args": {"command": "ls"}}, state)
         self.assertEqual(call[0]["update"]["sessionUpdate"], "tool_call")
         self.assertEqual(call[0]["update"]["kind"], "execute")
         self.assertIn("ls", call[0]["update"]["title"])
+        self.assertIn("cwd: /tmp/work", call[0]["update"]["title"])
         result = acp_events.map_event("s", {"type": "tool_result",
                                             "name": "Bash",
                                             "call_id": "call_1",
