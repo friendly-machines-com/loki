@@ -115,6 +115,17 @@ appears in `/model` as `Explicit LOKI_* connection`, so it can be selected
 again after switching to a catalog provider or while models.dev is
 unavailable.
 
+For noninteractive model selection (also usable over the terminal bridge), use
+`/models [FILTER]`, then `/providers MODEL`, then
+`/model MODEL --provider PROVIDER`. Quote model names containing spaces. Model
+names are commodities: you choose the model first, then explicitly choose one
+of its providers. Exact provider model IDs are also accepted. Nothing chooses a
+provider automatically, and there is no automatic failover. The reserved
+provider `explicit` selects the captured `LOKI_*` connection, using its exact
+model ID. Catalog endpoints must already have been approved with the local
+`/model` picker; direct selection never opens an approval prompt or bypasses
+credential checks.
+
 Use `/effort` to select reasoning effort when the selected model supports it.
 The initial setting is `Model default`. Your preference is remembered across
 model changes: unsupported models use their default, and a later compatible
@@ -129,6 +140,148 @@ exact count of the next prompt. `*` marks an older or incomplete measurement;
 `unknown` means usage or capacity is unavailable. To override the model's
 context capacity, set `LOKI_CONTEXT_WINDOW` to a positive token count. This
 changes the display only, not the model's limits.
+
+## Optional terminal bridge
+
+On POSIX, start `./loki.py --bridge-socket /absolute/path/to/bridge.sock` to
+attach an external proxy. The proxy hosts a Unix stream socket; Loki connects
+as a client. Without the option, no bridge connection or task is started.
+Headless and ACP bridge integration are not supported yet. XMPP accounts,
+rooms, credentials, archive handling, and sender authorization belong entirely
+to the proxy, not Loki. Existing hooks remain available for custom notifications.
+
+Keyboard and socket submissions share the terminal's FIFO queue. Each prompt
+starts a fresh turn; no active turn is modified. Prompts received during a
+picker are queued, never treated as picker answers. Remote input is marked
+`User [bridge]` in the terminal. Provider/model/cwd are resolved when the input
+executes, so a queued model change applies to subsequent prompts.
+
+The bridge accepts ordinary prompts, skills, `/pwd`, `/cd PATH`, `/ps`, `/status`
+(and its existing `all`, `--json`, and `save` forms), and the noninteractive
+model commands above. Remote `/model` lists models rather than opening a picker.
+Remote `/effort`, `/account`, `/image`, `/quit`, and `!COMMAND` are rejected in
+this version. Other slash-prefixed text still follows the normal model/Skill
+path. Keyboard-staged images are consumed only by keyboard prompts.
+
+Cancelling a turn with Ctrl-C pauses remote execution. Already queued remote
+inputs encountered while paused finish as `unexecuted`; new remote inputs are
+rejected. `/bridge resume`, from either keyboard or proxy, resumes execution in
+queue order. Unexecuted inputs are not automatically retried. Keyboard input
+otherwise retains its existing behavior.
+
+An absent or disconnected proxy produces a warning and capped reconnect
+backoff, but does not prevent local use or cancel accepted work. Turn completion
+is published after saving the transcript and running configured turn-end hooks.
+Hook failure does not change the agent outcome. Only final text and lifecycle
+are bridged, not token streams or every tool result.
+
+### Local trust boundary
+
+Use a private directory (for example, `$XDG_RUNTIME_DIR/loki`, mode `0700`)
+and a restricted socket (mode `0600`). On systems with `SO_PEERCRED`, Loki
+checks that the proxy UID matches its own; `--bridge-peer-uid UID` overrides the
+expected UID. Elsewhere, that explicit option is rejected and access relies on
+filesystem permissions. Loki opens
+the socket in the terminal runtime and does not pass its descriptor to tools or
+subagents. The bridge receives no credential-broker capability. Keyboard prompt text and
+final responses are mirrored and may contain workspace secrets; choose the
+proxy's recipients and room access accordingly.
+
+This is **not** protection against agent tools running as the same UID: they
+can potentially connect to the pathname themselves. Use a stronger isolation
+boundary if that threat matters. An authorized proxy can submit coding prompts
+which execute tools; the remote command restrictions are not a sandbox.
+The proxy must authenticate remote authors independently of room nicknames,
+ignore bot echoes, and distinguish archived messages from new commands.
+
+### Bridge protocol v1
+
+Each connection represents one live session. Multiple Loki processes connect
+to the same listener independently. Messages are UTF-8 JSON objects, one per
+newline, with a string `type`; embedded newlines are JSON-escaped. Loki first
+sends `{"type":"hello","version":1}` and requires exactly that reply within
+three seconds. Unsupported versions, invalid JSON/framing, or oversized frames
+close the connection. Validly framed invalid commands receive an error event.
+
+Loki then sends `session_registered`, containing:
+
+* `conversation_id`: the existing persistent UUID, retained on resume.
+* `instance_id`: a fresh UUID for this live runtime, retained across reconnects.
+* `frontend: "terminal"`, a suggested `label`, and capabilities
+  `{"accepts_prompts":true,"publishes_turns":true}`.
+* `event_seq` (latest sequence), `replay_from` (earliest retained event),
+  `acknowledged`, `paused`, `active` (turn identity or null), and `inputs`
+  (retained remote input IDs, status, and outcome).
+
+The same saved conversation opened twice has two distinct instance IDs.
+Labels/nicknames are not routing keys. A proxy should map explicit room aliases
+or dedicated rooms to live instance IDs and must not broadcast prompts or
+silently retarget stale messages. It should not reuse an alias while old
+messages might still target its former session.
+
+Submit a prompt or supported command:
+
+```json
+{"type":"submit_prompt","instance_id":"LIVE-UUID","input_id":"COMMAND-UUID","text":"Run the tests"}
+```
+
+`input_id` is an opaque, printable ASCII ID of 1-128 characters without spaces.
+Use a unique UUID per logical submission. Every submission must name the correct
+live instance; mismatches are rejected. `prompt_accepted` means queued **in
+memory**, not executed or durably saved. It contains `input_id`, `status`,
+`duplicate`, and, for duplicate submissions, `outcome`. A duplicate retained ID
+with identical text returns its known status without executing again; different
+text returns `prompt_rejected` with `reason: "input_id_conflict"`. Other rejection
+reasons include wrong instance, invalid/empty text or ID, oversized prompt,
+full queue, paused remote execution, and session closing.
+
+All lifecycle/result events carry `instance_id` and an increasing `event_seq`:
+
+* `turn_started`: `turn_id`, `input_id`, `origin` (`keyboard` or `bridge`),
+  actual `model` and `provider`. Keyboard inputs also have generated input IDs.
+* `input_chunk`: prompt text, `chunk_index` starting at zero, and the turn/input
+  identity. These follow `turn_started` and describe text input, not images.
+* `output_chunk`: final response or command output, `chunk_index`, `input_id`,
+  `origin`, and `turn_id` (null for local commands). Concatenate chunks in order.
+* `turn_finished`: turn/input identity, `origin`, `outcome`, and `paused`.
+* `command_finished`: `input_id`, `origin`, and `outcome`; no agent turn was run.
+* `session_state`: currently reports pause/resume.
+* `session_closing`: best-effort shutdown notification. Pending remote inputs
+  receive `command_finished` with outcome `unexecuted` when possible.
+* `protocol_error`: reason for an invalid acknowledgement or unknown message.
+
+Outcomes are `completed`, `cancelled`, `error`, `max_loops`, or `unexecuted`.
+Final text is chunked, not truncated. Zero chunks represents empty text; the
+finish event terminates the output. Proxies should also deduplicate incoming
+events by `(instance_id, event_seq)`.
+
+Acknowledge events cumulatively after processing them (and after durable storage
+if proxy crash recovery is required):
+
+```json
+{"type":"ack","instance_id":"LIVE-UUID","event_seq":42}
+```
+
+On reconnect, registration precedes replay of retained unacknowledged events.
+If events were evicted, `event_gap` reports the missing inclusive `from_seq` /
+`to_seq` range before replay. Registration is a current-state snapshot, not a
+historical event; replayed events can predate that snapshot. Global
+input/output ordering is not implied: sequence numbers order Loki events, and
+input IDs associate them with submissions.
+
+Limits: 1 MiB per encoded frame; 64 KiB UTF-8 per remote prompt; 32 queued remote
+inputs; 256 events / 8 MiB each for outbound buffering and replay; 256 retained
+completed input records (queued/running records are not evicted). Connection
+and handshake timeout is three seconds, write timeout five seconds, reconnect
+backoff one to thirty seconds with jitter. Slow peers cannot block inference:
+outbound overflow disconnects the transport, with bounded replay on reconnect.
+
+No state here is crash-proof. Events outside the replay window are explicitly
+lost, and deduplication ends when a completed record is evicted or its live
+instance exits. The proxy must retain processed command IDs and **never treat
+archive catch-up as a reason to resubmit commands**, particularly to a new
+instance. XMPP archival protects messages delivered to XMPP, not events which
+never reached the proxy. There is no automatic input replay into a new runtime.
 
 ## Tool hooks
 

@@ -4657,12 +4657,9 @@ PLAN_TOOLS = EXPLORE_TOOLS | {
 TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
 
 
-async def run_turn_end_hooks_async(events, text="", *, failed=False):
-    """Notify user-facing turn hooks after the model/tool loop has stopped."""
-    pipeline = TOOL_HOOK_PIPELINE
-    if not pipeline.turn_end_hooks:
-        return
-    kinds = {event.get("type") for event in events}
+def turn_end_reason(events, *, failed=False):
+    """One outcome classification for user-facing hooks and bridge events."""
+    kinds = {event.get("type") for event in (events or [])}
     if failed or kinds.intersection({
             "api_error", "network_error", "stream_error", "transcript_error",
             "provider_error", "response_failed", "response_incomplete"}):
@@ -4673,9 +4670,17 @@ async def run_turn_end_hooks_async(events, text="", *, failed=False):
         reason = "max_loops"
     else:
         reason = "completed"
+    return reason
+
+
+async def run_turn_end_hooks_async(events, text="", *, failed=False):
+    """Notify user-facing turn hooks after the model/tool loop has stopped."""
+    pipeline = TOOL_HOOK_PIPELINE
+    if not pipeline.turn_end_hooks:
+        return
     await pipeline.finish_turn({
         "event": "turn_end",
-        "reason": reason,
+        "reason": turn_end_reason(events, failed=failed),
         "cwd": current_cwd(),
         "text": text,
     })

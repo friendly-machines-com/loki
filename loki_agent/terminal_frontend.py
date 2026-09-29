@@ -12,7 +12,9 @@ import asyncio
 import getopt
 import json
 import logging
+import os
 import signal
+import socket
 import sys
 from dataclasses import dataclass
 
@@ -23,6 +25,9 @@ from .attachments import ImageAttachmentError, load_image_attachment
 from . import authentications
 from . import credential_capabilities
 from . import credential_runtimes
+from . import bridge_sessions
+from . import model_commands
+from .submissions import Submission
 from . import models as modelsdev
 from . import protocols
 from . import savefiles
@@ -148,6 +153,39 @@ def _report_model_list_errors(text):
     terminal.write_text(text, multiline=True, file=sys.stderr)
     print(file=sys.stderr)
     sys.stderr.flush()
+
+
+def _report_bridge_status(text):
+    _print_text_line('', text, file=sys.stderr, multiline=True)
+    sys.stderr.flush()
+
+
+def _apply_model_selection(picked):
+    if isinstance(picked, modelsdev.ExplicitConnectionOption):
+        config = build_config_from_env(credentials=_core.CREDENTIALS)
+        via = 'explicit LOKI_*'
+    else:
+        provider, provider_entry, model_entry = picked
+        via = repr(provider)
+        config = config_from_modelsdev_selection(
+            provider, provider_entry, model_entry, _core.CREDENTIALS)
+    apply_runtime_config(config)
+    descriptor = active_connection_descriptor()
+    if descriptor is not None:
+        set_session_connection(descriptor)
+    save_chat_log()
+    return f'Selected model: {current_model()!r} via {via}'
+
+
+async def _run_direct_model_command(command_text):
+    response = await model_commands.run(
+        command_text, credentials=_core.CREDENTIALS,
+        credential_authority=current_session().credential_authority,
+        explicit_connection=explicit_connection_option(_core.CREDENTIALS))
+    if response.selection is not None:
+        response.text = _apply_model_selection(response.selection)
+        _report_unavailable_reasoning_preference()
+    return response.text
 
 
 def _report_hook_stderr(command, text):
@@ -719,6 +757,8 @@ Options:
       --toolset NAME      toolset for headless mode
       --shell-cwd PATH    working directory for tools and Bash
                           (an explicit value outranks a resumed one)
+      --bridge-socket PATH  optional terminal bridge (absolute Unix socket path)
+      --bridge-peer-uid UID expected socket peer UID (default: current UID)
       --dangerously-skip-permissions
                           skip permission prompts
   -h, --help              show this help and exit
@@ -733,7 +773,7 @@ Use /account for live provider usage and limit resets, when supported.
 
 CLI_SHORT_OPTS = 'r:p:h'
 CLI_LONG_OPTS = ['resume=', 'prompt=', 'headless', 'toolset=',
-                 'shell-cwd=',
+                 'shell-cwd=', 'bridge-socket=', 'bridge-peer-uid=',
                  'dangerously-skip-permissions', 'help']
 
 
@@ -742,7 +782,25 @@ def parse_cli_args(args):
     # getopt's "resume=" requires a value; normalize a bare `--resume` to
     # `--resume=` so it opens the picker instead of erroring out.
     args = ['--resume=' if a == '--resume' else a for a in args]
-    return getopt.getopt(args, CLI_SHORT_OPTS, CLI_LONG_OPTS)
+    options, positional = getopt.getopt(args, CLI_SHORT_OPTS, CLI_LONG_OPTS)
+    values = dict(options)
+    path = values.get('--bridge-socket')
+    if path is not None:
+        if not hasattr(socket, 'AF_UNIX') or not hasattr(os, 'getuid'):
+            raise getopt.GetoptError('Unix socket bridges are unsupported here')
+        if not os.path.isabs(path) or '\x00' in path:
+            raise getopt.GetoptError('--bridge-socket requires an absolute path')
+        if '--headless' in values:
+            raise getopt.GetoptError('--bridge-socket is terminal-only')
+    if '--bridge-peer-uid' in values:
+        if not hasattr(socket, 'SO_PEERCRED'):
+            raise getopt.GetoptError('--bridge-peer-uid is unsupported here')
+        uid = values['--bridge-peer-uid']
+        if (path is None or not uid.isascii() or not uid.isdecimal()
+                or len(uid) > 10 or int(uid) > 0xffffffff):
+            raise getopt.GetoptError(
+                '--bridge-peer-uid requires a bridge and a nonnegative UID')
+    return options, positional
 
 
 async def async_main(args) -> int:
@@ -762,6 +820,8 @@ async def async_main(args) -> int:
     headless = False
     toolset = None
     shell_cwd = None
+    bridge_path = None
+    bridge_peer_uid = None
     for option_name, option_value in options:
         if option_name in ['--prompt', '-p']:
             prompt_arg = option_value
@@ -771,6 +831,10 @@ async def async_main(args) -> int:
             toolset = option_value
         elif option_name == '--shell-cwd':
             shell_cwd = option_value
+        elif option_name == '--bridge-socket':
+            bridge_path = option_value
+        elif option_name == '--bridge-peer-uid':
+            bridge_peer_uid = int(option_value)
 
     if shell_cwd is not None:
         try:
@@ -927,364 +991,460 @@ async def async_main(args) -> int:
         else:
             new_chat_log(new_chat_log_path())
 
-        pending_images = []
+        bridge = None
+        if bridge_path is not None:
+            bridge = bridge_sessions.BridgeSession(
+                current_session().conversation_id, frontend='terminal',
+                enqueue=session.user_messages.put_nowait,
+                path=bridge_path, peer_uid=bridge_peer_uid,
+                report=_report_bridge_status)
+            async with bridge:
+                await _consume_terminal_submissions(session, bridge)
+        else:
+            await _consume_terminal_submissions(session)
+
+    return 0
+
+
+@dataclass
+class SubmissionResult:
+    text: str = ""
+    outcome: str = "completed"
+    quit: bool = False
+    turn_id: str | None = None
+
+
+async def _consume_terminal_submissions(session, bridge=None):
+    pending_images = []
+    try:
         while True:
-            user_in = await session.user_messages.get()
+            value = await session.user_messages.get()
             restore_output_area_after_input()
-
-            if user_in is None:  # EOF sentinel from the producer
+            if value is None:
                 break
-
-            # An empty prompt submits staged images without inventing text.
-            if not user_in and not pending_images:
-                continue
-
-            print()
-            terminal.set_background_color(terminals.INPUT_COLOR)
-            print('User: ', end='')
-            terminal.write_text(user_in, multiline=True)
-            terminal.reset_colors_and_flags()
-            print()
-            command_text = user_in.strip()
-            match command_text:
-                case '/quit':
-                    break
-                case ('/status' | '/status --json' | '/status all'
-                      | '/status all --json' | '/status --json all'):
-                    from . import response_headers
-                    try:
-                        show_all = 'all' in command_text.split()
-                        as_json = '--json' in command_text.split()
-                        config = current_config()
-                        connected = (config is not None
-                                     and config.chat_provider.kind != protocols.DUMMY)
-                        store = current_session().response_headers
-                        if show_all:
-                            document = store.snapshot()
-                        elif connected:
-                            credential = (config.auth_spec.credential
-                                          if config.auth_spec else None)
-                            document = store.snapshot(
-                                config.chat_provider.chat_url,
-                                credential=credential.encode() if credential else None)
-                        else:
-                            document = {"version": 1, "endpoints": []}
-                        if as_json:
-                            text = json.dumps(document, indent=2, ensure_ascii=True)
-                        else:
-                            scope = ("All known connections" if show_all
-                                     else "Current endpoint and credential")
-                            text = (
-                                f"{scope} (last observed, not live balances).\n"
-                                "Saved observations plus this runtime's memory; other "
-                                "runtimes' unsaved observations are not visible.\n")
-                            if not show_all and not connected:
-                                text += "No active HTTP chat connection. Use /status all."
-                            elif not show_all and not document["endpoints"]:
-                                text += "No observations for the current connection."
-                            else:
-                                text += response_headers.render(document)
-                        terminal.write_text(text, multiline=True)
-                        print()
-                        # /status stays offline; this only points at live
-                        # provider data when the connection supports it.
-                        from . import provider_controls
-                        hint = provider_controls.live_hint(
-                            provider_controls.ControlContext(config=config))
-                        if hint is not None:
-                            terminal.write_text(hint, multiline=True)
-                            print()
-                    except (OSError, ValueError, OverflowError) as error:
-                        _print_text_line("Could not read response status: ",
-                                         error, file=sys.stderr)
-                    continue
-                case '/status save':
-                    try:
-                        await current_session().response_headers.save()
-                        print("Response status saved (this runtime only).")
-                    except (OSError, ValueError) as error:
-                        _print_text_line("Could not save response status: ",
-                                         error, file=sys.stderr)
-                    continue
-                case _ if (command_text == '/account'
-                           or command_text.startswith('/account ')):
-                    await run_account_controls_async(command_text, session)
-                    continue
-                case '/model':
-                    explicit_option = explicit_connection_option(_core.CREDENTIALS)
-                    async with session.modal() as modal:
-                        try:
-                            picked = await modelsdev.run_model_picker_async(
-                                input_fn=modal.prompt,
-                                credentials=_core.CREDENTIALS,
-                                explicit_connection=explicit_option,
-                                credential_authority=(
-                                    current_session().credential_authority),
-                                diagnostic_writer=(
-                                    _report_model_list_errors),
-                                text_writer=terminal.write_text)
-                        except (OSError, json.JSONDecodeError) as e:
-                            # models.dev unreachable (network errors) or answered
-                            # with non-JSON garbage: fall back to the current
-                            # provider's own /models list in the same modal.
-                            _print_text_line(
-                                "models.dev unavailable: ", e,
-                                file=sys.stderr, multiline=True)
-                            sys.stderr.flush()
-                            models_list = await load_models_async(
-                                diagnostic_writer=_report_model_list_errors)
-                            selected_model = (
-                                await modelsdev.run_flat_model_picker_async(
-                                    modal.prompt, models_list,
-                                    explicit_connection=explicit_option,
-                                    text_writer=terminal.write_text))
-                            if selected_model:
-                                if isinstance(
-                                        selected_model,
-                                        modelsdev.ExplicitConnectionOption):
-                                    apply_runtime_config(
-                                        build_config_from_env(
-                                            credentials=_core.CREDENTIALS))
-                                    selected_label = selected_model.model
-                                    selected_via = " via explicit LOKI_*"
-                                else:
-                                    reinstall_provider(
-                                        model=selected_model,
-                                        models_url=(
-                                            current_config().chat_provider.models_url
-                                            if current_config() else None),
-                                    )
-                                    selected_label = selected_model
-                                    selected_via = ""
-                                descriptor = active_connection_descriptor()
-                                if descriptor is not None:
-                                    set_session_connection(descriptor)
-                                save_chat_log()
-                                print(
-                                    "Selected model: ", end="",
-                                    file=sys.stderr)
-                                terminal.write_text(
-                                    repr(selected_label), file=sys.stderr)
-                                terminal.write_text(
-                                    selected_via, file=sys.stderr)
-                                print(file=sys.stderr)
-                                _report_unavailable_reasoning_preference()
-                                sys.stderr.flush()
-                                continue
-                            print("Model selection cancelled.",
-                                  file=sys.stderr)
-                            sys.stderr.flush()
-                            continue
-                    if picked is None:
-                        # User cancelled at either menu; keep the current model.
-                        print("Model selection cancelled.", file=sys.stderr)
-                        sys.stderr.flush()
-                        continue
-                    try:
-                        if isinstance(
-                                picked,
-                                modelsdev.ExplicitConnectionOption):
-                            apply_runtime_config(build_config_from_env(
-                                credentials=_core.CREDENTIALS))
-                            via = " via explicit LOKI_*"
-                        else:
-                            provider_id, provider_entry, model_entry = picked
-                            apply_runtime_config(
-                                config_from_modelsdev_selection(
-                                    provider_id,
-                                    provider_entry,
-                                    model_entry,
-                                    _core.CREDENTIALS,
-                                ))
-                            via = (
-                                f" via {provider_id!r}"
-                                if provider_id else "")
-                    except (protocols.ProtocolError, ValueError) as e:
-                        _print_text_line(
-                            "Could not switch model: ", e,
-                            file=sys.stderr, multiline=True)
-                        sys.stderr.flush()
-                        continue
-                    descriptor = active_connection_descriptor()
-                    if descriptor is not None:
-                        set_session_connection(descriptor)
-                    save_chat_log()
-                    print("Selected model: ", end="", file=sys.stderr)
-                    terminal.write_text(
-                        repr(current_model()), file=sys.stderr)
-                    terminal.write_text(via, file=sys.stderr)
-                    print(file=sys.stderr)
-                    _report_unavailable_reasoning_preference()
-                    sys.stderr.flush()
-                    continue
-                case '/effort':
-                    if _core.current_reasoning_effort_profile() is None:
-                        print(
-                            "The selected model does not advertise reasoning "
-                            "effort choices.",
-                            file=sys.stderr,
-                        )
-                        sys.stderr.flush()
-                        continue
-                    picked = await run_reasoning_effort_picker_async(session)
-                    if picked is _REASONING_EFFORT_PICKER_CANCELLED:
-                        print(
-                            "Reasoning effort selection cancelled.",
-                            file=sys.stderr,
-                        )
-                        sys.stderr.flush()
-                        continue
-                    try:
-                        _core.set_reasoning_effort(picked)
-                    except (OSError, ValueError) as error:
-                        _print_text_line(
-                            "Could not change reasoning effort: ",
-                            error,
-                            file=sys.stderr,
-                            multiline=True,
-                        )
-                        sys.stderr.flush()
-                        continue
-                    print("Selected reasoning effort: ", end="",
-                          file=sys.stderr)
-                    terminal.write_text(
-                        _core.reasoning_effort_status_text() or
-                        "Model default",
-                        file=sys.stderr,
-                    )
-                    print(file=sys.stderr)
-                    sys.stderr.flush()
-                    continue
-                case '/pwd':
-                    print_shell_cwd(
-                        text_writer=terminal.write_text)
-                    continue
-                case '/ps':
-                    terminal.write_text(run_jobs(), multiline=True)
-                    print()
-                    continue
-                case _ if command_text == '/cd' or command_text.startswith('/cd '):
-                    change_shell_cwd_from_text(
-                        command_text[3:].strip(),
-                        text_writer=terminal.write_text)
-                    continue
-                case _ if (command_text == '/image'
-                           or (len(command_text) > len('/image')
-                               and command_text.startswith('/image')
-                               and command_text[len('/image')].isspace())):
-                    try:
-                        image_path = _image_command_path(command_text)
-                        image = load_image_attachment(image_path)
-                    except ImageAttachmentError as error:
-                        sys.stdout.flush()
-                        print("image: ", end="", file=sys.stderr)
-                        terminal.write_text(
-                            str(error), file=sys.stderr)
-                        print(file=sys.stderr)
-                        sys.stderr.flush()
-                        continue
-                    pending_images.append(image)
-                    _terminal_activity.set_queued_images(
-                        len(pending_images))
-                    sys.stdout.flush()
-                    print("Attached image for next prompt: ",
-                          end="", file=sys.stderr)
-                    terminal.write_text(
-                        display_path(image.path), file=sys.stderr)
-                    print(
-                        f" ({image.media_type}, {image.byte_size} bytes)",
-                        file=sys.stderr)
-                    sys.stderr.flush()
-                    continue
-                case _:
-                    if command_text.startswith('!'):  # direct command execution
-                        cmd = user_in[1:].strip()
-                        print(
-                            f"{computer}: [Running local command: ",
-                            end="")
-                        terminal.write_text(cmd)
-                        print("]")
-                        cmd_output = await run_bash_async(cmd)
-                        terminal.write_text(cmd_output, multiline=True)
-                        print()
-                        # Morph the user input so the AI sees exactly what you did and the result
-                        user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
-                    else:
-                        pass
-
-            if current_config() is None:
-                sys.stdout.flush()
-                print("No provider configured; use /model to select one.",
-                      file=sys.stderr)
-                sys.stderr.flush()
-                continue
-            if not current_model():
-                sys.stdout.flush()
-                print("No model selected; use /model or set LOKI_MODEL.",
-                      file=sys.stderr)
-                sys.stderr.flush()
-                continue
-
-            record_agent_mode_instruction()
-            user_content = []
-            if user_in:
-                user_content.append(formats.text_block(user_in))
-            user_content.extend(
-                image.content_block() for image in pending_images)
-            current_transcript().append(
-                formats.message_item("user", user_content))
-            pending_images.clear()
-            _terminal_activity.set_queued_images(0)
-            mark_chat_log_dirty()
-
-            turn_events = [] if _core.TOOL_HOOK_PIPELINE.turn_end_hooks else None
-            turn_text = ""
-            turn_failed = False
-            _terminal_activity.set_turn_running(True)
+            submission = Submission.normalize(value)
+            result = SubmissionResult()
             try:
-                # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
-                # earlier prompt or turn must not poison the next model call.
-                session.reader.cancel_requested = False
-                session.reader.cancel_event.clear()
-                turn_text = await run_terminal_turn_async(
-                    current_transcript(),
-                    cancel_check=lambda: session.reader.cancel_requested,
-                    cancel_event=session.reader.cancel_event,
-                    turn_events=turn_events)
-            except KeyboardInterrupt:
-                if turn_events is not None:
-                    turn_events.append({"type": "response_cancelled"})
-                terminal.reset_colors_and_flags()
-                print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
-                # Keep the provider response.  Complete every outstanding call
-                # with an explicit local error so the next protocol projection
-                # has no dangling call/result pair.
-                for call in formats.pending_tool_calls(current_transcript()):
-                    current_transcript().append(formats.tool_result_for_call(
-                        call,
-                        "Tool call not executed because the user interrupted "
-                        "the turn.",
-                        is_error=True,
-                    ))
-                mark_chat_log_dirty()
-                continue
+                if (bridge is not None and bridge.paused
+                        and submission.origin == "bridge"
+                        and submission.text.strip() != "/bridge resume"):
+                    result.outcome = "unexecuted"
+                    result.text = "Remote execution paused; use /bridge resume."
+                else:
+                    if bridge is not None:
+                        bridge.input_started(submission)
+                    await _run_terminal_submission(
+                        submission, session, pending_images, result, bridge)
             except BaseException:
-                turn_failed = True
+                result.outcome = "error"
                 raise
             finally:
-                try:
-                    # Persist the final transcript before notifying external code.
-                    save_chat_log()
-                    if turn_events is not None:
-                        await _core.run_turn_end_hooks_async(
-                            turn_events, turn_text, failed=turn_failed)
-                finally:
-                    _terminal_activity.set_turn_running(False)
-
+                if bridge is not None:
+                    if result.turn_id is not None:
+                        bridge.turn_finished(
+                            submission, result.turn_id,
+                            result.outcome, result.text)
+                    else:
+                        bridge.command_finished(
+                            submission, result.outcome, result.text)
+            if result.quit:
+                break
+    finally:
         pending_images.clear()
         _terminal_activity.set_queued_images(0)
 
-    return 0
+
+async def _run_terminal_submission(
+        submission, session, pending_images, result, bridge=None):
+    user_in = submission.text
+    # An empty prompt submits staged images without inventing text.
+    if not user_in and not pending_images:
+        return
+
+    print()
+    terminal.set_background_color(terminals.INPUT_COLOR)
+    print('User [bridge]: ' if submission.origin == 'bridge' else 'User: ',
+          end='')
+    terminal.write_text(user_in, multiline=True)
+    terminal.reset_colors_and_flags()
+    print()
+    command_text = user_in.strip()
+    if command_text == '/bridge resume':
+        if bridge is None:
+            result.outcome = 'error'
+            result.text = 'No bridge enabled.'
+        else:
+            bridge.resume()
+            result.text = 'Remote execution resumed.'
+        _print_text_line('', result.text)
+        return
+    if (model_commands.is_model_command(command_text)
+            and (command_text != '/model' or submission.origin == 'bridge')):
+        try:
+            result.text = await _run_direct_model_command(command_text)
+        except Exception as error:
+            logger.debug('Noninteractive model command failed', exc_info=True)
+            result.outcome = 'error'
+            result.text = f'Model command failed: {error}'
+        _print_text_line('', result.text, multiline=True)
+        return
+    if submission.origin == 'bridge':
+        first = command_text.split(maxsplit=1)[0]
+        if (first in ('/quit', '/effort', '/account', '/image', '/bridge')
+                or command_text.startswith('!')
+                or (first == '/status' and command_text not in (
+                    '/status', '/status --json', '/status all',
+                    '/status all --json', '/status --json all', '/status save'))):
+            result.outcome = 'error'
+            result.text = 'This terminal command is unsupported over the bridge.'
+            _print_text_line('', result.text)
+            return
+    match command_text:
+        case '/quit':
+            result.quit = True
+            return
+        case ('/status' | '/status --json' | '/status all'
+              | '/status all --json' | '/status --json all'):
+            from . import response_headers
+            try:
+                show_all = 'all' in command_text.split()
+                as_json = '--json' in command_text.split()
+                config = current_config()
+                connected = (config is not None
+                             and config.chat_provider.kind != protocols.DUMMY)
+                store = current_session().response_headers
+                if show_all:
+                    document = store.snapshot()
+                elif connected:
+                    credential = (config.auth_spec.credential
+                                  if config.auth_spec else None)
+                    document = store.snapshot(
+                        config.chat_provider.chat_url,
+                        credential=credential.encode() if credential else None)
+                else:
+                    document = {"version": 1, "endpoints": []}
+                if as_json:
+                    text = json.dumps(document, indent=2, ensure_ascii=True)
+                else:
+                    scope = ("All known connections" if show_all
+                             else "Current endpoint and credential")
+                    text = (
+                        f"{scope} (last observed, not live balances).\n"
+                        "Saved observations plus this runtime's memory; other "
+                        "runtimes' unsaved observations are not visible.\n")
+                    if not show_all and not connected:
+                        text += "No active HTTP chat connection. Use /status all."
+                    elif not show_all and not document["endpoints"]:
+                        text += "No observations for the current connection."
+                    else:
+                        text += response_headers.render(document)
+                result.text = text
+                terminal.write_text(text, multiline=True)
+                print()
+                # /status stays offline; this only points at live
+                # provider data when the connection supports it.
+                from . import provider_controls
+                hint = provider_controls.live_hint(
+                    provider_controls.ControlContext(config=config))
+                if hint is not None:
+                    result.text += '\n' + hint
+                    terminal.write_text(hint, multiline=True)
+                    print()
+            except (OSError, ValueError, OverflowError) as error:
+                result.outcome = 'error'
+                result.text = f'Could not read response status: {error}'
+                _print_text_line("Could not read response status: ",
+                                 error, file=sys.stderr)
+            return
+        case '/status save':
+            try:
+                await current_session().response_headers.save()
+                result.text = 'Response status saved (this runtime only).'
+                print(result.text)
+            except (OSError, ValueError) as error:
+                result.outcome = 'error'
+                result.text = f'Could not save response status: {error}'
+                _print_text_line("Could not save response status: ",
+                                 error, file=sys.stderr)
+            return
+        case _ if (command_text == '/account'
+                   or command_text.startswith('/account ')):
+            await run_account_controls_async(command_text, session)
+            return
+        case '/model':
+            explicit_option = explicit_connection_option(_core.CREDENTIALS)
+            async with session.modal() as modal:
+                try:
+                    picked = await modelsdev.run_model_picker_async(
+                        input_fn=modal.prompt,
+                        credentials=_core.CREDENTIALS,
+                        explicit_connection=explicit_option,
+                        credential_authority=(
+                            current_session().credential_authority),
+                        diagnostic_writer=(
+                            _report_model_list_errors),
+                        text_writer=terminal.write_text)
+                except (OSError, json.JSONDecodeError) as e:
+                    # models.dev unreachable (network errors) or answered
+                    # with non-JSON garbage: fall back to the current
+                    # provider's own /models list in the same modal.
+                    _print_text_line(
+                        "models.dev unavailable: ", e,
+                        file=sys.stderr, multiline=True)
+                    sys.stderr.flush()
+                    models_list = await load_models_async(
+                        diagnostic_writer=_report_model_list_errors)
+                    selected_model = (
+                        await modelsdev.run_flat_model_picker_async(
+                            modal.prompt, models_list,
+                            explicit_connection=explicit_option,
+                            text_writer=terminal.write_text))
+                    if selected_model:
+                        if isinstance(
+                                selected_model,
+                                modelsdev.ExplicitConnectionOption):
+                            apply_runtime_config(
+                                build_config_from_env(
+                                    credentials=_core.CREDENTIALS))
+                            selected_label = selected_model.model
+                            selected_via = " via explicit LOKI_*"
+                        else:
+                            reinstall_provider(
+                                model=selected_model,
+                                models_url=(
+                                    current_config().chat_provider.models_url
+                                    if current_config() else None),
+                            )
+                            selected_label = selected_model
+                            selected_via = ""
+                        descriptor = active_connection_descriptor()
+                        if descriptor is not None:
+                            set_session_connection(descriptor)
+                        save_chat_log()
+                        print(
+                            "Selected model: ", end="",
+                            file=sys.stderr)
+                        terminal.write_text(
+                            repr(selected_label), file=sys.stderr)
+                        terminal.write_text(
+                            selected_via, file=sys.stderr)
+                        print(file=sys.stderr)
+                        _report_unavailable_reasoning_preference()
+                        sys.stderr.flush()
+                        return
+                    print("Model selection cancelled.",
+                          file=sys.stderr)
+                    sys.stderr.flush()
+                    return
+            if picked is None:
+                # User cancelled at either menu; keep the current model.
+                print("Model selection cancelled.", file=sys.stderr)
+                sys.stderr.flush()
+                return
+            try:
+                result.text = _apply_model_selection(picked)
+            except (protocols.ProtocolError, ValueError) as e:
+                result.outcome = 'error'
+                result.text = f'Could not switch model: {e}'
+                _print_text_line(
+                    "Could not switch model: ", e,
+                    file=sys.stderr, multiline=True)
+                sys.stderr.flush()
+                return
+            _print_text_line('', result.text, file=sys.stderr)
+            _report_unavailable_reasoning_preference()
+            sys.stderr.flush()
+            return
+        case '/effort':
+            if _core.current_reasoning_effort_profile() is None:
+                print(
+                    "The selected model does not advertise reasoning "
+                    "effort choices.",
+                    file=sys.stderr,
+                )
+                sys.stderr.flush()
+                return
+            picked = await run_reasoning_effort_picker_async(session)
+            if picked is _REASONING_EFFORT_PICKER_CANCELLED:
+                print(
+                    "Reasoning effort selection cancelled.",
+                    file=sys.stderr,
+                )
+                sys.stderr.flush()
+                return
+            try:
+                _core.set_reasoning_effort(picked)
+            except (OSError, ValueError) as error:
+                _print_text_line(
+                    "Could not change reasoning effort: ",
+                    error,
+                    file=sys.stderr,
+                    multiline=True,
+                )
+                sys.stderr.flush()
+                return
+            print("Selected reasoning effort: ", end="",
+                  file=sys.stderr)
+            terminal.write_text(
+                _core.reasoning_effort_status_text() or
+                "Model default",
+                file=sys.stderr,
+            )
+            print(file=sys.stderr)
+            sys.stderr.flush()
+            return
+        case '/pwd':
+            result.text = f'cwd: {current_cwd()}'
+            print_shell_cwd(text_writer=terminal.write_text)
+            return
+        case '/ps':
+            result.text = run_jobs()
+            terminal.write_text(result.text, multiline=True)
+            print()
+            return
+        case _ if command_text == '/cd' or command_text.startswith('/cd '):
+            parts = []
+
+            def write_cwd(text, **kwargs):
+                parts.append(str(text))
+                terminal.write_text(text, **kwargs)
+
+            changed = change_shell_cwd_from_text(
+                command_text[3:].strip(), text_writer=write_cwd)
+            result.outcome = 'completed' if changed else 'error'
+            result.text = ('cwd: ' if changed else 'cd: ') + ''.join(parts)
+            if changed and bridge is not None:
+                save_chat_log()
+            return
+        case _ if (command_text == '/image'
+                   or (len(command_text) > len('/image')
+                       and command_text.startswith('/image')
+                       and command_text[len('/image')].isspace())):
+            try:
+                image_path = _image_command_path(command_text)
+                image = load_image_attachment(image_path)
+            except ImageAttachmentError as error:
+                sys.stdout.flush()
+                print("image: ", end="", file=sys.stderr)
+                terminal.write_text(
+                    str(error), file=sys.stderr)
+                print(file=sys.stderr)
+                sys.stderr.flush()
+                return
+            pending_images.append(image)
+            _terminal_activity.set_queued_images(
+                len(pending_images))
+            sys.stdout.flush()
+            print("Attached image for next prompt: ",
+                  end="", file=sys.stderr)
+            terminal.write_text(
+                display_path(image.path), file=sys.stderr)
+            print(
+                f" ({image.media_type}, {image.byte_size} bytes)",
+                file=sys.stderr)
+            sys.stderr.flush()
+            return
+        case _:
+            if command_text.startswith('!'):  # direct command execution
+                cmd = user_in[1:].strip()
+                print(
+                    f"{computer}: [Running local command: ",
+                    end="")
+                terminal.write_text(cmd)
+                print("]")
+                cmd_output = await run_bash_async(cmd)
+                terminal.write_text(cmd_output, multiline=True)
+                print()
+                # Morph the user input so the AI sees exactly what you did and the result
+                user_in = f"I ran the local command `{cmd}`.\nOutput:\n```\n{cmd_output}\n```"
+            else:
+                pass
+
+    if current_config() is None:
+        result.outcome = 'error'
+        result.text = 'No provider configured; use /model to select one.'
+        sys.stdout.flush()
+        print(result.text, file=sys.stderr)
+        sys.stderr.flush()
+        return
+    if not current_model():
+        result.outcome = 'error'
+        result.text = 'No model selected; use /model or set LOKI_MODEL.'
+        sys.stdout.flush()
+        print(result.text, file=sys.stderr)
+        sys.stderr.flush()
+        return
+
+    record_agent_mode_instruction()
+    user_content = []
+    if user_in:
+        user_content.append(formats.text_block(user_in))
+    if submission.origin == 'keyboard':
+        user_content.extend(image.content_block() for image in pending_images)
+        pending_images.clear()
+        _terminal_activity.set_queued_images(0)
+    current_transcript().append(
+        formats.message_item("user", user_content))
+    mark_chat_log_dirty()
+
+    turn_events = ([] if bridge is not None
+                   or _core.TOOL_HOOK_PIPELINE.turn_end_hooks else None)
+    if bridge is not None:
+        config = current_config()
+        result.turn_id = bridge.turn_started(
+            submission, model=current_model(),
+            provider=config.chat_provider.provider_id if config else None)
+    turn_text = ""
+    turn_failed = False
+    _terminal_activity.set_turn_running(True)
+    try:
+        # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
+        # earlier prompt or turn must not poison the next model call.
+        session.reader.cancel_requested = False
+        session.reader.cancel_event.clear()
+        turn_text = await run_terminal_turn_async(
+            current_transcript(),
+            cancel_check=lambda: session.reader.cancel_requested,
+            cancel_event=session.reader.cancel_event,
+            turn_events=turn_events)
+        result.text = turn_text or ''
+    except KeyboardInterrupt:
+        if turn_events is not None:
+            turn_events.append({"type": "response_cancelled"})
+        terminal.reset_colors_and_flags()
+        print("\n\n? [EMERGENCY STOP] Agent execution cancelled by user!")
+        # Keep the provider response.  Complete every outstanding call
+        # with an explicit local error so the next protocol projection
+        # has no dangling call/result pair.
+        for call in formats.pending_tool_calls(current_transcript()):
+            current_transcript().append(formats.tool_result_for_call(
+                call,
+                "Tool call not executed because the user interrupted "
+                "the turn.",
+                is_error=True,
+            ))
+        mark_chat_log_dirty()
+        return
+    except BaseException:
+        turn_failed = True
+        raise
+    finally:
+        result.outcome = _core.turn_end_reason(turn_events, failed=turn_failed)
+        if not result.text and result.outcome == 'error':
+            for event in turn_events or []:
+                error = event.get('error')
+                if error is not None:
+                    result.text = (error.formatted() if hasattr(error, 'formatted')
+                                   else str(error))
+                    break
+        try:
+            # Persist the final transcript before notifying external code.
+            save_chat_log()
+            if turn_events is not None:
+                await _core.run_turn_end_hooks_async(
+                    turn_events, turn_text, failed=turn_failed)
+        finally:
+            _terminal_activity.set_turn_running(False)
 
 
 def initialize_terminal_overlay(active_terminal):

@@ -804,8 +804,8 @@ class UserMessageQueueTests(unittest.TestCase):
 
         self.assertEqual(queue.message_count, 2)
         self.assertEqual(counts, [1, 2])
-        self.assertEqual(queue.get_nowait(), "first")
-        self.assertEqual(queue.get_nowait(), "")
+        self.assertEqual(queue.get_nowait().text, "first")
+        self.assertEqual(queue.get_nowait().text, "")
         self.assertIsNone(queue.get_nowait())
         self.assertEqual(queue.message_count, 0)
         self.assertEqual(counts, [1, 2, 1, 0])
@@ -1148,7 +1148,7 @@ class InputHistoryTests(unittest.TestCase):
                 # The turn consumer records the message after the next input
                 # field opens. Even if the API then fails, recall must work
                 # without reopening that field or submitting another message.
-                history.append(submitted)
+                history.append(submitted.text)
                 events = [terminals.KeyEvent("TEXT", "draft"),
                           terminals.KeyEvent("CURSOR_UP")]
                 if restore_draft:
@@ -1158,7 +1158,7 @@ class InputHistoryTests(unittest.TestCase):
                     session.reader.keys.put_nowait(event)
                 result = await asyncio.wait_for(session.user_messages.get(), 1)
                 self.assertEqual(
-                    result, "draft" if restore_draft else "submitted message")
+                    result.text, "draft" if restore_draft else "submitted message")
             finally:
                 producer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

@@ -2155,6 +2155,10 @@ class UserMessageQueue(asyncio.Queue):
                 pass
 
     def put_nowait(self, item):
+        from .submissions import Submission
+
+        if item is not None:
+            item = Submission.normalize(item)
         super().put_nowait(item)
         if item is not None:
             self._message_count += 1
