@@ -1,0 +1,17 @@
+# Example systemd --user unit. Adjust installation/configuration paths.
+[Unit]
+Description=Loki XMPP bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/loki-xmpp/venv/bin/loki-xmpp-bridge --config %h/.config/loki-xmpp/config.toml
+Restart=on-failure
+RestartSec=10
+RuntimeDirectory=loki-xmpp
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

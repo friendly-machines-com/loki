@@ -1,0 +1,19 @@
+[build-system]
+requires = ["flit_core >=3.8,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "loki-xmpp-bridge"
+dynamic = ["version"]
+description = "Optional Unix-socket to XMPP group-chat proxy for Loki"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "COPYING"}
+authors = [{name = "Danny Milosavljevic"}]
+dependencies = ["slixmpp >=1.17,<2"]
+
+[project.scripts]
+loki-xmpp-bridge = "loki_xmpp_bridge.__main__:main"
+
+[tool.flit.sdist]
+include = ["tests/", "example.toml", "loki-xmpp-bridge.service"]

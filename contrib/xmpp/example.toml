@@ -1,0 +1,24 @@
+# Copy outside the workspace, adjust all paths/JIDs, and use --check-config.
+[bridge]
+jid = "bot@ci.friendly-machines.com"
+room = "agent-room@conference.ci.friendly-machines.com"
+nick = "Loki bridge"
+allowed_jids = ["daym@ci.friendly-machines.com"]
+password_file = "/home/USER/.config/loki-xmpp/password"
+socket_path = "/run/user/UID/loki-xmpp/bridge.sock"
+state_path = "/home/USER/.local/state/loki-xmpp/state.sqlite3"
+
+# Connect locally while verifying TLS against the bot JID's domain.
+host = "127.0.0.1"
+port = 5222
+# ca_file = "/absolute/path/to/private-ca.pem"
+
+# Durable state includes message bodies and must remain private/backed up.
+max_state_bytes = 268435456
+max_pending_commands = 128
+max_outbox_messages = 10000
+max_connections = 64
+max_result_bytes = 4194304
+message_bytes = 3000
+network_timeout = 30
+echo_timeout = 30

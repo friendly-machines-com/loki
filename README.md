@@ -149,6 +149,8 @@ as a client. Without the option, no bridge connection or task is started.
 Headless and ACP bridge integration are not supported yet. XMPP accounts,
 rooms, credentials, archive handling, and sender authorization belong entirely
 to the proxy, not Loki. Existing hooks remain available for custom notifications.
+A separately installable XMPP group-chat proxy is provided in
+[`contrib/xmpp`](contrib/xmpp/README.md), with its own dependencies and configuration.
 
 Keyboard and socket submissions share the terminal's FIFO queue. Each prompt
 starts a fresh turn; no active turn is modified. Prompts received during a
