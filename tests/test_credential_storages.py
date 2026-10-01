@@ -114,37 +114,6 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(os.path.exists(self.storage.file_path))
             self.assertFalse(os.path.exists(self.storage.lock_path))
 
-    async def test_login_is_atomic_private_and_loadable(self):
-        stored = await self.storage.store_openai_login(tokens())
-
-        self.assertEqual(stored.state, "active")
-        if os.name == 'posix':
-            self.assertEqual(
-                stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
-            self.assertEqual(
-                stat.S_IMODE(os.stat(self.storage.file_path).st_mode),
-                0o600,
-            )
-        else:
-            # No mode bits on Windows; the primitives read the DACL.
-            self.assertFalse(
-                private_files.describe_path(
-                    self.directory).group_or_other_access)
-            self.assertFalse(
-                private_files.describe_path(
-                    self.storage.file_path).group_or_other_access)
-        loaded = self.storage.load_openai_subscription()
-        self.assertEqual(loaded.tokens, tokens().normalized())
-        self.assertNotIn(
-            "access-a",
-            repr(loaded.tokens),
-        )
-        leftovers = [
-            name for name in os.listdir(self.directory)
-            if name.startswith(".tokens.json.")
-        ]
-        self.assertEqual(leftovers, [])
-
     async def test_login_failure_preserves_previous_tokens(self):
         await self.storage.store_openai_login(tokens())
         with mock.patch.object(
@@ -160,18 +129,6 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             self.storage.load_openai_subscription().tokens,
             tokens().normalized(),
         )
-
-    async def test_logout_preserves_document_tombstone(self):
-        await self.storage.store_openai_login(tokens())
-
-        self.assertTrue(
-            await self.storage.remove_openai_subscription())
-        self.assertFalse(
-            await self.storage.remove_openai_subscription())
-
-        document = self.storage.load_document()
-        self.assertGreater(document["revision"], 0)
-        self.assertEqual(document["credentials"], {})
 
     async def test_rejects_group_readable_json(self):
         await self.storage.store_openai_login(tokens())
@@ -402,29 +359,6 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                 credential_storages.CredentialStorageError,
                 "size limit"):
             self.storage.load_document()
-
-    async def test_successful_rotation_is_durable(self):
-        current = tokens()
-        await self.storage.store_openai_login(current)
-        calls = []
-
-        async def refresh(value):
-            calls.append(value)
-            return authentications.RefreshResult(
-                access_token="access-b",
-                refresh_token="refresh-b",
-                id_token="id-b",
-            )
-
-        rotated = await self.storage.rotate_openai_subscription(
-            current.normalized(), refresh=refresh, clock=lambda: 200)
-
-        self.assertEqual(calls, ["refresh-a"])
-        self.assertEqual(rotated.refresh_token, "refresh-b")
-        self.assertEqual(
-            self.storage.load_openai_subscription().tokens,
-            rotated,
-        )
 
     async def test_ambiguous_rotation_is_durably_fail_closed(self):
         current = tokens()

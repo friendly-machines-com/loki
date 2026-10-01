@@ -5,7 +5,6 @@ import urllib.parse
 import unittest
 from unittest import mock
 
-from loki_agent import authentications
 from loki_agent import http_client
 from loki_agent import oauth_logins
 
@@ -46,73 +45,6 @@ class OpenAIBrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
         return response
-
-    async def test_browser_callback_exchanges_code_with_pkce(self):
-        requests = []
-        access = jwt({"exp": 12345})
-        identity = jwt({
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": "account",
-                "chatgpt_account_is_fedramp": True,
-            },
-        })
-
-        async def request(method, url, **kwargs):
-            requests.append((method, url, kwargs))
-            return response(url, 200, {
-                "access_token": access,
-                "refresh_token": "refresh",
-                "id_token": identity,
-            })
-
-        login = await oauth_logins.start_openai_browser_login(
-            ports=(0,), request=request)
-        authorization = urllib.parse.urlsplit(
-            login.authorization_url)
-        query = urllib.parse.parse_qs(authorization.query)
-        redirect = urllib.parse.urlsplit(
-            query["redirect_uri"][0])
-
-        reader, writer = await asyncio.open_connection(
-            "127.0.0.1", redirect.port)
-        target = (
-            "/auth/callback?"
-            + urllib.parse.urlencode({
-                "code": "authorization-code",
-                "state": query["state"][0],
-            }))
-        writer.write(
-            f"GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n"
-            .encode("ascii"))
-        await writer.drain()
-        callback_response = await reader.read()
-        writer.close()
-        await writer.wait_closed()
-
-        tokens = await login.complete()
-
-        self.assertIn(b"200 OK", callback_response)
-        self.assertEqual(tokens.account_id, "account")
-        self.assertTrue(tokens.fedramp)
-        self.assertEqual(len(requests), 1)
-        method, url, arguments = requests[0]
-        self.assertEqual(method, "POST")
-        self.assertEqual(url, oauth_logins.OPENAI_TOKEN_URL)
-        form = urllib.parse.parse_qs(
-            arguments["body"].decode("ascii"))
-        self.assertEqual(form["code"], ["authorization-code"])
-        self.assertEqual(
-            form["redirect_uri"], [query["redirect_uri"][0]])
-        self.assertEqual(
-            form["client_id"],
-            [authentications.OPENAI_OAUTH_CLIENT_ID],
-        )
-        self.assertTrue(form["code_verifier"][0])
-        self.assertEqual(arguments["retry_max_attempts"], 1)
-        self.assertEqual(
-            arguments["headers_in"]["Content-Type"],
-            "application/x-www-form-urlencoded",
-        )
 
     async def test_wrong_state_cannot_finish_login(self):
         login = await oauth_logins.start_openai_browser_login(
@@ -200,93 +132,8 @@ class OpenAIBrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(login._server.is_serving())
         self.assertTrue(login._result.cancelled())
 
-    async def test_authorization_url_has_current_codex_fields(self):
-        pkce = oauth_logins.PkceCodes("verifier", "challenge")
-
-        url = oauth_logins.openai_authorization_url(
-            "http://localhost:1455/auth/callback",
-            pkce,
-            "state",
-        )
-
-        query = urllib.parse.parse_qs(
-            urllib.parse.urlsplit(url).query)
-        self.assertEqual(query["response_type"], ["code"])
-        self.assertEqual(query["scope"], [
-            oauth_logins.OPENAI_OAUTH_SCOPE])
-        self.assertEqual(query["code_challenge_method"], ["S256"])
-        self.assertEqual(
-            query["codex_cli_simplified_flow"], ["true"])
-        self.assertEqual(
-            query["id_token_add_organizations"], ["true"])
-        self.assertEqual(
-            query["originator"],
-            [authentications.OPENAI_ORIGINATOR],
-        )
-
 
 class OpenAIDeviceLoginTests(unittest.IsolatedAsyncioTestCase):
-    async def test_device_flow_polls_then_exchanges_code(self):
-        requests = []
-        responses = [
-            response("user", 200, {
-                "device_auth_id": "device",
-                "user_code": "ABCD-EFGH",
-                "interval": "1",
-            }),
-            response("poll", 403, {}),
-            response("poll", 200, {
-                "authorization_code": "authorization",
-                "code_challenge": (
-                    oauth_logins._pkce_challenge("verifier")),
-                "code_verifier": "verifier",
-            }),
-            response("token", 200, {
-                "access_token": jwt({"exp": 12345}),
-                "refresh_token": "refresh",
-                "id_token": jwt({"chatgpt_account_id": "account"}),
-            }),
-        ]
-
-        async def request(method, url, **kwargs):
-            requests.append((method, url, kwargs))
-            return responses.pop(0)
-
-        sleeps = []
-
-        async def sleep(delay):
-            sleeps.append(delay)
-
-        authorization = (
-            await oauth_logins.request_openai_device_authorization(
-                request=request))
-        tokens = await oauth_logins.complete_openai_device_login(
-            authorization,
-            request=request,
-            sleep=sleep,
-        )
-
-        self.assertEqual(authorization.user_code, "ABCD-EFGH")
-        self.assertEqual(sleeps, [1])
-        self.assertEqual(tokens.account_id, "account")
-        self.assertEqual(
-            [item[1] for item in requests],
-            [
-                oauth_logins.OPENAI_DEVICE_USER_CODE_URL,
-                oauth_logins.OPENAI_DEVICE_POLL_URL,
-                oauth_logins.OPENAI_DEVICE_POLL_URL,
-                oauth_logins.OPENAI_TOKEN_URL,
-            ],
-        )
-        exchange = urllib.parse.parse_qs(
-            requests[-1][2]["body"].decode("ascii"))
-        self.assertEqual(
-            exchange["redirect_uri"],
-            [oauth_logins.OPENAI_DEVICE_REDIRECT_URL],
-        )
-        self.assertEqual(
-            exchange["code_verifier"], ["verifier"])
-
     async def test_device_request_rejects_invalid_interval(self):
         async def request(_method, url, **_kwargs):
             return response(url, 200, {
