@@ -128,7 +128,7 @@ class WorkerChannel:
                 request_id = message.get("id")
                 if request_id is not None:
                     future = self._pending.get(str(request_id))
-                    if future is None:
+                    if future is None or future.done():
                         # Internal worker replies are never client messages.
                         # A late reply can legitimately arrive after its
                         # caller was cancelled; discard it.
@@ -197,6 +197,27 @@ class WorkerChannel:
             self.credential_delegation = None
 
 
+class SessionOperations:
+    """Front-owned lifetime of one session, including its provisional worker.
+
+    There is no prompt queue here. A configuration/open operation excludes new
+    ordinary requests for this session; conflicting requests fail explicitly.
+    The object, rather than its reusable session ID, owns tasks and approvals.
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.state = "opening"
+        self.channel = None
+        self.delegation = None
+        self.changing = False
+        self.tasks: set[asyncio.Task] = set()
+        self.client_requests: set[str] = set()
+        self.forwarded = asyncio.Event()
+        self.forwarded.set()
+        self.cleanup = None
+
+
 class Front:
     def __init__(
             self, read, write, credentials: CredentialStore,
@@ -209,89 +230,246 @@ class Front:
         self.environment = self.credential_supervisor.environment
         self.credentials = self.credential_supervisor.inventory
         self.credential_broker = self.credential_supervisor.broker
-        self.workers: dict[str, WorkerChannel] = {}
-        self._opening_sessions: set[str] = set()
+        self._sessions: dict[str, SessionOperations] = {}
+        self._connected = True
         self._tasks: set[asyncio.Task] = set()
         self._client_requests: dict[str, asyncio.Future] = {}
         self._next_client_request_id = 0
         self._client_supports_form_elicitation = False
 
+    @property
+    def workers(self) -> dict[str, WorkerChannel]:
+        """Published channels only; ownership lives in _sessions."""
+        return {session_id: owner.channel
+                for session_id, owner in self._sessions.items()
+                if owner.state == "active"}
+
     async def run(self):
         try:
             async for message in self.read():
-                await self.handle(message)
+                self.handle(message)
         finally:
-            tasks = list(self._tasks)
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            failure = acps.TransportError("ACP client connection closed")
-            for future in list(self._client_requests.values()):
-                if not future.done():
-                    future.set_exception(failure)
-            self._client_requests.clear()
-            channels = list(self.workers.values())
-            self.workers.clear()
-            if channels:
-                await asyncio.gather(
-                    *(channel.close() for channel in channels),
-                    return_exceptions=True,
-                )
+            await self.shutdown()
 
-    def _start_task(self, coroutine, *, name: str):
+    async def shutdown(self):
+        self._connected = False
+        owners = list(self._sessions.values())
+        for owner in owners:
+            self._begin_close(owner)
+        cleanups = {owner.cleanup for owner in owners}
+        tasks = list(self._tasks - cleanups)
+        # _begin_close already cancelled session operations. A second cancel
+        # could interrupt their acquisition-failure cleanup while it unwinds.
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        for future in self._client_requests.values():
+            future.cancel()
+        self._client_requests.clear()
+        # Cleanup tasks own worker/delegation release. Cancelling them alongside
+        # requests could abandon an unpublished worker or its credential pipe.
+        await asyncio.gather(*tasks, *cleanups, return_exceptions=True)
+
+    def _start_task(self, coroutine, *, name: str, owner=None):
         task = asyncio.create_task(coroutine, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        if owner is not None:
+            owner.tasks.add(task)
+            task.add_done_callback(owner.tasks.discard)
         return task
 
-    async def handle(self, message: dict):
+    def _error(self, message, error):
+        if not self._connected:
+            return
+        if message.get("id") is None:
+            print(f"ACP notification {message.get('method')!r} failed: "
+                  f"{error!r}", file=sys.stderr)
+        else:
+            self.write(acps.response(message["id"], error={
+                "code": getattr(error, "code", acps.INTERNAL_ERROR),
+                "message": str(error),
+            }))
+
+    def _reserve_session(self, session_id):
+        if not isinstance(session_id, str) or not session_id:
+            raise acps.TransportError(
+                "session open requires sessionId", code=acps.INVALID_PARAMS)
+        if session_id in self._sessions:
+            raise acps.TransportError(
+                f"session {session_id!r} is already active",
+                code=acps.INVALID_PARAMS)
+        owner = SessionOperations(session_id)
+        self._sessions[session_id] = owner
+        return owner
+
+    def _check_owner(self, owner):
+        if (self._sessions.get(owner.session_id) is not owner
+                or owner.state == "closing"):
+            raise acps.TransportError("session operation was closed")
+        channel = owner.channel
+        if channel is not None and (
+                channel._closed or channel.process.returncode is not None):
+            raise acps.TransportError("session worker is not running")
+
+    def handle(self, message: dict):
+        """Route/admit synchronously; never await operation work in the reader.
+
+        The same input stream carries approval answers and user requests. Even
+        waiting for a forwarding milestone here could starve lifecycle controls.
+        Admission reserves the session before scheduling, so buffered requests
+        cannot race past an approval operation whose task has not started yet.
+        """
         method = message.get("method")
         request_id = message.get("id")
         if method is None:
             self._resolve_client_response(message)
             return
+        if not self._connected:
+            return
         if request_id is None and method not in (
                 "session/cancel", "session/close"):
             return
-        if method == "session/prompt":
-            forwarded = asyncio.Event()
-            self._start_task(
-                self._answer(message, forwarded=forwarded),
-                name=f"acp-client-request-{request_id}",
-            )
-            # Preserve client order only until the request reaches the worker;
-            # its long-running reply remains concurrent with cancellation.
-            await forwarded.wait()
-            return
-        if method in RESTORE_METHODS:
-            # The transport loop must remain free to route cancellation and
-            # responses to reverse requests such as elicitation/create.
-            self._start_task(
-                self._answer(message),
-                name=f"acp-client-request-{request_id}",
-            )
-            return
-        if request_id is None:
-            self._start_task(
-                self._dispatch_notification(
-                    method, message.get("params") or {}),
-                name=f"acp-client-notification-{method}",
-            )
-            return
-        await self._answer(message)
-
-    async def _dispatch_notification(self, method: str, params: dict):
+        params = message.get("params") or {}
+        owner = None
+        predecessor = None
+        forwarded = None
+        changing = False
         try:
-            await self.dispatch(method, params)
+            if not isinstance(params, dict):
+                raise acps.TransportError(
+                    "request params must be an object", code=acps.INVALID_PARAMS)
+            if method == "session/new" or method in RESTORE_METHODS:
+                self._validate_session_setup(params)
+                self._working_directory(params)
+                session_id = (f"loki-{uuid.uuid4()}"
+                              if method == "session/new"
+                              else params.get("sessionId"))
+                owner = self._reserve_session(session_id)
+                changing = True
+            elif method in SESSION_METHODS or method == "session/close":
+                session_id = params.get("sessionId")
+                owner = self._sessions.get(session_id)
+                if owner is None or owner.state == "closing":
+                    raise acps.TransportError(
+                        f"unknown session {session_id!r}",
+                        code=acps.INVALID_PARAMS)
+                if method == "session/close":
+                    self._begin_close(owner)
+                    self._start_task(
+                        self._answer(message, owner=owner),
+                        name=f"acp-client-close-{request_id}")
+                    return
+                if method != "session/cancel" and (
+                        owner.state == "opening" or owner.changing):
+                    raise acps.TransportError(
+                        "session configuration or approval is pending; "
+                        "request was not executed",
+                        code=acps.INVALID_PARAMS)
+                if owner.state != "active":
+                    raise acps.TransportError(
+                        f"unknown session {session_id!r}",
+                        code=acps.INVALID_PARAMS)
+                predecessor = owner.forwarded
+                if method == "session/prompt":
+                    forwarded = asyncio.Event()
+                    owner.forwarded = forwarded
+                changing = method == "session/set_config_option"
+            if changing:
+                owner.changing = True
+            task = self._start_task(
+                self._operate(message, owner, predecessor, forwarded, changing),
+                name=f"acp-client-request-{request_id}", owner=owner)
+            task.add_done_callback(
+                lambda task: self._cancelled_before_start(task, message, forwarded))
         except Exception as error:
-            print(
-                f"ACP notification {method!r} failed: {error!r}",
-                file=sys.stderr,
-            )
+            self._error(message, error)
+
+    def _cancelled_before_start(self, task, message, forwarded):
+        # Cancelling a task before its first scheduling never enters its try/
+        # finally. Supply that request's missing response and forwarding release.
+        # _operate handles an entered task's cancellation and returns normally,
+        # so this callback cannot send a second response for that case.
+        if task.cancelled():
+            if forwarded is not None:
+                forwarded.set()
+            self._error(message, acps.TransportError(
+                "session operation was closed"))
+
+    async def _operate(self, message, owner, predecessor, forwarded, changing):
+        try:
+            # Reuse the existing prompt-forwarded boundary, but wait in the
+            # operation, not the reader. A following effort update/cancel must
+            # reach the worker after the prompt whose snapshot it follows.
+            # This is not a queue behind approval: those requests were rejected
+            # synchronously at admission above.
+            if predecessor is not None:
+                await predecessor.wait()
+            if owner is not None:
+                self._check_owner(owner)
+            await self._answer(message, forwarded=forwarded, owner=owner)
+        except asyncio.CancelledError:
+            self._error(message, acps.TransportError(
+                "session operation was closed"))
+            return
+        except Exception as error:
+            self._error(message, error)
+        finally:
+            if forwarded is not None:
+                forwarded.set()
+            if changing:
+                owner.changing = False
+            if owner is not None and owner.state == "opening":
+                # An open which failed before _open_worker (e.g. validation)
+                # must not leave an ID reserved after its request completes.
+                if self._sessions.get(owner.session_id) is owner:
+                    del self._sessions[owner.session_id]
+
+    def _begin_close(self, owner):
+        if owner.cleanup is not None:
+            return owner.cleanup
+        # Invalidation is synchronous: an already-buffered acceptance must not
+        # publish a worker or write a pin after this close wins admission.
+        owner.state = "closing"
+        if owner.delegation is not None:
+            owner.delegation.revoke_now()
+        for request_id in owner.client_requests:
+            future = self._client_requests.pop(request_id, None)
+            if future is not None:
+                future.cancel()
+        tasks = list(owner.tasks)
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        owner.cleanup = self._start_task(
+            self._finish_close(owner, tasks),
+            name=f"acp-session-close-{owner.session_id}")
+        return owner.cleanup
+
+    async def _finish_close(self, owner, tasks):
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if owner.channel is not None:
+                await owner.channel.close()
+            elif owner.delegation is not None:
+                await owner.delegation.close()
+        finally:
+            if self._sessions.get(owner.session_id) is owner:
+                del self._sessions[owner.session_id]
+
+    def _worker_finished(self, owner, task):
+        # A dead worker must also release a caller awaiting the *client*, not
+        # just the worker request futures resolved by WorkerChannel itself.
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.error("ACP worker reader failed: %r", error)
+        if owner.state != "closing":
+            self._begin_close(owner)
 
     async def _answer(
-            self, message: dict, forwarded: asyncio.Event | None = None):
+            self, message: dict, forwarded: asyncio.Event | None = None,
+            owner=None):
         method = message.get("method")
         request_id = message.get("id")
         try:
@@ -300,20 +478,16 @@ class Front:
                 message.get("params") or {},
                 request_id=request_id,
                 forwarded=forwarded,
+                owner=owner,
             )
-        except acps.TransportError as error:
-            self.write(acps.response(
-                request_id,
-                error={"code": error.code, "message": str(error)}))
-            return
         except Exception as error:
-            self.write(acps.response(
-                request_id,
-                error={"code": acps.INTERNAL_ERROR, "message": str(error)}))
+            self._error(message, error)
             return
         finally:
             if forwarded is not None:
                 forwarded.set()
+        if not self._connected or request_id is None:
+            return
         commands = None
         if isinstance(result, dict):
             commands = result.pop("lokiCommands", None)
@@ -336,22 +510,22 @@ class Front:
 
     async def dispatch(
             self, method: str, params: dict, request_id=None,
-            forwarded: asyncio.Event | None = None):
+            forwarded: asyncio.Event | None = None, owner=None):
         if method == "initialize":
             return self.initialize(params)
         if method == "session/new":
-            return await self.new_session(params)
+            return await self.new_session(params, owner=owner)
         if method in RESTORE_METHODS:
             return await self.restore_session(
-                method, params, request_id=request_id)
+                method, params, request_id=request_id, owner=owner)
         if method == "session/list":
             return self.list_sessions(params)
         if method == "session/close":
-            return await self.close_session(params)
+            return await self.close_session(params, owner=owner)
         if method in SESSION_METHODS:
             return await self.forward_to_worker(
                 method, params, forwarded=forwarded,
-                request_id=request_id)
+                request_id=request_id, owner=owner)
         raise acps.TransportError(
             f"method not found: {method}", code=acps.METHOD_NOT_FOUND)
 
@@ -393,7 +567,12 @@ class Front:
         if future is None or future.done():
             return
         if "error" in message:
-            error = message.get("error") or {}
+            error = message.get("error")
+            if not isinstance(error, dict):
+                future.set_exception(acps.TransportError(
+                    "ACP client response has an invalid error object",
+                    code=acps.INVALID_PARAMS))
+                return
             future.set_exception(acps.TransportError(
                 str(error.get("message") or "ACP client request failed"),
                 code=error.get("code", acps.INTERNAL_ERROR),
@@ -406,20 +585,25 @@ class Front:
                 code=acps.INVALID_PARAMS,
             ))
 
-    async def _request_client(self, method: str, params: dict):
+    async def _request_client(self, method: str, params: dict, *, owner):
+        self._check_owner(owner)
         self._next_client_request_id += 1
         request_id = f"loki-{self._next_client_request_id}"
         future = asyncio.get_running_loop().create_future()
         self._client_requests[request_id] = future
+        owner.client_requests.add(request_id)
         try:
             self.write(acps.request(request_id, method, params))
-            return await future
+            result = await future
+            self._check_owner(owner)
+            return result
         finally:
             self._client_requests.pop(request_id, None)
+            owner.client_requests.discard(request_id)
 
     async def _authorize_saved_connection(
             self, descriptor: ConnectionDescriptor,
-            restore_request_id, working_directory=None) -> None:
+            restore_request_id, working_directory=None, *, owner) -> None:
         if not self._client_supports_form_elicitation:
             raise acps.TransportError(
                 "restoring a saved network connection requires an ACP "
@@ -456,7 +640,7 @@ class Front:
                 },
                 "required": ["authorize"],
             },
-        })
+        }, owner=owner)
         content = (
             result.get("content") if isinstance(result, dict) else None)
         accepted = (
@@ -514,19 +698,18 @@ class Front:
 
     async def _open_worker(self, *, cwd: str, open_method: str,
                            session_id: str | None = None,
-                           restore_request_id=None) -> tuple[str, dict]:
-        if session_id is None:
-            session_id = f"loki-{uuid.uuid4()}"
-        if (session_id in self.workers
-                or session_id in self._opening_sessions):
-            raise acps.TransportError(
-                f"session {session_id!r} is already active",
-                code=acps.INVALID_PARAMS,
-            )
-        self._opening_sessions.add(session_id)
+                           restore_request_id=None, owner=None) -> tuple[str, dict]:
+        if owner is None:
+            owner = self._reserve_session(
+                session_id or f"loki-{uuid.uuid4()}")
+        session_id = owner.session_id
+        self._check_owner(owner)
         channel = None
         try:
             delegation = await self.credential_supervisor.delegate()
+            # Close may arrive during spawn, before a WorkerChannel exists.
+            # The provisional owner must already be able to revoke authority.
+            owner.delegation = delegation
             process = None
             try:
                 # The platform seam spawns the worker contained where the
@@ -546,6 +729,10 @@ class Front:
                     delegation.child_spawned()
             channel = WorkerChannel(
                 session_id, process, self.write, delegation)
+            owner.channel = channel
+            channel._reader_task.add_done_callback(
+                lambda task: self._worker_finished(owner, task))
+            self._check_owner(owner)
             prepared = await channel.request(
                 "session/prepare_open",
                 {
@@ -565,26 +752,33 @@ class Front:
                         f"worker returned an invalid connection: {error}"
                     ) from error
                 await self._authorize_saved_connection(
-                    descriptor, restore_request_id, cwd)
+                    descriptor, restore_request_id, cwd, owner=owner)
+            self._check_owner(owner)
             reply = await channel.request("session/commit_open", {})
-            # Publication is the commit point. Before this assignment no
-            # prompt, config change, or close request can reach the worker.
-            self.workers[session_id] = channel
+            self._check_owner(owner)
+            # Publication is the commit point. Close can invalidate even a
+            # provisional owner, but ordinary requests cannot reach it yet.
+            owner.state = "active"
             return session_id, reply or {}
         except BaseException:
-            if channel is not None:
-                await channel.close()
+            owner.state = "closing"
+            try:
+                if channel is not None:
+                    await channel.close()
+            finally:
+                if (owner.cleanup is None
+                        and self._sessions.get(session_id) is owner):
+                    del self._sessions[session_id]
             raise
-        finally:
-            self._opening_sessions.discard(session_id)
 
-    async def new_session(self, params: dict) -> dict:
+    async def new_session(self, params: dict, owner=None) -> dict:
         # session/new is intentionally fresh. Restoration has separate
         # session/load and session/resume operations and cannot alias this.
         self._validate_session_setup(params)
         session_id, worker_reply = await self._open_worker(
             cwd=self._working_directory(params),
             open_method="session/new",
+            owner=owner,
         )
         result = {"sessionId": session_id}
         config_options = worker_reply.get("configOptions")
@@ -596,7 +790,7 @@ class Front:
         return result
 
     async def restore_session(
-            self, method: str, params: dict, request_id=None) -> dict:
+            self, method: str, params: dict, request_id=None, owner=None) -> dict:
         """Restore one saved session with the method's ACP replay semantics."""
         saved_id = params.get("sessionId")
         if not isinstance(saved_id, str) or not saved_id:
@@ -610,6 +804,7 @@ class Front:
             open_method=method,
             session_id=saved_id,
             restore_request_id=request_id,
+            owner=owner,
         )
         result = {}
         config_options = worker_reply.get("configOptions")
@@ -661,39 +856,47 @@ class Front:
             })
         return {"sessions": entries}
 
-    async def close_session(self, params: dict) -> dict:
+    async def close_session(self, params: dict, owner=None) -> dict:
         session_id = params.get("sessionId")
-        channel = self.workers.pop(session_id, None)
-        if channel is None:
+        if owner is None:
+            owner = self._sessions.get(session_id)
+        if owner is None:
             raise acps.TransportError(
                 f"unknown session {session_id!r}",
                 code=acps.INVALID_PARAMS,
             )
-        await channel.close()
+        # EOF can cancel the close request itself; worker/delegation cleanup
+        # must finish independently of whether its reply can still be delivered.
+        await asyncio.shield(self._begin_close(owner))
         return {}
 
     async def forward_to_worker(
             self, method: str, params: dict,
             forwarded: asyncio.Event | None = None,
-            request_id=None):
+            request_id=None, owner=None):
         session_id = params.get("sessionId")
-        channel = self.workers.get(session_id)
-        if channel is None:
+        if owner is None:
+            owner = self._sessions.get(session_id)
+        if owner is None or owner.state != "active":
             raise acps.TransportError(
                 f"unknown session {session_id!r}",
                 code=acps.INVALID_PARAMS,
             )
+        self._check_owner(owner)
+        channel = owner.channel
         if method == "session/set_config_option":
             # A catalog endpoint decides where a static credential is sent.
             # The worker knows which pair a config value selects; the front
             # owns the client channel, so the approval is asked here and the
             # worker's own check then sees an approved pair.
-            await self._approve_config_endpoint(channel, params, request_id)
+            await self._approve_config_endpoint(
+                channel, params, request_id, owner=owner)
+        self._check_owner(owner)
         return await channel.request(
             method, params, forwarded=forwarded)
 
     async def _approve_config_endpoint(
-            self, channel, params: dict, request_id=None) -> None:
+            self, channel, params: dict, request_id=None, *, owner) -> None:
         """Ask the client to approve a catalog endpoint+credential pair."""
         selection = await channel.request(
             "session/describe_config_selection", params)
@@ -737,7 +940,7 @@ class Front:
                 },
                 "required": ["approve"],
             },
-        })
+        }, owner=owner)
         content = (
             result.get("content") if isinstance(result, dict) else None)
         approved = (
@@ -751,6 +954,9 @@ class Front:
                 "the provider endpoint was not approved",
                 code=acps.INVALID_PARAMS,
             )
+        # Consent belongs to this operation, not any replacement session using
+        # the same ID. No await separates the lifetime check and durable write.
+        self._check_owner(owner)
         endpoint_pins.record(
             str(selection.get("providerId")),
             str(selection.get("endpoint")),

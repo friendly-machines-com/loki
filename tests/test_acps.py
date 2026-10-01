@@ -48,6 +48,49 @@ def _close_process_streams(process):
             stream.close()
 
 
+class _FrontInput:
+    """One serial test input stream, not an application prompt queue.
+
+    A send acknowledges routing by Front.run, never completion of the request.
+    This catches handlers which starve their own reverse responses or EOF.
+    """
+
+    def __init__(self, front):
+        self.front = front
+        self.messages = asyncio.Queue()
+        front.read = self.read
+        self.task = asyncio.create_task(front.run())
+
+    async def read(self):
+        while True:
+            message, routed = await self.messages.get()
+            if message is None:
+                routed.set_result(None)
+                return
+            yield message
+            routed.set_result(None)
+
+    async def send(self, message):
+        await self.send_many(message)
+
+    async def send_many(self, *messages):
+        routed = []
+        for message in messages:
+            future = asyncio.get_running_loop().create_future()
+            self.messages.put_nowait((message, future))
+            routed.append(future)
+        await asyncio.wait_for(asyncio.gather(*routed), 3)
+
+    async def finish(self):
+        await self.send(None)
+        await asyncio.wait_for(self.task, 5)
+
+    async def close(self):
+        if not self.task.done():
+            self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+
 class FramingTests(unittest.TestCase):
     def test_response_and_notification_shapes(self):
         self.assertEqual(
@@ -216,18 +259,65 @@ class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):
             ROOT, front.environment, delegation)
         delegation.close.assert_awaited_once_with()
         self.assertFalse(front.workers)
-        self.assertFalse(front._opening_sessions)
+        self.assertFalse(any(owner.state == "opening"
+                             for owner in front._sessions.values()))
 
 
 class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_buffered_restore_close_settles_unstarted_request(self):
+        responses = []
+        changed = asyncio.Event()
+
+        def write(message):
+            responses.append(message)
+            changed.set()
+
+        front = acp.Front(lambda: None, write, CredentialStore({}))
+        source = _FrontInput(front)
+        self.addAsyncCleanup(source.close)
+        with mock.patch.object(front.credential_supervisor, 'delegate',
+                               new=mock.AsyncMock()) as delegate:
+            await source.send_many(
+                acps.request(1, 'session/resume', {'sessionId': 'saved', 'cwd': ROOT}),
+                acps.request(2, 'session/close', {'sessionId': 'saved'}))
+            async with asyncio.timeout(3):
+                while len(responses) < 2:
+                    changed.clear()
+                    await changed.wait()
+            by_id = {message['id']: message for message in responses}
+            self.assertEqual(by_id[1]['error']['message'], 'session operation was closed')
+            self.assertEqual(by_id[2], acps.response(2, result={}))
+            self.assertEqual(len(responses), 2)
+            delegate.assert_not_awaited()
+            self.assertFalse(front._sessions)
+            await source.finish()
+            self.assertFalse(front._tasks)
+
     async def test_buffered_config_cannot_overtake_prompt(self):
         order = []
         responses = []
         prompt_reply = asyncio.get_running_loop().create_future()
+        forwarding = asyncio.Event()
+        entered = asyncio.Event()
+        changed = asyncio.Event()
+
+        def write(message):
+            responses.append(message)
+            changed.set()
 
         class Channel:
+            _closed = False
+            process = mock.Mock(returncode=None)
+
+            async def close(self):
+                pass
+
             async def request(self, method, params, forwarded=None):
                 order.append(method)
+                changed.set()
+                if method == "session/prompt":
+                    entered.set()
+                    await forwarding.wait()
                 if forwarded is not None:
                     forwarded.set()
                 if method == "session/prompt":
@@ -239,10 +329,14 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
                 return {"configOptions": []}
 
         front = acp.Front(
-            lambda: None, responses.append, CredentialStore({}))
-        front.workers["session"] = Channel()
+            lambda: None, write, CredentialStore({}))
+        owner = front._reserve_session("session")
+        owner.channel = Channel()
+        owner.state = "active"
+        source = _FrontInput(front)
+        self.addAsyncCleanup(source.close)
 
-        await front.handle({
+        await source.send_many({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "session/prompt",
@@ -250,8 +344,7 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
                 "sessionId": "session",
                 "prompt": [{"type": "text", "text": "hello"}],
             },
-        })
-        await front.handle({
+        }, {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/set_config_option",
@@ -262,6 +355,21 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
             },
         })
 
+        await asyncio.wait_for(entered.wait(), 3)
+        # Even a worker-pipe forwarding wait belongs outside the sole reader.
+        await source.send(acps.request(3, 'unknown-method', {}))
+        async with asyncio.timeout(3):
+            while not any(message.get('id') == 3 for message in responses):
+                changed.clear()
+                await changed.wait()
+        self.assertEqual(order, ['session/prompt'])
+        self.assertEqual(next(m for m in responses if m.get('id') == 3)['error']['code'],
+                         acps.METHOD_NOT_FOUND)
+        forwarding.set()
+        async with asyncio.timeout(3):
+            while len(order) < 3:
+                changed.clear()
+                await changed.wait()
         self.assertEqual(order, [
             "session/prompt",
             "session/describe_config_selection",
@@ -270,7 +378,8 @@ class FrontPromptOrderingTests(unittest.IsolatedAsyncioTestCase):
         prompt_reply.set_result({"stopReason": "end_turn"})
         await asyncio.gather(*front._tasks)
         self.assertEqual(
-            {message["id"] for message in responses}, {1, 2})
+            {message["id"] for message in responses}, {1, 2, 3})
+        await source.finish()
 
 
 class SavedConnectionAuthorizationTests(
@@ -307,6 +416,9 @@ class SavedConnectionAuthorizationTests(
             def child_spawned(self):
                 return None
 
+            def revoke_now(self):
+                return None
+
             async def close(self):
                 return None
 
@@ -314,6 +426,9 @@ class SavedConnectionAuthorizationTests(
             def __init__(self, session_id, process, forward, delegation):
                 self.session_id = session_id
                 self.closed = False
+                self._closed = False
+                self.process = mock.Mock(returncode=None)
+                self._reader_task = asyncio.get_running_loop().create_future()
 
             async def request(self, method, params):
                 requests.append((method, params))
@@ -332,12 +447,15 @@ class SavedConnectionAuthorizationTests(
 
             async def close(self):
                 self.closed = True
+                self._closed = True
+                if not self._reader_task.done():
+                    self._reader_task.set_result(None)
 
         def write(message):
             messages.append(message)
             if message.get("method") == "elicitation/create":
                 async def respond():
-                    await front.handle(acps.response(
+                    front.handle(acps.response(
                         message["id"],
                         result=(
                             {
@@ -391,7 +509,7 @@ class SavedConnectionAuthorizationTests(
                     ["session/prepare_open"],
                 )
                 self.assertNotIn("saved", front.workers)
-                self.assertNotIn("saved", front._opening_sessions)
+                self.assertNotIn("saved", front._sessions)
 
     async def test_restore_fails_closed_without_form_elicitation(self):
         for method in acp.RESTORE_METHODS:
@@ -641,7 +759,7 @@ args=(%r + str(__import__('os').getpid()), 'a')
         spawned = {}
 
         class FakeProcess:
-            pass
+            returncode = None
 
         class FakeChannel:
             def __init__(
@@ -649,12 +767,18 @@ args=(%r + str(__import__('os').getpid()), 'a')
                     credential_delegation):
                 self.session_id = session_id
                 self.credential_delegation = credential_delegation
+                self.process = process
+                self._closed = False
+                self._reader_task = asyncio.get_running_loop().create_future()
 
             async def request(self, method, params):
                 return {}
 
             async def close(self):
                 await self.credential_delegation.close()
+                self._closed = True
+                if not self._reader_task.done():
+                    self._reader_task.set_result(None)
 
         async def fake_spawn(cwd, environment, delegation):
             spawned["cwd"] = cwd
@@ -669,7 +793,7 @@ args=(%r + str(__import__('os').getpid()), 'a')
                         acp, "WorkerChannel", FakeChannel):
                 session_id, _reply = await front._open_worker(
                     cwd=ROOT, open_method="session/new")
-                await front.workers.pop(session_id).close()
+                await front.close_session({'sessionId': session_id})
 
         asyncio.run(scenario())
 
@@ -1177,6 +1301,105 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                 await self._finish(front, diagnostics, session_id)
                 turns.append((prompt, answer))
                 read_saved(turns)
+
+
+class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_provisional_approval_rejection_close_and_eof_over_real_pipes(self):
+        from loki_agent import loki, protocols
+        from loki_agent.connections import ConnectionDescriptor
+
+        with tempfile.TemporaryDirectory() as root:
+            workspace = _configured_workspace(root)
+            os.mkdir(workspace)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith('LOKI_')
+                   and not key.endswith(('_KEY', '_TOKEN', '_PAT'))}
+            env.update(HOME=root, XDG_CONFIG_HOME=os.path.join(root, 'config'),
+                       XDG_STATE_HOME=os.path.join(root, 'state'), TERM='dumb',
+                       LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                       LOKI_MODEL='dummy-model')
+            configure_container(env, workspace)
+            front, diagnostics = await self._front(env, workspace)
+            await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+            opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+            session_id = opened['sessionId']
+            await self._request(front, 3, 'session/prompt', {
+                'sessionId': session_id,
+                'prompt': [{'type': 'text', 'text': 'seed conversation'}]})
+            await self._finish(front, diagnostics, session_id)
+            path = os.path.join(loki.chat_log_dir_for(workspace), f'chat-{session_id}.json')
+            with open(path, encoding='utf-8') as stream:
+                saved = json.load(stream)
+            saved['session_state']['connection'] = ConnectionDescriptor(
+                provider_id=None, provider_name='Saved connection',
+                model='untrusted-saved-model', protocol=protocols.OPENAI_CHAT,
+                chat_url='https://saved.invalid/v1/chat/completions',
+                models_url='https://saved.invalid/v1/models').to_dict()
+            with open(path, 'w', encoding='utf-8') as stream:
+                json.dump(saved, stream)
+            with open(path, 'rb') as stream:
+                original = stream.read()
+            for name in ('LOKI_PROVIDER', 'LOKI_API_BASE', 'LOKI_MODEL'):
+                del env[name]
+
+            for decision in ('accept', 'decline', 'close then accept', 'eof'):
+                with self.subTest(decision=decision):
+                    front, diagnostics = await self._front(env, workspace)
+                    await self._request(front, 1, 'initialize', {
+                        'protocolVersion': 1,
+                        'clientCapabilities': {'elicitation': {'form': {}}}})
+                    messages = []
+
+                    async def receive(predicate):
+                        async with asyncio.timeout(15):
+                            while True:
+                                raw = await front.stdout.readline()
+                                self.assertTrue(raw, 'front exited before expected response')
+                                message = json.loads(raw)
+                                messages.append(message)
+                                if predicate(message):
+                                    return message
+
+                    async def send(*messages):
+                        front.stdin.write(b''.join(
+                            (json.dumps(message) + '\n').encode() for message in messages))
+                        await asyncio.wait_for(front.stdin.drain(), 5)
+
+                    await send(acps.request(3, 'session/resume', {
+                        'sessionId': session_id, 'cwd': workspace}))
+                    ask = await receive(lambda m: m.get('method') == 'elicitation/create')
+                    self.assertEqual(ask['params']['requestId'], 3)
+                    await send(acps.request(4, 'session/prompt', {
+                        'sessionId': session_id,
+                        'prompt': [{'type': 'text', 'text': 'must not execute'}]}))
+                    rejected = await receive(lambda m: m.get('id') == 4)
+                    self.assertIn('request was not executed', rejected['error']['message'])
+                    answer = acps.response(ask['id'], result={
+                        'action': 'accept', 'content': {'authorize': True}})
+                    if decision == 'accept':
+                        await send(answer)
+                        restored = await receive(lambda m: m.get('id') == 3)
+                        self.assertIn('configOptions', restored['result'])
+                        await self._finish(front, diagnostics, session_id)
+                    else:
+                        if decision == 'decline':
+                            await send(acps.response(ask['id'], result={'action': 'decline'}))
+                            self.assertIn('error', await receive(lambda m: m.get('id') == 3))
+                        elif decision == 'close then accept':
+                            await send(acps.request(5, 'session/close', {'sessionId': session_id}), answer)
+                            await receive(lambda m: m.get('id') == 5)
+                            self.assertEqual(next(m for m in messages if m.get('id') == 5)['result'], {})
+                            self.assertIn('error', next(m for m in messages if m.get('id') == 3))
+                        front.stdin.close()
+                        await asyncio.wait_for(front.wait(), 5)
+                        stderr = await asyncio.wait_for(diagnostics, 5)
+                        self.assertEqual(front.returncode, 0, stderr.decode(errors='replace'))
+                        remaining = await asyncio.wait_for(front.stdout.read(), 5)
+                        if decision == 'eof':
+                            self.assertNotIn(b'"result"', remaining)
+                    with open(path, 'rb') as stream:
+                        self.assertEqual(stream.read(), original)
+                    self.assertFalse(any(m.get('method') == 'session/update' for m in messages))
 
 
 def _tool_fixture(root):
@@ -1726,7 +1949,9 @@ class _LocalWorkerProcess:
             message = json.loads(line)
             self.methods.append(message["method"])
             self.before_request(message)
-            await self.worker.handle(message)
+            # Match the worker entrypoint: prompt replies may be long-running,
+            # while ordered config/cancel messages continue to be handled.
+            await self.worker.handle(message, concurrent=True)
 
     def close(self):
         if self.close_task is None:
@@ -1797,6 +2022,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                     messages = []
                     changed = asyncio.Event()
                     front = None
+                    sources = []
 
                     def write(message):
                         messages.append(message)
@@ -1834,6 +2060,8 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                     stack.enter_context(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
 
                     async def backstop():
+                        for source in sources:
+                            await source.close()
                         for process in processes:
                             process.close()
                             await asyncio.wait_for(process.wait(), 1)
@@ -1856,12 +2084,15 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                                 await changed.wait()
 
                     async def request(request_id, operation, params):
-                        await asyncio.wait_for(front.handle(acps.request(request_id, operation, params)), 3)
+                        await source.send(acps.request(request_id, operation, params))
                         return await response(request_id)
 
                     try:
                         front = acp.Front(lambda: None, write, loki.CREDENTIALS)
-                        front.initialize({"clientCapabilities": {"elicitation": {"form": {}}}})
+                        source = _FrontInput(front)
+                        sources.append(source)
+                        await source.send(acps.request(0, 'initialize', {
+                            'clientCapabilities': {'elicitation': {'form': {}}}}))
                         opened = await request(1, "session/new", {"cwd": workspace})
                         session_id = opened["sessionId"]
                         result = await request(2, "session/prompt", {
@@ -1870,6 +2101,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(result["stopReason"], "end_turn")
                         path = processes[0].worker.session.chat_log_path
                         self.assertEqual(await request(3, "session/close", {"sessionId": session_id}), {})
+                        await source.finish()
                         self.assertEqual(processes[0].returncode, 0)
                         self.assertTrue(channels[0]._reader_task.done())
                         with open(path, "rb") as stream:
@@ -1880,9 +2112,12 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                                                        "LOKI_MODEL": "explicit-model"} if explicit else {})
                         loki.CREDENTIALS = credentials
                         front = acp.Front(lambda: None, write, credentials)
-                        front.initialize({"clientCapabilities": {"elicitation": {"form": {}}}})
+                        source = _FrontInput(front)
+                        sources.append(source)
+                        await source.send(acps.request(0, 'initialize', {
+                            'clientCapabilities': {'elicitation': {'form': {}}}}))
                         messages.clear()
-                        await front.handle(acps.request(73, method, {
+                        await source.send(acps.request(73, method, {
                             "sessionId": session_id, "cwd": workspace,
                             "replay": method == "session/resume"}))
                         if not explicit:
@@ -1899,7 +2134,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                             self.assertIn("Working directory:", params["message"])
                             self.assertIn(json.dumps(workspace, ensure_ascii=True), params["message"])
                             self.assertNotIn(session_id, front.workers)
-                            self.assertIn(session_id, front._opening_sessions)
+                            self.assertEqual(front._sessions[session_id].state, "opening")
                             self.assertEqual(processes[-1].methods, ["session/prepare_open"])
                             self.assertIsNone(processes[-1].worker.session.runtime_config)
                             self.assertIsNotNone(processes[-1].worker._pending_open)
@@ -1907,13 +2142,14 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(_historical_chunks(messages, session_id), [])
                             with open(path, "rb") as stream:
                                 self.assertEqual(stream.read(), original)
-                            await front.handle(acps.response(elicitation["id"], result={
+                            await source.send(acps.response(elicitation["id"], result={
                                 "action": "accept", "content": {"authorize": True}}))
                         restored = await response(73)
                         self.assertNotIn("sessionId", restored)
                         self.assertIn("configOptions", restored)
                         self.assertIn(session_id, front.workers)
-                        self.assertFalse(front._opening_sessions)
+                        self.assertTrue(all(owner.state != "opening"
+                                            for owner in front._sessions.values()))
                         self.assertFalse(front._client_requests)
                         self.assertEqual(processes[-1].methods, ["session/prepare_open", "session/commit_open"])
                         if explicit:
@@ -1947,6 +2183,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                             self.assertTrue(writer.closed)
                             self.assertTrue(writer.wait_closed_called)
                         self.assertEqual(await request(75, "session/close", {"sessionId": session_id}), {})
+                        await source.finish()
                         self.assertFalse(front.workers)
                         self.assertEqual(processes[-1].returncode, 0)
                         self.assertTrue(processes[-1].close_task.done())
@@ -3078,18 +3315,23 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         front._client_supports_form_elicitation = supports_elicitation
         return front
 
-    def _channel(self, selection):
+    def _channel(self, front, selection):
         channel = mock.Mock()
         channel.session_id = "s"
+        channel._closed = False
+        channel.process.returncode = None
         channel.request = mock.AsyncMock(return_value=selection)
+        owner = front._reserve_session('s')
+        owner.channel = channel
+        owner.state = 'active'
         return channel
 
     @asynccontextmanager
     async def _approval_journey(self):
         """Real application components; only catalog/HTTP and OS-child seams.
 
-        Client requests are dispatched concurrently to exercise response routing.
-        This is not Front.run or shipped-process elicitation qualification.
+        All client traffic uses one serial Front.run input stream. This is
+        component qualification, not a shipped-process catalog/HTTP check.
         """
         from types import SimpleNamespace
         from test_http_client import FakeConnector
@@ -3134,7 +3376,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                                    + str(len(body)).encode() + b'\r\n\r\n' + body)
                 f = SimpleNamespace(messages=[], changed=asyncio.Event(), tasks=[],
                                     processes=[], delegations=[], connector=FakeConnector(packets),
-                                    trace=[], endpoint=endpoint, secrets=(selected, unrelated, previous),
+                                    trace=[], endpoint=endpoint, workspace=workspace,
+                                    secrets=(selected, unrelated, previous),
                                     tasks_before=asyncio.all_tasks())
 
                 def write(message):
@@ -3144,7 +3387,9 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     f.changed.set()
 
                 f.front = acp.Front(lambda: None, write, credentials)
-                f.front.initialize({'clientCapabilities': {'elicitation': {'form': {}}}})
+                f.source = _FrontInput(f.front)
+                await f.source.send(acps.request(0, 'initialize', {
+                    'clientCapabilities': {'elicitation': {'form': {}}}}))
                 stack.enter_context(mock.patch.object(loki, 'CREDENTIALS', f.front.credentials))
                 stack.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', Session(shell_cwd=workspace)))
                 real_connect = asyncio.open_connection
@@ -3216,7 +3461,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                             await f.changed.wait()
 
                 async def request(request_id, method, params):
-                    await asyncio.wait_for(f.front.handle(acps.request(request_id, method, params)), 3)
+                    await f.source.send(acps.request(request_id, method, params))
                     message = await wait_message(lambda message: message.get('id') == request_id)
                     self.assertNotIn('error', message, message)
                     return message['result']
@@ -3243,8 +3488,10 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                         if not task.done():
                             task.cancel()
                     await asyncio.gather(*f.tasks, return_exceptions=True)
-                    for channel in list(f.front.workers.values()):
-                        await asyncio.wait_for(channel.close(), 3)
+                    await f.source.close()
+                    # Failure backstop, not release evidence: assertions above
+                    # must pass before this fallback can repair a leaked owner.
+                    await f.front.shutdown()
                     for delegation in f.delegations:
                         await delegation.close()
                     for task in list(f.front._tasks):
@@ -3252,9 +3499,11 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(*f.front._tasks, return_exceptions=True)
 
     async def _pending_approval(self, f, request_id):
-        task = asyncio.create_task(f.front.handle(acps.request(
-            request_id, 'session/set_config_option', f.params)))
+        task = asyncio.create_task(f.wait_message(
+            lambda message: message.get('id') == request_id))
         f.tasks.append(task)
+        await f.source.send(acps.request(
+            request_id, 'session/set_config_option', f.params))
         elicitation = await f.wait_message(
             lambda message: message.get('method') == 'elicitation/create'
             and message['params'].get('requestId') == request_id)
@@ -3285,6 +3534,11 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
 
     async def _close_approval_journey(self, f):
         self.assertEqual(await f.request(90, 'session/close', {'sessionId': f.session_id}), {})
+        await f.source.finish()
+        await self._assert_approval_released(f)
+
+    async def _assert_approval_released(self, f):
+        self.assertFalse(f.front._sessions)
         self.assertFalse(f.front.workers)
         self.assertFalse(f.front._client_requests)
         self.assertFalse(f.channel._pending)
@@ -3332,11 +3586,11 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         async with self._approval_journey() as f:
             task, elicitation = await self._pending_approval(f, 9)
             # A foreign response cannot resolve this approval.
-            await f.front.handle(acps.response('unrelated-id', result={
+            await f.source.send(acps.response('unrelated-id', result={
                 'action': 'accept', 'content': {'approve': True}}))
             self.assertFalse(f.front._client_requests[elicitation['id']].done())
             self.assertFalse(task.done())
-            await f.front.handle(acps.response(elicitation['id'], result={
+            await f.source.send(acps.response(elicitation['id'], result={
                 'action': 'accept', 'content': {'approve': True}}))
             await asyncio.wait_for(task, 3)
             reply = await f.wait_message(lambda message: message.get('id') == 9)
@@ -3410,7 +3664,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             await self._close_approval_journey(f)
 
     async def test_declined_approval_fails_the_switch(self):
-        refusals = ({'action': 'decline'}, {'action': 'accept', 'content': {'approve': False}},
+        refusals = ({'action': 'decline'}, {'action': 'cancel'}, {}, [],
+                    {'action': 'accept', 'content': {'approve': False}},
                     {'action': 'accept', 'content': {}},
                     {'action': 'accept', 'content': {'approve': 1}},
                     {'action': 'accept', 'content': {'approve': 'true'}})
@@ -3419,7 +3674,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 async with self._approval_journey() as f:
                     for request_id in (9, 10):
                         task, elicitation = await self._pending_approval(f, request_id)
-                        await f.front.handle(acps.response(elicitation['id'], result=refusal))
+                        await f.source.send(acps.response(elicitation['id'], result=refusal))
                         await asyncio.wait_for(task, 3)
                         reply = await f.wait_message(lambda message: message.get('id') == request_id)
                         self.assertIn('error', reply, reply)
@@ -3441,18 +3696,164 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                         self.assertNotIn('pin', f.trace)
                     await self._close_approval_journey(f)
 
+    def _assert_no_pin_or_inference(self, f):
+        with open(f.pins_path, 'rb') as stream:
+            self.assertEqual(stream.read(), f.original_pins)
+        self.assertEqual(f.leases, [])
+        self.assertEqual(f.connector.calls, [])
+        self.assertNotIn('pin', f.trace)
+        self.assertNotIn('switch', f.trace)
+
+    async def test_pending_approval_rejects_buffered_work_only_in_its_session(self):
+        async with self._approval_journey() as f:
+            calls = []
+
+            class OtherChannel:
+                _closed = False
+                process = mock.Mock(returncode=None)
+
+                async def request(self, method, params, forwarded=None):
+                    calls.append(method)
+                    if forwarded is not None:
+                        forwarded.set()
+                    return {'stopReason': 'end_turn'}
+
+                async def close(self):
+                    pass
+
+            other = f.front._reserve_session('other')
+            other.channel = OtherChannel()
+            other.state = 'active'
+            await f.source.send_many(
+                acps.request(9, 'session/set_config_option', f.params),
+                acps.request(10, 'session/prompt', {
+                    'sessionId': f.session_id,
+                    'prompt': [{'type': 'text', 'text': 'must not run'}]}),
+                acps.request(11, 'session/set_config_option', f.params),
+                acps.request(12, 'session/prompt', {
+                    'sessionId': 'other',
+                    'prompt': [{'type': 'text', 'text': 'independent'}]}))
+            for request_id in (10, 11):
+                reply = await f.wait_message(lambda m: m.get('id') == request_id)
+                self.assertEqual(reply['error']['code'], acps.INVALID_PARAMS)
+                self.assertIn('request was not executed', reply['error']['message'])
+            self.assertEqual(await f.wait_message(lambda m: m.get('id') == 12),
+                             acps.response(12, result={'stopReason': 'end_turn'}))
+            self.assertEqual(calls, ['session/prompt'])
+            ask = await f.wait_message(lambda m: m.get('method') == 'elicitation/create')
+            self.assertEqual(ask['params']['requestId'], 9)
+            self.assertEqual(f.processes[0].methods[-1], 'session/describe_config_selection')
+            self._assert_no_pin_or_inference(f)
+            with open(f.path, 'rb') as stream:
+                self.assertEqual(stream.read(), f.original_chat)
+            await f.source.send(acps.response(ask['id'], result={'action': 'decline'}))
+            reply = await f.wait_message(lambda m: m.get('id') == 9)
+            self.assertIn('not approved', reply['error']['message'])
+            self.assertEqual(await f.request(80, 'session/close', {'sessionId': 'other'}), {})
+            await self._close_approval_journey(f)
+
+    async def test_close_invalidates_approval_before_accept_and_after_reopen(self):
+        async with self._approval_journey() as f:
+            task, ask = await self._pending_approval(f, 9)
+            old_channel = f.channel
+            await f.source.send_many(
+                acps.request(10, 'session/close', {'sessionId': f.session_id}),
+                acps.response(ask['id'], result={
+                    'action': 'accept', 'content': {'approve': True}}))
+            self.assertIn('error', await asyncio.wait_for(task, 3))
+            self.assertEqual(await f.wait_message(lambda m: m.get('id') == 10),
+                             acps.response(10, result={}))
+            self._assert_no_pin_or_inference(f)
+            await f.request(11, 'session/resume', {
+                'sessionId': f.session_id, 'cwd': f.workspace})
+            f.channel = f.front.workers[f.session_id]
+            self.assertIsNot(f.channel, old_channel)
+            await f.source.send(acps.request(12, 'session/set_config_option', f.params))
+            new_ask = await f.wait_message(
+                lambda m: m.get('method') == 'elicitation/create'
+                and m['params']['requestId'] == 12)
+            self.assertNotEqual(new_ask['id'], ask['id'])
+            await f.source.send(acps.response(ask['id'], result={
+                'action': 'accept', 'content': {'approve': True}}))
+            self.assertFalse(f.front._client_requests[new_ask['id']].done())
+            self._assert_no_pin_or_inference(f)
+            await f.source.send(acps.response(new_ask['id'], result={'action': 'cancel'}))
+            self.assertIn('error', await f.wait_message(lambda m: m.get('id') == 12))
+            await self._close_approval_journey(f)
+
+    async def test_pending_approval_eof_and_worker_exit_release_authority(self):
+        for ending in ('eof', 'worker exit'):
+            with self.subTest(ending=ending):
+                async with self._approval_journey() as f:
+                    task, _ask = await self._pending_approval(f, 9)
+                    if ending == 'worker exit':
+                        f.processes[0].close()
+                        self.assertIn('error', await asyncio.wait_for(task, 3))
+                        await f.source.finish()
+                    else:
+                        # No response is owed over a disconnected transport.
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        await f.source.finish()
+                        self.assertFalse(any(m.get('id') == 9 for m in f.messages))
+                    self._assert_no_pin_or_inference(f)
+                    await self._assert_approval_released(f)
+
+    async def test_active_prompt_rejects_model_change_before_asking(self):
+        async with self._approval_journey() as f:
+            entered = asyncio.Event()
+            worker = f.processes[0].worker
+
+            async def turn(on_event, reasoning_effort):
+                entered.set()
+                await worker.cancel_event.wait()
+                on_event({'type': 'response_cancelled'})
+                return ''
+
+            with mock.patch.object(worker, '_run_turn', side_effect=turn):
+                await f.source.send(acps.request(9, 'session/prompt', {
+                    'sessionId': f.session_id,
+                    'prompt': [{'type': 'text', 'text': 'running turn'}]}))
+                await asyncio.wait_for(entered.wait(), 3)
+                await f.source.send(acps.request(10, 'session/set_config_option', f.params))
+                reply = await f.wait_message(lambda m: m.get('id') == 10)
+                self.assertIn('prompt is running', reply['error']['message'])
+                self.assertFalse(any(m.get('method') == 'elicitation/create' for m in f.messages))
+                self._assert_no_pin_or_inference(f)
+                await f.source.send(acps.notification('session/cancel', {'sessionId': f.session_id}))
+                reply = await f.wait_message(lambda m: m.get('id') == 9)
+                self.assertEqual(reply['result'], {'stopReason': 'cancelled'})
+            await self._close_approval_journey(f)
+
+    async def test_client_error_and_duplicate_response_do_not_authorize(self):
+        valid_error = {'code': -32800, 'message': 'dismissed'}
+        for error, expected in ((valid_error, valid_error), (['invalid error'], {
+                'code': acps.INVALID_PARAMS,
+                'message': 'ACP client response has an invalid error object'})):
+            with self.subTest(error=error):
+                async with self._approval_journey() as f:
+                    task, ask = await self._pending_approval(f, 9)
+                    await f.source.send_many(
+                        acps.response(ask['id'], error=error),
+                        acps.response(ask['id'], result={
+                            'action': 'accept', 'content': {'approve': True}}))
+                    reply = await asyncio.wait_for(task, 3)
+                    self.assertEqual(reply['error'], expected)
+                    self._assert_no_pin_or_inference(f)
+                    await self._close_approval_journey(f)
+
     async def test_changed_pair_shows_the_approved_values(self):
         front = self._front()
         selection = dict(self.PAIR, changed=True,
                          approvedEndpoint="https://old.invalid/v1",
                          approvedCredential="env:OLD_KEY")
-        channel = self._channel(selection)
+        channel = self._channel(front, selection)
         front._request_client = mock.AsyncMock(
             return_value={"action": "accept", "content": {"approve": True}})
 
         with mock.patch.object(acp.endpoint_pins, "record"):
             await front._approve_config_endpoint(
-                channel, {"sessionId": "s"}, 9)
+                channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
 
         message = front._request_client.await_args.args[1]["message"]
         self.assertIn("https://old.invalid/v1", message)
@@ -3461,24 +3862,24 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nothing_to_approve_asks_nothing(self):
         front = self._front()
-        channel = self._channel({})
+        channel = self._channel(front, {})
         front._request_client = mock.AsyncMock()
 
         with mock.patch.object(acp.endpoint_pins, "record") as record:
             await front._approve_config_endpoint(
-                channel, {"sessionId": "s"}, 9)
+                channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
 
         front._request_client.assert_not_awaited()
         record.assert_not_called()
 
     async def test_client_without_form_elicitation_fails_closed(self):
         front = self._front(supports_elicitation=False)
-        channel = self._channel(dict(self.PAIR))
+        channel = self._channel(front, dict(self.PAIR))
         front._request_client = mock.AsyncMock()
 
         with self.assertRaises(acps.TransportError):
             await front._approve_config_endpoint(
-                channel, {"sessionId": "s"}, 9)
+                channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
 
         front._request_client.assert_not_awaited()
 

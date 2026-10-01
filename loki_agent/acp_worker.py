@@ -92,21 +92,6 @@ class Worker:
                 name=f"acp-worker-prompt-{request_id}",
             )
             return
-        if (method == "session/set_config_option"
-                and self._prompt_task is not None
-                and not self._prompt_task.done()
-                and (message.get("params") or {}).get("configId")
-                != "reasoning_effort"):
-            self.write(acps.response(
-                request_id,
-                error={
-                    "code": acps.INVALID_PARAMS,
-                    "message": (
-                        "cannot change session configuration while a "
-                        "prompt is running"),
-                },
-            ))
-            return
         await self._answer(message)
 
     async def close(self):
@@ -164,6 +149,19 @@ class Worker:
             return await self.prepare_open(params)
         if method == "session/commit_open":
             return self.commit_open()
+        # Describe is the front's first step toward a configuration change.
+        # Apply the same active-turn guard there, before the front can ask for
+        # approval or persist a pin for a change we would subsequently refuse.
+        # The worker remains the authority on its active prompt, including the
+        # existing exception for next-turn reasoning-effort updates.
+        if (method in ("session/set_config_option",
+                       "session/describe_config_selection")
+                and self._prompt_task is not None
+                and not self._prompt_task.done()
+                and params.get("configId") != "reasoning_effort"):
+            raise acps.TransportError(
+                "cannot change session configuration while a prompt is running",
+                code=acps.INVALID_PARAMS)
         if method == "session/set_config_option":
             return self.set_config_option(params)
         if method == "session/describe_config_selection":
