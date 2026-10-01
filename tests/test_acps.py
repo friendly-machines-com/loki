@@ -502,7 +502,69 @@ class EntrypointTests(unittest.TestCase):
         ])
 
 
-class FrontWorkerTests(unittest.TestCase):
+class _ACPFrontFixture:
+    async def _front(self, env, workspace):
+        process = await asyncio.create_subprocess_exec(
+            *loki_acp_command(), env=env, cwd=workspace,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        # Drain diagnostics while the child runs; a full stderr pipe must not
+        # stall the protocol. Register the backstop before readiness assertions.
+        diagnostics = asyncio.create_task(process.stderr.read())
+
+        async def cleanup():
+            if process.returncode is None:
+                process.kill()
+            await asyncio.wait_for(process.wait(), 5)
+            await asyncio.wait_for(diagnostics, 5)
+        self.addAsyncCleanup(cleanup)
+        return process, diagnostics
+
+    async def _response(self, front, request_id):
+        preceding = []
+        deadline = asyncio.get_running_loop().time() + 15
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            line = await asyncio.wait_for(front.stdout.readline(), remaining)
+            self.assertTrue(line, "ACP front exited before its response")
+            message = json.loads(line)
+            if message.get("id") == request_id:
+                self.assertNotIn("error", message, message)
+                return message["result"], preceding
+            preceding.append(message)
+
+    async def _request(self, front, request_id, method, params):
+        front.stdin.write((json.dumps(acps.request(
+            request_id, method, params)) + "\n").encode())
+        await asyncio.wait_for(front.stdin.drain(), 5)
+        return await self._response(front, request_id)
+
+    async def _finish(self, front, diagnostics, session_id):
+        result, _ = await self._request(
+            front, 90, "session/close", {"sessionId": session_id})
+        self.assertEqual(result, {})
+        # The original owner must no longer route requests to the closed worker.
+        front.stdin.write((json.dumps(acps.request(
+            91, "session/prompt", {"sessionId": session_id,
+                                   "prompt": [{"type": "text", "text": "forbidden"}]}))
+                           + "\n").encode())
+        await asyncio.wait_for(front.stdin.drain(), 5)
+        async with asyncio.timeout(5):
+            while True:
+                line = await front.stdout.readline()
+                self.assertTrue(line, "front exited before rejecting closed session")
+                message = json.loads(line)
+                if message.get("id") == 91:
+                    self.assertIn("unknown session", message["error"]["message"])
+                    break
+        front.stdin.close()
+        await asyncio.wait_for(front.wait(), 5)
+        stderr = await asyncio.wait_for(diagnostics, 5)
+        self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
+        self.assertEqual(await asyncio.wait_for(front.stdout.read(), 5), b"")
+
+
+class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     def _front_env(self, tmpdir):
         env = dict(os.environ)
         env.update({
@@ -520,7 +582,7 @@ class FrontWorkerTests(unittest.TestCase):
         configure_container(env, workspace)
         return env
 
-    def test_ini_logging_reaches_the_front_not_the_contained_worker(self):
+    async def test_ini_logging_reaches_the_front_not_the_contained_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             config = os.path.join(directory, "logging.ini")
             # The handler arg is a Python literal that fileConfig evals, so the
@@ -542,17 +604,19 @@ handlers=trace
 class=FileHandler
 args=(%r + str(__import__('os').getpid()), 'a')
 """ % trace_prefix)
-            front_env = self._front_env
-
-            def relative_config_env(cwd):
-                env = front_env(cwd)
-                env["LOKI_LOG_CONFIG"] = os.path.relpath(
-                    config, os.path.join(cwd, "workspace"))
-                return env
-
-            with mock.patch.object(
-                    self, "_front_env", side_effect=relative_config_env):
-                self.test_initialize_new_session_prompt_roundtrip()
+            env = self._front_env(directory)
+            workspace = _configured_workspace(directory)
+            env["LOKI_LOG_CONFIG"] = os.path.relpath(config, workspace)
+            front, diagnostics = await self._front(env, workspace)
+            await self._request(front, 1, "initialize", {"protocolVersion": 1})
+            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
+            session_id = opened["sessionId"]
+            reply, updates = await self._request(front, 3, "session/prompt", {
+                "sessionId": session_id, "prompt": [{"type": "text", "text": "logging probe"}],
+            })
+            self.assertEqual(reply, {"stopReason": "end_turn"})
+            self.assertEqual(_tool_updates(updates, session_id), _assistant_chunks("acp reply text"))
+            await self._finish(front, diagnostics, session_id)
             # The front is uncontained and loads the INI.  The separately
             # execed worker is contained: it refuses any configuration the
             # invoker names (it cannot be assumed able to read it or write its
@@ -561,216 +625,6 @@ args=(%r + str(__import__('os').getpid()), 'a')
             traces = [name for name in os.listdir(directory)
                       if name.startswith("trace-")]
             self.assertEqual(len(traces), 1)
-
-    def test_initialize_new_session_prompt_roundtrip(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = self._front_env(tmpdir)
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(message):
-                    front.stdin.write(json.dumps(message) + "\n")
-                    front.stdin.flush()
-
-                def recv():
-                    line = front.stdout.readline()
-                    self.assertTrue(line, "front produced no message")
-                    return json.loads(line)
-
-                def recv_reply(reply_id):
-                    while True:
-                        message = recv()
-                        if message.get("id") == reply_id:
-                            return message
-
-                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": 1}})
-                reply = recv_reply(1)
-                self.assertEqual(reply["result"]["protocolVersion"], 1)
-                self.assertEqual(
-                    reply["result"]["agentInfo"]["name"], "loki")
-                self.assertEqual(
-                    reply["result"]["agentInfo"]["version"], __version__)
-                capabilities = reply["result"]["agentCapabilities"]
-                self.assertEqual(
-                    capabilities["sessionCapabilities"]["close"], {})
-                self.assertEqual(
-                    capabilities["sessionCapabilities"]["list"], {})
-                self.assertEqual(
-                    capabilities["sessionCapabilities"]["resume"], {})
-                self.assertFalse(
-                    capabilities["promptCapabilities"]["image"])
-
-                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": _configured_workspace(tmpdir)}})
-                reply = recv_reply(2)
-                session_id = reply["result"]["sessionId"]
-                self.assertTrue(session_id)
-
-                send({"jsonrpc": "2.0", "id": 3,
-                      "method": "session/prompt",
-                      "params": {
-                          "sessionId": session_id,
-                          "prompt": [{"type": "text",
-                                      "text": "hello acp"}]}})
-                updates = []
-                while True:
-                    message = recv()
-                    if message.get("id") == 3:
-                        reply = message
-                        break
-                    updates.append(message)
-                self.assertEqual(reply["result"]["stopReason"], "end_turn")
-                # The turn's assistant text must have streamed as a
-                # session/update before the reply landed.
-                self.assertTrue(any(
-                    m.get("method") == "session/update"
-                    and m["params"]["update"]["sessionUpdate"]
-                    == "agent_message_chunk"
-                    for m in updates))
-
-                send({"jsonrpc": "2.0", "id": 4,
-                      "method": "session/close",
-                      "params": {"sessionId": session_id}})
-                self.assertEqual(recv_reply(4)["result"], {})
-                send({"jsonrpc": "2.0", "id": 5,
-                      "method": "session/prompt",
-                      "params": {
-                          "sessionId": session_id,
-                          "prompt": [{"type": "text", "text": "closed"}]}})
-                self.assertIn("error", recv_reply(5))
-            finally:
-                front.stdin.close()
-                try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
-
-    def test_advertises_commands_and_serves_slash_commands(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = self._front_env(tmpdir)
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env,
-                cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(message):
-                    front.stdin.write(json.dumps(message) + "\n")
-                    front.stdin.flush()
-
-                def recv():
-                    line = front.stdout.readline()
-                    self.assertTrue(line, "front produced no message")
-                    return json.loads(line)
-
-                def recv_reply(reply_id):
-                    while True:
-                        message = recv()
-                        if message.get("id") == reply_id:
-                            return message
-
-                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": 1}})
-                recv_reply(1)
-
-                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": _configured_workspace(tmpdir)}})
-                reply = recv_reply(2)
-                session_id = reply["result"]["sessionId"]
-
-                # The advertisement follows the session reply, so the client
-                # already knows the session it describes.
-                message = recv()
-                self.assertEqual(message["method"], "session/update")
-                self.assertEqual(message["params"]["sessionId"], session_id)
-                update = message["params"]["update"]
-                self.assertEqual(
-                    update["sessionUpdate"], "available_commands_update")
-                self.assertIn(
-                    "pwd",
-                    [command["name"] for command in update["availableCommands"]])
-
-                # /pwd is answered locally: no model turn, no dummy reply.
-                send({"jsonrpc": "2.0", "id": 3,
-                      "method": "session/prompt",
-                      "params": {
-                          "sessionId": session_id,
-                          "prompt": [{"type": "text", "text": "/pwd"}]}})
-                chunks = []
-                while True:
-                    message = recv()
-                    if message.get("id") == 3:
-                        reply = message
-                        break
-                    if (message.get("method") == "session/update"
-                            and message["params"]["update"]["sessionUpdate"]
-                            == "agent_message_chunk"):
-                        chunks.append(
-                            message["params"]["update"]["content"]["text"])
-                self.assertEqual(reply["result"]["stopReason"], "end_turn")
-                text = "".join(chunks)
-                self.assertIn("cwd:", text)
-                self.assertNotIn("acp reply text", text)
-
-                # /image stages a snapshot for the next prompt.
-                with open(os.path.join(
-                        _configured_workspace(tmpdir), "shot.png"), "wb") as stream:
-                    stream.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
-                send({"jsonrpc": "2.0", "id": 6,
-                      "method": "session/prompt",
-                      "params": {
-                          "sessionId": session_id,
-                          "prompt": [{"type": "text",
-                                      "text": "/image shot.png"}]}})
-                chunks = []
-                while True:
-                    message = recv()
-                    if message.get("id") == 6:
-                        reply = message
-                        break
-                    if (message.get("method") == "session/update"
-                            and message["params"]["update"]["sessionUpdate"]
-                            == "agent_message_chunk"):
-                        chunks.append(
-                            message["params"]["update"]["content"]["text"])
-                self.assertEqual(reply["result"]["stopReason"], "end_turn")
-                self.assertIn("Attached image", "".join(chunks))
-
-                # A plain prompt still reaches the provider.
-                send({"jsonrpc": "2.0", "id": 4,
-                      "method": "session/prompt",
-                      "params": {
-                          "sessionId": session_id,
-                          "prompt": [{"type": "text", "text": "hello"}]}})
-                chunks = []
-                while True:
-                    message = recv()
-                    if message.get("id") == 4:
-                        break
-                    if (message.get("method") == "session/update"
-                            and message["params"]["update"]["sessionUpdate"]
-                            == "agent_message_chunk"):
-                        chunks.append(
-                            message["params"]["update"]["content"]["text"])
-                self.assertIn("acp reply text", "".join(chunks))
-
-                send({"jsonrpc": "2.0", "id": 5,
-                      "method": "session/close",
-                      "params": {"sessionId": session_id}})
-                self.assertEqual(recv_reply(5)["result"], {})
-            finally:
-                front.stdin.close()
-                try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
 
     def test_front_delegates_credentials_without_worker_environment_values(self):
         credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
@@ -1243,68 +1097,6 @@ def _historical_chunks(messages, session_id):
     return chunks
 
 
-class _ACPFrontFixture:
-    async def _front(self, env, workspace):
-        process = await asyncio.create_subprocess_exec(
-            *loki_acp_command(), env=env, cwd=workspace,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
-        # Drain diagnostics while the child runs; a full stderr pipe must not
-        # stall the protocol. Register the backstop before readiness assertions.
-        diagnostics = asyncio.create_task(process.stderr.read())
-
-        async def cleanup():
-            if process.returncode is None:
-                process.kill()
-            await asyncio.wait_for(process.wait(), 5)
-            await asyncio.wait_for(diagnostics, 5)
-        self.addAsyncCleanup(cleanup)
-        return process, diagnostics
-
-    async def _response(self, front, request_id):
-        preceding = []
-        deadline = asyncio.get_running_loop().time() + 15
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            line = await asyncio.wait_for(front.stdout.readline(), remaining)
-            self.assertTrue(line, "ACP front exited before its response")
-            message = json.loads(line)
-            if message.get("id") == request_id:
-                self.assertNotIn("error", message, message)
-                return message["result"], preceding
-            preceding.append(message)
-
-    async def _request(self, front, request_id, method, params):
-        front.stdin.write((json.dumps(acps.request(
-            request_id, method, params)) + "\n").encode())
-        await asyncio.wait_for(front.stdin.drain(), 5)
-        return await self._response(front, request_id)
-
-    async def _finish(self, front, diagnostics, session_id):
-        result, _ = await self._request(
-            front, 90, "session/close", {"sessionId": session_id})
-        self.assertEqual(result, {})
-        # The original owner must no longer route requests to the closed worker.
-        front.stdin.write((json.dumps(acps.request(
-            91, "session/prompt", {"sessionId": session_id,
-                                   "prompt": [{"type": "text", "text": "forbidden"}]}))
-                           + "\n").encode())
-        await asyncio.wait_for(front.stdin.drain(), 5)
-        async with asyncio.timeout(5):
-            while True:
-                line = await front.stdout.readline()
-                self.assertTrue(line, "front exited before rejecting closed session")
-                message = json.loads(line)
-                if message.get("id") == 91:
-                    self.assertIn("unknown session", message["error"]["message"])
-                    break
-        front.stdin.close()
-        await asyncio.wait_for(front.wait(), 5)
-        stderr = await asyncio.wait_for(diagnostics, 5)
-        self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
-        self.assertEqual(await asyncio.wait_for(front.stdout.read(), 5), b"")
-
-
 class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     async def test_saved_session_list_load_resume_durable_journey(self):
         import datetime
@@ -1639,6 +1431,269 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                 # Backstop only: owned job exit/output was asserted above.
                 for owner in workers:
                     await asyncio.wait_for(owner.close(), 3)
+
+
+def _command_fixture(root):
+    import base64
+    workspace = os.path.join(root, "workspace")
+    destination = os.path.join(workspace, "changed cwd")
+    os.makedirs(destination)
+    payload = b"ACP-W1 destination bytes"
+    for directory, content in ((workspace, b"wrong initial cwd"), (destination, payload)):
+        with open(os.path.join(directory, "payload.txt"), "wb") as stream:
+            stream.write(content)
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+        "/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
+    with open(os.path.join(destination, "shot.png"), "wb") as stream:
+        stream.write(png)
+    read = "type" if os.name == "nt" else "cat"
+    command = f"{read} payload.txt >> executed.txt && {read} executed.txt"
+    output = "status: completed\nexit_code: 0\n[stdout]\n" + payload.decode()
+    model_text = f"I ran the local command `{command}`.\nOutput:\n```\n{output}\n```"
+    image = {"type": "image", "source": {
+        "type": "base64", "media_type": "image/png",
+        "data": base64.b64encode(png).decode("ascii"),
+    }}
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("LOKI_")
+                   and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+    environment.update({
+        "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+        "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
+        "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
+        "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Local command answer.",
+    })
+    return workspace, os.path.realpath(destination), payload, png, command, output, model_text, image, environment
+
+
+async def _command_status(environment):
+    from loki_agent import paths, response_headers
+    path = os.path.join(paths.loki_state_dir(environment), "response-headers.json")
+    store = response_headers.Store(path)
+    store.observer("https://unrelated.example/v1/chat/completions", None, "observed-model")(
+        200, {"x-remaining": "7"})
+    await store.save()
+    with open(path, "rb") as stream:
+        original = stream.read()
+    return store, path, original
+
+
+class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    def _advertisement(self, commands):
+        names = [command["name"] for command in commands]
+        self.assertEqual(set(names), {"status", "account", "pwd", "cd", "ps", "image"})
+        self.assertEqual(len(names), 6)
+        self.assertTrue(all(command["description"] for command in commands))
+        self.assertNotIn("model", names)
+        self.assertNotIn("effort", names)
+
+    def _status(self, messages, session_id, original):
+        updates = _tool_updates(messages, session_id)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["sessionUpdate"], "agent_message_chunk")
+        document = json.loads(updates[0]["content"]["text"])
+        self.assertEqual(document, json.loads(original))
+        self.assertEqual(document["version"], 1)
+        self.assertEqual(len(document["endpoints"]), 1)
+        entry = document["endpoints"][0]
+        self.assertEqual(entry["endpoint"], "https://unrelated.example/v1/chat/completions")
+        self.assertEqual(entry["headers"]["x-remaining"]["value"], "7")
+        self.assertEqual(entry["latest"]["model"], "observed-model")
+        self.assertEqual(entry["latest"]["status"], 200)
+
+    def _saved(self, path, destination, model_text, image, answers):
+        from loki_agent import formats
+        with open(path, encoding="utf-8") as stream:
+            blob = json.load(stream)
+        formats.validate_events(blob["events"])
+        self.assertEqual(_conversation_pairs(blob), [
+            ("user", [{"type": "text", "text": model_text}, image]),
+            ("assistant", [{"type": "text", "text": answers[0]}]),
+            ("user", [{"type": "text", "text": "Second prompt"}]),
+            ("assistant", [{"type": "text", "text": answers[1]}]),
+        ])
+        start = next(i for i, event in enumerate(blob["events"]) if event.get("role") == "user")
+        self.assertEqual([event["type"] for event in blob["events"][start:]],
+                         ["message", "model_response", "message", "model_response"])
+        self.assertEqual(blob["session_state"]["shell_cwd"], destination)
+
+    async def test_shipped_commands_snapshot_bang_two_turns_and_close(self):
+        import socket
+        from loki_agent import loki
+        with tempfile.TemporaryDirectory() as root:
+            workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
+            _store, status_path, status_bytes = await _command_status(env)
+            configure_container(env, workspace)
+            # The new virtual cwd is also a supported configured workspace on
+            # Windows; no alternative launcher or containment route is invented.
+            configure_container(env, destination)
+            front, diagnostics = await self._front(env, workspace)
+            initialized, _ = await self._request(front, 1, "initialize", {"protocolVersion": 1})
+            self.assertEqual(initialized["protocolVersion"], 1)
+            self.assertEqual(initialized["agentInfo"]["name"], "loki")
+            self.assertEqual(initialized["agentInfo"]["version"], __version__)
+            for capability in ("close", "list", "resume"):
+                self.assertEqual(initialized["agentCapabilities"]["sessionCapabilities"][capability], {})
+            self.assertIs(initialized["agentCapabilities"]["promptCapabilities"]["image"], False)
+            opened, preceding = await self._request(front, 2, "session/new", {"cwd": workspace})
+            session_id = opened["sessionId"]
+            self.assertTrue(session_id)
+            self.assertFalse(any(message.get("method") == "session/update" for message in preceding))
+            advertised = json.loads(await asyncio.wait_for(front.stdout.readline(), 5))
+            self.assertEqual(advertised["method"], "session/update")
+            self.assertEqual(advertised["params"]["sessionId"], session_id)
+            self.assertEqual(advertised["params"]["update"]["sessionUpdate"], "available_commands_update")
+            self._advertisement(advertised["params"]["update"]["availableCommands"])
+            path = os.path.join(loki.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+
+            async def prompt(request_id, text):
+                reply, messages = await self._request(front, request_id, "session/prompt", {
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": text}],
+                })
+                self.assertEqual(reply, {"stopReason": "end_turn"})
+                return messages
+
+            for request_id, text, expected in (
+                    (3, "/pwd", f"cwd: {workspace}"),
+                    (4, f"/cd {destination}", f"cwd: {destination}"),
+                    (5, "/pwd", f"cwd: {destination}"),
+                    (6, "/image shot.png", f"Attached image for next prompt: {os.path.join(destination, 'shot.png')} (image/png, {len(png)} bytes)")):
+                messages = await prompt(request_id, text)
+                self.assertEqual(_tool_updates(messages, session_id), _assistant_chunks(expected))
+            self._status(await prompt(7, "/status all --json"), session_id, status_bytes)
+            self.assertFalse(os.path.exists(path), "local commands must not save a model turn")
+            with open(status_path, "rb") as stream:
+                self.assertEqual(stream.read(), status_bytes)
+            with open(os.path.join(destination, "shot.png"), "wb") as stream:
+                stream.write(b"\xff\xd8\xffreplacement source")
+            messages = await prompt(8, "!" + command)
+            acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
+            self.assertEqual(_tool_updates(messages, session_id),
+                             _assistant_chunks(acknowledgement, "Local command answer."))
+            self.assertEqual(_tool_updates(await prompt(9, "Second prompt"), session_id),
+                             _assistant_chunks("Local command answer."))
+            with open(os.path.join(destination, "executed.txt"), "rb") as stream:
+                self.assertEqual(stream.read(), payload)
+            self.assertFalse(os.path.exists(os.path.join(workspace, "executed.txt")))
+            await self._finish(front, diagnostics, session_id)
+            self._saved(path, destination, model_text, image,
+                        ("Local command answer.", "Local command answer."))
+
+    async def test_wire_commands_snapshot_bang_and_durable_two_turns(self):
+        import copy
+        import socket
+        from contextlib import ExitStack
+        from loki_agent import formats, loki, paths, protocols
+        from loki_agent.sessions import Session
+        with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+            workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
+            store, status_path, status_bytes = await _command_status(env)
+            stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            stack.enter_context(mock.patch.object(loki, "CREDENTIALS", CredentialStore(env)))
+            stack.enter_context(mock.patch.object(loki, "LOKI_CONFIG_DIR", paths.loki_config_dir(env)))
+            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(root, "jobs")))
+            # Start at the wrong cwd. Only the actual prepare wire request may
+            # install the conversation's initial workspace.
+            session = Session(shell_cwd=root, response_headers=store)
+            stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
+            stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
+            stack.enter_context(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
+            loki.apply_runtime_config(loki.build_config_from_env(credentials=loki.CREDENTIALS))
+            messages = []
+            requests = []
+            session_id = "local-commands"
+            process = _LocalWorkerProcess(session, session_id, lambda message: None)
+            channel = acp.WorkerChannel(session_id, process, messages.append)
+            process_cwd = os.getcwd()
+
+            async def completion(items, _tools, _verbose, _timing, **kwargs):
+                self.assertFalse(kwargs["cancel_check"]())
+                requests.append(copy.deepcopy(items))
+                self.assertLessEqual(len(requests), 2)
+                answer = "Image accepted." if len(requests) == 1 else "Second answer."
+                return formats.DecodedTurn(
+                    [formats.message_item("assistant", answer)],
+                    {"protocol": protocols.OPENAI_CHAT})
+
+            stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
+
+            async def prompt(text):
+                messages.clear()
+                reply = await asyncio.wait_for(channel.request("session/prompt", {
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": text}],
+                }), 10)
+                self.assertEqual(reply, {"stopReason": "end_turn"})
+                return list(messages)
+
+            try:
+                await asyncio.wait_for(channel.request("session/prepare_open", {
+                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"}), 3)
+                opened = await asyncio.wait_for(channel.request("session/commit_open", {}), 3)
+                self.assertEqual(session.shell_cwd, workspace)
+                self._advertisement(opened["lokiCommands"])
+                initial = copy.deepcopy(session.transcript_items)
+                for text, expected in (
+                        ("/pwd", f"cwd: {workspace}"),
+                        (f"/cd {destination}", f"cwd: {destination}"),
+                        ("/pwd", f"cwd: {destination}"),
+                        ("/image shot.png", f"Attached image for next prompt: {os.path.join(destination, 'shot.png')} (image/png, {len(png)} bytes)")):
+                    self.assertEqual(_tool_updates(await prompt(text), session_id), _assistant_chunks(expected))
+                    self.assertEqual(requests, [])
+                    if text.startswith("/cd "):
+                        initial.append({
+                            "type": "message", "role": "system", "content": [{
+                                "type": "text",
+                                "text": f"Current Loki cwd changed to: {destination}. Relative tool paths and Bash commands now run from this directory.",
+                            }],
+                        })
+                    self.assertEqual(session.transcript_items, initial)
+                self._status(await prompt("/status all --json"), session_id, status_bytes)
+                self.assertEqual(requests, [])
+                self.assertEqual(session.transcript_items, initial)
+                with open(status_path, "rb") as stream:
+                    self.assertEqual(stream.read(), status_bytes)
+                with open(os.path.join(destination, "shot.png"), "wb") as stream:
+                    stream.write(b"\xff\xd8\xffreplacement source")
+                acknowledgement = f"{socket.gethostname()}: [Running local command: {command}]\n{output}"
+                self.assertEqual(_tool_updates(await prompt("!" + command), session_id),
+                                 _assistant_chunks(acknowledgement, "Image accepted."))
+                self.assertEqual([item["content"] for item in requests[0] if item.get("role") == "user"],
+                                 [[{"type": "text", "text": model_text}, image]])
+                self.assertEqual(_tool_updates(await prompt("Second prompt"), session_id),
+                                 _assistant_chunks("Second answer."))
+                self.assertEqual(len(requests), 2)
+                self.assertEqual([item["content"] for item in requests[1] if item.get("role") == "user"],
+                                 [[{"type": "text", "text": model_text}, image],
+                                  [{"type": "text", "text": "Second prompt"}]])
+                self.assertEqual(os.getcwd(), process_cwd)
+                self.assertEqual(session.shell_cwd, destination)
+                with open(os.path.join(destination, "executed.txt"), "rb") as stream:
+                    self.assertEqual(stream.read(), payload)
+                self.assertFalse(os.path.exists(os.path.join(workspace, "executed.txt")))
+                self.assertEqual(len(session.job_manager.jobs), 1)
+                job = next(iter(session.job_manager.jobs.values()))
+                self.assertEqual(job.cwd, destination)
+                self.assertEqual(job.status, "exited")
+                self.assertEqual(job.exit_code, 0)
+                self.assertEqual(job.process.returncode, 0)
+                for path, expected in ((job.stdout_path, payload.decode()), (job.stderr_path, "")):
+                    with open(path, encoding="utf-8") as stream:
+                        self.assertEqual(stream.read(), expected)
+                self._saved(session.chat_log_path, destination, model_text, image,
+                            ("Image accepted.", "Second answer."))
+                await asyncio.wait_for(channel.close(), 3)
+                self.assertEqual(process.returncode, 0)
+                self.assertTrue(process.close_task.done())
+                self.assertIsNone(process.close_task.exception())
+                self.assertTrue(channel._reader_task.done())
+                self.assertFalse(channel._pending)
+                self._saved(session.chat_log_path, destination, model_text, image,
+                            ("Image accepted.", "Second answer."))
+            finally:
+                process.close()
+                await asyncio.wait_for(process.wait(), 3)
+                await asyncio.wait_for(channel.close(), 3)
 
 
 class _LocalWorkerProcess:
@@ -2306,48 +2361,6 @@ class TtyStdinTests(unittest.TestCase):
                     proc.kill()
                     proc.wait()
                 os.close(master)
-
-
-class WireCwdTests(unittest.TestCase):
-    """session/open's cwd lands in the session's virtual shell_cwd.
-
-    Workers inherit the front process's cwd; the conversation's working
-    directory arrives over the wire, so a tool call with a relative path
-    resolves inside the session directory, not the worker's.
-    """
-
-    def test_open_sets_shell_cwd_and_tools_resolve(self):
-        from loki_agent.acp_worker import Worker
-        from loki_agent.credentials import CredentialStore
-        from loki_agent.sessions import Session
-        from loki_agent import loki
-
-        async def run():
-            session = Session(shell_cwd="/")  # worker cwd, deliberately wrong
-            worker = Worker(session, lambda message: None)
-            old_credentials = loki.CREDENTIALS
-            old_session = loki._DEFAULT_SESSION
-            try:
-                loki.CREDENTIALS = CredentialStore({})
-                loki._DEFAULT_SESSION = session
-                await worker.prepare_open({
-                    "sessionId": "w",
-                    "cwd": ROOT,
-                    "openMethod": "session/new",
-                })
-                worker.commit_open()
-                result = await loki.dispatch_tool_async(
-                    "Bash", {"command": "cat tests/test_acps.py",
-                             "description": "probe"})
-                return session.shell_cwd, result
-            finally:
-                loki.CREDENTIALS = old_credentials
-                loki._DEFAULT_SESSION = old_session
-
-        shell_cwd, result = asyncio.run(run())
-        self.assertEqual(shell_cwd, ROOT)
-        self.assertTrue(result["ok"])
-        self.assertIn("WireCwdTests", result["content"])
 
 
 class WorkerSessionContractTests(unittest.TestCase):

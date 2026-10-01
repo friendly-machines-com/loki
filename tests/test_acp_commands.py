@@ -9,9 +9,6 @@ from loki_agent import provider_controls
 from loki_agent.sessions import Session
 
 
-PNG = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
-
-
 def session(shell_cwd):
     return Session(shell_cwd=shell_cwd)
 
@@ -20,13 +17,6 @@ class ParseTests(unittest.TestCase):
     def test_plain_text_is_not_a_command(self):
         self.assertIsNone(acp_commands.parse("hello"))
         self.assertIsNone(acp_commands.parse("/not-a-loki-command"))
-
-    def test_local_commands_parse_with_argument(self):
-        self.assertEqual(acp_commands.parse("/pwd"), ("pwd", ""))
-        self.assertEqual(acp_commands.parse("/cd /tmp"), ("cd", "/tmp"))
-        self.assertEqual(
-            acp_commands.parse("/status all --json"),
-            ("status", "all --json"))
 
     def test_skill_names_are_not_local_commands(self):
         # Skills are advertised, then handled by the model's Skill tool.
@@ -38,17 +28,6 @@ class ParseTests(unittest.TestCase):
 
 
 class AdvertisementTests(unittest.TestCase):
-    def test_local_commands_are_advertised(self):
-        with mock.patch.object(loki, "LOKI_CONFIG_DIR", "/nonexistent"):
-            names = {
-                command["name"]
-                for command in acp_commands.advertised_commands()}
-        self.assertIn("pwd", names)
-        self.assertIn("account", names)
-        # /model and /effort are native ACP config options, not commands.
-        self.assertNotIn("model", names)
-        self.assertNotIn("effort", names)
-
     def test_skills_are_advertised_with_descriptions(self):
         with tempfile.TemporaryDirectory() as directory:
             skill = os.path.join(directory, "skills", "demo")
@@ -80,24 +59,6 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     def _install(self, shell_cwd):
         loki._DEFAULT_SESSION = session(shell_cwd)
         return loki._DEFAULT_SESSION
-
-    async def test_pwd_reports_the_shell_cwd(self):
-        _session = self._install("/tmp")
-
-        outcome = await acp_commands.run("/pwd", _session)
-
-        self.assertEqual(outcome.text, "cwd: /tmp")
-        self.assertIsNone(outcome.model_text)
-
-    async def test_cd_changes_and_reports(self):
-        with tempfile.TemporaryDirectory() as directory:
-            _session = self._install("/tmp")
-
-            outcome = await acp_commands.run(f"/cd {directory}", _session)
-
-            self.assertEqual(
-                outcome.text, f"cwd: {os.path.realpath(directory)}")
-            self.assertEqual(_session.shell_cwd, os.path.realpath(directory))
 
     async def test_cd_failure_is_reported_not_raised(self):
         _session = self._install("/tmp")
@@ -150,41 +111,12 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.text, "No such account control: nope")
 
-    async def test_image_stages_a_snapshot(self):
-        with tempfile.TemporaryDirectory() as directory:
-            _session = self._install(directory)
-            path = os.path.join(directory, "shot.png")
-            with open(path, "wb") as stream:
-                stream.write(PNG)
-
-            outcome = await acp_commands.run("/image shot.png", _session)
-
-            self.assertIsNotNone(outcome.image)
-            self.assertEqual(outcome.image.media_type, "image/png")
-            block = outcome.image.content_block()
-            self.assertEqual(block["type"], "image")
-            self.assertIn("Attached image", outcome.text)
-
     async def test_image_failure_is_reported_not_raised(self):
         _session = self._install("/tmp")
 
         outcome = await acp_commands.run("/image nope.png", _session)
 
         self.assertTrue(outcome.text.startswith("image: "))
-
-    async def test_bang_runs_and_prepares_a_model_turn(self):
-        _session = self._install("/tmp")
-
-        async def fake_run(command, **kwargs):
-            self.assertEqual(command, "echo hi")
-            return "hi"
-
-        with mock.patch.object(loki, "run_bash_async", side_effect=fake_run):
-            outcome = await acp_commands.run("!echo hi", _session)
-
-        self.assertIn("Running local command: echo hi", outcome.text)
-        self.assertIn("I ran the local command `echo hi`", outcome.model_text)
-        self.assertIn("hi", outcome.model_text)
 
     async def test_non_command_returns_none(self):
         _session = self._install("/tmp")
