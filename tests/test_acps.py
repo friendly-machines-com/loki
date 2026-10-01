@@ -378,42 +378,6 @@ class SavedConnectionAuthorizationTests(
                 return front, requests, messages, error
         return front, requests, messages, result
 
-    async def test_accepts_exact_connection_before_publishing_worker(self):
-        for method in acp.RESTORE_METHODS:
-            with self.subTest(method=method):
-                front, requests, messages, result = await self._restore(
-                    method, "accept")
-
-                self.assertEqual(result, {})
-                self.assertIn("saved", front.workers)
-                self.assertEqual(
-                    [name for name, _params in requests],
-                    ["session/prepare_open", "session/commit_open"],
-                )
-                self.assertEqual(requests[0][1]["openMethod"], method)
-                elicitation = next(
-                    message for message in messages
-                    if message.get("method") == "elicitation/create")
-                self.assertEqual(elicitation["params"]["requestId"], 73)
-                self.assertEqual(elicitation["params"]["mode"], "form")
-                self.assertIs(
-                    elicitation["params"]["requestedSchema"]["properties"]
-                    ["authorize"]["default"],
-                    False,
-                )
-                self.assertIn(
-                    '"https://saved.example/v1/chat/completions"',
-                    elicitation["params"]["message"],
-                )
-                self.assertIn(
-                    "Working directory:",
-                    elicitation["params"]["message"],
-                )
-                self.assertIn(
-                    json.dumps(ROOT, ensure_ascii=True),
-                    elicitation["params"]["message"],
-                )
-
     async def test_decline_closes_provisional_worker_without_commit(self):
         for method in acp.RESTORE_METHODS:
             with self.subTest(method=method):
@@ -443,22 +407,6 @@ class SavedConnectionAuthorizationTests(
                     message.get("method") == "elicitation/create"
                     for message in messages))
                 self.assertNotIn("saved", front.workers)
-
-    async def test_explicit_startup_connection_needs_no_saved_approval(self):
-        for method in acp.RESTORE_METHODS:
-            with self.subTest(method=method):
-                front, requests, messages, result = await self._restore(
-                    method, "accept", authorization_connection=False)
-
-                self.assertEqual(result, {})
-                self.assertIn("saved", front.workers)
-                self.assertEqual(
-                    [name for name, _params in requests],
-                    ["session/prepare_open", "session/commit_open"],
-                )
-                self.assertFalse(any(
-                    message.get("method") == "elicitation/create"
-                    for message in messages))
 
     async def test_session_lifecycle_requires_explicit_cwd(self):
         front = acp.Front(
@@ -1368,273 +1316,455 @@ class CancelEndToEndTests(unittest.TestCase):
                     front.wait()
 
 
-class SessionRestoreTests(unittest.TestCase):
-    def _front(self, env, cwd):
-        process = subprocess.Popen(
-            loki_acp_command(),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            text=True, env=env, cwd=cwd)
-        self.addCleanup(_close_process_streams, process)
-        return process
+def _conversation_pairs(blob):
+    """Inspect canonical durable messages, without a production replay oracle."""
+    items = []
+    for event in blob["events"]:
+        if event["type"] == "model_response":
+            items.extend(event["items"])
+        else:
+            items.append(event)
+    return [(item["role"], item["content"]) for item in items
+            if item["type"] == "message"
+            and item["role"] in ("user", "assistant")]
 
-    def _env(self, tmpdir, reply="loadable answer"):
-        env = dict(os.environ)
-        env.update({
-            "HOME": tmpdir,
-            "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
-            "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
-            "TERM": "dumb",
-            "LOKI_PROVIDER": "dummy",
-            "LOKI_API_BASE": "http://dummy.invalid/v1",
-            "LOKI_MODEL": "dummy-model",
-            "LOKI_DUMMY_REPLY": reply,
-        })
-        workspace = os.path.join(tmpdir, "workspace")
-        os.makedirs(workspace, exist_ok=True)
-        configure_container(env, workspace)
-        return env
 
-    def _send(self, front, request_id, method, params):
-        front.stdin.write(json.dumps({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }) + "\n")
-        front.stdin.flush()
+def _expected_pairs(*turns):
+    return [
+        (role, [{"type": "text", "text": text}])
+        for prompt, answer in turns
+        for role, text in (("user", prompt), ("assistant", answer))
+    ]
 
-    def _response(self, front, request_id):
+
+def _historical_chunks(messages, session_id):
+    chunks = []
+    for message in messages:
+        if message.get("method") != "session/update":
+            continue
+        params = message["params"]
+        update = params["update"]
+        kind = update["sessionUpdate"]
+        if kind in ("user_message_chunk", "agent_message_chunk"):
+            if params["sessionId"] != session_id:
+                raise AssertionError("replay belongs to a different session")
+            chunks.append((kind, update["content"]))
+    return chunks
+
+
+class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
+    async def _front(self, env, workspace):
+        process = await asyncio.create_subprocess_exec(
+            *loki_acp_command(), env=env, cwd=workspace,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        # Drain diagnostics while the child runs; a full stderr pipe must not
+        # stall the protocol. Register the backstop before readiness assertions.
+        diagnostics = asyncio.create_task(process.stderr.read())
+
+        async def cleanup():
+            if process.returncode is None:
+                process.kill()
+            await asyncio.wait_for(process.wait(), 5)
+            await asyncio.wait_for(diagnostics, 5)
+        self.addAsyncCleanup(cleanup)
+        return process, diagnostics
+
+    async def _response(self, front, request_id):
         preceding = []
+        deadline = asyncio.get_running_loop().time() + 15
         while True:
-            line = front.stdout.readline()
-            self.assertTrue(line, "ACP front produced no response")
+            remaining = deadline - asyncio.get_running_loop().time()
+            line = await asyncio.wait_for(front.stdout.readline(), remaining)
+            self.assertTrue(line, "ACP front exited before its response")
             message = json.loads(line)
             if message.get("id") == request_id:
-                return message, preceding
+                self.assertNotIn("error", message, message)
+                return message["result"], preceding
             preceding.append(message)
 
-    def _initialize(self, front, *, agent_shell=False):
-        params = {"protocolVersion": 1}
-        if agent_shell:
-            params["clientInfo"] = {
-                "name": "agent-shell",
-                "title": "Emacs Agent Shell",
-                "version": "test",
-            }
-        self._send(front, 1, "initialize", params)
-        return self._response(front, 1)[0]["result"]
+    async def _request(self, front, request_id, method, params):
+        front.stdin.write((json.dumps(acps.request(
+            request_id, method, params)) + "\n").encode())
+        await asyncio.wait_for(front.stdin.drain(), 5)
+        return await self._response(front, request_id)
 
-    def _create_saved_session(self, env, tmpdir):
-        workspace = _configured_workspace(tmpdir)
-        front = self._front(env, tmpdir)
-        try:
-            self._initialize(front)
-            self._send(front, 2, "session/new", {"cwd": workspace})
-            session_id = self._response(front, 2)[0]["result"]["sessionId"]
-            self._send(front, 3, "session/prompt", {
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": "remember this"}],
-            })
-            response, _updates = self._response(front, 3)
-            self.assertEqual(response["result"]["stopReason"], "end_turn")
-            return session_id
-        finally:
-            front.stdin.close()
-            front.wait(timeout=5)
+    async def _finish(self, front, diagnostics, session_id):
+        result, _ = await self._request(
+            front, 90, "session/close", {"sessionId": session_id})
+        self.assertEqual(result, {})
+        # The original owner must no longer route requests to the closed worker.
+        front.stdin.write((json.dumps(acps.request(
+            91, "session/prompt", {"sessionId": session_id,
+                                   "prompt": [{"type": "text", "text": "forbidden"}]}))
+                           + "\n").encode())
+        await asyncio.wait_for(front.stdin.drain(), 5)
+        async with asyncio.timeout(5):
+            while True:
+                line = await front.stdout.readline()
+                self.assertTrue(line, "front exited before rejecting closed session")
+                message = json.loads(line)
+                if message.get("id") == 91:
+                    self.assertIn("unknown session", message["error"]["message"])
+                    break
+        front.stdin.close()
+        await asyncio.wait_for(front.wait(), 5)
+        stderr = await asyncio.wait_for(diagnostics, 5)
+        self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
+        self.assertEqual(await asyncio.wait_for(front.stdout.read(), 5), b"")
 
-    def test_load_always_replays_history(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = self._env(tmpdir)
-            saved_id = self._create_saved_session(env, tmpdir)
-            front = self._front(env, tmpdir)
-            try:
-                self._initialize(front)
-                self._send(front, 2, "session/load", {
-                    "sessionId": saved_id,
-                    "cwd": _configured_workspace(tmpdir),
-                    "mcpServers": [],
-                    # This former Loki extension cannot suppress ACP's
-                    # mandatory load replay.
-                    "replay": False,
-                })
-                response, replayed = self._response(front, 2)
-                self.assertNotIn("sessionId", response["result"])
-                self.assertIn("configOptions", response["result"])
-                kinds = [
-                    message["params"]["update"]["sessionUpdate"]
-                    for message in replayed
-                    if message.get("method") == "session/update"
-                ]
-                self.assertIn("user_message_chunk", kinds)
-                self.assertIn("agent_message_chunk", kinds)
-                replayed_text = " ".join(
-                    message["params"]["update"]["content"]["text"]
-                    for message in replayed
-                    if message.get("method") == "session/update"
-                    and message["params"]["update"]["sessionUpdate"]
-                    in ("user_message_chunk", "agent_message_chunk"))
-                self.assertIn("remember this", replayed_text)
-                self.assertIn("loadable answer", replayed_text)
-            finally:
-                front.stdin.close()
-                front.wait(timeout=5)
+    async def test_saved_session_list_load_resume_durable_journey(self):
+        import datetime
+        from loki_agent import formats, loki
 
-    def test_resume_continues_without_replaying_history(self):
-        from loki_agent import loki
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = self._env(tmpdir)
-            saved_id = self._create_saved_session(env, tmpdir)
-            front = self._front(env, tmpdir)
-            try:
-                initialized = self._initialize(front, agent_shell=True)
-                self.assertEqual(
-                    initialized["agentCapabilities"]
-                    ["sessionCapabilities"]["resume"],
-                    {},
-                )
-                self._send(front, 2, "session/list",
-                           {"cwd": _configured_workspace(tmpdir)})
-                listed = self._response(front, 2)[0]
-                self.assertIn(
-                    saved_id,
-                    [entry["sessionId"]
-                     for entry in listed["result"]["sessions"]],
-                )
-                self._send(front, 3, "session/resume", {
-                    "sessionId": saved_id,
-                    "cwd": _configured_workspace(tmpdir),
-                    "mcpServers": [],
-                    # Nor can the old extension make resume replay.
-                    "replay": True,
-                })
-                resumed, preceding = self._response(front, 3)
-                self.assertIn("configOptions", resumed["result"])
-                self.assertFalse(any(
-                    message.get("method") == "session/update"
-                    for message in preceding
-                ), preceding)
-
-                self._send(front, 4, "session/prompt", {
-                    "sessionId": saved_id,
-                    "prompt": [{
-                        "type": "text",
-                        "text": "after minimal resume",
-                    }],
-                })
-                continued, updates = self._response(front, 4)
-                self.assertEqual(
-                    continued["result"]["stopReason"], "end_turn")
-                self.assertTrue(any(
-                    message.get("method") == "session/update"
-                    and message["params"]["update"]["sessionUpdate"]
-                    == "agent_message_chunk"
-                    for message in updates
-                ), updates)
-
-                self._send(
-                    front, 5, "session/close", {"sessionId": saved_id})
-                self.assertEqual(self._response(front, 5)[0]["result"], {})
-            finally:
-                front.stdin.close()
-                front.wait(timeout=5)
-
-            saved_path = os.path.join(
-                loki.chat_log_dir_for(_configured_workspace(tmpdir)),
-                f"chat-{saved_id}.json")
-            with open(saved_path, encoding="utf-8") as stream:
-                persisted = stream.read()
-            self.assertIn("remember this", persisted)
-            self.assertIn("after minimal resume", persisted)
-
-
-class SessionListTests(unittest.TestCase):
-    def test_list_reports_saved_sessions_with_cwd(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = dict(os.environ)
+        with tempfile.TemporaryDirectory() as root:
+            workspace = _configured_workspace(root)
+            os.mkdir(workspace)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("LOKI_")
+                   and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
             env.update({
-                "HOME": tmpdir,
-                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
-                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
-                "TERM": "dumb",
-                "LOKI_PROVIDER": "dummy",
-                "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_MODEL": "dummy-model",
-                "LOKI_DUMMY_REPLY": "one",
+                "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+                "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "first answer",
             })
-            workspace = os.path.join(tmpdir, "workspace")
-            os.makedirs(workspace, exist_ok=True)
             configure_container(env, workspace)
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(m):
-                    front.stdin.write(json.dumps(m) + "\n")
-                    front.stdin.flush()
+            front, diagnostics = await self._front(env, workspace)
+            await self._request(front, 1, "initialize", {"protocolVersion": 1})
+            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
+            session_id = opened["sessionId"]
+            result, _ = await self._request(front, 3, "session/prompt", {
+                "sessionId": session_id, "prompt": [{"type": "text", "text": "first prompt"}]})
+            self.assertEqual(result["stopReason"], "end_turn")
+            await self._finish(front, diagnostics, session_id)
+            path = os.path.join(loki.chat_log_dir_for(workspace), f"chat-{session_id}.json")
 
-                def recv():
-                    line = front.stdout.readline()
-                    self.assertTrue(line)
-                    return json.loads(line)
+            def read_saved(turns):
+                with open(path, encoding="utf-8") as stream:
+                    blob = json.load(stream)
+                formats.validate_events(blob["events"])
+                self.assertEqual(_conversation_pairs(blob), _expected_pairs(*turns))
+                self.assertEqual(blob["session_state"]["shell_cwd"], workspace)
+                return blob
 
-                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": 1}})
-                while recv().get("id") != 1:
-                    pass
-                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": workspace}})
-                while True:
-                    m = recv()
-                    if m.get("id") == 2:
-                        break
-                session_id = m["result"]["sessionId"]
-                send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
-                      "params": {"sessionId": session_id,
-                                 "prompt": [{"type": "text",
-                                             "text": "hi"}]}})
-                while True:
-                    m = recv()
-                    if m.get("id") == 3:
-                        break
-            finally:
-                front.stdin.close()
-                front.wait(timeout=5)
+            turns = [("first prompt", "first answer")]
+            read_saved(turns)
+            for method, extension, prompt, answer in (
+                    ("session/load", False, "loaded prompt", "loaded answer"),
+                    ("session/resume", True, "resumed prompt", "resumed answer")):
+                env["LOKI_DUMMY_REPLY"] = answer
+                front, diagnostics = await self._front(env, workspace)
+                initialized, _ = await self._request(front, 1, "initialize", {
+                    "protocolVersion": 1,
+                    "clientInfo": {
+                        "name": "agent-shell", "title": "Emacs Agent Shell",
+                        "version": "test",
+                    },
+                })
+                self.assertEqual(initialized["agentCapabilities"]["sessionCapabilities"]["resume"], {})
+                for params in ({}, {"cwd": workspace}):
+                    listed, _ = await self._request(front, 2, "session/list", params)
+                    self.assertEqual(len(listed["sessions"]), 1)
+                    entry = listed["sessions"][0]
+                    self.assertEqual(entry["sessionId"], session_id)
+                    self.assertEqual(entry["cwd"], workspace)
+                    self.assertEqual(datetime.datetime.fromisoformat(entry["updatedAt"]),
+                                     datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc))
+                restored, replay = await self._request(front, 3, method, {
+                    "sessionId": session_id, "cwd": workspace, "mcpServers": [], "replay": extension})
+                self.assertNotIn("sessionId", restored)
+                self.assertIn("configOptions", restored)
+                expected_replay = [
+                    (kind, {"type": "text", "text": text})
+                    for user, assistant in turns
+                    for kind, text in (("user_message_chunk", user), ("agent_message_chunk", assistant))
+                ] if method == "session/load" else []
+                self.assertEqual(_historical_chunks(replay, session_id), expected_replay)
+                if method == "session/resume":
+                    self.assertFalse(any(m.get("method") == "session/update" for m in replay), replay)
+                result, updates = await self._request(front, 4, "session/prompt", {
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]})
+                self.assertEqual(result["stopReason"], "end_turn")
+                self.assertEqual(_historical_chunks(updates, session_id), [
+                    ("agent_message_chunk", {"type": "text", "text": answer})])
+                await self._finish(front, diagnostics, session_id)
+                turns.append((prompt, answer))
+                read_saved(turns)
 
-            # A second front process sees the saved conversation listed.
-            front2 = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front2)
-            try:
-                front2.stdin.write(json.dumps({
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "initialize",
-                    "params": {"protocolVersion": 1}}) + "\n")
-                front2.stdin.flush()
-                while True:
-                    m = json.loads(front2.stdout.readline())
-                    if m.get("id") == 1:
-                        break
-                front2.stdin.write(json.dumps({
-                    "jsonrpc": "2.0", "id": 2,
-                    "method": "session/list",
-                    "params": {}}) + "\n")
-                front2.stdin.flush()
-                m = json.loads(front2.stdout.readline())
-                self.assertEqual(m["id"], 2)
-                sessions = m["result"]["sessions"]
-                self.assertEqual(len(sessions), 1, sessions)
-                entry = sessions[0]
-                self.assertEqual(entry["sessionId"], session_id)
-                self.assertEqual(entry["cwd"], workspace)
-                self.assertIn("updatedAt", entry)
-            finally:
-                front2.stdin.close()
-                front2.wait(timeout=5)
+
+class _LocalWorkerProcess:
+    """Byte-transport seam only: real Worker and WorkerChannel, no OS child.
+
+    Worker.handle generates every reply and update. EOF drives Worker.close;
+    wait observes that operation, rather than supplying cleanup in assertions.
+    """
+    def __init__(self, session, session_id, before_request):
+        from loki_agent.acp_worker import Worker
+        self.before_request = before_request
+        self.stdout = asyncio.StreamReader()
+        self.stdin = self
+        self.returncode = None
+        self.buffer = bytearray()
+        self.finished = asyncio.Event()
+        self.close_task = None
+        self.methods = []
+        self.worker = Worker(session, lambda message: self.stdout.feed_data(
+            (json.dumps(message) + "\n").encode()), session_id)
+
+    def write(self, data):
+        self.buffer.extend(data)
+
+    async def drain(self):
+        while b"\n" in self.buffer:
+            line, _, rest = self.buffer.partition(b"\n")
+            self.buffer = bytearray(rest)
+            message = json.loads(line)
+            self.methods.append(message["method"])
+            self.before_request(message)
+            await self.worker.handle(message)
+
+    def close(self):
+        if self.close_task is None:
+            self.close_task = asyncio.create_task(self._finish())
+
+    async def _finish(self):
+        await self.worker.close()
+        self.returncode = 0
+        self.stdout.feed_eof()
+        self.finished.set()
+
+    async def wait_closed(self):
+        await self.wait()
+
+    async def wait(self):
+        await self.finished.wait()
+        return self.returncode
+
+
+class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authorized_restore_continues_and_saves(self):
+        from contextlib import ExitStack
+        from test_http_client import FakeConnector
+        from loki_agent import formats, http_client, loki
+        from loki_agent.sessions import Session
+
+        for explicit in (False, True):
+            for method in acp.RESTORE_METHODS:
+                with self.subTest(explicit=explicit, method=method), tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+                    workspace = os.path.join(root, 'workspace "quoted"')
+                    os.mkdir(workspace)
+                    environment = {key: value for key, value in os.environ.items()
+                                   if not key.startswith("LOKI_")
+                                   and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+                    environment.update({"HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+                                        "XDG_STATE_HOME": os.path.join(root, "state")})
+                    stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
+                    stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
+                    responses = []
+                    for answer in ("original answer", "continued answer"):
+                        body = json.dumps({
+                            "id": answer,
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": answer},
+                                "finish_reason": "stop",
+                            }],
+                        }).encode()
+                        responses.append(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                                         + str(len(body)).encode() + b"\r\n\r\n" + body)
+                    connector = FakeConnector(responses)
+                    open_connection = asyncio.open_connection
+
+                    async def connect(*args, **kwargs):
+                        if "sock" in kwargs:
+                            return await open_connection(*args, **kwargs)
+                        return await connector.open_connection(*args, **kwargs)
+
+                    stack.enter_context(mock.patch.object(
+                        http_client.asyncio, "open_connection", new=connect))
+                    stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", Session(shell_cwd=workspace)))
+                    startup = {"LOKI_PROVIDER": "openai", "LOKI_API_BASE": "https://saved.example/v1",
+                               "LOKI_MODEL": "saved-model", "LOKI_STREAM": "0"}
+                    stack.enter_context(mock.patch.object(loki, "CREDENTIALS", CredentialStore(startup)))
+                    processes = []
+                    delegations = []
+                    channels = []
+                    messages = []
+                    changed = asyncio.Event()
+                    front = None
+
+                    def write(message):
+                        messages.append(message)
+                        changed.set()
+
+                    async def launch(cwd, environment, delegation):
+                        session = Session(shell_cwd=cwd)
+                        session.credential_authority = front.credential_broker
+                        loki._DEFAULT_SESSION = session
+                        # Match the worker entrypoint's explicit startup config;
+                        # prepare_open itself deliberately does not invent it.
+                        if loki.explicit_connection_option(loki.CREDENTIALS):
+                            loki.apply_runtime_config(loki.build_config_from_env(
+                                credentials=loki.CREDENTIALS))
+
+                        def before_request(message):
+                            if message["method"] == "session/commit_open":
+                                self.assertNotIn(process.worker.session_id, front.workers)
+
+                        process = _LocalWorkerProcess(session, "provisional", before_request)
+                        processes.append(process)
+                        delegations.append(delegation)
+                        return process
+
+                    channel_type = acp.WorkerChannel
+
+                    def channel(*args):
+                        result = channel_type(*args)
+                        channels.append(result)
+                        return result
+
+                    stack.enter_context(mock.patch.object(acp.runtime_isolation, "start_worker", new=launch))
+                    stack.enter_context(mock.patch.object(acp, "WorkerChannel", new=channel))
+                    # OS process release is outside this byte-transport lane.
+                    stack.enter_context(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
+
+                    async def backstop():
+                        for process in processes:
+                            process.close()
+                            await asyncio.wait_for(process.wait(), 1)
+                        for channel in channels:
+                            await asyncio.wait_for(channel.close(), 1)
+                        if front is not None:
+                            for task in list(front._tasks):
+                                task.cancel()
+                            await asyncio.gather(*front._tasks, return_exceptions=True)
+
+                    # Runs before restoring patched globals, including on failure.
+                    async def response(request_id):
+                        async with asyncio.timeout(3):
+                            while True:
+                                changed.clear()
+                                for message in messages:
+                                    if message.get("id") == request_id:
+                                        self.assertNotIn("error", message, message)
+                                        return message["result"]
+                                await changed.wait()
+
+                    async def request(request_id, operation, params):
+                        await asyncio.wait_for(front.handle(acps.request(request_id, operation, params)), 3)
+                        return await response(request_id)
+
+                    try:
+                        front = acp.Front(lambda: None, write, loki.CREDENTIALS)
+                        front.initialize({"clientCapabilities": {"elicitation": {"form": {}}}})
+                        opened = await request(1, "session/new", {"cwd": workspace})
+                        session_id = opened["sessionId"]
+                        result = await request(2, "session/prompt", {
+                            "sessionId": session_id,
+                            "prompt": [{"type": "text", "text": "original prompt"}]})
+                        self.assertEqual(result["stopReason"], "end_turn")
+                        path = processes[0].worker.session.chat_log_path
+                        self.assertEqual(await request(3, "session/close", {"sessionId": session_id}), {})
+                        self.assertEqual(processes[0].returncode, 0)
+                        self.assertTrue(channels[0]._reader_task.done())
+                        with open(path, "rb") as stream:
+                            original = stream.read()
+                        self.assertEqual(_conversation_pairs(json.loads(original)),
+                                         _expected_pairs(("original prompt", "original answer")))
+                        credentials = CredentialStore({**startup, "LOKI_API_BASE": "https://explicit.example/v1",
+                                                       "LOKI_MODEL": "explicit-model"} if explicit else {})
+                        loki.CREDENTIALS = credentials
+                        front = acp.Front(lambda: None, write, credentials)
+                        front.initialize({"clientCapabilities": {"elicitation": {"form": {}}}})
+                        messages.clear()
+                        await front.handle(acps.request(73, method, {
+                            "sessionId": session_id, "cwd": workspace,
+                            "replay": method == "session/resume"}))
+                        if not explicit:
+                            async with asyncio.timeout(3):
+                                while not any(m.get("method") == "elicitation/create" for m in messages):
+                                    changed.clear()
+                                    await changed.wait()
+                            elicitation = next(m for m in messages if m.get("method") == "elicitation/create")
+                            params = elicitation["params"]
+                            self.assertEqual(params["requestId"], 73)
+                            self.assertEqual(params["mode"], "form")
+                            self.assertIs(params["requestedSchema"]["properties"]["authorize"]["default"], False)
+                            self.assertIn('"https://saved.example/v1/chat/completions"', params["message"])
+                            self.assertIn("Working directory:", params["message"])
+                            self.assertIn(json.dumps(workspace, ensure_ascii=True), params["message"])
+                            self.assertNotIn(session_id, front.workers)
+                            self.assertIn(session_id, front._opening_sessions)
+                            self.assertEqual(processes[-1].methods, ["session/prepare_open"])
+                            self.assertIsNone(processes[-1].worker.session.runtime_config)
+                            self.assertIsNotNone(processes[-1].worker._pending_open)
+                            self.assertEqual(len(connector.writers), 1)
+                            self.assertEqual(_historical_chunks(messages, session_id), [])
+                            with open(path, "rb") as stream:
+                                self.assertEqual(stream.read(), original)
+                            await front.handle(acps.response(elicitation["id"], result={
+                                "action": "accept", "content": {"authorize": True}}))
+                        restored = await response(73)
+                        self.assertNotIn("sessionId", restored)
+                        self.assertIn("configOptions", restored)
+                        self.assertIn(session_id, front.workers)
+                        self.assertFalse(front._opening_sessions)
+                        self.assertFalse(front._client_requests)
+                        self.assertEqual(processes[-1].methods, ["session/prepare_open", "session/commit_open"])
+                        if explicit:
+                            self.assertFalse(any(m.get("method") == "elicitation/create" for m in messages))
+                        expected = [("user_message_chunk", {"type": "text", "text": "original prompt"}),
+                                    ("agent_message_chunk", {"type": "text", "text": "original answer"})]
+                        self.assertEqual(_historical_chunks(messages, session_id), expected if method == "session/load" else [])
+                        continued_start = len(messages)
+                        result = await request(74, "session/prompt", {
+                            "sessionId": session_id,
+                            "prompt": [{"type": "text", "text": "continued prompt"}]})
+                        self.assertEqual(result["stopReason"], "end_turn")
+                        self.assertEqual(_historical_chunks(messages[continued_start:], session_id), [
+                            ("agent_message_chunk", {"type": "text", "text": "continued answer"})])
+                        self.assertEqual(len(connector.writers), 2)
+                        self.assertEqual(connector.responses, [])
+                        self.assertEqual([call["host"] for call in connector.calls],
+                                         ["saved.example", "explicit.example" if explicit else "saved.example"])
+                        packet = bytes(connector.writers[-1].data)
+                        headers, body = packet.split(b"\r\n\r\n", 1)
+                        host = b"explicit.example" if explicit else b"saved.example"
+                        self.assertIn(b"POST /v1/chat/completions HTTP/1.1\r\n", headers)
+                        self.assertIn(b"Host: " + host, headers)
+                        payload = json.loads(body)
+                        self.assertEqual(payload["model"], "explicit-model" if explicit else "saved-model")
+                        self.assertEqual([(m["role"], m["content"]) for m in payload["messages"]
+                                          if m["role"] in ("user", "assistant")],
+                                         [("user", "original prompt"), ("assistant", "original answer"),
+                                          ("user", "continued prompt")])
+                        for writer in connector.writers:
+                            self.assertTrue(writer.closed)
+                            self.assertTrue(writer.wait_closed_called)
+                        self.assertEqual(await request(75, "session/close", {"sessionId": session_id}), {})
+                        self.assertFalse(front.workers)
+                        self.assertEqual(processes[-1].returncode, 0)
+                        self.assertTrue(processes[-1].close_task.done())
+                        self.assertIsNone(processes[-1].close_task.exception())
+                        self.assertTrue(channels[-1]._reader_task.done())
+                        for delegation in delegations:
+                            self.assertIsNone(delegation.owner_parent)
+                            self.assertIsNone(delegation.owner_child)
+                            self.assertIsNone(delegation.credential_child)
+                            server = delegation.credential_server
+                            self.assertTrue(server._reader_task.done())
+                            self.assertTrue(server._writer_close_task.done())
+                            self.assertIsNone(server._writer_close_task.exception())
+                        self.assertIsNone(channels[-1].credential_delegation)
+                        self.assertFalse(channels[-1]._pending)
+                        with open(path, encoding="utf-8") as stream:
+                            blob = json.load(stream)
+                        formats.validate_events(blob["events"])
+                        self.assertEqual(_conversation_pairs(blob), _expected_pairs(
+                            ("original prompt", "original answer"), ("continued prompt", "continued answer")))
+                    finally:
+                        await backstop()
 
 
 class ConfigOptionTests(unittest.TestCase):
