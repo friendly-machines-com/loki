@@ -219,6 +219,21 @@ def _drop_namespace_capabilities(libc) -> None:
     data = (_CapabilityData * 2)()
     if capset(ctypes.byref(header), data) != 0:
         _raise_errno("capset")
+
+
+def _set_no_new_privileges(libc) -> None:
+    try:
+        prctl = libc.prctl
+    except AttributeError as error:
+        raise RuntimeIsolationError("libc lacks prctl") from error
+    prctl.argtypes = (
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    )
+    prctl.restype = ctypes.c_int
     if prctl(
             ctypes.c_int(_PR_SET_NO_NEW_PRIVS),
             ctypes.c_ulong(1),
@@ -235,10 +250,13 @@ def isolate_credential_directory(directory: str | None = None) -> bool:
     Production supervisors create the dedicated directory before spawning
     every runtime, including before the first login.  The absent-directory
     case remains useful only for runtimes constructed without persistent
-    storage, such as focused tests.
+    storage, such as focused tests. Linux runtimes always set NO_NEW_PRIVS,
+    even when there is no credential directory to hide.
     """
     if not sys.platform.startswith("linux"):
         return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    _set_no_new_privileges(libc)
     target = credential_directory() if directory is None else directory
     if not os.path.isdir(target):
         return False
@@ -249,7 +267,6 @@ def isolate_credential_directory(directory: str | None = None) -> bool:
         raise RuntimeIsolationError(
             f"could not record the runtime working directory: {error}"
         ) from error
-    libc = ctypes.CDLL(None, use_errno=True)
     # Once the new user namespace exists, an unmapped caller is reported as
     # the overflow identity. Preserve the real IDs before unshare so the map
     # describes the supervisor-visible user rather than that placeholder.

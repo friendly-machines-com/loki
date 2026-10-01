@@ -141,6 +141,47 @@ class LinuxIsolationTests(unittest.TestCase):
     differ, not because the property does.
     """
 
+    def test_missing_credentials_still_sets_and_inherits_no_new_privileges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code = r"""
+import ctypes
+import subprocess
+import sys
+from loki_agent.runtime_isolations import isolate_credential_directory
+
+assert isolate_credential_directory(sys.argv[1]) is False
+libc = ctypes.CDLL(None)
+assert libc.prctl(39, 0, 0, 0, 0) == 1  # PR_GET_NO_NEW_PRIVS
+subprocess.run([
+    sys.executable, "-c",
+    "import ctypes; assert ctypes.CDLL(None).prctl(39, 0, 0, 0, 0) == 1",
+], check=True)
+"""
+            process = subprocess.run(
+                [sys.executable, "-c", code,
+                 os.path.join(directory, "missing")],
+                cwd=ROOT, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+
+    def test_no_new_privileges_failure_is_fatal_without_credentials(self):
+        libc = mock.Mock()
+        libc.prctl.return_value = -1
+        with mock.patch.object(runtime_isolations.ctypes, "CDLL",
+                               return_value=libc), \
+                mock.patch.object(runtime_isolations.ctypes, "get_errno",
+                                  return_value=errno.EPERM), \
+                mock.patch.object(runtime_isolations.os.path, "isdir",
+                                  return_value=False):
+            with self.assertRaisesRegex(
+                    runtime_isolations.RuntimeIsolationError,
+                    "PR_SET_NO_NEW_PRIVS"):
+                runtime_isolations.isolate_credential_directory("/missing")
+        self.assertEqual(
+            [argument.value for argument in libc.prctl.call_args.args],
+            [runtime_isolations._PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0],
+        )
+
     def test_runtime_rebinds_cwd_through_credential_cover(self):
         # Windows side: test_windows_runtime.IsolationSeamTests
         # .test_runtime_cwd_is_the_supervisor_cwd_not_the_workspace.
