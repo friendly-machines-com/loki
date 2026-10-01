@@ -107,9 +107,10 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
 
         async def refresh(refresh_token):
             calls.append(refresh_token)
+            generation = len(calls)
             return authentications.RefreshResult(
-                access_token="access-new",
-                refresh_token="refresh-new",
+                access_token=f"access-{generation}",
+                refresh_token=f"refresh-{generation}",
             )
 
         async def rotate(tokens):
@@ -133,13 +134,24 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             credential, rejected_generation=first.generation)
 
         self.assertEqual(first.value, "access-old")
-        self.assertEqual(second.value, "access-new")
+        self.assertEqual(second.value, "access-1")
+        self.assertEqual(first.generation, 0)
+        self.assertEqual(second.generation, 1)
         self.assertEqual(calls, ["refresh-old"])
         self.assertFalse(hasattr(second, "refresh_token"))
         third = await self.client.lease(
             credential, rejected_generation=second.generation)
-        self.assertEqual(third.value, "access-new")
-        self.assertEqual(calls, ["refresh-old", "refresh-new"])
+        self.assertEqual(third.value, "access-2")
+        self.assertEqual(third.generation, 2)
+        self.assertEqual(calls, ["refresh-old", "refresh-1"])
+        # A late rejection of generation zero adopts generation two; it must
+        # not refresh again or roll the client back to an earlier token.
+        stale = await self.client.lease(
+            credential, rejected_generation=first.generation)
+        self.assertEqual((stale.credential, stale.value, stale.generation),
+                         (credential, "access-2", 2))
+        self.assertEqual(calls, ["refresh-old", "refresh-1"])
+        self.assertFalse(hasattr(third, "refresh_token"))
 
     async def test_concurrent_requests_are_multiplexed(self):
         await self.connect({self.first, self.second})
@@ -151,9 +163,11 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         self.assertEqual(
-            [lease.value for lease in leases].count("first-secret"), 10)
-        self.assertEqual(
-            [lease.value for lease in leases].count("second-secret"), 10)
+            [(lease.credential, lease.value, lease.generation)
+             for lease in leases],
+            [(self.first, "first-secret", 0) if index % 2 == 0
+             else (self.second, "second-secret", 0)
+             for index in range(20)])
 
     async def test_server_serializes_requests_for_bounded_backpressure(self):
         active = 0
@@ -190,8 +204,10 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [lease.value for lease in leases], ["secret"] * 20)
 
-    async def test_owner_close_fails_pending_and_future_requests(self):
+    async def test_capability_revocation_fails_live_pending_and_future_requests(self):
         started = asyncio.Event()
+        cancelled = asyncio.Event()
+        requests = []
 
         class BlockingAuthority:
             def available(inner_self):
@@ -200,8 +216,12 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             async def lease(
                     inner_self, credential,
                     rejected_generation=None):
+                requests.append(credential)
                 started.set()
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
 
         self.server, child_fd = (
             await credential_capabilities.CredentialCapabilityServer.create(
@@ -209,14 +229,25 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.client = (
             await credential_capabilities.CredentialClient.from_fd(child_fd))
         pending = asyncio.create_task(self.client.lease(self.first))
-        await started.wait()
-        await self.server.close()
-
-        with self.assertRaises(
-                credential_capabilities.CapabilityError):
-            await pending
-        with self.assertRaises(credential_capabilities.CapabilityError):
-            await self.client.lease(self.first)
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            self.assertFalse(pending.done())
+            await asyncio.wait_for(self.server.close(), 2)
+            with self.assertRaisesRegex(
+                    credential_capabilities.CapabilityError, "closed"):
+                await asyncio.wait_for(pending, 2)
+            self.assertTrue(cancelled.is_set())
+            self.assertTrue(self.server._reader_task.done())
+            # Client is still present; denial cannot be supplied by voluntarily
+            # shutting it down as the cooperative owner-lifetime child does.
+            with self.assertRaisesRegex(
+                    credential_capabilities.CapabilityError, "closed"):
+                await asyncio.wait_for(self.client.lease(self.first), 2)
+            self.assertEqual(requests, [self.first])
+            self.assertEqual(self.client._pending, {})
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
     async def test_awaited_server_close_waits_for_transport_cleanup(self):
         await self.connect({self.first})
@@ -323,21 +354,30 @@ class DelegatedRuntimeProcessTests(unittest.IsolatedAsyncioTestCase):
                     *arguments, "--credential", self.credential.encode(),
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=out, stderr=err, close_fds=True, **spawn)
-                self.delegation.child_spawned()
-                await self._await_marker(out_path, b"lease:", process)
-                # Revoke lifetime only: closing the owner end must end the
-                # child while the credential server is still live.
-                host_ipc.close_end(self.delegation.owner_parent)
-                self.delegation.owner_parent = None
-                self.assertEqual(
-                    await asyncio.wait_for(process.wait(), 30), 0)
+                # Register the backstop before the first readiness assertion;
+                # a failed handshake must not leave a child using the files.
+                try:
+                    self.delegation.child_spawned()
+                    await self._await_marker(out_path, b"lease:", process)
+                    self.assertIsNone(process.returncode)
+                    self.assertFalse(
+                        self.delegation.credential_server._reader_task.done())
+                    # This is cooperative lifetime shutdown, not proof that
+                    # a still-live credential channel rejects new requests.
+                    host_ipc.close_end(self.delegation.owner_parent)
+                    self.delegation.owner_parent = None
+                    self.assertEqual(
+                        await asyncio.wait_for(process.wait(), 5), 0)
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                    await asyncio.wait_for(process.wait(), 5)
             with open(out_path, encoding="utf-8") as stream:
                 stdout = stream.read()
             with open(err_path, encoding="utf-8") as stream:
                 stderr = stream.read()
 
-        self.assertIn("lease:delegated-secret", stdout)
-        self.assertIn("revoked", stdout)
+        self.assertEqual(stdout, "lease:delegated-secret\nrevoked\n")
         self.assertEqual(stderr, "")
 
     @staticmethod

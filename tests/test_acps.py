@@ -1869,83 +1869,100 @@ class WorkerReasoningConfigTests(unittest.TestCase):
             loki.CREDENTIALS = old_credentials
 
     def test_effort_change_during_prompt_applies_to_next_turn(self):
-        from loki_agent import loki, protocols
+        from loki_agent import formats, loki, protocols
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
 
-        old_session = loki._DEFAULT_SESSION
-        try:
-            session = Session(shell_cwd=ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, 'read.txt')
+            with open(target, 'w', encoding='utf-8') as stream:
+                stream.write('real tool continuation')
+            session = Session(shell_cwd=directory)
+            session.chat_log_path = os.path.join(directory, 'chat.json')
             session.runtime_config = loki.make_runtime_config(
-                "https://api.openai.com/v1/responses",
-                protocols.OPENAI_RESPONSES,
-                model="gpt-test",
-                provider_id="openai",
-                reasoning_effort_profile=self._profile("low", "high"),
-            )
-            session.reasoning_effort_preference = "high"
-            session.session_state = {"reasoning_effort": "high"}
-            loki._DEFAULT_SESSION = session
-            written = []
-            worker = Worker(session, written.append, "session")
+                'https://api.openai.com/v1/responses',
+                protocols.OPENAI_RESPONSES, model='gpt-test',
+                provider_id='openai',
+                reasoning_effort_profile=self._profile('low', 'high'))
+            session.reasoning_effort_preference = 'high'
+            session.session_state = {'reasoning_effort': 'high'}
+            written, snapshots = [], []
+            worker = Worker(session, written.append, 'session')
             worker._set_choices([
-                ({
-                    "value": "model",
-                    "name": "Model",
-                }, object()),
-            ], "model")
-            started = asyncio.Event()
-            release = asyncio.Event()
-            snapshots = []
+                ({'value': 'model', 'name': 'Model'}, object())], 'model')
+            started, release = asyncio.Event(), asyncio.Event()
 
-            async def run_turn(_on_event, reasoning_effort):
+            async def completion(items, tools, *args, reasoning_effort, **kwargs):
                 snapshots.append(reasoning_effort)
-                started.set()
-                await release.wait()
+                if len(snapshots) == 1:
+                    started.set()
+                    await release.wait()
+                    return formats.DecodedTurn([
+                        formats.tool_call_item('read', 'Read',
+                                               {'file_path': target})])
+                if len(snapshots) == 2:
+                    result = next(item for item in items
+                                  if item.get('type') == 'tool_result')
+                    self.assertEqual(result['call_id'], 'read')
+                    self.assertFalse(result['is_error'])
+                    self.assertIn('real tool continuation',
+                                  result['content'][0]['text'])
+                else:
+                    self.assertEqual(len(snapshots), 3)
+                return formats.DecodedTurn([
+                    formats.message_item('assistant',
+                                         f'answer-{len(snapshots)}')])
 
-            worker._run_turn = run_turn
+            async def prompt(request_id):
+                await worker.handle({
+                    'jsonrpc': '2.0', 'id': request_id,
+                    'method': 'session/prompt', 'params': {
+                        'sessionId': 'session',
+                        'prompt': [{'type': 'text', 'text': 'continue'}]}},
+                    concurrent=True)
 
             async def scenario():
-                await worker.handle({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "session/prompt",
-                    "params": {
-                        "sessionId": "session",
-                        "prompt": [{
-                            "type": "text",
-                            "text": "hello",
-                        }],
-                    },
-                }, concurrent=True)
-                await started.wait()
-                await worker.handle({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "session/set_config_option",
-                    "params": {
-                        "sessionId": "session",
-                        "configId": "reasoning_effort",
-                        "value": "effort:low",
-                    },
-                }, concurrent=True)
-                release.set()
-                await worker._prompt_task
+                try:
+                    await prompt(1)
+                    await asyncio.wait_for(started.wait(), 2)
+                    await worker.handle({
+                        'jsonrpc': '2.0', 'id': 2,
+                        'method': 'session/set_config_option', 'params': {
+                            'sessionId': 'session',
+                            'configId': 'reasoning_effort',
+                            'value': 'effort:low'}}, concurrent=True)
+                    release.set()
+                    await asyncio.wait_for(worker._prompt_task, 2)
+                    self.assertEqual(snapshots, ['high', 'high'])
+                    await prompt(3)
+                    await asyncio.wait_for(worker._prompt_task, 2)
+                finally:
+                    release.set()
+                    await asyncio.wait_for(worker.close(), 2)
 
-            asyncio.run(scenario())
-
-            self.assertEqual(snapshots, ["high"])
-            self.assertEqual(
-                loki.current_reasoning_effort_preference(), "low")
-            response = next(
-                message for message in written
-                if message.get("id") == 2)
-            self.assertEqual(
-                response["result"]["configOptions"][1]["currentValue"],
-                "effort:low",
-            )
-        finally:
-            loki._DEFAULT_SESSION = old_session
+            with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                    mock.patch.object(loki, 'file_state', {}), \
+                    mock.patch.object(loki, 'async_chat_completion', completion):
+                asyncio.run(scenario())
+            self.assertEqual(snapshots, ['high', 'high', 'low'])
+            response = next(message for message in written
+                            if message.get('id') == 2)
+            self.assertEqual(response['result']['configOptions'][1]
+                             ['currentValue'], 'effort:low')
+            for request_id in (1, 3):
+                response = next(message for message in written
+                                if message.get('id') == request_id)
+                self.assertEqual(response['result']['stopReason'], 'end_turn')
+            with open(session.chat_log_path, encoding='utf-8') as stream:
+                saved = json.load(stream)
+            self.assertEqual(saved['session_state']['reasoning_effort'], 'low')
+            results = [item for item in saved['events']
+                       if item.get('type') == 'tool_result']
+            self.assertEqual([item['call_id'] for item in results], ['read'])
+            self.assertFalse(results[0]['is_error'])
+            self.assertIn('real tool continuation', results[0]['content'][0]['text'])
+            self.assertIn('answer-2', json.dumps(saved['events']))
+            self.assertIn('answer-3', json.dumps(saved['events']))
 
 
 class TtyStdinTests(unittest.TestCase):

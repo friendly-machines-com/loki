@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -141,28 +142,76 @@ class LinuxIsolationTests(unittest.TestCase):
     differ, not because the property does.
     """
 
-    def test_missing_credentials_still_sets_and_inherits_no_new_privileges(self):
+    def test_storage_free_runtime_sets_no_new_privileges_from_known_state(self):
+        # A real child can inherit an already-set flag. This native-call seam
+        # starts at zero as well as one, so omitting the setter cannot pass.
+        for initial in (0, 1):
+            with self.subTest(initial=initial), \
+                    tempfile.TemporaryDirectory() as directory:
+                state = initial
+                calls = []
+
+                def prctl(*arguments):
+                    nonlocal state
+                    values = tuple(argument.value for argument in arguments)
+                    calls.append(values)
+                    self.assertEqual(values, (38, 1, 0, 0, 0))
+                    state = 1
+                    return 0
+
+                libc = mock.Mock(prctl=mock.Mock(side_effect=prctl))
+                with mock.patch.object(runtime_isolations.ctypes, "CDLL",
+                                       return_value=libc), \
+                        mock.patch.object(
+                            runtime_isolations,
+                            "_unshare_user_and_mount_namespaces") as unshare:
+                    self.assertFalse(
+                        runtime_isolations.isolate_credential_directory(
+                            os.path.join(directory, "missing")))
+                    self.assertEqual(state, 1)
+                    self.assertEqual(calls, [(38, 1, 0, 0, 0)])
+                    # Repeated storage-free initialization is still protected.
+                    self.assertFalse(
+                        runtime_isolations.isolate_credential_directory(
+                            os.path.join(directory, "missing")))
+                    self.assertEqual(state, 1)
+                    self.assertEqual(calls, [(38, 1, 0, 0, 0)] * 2)
+                    unshare.assert_not_called()
+
+    def test_missing_credentials_native_privilege_transition_and_exec(self):
         with tempfile.TemporaryDirectory() as directory:
             code = r"""
 import ctypes
+import json
 import subprocess
 import sys
 from loki_agent.runtime_isolations import isolate_credential_directory
 
-assert isolate_credential_directory(sys.argv[1]) is False
 libc = ctypes.CDLL(None)
-assert libc.prctl(39, 0, 0, 0, 0) == 1  # PR_GET_NO_NEW_PRIVS
-subprocess.run([
+before = libc.prctl(39, 0, 0, 0, 0)  # PR_GET_NO_NEW_PRIVS
+if before == 1:
+    sys.exit(77)  # Irreversible inherited state cannot witness a transition.
+assert before == 0, before
+assert isolate_credential_directory(sys.argv[1]) is False
+assert libc.prctl(39, 0, 0, 0, 0) == 1
+child = subprocess.run([
     sys.executable, "-c",
-    "import ctypes; assert ctypes.CDLL(None).prctl(39, 0, 0, 0, 0) == 1",
-], check=True)
+    "import ctypes; print(ctypes.CDLL(None).prctl(39, 0, 0, 0, 0))",
+], capture_output=True, text=True, check=True, timeout=5)
+print(json.dumps({"before": before, "after": 1,
+                  "exec_child": int(child.stdout)}))
 """
             process = subprocess.run(
                 [sys.executable, "-c", code,
                  os.path.join(directory, "missing")],
                 cwd=ROOT, capture_output=True, text=True, timeout=10,
             )
+            if process.returncode == 77:
+                self.skipTest("native transition unavailable: NO_NEW_PRIVS "
+                              "was already inherited; stateful seam still runs")
             self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(json.loads(process.stdout),
+                             {"before": 0, "after": 1, "exec_child": 1})
 
     def test_no_new_privileges_failure_is_fatal_without_credentials(self):
         libc = mock.Mock()
@@ -182,55 +231,7 @@ subprocess.run([
             [runtime_isolations._PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0],
         )
 
-    def test_runtime_rebinds_cwd_through_credential_cover(self):
-        # Windows side: test_windows_runtime.IsolationSeamTests
-        # .test_runtime_cwd_is_the_supervisor_cwd_not_the_workspace.
-        with tempfile.TemporaryDirectory() as directory:
-            credentials = os.path.join(directory, "credentials")
-            os.mkdir(credentials)
-            marker = os.path.join(credentials, "secret")
-            with open(marker, "w", encoding="ascii") as stream:
-                stream.write("supervisor-visible")
-
-            code = r"""
-import json
-import os
-import sys
-
-from loki_agent.runtime_isolations import isolate_credential_directory
-
-target = sys.argv[1]
-os.chdir(target)
-isolated = isolate_credential_directory(target)
-try:
-    with open("secret", encoding="ascii") as stream:
-        stream.read()
-except (FileNotFoundError, PermissionError):
-    relative_hidden = True
-else:
-    relative_hidden = False
-print(json.dumps({
-    "isolated": isolated,
-    "cwd": os.getcwd(),
-    "relative_hidden": relative_hidden,
-}))
-"""
-            process = subprocess.run(
-                [sys.executable, "-c", code, credentials],
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-            )
-
-            self.assertEqual(process.returncode, 0, process.stderr)
-            result = json.loads(process.stdout)
-            self.assertTrue(result["isolated"])
-            self.assertEqual(result["cwd"], credentials)
-            self.assertTrue(result["relative_hidden"])
-
-    def test_runtime_hides_only_its_credential_directory_and_drops_caps(self):
+    def test_credential_cover_allows_workspace_but_denies_runtime_and_exec_child(self):
         # Windows side:
         # test_windows_appcontainers.AppContainerTests.test_runtime_gate.
         with tempfile.TemporaryDirectory() as directory:
@@ -239,6 +240,11 @@ print(json.dumps({
             marker = os.path.join(credentials, "secret")
             with open(marker, "w", encoding="ascii") as stream:
                 stream.write("supervisor-visible")
+            workspace = os.path.join(directory, "workspace")
+            os.mkdir(workspace)
+            control = os.path.join(workspace, "allowed")
+            with open(control, "w", encoding="ascii") as stream:
+                stream.write("workspace-visible")
 
             code = r"""
 import ctypes
@@ -249,8 +255,27 @@ import sys
 
 from loki_agent.runtime_isolations import isolate_credential_directory
 
-target = sys.argv[1]
+target, workspace, starting_cwd = sys.argv[1:]
+secret = os.path.join(target, "secret")
+control = os.path.join(workspace, "allowed")
+with open(secret, encoding="ascii") as stream:
+    assert stream.read() == "supervisor-visible"
+with open(control, encoding="ascii") as stream:
+    assert stream.read() == "workspace-visible"
+os.chdir(starting_cwd)
 isolated = isolate_credential_directory(target)
+assert os.getcwd() == starting_cwd
+if starting_cwd == target:
+    try:
+        open("secret").close()
+    except (FileNotFoundError, PermissionError):
+        pass
+    else:
+        raise AssertionError("pre-mount cwd still exposes the credential file")
+with open(control, encoding="ascii") as stream:
+    assert stream.read() == "workspace-visible"
+with open(os.path.join(workspace, "runtime-created"), "w") as stream:
+    stream.write("allowed write")
 try:
     os.listdir(target)
 except PermissionError:
@@ -269,7 +294,9 @@ tool = subprocess.run(
         sys.executable,
         "-c",
         (
-            "import sys\n"
+            "import ctypes, sys\n"
+            "assert ctypes.CDLL(None).prctl(39, 0, 0, 0, 0) == 1\n"
+            "assert open(sys.argv[2]).read() == 'workspace-visible'\n"
             "try:\n"
             "    stream = open(sys.argv[1], encoding='ascii')\n"
             "except (FileNotFoundError, PermissionError):\n"
@@ -278,8 +305,10 @@ tool = subprocess.run(
             "    stream.close()\n"
             "    print('visible')\n"
         ),
-        os.path.join(target, "secret"),
+        secret,
+        control,
     ],
+    timeout=5,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
     text=True,
@@ -290,7 +319,7 @@ with open("/proc/self/status", encoding="ascii") as stream:
     for line in stream:
         key, separator, value = line.partition(":")
         if separator and key in {
-                "CapEff", "CapPrm", "CapBnd", "NoNewPrivs"}:
+                "CapEff", "CapPrm", "CapInh", "CapBnd", "NoNewPrivs"}:
             status[key] = value.strip()
 libc = ctypes.CDLL(None, use_errno=True)
 unmount_result = libc.umount2(os.fsencode(target), 0)
@@ -304,32 +333,32 @@ print(json.dumps({
     "unmount_errno": ctypes.get_errno(),
 }))
 """
-            process = subprocess.run(
-                [sys.executable, "-c", code, credentials],
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-            )
+            for starting_cwd in (workspace, credentials):
+                with self.subTest(starting_cwd=starting_cwd):
+                    process = subprocess.run(
+                        [sys.executable, "-c", code, credentials,
+                         workspace, starting_cwd],
+                        cwd=ROOT, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    result = json.loads(process.stdout)
+                    self.assertTrue(result["isolated"])
+                    self.assertTrue(result["hidden"])
+                    self.assertTrue(result["marker_hidden"])
+                    self.assertTrue(result["tool_hidden"], process.stderr)
+                    for key in ("CapEff", "CapPrm", "CapInh", "CapBnd"):
+                        self.assertEqual(result["status"][key], "0" * 16)
+                    self.assertEqual(result["status"]["NoNewPrivs"], "1")
+                    self.assertEqual(result["unmount_result"], -1)
+                    self.assertEqual(result["unmount_errno"], errno.EPERM)
 
-            self.assertEqual(process.returncode, 0, process.stderr)
-            result = json.loads(process.stdout)
-            self.assertTrue(result["isolated"])
-            self.assertTrue(result["hidden"])
-            self.assertTrue(result["marker_hidden"])
-            self.assertTrue(result["tool_hidden"])
-            self.assertEqual(result["status"]["CapEff"], "0" * 16)
-            self.assertEqual(result["status"]["CapPrm"], "0" * 16)
-            self.assertEqual(result["status"]["CapBnd"], "0" * 16)
-            self.assertEqual(result["status"]["NoNewPrivs"], "1")
-            self.assertEqual(result["unmount_result"], -1)
-            self.assertEqual(result["unmount_errno"], errno.EPERM)
-
-            # The child changed only its private mount namespace.
-            with open(marker, encoding="ascii") as stream:
-                self.assertEqual(
-                    stream.read(), "supervisor-visible")
+                    # The runtime can change the workspace, not the parent's
+                    # credential view. Observe both before fixture cleanup.
+                    with open(marker, encoding="ascii") as stream:
+                        self.assertEqual(stream.read(), "supervisor-visible")
+                    with open(os.path.join(workspace, "runtime-created"),
+                              encoding="ascii") as stream:
+                        self.assertEqual(stream.read(), "allowed write")
 
 
 def launch_patches(spawn):
@@ -359,69 +388,122 @@ def launch_patches(spawn):
 
 
 class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_terminal_and_acp_supervisors_load_same_json(self):
+    async def test_shared_subscription_lease_rotate_reopen_and_logout(self):
         with tempfile.TemporaryDirectory() as temporary:
-            storage = credential_storages.JsonCredentialStorage(
-                os.path.join(temporary, "credentials"))
-            stored_tokens = authentications.OpenAITokenSet(
-                access_token="access-secret",
-                refresh_token="refresh-secret",
-                account_id="account",
-                expires_at=10**12,
-            )
-            await storage.store_openai_login(stored_tokens)
-            terminal_supervisor = (
-                credential_supervisors.CredentialSupervisor(
-                    CredentialStore({}), storage))
-            acp_front = acp.Front(
-                lambda: None,
-                lambda _message: None,
-                CredentialStore({}),
-                storage,
-            )
-            credential = (
-                authentications.CredentialRef.openai_subscription())
-
-            terminal_lease = await terminal_supervisor.broker.lease(
-                credential)
-            acp_lease = await acp_front.credential_broker.lease(
-                credential)
-
-            self.assertTrue(
-                terminal_supervisor.inventory.has_ref(credential))
-            self.assertTrue(acp_front.credentials.has_ref(credential))
-            self.assertEqual(
-                terminal_lease.value, "access-secret")
-            self.assertEqual(acp_lease.value, "access-secret")
-            self.assertFalse(hasattr(terminal_lease, "refresh_token"))
-            self.assertFalse(hasattr(acp_lease, "refresh_token"))
-
-    async def test_persistent_subscription_is_leased_not_inherited(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            storage = credential_storages.JsonCredentialStorage(
-                os.path.join(temporary, "credentials"))
+            directory = os.path.join(temporary, "credentials")
+            storage = credential_storages.JsonCredentialStorage(directory)
+            now = time.time()
             tokens = authentications.OpenAITokenSet(
-                access_token="access-secret",
-                refresh_token="refresh-secret",
-                account_id="account",
-                expires_at=10**12,
+                access_token="access-secret", refresh_token="refresh-secret",
+                id_token="identity-secret", account_id="account",
+                fedramp=True, expires_at=10**12, last_refresh=now,
             )
             await storage.store_openai_login(tokens)
-            supervisor = credential_supervisors.CredentialSupervisor(
+            self.assertEqual(
+                credential_storages.JsonCredentialStorage(directory)
+                .load_openai_subscription().tokens, tokens)
+            calls = []
+
+            async def refresh(value):
+                calls.append(value)
+                # The attempt must be durable and secret-free before sending.
+                pending = credential_storages.JsonCredentialStorage(directory)
+                record = pending.load_openai_subscription()
+                self.assertEqual(record.state, "refreshing")
+                self.assertIsNone(record.tokens)
+                if value == "refresh-secret":
+                    return authentications.RefreshResult(
+                        access_token="access-new", refresh_token="refresh-new")
+                self.assertEqual(value, "refresh-new")
+                return authentications.RefreshResult(
+                    access_token="access-next", refresh_token="refresh-next")
+
+            rotate_persisted = storage.rotate_openai_subscription
+
+            async def rotate(current):
+                return await rotate_persisted(
+                    current, refresh=refresh, clock=lambda: now)
+
+            storage.rotate_openai_subscription = rotate
+            terminal = credential_supervisors.CredentialSupervisor(
                 CredentialStore({}), storage)
-            credential = (
-                authentications.CredentialRef.openai_subscription())
+            front = acp.Front(lambda: None, lambda message: None,
+                              CredentialStore({}), storage)
+            credential = authentications.CredentialRef.openai_subscription()
+            leases = []
+            for broker, inventory in (
+                    (terminal.broker, terminal.inventory),
+                    (front.credential_broker, front.credentials)):
+                self.assertTrue(inventory.has_ref(credential))
+                for secret in (tokens.access_token, tokens.refresh_token,
+                               tokens.id_token):
+                    self.assertNotIn(secret, repr(terminal.environment))
+                    self.assertNotIn(secret, repr(inventory))
+                lease = await broker.lease(credential)
+                leases.append(lease)
+                self.assertEqual(lease.value, tokens.access_token)
+                self.assertTrue(lease.refreshable)
+                self.assertFalse(hasattr(lease, "refresh_token"))
+            self.assertEqual(calls, [])
 
-            self.assertTrue(supervisor.inventory.has_ref(credential))
-            self.assertNotIn(
-                "access-secret", repr(supervisor.environment))
-            self.assertNotIn(
-                "refresh-secret", repr(supervisor.inventory))
-            lease = await supervisor.broker.lease(credential)
+            # One supervisor refreshes; the other's stale generation must
+            # adopt the durable result, not spend the old refresh token twice.
+            for broker, old in zip(
+                    (terminal.broker, front.credential_broker), leases):
+                lease = await broker.lease(
+                    credential, rejected_generation=old.generation)
+                self.assertEqual(lease.value, "access-new")
+                self.assertGreater(lease.generation, old.generation)
+                self.assertFalse(hasattr(lease, "refresh_token"))
+            self.assertEqual(calls, ["refresh-secret"])
+            expected = authentications.OpenAITokenSet(
+                access_token="access-new", refresh_token="refresh-new",
+                id_token="identity-secret", account_id="account",
+                fedramp=True, last_refresh=now,
+            )
+            reopened = credential_storages.JsonCredentialStorage(directory)
+            self.assertEqual(reopened.load_openai_subscription().tokens,
+                             expected)
+            fresh_terminal = credential_supervisors.CredentialSupervisor(
+                CredentialStore({}), reopened)
+            fresh_front = acp.Front(
+                lambda: None, lambda message: None,
+                CredentialStore({}), reopened)
+            for broker in (fresh_terminal.broker,
+                           fresh_front.credential_broker):
+                self.assertEqual((await broker.lease(credential)).value,
+                                 "access-new")
+            self.assertEqual(calls, ["refresh-secret"])
 
-            self.assertEqual(lease.value, "access-secret")
-            self.assertTrue(lease.refreshable)
-            self.assertFalse(hasattr(lease, "refresh_token"))
+            # Also preserve the automatic expiry trigger from the old durable
+            # refresh test, not just the rejected-generation route.
+            await storage.store_openai_login(authentications.OpenAITokenSet(
+                access_token="access-new", refresh_token="refresh-new",
+                id_token="identity-secret", account_id="account",
+                fedramp=True, expires_at=1, last_refresh=now))
+            expired = credential_supervisors.CredentialSupervisor(
+                CredentialStore({}), storage)
+            self.assertEqual((await expired.broker.lease(credential)).value,
+                             "access-next")
+            self.assertEqual(calls, ["refresh-secret", "refresh-new"])
+            self.assertEqual(reopened.load_openai_subscription().tokens,
+                             authentications.OpenAITokenSet(
+                                 access_token="access-next",
+                                 refresh_token="refresh-next",
+                                 id_token="identity-secret",
+                                 account_id="account", fedramp=True,
+                                 last_refresh=now))
+
+            await reopened.remove_openai_subscription()
+            self.assertIsNone(
+                credential_storages.JsonCredentialStorage(directory)
+                .load_openai_subscription())
+            logged_out = credential_supervisors.CredentialSupervisor(
+                CredentialStore({}),
+                credential_storages.JsonCredentialStorage(directory))
+            self.assertFalse(logged_out.inventory.has_ref(credential))
+            with self.assertRaises(authentications.CredentialUnavailable):
+                await logged_out.broker.lease(credential)
 
     async def test_subscription_redelegates_to_nested_runtime(self):
         credential = (
@@ -505,50 +587,6 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(supervisor.inventory.has_ref(
                 authentications.CredentialRef.openai_subscription()))
-
-    async def test_broker_refresh_updates_persistent_token_set(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            storage = credential_storages.JsonCredentialStorage(
-                os.path.join(temporary, "credentials"))
-            tokens = authentications.OpenAITokenSet(
-                access_token="access-old",
-                refresh_token="refresh-old",
-                expires_at=1,
-                last_refresh=1,
-            )
-            await storage.store_openai_login(tokens)
-            calls = []
-
-            async def refresh(value):
-                calls.append(value)
-                return authentications.RefreshResult(
-                    access_token="access-new",
-                    refresh_token="refresh-new",
-                )
-
-            rotate_persisted = storage.rotate_openai_subscription
-
-            async def rotate(current):
-                return await rotate_persisted(
-                    current,
-                    refresh=refresh,
-                    clock=lambda: 100,
-                )
-
-            storage.rotate_openai_subscription = rotate
-            supervisor = credential_supervisors.CredentialSupervisor(
-                CredentialStore({}), storage)
-            credential = (
-                authentications.CredentialRef.openai_subscription())
-
-            lease = await supervisor.broker.lease(credential)
-
-            self.assertEqual(lease.value, "access-new")
-            self.assertEqual(calls, ["refresh-old"])
-            self.assertEqual(
-                storage.load_openai_subscription().tokens.refresh_token,
-                "refresh-new",
-            )
 
     async def test_static_environment_credential_is_leased_through_capability(
             self):
@@ -806,35 +844,6 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
             def child_spawn_kwargs(self):
                 return {"pass_fds": (7, 9)}
 
-        if os.name == "nt":
-            # The same spawn, contained: the session cwd keys the container,
-            # the delegation ends cross as handles, and the ambient cwd stays
-            # the front's.
-            from loki_agent import windows_subprocesses
-
-            async def spawn(**kwargs):
-                spawned["kwargs"] = kwargs
-                return object()
-
-            with mock.patch.object(
-                    runtime_isolation.windows_runtime, "required_workspace",
-                    return_value="/recorded/work") as gate, \
-                    mock.patch.object(windows_subprocesses,
-                                      "create_worker_process", new=spawn):
-                await runtime_isolation.start_worker(
-                    "/work", {"SAFE": "value"}, Delegation())
-
-            self.assertEqual(gate.call_args.args, ("/work",))
-            kwargs = spawned["kwargs"]
-            self.assertEqual(kwargs["workspace"], "/recorded/work")
-            self.assertEqual(kwargs["environment"], {"SAFE": "value"})
-            self.assertEqual(kwargs["arguments"], [
-                "--worker", "--session-owner-fd", "7",
-                "--credential-capability-fd", "9"])
-            self.assertEqual(kwargs["inherited_handles"], [7, 9])
-            self.assertEqual(kwargs["current_directory"], os.getcwd())
-            return
-
         async def spawn(*args, **kwargs):
             spawned["args"] = args
             spawned["kwargs"] = kwargs
@@ -861,6 +870,10 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["env"], {"SAFE": "value"})
         self.assertEqual(kwargs["pass_fds"], (7, 9))
         self.assertTrue(kwargs["start_new_session"])
+
+
+class WindowsWorkerStdioTests(unittest.IsolatedAsyncioTestCase):
+    """Portable native-call simulation, including on native Windows runners."""
 
     async def test_worker_stdio_ends_are_handed_over_and_released(self):
         # The contained worker's stdio: the child's ends are the only ones

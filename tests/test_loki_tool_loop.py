@@ -7491,35 +7491,54 @@ class ResponsesToolLoopTests(unittest.TestCase):
 
 
 class HarnessProjectionTests(unittest.TestCase):
-    def test_allowed_tool_subset_is_the_only_schema_advertised(self):
-        seen_tools = []
+    def test_allowed_subset_advertisement_and_real_execution_enforcement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / 'reviewed.txt'
+            target.write_text('read-only sentinel', encoding='utf-8')
+            session = loki.Session(shell_cwd=directory)
+            requests = []
 
-        async def fake_completion(
-                items, tools, model=None, *, codex_turn_state,
-                reasoning_effort=None):
-            seen_tools.extend(tools)
-            return formats.DecodedTurn([
-                formats.message_item("assistant", "done"),
-            ])
+            async def completion(items, tools, model=None, *, codex_turn_state,
+                                 reasoning_effort=None):
+                self.assertEqual({tool['function']['name'] for tool in tools},
+                                 {'Read', 'Grep'})
+                requests.append(copy.deepcopy(items))
+                if len(requests) == 1:
+                    # Read first: absent the allowed-set gate, the subsequent
+                    # Write would be authorized and would really clobber it.
+                    return formats.DecodedTurn([
+                        formats.tool_call_item('read', 'Read',
+                                               {'file_path': str(target)}),
+                        formats.tool_call_item('forbidden', 'Write', {
+                            'file_path': str(target), 'content': 'clobbered'}),
+                    ])
+                self.assertEqual(len(requests), 2)
+                results = [item for item in items
+                           if item.get('type') == 'tool_result']
+                self.assertEqual([item['call_id'] for item in results],
+                                 ['read', 'forbidden'])
+                self.assertFalse(results[0]['is_error'])
+                self.assertIn('read-only sentinel',
+                              results[0]['content'][0]['text'])
+                self.assertTrue(results[1]['is_error'])
+                self.assertIn('Tool Write not available in this subagent',
+                              results[1]['content'][0]['text'])
+                return formats.DecodedTurn([
+                    formats.message_item('assistant', 'inspected without changes')])
 
-        old_completion = loki.async_chat_completion
-        try:
-            loki.async_chat_completion = fake_completion
-            result = asyncio.run(loki.run_tool_loop_async(
-                [formats.message_item("user", "inspect")],
-                allowed={"Read", "Grep"},
-            ))
-        finally:
-            loki.async_chat_completion = old_completion
-
-        self.assertEqual(result, "done")
-        self.assertEqual(
-            {
-                tool["function"]["name"]
-                for tool in seen_tools
-            },
-            {"Read", "Grep"},
-        )
+            transcript = [formats.message_item('user', 'inspect')]
+            with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                    mock.patch.object(loki, 'file_state', {}), \
+                    mock.patch.object(loki, 'async_chat_completion', completion):
+                result = asyncio.run(loki.run_tool_loop_async(
+                    transcript, allowed={'Read', 'Grep'}))
+            self.assertEqual(result, 'inspected without changes')
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(target.read_text(encoding='utf-8'),
+                             'read-only sentinel')
+            self.assertEqual([item['call_id'] for item in transcript
+                              if item.get('type') == 'tool_result'],
+                             ['read', 'forbidden'])
 
     def test_toolless_completion_returns_all_assistant_phases(self):
         async def fake_completion(
@@ -7588,21 +7607,19 @@ class QuestionGuardTests(unittest.TestCase):
         items = [formats.message_item("user", text)]
         return loki.get_tool_loop_extra_context(items)
 
-    def test_question_mark_inhibits(self):
-        self.assertEqual(
-            self._context_for("what does run_edit do?")["inhibit_edits"],
-            "answering the user's question")
-
-    def test_what_anywhere_inhibits(self):
-        self.assertEqual(
-            self._context_for("that is odd, what? exactly fails here")
-            ["inhibit_edits"],
-            "answering the user's question")
-
-    def test_plain_request_does_not_inhibit(self):
-        self.assertFalse(
-            self._context_for("please fix the failing tests")
-            ["inhibit_edits"])
+    def test_question_trigger_boundaries(self):
+        # The current trigger is a trailing question mark or literal 'what?'
+        # anywhere (case-insensitive), not every occurrence of 'what' or '?'.
+        for text, inhibited in (
+                ('why does the build fail?', True),
+                ('that is odd, WHAT? exactly fails here', True),
+                ('what is broken', False),
+                ('does it fail? fix it now', False),
+                ('please fix the failing tests', False)):
+            with self.subTest(text=text):
+                self.assertEqual(self._context_for(text)['inhibit_edits'],
+                                 "answering the user's question"
+                                 if inhibited else False)
 
     def test_only_a_trailing_user_message_counts(self):
         items = [
@@ -7659,30 +7676,41 @@ class QuestionGuardTests(unittest.TestCase):
                     ["inhibit_edits"],
                     f"{mode} mode")
 
-    def test_question_refuses_state_changing_tools(self):
-        extra = self._context_for("what does run_edit do?")
-        for name, args in (
-                ("Edit", {
-                    "file_path": __file__,
-                    "old_string": "x",
-                    "new_string": "y"}),
-                ("Write", {
-                    "file_path": "/tmp/loki-guard-test",
-                    "content": "x"}),
-                ("Bash", {"command": "true"}),
-        ):
-            with self.subTest(tool=name):
-                result = asyncio.run(loki.dispatch_tool_async(
-                    name, args, extra_context=extra))
-                self.assertFalse(result["ok"])
-                self.assertIn(
-                    "answering the user's question", result["content"])
-
-    def test_question_allows_read_only_tools(self):
-        extra = self._context_for("what is in this file?")
-        result = asyncio.run(loki.dispatch_tool_async(
-            "Read", {"file_path": __file__}, extra_context=extra))
-        self.assertTrue(result["ok"])
+    def test_question_refuses_changes_to_disposable_reviewed_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / 'reviewed.txt'
+            target.write_text('preserve these bytes', encoding='utf-8')
+            manager = loki.JobManager(str(root / 'jobs'))
+            session = loki.Session(shell_cwd=directory, job_manager=manager)
+            quote = (subprocess.list2cmdline([str(target)]) if os.name == 'nt'
+                     else shlex.quote(str(target)))
+            with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                    mock.patch.object(loki, 'file_state', {}):
+                extra = self._context_for('what does run_edit do?')
+                read = asyncio.run(loki.dispatch_tool_async(
+                    'Read', {'file_path': str(target)}, extra_context=extra))
+                self.assertTrue(read['ok'])
+                self.assertIn('preserve these bytes', read['content'])
+                # Read-before-write is satisfied, so it cannot accidentally
+                # supply the refusal if the question guard regresses.
+                for name, args in (
+                        ('Edit', {'file_path': str(target),
+                                  'old_string': 'preserve',
+                                  'new_string': 'clobber'}),
+                        ('Write', {'file_path': str(target),
+                                   'content': 'clobbered'}),
+                        ('Bash', {'command': f'echo clobbered > {quote}'})):
+                    with self.subTest(tool=name):
+                        result = asyncio.run(loki.dispatch_tool_async(
+                            name, args, extra_context=extra))
+                        self.assertFalse(result['ok'])
+                        self.assertIn("answering the user's question",
+                                      result['content'])
+                        self.assertEqual(target.read_text(encoding='utf-8'),
+                                         'preserve these bytes')
+                        self.assertEqual(set(root.iterdir()), {target})
+                        self.assertEqual(manager.jobs, {})
 
     def test_refused_bash_grep_recommends_grep_tool(self):
         command = {"command": "grep -rn foo ."}

@@ -36,25 +36,34 @@ class ProcessProtectionTests(unittest.TestCase):
         self.assertFalse(protected)
         load.assert_not_called()
 
-    def test_linux_sets_and_verifies_non_dumpable(self):
-        prctl = FakePrctl([0, 0])
-        libc = mock.Mock(prctl=prctl)
-        with mock.patch.object(
-                process_protections.sys, "platform", "linux"), \
-                mock.patch.object(
-                    process_protections.ctypes, "CDLL",
-                    return_value=libc):
-            protected = (
-                process_protections.protect_credential_process())
-
-        self.assertTrue(protected)
-        self.assertEqual(
-            [call[0] for call in prctl.calls],
-            [
-                process_protections._PR_SET_DUMPABLE,
-                process_protections._PR_GET_DUMPABLE,
-            ],
-        )
+    def test_linux_set_verify_contract_and_fail_closed_errors(self):
+        for results, error in (
+                ([0, 0], None),
+                ([-1], "PR_SET_DUMPABLE failed"),
+                ([0, -1], "unexpected state -1"),
+                ([0, 1], "unexpected state 1"),
+                ([0, 2], "unexpected state 2")):
+            with self.subTest(results=results):
+                prctl = FakePrctl(results)
+                libc = mock.Mock(prctl=prctl)
+                with mock.patch.object(process_protections.sys,
+                                       "platform", "linux"), \
+                        mock.patch.object(process_protections.ctypes, "CDLL",
+                                          return_value=libc), \
+                        mock.patch.object(process_protections.ctypes,
+                                          "get_errno", return_value=13):
+                    if error is None:
+                        self.assertTrue(
+                            process_protections.protect_credential_process())
+                    else:
+                        with self.assertRaisesRegex(
+                                process_protections.ProcessProtectionError,
+                                error):
+                            process_protections.protect_credential_process()
+                expected = [(4, 0, 0, 0, 0)]  # SET_DUMPABLE must clear it.
+                if len(results) == 2:
+                    expected.append((3, 0, 0, 0, 0))  # GET_DUMPABLE
+                self.assertEqual(prctl.calls, expected)
 
     def test_real_process_reports_protection(self):
         if os.name == "nt":
@@ -85,12 +94,20 @@ class ProcessProtectionTests(unittest.TestCase):
             self.assertNotIn("WD", dacl)
             self.assertNotIn("BU", dacl)
             return
+        if not sys.platform.startswith("linux"):
+            self.skipTest("native dumpability witness requires Linux")
         code = (
-            "import ctypes\n"
+            "import ctypes, json\n"
             "from loki_agent import process_protections\n"
-            "process_protections.protect_credential_process()\n"
             "libc = ctypes.CDLL(None)\n"
-            "print(libc.prctl(3, 0, 0, 0, 0))\n"
+            "assert libc.prctl(4, 1, 0, 0, 0) == 0\n"
+            "before = libc.prctl(3, 0, 0, 0, 0)\n"
+            "assert before == 1\n"
+            "assert process_protections.protect_credential_process()\n"
+            "after = libc.prctl(3, 0, 0, 0, 0)\n"
+            "assert process_protections.protect_credential_process()\n"
+            "print(json.dumps([before, after,\n"
+            "    libc.prctl(3, 0, 0, 0, 0)]))\n"
         )
 
         process = subprocess.run(
@@ -102,7 +119,7 @@ class ProcessProtectionTests(unittest.TestCase):
         )
 
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertEqual(process.stdout.strip(), "0")
+        self.assertEqual(json.loads(process.stdout), [1, 0, 0])
 
 
 if __name__ == "__main__":

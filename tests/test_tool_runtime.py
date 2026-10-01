@@ -1,5 +1,4 @@
 import asyncio
-import asyncio
 import copy
 import json
 import os
@@ -1161,8 +1160,8 @@ class TurnEndHookTests(unittest.TestCase):
             config_path = os.path.join(directory, "hooks.json")
             with open(config_path, "w", encoding="utf-8") as stream:
                 json.dump({"turn_end": [{
-                    "id": "slow", "command": [sys.executable, "-c",
-                                             "import time; time.sleep(1)"],
+                    "id": "slow", "command": [
+                        sys.executable, "-c", "import time; time.sleep(1)"],
                     "timeout_ms": 20,
                 }]}, stream)
             pipeline = tool_runtime.load_hook_pipeline(config_path)

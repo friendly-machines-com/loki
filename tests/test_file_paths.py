@@ -1,8 +1,11 @@
 """Path lookup regressions and the existing atomic-write/symlink contract."""
 
+import base64
+import hashlib
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -11,22 +14,43 @@ from loki_agent import loki, savefiles, sessions, terminal_frontend
 
 class StatIdentityTests(unittest.TestCase):
 
-    def test_identity_omits_the_deprecated_windows_ctime(self):
-        # Windows st_ctime is deprecated and moving from creation time to
-        # metadata-change time (or zero), so it is not an identity; POSIX ctime
-        # is the kernel-maintained change time and stays.
-        class Stat:
-            st_dev = 1
-            st_ino = 2
-            st_size = 3
-            st_mtime_ns = 4
-            st_ctime_ns = 5
+    def test_observation_handles_ctime_changes_by_platform(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observed'
+            payload = b'known independently hashed content'
+            path.write_bytes(payload)
+            original = path.stat()
+            for platform in ('posix', 'nt'):
+                for expected in (None, original):
+                    with self.subTest(platform=platform,
+                                      expected_stat=expected is not None):
+                        calls = 0
 
-        identity = loki._stat_identity(Stat())
-        if os.name == "posix":
-            self.assertEqual(identity, (1, 2, 3, 4, 5))
-        else:
-            self.assertEqual(identity, (1, 2, 3, 4))
+                        def changing_metadata(fd):
+                            nonlocal calls
+                            calls += 1
+                            return SimpleNamespace(
+                                st_dev=original.st_dev,
+                                st_ino=original.st_ino,
+                                st_size=original.st_size,
+                                st_mtime_ns=original.st_mtime_ns,
+                                st_ctime_ns=original.st_ctime_ns + calls)
+
+                        # Real bytes/open, substituted metadata: test the
+                        # observation consumer, not a private tuple layout.
+                        with mock.patch.object(loki.os, 'name', platform), \
+                                mock.patch.object(loki.os, 'fstat',
+                                                  side_effect=changing_metadata):
+                            if platform == 'posix':
+                                with self.assertRaisesRegex(
+                                        OSError, 'changed while it was being read'):
+                                    loki._file_observation(str(path), expected)
+                            else:
+                                observed = loki._file_observation(str(path), expected)
+                                self.assertEqual(observed.digest,
+                                                 hashlib.sha256(payload).hexdigest())
+                                self.assertEqual(observed.size, len(payload))
+                                self.assertEqual(calls, 2)
 
 
 class FilePathTests(unittest.TestCase):
@@ -160,111 +184,100 @@ class FilePathTests(unittest.TestCase):
         self.assertFalse((self.project / 'missing').exists())
         self.assertTrue(alias.is_symlink())
 
-    def test_read_and_edit_follow_kernel_dotdot_lookup(self):
-        wrong = self.project / 'text.txt'
-        right = self.elsewhere / 'text.txt'
-        wrong.write_text('wrong target')
-        right.write_text('correct target')
-        path = 'link/../text.txt'
-        if os.name != 'posix':
-            # Windows resolves `..` lexically: link/.. is the link's own
-            # directory (the project), not the link target's parent.
-            self.assertIn('wrong target', loki.run_read(path))
-            self.assertNotIn('correct target', loki.run_read(path))
-            self.assertIn('Successfully', loki.run_edit(path, 'wrong', 'edited'))
-            self.assertEqual(wrong.read_text(), 'edited target')
-            self.assertEqual(right.read_text(), 'correct target')
-            return
-        self.assertIn('correct target', loki.run_read(path))
-        self.assertNotIn('wrong target', loki.run_read(path))
-        self.assertIn('Successfully', loki.run_edit(path, 'correct', 'edited'))
-        self.assertEqual(right.read_text(), 'edited target')
-        self.assertEqual(wrong.read_text(), 'wrong target')
+    def test_cwd_read_edit_write_publish_atomically_through_aliases(self):
+        process_cwd = os.getcwd()
+        for chained in (False, True):
+            with self.subTest(chained=chained):
+                case = f'case-{int(chained)}'
+                for base in (self.project, self.elsewhere):
+                    (base / case).mkdir()
+                # POSIX follows link/.. into elsewhere; Windows cancels it
+                # lexically into project. The other copy must never change.
+                selected_base = (self.elsewhere if os.name == 'posix'
+                                 else self.project)
+                other_base = (self.project if os.name == 'posix'
+                              else self.elsewhere)
+                directory = selected_base / case
+                target = directory / 'text.txt'
+                other = other_base / case / 'text.txt'
+                target.write_text('old')
+                target.chmod(0o640)
+                other.write_text('unrelated target')
+                alias = directory / 'alias'
+                links = [alias]
+                if chained:
+                    intermediate = directory / 'intermediate'
+                    intermediate.symlink_to('text.txt')
+                    alias.symlink_to('intermediate')
+                    links.append(intermediate)
+                else:
+                    alias.symlink_to('text.txt')
+                link_operands = {link: os.readlink(link) for link in links}
+                old_link = directory / 'hard-link'
+                os.link(target, old_link)
+                original_inode = target.stat().st_ino
+                literal_directory = str(self.project) + f'/link/../{case}'
+                selected = loki.change_shell_cwd(literal_directory)
+                self.assertTrue(os.path.samefile(selected, directory))
+                self.assertEqual(os.getcwd(), process_cwd)
+                operand = literal_directory + '/alias'
 
-    def test_write_uses_the_kernel_selected_parent_for_temporary_file(self):
-        right = self.elsewhere / 'text.txt'
-        wrong = self.project / 'text.txt'
-        right.write_text('right')
-        wrong.write_text('wrong')
-        path = str(self.project) + '/link/../text.txt'
-        # Windows' lexical `..` selects the project copy; POSIX follows the
-        # link and selects the elsewhere copy.
-        selected = wrong if os.name != 'posix' else right
-        directory = self.project if os.name != 'posix' else self.elsewhere
-        loki.run_read(path)
-        real_open_directory = loki.private_files.open_directory
-        real_create = loki.private_files.create_exclusive_at
-        opened = []
-        created = []
+                # Reading the terminus does not authorize another spelling.
+                loki.run_read(str(target))
+                self.assertIn('You must Read',
+                              loki.run_edit(operand, 'old', 'edited'))
+                self.assertEqual(target.read_text(), 'old')
+                self.assertIn('old', loki.run_read(operand))
+                self.assertIn('old', loki.run_read('alias'))
+                real_open = loki.private_files.open_directory
+                real_create = loki.private_files.create_exclusive_at
+                opened, created = [], []
 
-        def observe_open_directory(name):
-            directory_fd = real_open_directory(name)
-            opened.append(directory_fd)
-            return directory_fd
+                def observe_open(name):
+                    handle = real_open(name)
+                    opened.append(handle)
+                    return handle
 
-        def observe_create(directory_fd, name, mode):
-            created.append(directory_fd)
-            return real_create(directory_fd, name, mode)
+                def observe_create(handle, name, mode):
+                    created.append(handle)
+                    return real_create(handle, name, mode)
 
-        # The temporary file must be created relative to the directory the
-        # kernel opened, not to a spelling an allocator re-derived: the
-        # descriptor the create receives is the one the open returned.  This
-        # holds on both platforms, so no branch is needed.
-        with mock.patch.object(
-                loki.private_files, 'open_directory',
-                side_effect=observe_open_directory), \
-                mock.patch.object(
-                    loki.private_files, 'create_exclusive_at',
-                    side_effect=observe_create):
-            self.assertIn('Successfully', loki.run_write(path, 'updated'))
-        self.assertEqual(created, opened)
-        self.assertEqual(selected.read_text(), 'updated')
-        self.assertFalse(list(directory.glob('.*.tmp')))
-
-    def test_final_symlink_survives_atomic_target_replacement(self):
-        target = self.project / 'target'
-        target.write_text('old')
-        target.chmod(0o640)
-        alias = self.project / 'alias'
-        alias.symlink_to('target')
-        hard_link = self.project / 'hard-link'
-        os.link(target, hard_link)
-        original_inode = target.stat().st_ino
-        # Authorization is per spelling: a read of the target does not
-        # authorise writing the alias, and the alias must be read as such.
-        loki.run_read(str(target))
-        self.assertIn('You must Read', loki.run_edit(str(alias), 'old', 'edited'))
-        self.assertIn('old', loki.run_read(str(alias)))
-        self.assertIn('Successfully', loki.run_edit(str(alias), 'old', 'edited'))
-        self.assertTrue(alias.is_symlink())
-        # Windows readlink reports a \\?\ absolute path, so compare identity.
-        self.assertEqual(os.path.realpath(alias), os.path.realpath(target))
-        self.assertEqual(target.read_text(), 'edited')
-        if os.name == 'posix':
-            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
-        self.assertNotEqual(target.stat().st_ino, original_inode)
-        self.assertEqual(hard_link.read_text(), 'old')
-        self.assertIn('Successfully', loki.run_write(str(alias), 'written'))
-        self.assertTrue(alias.is_symlink())
-        self.assertEqual(target.read_text(), 'written')
-
-    def test_chained_final_symlink_replaces_the_terminus(self):
-        # _follow_final_link follows a chain hop by hop, so a write through a
-        # chain replaces the terminus and leaves every link a link.  A single
-        # readlink would instead have clobbered the intermediate link.
-        target = self.project / 'target'
-        intermediate = self.project / 'intermediate'
-        alias = self.project / 'alias'
-        target.write_text('old')
-        intermediate.symlink_to('target')
-        alias.symlink_to('intermediate')
-        self.assertIn('old', loki.run_read(str(alias)))
-        self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
-        self.assertTrue(alias.is_symlink())
-        self.assertTrue(intermediate.is_symlink())
-        self.assertEqual(target.read_text(), 'updated')
-        self.assertEqual(os.path.realpath(intermediate),
-                         os.path.realpath(target))
+                with mock.patch.object(loki.private_files, 'open_directory',
+                                       side_effect=observe_open), \
+                        mock.patch.object(loki.private_files,
+                                          'create_exclusive_at',
+                                          side_effect=observe_create):
+                    self.assertIn('Successfully',
+                                  loki.run_edit(operand, 'old', 'edited'))
+                    self.assertEqual(target.read_text(), 'edited')
+                    edited_inode = target.stat().st_ino
+                    self.assertNotEqual(edited_inode, original_inode)
+                    self.assertEqual(old_link.read_text(), 'old')
+                    self.assertIn('Successfully',
+                                  loki.run_write(operand, 'written'))
+                self.assertEqual(len(opened), 2)
+                self.assertEqual(created, opened)
+                self.assertNotEqual(target.stat().st_ino, edited_inode)
+                self.assertEqual(target.read_text(), 'written')
+                self.assertEqual(old_link.read_text(), 'old')
+                self.assertEqual(other.read_text(), 'unrelated target')
+                for link, original in link_operands.items():
+                    self.assertTrue(link.is_symlink())
+                    self.assertEqual(os.readlink(link), original)
+                    self.assertTrue(os.path.samefile(link, target))
+                if os.name == 'posix':
+                    self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+                self.assertFalse(list(directory.glob('.*.tmp')))
+                self.assertEqual(os.getcwd(), process_cwd)
+                invalid = literal_directory + '/missing/..'
+                if os.name == 'posix':
+                    with self.assertRaises(FileNotFoundError):
+                        loki.change_shell_cwd(invalid)
+                else:
+                    self.assertTrue(os.path.samefile(
+                        loki.change_shell_cwd(invalid), directory))
+                self.assertTrue(os.path.samefile(loki.current_cwd(), directory))
+                self.assertFalse((directory / 'missing').exists())
 
     def test_dangling_final_symlink_creates_target_and_preserves_link(self):
         alias = self.project / 'alias'
@@ -288,19 +301,21 @@ class FilePathTests(unittest.TestCase):
         wrong.write_text('wrong')
         alias = self.project / 'alias'
         alias.symlink_to('link/../target')
+        original_link = os.readlink(alias)
         if os.name != 'posix':
             # Windows refuses a symlink whose target contains `..` (WinError
-            # 123), so the write is refused and the link stays.
+            # 123), so the write is refused and both files stay untouched.
             self.assertTrue(
                 loki.run_write(str(alias), 'updated').startswith('Error:'))
-            self.assertTrue(alias.is_symlink())
-            return
-        # POSIX applies `..` in the link target through the kernel.
-        selected = right
-        loki.run_read(str(alias))
-        self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
-        self.assertEqual(selected.read_text(), 'updated')
+            self.assertEqual(right.read_text(), 'right')
+        else:
+            # POSIX applies `..` in the link target through the kernel.
+            loki.run_read(str(alias))
+            self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
+            self.assertEqual(right.read_text(), 'updated')
+        self.assertEqual(wrong.read_text(), 'wrong')
         self.assertTrue(alias.is_symlink())
+        self.assertEqual(os.readlink(alias), original_link)
 
     def test_invalid_traversal_does_not_read_a_simplified_path(self):
         target = self.project / 'target'
@@ -372,9 +387,13 @@ class FilePathTests(unittest.TestCase):
         b = self.project / 'b'
         a.symlink_to('b')
         b.symlink_to('a')
+        original_links = {a: os.readlink(a), b: os.readlink(b)}
+        original_names = set(self.project.iterdir())
         self.assertTrue(loki.run_write(str(a), 'wrong').startswith('Error:'))
-        self.assertTrue(a.is_symlink())
-        self.assertTrue(b.is_symlink())
+        for link, operand in original_links.items():
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), operand)
+        self.assertEqual(set(self.project.iterdir()), original_names)
 
     def test_file_operands_do_not_expand_tilde(self):
         (self.project / '~').mkdir()
@@ -386,6 +405,7 @@ class FilePathTests(unittest.TestCase):
             self.assertIn('literal', loki.run_read('~/target'))
             self.assertIn('Successfully', loki.run_write('~/target', 'updated'))
         self.assertEqual((home / 'target').read_text(), 'home target')
+        self.assertEqual((self.project / '~' / 'target').read_text(), 'updated')
 
     def test_unlinked_fd_read_does_not_authorize_a_different_named_file(self):
         if os.name != 'posix':
@@ -409,28 +429,6 @@ class FilePathTests(unittest.TestCase):
             self.assertTrue(result.startswith('Error:'), result)
             self.assertEqual(other.read_text(), 'same bytes')
 
-    def test_cd_validates_path_without_changing_process_cwd(self):
-        original_cwd = os.getcwd()
-        path = str(self.project) + '/link/..'
-        expected = self.project if os.name != 'posix' else self.elsewhere
-        result = loki.change_shell_cwd(path)
-        self.assertTrue(os.path.samefile(result, expected))
-        self.assertEqual(os.getcwd(), original_cwd)
-        (expected / 'target').write_text('correct cwd')
-        self.assertIn('correct cwd', loki.run_read('target'))
-        if os.name == 'posix':
-            with self.assertRaises(FileNotFoundError):
-                loki.change_shell_cwd(str(self.project) + '/missing/..')
-        else:
-            # Windows cancels the missing component lexically, so the parent
-            # directory still resolves and nothing is raised.
-            self.assertTrue(os.path.samefile(
-                loki.change_shell_cwd(str(self.project) + '/missing/..'),
-                self.project))
-        # The second call reports the same directory under a different spelling
-        # on Windows, so compare the objects, not the strings.
-        self.assertTrue(os.path.samefile(loki.current_cwd(), result))
-
     def test_image_lookup_and_invalid_traversals(self):
         correct = b'\x89PNG\r\n\x1a\ncorrect'
         (self.elsewhere / 'image.png').write_bytes(correct)
@@ -444,6 +442,12 @@ class FilePathTests(unittest.TestCase):
             image = terminal_frontend.load_image_attachment(
                 'link/../image.png', base_dir=str(self.project))
             self.assertEqual(image.byte_size, len(correct))
+            self.assertEqual(image.media_type, 'image/png')
+            self.assertEqual(base64.b64decode(image.encoded_data), correct)
+            self.assertTrue(os.path.samefile(
+                image.path, self.elsewhere / 'image.png'))
+            (self.elsewhere / 'image.png').write_bytes(b'changed after staging')
+            self.assertEqual(base64.b64decode(image.encoded_data), correct)
         for path in ('missing/../image.png', 'image.png/'):
             with self.subTest(path=path):
                 with self.assertRaises(terminal_frontend.ImageAttachmentError):
