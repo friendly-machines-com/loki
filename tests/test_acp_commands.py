@@ -83,13 +83,6 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("C:worksub", outcome.text)
 
-    async def test_ps_lists_jobs(self):
-        _session = self._install("/tmp")
-        with mock.patch.object(loki, "run_jobs", return_value="no jobs"):
-            outcome = await acp_commands.run("/ps", _session)
-
-        self.assertEqual(outcome.text, "no jobs")
-
     async def test_status_without_a_connection_says_so(self):
         _session = self._install("/tmp")
 

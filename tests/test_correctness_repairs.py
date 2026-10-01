@@ -500,69 +500,116 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertEqual(metadata["status"], "cancelled")
         self.assertEqual(metadata["exit_code"], job.process.returncode)
 
-    def test_session_close_reaps_owned_jobs_only(self):
+    def test_worker_owned_and_ordinary_job_lifecycle(self):
+        from loki_agent import acp_commands
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+        from process_lifecycle_fixtures import ProcessResources
+
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            session = Session(shell_cwd=tmpdir)
+            session.job_manager = manager
+            worker = Worker(session, lambda message: None, "session")
+            resources = []
+            tasks_before = asyncio.all_tasks()
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            owned_cwd = os.path.join(tmpdir, "owned")
+            ordinary_cwd = os.path.join(tmpdir, "ordinary")
+            os.mkdir(owned_cwd)
+            os.mkdir(ordinary_cwd)
             owned_script = (
-                "import asyncio,sys\n"
+                "import asyncio,sys,os\n"
+                f"sys.path.insert(0, {root!r})\n"
                 "from loki_agent import credential_runtimes, host_ipc\n"
                 "async def main():\n"
                 "    owner = credential_runtimes.SessionOwner(\n"
                 "        host_ipc.child_endpoint(sys.argv[-1]))\n"
-                "    print('owned-ready', flush=True)\n"
+                "    print('owned-ready:' + os.getcwd(), flush=True)\n"
                 "    await owner.closed_task\n"
+                "    print('owner-eof', flush=True)\n"
                 "asyncio.run(main())\n"
             )
-            ordinary_script = (
-                "import time\n"
-                "print('ordinary-ready', flush=True)\n"
-                "time.sleep(30)\n"
-            )
-            # The child imports loki_agent to use the real owner-channel
-            # reader, so it must run where the package is importable.
-            owned = await manager.run_background_exec(
-                [sys.executable, "-c", owned_script],
-                cwd=os.path.dirname(os.path.dirname(__file__)),
-                session_owned=True,
-            )
-            ordinary = await manager.run_background_exec(
-                [sys.executable, "-c", ordinary_script],
-                cwd=tmpdir,
-            )
             try:
-                deadline = asyncio.get_running_loop().time() + 3
-                while (
-                        "owned-ready" not in loki._read_spool_tail(
-                            owned.stdout_path)
-                        or "ordinary-ready" not in loki._read_spool_tail(
-                            ordinary.stdout_path)
-                ):
-                    if asyncio.get_running_loop().time() >= deadline:
-                        self.fail("background processes did not become ready")
-                    await asyncio.sleep(0.01)
-
-                await manager.close_session_owned()
-                self.assertIsNotNone(owned.process.returncode)
-                self.assertIsNone(ordinary.process.returncode)
-                with open(
-                        owned.metadata_path,
-                        encoding="utf-8") as metadata_file:
-                    metadata = json.load(metadata_file)
-                return owned, ordinary, metadata
+                with mock.patch.object(loki, '_DEFAULT_SESSION', session):
+                    owned = await manager.run_background_exec(
+                        [sys.executable, "-c", owned_script], cwd=owned_cwd,
+                        session_owned=True, subagent=True)
+                    resources.append(ProcessResources(owned.process))
+                    ordinary = await manager.run_background_exec(
+                        [sys.executable, "-c",
+                         "import os,time; print('ordinary-ready:' + os.getcwd(), "
+                         "flush=True); time.sleep(60)"], cwd=ordinary_cwd)
+                    resources.append(ProcessResources(ordinary.process))
+                    self.assertEqual(owned.cwd, owned_cwd)
+                    self.assertEqual(ordinary.cwd, ordinary_cwd)
+                    self.assertNotEqual(owned.id, ordinary.id)
+                    deadline = asyncio.get_running_loop().time() + 5
+                    for job, marker in ((owned, 'owned-ready:'),
+                                        (ordinary, 'ordinary-ready:')):
+                        while marker + job.cwd not in loki._read_spool_tail(job.stdout_path):
+                            self.assertIsNone(job.process.returncode,
+                                              loki._read_spool_tail(job.stderr_path))
+                            if asyncio.get_running_loop().time() >= deadline:
+                                self.fail('children did not become ready')
+                            await asyncio.sleep(.01)
+                    self.assertEqual(manager._active_subagents, 1)
+                    outcome = await acp_commands.run('/ps', session)
+                    self.assertEqual(outcome.text, manager.list_jobs())
+                    self.assertEqual(len(outcome.text.splitlines()), 3)
+                    self.assertEqual(outcome.text.splitlines()[0], 'Jobs:')
+                    for job in (owned, ordinary):
+                        self.assertIsNone(job.process.returncode)
+                        self.assertEqual(job.status, 'running')
+                        lines = [line for line in outcome.text.splitlines()
+                                 if line.startswith(f'{job.id}. ')]
+                        self.assertEqual(len(lines), 1)
+                        line, = lines
+                        self.assertIn('status=running', line)
+                        self.assertIn(f'pid={job.process.pid}', line)
+                        self.assertIn(f'cwd={job.cwd!r}', line)
+                        status = manager.job_status(job.id)
+                        self.assertIn(f'cwd: {job.cwd}', status)
+                        self.assertIn('status: running', status)
+                        with open(job.metadata_path, encoding='utf-8') as stream:
+                            metadata = json.load(stream)
+                        self.assertEqual(metadata['cwd'], job.cwd)
+                        self.assertEqual(metadata['status'], 'running')
+                        self.assertEqual(metadata['session_owned'], job is owned)
+                    await _finish_within(worker.close(), 8, 'Worker close')
+                    self.assertEqual(owned.process.returncode, 0)
+                    self.assertEqual(owned.exit_code, 0)
+                    self.assertEqual(owned.status, 'owner_closed')
+                    self.assertIn('owner-eof', loki._read_spool_tail(owned.stdout_path))
+                    self.assertIsNone(owned.owner_signal_fd)
+                    self.assertFalse(owned.subagent_slot)
+                    self.assertEqual(manager._active_subagents, 0)
+                    with open(owned.metadata_path, encoding='utf-8') as stream:
+                        metadata = json.load(stream)
+                    self.assertEqual(metadata['status'], 'owner_closed')
+                    self.assertEqual(metadata['exit_code'], 0)
+                    self.assertTrue(metadata['session_owned'])
+                    await asyncio.sleep(0)
+                    resources[0].assert_released(self)
+                    await _finish_within(worker.close(), 8, 'repeat Worker close')
+                    self.assertIsNone(ordinary.process.returncode)
+                    self.assertEqual(ordinary.status, 'running')
+                    self.assertFalse(ordinary.session_owned)
+                    with open(ordinary.metadata_path, encoding='utf-8') as stream:
+                        self.assertEqual(json.load(stream)['status'], 'running')
+                    host_process.signal_group(ordinary.process, ordinary.pgid,
+                                              host_process.FORCE)
+                    await _finish_within(ordinary.process.wait(), 5, 'ordinary reap')
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    resources[1].assert_released(self)
+                    self.assertFalse(asyncio.all_tasks() - tasks_before)
             finally:
-                if ordinary.process.returncode is None:
-                    host_process.signal_group(
-                        ordinary.process, ordinary.pgid,
-                        host_process.FORCE)
-                    await ordinary.process.wait()
+                for resource in resources:
+                    await resource.cleanup()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            owned, ordinary, metadata = asyncio.run(scenario(tmpdir))
-        self.assertEqual(owned.status, "owner_closed")
-        self.assertEqual(owned.exit_code, 0)
-        self.assertTrue(metadata["session_owned"])
-        self.assertEqual(metadata["status"], "owner_closed")
-        self.assertIsNotNone(ordinary.process.returncode)
+            asyncio.run(_finish_within(scenario(tmpdir), 30, 'job lifecycle'))
 
     def test_bash_timeout_is_a_failed_tool_result(self):
         async def scenario(tmpdir):
@@ -641,46 +688,66 @@ class JobOwnershipContractTests(unittest.TestCase):
             asyncio.run(scenario(tmpdir))
 
     def test_session_close_during_launch_does_not_publish_a_live_child(self):
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+        from process_lifecycle_fixtures import ProcessResources
+
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
-            entered = asyncio.Event()
-            release = asyncio.Event()
+            session = Session(shell_cwd=tmpdir)
+            session.job_manager = manager
+            worker = Worker(session, lambda message: None, "session")
+            entered, release = asyncio.Event(), asyncio.Event()
             real = asyncio.create_subprocess_exec
+            resources = []
+            tasks_before = asyncio.all_tasks()
 
             async def delayed(*args, **kwargs):
                 entered.set()
                 await release.wait()
-                return await real(*args, **kwargs)
+                process = await real(*args, **kwargs)
+                resources.append(ProcessResources(process))
+                return process
 
-            with mock.patch.object(asyncio, "create_subprocess_exec",
-                                   side_effect=delayed):
-                task = asyncio.create_task(manager.run_background_exec(
-                    [sys.executable, "-c", "import time; time.sleep(30)"],
-                    cwd=tmpdir, session_owned=True, subagent=True))
-                entered_task = asyncio.create_task(entered.wait())
-                done, _pending = await asyncio.wait(
-                    {entered_task, task},
-                    return_when=asyncio.FIRST_COMPLETED)
-                if task in done:
-                    # The launch failed before it reached the spawn seam, so
-                    # ``entered`` will never be set; surface the failure now
-                    # rather than waiting on that event forever.
-                    task.result()
-                await manager.close_session_owned()
+            task = None
+            try:
+                with mock.patch.object(asyncio, "create_subprocess_exec", new=delayed):
+                    task = asyncio.create_task(manager.run_background_exec(
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        cwd=tmpdir, session_owned=True, subagent=True))
+                    await _finish_within(entered.wait(), 5, 'launch barrier')
+                    self.assertEqual(manager._active_subagents, 1)
+                    await _finish_within(worker.close(), 5, 'close during launch')
+                    release.set()
+                    with self.assertRaises(loki._JobRevokedDuringLaunch) as raised:
+                        await _finish_within(task, 5, 'revoked launch')
+                    self.assertIs(type(raised.exception), loki._JobRevokedDuringLaunch)
+                self.assertEqual(len(resources), 1)
+                # Observe the captured unpublished child before any backstop.
+                self.assertIsNotNone(resources[0].process.returncode)
+                await asyncio.sleep(0)
+                resources[0].assert_released(self)
+                job, = manager.jobs.values()
+                self.assertIsNone(job.process)
+                self.assertIsNone(job.owner_signal_fd)
+                self.assertEqual(job.status, 'cancelled')
+                self.assertFalse(job.subagent_slot)
+                self.assertEqual(manager._active_subagents, 0)
+                with open(job.metadata_path, encoding='utf-8') as stream:
+                    self.assertEqual(json.load(stream)['status'], 'cancelled')
+                self.assertTrue(task.done())
+                await _finish_within(worker.close(), 5, 'repeat race close')
+                self.assertFalse(asyncio.all_tasks() - tasks_before)
+            finally:
                 release.set()
-                with self.assertRaises(loki._JobRevokedDuringLaunch):
-                    await task
-            return manager
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                for resource in resources:
+                    await resource.cleanup()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = asyncio.run(_finish_within(
-                scenario(tmpdir), 60, "session close during launch"))
-
-        job = next(iter(manager.jobs.values()))
-        self.assertEqual(job.status, "cancelled")
-        # Never published, so the revoked child left no job-owned process.
-        self.assertIsNone(job.process)
-        self.assertEqual(manager._active_subagents, 0)
+            asyncio.run(_finish_within(scenario(tmpdir), 20, 'launch race'))
 
     def test_a_failed_spawn_is_left_as_a_recorded_failed_job(self):
         async def scenario(tmpdir):

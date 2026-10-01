@@ -779,25 +779,6 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
             formats.load_log_blob(blob)
 
 
-class JobCwdVisibilityTests(unittest.TestCase):
-    def test_job_metadata_and_status_show_launch_cwd(self):
-        with tempfile.TemporaryDirectory() as directory:
-            manager = loki.JobManager(directory)
-            job = loki.Job(
-                id="1", command="pwd", argv=None, shell=True,
-                description="show cwd", background=True,
-                spool_dir=directory,
-                stdout_path=os.path.join(directory, "stdout"),
-                stderr_path=os.path.join(directory, "stderr"),
-                metadata_path=os.path.join(directory, "job.json"),
-                started_at_iso="now", cwd=directory, status="exited",
-            )
-            manager.jobs[job.id] = job
-            self.assertEqual(manager._job_metadata(job)["cwd"], directory)
-            self.assertIn(f"cwd: {directory}", manager.job_status("1"))
-            self.assertIn(f"cwd={directory!r}", manager.list_jobs())
-
-
 class TurnEndHookTests(unittest.TestCase):
     def test_no_hooks_do_not_start_subprocess_or_build_payload(self):
         with mock.patch.object(loki, "TOOL_HOOK_PIPELINE",
