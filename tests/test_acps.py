@@ -1077,44 +1077,6 @@ if "--worker" in sys.argv:
 
 
 class EventMapperTests(unittest.TestCase):
-    def test_assistant_delta_streams_chunk(self):
-        from loki_agent import acp_events
-        updates = acp_events.map_event("s", {"type": "assistant_delta",
-                                             "content": "hi"}, {})
-        self.assertEqual(len(updates), 1)
-        self.assertEqual(
-            updates[0]["update"]["sessionUpdate"], "agent_message_chunk")
-        self.assertEqual(updates[0]["update"]["content"]["text"], "hi")
-
-    def test_tool_call_then_result_pair(self):
-        from loki_agent import acp_events
-        state = {}
-        call = acp_events.map_event("s", {"type": "tool_call",
-                                          "name": "Bash",
-                                          "call_id": "call_1",
-                                          "cwd": "/tmp/work",
-                                          "args": {"command": "ls"}}, state)
-        self.assertEqual(call[0]["update"]["sessionUpdate"], "tool_call")
-        self.assertEqual(call[0]["update"]["kind"], "execute")
-        self.assertIn("ls", call[0]["update"]["title"])
-        self.assertIn("cwd: /tmp/work", call[0]["update"]["title"])
-        result = acp_events.map_event("s", {"type": "tool_result",
-                                            "name": "Bash",
-                                            "call_id": "call_1",
-                                            "content": "a\nb",
-                                            "is_error": False}, state)
-        self.assertEqual(result[0]["update"]["sessionUpdate"],
-                         "tool_call_update")
-        self.assertEqual(result[0]["update"]["toolCallId"], "call_1")
-        self.assertNotIn("status", result[0]["update"])
-        self.assertEqual(
-            result[0]["update"]["content"],
-            [{
-                "type": "content",
-                "content": {"type": "text", "text": "a\nb"},
-            }],
-        )
-
     def test_rejected_tool_uses_its_real_call_id(self):
         from loki_agent import acp_events
         updates = acp_events.map_event(
@@ -1147,77 +1109,6 @@ class EventMapperTests(unittest.TestCase):
                      "assistant_start", "provider_notice"):
             self.assertEqual(
                 acp_events.map_event("s", {"type": kind}, {}), [])
-
-
-class UpdateStreamingTests(unittest.TestCase):
-    """A tool-call turn must stream session/update notifications."""
-
-    def test_prompt_emits_updates_and_stop_reason(self):
-        # The dummy provider replies with tool calls when the user text
-        # starts with "tool:" -- reply is JSON naming the call.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = dict(os.environ)
-            env.update({
-                "HOME": tmpdir,
-                "XDG_CONFIG_HOME": os.path.join(tmpdir, "config"),
-                "XDG_STATE_HOME": os.path.join(tmpdir, "state"),
-                "TERM": "dumb",
-                "LOKI_PROVIDER": "dummy",
-                "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_MODEL": "dummy-model",
-                "LOKI_DUMMY_REPLY": "plain answer",
-            })
-            workspace = os.path.join(tmpdir, "workspace")
-            os.makedirs(workspace, exist_ok=True)
-            configure_container(env, workspace)
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front)
-            try:
-                def send(message):
-                    front.stdin.write(json.dumps(message) + "\n")
-                    front.stdin.flush()
-
-                def recv():
-                    line = front.stdout.readline()
-                    self.assertTrue(line, "front produced no message")
-                    return json.loads(line)
-
-                send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": 1}})
-                recv()
-                send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                      "params": {"cwd": workspace}})
-                session_id = recv()["result"]["sessionId"]
-                send({"jsonrpc": "2.0", "id": 3,
-                      "method": "session/prompt",
-                      "params": {"sessionId": session_id,
-                                 "prompt": [{"type": "text",
-                                             "text": "hello"}]}})
-                messages = []
-                while True:
-                    reply = recv()
-                    if reply.get("id") == 3:
-                        break
-                    messages.append(reply)
-                # Plain reply: at least the assistant message chunk arrived
-                # as a session/update notification before the reply.
-                self.assertTrue(
-                    any(m.get("method") == "session/update"
-                        and m["params"]["update"]["sessionUpdate"]
-                        == "agent_message_chunk"
-                        for m in messages),
-                    f"no agent_message_chunk in {[m.get('method') for m in messages]}")
-                self.assertEqual(reply["result"]["stopReason"], "end_turn")
-            finally:
-                front.stdin.close()
-                try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
 
 
 class CancelEndToEndTests(unittest.TestCase):
@@ -1352,7 +1243,7 @@ def _historical_chunks(messages, session_id):
     return chunks
 
 
-class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
+class _ACPFrontFixture:
     async def _front(self, env, workspace):
         process = await asyncio.create_subprocess_exec(
             *loki_acp_command(), env=env, cwd=workspace,
@@ -1413,6 +1304,8 @@ class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
         self.assertEqual(await asyncio.wait_for(front.stdout.read(), 5), b"")
 
+
+class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     async def test_saved_session_list_load_resume_durable_journey(self):
         import datetime
         from loki_agent import formats, loki
@@ -1491,6 +1384,261 @@ class SessionRestoreTests(unittest.IsolatedAsyncioTestCase):
                 await self._finish(front, diagnostics, session_id)
                 turns.append((prompt, answer))
                 read_saved(turns)
+
+
+def _tool_fixture(root):
+    workspace = os.path.join(root, "workspace")
+    os.mkdir(workspace)
+    payload = b"ACP-W3 unique file output"
+    with open(os.path.join(workspace, "payload.txt"), "wb") as stream:
+        stream.write(payload)
+    # A wrong cwd cannot accidentally return the same bytes.
+    with open(os.path.join(root, "payload.txt"), "wb") as stream:
+        stream.write(b"wrong directory")
+    read = "type" if os.name == "nt" else "cat"
+    command = f"{read} payload.txt >> executed.txt && {read} executed.txt"
+    result = "status: completed\nexit_code: 0\n[stdout]\n" + payload.decode()
+    return workspace, payload, command, result
+
+
+def _tool_updates(messages, session_id):
+    updates = []
+    for message in messages:
+        if message.get("method") != "session/update":
+            continue
+        params = message["params"]
+        if params["sessionId"] != session_id:
+            raise AssertionError("tool update belongs to another session")
+        update = params["update"]
+        if update["sessionUpdate"] in (
+                "agent_message_chunk", "user_message_chunk",
+                "tool_call", "tool_call_update"):
+            updates.append(update)
+    return updates
+
+
+def _call_and_result(call_id, command, workspace, result):
+    # Independent ACP wire oracle, including successful-status omission.
+    return [
+        {"sessionUpdate": "tool_call", "toolCallId": call_id,
+         "title": f"Bash: {command} (cwd: {workspace})",
+         "kind": "execute", "status": "in_progress"},
+        {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+         "content": [{"type": "content", "content": {
+             "type": "text", "text": result}}]},
+    ]
+
+
+def _assistant_chunks(*texts):
+    return [{"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": text}} for text in texts]
+
+
+class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    def _saved_tool_turn(self, path, session_id, user, call_id, args, result, answers):
+        from loki_agent import formats
+
+        with open(path, encoding="utf-8") as stream:
+            blob = json.load(stream)
+        formats.validate_events(blob["events"])
+        events = blob["events"]
+        user_index = next(i for i, event in enumerate(events)
+                          if event.get("role") == "user")
+        turn = events[user_index:]
+        self.assertEqual([event["type"] for event in turn],
+                         ["message", "model_response", "tool_result", "model_response"])
+        self.assertEqual(_conversation_pairs(blob), [
+            ("user", [{"type": "text", "text": user}]),
+            *[("assistant", [{"type": "text", "text": answer}]) for answer in answers],
+        ])
+        calls = [item for event in turn if event["type"] == "model_response"
+                 for item in event["items"] if item["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], call_id)
+        self.assertEqual(calls[0]["name"], "Bash")
+        self.assertEqual(json.loads(calls[0]["arguments"]), args)
+        tool_result = turn[2]
+        self.assertEqual(tool_result["call_id"], call_id)
+        self.assertEqual(tool_result["name"], "Bash")
+        self.assertIs(tool_result["is_error"], False)
+        self.assertEqual(tool_result["content"], [{"type": "text", "text": result}])
+        self.assertEqual(os.path.basename(path), f"chat-{session_id}.json")
+        return blob
+
+    async def test_shipped_front_real_tool_updates_save_and_close(self):
+        from loki_agent import loki
+
+        with tempfile.TemporaryDirectory() as root:
+            workspace, payload, command, result = _tool_fixture(root)
+            args = {"command": command, "description": "Read the relative fixture", "timeout": 5000}
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("LOKI_")
+                           and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+            environment.update({
+                "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+                "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Tool complete.",
+                "LOKI_DUMMY_TOOL_CALL": json.dumps({"name": "Bash", "arguments": args}),
+            })
+            configure_container(environment, workspace)
+            front, diagnostics = await self._front(environment, workspace)
+            await self._request(front, 1, "initialize", {"protocolVersion": 1})
+            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
+            session_id = opened["sessionId"]
+            reply, messages = await self._request(front, 3, "session/prompt", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "Run the real file proof"}],
+            })
+            self.assertEqual(reply, {"stopReason": "end_turn"})
+            self.assertEqual(_tool_updates(messages, session_id),
+                             _call_and_result("dummy-tool-call", command, workspace, result)
+                             + _assistant_chunks("Tool complete."))
+            # The append-only witness distinguishes skipped/fabricated dispatch
+            # and duplicate execution; it is read before shutdown/backstops.
+            with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
+                self.assertEqual(stream.read(), payload)
+            await self._finish(front, diagnostics, session_id)
+            path = os.path.join(loki.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+            self._saved_tool_turn(path, session_id, "Run the real file proof",
+                                  "dummy-tool-call", args, result, ["Tool complete."])
+
+    async def test_resource_real_tool_continuation_save_and_fresh_replay(self):
+        import copy
+        from contextlib import ExitStack
+        from pathlib import Path
+        from loki_agent import formats, loki, protocols
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+            workspace, payload, command, result = _tool_fixture(root)
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("LOKI_")
+                           and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+            environment.update({"HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+                                "XDG_STATE_HOME": os.path.join(root, "state")})
+            stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
+            credentials = CredentialStore({
+                "LOKI_PROVIDER": "openai", "LOKI_API_BASE": "https://provider.invalid/v1",
+                "LOKI_MODEL": "tool-model", "LOKI_STREAM": "1",
+            })
+            stack.enter_context(mock.patch.object(loki, "CREDENTIALS", credentials))
+            session = Session(shell_cwd=workspace)
+            stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
+            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(root, "jobs")))
+            stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
+            loki.apply_runtime_config(loki.build_config_from_env(credentials=credentials))
+            messages = []
+            session_id = "tool-workflow"
+            worker = Worker(session, messages.append, session_id)
+            workers = [worker]
+            args = {"command": command, "description": "Read the relative fixture", "timeout": 5000}
+            call_id = "provider-call-73"
+            resource = {"name": "payload.txt", "uri": Path(workspace, "payload.txt").as_uri(),
+                        "title": "Source \u03b1", "description": "A uniquely populated local file",
+                        "mimeType": "text/plain", "size": len(payload)}
+            user = "inspect this\n[ACP resource link]\n" + json.dumps(resource, ensure_ascii=False)
+            requests = []
+
+            async def completion(items, _tools, _verbose, _timing, **kwargs):
+                self.assertFalse(kwargs["cancel_check"]())
+                requests.append(copy.deepcopy(items))
+                self.assertLessEqual(len(requests), 2, "unexpected additional provider request")
+                if len(requests) == 1:
+                    for chunk in ("Inspecting ", "resource."):
+                        kwargs["on_text_delta"](chunk)
+                    return formats.DecodedTurn([
+                        formats.message_item("assistant", "Inspecting resource."),
+                        formats.tool_call_item(call_id, "Bash", args),
+                    ], {"protocol": protocols.OPENAI_CHAT})
+                for chunk in ("Tool ", "complete."):
+                    kwargs["on_text_delta"](chunk)
+                return formats.DecodedTurn([
+                    formats.message_item("assistant", "Tool complete."),
+                ], {"protocol": protocols.OPENAI_CHAT})
+
+            stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
+            try:
+                await asyncio.wait_for(worker.prepare_open({
+                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"}), 3)
+                worker.commit_open()
+                messages.clear()
+                reply = await asyncio.wait_for(worker.prompt({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "inspect this"},
+                               {"type": "resource_link", **resource, "unadvertised": "must not leak"}],
+                }), 10)
+                self.assertEqual(reply, {"stopReason": "end_turn"})
+                self.assertEqual(len(requests), 2)
+                for request in requests:
+                    self.assertEqual([item["content"] for item in request
+                                      if item.get("role") == "user"],
+                                     [[{"type": "text", "text": user}]])
+                followup = requests[1]
+                self.assertEqual([item["type"] for item in followup[-3:]],
+                                 ["message", "model_response", "tool_result"])
+                self.assertEqual(followup[-2]["items"][0], {
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "text", "text": "Inspecting resource."}],
+                })
+                continued_call = followup[-2]["items"][1]
+                self.assertEqual(continued_call["call_id"], call_id)
+                self.assertEqual(continued_call["name"], "Bash")
+                self.assertEqual(json.loads(continued_call["arguments"]), args)
+                self.assertEqual(len(followup[-2]["items"]), 2)
+                self.assertEqual(followup[-1]["call_id"], call_id)
+                self.assertEqual(followup[-1]["content"], [{"type": "text", "text": result}])
+                self.assertIs(followup[-1]["is_error"], False)
+                self.assertEqual(_tool_updates(messages, session_id),
+                                 _assistant_chunks("Inspecting ", "resource.")
+                                 + _call_and_result(call_id, command, workspace, result)
+                                 + _assistant_chunks("Tool ", "complete."))
+                with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
+                    self.assertEqual(stream.read(), payload)
+                self.assertIsNotNone(session.job_manager)
+                self.assertEqual(len(session.job_manager.jobs), 1)
+                job = next(iter(session.job_manager.jobs.values()))
+                self.assertEqual(job.cwd, workspace)
+                self.assertEqual(job.status, "exited")
+                self.assertEqual(job.exit_code, 0)
+                self.assertEqual(job.process.returncode, 0)
+                with open(job.stdout_path, encoding="utf-8") as stream:
+                    self.assertEqual(stream.read(), payload.decode())
+                with open(job.stderr_path, encoding="utf-8") as stream:
+                    self.assertEqual(stream.read(), "")
+                path = session.chat_log_path
+                saved = self._saved_tool_turn(path, session_id, user, call_id, args, result,
+                                              ["Inspecting resource.", "Tool complete."])
+                await asyncio.wait_for(worker.close(), 3)
+                restored_session = Session(shell_cwd=workspace)
+                loki._DEFAULT_SESSION = restored_session
+                restored = Worker(restored_session, messages.append, session_id)
+                workers.append(restored)
+                messages.clear()
+                await asyncio.wait_for(restored.prepare_open({
+                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/load",
+                    "replay": False}), 3)
+                self.assertEqual(restored_session.transcript_items, saved["events"])
+                self.assertEqual(_tool_updates(messages, session_id), [])
+                restored.commit_open()
+                self.assertEqual(_tool_updates(messages, session_id), [
+                    {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": user}},
+                    *_assistant_chunks("Inspecting resource."),
+                    {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Bash",
+                     "kind": "other", "status": "completed"},
+                    {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Tool result: Bash",
+                     "kind": "other", "status": "completed"},
+                    *_assistant_chunks("Tool complete."),
+                ])
+                self.assertEqual(len(requests), 2, "load must not perform inference")
+                with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
+                    self.assertEqual(stream.read(), payload, "load must not execute historical calls")
+                await asyncio.wait_for(restored.close(), 3)
+            finally:
+                # Backstop only: owned job exit/output was asserted above.
+                for owner in workers:
+                    await asyncio.wait_for(owner.close(), 3)
 
 
 class _LocalWorkerProcess:
@@ -2748,42 +2896,6 @@ class WorkerSessionContractTests(unittest.TestCase):
                     "prompt": [{"type": "text", "text": "hello"}],
                 }))
                 self.assertEqual(result["stopReason"], "cancelled")
-        finally:
-            loki._DEFAULT_SESSION = old_session
-
-    def test_prompt_supports_baseline_resource_links(self):
-        from loki_agent import formats, loki
-        from loki_agent.acp_worker import Worker
-        from loki_agent.sessions import Session
-
-        old_session = loki._DEFAULT_SESSION
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                session = Session(shell_cwd=os.path.join(tmpdir, "workspace"))
-                loki._DEFAULT_SESSION = session
-                worker = Worker(session, lambda message: None, "s")
-
-                async def no_turn(on_event, _reasoning_effort):
-                    return None
-
-                worker._run_turn = no_turn
-                result = asyncio.run(worker.prompt({
-                    "sessionId": "s",
-                    "prompt": [
-                        {"type": "text", "text": "inspect this"},
-                        {
-                            "type": "resource_link",
-                            "name": "source.py",
-                            "uri": "file:///tmp/source.py",
-                            "mimeType": "text/x-python",
-                        },
-                    ],
-                }))
-                text = formats.item_text(
-                    session.transcript_items[-1])
-                self.assertIn("inspect this", text)
-                self.assertIn("file:///tmp/source.py", text)
-                self.assertEqual(result["stopReason"], "end_turn")
         finally:
             loki._DEFAULT_SESSION = old_session
 

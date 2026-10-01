@@ -163,40 +163,6 @@ class CancellationBetweenToolCallsTests(unittest.TestCase):
             ["message"],
         )
 
-    def test_no_cancel_means_full_loop(self):
-        # Control: identical setup without cancel runs everything and loops
-        # until the model responds with plain text.
-        chat = _ScriptedChat([
-            [_tool_call("TodoWrite", "c1", {"todos": []})],
-            [
-                {"type": "message", "role": "assistant",
-                 "content": [{"type": "text", "text": "all done"}]},
-            ],
-        ])
-        cancel = _CancelAfter()
-        executed = []
-
-        async def fake_dispatch(tc, **kwargs):
-            executed.append(tc.get("call_id"))
-            return {"ok": True, "content": "fine"}, "client"
-
-        transcript = [formats.message_item("user", "go")]
-        with mock.patch.object(
-                loki, "execute_tool_call_async", new=fake_dispatch):
-            async def scenario():
-                return await loki.run_tool_loop_async(
-                    transcript,
-                    chat_fn=chat,
-                    on_event=lambda e: None,
-                    cancel_check=cancel,
-                    allowed=["TodoWrite"],
-                )
-            result = asyncio.run(scenario())
-
-        self.assertEqual(result, "all done")
-        self.assertEqual(executed, ["c1"])
-        self.assertEqual(chat.calls, 2)
-
     def test_cancel_that_races_with_nonstream_response_discards_response(self):
         cancel = _CancelAfter()
         events = []
