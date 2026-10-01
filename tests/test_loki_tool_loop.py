@@ -510,37 +510,6 @@ class ProviderReinstallTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
-    def test_reinstall_preserves_subscription_authentication(self):
-        saved = save_loki_state(["runtime_config"])
-        credential = (
-            authentications.CredentialRef.openai_subscription())
-        try:
-            loki.apply_runtime_config(loki.make_runtime_config(
-                "https://chatgpt.com/backend-api/codex/responses",
-                protocols.OPENAI_RESPONSES,
-                model="old-model",
-                provider_id="openai-subscription",
-                credential_ref=credential,
-                auth_scheme="openai-subscription",
-                openai_request_profile=_codex_model("old-model"),
-            ))
-
-            loki.reinstall_provider(
-                model="new-model",
-                openai_request_profile=_codex_model("new-model"),
-            )
-
-            self.assertEqual(
-                loki.current_config().auth_spec.scheme,
-                "openai-subscription",
-            )
-            self.assertEqual(
-                loki.current_config().auth_spec.credential,
-                credential,
-            )
-        finally:
-            restore_loki_state(saved)
-
     def test_reinstall_provider_switches_protocol_per_model(self):
         env = {
             "LOKI_API_BASE": "https://example.test/v1/responses",
@@ -1176,91 +1145,6 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIsNone(
             protocol_override.reasoning_effort_profile)
 
-    def test_saved_subscription_connection_restores_its_auth_scheme(self):
-        credential = (
-            authentications.CredentialRef.openai_subscription())
-        descriptor = ConnectionDescriptor(
-            provider_id="openai-subscription",
-            provider_name="OpenAI ChatGPT subscription",
-            model="gpt-5-codex",
-            chat_url="https://chatgpt.com/backend-api/codex/responses",
-            models_url=(
-                authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL),
-            protocol=protocols.OPENAI_RESPONSES,
-            credential_ref=credential,
-            auth_scheme="openai-subscription",
-            stream=True,
-            openai_request_profile=_codex_model(
-                "gpt-5-codex", use_responses_lite=True),
-        )
-        inventory = CredentialInventory({}, {credential})
-
-        config = loki.config_from_connection_descriptor(
-            ConnectionDescriptor.from_dict(descriptor.to_dict()),
-            inventory,
-        )
-
-        self.assertEqual(config.auth_spec.credential, credential)
-        self.assertEqual(config.auth_spec.scheme, "openai-subscription")
-        self.assertTrue(config.chat_provider.responses_lite)
-        self.assertEqual(
-            config.chat_provider.models_url,
-            authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
-        )
-
-    def test_subscription_descriptor_refreshes_from_authenticated_catalog(
-            self):
-        credential = (
-            authentications.CredentialRef.openai_subscription())
-        descriptor = ConnectionDescriptor(
-            provider_id="openai-subscription",
-            provider_name="OpenAI ChatGPT subscription",
-            model="gpt-test",
-            chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
-            models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
-            protocol=protocols.OPENAI_RESPONSES,
-            credential_ref=credential,
-            auth_scheme="openai-subscription",
-            openai_request_profile=_codex_model(
-                supports_parallel_tool_calls=False,
-                supports_reasoning_summaries=True,
-                default_reasoning_level="low"),
-            reasoning_effort_profile=_effort_profile("low"),
-        )
-        response = {
-            "models": [{
-                "slug": "gpt-test",
-                "display_name": "GPT Test",
-                "visibility": "list",
-                "input_modalities": ["text"],
-                "supported_reasoning_levels": [{
-                    "effort": "high",
-                    "description": "Deep",
-                }],
-                "default_reasoning_level": "high",
-                "supports_reasoning_summaries": True,
-                "default_reasoning_summary": "none",
-                "supports_parallel_tool_calls": True,
-            }],
-        }
-
-        with mock.patch.object(
-                modelsdev,
-                "fetch_openai_subscription_models",
-                new=mock.AsyncMock(return_value=response)):
-            refreshed = asyncio.run(
-                loki.refresh_connection_descriptor_async(
-                    descriptor, object()))
-
-        self.assertIsNot(refreshed, descriptor)
-        self.assertTrue(
-            refreshed.openai_request_profile.supports_parallel_tool_calls)
-        self.assertEqual(
-            refreshed.reasoning_effort_profile.values, ("high",))
-        self.assertEqual(
-            refreshed.openai_request_profile.default_reasoning_level,
-            "high")
-
     def test_subscription_refresh_keeps_connection_without_valid_selector(
             self):
         credential = (
@@ -1346,59 +1230,6 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(refreshed, descriptor)
         self.assertTrue(any("using saved" in item for item in diagnostics))
-
-    def test_synthesized_subscription_selection_is_streaming_and_confined(
-            self):
-        credential = (
-            authentications.CredentialRef.openai_subscription())
-        catalog = modelsdev.add_openai_subscription_catalog(
-            modelsdev.normalize_catalog({
-                "openai": {
-                    "id": "openai",
-                    "name": "OpenAI",
-                    "npm": "@ai-sdk/openai",
-                    "env": ["OPENAI_API_KEY"],
-                    "models": {},
-                },
-            }),
-            {
-                "models": [{
-                    "slug": "gpt-test",
-                    "display_name": "GPT Test",
-                    "visibility": "list",
-                    "input_modalities": ["text"],
-                    "supported_reasoning_levels": [],
-                    "use_responses_lite": True,
-                    "supports_parallel_tool_calls": False,
-                }],
-            },
-        )
-        provider = catalog["openai-subscription"]
-        model = provider["models"]["gpt-test"]
-
-        config = loki.config_from_modelsdev_selection(
-            "openai-subscription",
-            provider,
-            model,
-            CredentialInventory({}, {credential}),
-        )
-
-        self.assertEqual(
-            config.chat_provider.input_url,
-            authentications.OPENAI_CHATGPT_RESPONSES_URL,
-        )
-        self.assertEqual(config.auth_spec.credential, credential)
-        self.assertEqual(
-            config.auth_spec.scheme, "openai-subscription")
-        self.assertEqual(
-            config.chat_provider.models_url,
-            authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
-        )
-        self.assertTrue(config.stream)
-        self.assertTrue(config.chat_provider.responses_lite)
-        self.assertEqual(
-            config.chat_provider.headers[
-                protocols.RESPONSES_LITE_HEADER], "true")
 
     def test_saved_subscription_cannot_redirect_access_token(self):
         credential = (
@@ -2298,96 +2129,217 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         )
 
 
-class SubscriptionResumeTests(unittest.TestCase):
-    _state_names = [
-        "CREDENTIALS",
-        "runtime_config",
-        "credential_authority",
-        "transcript_items",
-        "session_todos",
-        "session_toolsets",
-        "session_state",
-        "chat_log_path",
-        "chat_log_dirty",
-        "job_manager",
-        "shell_cwd",
-        "previous_shell_cwd",
-    ]
+class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_streaming_subscription_inference_save_and_resume(self):
+        await self._workflow(stream=True)
 
-    def setUp(self):
-        self.saved_state = save_loki_state(self._state_names)
+    async def test_buffered_subscription_inference_save_and_resume(self):
+        await self._workflow(stream=False)
 
-    def tearDown(self):
-        restore_loki_state(self.saved_state)
+    async def _workflow(self, *, stream, approve=True):
+        from loki_agent import credential_storages
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            storage = credential_storages.JsonCredentialStorage(str(root / "credentials"))
+            await storage.store_openai_login(authentications.OpenAITokenSet(
+                access_token="leased-access-sentinel", refresh_token="durable-refresh-sentinel",
+                id_token="identity-sentinel", account_id="account-sentinel",
+                expires_at=10**12, last_refresh=10**12))
+            supervisor = credential_supervisors.CredentialSupervisor(CredentialStore({}), storage)
+            chat_id = "5a72cf91-7370-409b-8b39-a68cc21b649e"
+            path = str(root / f"chat-{chat_id}.json")
+            requests, catalog_requests = [], []
+            output, errors = io.StringIO(), io.StringIO()
+            initial = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / "jobs")))
+            initial.credential_authority = supervisor.broker
+            initial.session_todos = [{"content": "inspect durable workflow", "status": "pending", "priority": "high"}]
 
-    def test_terminal_resume_confirms_and_saves_refreshed_profile(self):
-        credential = authentications.CredentialRef.openai_subscription()
-        old_profile = _codex_model(
-            supports_parallel_tool_calls=False)
-        new_profile = _codex_model(
-            supports_parallel_tool_calls=True)
-        old_descriptor = ConnectionDescriptor(
-            provider_id="openai-subscription",
-            provider_name="OpenAI ChatGPT subscription",
-            model="gpt-5-codex",
-            chat_url=authentications.OPENAI_CHATGPT_RESPONSES_URL,
-            models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
-            protocol=protocols.OPENAI_RESPONSES,
-            credential_ref=credential,
-            auth_scheme="openai-subscription",
-            stream=True,
-            openai_request_profile=old_profile,
-        )
-        new_descriptor = ConnectionDescriptor(
-            **{
-                **old_descriptor.__dict__,
-                "openai_request_profile": new_profile,
-            },
-        )
-        loki.CREDENTIALS = CredentialInventory({}, {credential})
-        loki.current_session().credential_authority = object()
-        session = ScriptedInputSession([None])
+            def catalog(updated):
+                return {"models": [{
+                    "slug": slug, "display_name": slug, "visibility": "list",
+                    "input_modalities": ["text"], "use_responses_lite": True,
+                    "supports_parallel_tool_calls": updated,
+                    "supports_reasoning_summaries": True,
+                    "default_reasoning_summary": "none",
+                    "supported_reasoning_levels": [{"effort": "high" if updated else "low"}],
+                    "default_reasoning_level": "high" if updated else "low",
+                } for slug in ("old-model", "gpt-test")]}
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "chat-test.json")
-            blob = formats.new_log_blob(
-                loki.initial_transcript_items(), [])
-            blob["session_state"] = {
-                "shell_cwd": tmpdir,
-                "connection": old_descriptor.to_dict(),
-            }
-            pathlib.Path(path).write_text(
-                json.dumps(blob), encoding="utf-8")
-            refresh = mock.AsyncMock(return_value=new_descriptor)
-            confirm = mock.AsyncMock(return_value=True)
-            with mock.patch(
-                    "loki_agent.terminal_frontend.input_session",
-                    return_value=session), mock.patch.object(
-                        loki,
-                        "refresh_connection_descriptor_async",
-                        new=refresh), mock.patch(
-                            "loki_agent.terminal_frontend."
-                            "confirm_saved_connection_async",
-                            new=confirm), mock.patch(
-                                "loki_agent.terminal_frontend."
-                                "restore_output_area_after_input"), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                status = asyncio.run(
-                    terminal_frontend.async_main([f"--resume={path}"]))
-            saved = json.loads(
-                pathlib.Path(path).read_text(encoding="utf-8"))
+            def message(text):
+                return {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": text}]}
 
-        self.assertEqual(status, 0)
-        refresh.assert_awaited_once_with(
-            old_descriptor,
-            loki.current_session().credential_authority,
-            diagnostic_writer=terminal_frontend._report_model_list_errors,
-        )
-        self.assertEqual(confirm.await_args.args[0], new_descriptor)
-        self.assertEqual(
-            saved["session_state"]["connection"],
-            new_descriptor.to_dict(),
-        )
+            responses = [
+                ("first-state-sentinel", [message("continuing")], False),
+                ("ignored-state-sentinel", [{"type": "function_call", "call_id": "todo-call",
+                                             "name": "TodoRead", "arguments": "{}"}], None),
+                (None, [message("first durable answer")], None),
+                ("resumed-state-sentinel", [message("resumed durable answer")], None),
+                ("next-state-sentinel", [message("next durable answer")], None),
+            ]
+
+            def check_headers(headers):
+                self.assertEqual(headers["Authorization"], "Bearer leased-access-sentinel")
+                self.assertEqual({k.lower(): v for k, v in headers.items()}[
+                    "chatgpt-account-id"], "account-sentinel")
+                self.assertNotIn("durable-refresh-sentinel", json.dumps(headers))
+
+            def inference(method, url, kwargs):
+                self.assertEqual(method, "POST")
+                self.assertEqual(url, authentications.OPENAI_CHATGPT_RESPONSES_URL)
+                headers = dict(kwargs["headers_in"])
+                if "prepare_attempt_headers" in kwargs:
+                    kwargs["prepare_attempt_headers"](headers)
+                check_headers(headers)
+                self.assertEqual(headers[protocols.RESPONSES_LITE_HEADER], "true")
+                for name in ("session-id", "thread-id", "x-client-request-id"):
+                    self.assertEqual(headers[name], chat_id)
+                payload = json.loads(kwargs["body"])
+                self.assertEqual(payload["model"], "gpt-test")
+                self.assertEqual(payload["prompt_cache_key"], chat_id)
+                requests.append((headers, payload))
+                state, items, end_turn = responses.pop(0)
+                response = {"id": f"response-{len(requests)}", "object": "response",
+                            "status": "completed", "output": items}
+                if end_turn is not None:
+                    response["end_turn"] = end_turn
+                response_headers = {loki.CODEX_TURN_STATE_HEADER: state} if state else {}
+                return response_headers, response
+
+            async def request(method, url, **kwargs):
+                if method == "GET":
+                    self.assertEqual(url, authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL)
+                    check_headers(kwargs["headers_in"])
+                    catalog_requests.append(dict(kwargs["headers_in"]))
+                    data = catalog(len(catalog_requests) > 1)
+                    return http_client.HttpResponse(url, 200, "OK", {}, json.dumps(data).encode())
+                headers, data = inference(method, url, kwargs)
+                kwargs["on_response_headers"](200, headers)
+                return http_client.HttpResponse(url, 200, "OK", headers, json.dumps(data).encode())
+
+            @contextlib.asynccontextmanager
+            async def streaming(method, url, **kwargs):
+                headers, data = inference(method, url, kwargs)
+                headers["content-type"] = "text/event-stream"
+
+                async def chunks():
+                    for item in data["output"]:
+                        yield ("data: " + json.dumps({"type": "response.output_item.done", "item": item}) + "\n\n").encode()
+                    yield ("data: " + json.dumps({
+                        "type": "response.completed",
+                        "response": {**data, "output": []}}) + "\n\n").encode()
+                yield http_client.HttpStreamResponse(url, 200, "OK", headers, chunks())
+
+            with mock.patch.object(loki, "_DEFAULT_SESSION", initial), \
+                    mock.patch.object(loki, "CREDENTIALS", supervisor.inventory), \
+                    mock.patch.object(http_client, "async_http_request", new=request), \
+                    mock.patch.object(http_client, "async_http_stream", new=streaming), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                data = await modelsdev.fetch_openai_subscription_models(supervisor.broker)
+                entries = modelsdev.add_openai_subscription_catalog(modelsdev.normalize_catalog({}), data)
+                provider = entries["openai-subscription"]
+                config = loki.config_from_modelsdev_selection(
+                    "openai-subscription", provider,
+                    provider["models"]["old-model"], supervisor.inventory)
+                self.assertTrue(config.stream)
+                loki.apply_runtime_config(config)
+                loki.reinstall_provider(
+                    model="gpt-test",
+                    models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
+                    openai_request_profile=loki.config_from_modelsdev_selection(
+                        "openai-subscription", provider,
+                        provider["models"]["gpt-test"], supervisor.inventory).chat_provider.openai_request_profile)
+                # Buffered is an explicit supported runtime variant; catalog defaults to SSE.
+                loki.reinstall_provider(
+                    stream=stream,
+                    models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL)
+                ref = authentications.CredentialRef.openai_subscription()
+                self.assertEqual(loki.current_config().auth_spec.credential, ref)
+                self.assertEqual(loki.current_config().auth_spec.scheme, "openai-subscription")
+                self.assertEqual(loki.current_config().chat_provider.models_url,
+                                 authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL)
+                loki.new_chat_log(path)
+                loki.current_session().session_todos = initial.session_todos = [
+                    {"content": "inspect durable workflow", "status": "pending", "priority": "high"}]
+                loki.current_transcript().append(formats.message_item("user", "run tools"))
+                first = await asyncio.wait_for(loki.run_tool_loop_async(
+                    loki.current_transcript(), max_loops=4, allowed={"TodoRead"}), 10)
+                self.assertEqual(first, "first durable answer")
+                results = [item for item in loki.current_transcript() if item.get("type") == "tool_result"]
+                self.assertEqual([item["call_id"] for item in results], ["todo-call"])
+                self.assertIn("inspect durable workflow", json.dumps(results))
+                self.assertIn("todo-call", json.dumps(requests[2][1]))
+                self.assertIn("inspect durable workflow", json.dumps(requests[2][1]))
+                self.assertEqual([item.get("end_turn") for item in
+                                  loki.current_transcript() if item.get("type") == "model_response"][0], False)
+                self.assertIn("Todos:\n  1. [pending] (high) inspect durable workflow",
+                              formats.item_text(results[0]))
+                loki.mark_chat_log_dirty()
+                loki.save_chat_log()
+                before = pathlib.Path(path).read_bytes()
+                first_blob = json.loads(before)
+                self.assertNotIn("conversation_id", first_blob["session_state"])
+                saved_results = [item for item in first_blob["events"]
+                                 if item.get("type") == "tool_result"]
+                self.assertEqual(
+                    [(item["call_id"], formats.item_text(item)) for item in saved_results],
+                    [("todo-call", "Todos:\n  1. [pending] (high) inspect durable workflow")])
+                await initial.job_manager.close_session_owned()
+                self.assertFalse(any(job.process and job.process.returncode is None
+                                     for job in initial.job_manager.jobs.values()))
+
+                reopened_storage = credential_storages.JsonCredentialStorage(storage.directory)
+                reopened_owner = credential_supervisors.CredentialSupervisor(CredentialStore({}), reopened_storage)
+                resumed = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / "resumed-jobs")))
+                resumed.credential_authority = reopened_owner.broker
+
+                class Input(ScriptedInputSession):
+                    async def prompt(inner_self, prompt=None, history=None):
+                        self.assertEqual(prompt, "Use this saved connection? [y/N]: ")
+                        self.assertEqual(len(catalog_requests), 2)
+                        self.assertEqual(len(requests), 3)
+                        return "yes" if approve else "no"
+
+                inputs = Input(["continue saved conversation", "start next turn", None])
+                with mock.patch.object(loki, "_DEFAULT_SESSION", resumed), \
+                        mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                        mock.patch.object(terminals, "open_terminal_stdin"), \
+                        mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
+                    status = await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10)
+                    self.assertEqual(status, 0)
+                    if not approve:
+                        self.assertEqual(pathlib.Path(path).read_bytes(), before)
+                        self.assertEqual(len(requests), 3)
+                        return
+                    self.assertEqual(resumed.conversation_id, chat_id)
+                    self.assertTrue(loki.current_config().chat_provider.responses_lite)
+                    self.assertTrue(loki.current_config().chat_provider.openai_request_profile.supports_parallel_tool_calls)
+                    self.assertEqual(loki.current_config().reasoning_effort_profile.values, ("high",))
+                    loki.save_chat_log()
+                    await resumed.job_manager.close_session_owned()
+                saved = json.loads(pathlib.Path(path).read_bytes())
+                connection = saved["session_state"]["connection"]
+                self.assertTrue(connection["openai_request_profile"]["supports_parallel_tool_calls"])
+                self.assertEqual(connection["reasoning_effort_profile"]["options"][0]["value"], "high")
+                self.assertEqual(len(catalog_requests), 2)
+                self.assertEqual(responses, [])
+                self.assertEqual([h.get(loki.CODEX_TURN_STATE_HEADER) for h, _ in requests],
+                                 [None, "first-state-sentinel", "first-state-sentinel", None, None])
+                for _, payload in requests[3:]:
+                    self.assertIn("first durable answer", json.dumps(payload))
+                    self.assertIn("todo-call", json.dumps(payload))
+                    self.assertEqual(payload["reasoning"]["effort"], "high")
+                durable = pathlib.Path(path).read_text()
+                for text in ("first durable answer", "resumed durable answer", "next durable answer",
+                             "todo-call", "inspect durable workflow"):
+                    self.assertIn(text, durable)
+                for secret in ("leased-access-sentinel", "durable-refresh-sentinel", "identity-sentinel",
+                               "first-state-sentinel", "ignored-state-sentinel", "resumed-state-sentinel"):
+                    self.assertNotIn(secret, durable + output.getvalue() + errors.getvalue())
+                formats.validate_events(resumed.transcript_items)
+
+    async def test_refused_refreshed_subscription_preserves_saved_bytes(self):
+        await self._workflow(stream=True, approve=False)
 
 
 class ExitStatusTests(unittest.TestCase):
@@ -2848,34 +2800,6 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
 
 
 class SessionResponsePersistenceTests(unittest.TestCase):
-    def test_conversation_id_is_derived_from_chat_identity(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "session_toolsets",
-            "conversation_id",
-        ]
-        old_values = save_loki_state(names)
-        chat_id = "5a72cf91-7370-409b-8b39-a68cc21b649e"
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, f"chat-{chat_id}.json")
-                loki.new_chat_log(path)
-                first_key = loki.current_session().conversation_id
-                loki.save_chat_log()
-                blob = json.loads(pathlib.Path(path).read_text(
-                    encoding="utf-8"))
-
-                loki.current_session().conversation_id = "different"
-                with contextlib.redirect_stdout(io.StringIO()):
-                    loki.load_chat_log(path)
-                resumed_key = loki.current_session().conversation_id
-        finally:
-            restore_loki_state(old_values)
-
-        self.assertEqual(first_key, chat_id)
-        self.assertEqual(resumed_key, first_key)
-        self.assertNotIn("conversation_id", blob["session_state"])
-
     def test_acp_chat_identity_uses_the_embedded_uuid(self):
         chat_id = "5a72cf91-7370-409b-8b39-a68cc21b649e"
         path = os.path.join(
@@ -2885,39 +2809,6 @@ class SessionResponsePersistenceTests(unittest.TestCase):
             loki.conversation_id_for_path(path),
             chat_id,
         )
-
-    def test_completion_uses_conversation_id_as_openai_cache_key(self):
-        saved = save_loki_state(["runtime_config", "conversation_id"])
-        try:
-            loki.apply_runtime_config(loki.make_runtime_config(
-                authentications.OPENAI_CHATGPT_RESPONSES_URL,
-                protocols.OPENAI_RESPONSES,
-                model="gpt-test",
-                provider_id="openai-subscription",
-                credential_ref=(
-                    authentications.CredentialRef.openai_subscription()),
-                auth_scheme="openai-subscription",
-                stream=True,
-                openai_request_profile=_codex_model(),
-            ))
-            loki.current_session().conversation_id = "session-cache-key"
-            request = mock.AsyncMock(return_value=protocols.ProviderResponse({
-                "object": "response",
-                "status": "completed",
-                "output": [],
-            }))
-            with mock.patch.object(
-                    loki, "async_chat_stream_request", new=request):
-                asyncio.run(loki.async_chat_completion(
-                    [formats.message_item("user", "hello")],
-                    tools=[],
-                ))
-        finally:
-            restore_loki_state(saved)
-
-        payload = request.await_args.args[1]
-        self.assertEqual(
-            payload["prompt_cache_key"], "session-cache-key")
 
     def test_response_boundary_and_toolset_are_saved_without_call_ledger(self):
         names = [
@@ -6211,121 +6102,6 @@ class RequestTimeCredentialTests(unittest.TestCase):
             "first-state",
         )
 
-    def test_codex_turn_state_spans_followups_and_resets_next_turn(self):
-        self._install_subscription(stream=True)
-        requests = []
-        responses = [
-            (
-                "first-state",
-                [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "continuing",
-                    }],
-                }],
-                False,
-            ),
-            (
-                "ignored-later-state",
-                [{
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "TodoRead",
-                    "arguments": "{}",
-                }],
-                None,
-            ),
-            (
-                None,
-                [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "first turn done",
-                    }],
-                }],
-                None,
-            ),
-            (
-                "second-turn-state",
-                [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "second turn done",
-                    }],
-                }],
-                None,
-            ),
-        ]
-
-        @contextlib.asynccontextmanager
-        async def fake_http_stream(method, request_url, **kwargs):
-            requests.append(dict(kwargs["headers_in"]))
-            state, output, end_turn = responses.pop(0)
-
-            async def response_body():
-                chunks = []
-                for item in output:
-                    chunks.append(
-                        "data: "
-                        + json.dumps({
-                            "type": "response.output_item.done",
-                            "item": item,
-                        })
-                        + "\n\n"
-                    )
-                response = {
-                    "id": f"response_{len(requests)}",
-                    "status": "completed",
-                    "output": [],
-                }
-                if end_turn is not None:
-                    response["end_turn"] = end_turn
-                chunks.append(
-                    "data: "
-                    + json.dumps({
-                        "type": "response.completed",
-                        "response": response,
-                    })
-                    + "\n\n"
-                )
-                yield "".join(chunks).encode("utf-8")
-
-            headers = {"content-type": "text/event-stream"}
-            if state is not None:
-                headers[loki.CODEX_TURN_STATE_HEADER] = state
-            yield loki.http_client.HttpStreamResponse(
-                request_url, 200, "OK", headers, response_body())
-
-        transcript = [formats.message_item("user", "run tools")]
-        with mock.patch.object(
-                loki.http_client, "async_http_stream",
-                side_effect=fake_http_stream):
-            first = asyncio.run(loki.run_tool_loop_async(
-                transcript, max_loops=4))
-            transcript.append(formats.message_item(
-                "user", "start another turn"))
-            second = asyncio.run(loki.run_tool_loop_async(
-                transcript, max_loops=2))
-
-        self.assertEqual(first, "first turn done")
-        self.assertEqual(second, "second turn done")
-        for headers in requests:
-            self._assert_codex_identity(headers)
-        self.assertEqual(responses, [])
-        self.assertEqual(
-            [
-                headers.get(loki.CODEX_TURN_STATE_HEADER)
-                for headers in requests
-            ],
-            [None, "first-state", "first-state", None],
-        )
-
     def test_caller_cannot_supply_codex_turn_state(self):
         self._install_subscription(stream=True)
         observed = []
@@ -6354,93 +6130,6 @@ class RequestTimeCredentialTests(unittest.TestCase):
         self.assertNotIn("X-Codex-Turn-State", observed[0])
         self.assertNotIn(
             loki.CODEX_TURN_STATE_HEADER, observed[0])
-
-    def test_buffered_codex_turn_state_is_replayed_then_reset(self):
-        self._install_subscription(stream=False)
-        requests = []
-        responses = [
-            (
-                "buffered-state",
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [{
-                        "type": "function_call",
-                        "call_id": "call_1",
-                        "name": "TodoRead",
-                        "arguments": "{}",
-                    }],
-                },
-            ),
-            (
-                None,
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "buffered first done",
-                        }],
-                    }],
-                },
-            ),
-            (
-                "new-buffered-state",
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "buffered second done",
-                        }],
-                    }],
-                },
-            ),
-        ]
-
-        async def request(method, url, **kwargs):
-            attempt_headers = dict(kwargs["headers_in"])
-            kwargs["prepare_attempt_headers"](attempt_headers)
-            requests.append(attempt_headers)
-            state, response = responses.pop(0)
-            response_headers = {}
-            if state is not None:
-                response_headers[loki.CODEX_TURN_STATE_HEADER] = state
-            kwargs["on_response_headers"](200, response_headers)
-            return loki.http_client.HttpResponse(
-                url,
-                200,
-                "OK",
-                response_headers,
-                json.dumps(response).encode("utf-8"),
-            )
-
-        transcript = [formats.message_item("user", "run buffered")]
-        with mock.patch.object(
-                loki.http_client, "async_http_request", new=request):
-            first = asyncio.run(loki.run_tool_loop_async(
-                transcript, max_loops=3))
-            transcript.append(formats.message_item(
-                "user", "new buffered turn"))
-            second = asyncio.run(loki.run_tool_loop_async(
-                transcript, max_loops=2))
-
-        self.assertEqual(first, "buffered first done")
-        self.assertEqual(second, "buffered second done")
-        self.assertEqual(responses, [])
-        self.assertEqual(
-            [
-                headers.get(loki.CODEX_TURN_STATE_HEADER)
-                for headers in requests
-            ],
-            [None, "buffered-state", None],
-        )
 
     def test_static_credential_does_not_retry_a_401(self):
         credential = authentications.CredentialRef.environment(
@@ -7448,42 +7137,6 @@ class ResponsesToolLoopTests(unittest.TestCase):
             [item["type"] for item in requests[1]],
             ["message", "model_response"],
         )
-        self.assertEqual(
-            [item["type"] for item in transcript],
-            ["message", "model_response", "model_response"],
-        )
-
-    def test_responses_end_turn_false_requests_another_sample(self):
-        transcript = [formats.message_item("user", "continue")]
-        requests = []
-
-        async def chat_fn(items, *, codex_turn_state):
-            requests.append(copy.deepcopy(items))
-            if len(requests) == 1:
-                return formats.DecodedTurn(
-                    [formats.message_item("assistant", "first part")],
-                    {
-                        "protocol": formats.OPENAI_RESPONSES,
-                        "end_turn": False,
-                    },
-                )
-            return formats.DecodedTurn(
-                [formats.message_item("assistant", "finished")],
-                {
-                    "protocol": formats.OPENAI_RESPONSES,
-                    "end_turn": True,
-                },
-            )
-
-        result = asyncio.run(loki.run_tool_loop_async(
-            transcript,
-            chat_fn=chat_fn,
-            max_loops=3,
-        ))
-
-        self.assertEqual(result, "finished")
-        self.assertEqual(len(requests), 2)
-        self.assertIs(requests[1][-1]["end_turn"], False)
         self.assertEqual(
             [item["type"] for item in transcript],
             ["message", "model_response", "model_response"],
