@@ -1,9 +1,23 @@
 import asyncio
+import contextlib
+import sys
 import time
 import unittest
 from unittest import mock
 
 from loki_agent import http_client
+
+
+@contextlib.asynccontextmanager
+async def _running_request(awaitable):
+    task = asyncio.create_task(awaitable)
+    try:
+        yield task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True), 1)
 
 
 class FakeWriter:
@@ -150,42 +164,82 @@ class HttpClientRequestTests(unittest.TestCase):
         self.assertTrue(raised.exception.request_may_have_been_sent)
 
     def test_task_cancellation_preserves_delivery_state(self):
-        connector = FakeConnector([])
-        draining = asyncio.Event()
+        async def scenario(phase):
+            connector = FakeConnector([])
+            entered, interrupted = asyncio.Event(), asyncio.Event()
+            delivery_states = []
+            operations = []
 
-        async def blocked_open(*args, **kwargs):
-            reader = asyncio.StreamReader()
-            writer = FakeWriter()
+            async def block():
+                operations.append(asyncio.current_task())
+                entered.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    interrupted.set()
 
-            async def drain():
-                draining.set()
-                await asyncio.Event().wait()
+            async def open_connection(host, port, ssl=None, server_hostname=None):
+                connector.calls.append((host, port, ssl, server_hostname))
+                if phase == "connect":
+                    await block()
+                reader, writer = asyncio.StreamReader(), FakeWriter()
+                connector.writers.append(writer)
+                writer.drain = block
+                return reader, writer
 
-            writer.drain = drain
-            return reader, writer
+            async def request():
+                try:
+                    return await http_client.async_http_request(
+                        "POST", "https://example.test/token", body=b"{}",
+                        timeout=20, retry_max_attempts=3,
+                        retry_base_delay_s=0, retry_max_jitter_s=0)
+                except asyncio.CancelledError as error:
+                    # Observe the production annotation before the outer Task
+                    # boundary can discard it on historical CPython 3.10.
+                    delivery_states.append(error.request_may_have_been_sent)
+                    raise
 
-        connector.open_connection = blocked_open
+            connector.open_connection = open_connection
+            tls_context = object()
+            with PatchedOpenConnection(connector, tls_context):
+                async with _running_request(request()) as task:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self.assertFalse(task.done())
+                    self.assertFalse(interrupted.is_set())
+                    self.assertEqual(len(connector.writers), phase == "drain")
+                    if connector.writers:
+                        self.assertEqual(bytes(connector.writers[0].data), (
+                            "POST /token HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n"
+                            f"User-Agent: {http_client.APPLICATION_USER_AGENT}\r\n"
+                            "Content-Length: 2\r\n\r\n{}").encode())
+                        self.assertFalse(connector.writers[0].closed)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError) as raised:
+                        await asyncio.wait_for(task, 1)
+                    expected = phase == "drain"
+                    self.assertEqual(delivery_states, [expected])
+                    legacy_loss = (
+                        sys.implementation.name == "cpython"
+                        and sys.version_info[:2] == (3, 10)
+                        and not hasattr(raised.exception, "request_may_have_been_sent"))
+                    if not legacy_loss:
+                        self.assertIs(raised.exception.request_may_have_been_sent, expected)
+                    # The legacy missing fact is not classified as a successful
+                    # Task-boundary annotation proof or defaulted to True here.
+                    self.assertTrue(task.done())
+                    self.assertTrue(task.cancelled())
+                    self.assertTrue(interrupted.is_set())
+                    self.assertEqual(len(operations), 1)
+                    self.assertTrue(operations[0].done())
+                    self.assertTrue(operations[0].cancelled())
+                    self.assertEqual(connector.calls, [("example.test", 443, tls_context, "example.test")])
+                    for writer in connector.writers:
+                        self.assertTrue(writer.closed)
+                        self.assertTrue(writer.wait_closed_called)
 
-        async def scenario():
-            task = asyncio.create_task(http_client.async_http_request(
-                "POST",
-                "https://example.test/token",
-                body=b"{}",
-            ))
-            await draining.wait()
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError) as raised:
-                await task
-            return raised.exception
-
-        with PatchedOpenConnection(connector):
-            error = asyncio.run(scenario())
-
-        # CPython 3.10 recreates CancelledError at the Task boundary and
-        # discards attributes attached inside the coroutine. Missing state
-        # must conservatively mean "possibly sent", never "safe to replay".
-        self.assertTrue(getattr(
-            error, "request_may_have_been_sent", True))
+        for phase in ("connect", "drain"):
+            with self.subTest(phase=phase):
+                asyncio.run(scenario(phase))
 
     def test_buffered_request_can_be_cancelled_during_connect(self):
         connector = FakeConnector([])
@@ -218,38 +272,52 @@ class HttpClientRequestTests(unittest.TestCase):
             asyncio.run(scenario())
 
     def test_buffered_request_cancel_interrupts_retry_backoff(self):
-        connector = FakeConnector([])
-        attempts = 0
-
-        async def failed_open(*args, **kwargs):
-            nonlocal attempts
-            attempts += 1
-            raise ConnectionResetError("offline")
-
-        connector.open_connection = failed_open
-
         async def scenario():
+            connector = FakeConnector([])
+            sleeping, interrupted = asyncio.Event(), asyncio.Event()
+            sleep_tasks = []
             cancelled = False
+            real_sleep = asyncio.sleep
 
-            def cancel_check():
-                return cancelled
+            async def failed_open(host, port, ssl=None, server_hostname=None):
+                connector.calls.append((host, port, ssl, server_hostname))
+                raise ConnectionResetError("offline")
 
-            task = asyncio.create_task(http_client.async_http_request(
-                "POST", "https://example.test/v1/chat/completions",
-                body=b"{}", timeout=30,
-                retry_max_attempts=3,
-                retry_base_delay_s=10,
-                retry_max_jitter_s=0,
-                cancel_check=cancel_check,
-            ))
-            while attempts == 0:
-                await asyncio.sleep(0)
-            cancelled = True
-            with self.assertRaises(http_client.HttpRequestCancelled):
-                await asyncio.wait_for(task, timeout=1)
+            async def observed_sleep(delay):
+                self.assertEqual(delay, 10)
+                sleep_tasks.append(asyncio.current_task())
+                sleeping.set()
+                try:
+                    await real_sleep(delay)
+                finally:
+                    interrupted.set()
 
-        with PatchedOpenConnection(connector):
-            asyncio.run(scenario())
+            connector.open_connection = failed_open
+            tls_context = object()
+            with PatchedOpenConnection(connector, tls_context), mock.patch.object(
+                    asyncio, "sleep", new=observed_sleep):
+                async with _running_request(http_client.async_http_request(
+                        "POST", "https://example.test/v1/chat/completions",
+                        body=b"{}", timeout=20, retry_max_attempts=3,
+                        retry_base_delay_s=10, retry_max_jitter_s=0,
+                        cancel_check=lambda: cancelled)) as task:
+                    await asyncio.wait_for(sleeping.wait(), 1)
+                    self.assertFalse(cancelled)
+                    self.assertFalse(task.done())
+                    self.assertFalse(interrupted.is_set())
+                    self.assertEqual(len(connector.calls), 1)
+                    cancelled = True
+                    with self.assertRaises(http_client.HttpRequestCancelled):
+                        await asyncio.wait_for(task, 1)
+                    self.assertTrue(task.done())
+                    self.assertTrue(interrupted.is_set())
+                    self.assertEqual(len(sleep_tasks), 1)
+                    self.assertTrue(sleep_tasks[0].done())
+                    self.assertTrue(sleep_tasks[0].cancelled())
+                    self.assertEqual(connector.calls, [("example.test", 443, tls_context, "example.test")])
+                    self.assertEqual(connector.writers, [])
+
+        asyncio.run(scenario())
 
     def test_https_request_serializes_headers_body_and_tls_connection(self):
         connector = FakeConnector([
@@ -409,41 +477,50 @@ class HttpClientRequestTests(unittest.TestCase):
 
 class HttpClientRedirectTests(unittest.TestCase):
     def test_same_host_redirect_is_followed(self):
-        old_request = http_client.async_http_request
-        calls = []
-
-        async def fake_request(method, request_url, **kwargs):
-            calls.append((method, request_url, kwargs))
-            if request_url.endswith("/start"):
-                return http_client.HttpResponse(
-                    request_url,
-                    302,
-                    "Found",
-                    {"location": "/next"},
-                    b"",
-                )
-            return http_client.HttpResponse(request_url, 200, "OK", {}, b"done")
-
-        try:
-            http_client.async_http_request = fake_request
-            response = asyncio.run(http_client.async_http_request_follow_same_host(
-                "GET",
-                "https://example.test/start",
-                headers_in={"X-Test": "ok"},
-                timeout=5,
-                max_bytes=10,
-            ))
-        finally:
-            http_client.async_http_request = old_request
-
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.url, "https://example.test/next")
-        self.assertEqual(response.body, b"done")
-        self.assertEqual([call[1] for call in calls], [
-            "https://example.test/start",
-            "https://example.test/next",
+        connector = FakeConnector([
+            b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 7\r\n\r\ndiscard",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone",
         ])
-        self.assertEqual(calls[0][2]["headers_in"], {"X-Test": "ok"})
+        tls_context = object()
+        headers = {"X-Test": "ok", "Authorization": "Bearer redirect-secret"}
+        real_open = connector.open_connection
+
+        async def open_connection(*args, **kwargs):
+            if connector.writers:
+                self.assertTrue(connector.writers[0].closed)
+                self.assertTrue(connector.writers[0].wait_closed_called)
+            return await real_open(*args, **kwargs)
+
+        connector.open_connection = open_connection
+
+        async def scenario():
+            return await asyncio.wait_for(http_client.async_http_request_follow_same_host(
+                "GET", "https://example.test/start", headers_in=headers,
+                timeout=5, max_bytes=10), 3)
+
+        with PatchedOpenConnection(connector, tls_context):
+            response = asyncio.run(scenario())
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.reason, "OK")
+            self.assertEqual(response.url, "https://example.test/next")
+            self.assertEqual(response.body, b"done")
+            self.assertEqual(response.headers, {"content-length": "4"})
+            self.assertFalse(response.truncated)
+            self.assertIsNone(response.redirect_url)
+            self.assertEqual(connector.responses, [])
+            self.assertEqual(connector.calls, [{
+                "host": "example.test", "port": 443,
+                "ssl": tls_context, "server_hostname": "example.test",
+            }] * 2)
+            self.assertEqual(len(connector.writers), 2)
+            for path, writer in zip(("/start", "/next"), connector.writers):
+                self.assertEqual(bytes(writer.data), (
+                    f"GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n"
+                    f"User-Agent: {http_client.APPLICATION_USER_AGENT}\r\n"
+                    "X-Test: ok\r\nAuthorization: Bearer redirect-secret\r\n\r\n").encode())
+                self.assertTrue(writer.closed)
+                self.assertTrue(writer.wait_closed_called)
+            self.assertEqual(headers, {"X-Test": "ok", "Authorization": "Bearer redirect-secret"})
 
     def test_cross_host_redirect_is_reported_not_followed(self):
         old_request = http_client.async_http_request
@@ -532,46 +609,88 @@ class HttpClientRedirectTests(unittest.TestCase):
 
 class HttpClientRetryTests(unittest.TestCase):
     def test_retry_preparation_sees_state_from_prior_response_headers(self):
-        state = {"value": None}
-        attempts = []
+        async def scenario():
+            state = {"value": None}
+            prepared, observed, body_reads = [], [], []
+            headers = {"Authorization": "Bearer retry-secret"}
+            body = b'{"input":"request"}'
+            connector = FakeConnector([
+                b"HTTP/1.1 200 OK\r\nX-Routing-State: final-state\r\nContent-Length: 4\r\n\r\ndone",
+            ])
+            real_open = connector.open_connection
 
-        def prepare(headers):
-            if state["value"] is not None:
-                headers["X-Routing-State"] = state["value"]
+            class ResettingReader(asyncio.StreamReader):
+                async def readexactly(inner_self, size):
+                    self.assertEqual(state["value"], "server-state")
+                    data = await super().readexactly(size)
+                    body_reads.append((size, data))
+                    if data == b"\r\n":
+                        # Reset only after real headers and a complete body
+                        # chunk were consumed, not before parsing can start.
+                        inner_self.set_exception(ConnectionResetError("body read reset"))
+                    return data
 
-        def capture(status, headers):
-            self.assertEqual(status, 200)
-            state["value"] = headers.get("x-routing-state")
+            async def open_connection(host, port, ssl=None, server_hostname=None):
+                if connector.calls:
+                    self.assertTrue(connector.writers[0].closed)
+                    self.assertTrue(connector.writers[0].wait_closed_called)
+                    return await real_open(host, port, ssl=ssl, server_hostname=server_hostname)
+                connector.calls.append({
+                    "host": host, "port": port, "ssl": ssl, "server_hostname": server_hostname})
+                reader, writer = ResettingReader(), FakeWriter()
+                reader.feed_data(
+                    b"HTTP/1.1 200 OK\r\nX-Routing-State: server-state\r\n"
+                    b"Transfer-Encoding: chunked\r\n\r\n5\r\nstale\r\n")
+                connector.writers.append(writer)
+                return reader, writer
 
-        async def request_once(
-                method, request_url, *, headers_in=None, body=b"",
-                timeout=30, max_bytes=http_client.HTTP_MAX_RESPONSE_BYTES,
-                cancel_check=None, on_response_headers=None):
-            attempts.append(dict(headers_in))
-            if len(attempts) == 1:
-                on_response_headers(
-                    200, {"x-routing-state": "server-state"})
-                raise ConnectionResetError("body read reset")
-            return http_client.HttpResponse(
-                request_url, 200, "OK", {}, b"done")
+            def prepare(attempt_headers):
+                prepared.append((dict(attempt_headers), state["value"]))
+                if state["value"] is not None:
+                    attempt_headers["X-Routing-State"] = state["value"]
 
-        with mock.patch.object(
-                http_client, "_async_http_request_once",
-                new=request_once):
-            response = asyncio.run(http_client.async_http_request(
-                "POST",
-                "https://example.test/responses",
-                retry_max_attempts=2,
-                retry_base_delay_s=0,
-                retry_max_jitter_s=0,
-                prepare_attempt_headers=prepare,
-                on_response_headers=capture,
-            ))
+            def capture(status, response_headers):
+                observed.append((status, dict(response_headers)))
+                state["value"] = response_headers.get("x-routing-state")
 
-        self.assertEqual(response.body, b"done")
-        self.assertNotIn("X-Routing-State", attempts[0])
-        self.assertEqual(
-            attempts[1]["X-Routing-State"], "server-state")
+            connector.open_connection = open_connection
+            tls_context = object()
+            with PatchedOpenConnection(connector, tls_context):
+                response = await asyncio.wait_for(http_client.async_http_request(
+                    "POST", "https://example.test/responses", headers_in=headers, body=body,
+                    timeout=5, retry_max_attempts=2, retry_base_delay_s=0,
+                    retry_max_jitter_s=0, prepare_attempt_headers=prepare,
+                    on_response_headers=capture), 3)
+                self.assertEqual(response.url, "https://example.test/responses")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.reason, "OK")
+                self.assertEqual(response.body, b"done")
+                self.assertFalse(response.truncated)
+                self.assertEqual(response.headers, {"x-routing-state": "final-state", "content-length": "4"})
+                self.assertEqual(body_reads, [(5, b"stale"), (2, b"\r\n")])
+                self.assertEqual(prepared, [(headers, None), (headers, "server-state")])
+                self.assertEqual(observed, [
+                    (200, {"x-routing-state": "server-state", "transfer-encoding": "chunked"}),
+                    (200, {"x-routing-state": "final-state", "content-length": "4"}),
+                ])
+                self.assertEqual(state["value"], "final-state")
+                self.assertEqual(connector.responses, [])
+                self.assertEqual(connector.calls, [{
+                    "host": "example.test", "port": 443,
+                    "ssl": tls_context, "server_hostname": "example.test",
+                }] * 2)
+                self.assertEqual(len(connector.writers), 2)
+                for routing, writer in zip(("", "X-Routing-State: server-state\r\n"), connector.writers):
+                    self.assertEqual(bytes(writer.data), (
+                        "POST /responses HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n"
+                        f"User-Agent: {http_client.APPLICATION_USER_AGENT}\r\n"
+                        f"Authorization: Bearer retry-secret\r\n{routing}Content-Length: {len(body)}\r\n\r\n"
+                    ).encode() + body)
+                    self.assertTrue(writer.closed)
+                    self.assertTrue(writer.wait_closed_called)
+                self.assertEqual(headers, {"Authorization": "Bearer retry-secret"})
+
+        asyncio.run(scenario())
 
     def test_response_headers_are_reported_before_body_read_failure(self):
         connector = FakeConnector([
@@ -665,53 +784,121 @@ class HttpClientRetryTests(unittest.TestCase):
 
 class HttpClientStreamingTests(unittest.TestCase):
     def test_stream_can_be_cancelled_during_connection_setup(self):
-        connector = FakeConnector([])
+        async def scenario(active):
+            connector = FakeConnector([])
+            entered, interrupted = asyncio.Event(), asyncio.Event()
+            operations = []
+            cancelled = not active
+            contexts = []
 
-        async def request():
-            async with http_client.async_http_stream(
-                    "POST", "http://example.test/stream",
-                    body=b"{}", timeout=5, max_bytes=100,
-                    cancel_check=lambda: True):
-                self.fail("cancelled stream entered its response context")
+            async def open_connection(host, port, ssl=None, server_hostname=None):
+                connector.calls.append((host, port, ssl, server_hostname))
+                operations.append(asyncio.current_task())
+                entered.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    interrupted.set()
 
-        with PatchedOpenConnection(connector):
-            with self.assertRaises(http_client.HttpRequestCancelled):
-                asyncio.run(request())
+            async def request():
+                async with http_client.async_http_stream(
+                        "POST", "http://example.test/stream", body=b"{}",
+                        timeout=20, max_bytes=100, cancel_check=lambda: cancelled):
+                    contexts.append("entered")
+
+            connector.open_connection = open_connection
+            with PatchedOpenConnection(connector):
+                async with _running_request(request()) as task:
+                    if active:
+                        await asyncio.wait_for(entered.wait(), 1)
+                        self.assertFalse(cancelled)
+                        self.assertFalse(task.done())
+                        self.assertFalse(interrupted.is_set())
+                        cancelled = True
+                    with self.assertRaises(http_client.HttpRequestCancelled):
+                        await asyncio.wait_for(task, 1)
+                    self.assertTrue(task.done())
+                    self.assertEqual(contexts, [])
+                    self.assertEqual(connector.writers, [])
+                    self.assertEqual(connector.calls, [("example.test", 80, None, None)] if active else [])
+                    self.assertEqual(entered.is_set(), active)
+                    self.assertEqual(interrupted.is_set(), active)
+                    self.assertEqual(len(operations), int(active))
+                    for operation in operations:
+                        self.assertTrue(operation.done())
+                        self.assertTrue(operation.cancelled())
+
+        for active in (False, True):
+            with self.subTest(active=active):
+                asyncio.run(scenario(active))
 
     def test_chunked_response_is_exposed_incrementally_and_closed(self):
-        connector = FakeConnector([
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/event-stream\r\n"
-            b"Transfer-Encoding: chunked\r\n"
-            b"\r\n"
-            b"3\r\nabc\r\n"
-            b"4\r\ndefg\r\n"
-            b"0\r\nX-Trailer: ignored\r\n\r\n"
-        ])
+        async def scenario():
+            connector = FakeConnector([])
+            first_observed, second_read = asyncio.Event(), asyncio.Event()
+            released = False
+            chunks, responses = [], []
 
-        async def request():
-            async with http_client.async_http_stream(
-                    "POST", "http://example.test/stream",
-                    body=b"{}", timeout=5, max_bytes=100) as response:
-                chunks = [chunk async for chunk in response.body]
-                return response, chunks
+            class GatedReader(asyncio.StreamReader):
+                async def readline(inner_self):
+                    if first_observed.is_set() and not released:
+                        second_read.set()
+                    return await super().readline()
 
-        with PatchedOpenConnection(connector):
-            response, chunks = asyncio.run(request())
+            reader = GatedReader()
+            reader.feed_data(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n")
+            writer = FakeWriter()
 
-        self.assertEqual(response.status, 200)
-        self.assertEqual(
-            response.header("content-type"), "text/event-stream")
-        self.assertEqual(chunks, [b"abc", b"defg"])
-        self.assertTrue(connector.writers[0].closed)
-        self.assertTrue(connector.writers[0].wait_closed_called)
-        raw_headers = bytes(
-            connector.writers[0].data).split(b"\r\n\r\n", 1)[0]
-        self.assertIn(
-            f"User-Agent: {http_client.APPLICATION_USER_AGENT}".encode(
-                "ascii"),
-            raw_headers.split(b"\r\n"),
-        )
+            async def open_connection(host, port, ssl=None, server_hostname=None):
+                connector.calls.append((host, port, ssl, server_hostname))
+                connector.writers.append(writer)
+                return reader, writer
+
+            async def consume():
+                async with http_client.async_http_stream(
+                        "POST", "http://example.test/stream", body=b"{}",
+                        timeout=20, max_bytes=100) as response:
+                    responses.append(response)
+                    async for chunk in response.body:
+                        chunks.append(chunk)
+                        if len(chunks) == 1:
+                            first_observed.set()
+
+            connector.open_connection = open_connection
+            with PatchedOpenConnection(connector):
+                async with _running_request(consume()) as task:
+                    await asyncio.wait_for(first_observed.wait(), 1)
+                    await asyncio.wait_for(second_read.wait(), 1)
+                    self.assertEqual(chunks, [b"abc"])
+                    self.assertFalse(task.done())
+                    self.assertFalse(released)
+                    self.assertFalse(reader.at_eof())
+                    self.assertFalse(writer.closed)
+                    self.assertFalse(writer.wait_closed_called)
+                    self.assertEqual(len(responses), 1)
+                    self.assertEqual(responses[0].status, 200)
+                    self.assertEqual(responses[0].header("content-type"), "text/event-stream")
+                    released = True
+                    reader.feed_data(b"4\r\ndefg\r\n0\r\nX-Trailer: ignored\r\n\r\n")
+                    reader.feed_eof()
+                    await asyncio.wait_for(task, 1)
+                    self.assertTrue(task.done())
+                    self.assertFalse(task.cancelled())
+                    self.assertEqual(chunks, [b"abc", b"defg"])
+                    self.assertEqual(responses[0].headers, {
+                        "content-type": "text/event-stream", "transfer-encoding": "chunked"})
+                    self.assertEqual(connector.calls, [("example.test", 80, None, None)])
+                    self.assertEqual(connector.writers, [writer])
+                    self.assertEqual(bytes(writer.data), (
+                        "POST /stream HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n"
+                        f"User-Agent: {http_client.APPLICATION_USER_AGENT}\r\n"
+                        "Content-Length: 2\r\n\r\n{}").encode())
+                    self.assertTrue(writer.closed)
+                    self.assertTrue(writer.wait_closed_called)
+
+        asyncio.run(scenario())
 
     def test_stream_content_length_is_read_without_buffering_api(self):
         connector = FakeConnector([
