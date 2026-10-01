@@ -445,107 +445,6 @@ class TerminalImageCommandTests(unittest.TestCase):
 
 
 class ProviderReinstallTests(unittest.TestCase):
-    def test_make_runtime_config_builds_provider_and_headers(self):
-        config = loki.make_runtime_config(
-            "https://api.example.test/v1/messages",
-            protocols.ANTHROPIC_MESSAGES,
-            model="model-a",
-            max_tokens=1234,
-            anthropic_version="2024-01-01",
-            auth_header="X-Custom-Auth",
-            credential_ref=authentications.CredentialRef.environment(
-                "EXAMPLE_API_KEY"),
-        )
-
-        self.assertEqual(
-            config.chat_provider.input_url,
-            "https://api.example.test/v1/messages")
-        self.assertEqual(
-            config.chat_provider.kind, protocols.ANTHROPIC_MESSAGES)
-        self.assertEqual(config.model, "model-a")
-        self.assertEqual(config.chat_provider.max_tokens, 1234)
-        self.assertEqual(config.chat_provider.kind, protocols.ANTHROPIC_MESSAGES)
-        self.assertNotIn(
-            "X-Custom-Auth", config.chat_provider.headers)
-        self.assertEqual(config.auth_spec.scheme, "custom")
-        self.assertEqual(
-            config.auth_spec.credential,
-            authentications.CredentialRef.environment("EXAMPLE_API_KEY"))
-        self.assertEqual(
-            config.chat_provider.headers["anthropic-version"],
-            "2024-01-01")
-        self.assertEqual(config.auth_spec.header_name, "X-Custom-Auth")
-
-    def test_reinstall_provider_swaps_provider_preserving_settings(self):
-        env = {
-            "LOKI_API_BASE": "https://example.test/v1/responses",
-            "LOKI_PROVIDER": "openai_responses",
-            "LOKI_API_KEY": "test-key",
-            "LOKI_MODEL": "model-a",
-            "LOKI_MAX_TOKENS": "512",
-        }
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
-
-        try:
-            loki.apply_runtime_config(loki.build_config_from_env(env))
-            old_provider = loki.current_config().chat_provider
-
-            loki.reinstall_provider(model="model-b")
-
-            self.assertEqual(loki.current_model(), "model-b")
-            self.assertEqual(loki.current_config().model, "model-b")
-            # A fresh Provider object was built and swapped in.
-            self.assertIsNot(loki.current_config().chat_provider, old_provider)
-            # Everything else carries over from the previous config.
-            self.assertEqual(loki.current_config().chat_provider.kind, protocols.OPENAI_RESPONSES)
-            self.assertEqual(loki.current_config().chat_provider.chat_url, "https://example.test/v1/responses")
-            self.assertEqual(loki.current_config().chat_provider.max_tokens, 512)
-            self.assertEqual(
-                loki.current_config().auth_spec.credential,
-                authentications.CredentialRef.environment("LOKI_API_KEY"))
-            self.assertNotIn(
-                "Authorization",
-                loki.current_config().chat_provider.headers)
-        finally:
-            restore_loki_state(old_values)
-
-    def test_reinstall_provider_switches_protocol_per_model(self):
-        env = {
-            "LOKI_API_BASE": "https://example.test/v1/responses",
-            "LOKI_PROVIDER": "openai_responses",
-            "LOKI_API_KEY": "test-key",
-            "LOKI_MODEL": "model-a",
-        }
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
-
-        try:
-            loki.apply_runtime_config(loki.build_config_from_env(env))
-
-            # A future models.dev record maps this model to a different
-            # provider + protocol; reinstall must rebuild Provider/headers.
-            loki.reinstall_provider(
-                model="claude-model",
-                url="https://anthropic.example.test",
-                provider_kind=protocols.ANTHROPIC_MESSAGES,
-                credential_ref=authentications.CredentialRef.environment(
-                    "ANTHROPIC_API_KEY"),
-            )
-
-            self.assertEqual(loki.current_model(), "claude-model")
-            provider = loki.current_config().chat_provider
-            self.assertEqual(provider.kind, protocols.ANTHROPIC_MESSAGES)
-            self.assertEqual(provider.chat_url, "https://anthropic.example.test/v1/messages")
-            self.assertNotIn("x-api-key", provider.headers)
-            self.assertNotIn(
-                "x-api-key",
-                loki.current_config().chat_provider.headers)
-            self.assertEqual(
-                loki.current_config().auth_spec.scheme, "anthropic")
-        finally:
-            restore_loki_state(old_values)
-
     def test_reinstall_does_not_carry_custom_auth_to_new_provider(self):
         saved = save_loki_state(["runtime_config"])
         try:
@@ -937,55 +836,6 @@ class RuntimeConfigTests(unittest.TestCase):
                 ValueError, "unavailable credential"):
             loki.build_config_from_env(credentials=inventory)
 
-    def test_build_config_uses_explicit_env_key(self):
-        env = {
-            "LOKI_API_BASE": "https://api.deepseek.com/anthropic",
-            "LOKI_PROVIDER": "anthropic_messages",
-            "LOKI_API_KEY": "loki-key",
-            "ANTHROPIC_API_KEY": "anthropic-key",
-            "OPENAI_API_KEY": "openai-key",
-            "LOKI_MODEL": "deepseek-test",
-            "LOKI_MAX_TOKENS": "123",
-            "LOKI_ANTHROPIC_VERSION": "2024-01-01",
-        }
-
-        config = loki.build_config_from_env(env)
-
-        self.assertEqual(
-            config.chat_provider.input_url,
-            "https://api.deepseek.com/anthropic")
-        self.assertEqual(
-            config.chat_provider.kind, protocols.ANTHROPIC_MESSAGES)
-        self.assertEqual(config.model, "deepseek-test")
-        self.assertEqual(config.chat_provider.max_tokens, 123)
-        self.assertNotIn("x-api-key", config.chat_provider.headers)
-        self.assertEqual(
-            config.chat_provider.headers["anthropic-version"],
-            "2024-01-01")
-        self.assertEqual(config.auth_spec.scheme, "anthropic")
-        self.assertEqual(
-            config.auth_spec.credential,
-            authentications.CredentialRef.environment("LOKI_API_KEY"))
-        self.assertNotIn("LOKI_API_KEY", env)
-        self.assertNotIn("ANTHROPIC_API_KEY", env)
-        self.assertNotIn("OPENAI_API_KEY", env)
-
-    def test_build_config_accepts_explicit_connection_without_authentication(
-            self):
-        env = {
-            "LOKI_API_BASE": "https://example.test/v1/chat/completions",
-            "LOKI_PROVIDER": "openai_chat",
-            "LOKI_MODEL": "local-model",
-        }
-        config = loki.build_config_from_env(env)
-
-        self.assertIsNone(config.auth_spec)
-        self.assertEqual(config.model, "local-model")
-        self.assertNotIn(
-            "Authorization", config.chat_provider.headers)
-        self.assertNotIn("x-api-key", config.chat_provider.headers)
-        self.assertFalse(config.stream)
-
     def test_explicit_streaming_is_opt_in_and_validated(self):
         base = {
             "LOKI_API_BASE": "http://localhost:8000/v1/chat/completions",
@@ -1253,52 +1103,6 @@ class RuntimeConfigTests(unittest.TestCase):
                 CredentialInventory({}, {credential}),
             )
 
-    def test_saved_connection_allows_explicit_custom_header_override(self):
-        descriptor = ConnectionDescriptor(
-            provider_id="provider",
-            provider_name="Provider",
-            model="model",
-            chat_url="https://provider.example.test/v1/responses",
-            models_url=None,
-            protocol=protocols.OPENAI_RESPONSES,
-            credential_ref=(
-                authentications.CredentialRef.environment(
-                    "PROVIDER_API_KEY")),
-            auth_scheme="bearer",
-        )
-
-        config = loki.config_from_connection_descriptor(
-            descriptor,
-            CredentialStore({
-                "PROVIDER_API_KEY": "secret",
-                "LOKI_AUTH_HEADER": "X-Custom-Key",
-            }),
-        )
-
-        self.assertEqual(config.auth_spec.scheme, "custom")
-        self.assertEqual(config.auth_spec.header_name, "X-Custom-Key")
-
-    def test_saved_credentialless_connection_restores_without_authentication(
-            self):
-        descriptor = ConnectionDescriptor(
-            provider_id=None,
-            provider_name="Explicit LOKI_* connection",
-            model="local-model",
-            chat_url="http://localhost:8000/v1/chat/completions",
-            models_url="http://localhost:8000/v1/models",
-            protocol=protocols.OPENAI_CHAT,
-            stream=True,
-        )
-
-        config = loki.config_from_connection_descriptor(
-            descriptor, CredentialStore({}))
-
-        self.assertIsNone(config.auth_spec)
-        self.assertNotIn(
-            "Authorization", config.chat_provider.headers)
-        self.assertNotIn("x-api-key", config.chat_provider.headers)
-        self.assertTrue(config.stream)
-
     def test_saved_prompt_cache_setting_restores_without_reinference(self):
         descriptor = ConnectionDescriptor(
             provider_id="compatible",
@@ -1317,71 +1121,6 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertTrue(restored.chat_provider.prompt_cache)
         self.assertFalse(overridden.chat_provider.prompt_cache)
-
-    def test_modelsdev_selection_builds_fresh_provider_auth(self):
-        provider_entry = {
-            "name": "OpenRouter",
-            "env": ["OPENROUTER_API_KEY"],
-            "api": "https://openrouter.ai/api/v1",
-        }
-        config = loki.config_from_modelsdev_selection(
-            "openrouter",
-            provider_entry,
-            {"id": "z-ai/glm", "name": "GLM",
-             "status": "deprecated"},
-            CredentialStore({
-                "OPENROUTER_API_KEY": "selected-key",
-                "LOKI_API_KEY": "old-key",
-                "LOKI_STREAM": "1",
-            }),
-        )
-        self.assertEqual(
-            config.auth_spec.credential,
-            authentications.CredentialRef.environment(
-                "OPENROUTER_API_KEY"))
-        self.assertNotIn(
-            "Authorization", config.chat_provider.headers)
-        self.assertIsNone(config.auth_spec.header_name)
-        self.assertEqual(
-            config.chat_provider.provider_id, "openrouter")
-        self.assertEqual(config.model, "z-ai/glm")
-        self.assertEqual(config.model_status, "deprecated")
-        self.assertTrue(config.stream)
-
-    def test_normalized_openai_selection_preserves_visible_provenance(self):
-        provider_entry = modelsdev.normalize_catalog({
-            "openai": {
-                "id": "openai",
-                "name": "OpenAI",
-                "npm": "@ai-sdk/openai",
-                "env": ["OPENAI_API_KEY"],
-                "models": {},
-            },
-        })["openai"]
-
-        config = loki.config_from_modelsdev_selection(
-            "openai",
-            provider_entry,
-            {"id": "gpt-test", "name": "GPT Test"},
-            CredentialStore({"OPENAI_API_KEY": "selected-key"}),
-        )
-
-        self.assertEqual(
-            config.chat_provider.provider_name,
-            "OpenAI Platform API [endpoint supplied by Loki]",
-        )
-        self.assertEqual(
-            config.chat_provider.chat_url,
-            "https://api.openai.com/v1/responses",
-        )
-        self.assertEqual(
-            config.chat_provider.models_url,
-            "https://api.openai.com/v1/models",
-        )
-        self.assertEqual(
-            config.auth_spec.credential,
-            authentications.CredentialRef.environment(
-                "OPENAI_API_KEY"))
 
 
 class ModelLoadingTests(unittest.TestCase):
@@ -1498,27 +1237,6 @@ class ModelLoadingTests(unittest.TestCase):
             "Configuration error: model missing; set LOKI_MODEL.",
             stderr.getvalue(),
         )
-
-    def test_headless_startup_accepts_credentialless_explicit_connection(self):
-        loki.CREDENTIALS = CredentialStore({
-            "LOKI_API_BASE":
-                "http://localhost:8000/v1/chat/completions",
-            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
-            "LOKI_MODEL": "local-model",
-        })
-        runner = mock.AsyncMock()
-
-        with mock.patch(
-                "loki_agent.terminal_frontend.subagents.run_cli_async",
-                new=runner):
-            status = asyncio.run(terminal_frontend.async_main(["--headless"]))
-
-        runner.assert_awaited_once()
-        self.assertEqual(status, 0)
-        self.assertIsNone(loki.current_config().auth_spec)
-        self.assertNotIn(
-            "Authorization",
-            loki.current_config().chat_provider.headers)
 
     def test_headless_configuration_failure_returns_usage_error(self):
         loki.CREDENTIALS = CredentialStore({})
@@ -1820,167 +1538,118 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(loki.current_config().model, "current-model")
 
     def test_provider_fallback_selection_preserves_connection(self):
-        models_url = "https://catalog.example.test/custom/models"
-        loki.CREDENTIALS = CredentialStore({
-            "LOKI_API_BASE":
-                "https://provider.example.test/v1/chat/completions",
-            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
-            "LOKI_API_KEY": "test-key",
-            "LOKI_MODELS_URL": models_url,
-        })
-        session = ScriptedInputSession(["/model", "/quit"])
+        async def workflow():
+            models_url = "https://catalog.example.test/custom/models"
+            owner = credential_supervisors.CredentialSupervisor(CredentialStore({
+                "LOKI_API_BASE": "https://provider.example.test/v1/chat/completions",
+                "LOKI_PROVIDER": protocols.OPENAI_CHAT, "LOKI_API_KEY": "fallback-secret",
+                "LOKI_MODELS_URL": models_url,
+            }))
+            from test_http_client import FakeConnector
 
-        async def load_provider_models(diagnostic_writer=None):
-            loki.current_session().models = ["first-model", "selected-model"]
+            def response(data):
+                body = json.dumps(data).encode()
+                return b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "chat-test.json")
-            loader = mock.AsyncMock(side_effect=load_provider_models)
-            with mock.patch(
-                    "loki_agent.terminal_frontend.input_session",
-                    return_value=session), mock.patch(
-                        "loki_agent.terminal_frontend.new_chat_log_path",
-                        return_value=path), mock.patch(
-                            "loki_agent.terminal_frontend.restore_output_area_after_input"
-                        ), mock.patch(
-                            "loki_agent.terminal_frontend.load_models_async",
-                            new=loader), mock.patch(
-                                "loki_agent.terminal_frontend.modelsdev."
-                                "run_model_picker_async",
-                                new=mock.AsyncMock(
-                                    side_effect=OSError("offline"))), \
-                    mock.patch(
-                        "loki_agent.terminal_frontend.modelsdev."
-                        "run_flat_model_picker_async",
-                        new=mock.AsyncMock(return_value="selected-model")):
-                status = asyncio.run(terminal_frontend.async_main([]))
+            def answer(text):
+                return {"object": "chat.completion", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
 
-            with open(path, "r", encoding="utf-8") as f:
-                saved = json.load(f)
+            connector = FakeConnector([
+                response({"data": [{"id": "first-model"}, {"id": "selected-model"}]}),
+                response(answer("fallback durable answer")), response(answer("fallback resumed answer"))])
+            catalog_attempts = []
+            with tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "chat-fallback.json")
+                session = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(directory))
+                session.credential_authority = owner.broker
+                self.addCleanup(lambda: asyncio.run(session.job_manager.close_session_owned()))
 
-        loader.assert_awaited_once()
-        self.assertEqual(status, 0)
-        self.assertEqual(loki.current_model(), "selected-model")
-        self.assertEqual(loki.current_config().model, "selected-model")
-        self.assertEqual(
-            loki.current_config().chat_provider.models_url, models_url)
-        self.assertEqual(
-            saved["session_state"]["connection"]["models_url"], models_url)
-        self.assertEqual(
-            saved["session_state"]["connection"]["model"], "selected-model")
+                class Input(ScriptedInputSession):
+                    async def prompt(inner_self, prompt=None, history=None):
+                        self.assertIn("filter WORDS", prompt)
+                        return "2"
 
-    def test_modelsdev_selection_persists_deprecated_status(self):
-        loki.CREDENTIALS = CredentialStore({
-            "PROVIDER_API_KEY": "test-key",
-        })
-        session = ScriptedInputSession(["/model", "/quit"])
-        provider_entry = {
-            "name": "Provider",
-            "env": ["PROVIDER_API_KEY"],
-            "api": "https://provider.example.test/v1",
-        }
-        model_entry = {
-            "id": "old-model",
-            "name": "Old Model",
-            "status": "deprecated",
-        }
+                inputs = Input(["/model", "answer with fallback model", None])
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "chat-test.json")
-            with mock.patch(
-                    "loki_agent.terminal_frontend.input_session",
-                    return_value=session), mock.patch(
-                        "loki_agent.terminal_frontend.new_chat_log_path",
-                        return_value=path), mock.patch(
-                            "loki_agent.terminal_frontend.restore_output_area_after_input"
-                        ), mock.patch(
-                            "loki_agent.terminal_frontend.modelsdev."
-                            "run_model_picker_async",
-                            new=mock.AsyncMock(return_value=(
-                                "provider", provider_entry, model_entry))):
-                status = asyncio.run(terminal_frontend.async_main([]))
+                async def connect(host, port, **kwargs):
+                    self.assertEqual(port, 443)
+                    self.assertIsNotNone(kwargs.get("ssl"))
+                    if host == "models.dev":
+                        catalog_attempts.append(host)
+                        raise OSError("catalog offline")
+                    self.assertIn(host, ("catalog.example.test", "provider.example.test"))
+                    return await connector.open_connection(host, port, **kwargs)
 
-            with open(path, "r", encoding="utf-8") as f:
-                saved = json.load(f)
+                saved = modelsdev._index_cache
+                modelsdev._index_cache = None
+                try:
+                    with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                            mock.patch.object(loki, "CREDENTIALS", owner.inventory), \
+                            mock.patch.object(asyncio, "open_connection", side_effect=connect), \
+                            mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                            mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=path), \
+                            mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([]), 10), 0)
+                        loki.save_chat_log()
+                        self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
+                        await session.job_manager.close_session_owned()
+                finally:
+                    modelsdev._index_cache = saved
+                saved = json.loads(pathlib.Path(path).read_text())
+                self.assertEqual(saved["session_state"]["connection"]["models_url"], models_url)
+                self.assertEqual(saved["session_state"]["connection"]["model"], "selected-model")
+                self.assertEqual(formats.item_text(saved["events"][-1]), "fallback durable answer")
+                self.assertNotIn("fallback-secret", pathlib.Path(path).read_text())
+                self.assertEqual(catalog_attempts, ["models.dev"])
+                fresh = credential_supervisors.CredentialSupervisor(CredentialStore({"LOKI_API_KEY": "fallback-secret"}))
+                resumed = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(os.path.join(directory, "resumed-jobs")))
+                resumed.credential_authority = fresh.broker
+                self.addCleanup(lambda: asyncio.run(resumed.job_manager.close_session_owned()))
 
-        self.assertEqual(status, 0)
-        self.assertEqual(loki.current_config().model_status, "deprecated")
-        self.assertIn(
-            "Model: old-model (deprecated), Context: unknown; /model", terminal_frontend.status_text())
-        self.assertEqual(
-            saved["session_state"]["connection"]["model_status"],
-            "deprecated",
-        )
+                class ResumeInput(ScriptedInputSession):
+                    async def prompt(inner_self, prompt=None, history=None):
+                        self.assertEqual(prompt, "Use this saved connection? [y/N]: ")
+                        return "yes"
 
-    def test_model_can_switch_from_catalog_back_to_explicit_connection(self):
-        explicit_url = "http://localhost:8000/v1"
-        loki.CREDENTIALS = CredentialStore({
-            "LOKI_API_BASE": explicit_url,
-            "LOKI_PROVIDER": protocols.OPENAI_CHAT,
-            "LOKI_MODEL": "private-model",
-            "CATALOG_API_KEY": "catalog-key",
-        })
-        session = ScriptedInputSession(["/model", "/model", "/quit"])
-        catalog_provider = {
-            "name": "Catalog Provider",
-            "env": ["CATALOG_API_KEY"],
-            "api": "https://catalog.example.test/v1",
-        }
-        catalog_model = {
-            "id": "catalog-model",
-            "name": "Catalog Model",
-        }
-        seen_explicit = []
+                with mock.patch.object(loki, "_DEFAULT_SESSION", resumed), \
+                        mock.patch.object(loki, "CREDENTIALS", fresh.inventory), \
+                        mock.patch.object(asyncio, "open_connection", side_effect=connect), \
+                        mock.patch.object(terminal_frontend, "input_session", return_value=ResumeInput(["continue fallback", None])), \
+                        mock.patch.object(terminals, "open_terminal_stdin"), \
+                        mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10), 0)
+                    self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
+                    loki.save_chat_log()
+                    await resumed.job_manager.close_session_owned()
+                final = json.loads(pathlib.Path(path).read_text())
+                self.assertEqual(final["events"][:len(saved["events"])], saved["events"])
+                self.assertEqual(formats.item_text(final["events"][-1]), "fallback resumed answer")
+                self.assertEqual(final["session_state"]["connection"], saved["session_state"]["connection"])
+                self.assertNotIn("fallback-secret", pathlib.Path(path).read_text())
+                self.assertEqual(connector.responses, [])
+                requests, payloads = [], []
+                for connection, writer in zip(connector.calls, connector.writers):
+                    self.assertTrue(writer.closed)
+                    self.assertTrue(writer.wait_closed_called)
+                    head, body = bytes(writer.data).split(b"\r\n\r\n", 1)
+                    lines = head.decode().split("\r\n")
+                    method, target, version = lines[0].split(" ")
+                    self.assertEqual(version, "HTTP/1.1")
+                    headers = dict(line.split(": ", 1) for line in lines[1:])
+                    self.assertEqual(headers["Authorization"], "Bearer fallback-secret")
+                    requests.append((method, "https://" + connection["host"] + target))
+                    if body:
+                        payload = json.loads(body)
+                        self.assertEqual(payload["model"], "selected-model")
+                        payloads.append(payload)
+                self.assertEqual(requests, [("GET", models_url)] + [
+                    ("POST", "https://provider.example.test/v1/chat/completions")] * 2)
+                self.assertIn("fallback durable answer", json.dumps(payloads[1]))
 
-        async def pick_model(*, input_fn, credentials,
-                             explicit_connection=None,
-                             credential_authority=None,
-                             diagnostic_writer=None, text_writer):
-            seen_explicit.append(explicit_connection)
-            if len(seen_explicit) == 1:
-                return "catalog", catalog_provider, catalog_model
-            return explicit_connection
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "chat-test.json")
-            with mock.patch(
-                    "loki_agent.terminal_frontend.input_session",
-                    return_value=session), mock.patch(
-                        "loki_agent.terminal_frontend.new_chat_log_path",
-                        return_value=path), mock.patch(
-                            "loki_agent.terminal_frontend.restore_output_area_after_input"
-                        ), mock.patch(
-                            "loki_agent.terminal_frontend.modelsdev."
-                            "run_model_picker_async",
-                            new=mock.AsyncMock(side_effect=pick_model)):
-                status = asyncio.run(terminal_frontend.async_main([]))
-
-            with open(path, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-
-        self.assertEqual(status, 0)
-        self.assertEqual(len(seen_explicit), 2)
-        self.assertTrue(all(
-            isinstance(option, modelsdev.ExplicitConnectionOption)
-            for option in seen_explicit))
-        self.assertEqual(
-            loki.current_config().chat_provider.input_url, explicit_url)
-        self.assertEqual(loki.current_config().model, "private-model")
-        self.assertEqual(
-            loki.current_config().chat_provider.provider_name,
-            "Explicit LOKI_* connection",
-        )
-        connection = saved["session_state"]["connection"]
-        self.assertEqual(connection["model"], "private-model")
-        self.assertEqual(
-            connection["chat_url"],
-            "http://localhost:8000/v1/chat/completions",
-        )
-        self.assertIsNone(connection["credential"])
-        self.assertIsNone(loki.current_config().auth_spec)
-        self.assertNotIn(
-            "Authorization",
-            loki.current_config().chat_provider.headers)
+        asyncio.run(workflow())
 
     def test_explicit_connection_is_selectable_when_modelsdev_is_offline(self):
         explicit_url = "http://localhost:8000/v1"
@@ -2127,6 +1796,536 @@ class TerminalReasoningEffortTests(unittest.TestCase):
                 ("high", "high"),
             ],
         )
+
+
+class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_numeric_selection_approval_and_resumed_conversation(self):
+        await self._workflow("numeric")
+
+    async def test_filtered_selection_and_custom_header_resume(self):
+        await self._workflow("custom")
+
+    async def test_display_name_filter_and_credentialless_switch_resume(self):
+        await self._workflow("credentialless")
+
+    async def _workflow(self, variant):
+        from loki_agent import acp_worker, endpoint_pins
+        from test_endpoint_pins import _StateDir
+        from test_models_dev import DATA
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
+        source = root / "selection.txt"
+        source.write_text("selection witness\n", encoding="utf-8")
+        path = str(root / "chat-selection.json")
+        raw = copy.deepcopy(DATA)
+        raw["openrouter"]["models"]["z-ai/glm-5.2"].update({
+            "status": "deprecated", "provider": {
+                "api": "https://effective.example/v1", "npm": "@ai-sdk/openai"}})
+        raw["openai"] = {
+            "id": "openai", "name": "OpenAI", "npm": "@ai-sdk/openai",
+            "env": ["OPENAI_API_KEY"],
+            "models": {"gpt-test": {"id": "gpt-test", "name": "GPT Test", "status": "deprecated"}}}
+        raw["openai"]["models"]["gpt-override"] = {
+            "id": "gpt-override", "name": "GPT Override",
+            "provider": {"api": "https://normalized-effective.example/v1"}}
+        values = {
+            "LOKI_API_KEY": "stale-explicit-secret", "OPENROUTER_API_KEY": "selected-router-secret",
+            "OPENAI_API_KEY": "selected-openai-secret", "ANTHROPIC_API_KEY": "selected-anthropic-secret",
+            "ZHIPU_API_KEY": "unused-zhipu-secret", "LOKI_MAX_TOKENS": "1234",
+            "LOKI_ANTHROPIC_VERSION": "2024-01-01", "LOKI_STREAM": "0"}
+        owner = credential_supervisors.CredentialSupervisor(CredentialStore(values))
+        session = loki.Session(shell_cwd=str(root), job_manager=loki.JobManager(str(root / "jobs")))
+        session.credential_authority = owner.broker
+        self.addAsyncCleanup(session.job_manager.close_session_owned)
+        requests, prompts, approvals = [], [], []
+        output = io.StringIO()
+        phase = {}
+        saved_index = modelsdev._index_cache
+        self.addCleanup(setattr, modelsdev, "_index_cache", saved_index)
+        modelsdev._index_cache = None
+
+        def reply(text=None, tool=False):
+            if phase["protocol"] == protocols.ANTHROPIC_MESSAGES:
+                return {"type": "message", "id": "anthropic-selection", "role": "assistant",
+                        "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}}
+            if phase["protocol"] == protocols.OPENAI_CHAT:
+                return {"object": "chat.completion", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+            items = ([{"type": "function_call", "call_id": "selection-read", "name": "Read",
+                      "arguments": json.dumps({"file_path": str(source)})}] if tool else
+                     [{"type": "message", "role": "assistant", "content": [
+                         {"type": "output_text", "text": text}]}])
+            return {"object": "response", "status": "completed", "output": items}
+
+        async def request(method, url, **kwargs):
+            if method == "GET":
+                self.assertEqual(url, modelsdev.MODELS_DEV_URL)
+                self.assertEqual(kwargs["headers_in"]["Accept"], "application/json")
+                self.assertNotIn("Authorization", kwargs["headers_in"])
+                return http_client.HttpResponse(url, 200, "OK", {}, json.dumps(raw).encode())
+            self.assertEqual(method, "POST")
+            self.assertEqual(url, phase["url"])
+            headers = kwargs["headers_in"]
+            credential = phase.get("credential")
+            if credential:
+                self.assertEqual(headers[phase["header"]], phase.get("prefix", "") + credential)
+            for header in ("Authorization", "x-api-key", "X-Custom-Key"):
+                if not credential or header != phase["header"]:
+                    self.assertNotIn(header, headers)
+            payload = json.loads(kwargs["body"])
+            self.assertEqual(payload["model"], phase["model"])
+            if phase["protocol"] == protocols.ANTHROPIC_MESSAGES:
+                self.assertEqual(payload["max_tokens"], 1234)
+                self.assertEqual(headers["anthropic-version"], "2024-01-01")
+            if phase.get("history"):
+                serialized = json.dumps(payload)
+                self.assertIn("router durable answer", serialized)
+                self.assertIn("selection-read", serialized)
+                self.assertIn("1\\tselection witness", serialized)
+            for prior_answer in phase.get("resume_answers", []):
+                self.assertIn(prior_answer, json.dumps(payload))
+            if len(phase["queue"]) == 1 and phase.get("tool"):
+                self.assertEqual([(item["call_id"], item["output"]) for item in payload["input"]
+                                  if item.get("type") == "function_call_output"],
+                                 [("selection-read", "1\tselection witness")])
+            requests.append((url, copy.deepcopy(headers), payload))
+            data = phase["queue"].pop(0)
+            return http_client.HttpResponse(url, 200, "OK", {}, json.dumps(data).encode())
+
+        async def response_chunks(data):
+            if phase["protocol"] == protocols.OPENAI_RESPONSES:
+                for item in data["output"]:
+                    yield ("data: " + json.dumps({"type": "response.output_item.done", "item": item}) + "\n\n").encode()
+                yield ("data: " + json.dumps({"type": "response.completed", "response": {**data, "output": []}}) + "\n\n").encode()
+            else:
+                self.assertEqual(phase["protocol"], protocols.OPENAI_CHAT)
+                text = data["choices"][0]["message"]["content"]
+                for delta, finish in (({"role": "assistant", "content": text}, None), ({}, "stop")):
+                    yield ("data: " + json.dumps({"object": "chat.completion.chunk", "choices": [
+                        {"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+
+        # Route only the external connection to a loopback service. The production
+        # HTTP serializer, parser, streaming transport and provider decoders run.
+        service_tasks, service_errors, wire_requests = [], [], []
+
+        async def serve(reader, writer):
+            service_tasks.append(asyncio.current_task())
+            try:
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+                lines = head.decode("latin-1").split("\r\n")
+                method, target, version = lines[0].split(" ")
+                self.assertEqual(version, "HTTP/1.1")
+                headers = dict(line.split(": ", 1) for line in lines[1:] if line)
+                body = await asyncio.wait_for(reader.readexactly(int(headers.get("Content-Length", "0"))), 5)
+                url = "https://" + headers["Host"] + target
+                wire_requests.append((method, url))
+                response = await request(method, url, headers_in=headers, body=body)
+                response_body = response.body
+                content_type = "application/json"
+                if body and json.loads(body).get("stream"):
+                    content_type = "text/event-stream"
+                    response_body = b"".join([chunk async for chunk in response_chunks(json.loads(response_body))])
+                writer.write(b"HTTP/1.1 200 OK\r\n" + f"Content-Type: {content_type}\r\n".encode()
+                             + f"Content-Length: {len(response_body)}\r\n\r\n".encode() + response_body)
+                await asyncio.wait_for(writer.drain(), 5)
+            except Exception as error:
+                service_errors.append(error)
+            finally:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), 5)
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+
+        async def close_service():
+            server.close()
+            await asyncio.wait_for(server.wait_closed(), 5)
+            if service_tasks:
+                await asyncio.wait_for(asyncio.gather(*service_tasks), 10)
+
+        self.addAsyncCleanup(close_service)
+        port = server.sockets[0].getsockname()[1]
+        real_connect = asyncio.open_connection
+
+        async def connect(host, port_in, **kwargs):
+            from urllib.parse import urlsplit
+            self.assertEqual(port_in, 443)
+            self.assertIsNotNone(kwargs.get("ssl"))
+            self.assertIn(host, ("models.dev", urlsplit(phase["url"]).hostname))
+            return await real_connect("127.0.0.1", port)
+
+        def prepare(url, model, protocol, secret=None, *, header="Authorization", history=False, tool=False):
+            phase.clear()
+            phase.update(url=url, model=model, protocol=protocol, credential=secret, header=header,
+                         prefix="Bearer " if header == "Authorization" else "", history=history, tool=tool)
+            phase["answer"] = {
+                "z-ai/glm-5.2": "router durable answer", "router-replacement": "router replacement durable answer",
+                "gpt-test": "openai durable answer", "gpt-override": "override durable answer",
+                "claude-sonnet-4-6": "anthropic durable answer", "beta": "credentialless durable answer",
+                "explicit-model": "explicit durable answer"}[model]
+            phase["queue"] = ([reply(tool=True)] if tool else []) + [reply(text=phase["answer"])]
+
+        async def turn(prompt):
+            loki.set_session_connection(loki.active_connection_descriptor())
+            loki.current_transcript().append(formats.message_item("user", prompt))
+            answer = await asyncio.wait_for(loki.run_tool_loop_async(
+                loki.current_transcript(), allowed={"Read"}, max_loops=3), 10)
+            self.assertEqual(phase["queue"], [])
+            self.assertEqual(answer, phase["answer"])
+            loki.mark_chat_log_dirty()
+            loki.save_chat_log()
+
+        async def pick(answers, expected_pid, expected_api, expected_ref):
+            script = iter(answers)
+            previous = endpoint_pins.load()
+            provider_prompt_seen = False
+            last_input_render_end = len(output.getvalue())
+
+            async def input_fn(prompt=None, history=None):
+                nonlocal provider_prompt_seen, last_input_render_end
+                if expected_pid == "openrouter" and prompt.startswith("Provider choice") and not provider_prompt_seen:
+                    shown = output.getvalue()[render_start:]
+                    self.assertIn("1. OpenRouter id=z-ai/glm-5.2", shown)
+                    self.assertIn("2. Zhipu AI id=glm-5.2", shown)
+                    provider_prompt_seen = True
+                prompts.append(prompt)
+                answer = next(script)
+                if prompt == "Send this credential to this endpoint? [y/N] ":
+                    self.assertEqual(endpoint_pins.load(), previous)
+                    self.assertEqual(endpoint_pins.status(expected_pid, expected_api, expected_ref)[0],
+                                     endpoint_pins.CHANGED if expected_pid in previous else endpoint_pins.NEW)
+                    shown = output.getvalue()[last_input_render_end:]
+                    self.assertIn(expected_api, shown)
+                    self.assertIn(expected_ref, shown)
+                    worker = acp_worker.Worker(session, lambda message: None, "approval")
+                    worker._option_leaves = {"chosen": next(
+                        leaf for members in modelsdev._index_cache[1].values() for leaf in members
+                        if leaf[0] == expected_pid
+                        and modelsdev.provider_access(leaf[1], owner.inventory).api_url == expected_api)}
+                    active = loki.current_config()
+                    requests_before = len(requests)
+                    with self.assertRaisesRegex(ValueError, "approve it once"):
+                        loki.config_from_modelsdev_selection(*worker._option_leaves["chosen"], owner.inventory)
+                    self.assertIs(loki.current_config(), active)
+                    self.assertEqual(len(requests), requests_before)
+                    description = worker.describe_config_selection({"value": "chosen"})
+                    self.assertEqual(description["providerId"], expected_pid)
+                    self.assertEqual(description["endpoint"], expected_api)
+                    self.assertEqual(description["credential"], expected_ref)
+                    self.assertEqual(description["changed"], expected_pid in previous)
+                    approvals.append((expected_pid, expected_api, expected_ref))
+                last_input_render_end = len(output.getvalue())
+                return answer
+
+            render_start = len(output.getvalue())
+            leaf = await modelsdev.run_model_picker_async(
+                input_fn, owner.inventory, text_writer=output.write)
+            rendered = output.getvalue()[render_start:]
+            self.assertTrue(rendered.startswith("\nUsable models:\n"))
+            self.assertEqual(rendered.count("\nUsable models:\n"), 2 if answers[0].startswith("filter") else 1)
+            self.assertEqual(rendered.count("\nUsable providers:\n"), 2 if len(answers) == 5 else 1)
+            self.assertEqual(leaf[0], expected_pid)
+            approved_pair = {"api": expected_api, "credential": expected_ref}
+            self.assertEqual(endpoint_pins.status(expected_pid, expected_api, expected_ref),
+                             (endpoint_pins.PINNED, approved_pair))
+            self.assertEqual(endpoint_pins.load(), {**previous, expected_pid: approved_pair})
+            self.assertEqual(json.loads(pathlib.Path(state_directory, "loki", "provider-endpoints.json").read_text()),
+                             {**previous, expected_pid: approved_pair})
+            with self.assertRaises(StopIteration):
+                next(script)
+            return leaf
+
+        with _StateDir() as state_directory, mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                mock.patch.object(loki, "CREDENTIALS", owner.inventory), \
+                mock.patch.object(asyncio, "open_connection", side_effect=connect), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            # An explicit endpoint leases only LOKI_API_KEY, never a generic SDK key.
+            env = {**values, "LOKI_API_BASE": "https://api.deepseek.com/anthropic",
+                   "LOKI_PROVIDER": protocols.ANTHROPIC_MESSAGES, "LOKI_MODEL": "explicit-model"}
+            if variant == "custom":
+                env["LOKI_AUTH_HEADER"] = "X-Custom-Key"
+            config = loki.build_config_from_env(env)
+            self.assertEqual(config.auth_spec.scheme, "custom" if variant == "custom" else "anthropic")
+            self.assertEqual(config.auth_spec.header_name, "X-Custom-Key" if variant == "custom" else None)
+            self.assertNotIn("X-Custom-Key", config.chat_provider.headers)
+            self.assertFalse(any(name.endswith("API_KEY") for name in env))
+            self.assertEqual(config.auth_spec.credential, authentications.CredentialRef.environment("LOKI_API_KEY"))
+            self.assertNotIn("x-api-key", config.chat_provider.headers)
+            self.assertEqual(config.chat_provider.input_url, "https://api.deepseek.com/anthropic")
+            loki.apply_runtime_config(config)
+            loki.new_chat_log(path)
+            if variant == "credentialless":
+                startup_values = {name: value for name, value in values.items() if name != "LOKI_API_KEY"}
+                startup_values.pop("LOKI_STREAM")
+                startup_values.update(LOKI_API_BASE="https://local.example/v1",
+                                      LOKI_PROVIDER=protocols.OPENAI_CHAT, LOKI_MODEL="beta")
+                prepare("https://local.example/v1/chat/completions", "beta", protocols.OPENAI_CHAT)
+                with mock.patch.object(loki, "CREDENTIALS", CredentialStore(startup_values)):
+                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main(
+                        ["--headless", "--prompt=credentialless startup"]), 10), 0)
+                self.assertIsNone(loki.current_config().auth_spec)
+                self.assertFalse(loki.current_config().stream)
+                self.assertEqual(phase["queue"], [])
+            else:
+                prepare("https://api.deepseek.com/anthropic/v1/messages", "explicit-model", protocols.ANTHROPIC_MESSAGES,
+                        "stale-explicit-secret", header="X-Custom-Key" if variant == "custom" else "x-api-key")
+                await turn("explicit request")
+
+            choices = {"numeric": ["2", "1", "y"],
+                       "custom": ["filter openrouter", "1", "filter openrouter", "1", "y"],
+                       "credentialless": ["filter zhipu ai", "1", "1", "y"]}[variant]
+            leaf = await pick(choices, "openrouter", "https://effective.example/v1", "env:OPENROUTER_API_KEY")
+            self.assertEqual(leaf[2]["id"], "z-ai/glm-5.2")
+            worker = acp_worker.Worker(session, lambda message: None, "selection")
+            worker._option_leaves = {"chosen": leaf}
+            self.assertEqual(worker.describe_config_selection({"value": "chosen"}), {})
+            selection_credentials = CredentialStore({**values, "LOKI_STREAM": "1"}) if variant == "custom" else owner.inventory
+            config = loki.config_from_modelsdev_selection(*leaf, selection_credentials)
+            self.assertEqual(config.model_status, "deprecated")
+            self.assertEqual(config.auth_spec.credential, authentications.CredentialRef.environment("OPENROUTER_API_KEY"))
+            self.assertIsNone(config.auth_spec.header_name)
+            loki.apply_runtime_config(config)
+            self.assertIn("Model: z-ai/glm-5.2 (deprecated), Context: unknown; /model", terminal_frontend.status_text())
+            self.assertEqual(loki.current_config().stream, variant == "custom")
+            self.assertNotIn("Authorization", loki.current_config().chat_provider.headers)
+            prepare("https://effective.example/v1/responses", "z-ai/glm-5.2", protocols.OPENAI_RESPONSES,
+                    "selected-router-secret", tool=True)
+            await turn("read the selection witness")
+            self.assertEqual(endpoint_pins.status("openrouter", raw["openrouter"]["api"], "env:OPENROUTER_API_KEY")[0],
+                             endpoint_pins.CHANGED)
+            before_retry = len(prompts)
+            await pick(["filter openrouter", "1", "1"], "openrouter", "https://effective.example/v1", "env:OPENROUTER_API_KEY")
+            self.assertEqual(len(prompts) - before_retry, 3)
+            self.assertEqual(len(approvals), 1)
+            persisted_router = json.loads(pathlib.Path(path).read_text())
+            self.assertEqual(persisted_router["session_state"]["connection"]["model_status"], "deprecated")
+
+            original_provider = loki.current_config().chat_provider
+            loki.reinstall_provider(model="router-replacement")
+            self.assertIsNot(loki.current_config().chat_provider, original_provider)
+            self.assertEqual(loki.current_model(), "router-replacement")
+            self.assertEqual(loki.current_config().model, "router-replacement")
+            self.assertEqual(loki.current_config().chat_provider.kind, protocols.OPENAI_RESPONSES)
+            self.assertEqual(loki.current_config().chat_provider.max_tokens, 1234)
+            self.assertEqual(loki.current_config().stream, variant == "custom")
+            self.assertEqual(loki.current_config().auth_spec.credential,
+                             authentications.CredentialRef.environment("OPENROUTER_API_KEY"))
+            prepare("https://effective.example/v1/responses", "router-replacement", protocols.OPENAI_RESPONSES,
+                    "selected-router-secret", history=True)
+            await turn("replace model on the same provider")
+
+            # Reapproval replaces, rather than accumulates, a provider's durable pair.
+            raw["openrouter"]["models"]["z-ai/glm-5.2"]["provider"]["api"] = "https://replacement.example/v1"
+            modelsdev._index_cache = None
+            leaf = await pick(["filter openrouter", "1", "1", "yes"], "openrouter",
+                              "https://replacement.example/v1", "env:OPENROUTER_API_KEY")
+            loki.apply_runtime_config(loki.config_from_modelsdev_selection(*leaf, owner.inventory))
+            prepare("https://replacement.example/v1/responses", "z-ai/glm-5.2", protocols.OPENAI_RESPONSES,
+                    "selected-router-secret", history=True)
+            await turn("replace approved endpoint")
+            pin_path = pathlib.Path(state_directory, "loki", "provider-endpoints.json")
+            self.assertEqual(json.loads(pin_path.read_text())["openrouter"], {
+                "api": "https://replacement.example/v1", "credential": "env:OPENROUTER_API_KEY"})
+            self.assertEqual(endpoint_pins.load()["openrouter"], {
+                "api": "https://replacement.example/v1", "credential": "env:OPENROUTER_API_KEY"})
+            self.assertEqual(
+                endpoint_pins.status("openrouter", "https://effective.example/v1", "env:OPENROUTER_API_KEY")[0],
+                endpoint_pins.CHANGED)
+
+            # Replace the provider/protocol through another real approved catalog selection.
+            leaf = await pick(["filter anthropic", "1", "1", "y"], "anthropic",
+                              "https://api.anthropic.com/v1/messages", "env:ANTHROPIC_API_KEY")
+            selected = loki.config_from_modelsdev_selection(*leaf, owner.inventory)
+            loki.reinstall_provider(model=selected.model, url="https://api.anthropic.com",
+                                    provider_kind=selected.chat_provider.kind, provider_id="anthropic",
+                                    anthropic_version=selected.chat_provider.headers["anthropic-version"],
+                                    credential_ref=selected.auth_spec.credential)
+            self.assertEqual(loki.current_config().auth_spec.scheme, "anthropic")
+            self.assertEqual(loki.current_config().chat_provider.max_tokens, 1234)
+            prepare("https://api.anthropic.com/v1/messages", "claude-sonnet-4-6", protocols.ANTHROPIC_MESSAGES,
+                    "selected-anthropic-secret", header="x-api-key", history=True)
+            await turn("switch protocol")
+
+            if variant == "credentialless":
+                # The actual terminal /model handler replaces a loaded connection
+                # and then selects the explicit credentialless option again.
+                answers = iter(["filter GPT Test", "1", "1", "yes", "filter beta", "1", "1"])
+
+                class SwitchInput(ScriptedInputSession):
+                    async def get(inner_self):
+                        message = await super().get()
+                        if message == "/model" and loki.current_model() == "gpt-test":
+                            self.assertIn("Model: gpt-test (deprecated), Context: unknown; /model", terminal_frontend.status_text())
+                            self.assertEqual(json.loads(pathlib.Path(path).read_text())["session_state"]["connection"]["model_status"],
+                                             "deprecated")
+                        if message == "normalized selection":
+                            self.assertEqual(loki.current_config().chat_provider.provider_name,
+                                             "OpenAI Platform API [endpoint supplied by Loki]")
+                            prepare("https://api.openai.com/v1/responses", "gpt-test", protocols.OPENAI_RESPONSES,
+                                    "selected-openai-secret", history=True)
+                        elif message == "switch to credentialless":
+                            self.assertIsNone(loki.current_config().auth_spec)
+                            self.assertEqual(loki.current_config().chat_provider.input_url, "https://local.example/v1")
+                            self.assertEqual(loki.current_config().chat_provider.provider_name, "Explicit LOKI_* connection")
+                            prepare("https://local.example/v1/chat/completions", "beta", protocols.OPENAI_CHAT, history=True)
+                        return message
+
+                    async def prompt(inner_self, prompt=None, history=None):
+                        answer = next(answers)
+                        if prompt == "Send this credential to this endpoint? [y/N] ":
+                            self.assertEqual(
+                                endpoint_pins.status("openai", "https://api.openai.com/v1", "env:OPENAI_API_KEY"),
+                                (endpoint_pins.NEW, None))
+                            self.assertIn("env:OPENAI_API_KEY", output.getvalue())
+                        else:
+                            self.assertIn("filter WORDS", prompt)
+                        return answer
+
+                startup_values["LOKI_STREAM"] = "1"
+                inputs = SwitchInput(["/model", "normalized selection", "/model", "switch to credentialless", None])
+                with mock.patch.object(loki, "CREDENTIALS", CredentialStore(startup_values)), \
+                        mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                        mock.patch.object(terminals, "open_terminal_stdin"), \
+                        mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
+                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10), 0)
+                    loki.save_chat_log()
+                self.assertEqual(phase["queue"], [])
+                with self.assertRaises(StopIteration):
+                    next(answers)
+            else:
+                leaf = await pick(["filter GPT Test", "1", "1", "y"], "openai",
+                                  "https://api.openai.com/v1", "env:OPENAI_API_KEY")
+                loki.apply_runtime_config(loki.config_from_modelsdev_selection(*leaf, owner.inventory))
+                self.assertEqual(loki.current_config().chat_provider.provider_name,
+                                 "OpenAI Platform API [endpoint supplied by Loki]")
+                self.assertEqual(loki.current_config().chat_provider.models_url, "https://api.openai.com/v1/models")
+                prepare("https://api.openai.com/v1/responses", "gpt-test", protocols.OPENAI_RESPONSES,
+                        "selected-openai-secret", history=True)
+                await turn("normalized selection")
+                if variant == "numeric":
+                    leaf = await pick(["filter GPT Override", "1", "1", "yes"], "openai",
+                                      "https://normalized-effective.example/v1", "env:OPENAI_API_KEY")
+                    self.assertEqual(leaf[2]["id"], "gpt-override")
+                    loki.apply_runtime_config(loki.config_from_modelsdev_selection(*leaf, owner.inventory))
+                    prepare("https://normalized-effective.example/v1/responses", "gpt-override", protocols.OPENAI_RESPONSES,
+                            "selected-openai-secret", history=True)
+                    await turn("override a normalized provider endpoint")
+
+            expected_prompts = ["read the selection witness", "replace model on the same provider",
+                                "replace approved endpoint", "switch protocol", "normalized selection"]
+            expected_answers = ["router durable answer", "router replacement durable answer",
+                                "router durable answer", "anthropic durable answer", "openai durable answer"]
+            if variant != "credentialless":
+                expected_prompts.insert(0, "explicit request")
+                expected_answers.insert(0, "explicit durable answer")
+            if variant == "credentialless":
+                expected_prompts.append("switch to credentialless")
+                expected_answers.append("credentialless durable answer")
+            elif variant == "numeric":
+                expected_prompts.append("override a normalized provider endpoint")
+                expected_answers.append("override durable answer")
+            before = json.loads(pathlib.Path(path).read_text())
+            self.assertEqual(before["session_state"]["connection"], loki.active_connection_descriptor().to_dict())
+            self.assertEqual([(item["call_id"], formats.item_text(item)) for item in before["events"]
+                              if item.get("type") == "tool_result"], [("selection-read", "1\tselection witness")])
+            formats.validate_events(before["events"])
+            await session.job_manager.close_session_owned()
+            fresh_values = {name: value for name, value in values.items() if name.endswith("API_KEY")}
+            if variant == "custom":
+                fresh_values["LOKI_AUTH_HEADER"] = "X-Custom-Key"
+            fresh_owner = credential_supervisors.CredentialSupervisor(CredentialStore(fresh_values))
+            self.assertIsNot(fresh_owner.broker, owner.broker)
+            resumed = loki.Session(shell_cwd=str(root), job_manager=loki.JobManager(str(root / "resumed-jobs")))
+            resumed.credential_authority = fresh_owner.broker
+            self.addAsyncCleanup(resumed.job_manager.close_session_owned)
+            descriptor = before["session_state"]["connection"]
+            if variant == "credentialless":
+                self.assertIsNone(descriptor["credential"])
+                self.assertEqual(descriptor["model"], "beta")
+                self.assertTrue(descriptor["stream"])
+                self.assertEqual(descriptor["chat_url"], "https://local.example/v1/chat/completions")
+                prepare("https://local.example/v1/chat/completions", "beta", protocols.OPENAI_CHAT, history=True)
+            elif variant == "numeric":
+                prepare("https://normalized-effective.example/v1/responses", "gpt-override", protocols.OPENAI_RESPONSES,
+                        "selected-openai-secret", history=True)
+            else:
+                prepare("https://api.openai.com/v1/responses", "gpt-test", protocols.OPENAI_RESPONSES,
+                        "selected-openai-secret", header="X-Custom-Key", history=True)
+
+            phase["resume_answers"] = list(expected_answers)
+
+            class Input(ScriptedInputSession):
+                async def prompt(inner_self, prompt=None, history=None):
+                    self.assertEqual(prompt, "Use this saved connection? [y/N]: ")
+                    self.assertEqual(resumed.transcript_items, [])
+                    self.assertIn(descriptor["chat_url"], output.getvalue())
+                    if variant == "credentialless":
+                        self.assertIn("Authentication: none\n", output.getvalue())
+                        self.assertIn("Streaming: yes\n", output.getvalue())
+                        self.assertNotIn("Credential: None", output.getvalue())
+                    return "yes"
+
+            inputs = Input(["continue selection", None])
+            count = len(requests)
+            with mock.patch.object(loki, "_DEFAULT_SESSION", resumed), \
+                    mock.patch.object(loki, "CREDENTIALS", fresh_owner.inventory), \
+                    mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
+                    mock.patch.object(terminals, "open_terminal_stdin"), \
+                    mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
+                self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10), 0)
+                self.assertEqual(loki.current_config().chat_provider.max_tokens, 1234)
+                self.assertEqual(loki.current_config().stream, variant == "credentialless")
+                self.assertEqual(loki.current_transcript()[:len(before["events"])], before["events"])
+                loki.save_chat_log()
+                await resumed.job_manager.close_session_owned()
+            self.assertEqual(len(requests), count + 1)
+            self.assertEqual(phase["queue"], [])
+            final = json.loads(pathlib.Path(path).read_text())
+            self.assertEqual(final["events"][:len(before["events"])], before["events"])
+            self.assertEqual(formats.item_text(final["events"][-1]),
+                             {"credentialless": "credentialless durable answer", "numeric": "override durable answer",
+                              "custom": "openai durable answer"}[variant])
+            self.assertEqual([formats.item_text(item) for item in final["events"]
+                              if item.get("type") == "message" and item.get("role") == "user"],
+                             expected_prompts + ["continue selection"])
+            responses = [item for item in final["events"] if item.get("type") == "model_response"]
+            self.assertEqual([formats.item_text(item) for item in responses if not formats.response_tool_calls(item)],
+                             expected_answers + [phase["answer"]])
+            self.assertEqual([(call["call_id"], call["name"], formats.tool_call_input(call))
+                              for item in responses for call in formats.response_tool_calls(item)],
+                             [("selection-read", "Read", {"file_path": str(source)})])
+            expected_types = []
+            for prompt in expected_prompts + ["continue selection"]:
+                expected_types.extend(["message", "model_response"])
+                if prompt == "read the selection witness":
+                    expected_types.extend(["tool_result", "model_response"])
+            self.assertEqual([item["type"] for item in final["events"]
+                              if item["type"] != "instruction"
+                              and (item["type"] != "message" or item.get("role") == "user")], expected_types)
+            self.assertNotIn("calls", final)
+            self.assertEqual(final["session_state"]["connection"]["chat_url"], descriptor["chat_url"])
+            for secret in (value for name, value in values.items() if name.endswith("API_KEY")):
+                self.assertNotIn(secret, pathlib.Path(path).read_text() + pin_path.read_text() + output.getvalue())
+            self.assertTrue(any(prompt.startswith("Model choice") for prompt in prompts))
+            self.assertTrue(any(prompt.startswith("Provider choice") for prompt in prompts))
+            self.assertTrue(all("filter WORDS" in prompt and "empty cancels" in prompt
+                                for prompt in prompts if "choice" in prompt.lower()))
+            rendered = output.getvalue()
+            self.assertIn("\nUsable models:\n", rendered)
+            self.assertIn("\nUsable providers:\n", rendered)
+            self.assertLess(rendered.index("\nUsable models:\n"), rendered.index("\nUsable providers:\n"))
+            if variant == "custom":
+                self.assertGreaterEqual(rendered.count("\nUsable providers:\n"), 5)
+            await asyncio.wait_for(asyncio.gather(*service_tasks), 10)
+            self.assertEqual(service_errors, [])
+            self.assertTrue(all(task.done() for task in service_tasks))
+            self.assertEqual(len(wire_requests), len(requests) + 2)
+            server.close()
+            await asyncio.wait_for(server.wait_closed(), 5)
+            self.assertFalse(server.is_serving())
 
 
 class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -2546,27 +2745,6 @@ class StatusTextTests(unittest.TestCase):
             "Local: CWD: /tmp/unsafe^[[2J^Jnext, turn: ", displayed)
         self.assertNotIn("\x1b", displayed)
         self.assertEqual(displayed.count("\n"), 1)
-
-    def test_status_text_marks_a_deprecated_selected_model(self):
-        names = ["runtime_config", "shell_cwd"]
-        old_values = save_loki_state(names)
-
-        try:
-            loki.current_session().shell_cwd = loki.STARTUP_CWD
-            loki.apply_runtime_config(loki.make_runtime_config(
-                "https://example.test/v1",
-                protocols.OPENAI_CHAT,
-                model="old-model",
-                credential_ref=authentications.CredentialRef.environment(
-                    "EXAMPLE_API_KEY"),
-                model_status="deprecated",
-            ))
-
-            text = terminal_frontend.status_text()
-        finally:
-            restore_loki_state(old_values)
-
-        self.assertIn("Model: old-model (deprecated), Context: unknown; /model", text)
 
 
 class TerminalOverlayLifecycleTests(unittest.TestCase):
@@ -4164,39 +4342,6 @@ class ShellCwdTests(unittest.TestCase):
         )
         self.assertNotIn("do-not-persist-this", text)
 
-    def test_save_chat_log_persists_credentialless_connection(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos",
-            "runtime_config", ]
-        old_values = save_loki_state(names)
-
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                loki.apply_runtime_config(loki.make_runtime_config(
-                    "http://localhost:8000/v1",
-                    protocols.OPENAI_CHAT,
-                    model="local-model",
-                    provider_name="Explicit LOKI_* connection",
-                    stream=True,
-                ))
-                loki.new_chat_log(path)
-                loki.save_chat_log()
-                blob = json.loads(
-                    pathlib.Path(path).read_text(encoding="utf-8"))
-        finally:
-            restore_loki_state(old_values)
-
-        connection = blob["session_state"]["connection"]
-        self.assertEqual(connection["model"], "local-model")
-        self.assertIsNone(connection["credential"])
-        self.assertTrue(connection["stream"])
-        self.assertEqual(
-            connection["chat_url"],
-            "http://localhost:8000/v1/chat/completions",
-        )
-
     def test_loading_and_clean_cleanup_leave_chat_bytes_unchanged(self):
         names = [
             "chat_log_path", "session_state", "chat_log_dirty",
@@ -4409,60 +4554,6 @@ class ShellCwdTests(unittest.TestCase):
         finally:
             restore_loki_state(old_values)
 
-    def test_successful_model_selection_replaces_resumed_connection(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "runtime_config", "shell_cwd", "previous_shell_cwd",
-        ]
-        old_values = save_loki_state(names)
-
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                old_descriptor = ConnectionDescriptor(
-                    provider_id="old",
-                    provider_name="Old",
-                    model="old-model",
-                    chat_url="https://old.example/v1/chat/completions",
-                    models_url="https://old.example/v1/models",
-                    protocol=protocols.OPENAI_CHAT,
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "OLD_API_KEY")),
-                )
-                blob = formats.new_log_blob(
-                    loki.initial_transcript_items(), [])
-                blob["session_state"] = {
-                    "shell_cwd": tmpdir,
-                    "connection": old_descriptor.to_dict(),
-                }
-                pathlib.Path(path).write_text(
-                    json.dumps(blob), encoding="utf-8")
-                loki.load_chat_log(path)
-
-                loki.apply_runtime_config(loki.make_runtime_config(
-                    "https://new.example/v1",
-                    protocols.OPENAI_CHAT,
-                    model="new-model",
-                    provider_id="new",
-                    provider_name="New",
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "NEW_API_KEY")),
-                ))
-                new_descriptor = loki.active_connection_descriptor()
-                loki.set_session_connection(new_descriptor)
-                loki.save_chat_log()
-
-                after = json.loads(
-                    pathlib.Path(path).read_text(encoding="utf-8"))
-                self.assertEqual(
-                    after["session_state"]["connection"],
-                    new_descriptor.to_dict(),
-                )
-        finally:
-            restore_loki_state(old_values)
-
     def test_load_session_state_restores_shell_cwd(self):
         names = ["shell_cwd", "previous_shell_cwd"]
         old_values = save_loki_state(names)
@@ -4552,42 +4643,6 @@ class ShellCwdTests(unittest.TestCase):
             rendered,
         )
         self.assertIn("Credential: 'OPENROUTER_API_KEY'", rendered)
-
-    def test_saved_credentialless_connection_confirmation_identifies_no_auth(
-            self):
-        descriptor = ConnectionDescriptor(
-            provider_id=None,
-            provider_name="Explicit LOKI_* connection",
-            model="local-model",
-            chat_url="http://localhost:8000/v1/chat/completions",
-            models_url="http://localhost:8000/v1/models",
-            protocol=protocols.OPENAI_CHAT,
-            stream=True,
-        )
-
-        class FakeSession:
-            def modal(self):
-                return self
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return None
-
-            async def prompt(self, prompt):
-                return "yes"
-
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            accepted = asyncio.run(
-                terminal_frontend.confirm_saved_connection_async(
-                    descriptor, FakeSession()))
-
-        self.assertTrue(accepted)
-        self.assertIn("Authentication: none", output.getvalue())
-        self.assertIn("Streaming: yes", output.getvalue())
-        self.assertNotIn("Credential: None", output.getvalue())
 
 
 class SubagentLaunchTests(unittest.TestCase):

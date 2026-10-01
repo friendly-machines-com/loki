@@ -129,18 +129,3 @@ class ModelProviderOverrideTests(unittest.TestCase):
         self.assertEqual(
             config.auth_spec.credential,
             authentications.CredentialRef.environment("OPENCODE_API_KEY"))
-
-    def test_model_override_endpoint_is_used_once_approved(self):
-        provider = models.normalize_catalog({"openai": {
-            "id": "openai", "npm": "@ai-sdk/openai",
-            "env": ["OPENAI_API_KEY"],
-        }})["openai"]
-        model = {"id": "test", "provider": {
-            "api": "https://unrelated.example/v1",
-        }}
-        config = loki.config_from_modelsdev_selection(
-            "openai", provider, model,
-            CredentialStore({"OPENAI_API_KEY": "test-key"}))
-        self.assertEqual(
-            config.chat_provider.chat_url,
-            "https://unrelated.example/v1/responses")

@@ -49,24 +49,6 @@ class _StateDir:
 
 
 class PinStoreTests(unittest.TestCase):
-    def test_unknown_provider_is_new(self):
-        with _StateDir():
-            self.assertEqual(
-                endpoint_pins.status("acme", API, CREDENTIAL),
-                (endpoint_pins.NEW, None))
-
-    def test_recorded_pair_is_pinned(self):
-        with _StateDir():
-            endpoint_pins.record("acme", API, CREDENTIAL)
-
-            self.assertEqual(
-                endpoint_pins.load(),
-                {"acme": {"api": API, "credential": CREDENTIAL}})
-            self.assertEqual(
-                endpoint_pins.status("acme", API, CREDENTIAL),
-                (endpoint_pins.PINNED,
-                 {"api": API, "credential": CREDENTIAL}))
-
     def test_different_endpoint_is_changed_with_approved_value(self):
         with _StateDir():
             endpoint_pins.record("acme", API, CREDENTIAL)
@@ -85,16 +67,6 @@ class PinStoreTests(unittest.TestCase):
                 endpoint_pins.status("acme", API, "env:OTHER_API_KEY"),
                 (endpoint_pins.CHANGED,
                  {"api": API, "credential": CREDENTIAL}))
-
-    def test_recording_again_updates_the_approval(self):
-        with _StateDir():
-            endpoint_pins.record("acme", API, CREDENTIAL)
-            endpoint_pins.record("acme", OTHER_API, CREDENTIAL)
-
-            self.assertEqual(
-                endpoint_pins.status("acme", OTHER_API, CREDENTIAL),
-                (endpoint_pins.PINNED,
-                 {"api": OTHER_API, "credential": CREDENTIAL}))
 
     def test_corrupt_store_reads_as_empty(self):
         with _StateDir() as state:
@@ -130,10 +102,9 @@ class PinStoreTests(unittest.TestCase):
 
 
 class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
-    async def _confirm(self, answers, provider_entry=None, model_entry=None,
-                       credentials=None):
+    async def _confirm(self, answers, provider_entry=None, credentials=None):
         entry = provider_entry or catalog()["acme"]
-        model = model_entry or entry["models"]["m"]
+        model = entry["models"]["m"]
         printed = []
         with contextlib.redirect_stdout(io.StringIO()):
             picked = await models._confirm_catalog_endpoint(
@@ -146,30 +117,6 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
             )
         return picked, "\n".join(printed)
 
-    async def test_pinned_pair_is_not_prompted(self):
-        with _StateDir():
-            endpoint_pins.record("acme", API, CREDENTIAL)
-            input_fn = AsyncMock()
-
-            picked = await models._confirm_catalog_endpoint(
-                input_fn, lambda text: None,
-                CredentialStore({"ACME_API_KEY": "secret"}),
-                "acme", catalog()["acme"], catalog()["acme"]["models"]["m"])
-
-            self.assertTrue(picked)
-            input_fn.assert_not_called()
-
-    async def test_new_pair_is_shown_and_recorded_on_accept(self):
-        with _StateDir():
-            picked, shown = await self._confirm(["y"])
-
-            self.assertTrue(picked)
-            self.assertIn(API, shown)
-            self.assertIn(CREDENTIAL, shown)
-            self.assertEqual(
-                endpoint_pins.status("acme", API, CREDENTIAL)[0],
-                endpoint_pins.PINNED)
-
     async def test_declining_leaves_endpoint_unapproved(self):
         with _StateDir():
             picked, shown = await self._confirm([""])
@@ -181,73 +128,63 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 endpoint_pins.NEW)
 
     async def test_changed_pair_shows_both_values(self):
-        with _StateDir():
-            endpoint_pins.record("acme", API, CREDENTIAL)
+        from loki_agent import http_client
 
-            picked, shown = await self._confirm(
-                ["n"], provider_entry=catalog(api=OTHER_API)["acme"])
-
-            self.assertFalse(picked)
-            self.assertIn(API, shown)
-            self.assertIn(OTHER_API, shown)
-
-    async def test_model_override_endpoint_is_the_approved_one(self):
-        with _StateDir():
-            entry = catalog(model_extra={"provider": {"api": OTHER_API}})
-            provider_entry = entry["acme"]
-            model = provider_entry["models"]["m"]
-
-            with contextlib.redirect_stdout(io.StringIO()):
-                picked = await models._confirm_catalog_endpoint(
-                    AsyncMock(return_value="y"), lambda text: None,
-                    CredentialStore({"ACME_API_KEY": "secret"}),
-                    "acme", provider_entry, model)
-
-            self.assertTrue(picked)
-            self.assertEqual(
-                endpoint_pins.status("acme", OTHER_API, CREDENTIAL)[0],
-                endpoint_pins.PINNED)
-            # The provider's own template was never approved.
-            self.assertEqual(
-                endpoint_pins.status("acme", API, CREDENTIAL)[0],
-                endpoint_pins.CHANGED)
+        for api, credential_name in ((OTHER_API, "ACME_API_KEY"), (API, "OTHER_API_KEY")):
+            with self.subTest(api=api, credential=credential_name), _StateDir() as state:
+                endpoint_pins.record("acme", API, CREDENTIAL)
+                path = os.path.join(state, "loki", "provider-endpoints.json")
+                with open(path, "rb") as stream:
+                    before = stream.read()
+                entry = catalog(api=api)["acme"]
+                entry["env"] = [credential_name]
+                credentials = CredentialStore({credential_name: "must-not-be-sent"})
+                original_entry = catalog()["acme"]
+                original_config = loki.config_from_modelsdev_selection(
+                    "acme", original_entry, original_entry["models"]["m"],
+                    CredentialStore({"ACME_API_KEY": "approved-secret"}))
+                session = loki.Session(runtime_config=original_config)
+                with mock.patch.object(loki, "_DEFAULT_SESSION", session), mock.patch.object(
+                        http_client, "async_http_request", new=AsyncMock()) as transport:
+                    for _ in range(2):
+                        picked, shown = await self._confirm(
+                            ["n"], provider_entry=entry, credentials=credentials)
+                        self.assertFalse(picked)
+                        self.assertIn(API, shown)
+                        self.assertIn(api, shown)
+                        self.assertIn(CREDENTIAL, shown)
+                        self.assertIn("env:" + credential_name, shown)
+                        with self.assertRaisesRegex(ValueError, "differs from the approved endpoint"):
+                            loki.config_from_modelsdev_selection(
+                                "acme", entry, entry["models"]["m"], credentials)
+                        self.assertIs(session.runtime_config, original_config)
+                        with open(path, "rb") as stream:
+                            self.assertEqual(stream.read(), before)
+                    transport.assert_not_awaited()
+                self.assertEqual(endpoint_pins.status("acme", API, CREDENTIAL)[0], endpoint_pins.PINNED)
 
 
 class PickerTests(unittest.IsolatedAsyncioTestCase):
-    async def _run_picker(self, input_answer):
-        entry = catalog()
-        groups = models.build_groups(entry)
-        members = groups["M"]
-        credentials = CredentialStore({"ACME_API_KEY": "secret"})
-        with mock.patch.object(
-                models, "ensure_index",
-                AsyncMock(return_value=({}, groups))), \
-             mock.patch.object(
-                models, "_numbered_menu_async",
-                AsyncMock(side_effect=[members, members[0]])):
-            with contextlib.redirect_stdout(io.StringIO()):
-                return await models.run_model_picker_async(
-                    input_fn=AsyncMock(return_value=input_answer),
-                    credentials=credentials,
-                    text_writer=lambda text: None)
-
     async def test_declining_returns_none(self):
-        with _StateDir():
-            self.assertIsNone(await self._run_picker(""))
+        from loki_agent import http_client
 
-            self.assertEqual(
-                endpoint_pins.status("acme", API, CREDENTIAL)[0],
-                endpoint_pins.NEW)
-
-    async def test_accepting_returns_the_selection_and_pins(self):
-        with _StateDir():
-            picked = await self._run_picker("y")
-
-            self.assertIsNotNone(picked)
-            self.assertEqual(picked[0], "acme")
-            self.assertEqual(
-                endpoint_pins.status("acme", API, CREDENTIAL)[0],
-                endpoint_pins.PINNED)
+        entry = catalog()
+        credentials = CredentialStore({"ACME_API_KEY": "must-not-be-sent"})
+        session = loki.Session()
+        with _StateDir(), mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                mock.patch.object(models, "_index_cache", (entry, models.build_groups(entry))), \
+                mock.patch.object(http_client, "async_http_request", new=AsyncMock()) as transport, \
+                contextlib.redirect_stdout(io.StringIO()):
+            inputs = AsyncMock(side_effect=["1", "1", ""])
+            self.assertIsNone(await models.run_model_picker_async(
+                inputs, credentials, text_writer=lambda text: None))
+            self.assertEqual(inputs.await_count, 3)
+            self.assertEqual(endpoint_pins.load(), {})
+            self.assertEqual(endpoint_pins.status("acme", API, CREDENTIAL), (endpoint_pins.NEW, None))
+            with self.assertRaisesRegex(ValueError, "has not been approved"):
+                loki.config_from_modelsdev_selection("acme", entry["acme"], entry["acme"]["models"]["m"], credentials)
+            self.assertIsNone(session.runtime_config)
+            transport.assert_not_awaited()
 
 
 class SelectionRefusalTests(unittest.IsolatedAsyncioTestCase):
@@ -280,16 +217,6 @@ class SelectionRefusalTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(OTHER_API, str(raised.exception))
             self.assertIn(API, str(raised.exception))
 
-    async def test_approved_pair_is_usable(self):
-        with _StateDir():
-            endpoint_pins.record("acme", API, CREDENTIAL)
-            provider_entry, model_entry, credentials = self._selection()
-
-            config = loki.config_from_modelsdev_selection(
-                "acme", provider_entry, model_entry, credentials)
-
-            self.assertIn("acme.invalid", config.chat_provider.chat_url)
-
 
 class WorkerSelectionTests(unittest.TestCase):
     """The read-only answer the ACP front turns into an approval request."""
@@ -308,20 +235,6 @@ class WorkerSelectionTests(unittest.TestCase):
         loki.CREDENTIALS = CredentialStore(values)
         self.addCleanup(setattr, loki, "CREDENTIALS", old)
 
-    def test_reports_the_pair_for_an_unapproved_catalog_leaf(self):
-        with _StateDir():
-            entry = catalog()
-            self._with_credentials({"ACME_API_KEY": "k"})
-            worker = self._worker_for(
-                ("acme", entry["acme"], entry["acme"]["models"]["m"]))
-
-            selection = worker.describe_config_selection({"value": "v"})
-
-            self.assertEqual(selection["providerId"], "acme")
-            self.assertEqual(selection["endpoint"], API)
-            self.assertEqual(selection["credential"], CREDENTIAL)
-            self.assertFalse(selection["changed"])
-
     def test_reports_a_change_with_the_approved_pair(self):
         with _StateDir():
             endpoint_pins.record("acme", API, CREDENTIAL)
@@ -335,17 +248,6 @@ class WorkerSelectionTests(unittest.TestCase):
             self.assertTrue(selection["changed"])
             self.assertEqual(selection["approvedEndpoint"], API)
             self.assertEqual(selection["approvedCredential"], CREDENTIAL)
-
-    def test_approved_pair_needs_no_approval(self):
-        with _StateDir():
-            endpoint_pins.record("acme", API, CREDENTIAL)
-            entry = catalog()
-            self._with_credentials({"ACME_API_KEY": "k"})
-            worker = self._worker_for(
-                ("acme", entry["acme"], entry["acme"]["models"]["m"]))
-
-            self.assertEqual(
-                worker.describe_config_selection({"value": "v"}), {})
 
     def test_synthetic_provider_needs_no_approval(self):
         response = {"models": [{

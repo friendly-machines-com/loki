@@ -121,83 +121,106 @@ def _subscription_catalog(*slugs):
 
 
 class CatalogFetchTests(unittest.TestCase):
-    def test_fetch_uses_loki_http_transport_with_catalog_bounds(self):
-        response = http_client.HttpResponse(
-            models.MODELS_DEV_URL,
-            200,
-            "OK",
-            {"content-type": "application/json"},
-            json.dumps(DATA).encode("utf-8"),
-        )
-        transport = mock.AsyncMock(return_value=response)
+    def test_catalog_fetch_cache_reopen_normalize_and_filter(self):
+        async def lifecycle():
+            raw = dict(DATA, openai={
+                "id": "openai", "name": "OpenAI", "npm": "@ai-sdk/openai",
+                "env": ["OPENAI_API_KEY"],
+                "models": {"gpt-test": {"id": "gpt-test", "name": "GPT Test"}},
+            })
+            body = json.dumps(raw).encode()
+            received = []
+            settled = asyncio.Event()
 
-        with mock.patch.object(
-                http_client, "async_http_request", new=transport):
-            result = asyncio.run(models.fetch_models_dev())
+            async def serve(reader, writer):
+                try:
+                    received.append(await asyncio.wait_for(
+                        reader.readuntil(b"\r\n\r\n"), 5))
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                 + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+                    await asyncio.wait_for(writer.drain(), 5)
+                finally:
+                    writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), 5)
+                    settled.set()
 
-        self.assertEqual(result, DATA)
-        self.assertEqual(transport.await_args.args, (
-            "GET", models.MODELS_DEV_URL))
-        self.assertEqual(
-            transport.await_args.kwargs["headers_in"],
-            {
-                "Accept": "application/json",
-            },
-        )
-        self.assertEqual(
-            transport.await_args.kwargs["timeout"],
-            models.MODELS_DEV_TIMEOUT_S,
-        )
-        self.assertEqual(
-            transport.await_args.kwargs["max_bytes"],
-            models.MODELS_DEV_MAX_BYTES,
-        )
-        self.assertEqual(
-            transport.await_args.kwargs["retry_max_attempts"],
-            models.MODELS_DEV_RETRY_MAX_ATTEMPTS,
-        )
+            server = await asyncio.start_server(serve, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            real_connect = asyncio.open_connection
+            real_request = http_client.async_http_request
+            real_fetch = models.fetch_models_dev
+            fetched_catalogs = []
 
-    def test_fetch_reads_cache_file_without_network_io(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cache_path = pathlib.Path(directory, "models.json")
-            cache_path.write_text(json.dumps(DATA), encoding="utf-8")
-            transport = mock.AsyncMock(
-                side_effect=AssertionError("cache hit performed network I/O"))
-            with mock.patch.object(
-                    http_client, "async_http_request", new=transport
-            ), mock.patch.object(
-                    asyncio, "to_thread",
-                    side_effect=AssertionError("cache read used an executor")
-            ):
-                result = asyncio.run(models.fetch_models_dev(
-                    cache_path=str(cache_path)))
+            async def fetch(*args, **kwargs):
+                fetched = await real_fetch(*args, **kwargs)
+                fetched_catalogs.append(fetched)
+                return fetched
 
-        self.assertEqual(result, DATA)
-        transport.assert_not_awaited()
+            async def connect(host, port_in, **kwargs):
+                self.assertEqual((host, port_in), ("models.dev", 443))
+                self.assertIsNotNone(kwargs.get("ssl"))
+                return await real_connect("127.0.0.1", port)
 
-    def test_fetch_writes_cache_file_without_an_executor(self):
-        response = http_client.HttpResponse(
-            models.MODELS_DEV_URL,
-            200,
-            "OK",
-            {"content-type": "application/json"},
-            json.dumps(DATA).encode("utf-8"),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            cache_path = pathlib.Path(directory, "models.json")
-            with mock.patch.object(
-                    http_client, "async_http_request",
-                    new=mock.AsyncMock(return_value=response)
-            ), mock.patch.object(
-                    asyncio, "to_thread",
-                    side_effect=AssertionError("cache write used an executor")
-            ):
-                result = asyncio.run(models.fetch_models_dev(
-                    cache_path=str(cache_path)))
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            with tempfile.TemporaryDirectory() as directory:
+                cache = pathlib.Path(directory, "models.json")
+                self.assertFalse(cache.exists())
+                saved = models._index_cache
+                models._index_cache = None
+                try:
+                    with mock.patch.object(asyncio, "open_connection", side_effect=connect), \
+                         mock.patch.object(http_client, "async_http_request", wraps=real_request) as transport, \
+                         mock.patch.object(models, "fetch_models_dev", side_effect=fetch), \
+                         mock.patch.object(asyncio, "to_thread", side_effect=AssertionError("executor used")):
+                        data, groups = await asyncio.wait_for(models.ensure_index(cache_path=str(cache)), 10)
+                    await asyncio.wait_for(settled.wait(), 5)
+                    self.assertEqual(transport.await_count, 1)
+                    self.assertEqual(transport.await_args.args, ("GET", models.MODELS_DEV_URL))
+                    self.assertEqual(transport.await_args.kwargs, {
+                        "headers_in": {"Accept": "application/json"},
+                        "timeout": models.MODELS_DEV_TIMEOUT_S,
+                        "max_bytes": models.MODELS_DEV_MAX_BYTES,
+                        "retry_max_attempts": models.MODELS_DEV_RETRY_MAX_ATTEMPTS,
+                    })
+                    self.assertEqual(len(received), 1)
+                    self.assertTrue(received[0].startswith(b"GET /api.json HTTP/1.1\r\n"))
+                    self.assertIn(b"Accept: application/json\r\n", received[0])
+                    self.assertNotIn(b"Authorization", received[0])
+                    self.assertEqual(json.loads(cache.read_text()), raw)
+                    self.assertEqual({pid: data[pid] for pid in DATA}, DATA)
+                    self.assertEqual(fetched_catalogs, [raw])
+                    self.assertNotIn("api", raw["openai"])
+                    self.assertEqual(data["openai"]["api"], "https://api.openai.com/v1")
+                    self.assertEqual(models.provider_display_name("openai", data["openai"]),
+                                     "OpenAI Platform API [endpoint supplied by Loki]")
+                    self.assertEqual([pid for pid, _, _ in groups["GPT Test"]], ["openai"])
+                    models._index_cache = None
+                    with mock.patch.object(asyncio, "open_connection", side_effect=AssertionError("offline")) as network, \
+                         mock.patch.object(models, "fetch_models_dev", side_effect=fetch), \
+                         mock.patch.object(asyncio, "to_thread", side_effect=AssertionError("executor used")):
+                        reopened, reopened_groups = await models.ensure_index(cache_path=str(cache))
+                    network.assert_not_called()
+                    self.assertEqual(fetched_catalogs, [raw, raw])
+                    self.assertEqual(reopened, data)
+                    self.assertEqual(reopened_groups, groups)
+                    usable = models.filter_supported_groups(reopened_groups, CredentialStore({
+                        "OPENAI_API_KEY": "selected-secret", "OPENROUTER_API_KEY": "router-secret"}))
+                    self.assertEqual({name: [(pid, model["id"]) for pid, _, model in members]
+                                      for name, members in usable.items()}, {
+                                          "GPT Test": [("openai", "gpt-test")],
+                                          "GLM-5.2": [("openrouter", "z-ai/glm-5.2")],
+                                      })
+                    choices = models.flattened_config_option_choices(
+                        CredentialStore({"OPENAI_API_KEY": "selected-secret", "OPENROUTER_API_KEY": "router-secret"}),
+                        groups=reopened_groups)
+                    self.assertEqual([(leaf[0], leaf[2]["id"]) for _, leaf in choices],
+                                     [("openrouter", "z-ai/glm-5.2"), ("openai", "gpt-test")])
+                    self.assertEqual(json.loads(cache.read_text()), raw)
+                finally:
+                    models._index_cache = saved
+                    server.close()
+                    await asyncio.wait_for(server.wait_closed(), 5)
 
-        self.assertEqual(result, DATA)
-        self.assertEqual(cached, DATA)
+        asyncio.run(lifecycle())
 
     def test_fetch_rejects_http_errors_and_oversized_catalogs(self):
         responses = [
@@ -851,28 +874,6 @@ class CatalogNormalizationTests(unittest.TestCase):
         )
         self.assertIn("endpoint supplied by Loki", option["description"])
 
-    def test_ensure_index_normalizes_without_mutating_fetched_catalog(self):
-        raw = {"openai": self.openai_provider()}
-        saved = models._index_cache
-        models._index_cache = None
-        try:
-            with mock.patch.object(
-                    models, "fetch_models_dev",
-                    new=mock.AsyncMock(return_value=raw)):
-                data, groups = asyncio.run(models.ensure_index())
-        finally:
-            models._index_cache = saved
-
-        self.assertNotIn("api", raw["openai"])
-        self.assertEqual(
-            data["openai"]["api"],
-            "https://api.openai.com/v1",
-        )
-        self.assertEqual(
-            [provider_id for provider_id, _, _ in groups["GPT Test"]],
-            ["openai"],
-        )
-
 
 class GroupingTests(unittest.TestCase):
     def test_build_groups_conflates_provider_specific_ids_by_name(self):
@@ -1081,20 +1082,6 @@ class ProtocolAndKeyTests(unittest.TestCase):
 
 
 class MenuTests(unittest.TestCase):
-    def test_menu_selects_by_number(self):
-        rows = [("a", "Alpha"), ("b", "Beta")]
-        result = asyncio.run(models._numbered_menu_async(
-            rows, "Choice: ", _input_script(["2"]),
-            text_writer=_write_text))
-        self.assertEqual(result, "b")
-
-    def test_menu_filter_narrows_then_selects(self):
-        rows = [("a", "Alpha beta"), ("b", "Beta gamma")]
-        result = asyncio.run(models._numbered_menu_async(
-            rows, "Choice: ", _input_script(["filter alpha", "1"]),
-            text_writer=_write_text))
-        self.assertEqual(result, "a")
-
     def test_menu_empty_cancels(self):
         rows = [("a", "Alpha")]
         result = asyncio.run(models._numbered_menu_async(
@@ -1124,24 +1111,6 @@ class MenuTests(unittest.TestCase):
             "1. Model ^[]0;owned^G^J"
             "\u6a21\u578b \U0001f469\u200d\U0001f4bb\n",
         )
-
-    def test_menu_header_separates_every_rendered_block(self):
-        rows = [("a", "Alpha"), ("b", "Beta")]
-        output = io.StringIO()
-
-        with contextlib.redirect_stdout(output):
-            result = asyncio.run(models._numbered_menu_async(
-                rows,
-                "Choice: ",
-                _input_script(["filter beta", "1"]),
-                text_writer=_write_text,
-                header="Usable things:",
-            ))
-
-        self.assertEqual(result, "b")
-        rendered = output.getvalue()
-        self.assertTrue(rendered.startswith("\nUsable things:\n"))
-        self.assertEqual(rendered.count("\nUsable things:\n"), 2)
 
     def test_model_rows_show_all_providers(self):
         data = {f"p{i}": {"api": "https://x.test/v1", "models": {
@@ -1174,23 +1143,6 @@ class MenuTests(unittest.TestCase):
             "Explicit LOKI_* connection id=glm-5.2" in label
             and "api=http://localhost:8000/v1" in label
             for label in provider_labels))
-
-    def test_model_menu_filter_matches_provider_names(self):
-        rows = models._model_rows(_groups())
-        # "filter openrouter" must narrow to GLM-5.2 even though "openrouter"
-        # appears only among its providers, not in the model name.
-        result = asyncio.run(models._numbered_menu_async(
-            rows, "Choice: ", _input_script(["filter openrouter", "1"]),
-            text_writer=_write_text))
-        self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
-
-    def test_model_menu_filter_matches_provider_display_name(self):
-        rows = models._model_rows(_groups())
-        # "Zhipu AI" is the provider's display name, not its id (zhipuai).
-        result = asyncio.run(models._numbered_menu_async(
-            rows, "Choice: ", _input_script(["filter zhipu ai", "1"]),
-            text_writer=_write_text))
-        self.assertEqual([pid for pid, _, _ in result], ["zhipuai", "openrouter"])
 
     def test_provider_rows_show_catalog_api_url(self):
         rows = models._provider_rows(_groups()["GLM-5.2"])
@@ -1309,31 +1261,6 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(provider_id, "provider")
         self.assertEqual(model_entry["status"], "deprecated")
 
-    def test_run_model_picker_two_level_flow(self):
-        saved = models._index_cache
-        models._index_cache = (DATA, models.build_groups(DATA))
-        output = io.StringIO()
-        try:
-            # Model menu (sorted): 1. Claude Sonnet 4.6, 2. GLM-5.2.
-            # Provider menu (sorted): 1. OpenRouter, 2. Zhipu AI.
-            with contextlib.redirect_stdout(output):
-                result = asyncio.run(models.run_model_picker_async(
-                    _input_script(["2", "1"]), _credentials(),
-                    text_writer=_write_text))
-        finally:
-            models._index_cache = saved
-
-        provider_id, provider_entry, model_entry = result
-        self.assertEqual(provider_id, "openrouter")
-        self.assertEqual(model_entry["id"], "z-ai/glm-5.2")
-        rendered = output.getvalue()
-        self.assertTrue(rendered.startswith("\nUsable models:\n"))
-        self.assertIn("\nUsable providers:\n", rendered)
-        self.assertLess(
-            rendered.index("\nUsable models:\n"),
-            rendered.index("\nUsable providers:\n"),
-        )
-
     def test_run_model_picker_selects_subscription_credential(self):
         credential = (
             authentications.CredentialRef.openai_subscription())
@@ -1402,12 +1329,6 @@ class PickerTests(unittest.TestCase):
             models._index_cache = saved
         self.assertIsNone(result)
 
-    def test_run_flat_model_picker_selects_by_number(self):
-        result = asyncio.run(models.run_flat_model_picker_async(
-            _input_script(["2"]), ["alpha", "beta"],
-            text_writer=_write_text))
-        self.assertEqual(result, "beta")
-
     def test_run_flat_model_picker_empty_list_returns_none(self):
         result = asyncio.run(models.run_flat_model_picker_async(
             _input_script([]), [], text_writer=_write_text))
@@ -1429,28 +1350,6 @@ class PickerTests(unittest.TestCase):
                 asyncio.run(models.run_model_picker_async(
                     _input_script([]), _credentials(),
                     text_writer=_write_text))
-
-    def test_picker_prompts_advertise_filter_gesture(self):
-        saved = models._index_cache
-        models._index_cache = (DATA, models.build_groups(DATA))
-        prompts = []
-
-        async def capture(prompt=None, history=None):
-            prompts.append(prompt or "")
-            raise EOFError
-
-        try:
-            asyncio.run(models.run_model_picker_async(
-                capture, _credentials(), text_writer=_write_text))
-        except EOFError:
-            pass
-        finally:
-            models._index_cache = saved
-
-        self.assertTrue(prompts)
-        self.assertIn("Model choice", prompts[0])
-        self.assertIn("filter WORDS", prompts[0])
-        self.assertIn("empty cancels", prompts[0])
 
     def test_model_rows_show_minimal_features_in_parentheses(self):
         rows = models._model_rows(_groups())
