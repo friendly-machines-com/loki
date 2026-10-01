@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, asynccontextmanager
 from unittest import mock
 from loki_entrypoints import configure_container, loki_acp_command
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
@@ -3083,36 +3084,362 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         channel.request = mock.AsyncMock(return_value=selection)
         return channel
 
-    async def test_accepted_approval_records_the_pair_and_asks(self):
-        front = self._front()
-        channel = self._channel(dict(self.PAIR))
-        front._request_client = mock.AsyncMock(
-            return_value={"action": "accept", "content": {"approve": True}})
+    @asynccontextmanager
+    async def _approval_journey(self):
+        """Real application components; only catalog/HTTP and OS-child seams.
 
-        with mock.patch.object(acp.endpoint_pins, "record") as record:
-            await front._approve_config_endpoint(
-                channel, {"sessionId": "s"}, 9)
+        Client requests are dispatched concurrently to exercise response routing.
+        This is not Front.run or shipped-process elicitation qualification.
+        """
+        from types import SimpleNamespace
+        from test_http_client import FakeConnector
+        from loki_agent import endpoint_pins, http_client, loki
+        from loki_agent.sessions import Session
 
-        params = front._request_client.await_args.args[1]
-        self.assertEqual(params["requestId"], 9)
-        self.assertEqual(params["mode"], "form")
-        self.assertIn("https://acme.invalid/v1", params["message"])
-        self.assertIn("env:ACME_API_KEY", params["message"])
-        record.assert_called_once_with(
-            "acme", "https://acme.invalid/v1", "env:ACME_API_KEY")
+        async with asyncio.timeout(20):
+            with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+                workspace = os.path.join(root, 'workspace')
+                os.mkdir(workspace)
+                environment = {key: value for key, value in os.environ.items()
+                               if not key.startswith('LOKI_')
+                               and not key.endswith(('_KEY', '_TOKEN', '_PAT'))}
+                environment.update(HOME=root, XDG_CONFIG_HOME=os.path.join(root, 'config'),
+                                   XDG_STATE_HOME=os.path.join(root, 'state'))
+                stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
+                selected, unrelated, previous = (
+                    'approval-selected-secret', 'approval-unrelated-secret',
+                    'approval-previous-secret')
+                credentials = CredentialStore({
+                    'ACME_API_KEY': selected, 'UNRELATED_API_KEY': unrelated,
+                    'LOKI_API_KEY': previous, 'LOKI_PROVIDER': 'openai',
+                    'LOKI_API_BASE': 'https://previous.example/v1',
+                    'LOKI_MODEL': 'previous-model', 'LOKI_STREAM': '0'})
+                endpoint = 'https://approved.example/override/v1'
+                catalog = {'acme': {
+                    'id': 'acme', 'name': 'Acme', 'env': ['ACME_API_KEY'],
+                    'npm': '@ai-sdk/openai-compatible', 'api': 'https://provider.example/base/v1',
+                    'models': {'chosen-model': {
+                        'id': 'chosen-model', 'name': 'Chosen Model',
+                        'provider': {'api': endpoint, 'npm': '@ai-sdk/openai-compatible'}}}}}
+                groups = models.build_groups(catalog)
+                stack.enter_context(mock.patch.object(
+                    models, 'ensure_index',
+                    new=mock.AsyncMock(return_value=(catalog, groups))))
+                packets = []
+                for answer in ('approved answer', 'pinned answer'):
+                    body = json.dumps({'id': answer, 'choices': [{
+                        'index': 0, 'message': {'role': 'assistant', 'content': answer},
+                        'finish_reason': 'stop'}]}).encode()
+                    packets.append(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
+                                   + str(len(body)).encode() + b'\r\n\r\n' + body)
+                f = SimpleNamespace(messages=[], changed=asyncio.Event(), tasks=[],
+                                    processes=[], delegations=[], connector=FakeConnector(packets),
+                                    trace=[], endpoint=endpoint, secrets=(selected, unrelated, previous),
+                                    tasks_before=asyncio.all_tasks())
+
+                def write(message):
+                    f.messages.append(message)
+                    if message.get('method') == 'elicitation/create':
+                        f.trace.append('elicitation')
+                    f.changed.set()
+
+                f.front = acp.Front(lambda: None, write, credentials)
+                f.front.initialize({'clientCapabilities': {'elicitation': {'form': {}}}})
+                stack.enter_context(mock.patch.object(loki, 'CREDENTIALS', f.front.credentials))
+                stack.enter_context(mock.patch.object(loki, '_DEFAULT_SESSION', Session(shell_cwd=workspace)))
+                real_connect = asyncio.open_connection
+
+                async def connect(*args, **kwargs):
+                    if 'sock' in kwargs:
+                        return await real_connect(*args, **kwargs)
+                    f.trace.append('http')
+                    return await f.connector.open_connection(*args, **kwargs)
+
+                stack.enter_context(mock.patch.object(http_client.asyncio, 'open_connection', new=connect))
+                real_lease = f.front.credential_broker.lease
+                f.leases = []
+
+                async def lease(ref, **kwargs):
+                    f.leases.append(ref.encode())
+                    f.trace.append('lease')
+                    return await real_lease(ref, **kwargs)
+
+                stack.enter_context(mock.patch.object(f.front.credential_broker, 'lease', new=lease))
+                endpoint_pins.record('untouched', 'https://untouched.example/v1', 'env:UNRELATED_API_KEY')
+                f.pins_path = endpoint_pins._path()
+                with open(f.pins_path, 'rb') as stream:
+                    f.original_pins = stream.read()
+                f.expected_pins = {
+                    'untouched': {'api': 'https://untouched.example/v1',
+                                  'credential': 'env:UNRELATED_API_KEY'},
+                    'acme': {'api': endpoint, 'credential': 'env:ACME_API_KEY'}}
+                real_record = endpoint_pins.record
+
+                def record(*args):
+                    real_record(*args)
+                    f.trace.append('pin')
+
+                stack.enter_context(mock.patch.object(endpoint_pins, 'record', new=record))
+
+                async def launch(cwd, environment, delegation):
+                    session = Session(shell_cwd=cwd)
+                    # Same-process authority, as in the existing selection
+                    # journey; no worker credential-IPC claim is made here.
+                    session.credential_authority = f.front.credential_broker
+                    loki._DEFAULT_SESSION = session
+                    loki.apply_runtime_config(loki.build_config_from_env(credentials=loki.CREDENTIALS))
+
+                    def before_request(message):
+                        if message['method'] == 'session/describe_config_selection':
+                            f.trace.append('describe')
+                        if message['method'] == 'session/set_config_option':
+                            f.trace.append('switch')
+                            with open(f.pins_path, encoding='utf-8') as stream:
+                                self.assertEqual(json.load(stream), f.expected_pins)
+
+                    process = _LocalWorkerProcess(session, 'provisional', before_request)
+                    f.processes.append(process)
+                    f.delegations.append(delegation)
+                    f.session = session
+                    return process
+
+                stack.enter_context(mock.patch.object(acp.runtime_isolation, 'start_worker', new=launch))
+                stack.enter_context(mock.patch.object(acp.runtime_isolation, 'close_runtime_process', new=lambda process: None))
+
+                async def wait_message(predicate):
+                    async with asyncio.timeout(3):
+                        while True:
+                            f.changed.clear()
+                            for message in f.messages:
+                                if predicate(message):
+                                    return message
+                            await f.changed.wait()
+
+                async def request(request_id, method, params):
+                    await asyncio.wait_for(f.front.handle(acps.request(request_id, method, params)), 3)
+                    message = await wait_message(lambda message: message.get('id') == request_id)
+                    self.assertNotIn('error', message, message)
+                    return message['result']
+
+                f.wait_message, f.request = wait_message, request
+                try:
+                    opened = await request(1, 'session/new', {'cwd': workspace})
+                    f.session_id = opened['sessionId']
+                    f.channel = f.front.workers[f.session_id]
+                    choice, = [option for config in opened['configOptions'] if config['id'] == 'model'
+                               for option in config['options'] if option['value'] == 'acme/chosen-model']
+                    f.value = choice['value']
+                    f.params = {'sessionId': f.session_id, 'configId': 'model', 'value': f.value}
+                    f.original_config = f.session.runtime_config
+                    f.path = f.session.chat_log_path
+                    self.assertTrue(loki.save_chat_log())
+                    with open(f.path, 'rb') as stream:
+                        f.original_chat = stream.read()
+                    f.trace.clear()
+                    self.assertEqual(f.leases, [])
+                    yield f
+                finally:
+                    for task in f.tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*f.tasks, return_exceptions=True)
+                    for channel in list(f.front.workers.values()):
+                        await asyncio.wait_for(channel.close(), 3)
+                    for delegation in f.delegations:
+                        await delegation.close()
+                    for task in list(f.front._tasks):
+                        task.cancel()
+                    await asyncio.gather(*f.front._tasks, return_exceptions=True)
+
+    async def _pending_approval(self, f, request_id):
+        task = asyncio.create_task(f.front.handle(acps.request(
+            request_id, 'session/set_config_option', f.params)))
+        f.tasks.append(task)
+        elicitation = await f.wait_message(
+            lambda message: message.get('method') == 'elicitation/create'
+            and message['params'].get('requestId') == request_id)
+        self.assertFalse(task.done())
+        self.assertIn(elicitation['id'], f.front._client_requests)
+        self.assertEqual(elicitation['jsonrpc'], '2.0')
+        params = elicitation['params']
+        self.assertEqual(params['mode'], 'form')
+        self.assertEqual(params['message'], 'Send this credential to this endpoint?\n'
+                         f'Endpoint: "{f.endpoint}"\nCredential: "env:ACME_API_KEY"')
+        self.assertEqual(params['requestedSchema']['type'], 'object')
+        self.assertEqual(params['requestedSchema']['required'], ['approve'])
+        field = params['requestedSchema']['properties']['approve']
+        self.assertEqual(field['type'], 'boolean')
+        self.assertIs(field['default'], False)
+        self.assertEqual(f.trace[-2:], ['describe', 'elicitation'])
+        self.assertIs(f.session.runtime_config, f.original_config)
+        self.assertEqual(f.session.session_state['connection'],
+                         json.loads(f.original_chat)['session_state']['connection'])
+        self.assertFalse(f.session.chat_log_dirty)
+        self.assertEqual(f.leases, [])
+        self.assertEqual(f.connector.calls, [])
+        with open(f.pins_path, 'rb') as stream:
+            self.assertEqual(stream.read(), f.original_pins)
+        with open(f.path, 'rb') as stream:
+            self.assertEqual(stream.read(), f.original_chat)
+        return task, elicitation
+
+    async def _close_approval_journey(self, f):
+        self.assertEqual(await f.request(90, 'session/close', {'sessionId': f.session_id}), {})
+        self.assertFalse(f.front.workers)
+        self.assertFalse(f.front._client_requests)
+        self.assertFalse(f.channel._pending)
+        self.assertTrue(f.channel._reader_task.done())
+        self.assertIsNone(f.channel.credential_delegation)
+        for process in f.processes:
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(process.close_task.done())
+            self.assertIsNone(process.close_task.exception())
+        for delegation in f.delegations:
+            self.assertIsNone(delegation.owner_parent)
+            self.assertIsNone(delegation.owner_child)
+            self.assertIsNone(delegation.credential_child)
+            server = delegation.credential_server
+            self.assertTrue(server._reader_task.done())
+            self.assertTrue(server._writer_close_task.done())
+            self.assertIsNone(server._writer_close_task.exception())
+        for writer in f.connector.writers:
+            self.assertTrue(writer.closed)
+            self.assertTrue(writer.wait_closed_called)
+        await asyncio.sleep(0)
+        self.assertFalse(f.front._tasks)
+        if f.session.job_manager is not None:
+            self.assertEqual(f.session.job_manager.jobs, {})
+        self.assertFalse(asyncio.all_tasks() - f.tasks_before)
+        with open(f.path, 'rb') as stream:
+            saved = stream.read()
+        with open(f.pins_path, 'rb') as stream:
+            pins = stream.read()
+        for secret in f.secrets:
+            self.assertNotIn(secret.encode(), saved + pins + json.dumps(f.messages).encode())
+
+    def _assert_approved_descriptor(self, f, blob):
+        descriptor = blob['session_state']['connection']
+        self.assertEqual(descriptor['provider_id'], 'acme')
+        self.assertEqual(descriptor['model'], 'chosen-model')
+        self.assertEqual(descriptor['chat_url'], f.endpoint + '/chat/completions')
+        self.assertEqual(descriptor['credential'], {'kind': 'env', 'name': 'ACME_API_KEY'})
+        self.assertEqual(descriptor['protocol'], 'openai_chat')
+        self.assertIs(descriptor['stream'], False)
+
+    async def test_approval_routes_pins_switches_infers_and_reuses(self):
+        from loki_agent import endpoint_pins, formats
+
+        async with self._approval_journey() as f:
+            task, elicitation = await self._pending_approval(f, 9)
+            # A foreign response cannot resolve this approval.
+            await f.front.handle(acps.response('unrelated-id', result={
+                'action': 'accept', 'content': {'approve': True}}))
+            self.assertFalse(f.front._client_requests[elicitation['id']].done())
+            self.assertFalse(task.done())
+            await f.front.handle(acps.response(elicitation['id'], result={
+                'action': 'accept', 'content': {'approve': True}}))
+            await asyncio.wait_for(task, 3)
+            reply = await f.wait_message(lambda message: message.get('id') == 9)
+            self.assertNotIn('error', reply, reply)
+            self.assertEqual(f.trace, ['describe', 'elicitation', 'pin', 'switch'])
+            model_option, = [option for option in reply['result']['configOptions'] if option['id'] == 'model']
+            self.assertEqual(model_option['currentValue'], f.value)
+            self.assertFalse(f.front._client_requests)
+            self.assertEqual(f.session.runtime_config.model, 'chosen-model')
+            self.assertEqual(f.session.runtime_config.chat_provider.chat_url, f.endpoint + '/chat/completions')
+            with open(f.path, 'rb') as stream:
+                switched = json.load(stream)
+            self._assert_approved_descriptor(f, switched)
+            self.assertEqual(_conversation_pairs(switched), [])
+            self.assertEqual(endpoint_pins.load(), f.expected_pins)
+            self.assertEqual(endpoint_pins.status('acme', f.endpoint, 'env:ACME_API_KEY'),
+                             (endpoint_pins.PINNED, f.expected_pins['acme']))
+            expected_pairs = []
+            for index, (prompt, answer) in enumerate((('approved prompt', 'approved answer'),
+                                                      ('pinned prompt', 'pinned answer'))):
+                if index:
+                    with open(f.pins_path, 'rb') as stream:
+                        pinned_bytes = stream.read()
+                    await f.request(12, 'session/set_config_option', f.params)
+                    self.assertEqual(sum(message.get('method') == 'elicitation/create'
+                                         for message in f.messages), 1)
+                    with open(f.pins_path, 'rb') as stream:
+                        self.assertEqual(stream.read(), pinned_bytes)
+                start = len(f.messages)
+                result = await f.request(20 + index, 'session/prompt', {
+                    'sessionId': f.session_id, 'prompt': [{'type': 'text', 'text': prompt}]})
+                self.assertEqual(result, {'stopReason': 'end_turn'})
+                self.assertEqual(_historical_chunks(f.messages[start:], f.session_id), [
+                    ('agent_message_chunk', {'type': 'text', 'text': answer})])
+                updates = [message for message in f.messages[start:] if message.get('method') == 'session/update']
+                self.assertTrue(updates)
+                self.assertTrue(all(message['params']['sessionId'] == f.session_id for message in updates))
+                packet = bytes(f.connector.writers[index].data)
+                headers, body = packet.split(b'\r\n\r\n', 1)
+                self.assertTrue(headers.startswith(b'POST /override/v1/chat/completions HTTP/1.1\r\n'))
+                self.assertIn(b'Host: approved.example', headers)
+                authorization = [line for line in headers.split(b'\r\n')
+                                 if line.lower().startswith(b'authorization:')]
+                self.assertEqual(authorization, [b'Authorization: Bearer ' + f.secrets[0].encode()])
+                for secret in f.secrets[1:]:
+                    self.assertNotIn(secret.encode(), packet)
+                payload = json.loads(body)
+                self.assertEqual(payload['model'], 'chosen-model')
+                self.assertNotIn('stream', payload)
+                expected_context = expected_pairs + [('user', prompt)]
+                self.assertEqual([(message['role'], message['content']) for message in payload['messages']
+                                  if message['role'] in ('user', 'assistant')], expected_context)
+                expected_pairs.extend([('user', prompt), ('assistant', answer)])
+                with open(f.path, 'rb') as stream:
+                    saved = stream.read()
+                blob = json.loads(saved)
+                formats.validate_events(blob['events'])
+                self.assertEqual(_conversation_pairs(blob), [
+                    (role, [{'type': 'text', 'text': text}])
+                    for role, text in expected_pairs])
+                self._assert_approved_descriptor(f, blob)
+                with open(f.pins_path, 'rb') as stream:
+                    pins = stream.read()
+                for secret in f.secrets:
+                    self.assertNotIn(secret.encode(), saved + pins + json.dumps(f.messages).encode())
+            self.assertEqual([call['host'] for call in f.connector.calls], ['approved.example'] * 2)
+            self.assertEqual(f.leases, ['env:ACME_API_KEY'] * 2)
+            self.assertEqual(f.connector.responses, [])
+            self.assertEqual(f.trace, ['describe', 'elicitation', 'pin', 'switch', 'lease', 'http',
+                                       'describe', 'switch', 'lease', 'http'])
+            await self._close_approval_journey(f)
 
     async def test_declined_approval_fails_the_switch(self):
-        front = self._front()
-        channel = self._channel(dict(self.PAIR))
-        front._request_client = mock.AsyncMock(
-            return_value={"action": "decline"})
-
-        with mock.patch.object(acp.endpoint_pins, "record") as record:
-            with self.assertRaises(acps.TransportError):
-                await front._approve_config_endpoint(
-                    channel, {"sessionId": "s"}, 9)
-
-        record.assert_not_called()
+        refusals = ({'action': 'decline'}, {'action': 'accept', 'content': {'approve': False}},
+                    {'action': 'accept', 'content': {}},
+                    {'action': 'accept', 'content': {'approve': 1}},
+                    {'action': 'accept', 'content': {'approve': 'true'}})
+        for refusal in refusals:
+            with self.subTest(refusal=refusal):
+                async with self._approval_journey() as f:
+                    for request_id in (9, 10):
+                        task, elicitation = await self._pending_approval(f, request_id)
+                        await f.front.handle(acps.response(elicitation['id'], result=refusal))
+                        await asyncio.wait_for(task, 3)
+                        reply = await f.wait_message(lambda message: message.get('id') == request_id)
+                        self.assertIn('error', reply, reply)
+                        self.assertEqual(reply['error'], {
+                            'code': acps.INVALID_PARAMS,
+                            'message': 'the provider endpoint was not approved'})
+                        self.assertIs(f.session.runtime_config, f.original_config)
+                        self.assertEqual(f.session.session_state['connection'],
+                                         json.loads(f.original_chat)['session_state']['connection'])
+                        self.assertFalse(f.session.chat_log_dirty)
+                        with open(f.path, 'rb') as stream:
+                            self.assertEqual(stream.read(), f.original_chat)
+                        with open(f.pins_path, 'rb') as stream:
+                            self.assertEqual(stream.read(), f.original_pins)
+                        self.assertEqual(f.leases, [])
+                        self.assertEqual(f.connector.calls, [])
+                        self.assertFalse(f.front._client_requests)
+                        self.assertNotIn('switch', f.trace)
+                        self.assertNotIn('pin', f.trace)
+                    await self._close_approval_journey(f)
 
     async def test_changed_pair_shows_the_approved_values(self):
         front = self._front()
@@ -3154,21 +3481,6 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 channel, {"sessionId": "s"}, 9)
 
         front._request_client.assert_not_awaited()
-
-    async def test_config_option_change_goes_through_the_approval(self):
-        front = self._front()
-        channel = self._channel({})
-        front.workers["s"] = channel
-        front._approve_config_endpoint = mock.AsyncMock()
-
-        await front.forward_to_worker(
-            "session/set_config_option", {"sessionId": "s", "value": "v"},
-            request_id=9)
-
-        front._approve_config_endpoint.assert_awaited_once()
-        self.assertEqual(
-            channel.request.await_args.args[0],
-            "session/set_config_option")
 
 
 if __name__ == "__main__":
