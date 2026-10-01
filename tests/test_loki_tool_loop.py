@@ -2684,29 +2684,6 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
         self.assertNotIn("internal startup instruction", text)
         self.assertNotIn("response_metadata", text)
 
-    def test_resume_renderer_uses_response_model_labels(self):
-        items = [
-            formats.message_item("user", "hello"),
-            formats.model_response_event(
-                "openai_chat",
-                [formats.message_item("assistant", "from first")],
-                model="model-a",
-            ),
-            formats.message_item("user", "again"),
-            formats.model_response_event(
-                "anthropic_messages",
-                [formats.message_item("assistant", "from second")],
-                model="model-b",
-            ),
-        ]
-
-        text = self._render(
-            savefiles.ResumeTranscriptRenderer(assistant_label="current"),
-            items)
-
-        self.assertIn("model-a: from first", text)
-        self.assertIn("model-b: from second", text)
-
     def test_resume_renderer_shows_provider_notice_without_assistant_text(
             self):
         event = formats.model_response_event(
@@ -2810,62 +2787,436 @@ class SessionResponsePersistenceTests(unittest.TestCase):
             chat_id,
         )
 
-    def test_response_boundary_and_toolset_are_saved_without_call_ledger(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos",
-            "session_toolsets", "shell_cwd", "previous_shell_cwd",
-        ]
-        old_values = {
-            name: copy.deepcopy(loki.current_session().__dict__[name])
-            for name in names
-        }
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                loki.new_chat_log(path)
-                loki.current_transcript().append(
-                    formats.message_item("user", "hello"))
-                turn = formats.DecodedTurn(
-                    [formats.message_item("assistant", "world")],
-                    {
-                        "protocol": "openai_chat",
-                        "provider_id": "provider",
-                        "model": "model-a",
-                        "usage": {"total_tokens": 3},
-                    },
-                )
-                loki.current_transcript().append(turn.to_event())
-                loki._remember_session_toolset(loki.TOOLS)
+
+class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_switch_repair_hooks_real_tools_save_resume_and_replay(self):
+        from loki_agent import replays, tool_runtime
+        import urllib.parse
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with contextlib.nullcontext(temporary.name) as directory:
+            root = pathlib.Path(directory)
+            source = root / 'source.txt'
+            source.write_text('marker original\n', encoding='utf-8')
+            notes = root / 'notes.md'
+            path = str(root / 'chat-switch.json')
+            hook_log = root / 'hook-events.jsonl'
+            hook_config = root / 'hooks.json'
+            script = (
+                'import json,pathlib,sys\n'
+                'p=json.load(sys.stdin); i=p["invocation"]; a=i["effective_arguments"]\n'
+                'with open(sys.argv[1], "a") as f: f.write(json.dumps([p["event"],i["call_id"],a])+"\\n")\n'
+                'if p["event"]=="pre_tool_call":\n'
+                ' assert isinstance(a["allowed_domains"],list)\n'
+                ' assert "blocked_domains" not in a\n'
+                ' a["query"] += " external"\n'
+                ' json.dump({"arguments":a},sys.stdout)\n'
+                'else:\n'
+                ' assert p["outcome"]["executed"] and p["outcome"]["ok"]\n'
+                ' pathlib.Path(sys.argv[2]).write_text("marker post\\n")\n'
+                ' json.dump({"changed_paths":[sys.argv[2]],"note":"post observed"},sys.stdout)\n'
+            )
+            hook_config.write_text(json.dumps({
+                'pre_tool_call': [{'id': 'external.transform', 'tools': ['WebSearch'],
+                                   'command': [sys.executable, '-c', script, str(hook_log), str(source)]}],
+                'post_tool_call': [{'id': 'external.post', 'tools': ['WebSearch'],
+                                    'command': [sys.executable, '-c', script, str(hook_log), str(source)]}],
+            }), encoding='utf-8')
+            store = CredentialStore({f'{name}_API_KEY': f'leased-{name}-secret'
+                                     for name in ('A', 'B', 'CHAT', 'ANTHROPIC', 'C')})
+            owner = credential_supervisors.CredentialSupervisor(store)
+            session = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / 'jobs')))
+            session.credential_authority = owner.broker
+            self.addAsyncCleanup(session.job_manager.close_session_owned)
+            children, dispatched, events, search_queries, captured = [], [], [], [], []
+            outcomes, originals, expected_replay, expected_terminal = {}, {}, [], []
+            diagnostics = io.StringIO()
+            real_dispatch = loki.dispatch_tool_async
+            real_spawn = asyncio.create_subprocess_exec
+            phase = {}
+            source_key = loki._file_key(str(source))
+
+            async def spawn(*args, **kwargs):
+                child = await real_spawn(*args, **kwargs)
+                children.append(child)
+
+                async def reap():
+                    if child.returncode is None:
+                        child.kill()
+                        await asyncio.wait_for(child.wait(), 5)
+                self.addAsyncCleanup(reap)
+                return child
+
+            async def dispatch(name, args, allowed=None, extra_context=None):
+                dispatched.append((name, copy.deepcopy(args)))
+                return await real_dispatch(name, args, allowed=allowed, extra_context=extra_context)
+
+            def hook_records():
+                return [json.loads(line) for line in hook_log.read_text().splitlines()] if hook_log.exists() else []
+
+            def transform(invocation):
+                self.assertIsInstance(invocation.effective_arguments['allowed_domains'], list)
+                self.assertEqual(invocation.effective_arguments['query'], 'loki external')
+                self.assertEqual(hook_records()[-1][:2], ['pre_tool_call', invocation.call_id])
+                arguments = copy.deepcopy(invocation.effective_arguments)
+                arguments['query'] += ' custom'
+                return tool_runtime.PreHookDecision(arguments=arguments)
+
+            def gate(invocation):
+                self.assertEqual(invocation.effective_arguments, {
+                    'query': 'loki external custom', 'allowed_domains': ['example.com']})
+                if invocation.call_id == 'chat-search':
+                    self.assertIn(source_key, loki.file_state)
+                return tool_runtime.PreHookDecision()
+
+            def post(invocation, outcome):
+                self.assertTrue(outcome.executed)
+                self.assertTrue(outcome.ok)
+                self.assertEqual(hook_records()[-1][:2], ['post_tool_call', invocation.call_id])
+                self.assertEqual(source.read_text(), 'marker post\n')
+                return tool_runtime.PostHookDecision()
+
+            def provider_config(name, protocol):
+                suffix = {protocols.OPENAI_RESPONSES: 'responses', protocols.OPENAI_CHAT: 'chat/completions',
+                          protocols.ANTHROPIC_MESSAGES: 'messages'}[protocol]
+                return loki.make_runtime_config(
+                    f'https://{name.lower()}.example/v1/{suffix}', protocol,
+                    model=f'model-{name}', provider_id=name, provider_name=name,
+                    credential_ref=authentications.CredentialRef.environment(f'{name}_API_KEY'))
+
+            def reply(call=None, *, private=False, text=None):
+                name, protocol = phase['name'], phase['protocol']
+                usage = {'input_tokens': 2, 'output_tokens': 1} if protocol != protocols.OPENAI_CHAT else {'total_tokens': 3}
+                if protocol == protocols.OPENAI_RESPONSES:
+                    items = []
+                    if private:
+                        items.append({'type': 'reasoning', 'id': f'private-{name}', 'summary': [],
+                                      'encrypted_content': f'opaque-{name}'})
+                    if text:
+                        items.append({'type': 'message', 'role': 'assistant', 'content': [
+                            {'type': 'output_text', 'text': text}]})
+                    if call:
+                        cid, tool, args = call
+                        items.append({'type': 'function_call', 'call_id': cid, 'name': tool,
+                                      'arguments': json.dumps(args)})
+                    return {'object': 'response', 'status': 'completed', 'model': f'model-{name}',
+                            'output': items, 'usage': usage}
+                if protocol == protocols.OPENAI_CHAT:
+                    message = {'role': 'assistant', 'content': phase['exact_content'] if call else text}
+                    if call:
+                        cid, tool, args = call
+                        message['tool_calls'] = [{'id': cid, 'type': 'function', 'function': {
+                            'name': tool, 'arguments': json.dumps(args)}}]
+                    return {'object': 'chat.completion', 'id': 'chat-exact', 'model': f'model-{name}',
+                            'choices': [{'index': 0, 'message': message,
+                                         'finish_reason': 'tool_calls' if call else 'stop'}], 'usage': usage}
+                content = []
+                if private:
+                    content.append({'type': 'thinking', 'thinking': 'private anthropic thought',
+                                    'signature': 'anthropic-signature'})
+                if text:
+                    content.append({'type': 'text', 'text': text})
+                if call:
+                    cid, tool, args = call
+                    content.append({'type': 'tool_use', 'id': cid, 'name': tool, 'input': args})
+                return {'type': 'message', 'id': 'anthropic-origin', 'role': 'assistant',
+                        'model': f'model-{name}', 'content': content,
+                        'stop_reason': 'tool_use' if call else 'end_turn', 'usage': usage}
+
+            async def request(method, url, **kwargs):
+                self.assertEqual(method, 'POST')
+                if url == loki.DUCKDUCKGO_HTML_SEARCH_URL:
+                    query = urllib.parse.parse_qs(kwargs['body'].decode())['q'][0]
+                    search_queries.append(query)
+                    self.assertNotIn('Authorization', kwargs['headers_in'])
+                    html = b'<a class="result__a" href="https://example.com/result">Sentinel result</a>'
+                    return http_client.HttpResponse(url, 200, 'OK', {'content-type': 'text/html'}, html)
+                config = loki.current_config()
+                self.assertEqual(url, config.chat_provider.input_url)
+                self.assertEqual(url, phase['url'])
+                suffix = {protocols.OPENAI_RESPONSES: 'responses',
+                          protocols.OPENAI_CHAT: 'chat/completions',
+                          protocols.ANTHROPIC_MESSAGES: 'messages'}[phase['protocol']]
+                self.assertEqual(url, f"https://{phase['name'].lower()}.example/v1/{suffix}")
+                headers = kwargs['headers_in']
+                if phase['protocol'] == protocols.ANTHROPIC_MESSAGES:
+                    self.assertEqual(headers['x-api-key'], 'leased-ANTHROPIC-secret')
+                    self.assertNotIn('Authorization', headers)
+                else:
+                    self.assertEqual(headers['Authorization'], f"Bearer leased-{phase['name']}-secret")
+                    self.assertNotIn('x-api-key', headers)
+                payload = json.loads(kwargs['body'])
+                self.assertEqual(payload['model'], f"model-{phase['name']}")
+                self.assertNotIn('"execution":', json.dumps(payload))
+                if phase['protocol'] == protocols.OPENAI_RESPONSES:
+                    wire_calls = [(i['call_id'], json.loads(i['arguments']))
+                                  for i in payload['input'] if i.get('type') == 'function_call']
+                elif phase['protocol'] == protocols.OPENAI_CHAT:
+                    wire_calls = [(i['id'], json.loads(i['function']['arguments']))
+                                  for m in payload['messages'] for i in m.get('tool_calls', [])]
+                else:
+                    wire_calls = [(i['id'], i['input']) for m in payload['messages']
+                                  for i in m['content'] if i.get('type') == 'tool_use']
+                for cid, arguments in wire_calls:
+                    self.assertEqual(arguments, originals[cid])
+                validators = {protocols.OPENAI_RESPONSES: '_assert_responses_payload_valid',
+                              protocols.OPENAI_CHAT: '_assert_chat_payload_valid',
+                              protocols.ANTHROPIC_MESSAGES: '_assert_anthropic_payload_valid'}
+                getattr(PrimaryModelSwitchResumeTests, validators[phase['protocol']])(self, payload)
+                captured.append((phase['name'], copy.deepcopy(payload)))
+                # Opaque origin-only blocks must never reach a foreign provider.
+                serialized = json.dumps(payload)
+                for origin in ('A', 'B'):
+                    if phase['name'] != origin:
+                        self.assertNotIn(f'opaque-{origin}', serialized)
+                        self.assertNotIn(f'private-{origin}', serialized)
+                if phase['name'] != 'ANTHROPIC':
+                    self.assertNotIn('anthropic-signature', serialized)
+                    self.assertNotIn('private anthropic thought', serialized)
+                data = phase['queue'].pop(0)
+                return http_client.HttpResponse(url, 200, 'OK', {'content-type': 'application/json'}, json.dumps(data).encode())
+
+            async def turn(name, protocol, calls, prompt, *, private=False, restored=False):
+                phase.clear()
+                phase.update(name=name, protocol=protocol, exact_content=[
+                    {'type': 'text', 'text': 'first block'}, {'type': 'text', 'text': 'second block'}])
+                config = loki.current_config() if restored else provider_config(name, protocol)
+                if not restored:
+                    loki.apply_runtime_config(config)
+                loki.set_session_connection(loki.active_connection_descriptor())
+                phase['url'] = config.chat_provider.input_url
+                phase['queue'] = [reply(call, private=private and i == len(calls) - 1) for i, call in enumerate(calls)]
+                answer = f'{prompt} done'
+                phase['queue'].append(reply(text=answer))
+                transcript = loki.current_transcript()
+                transcript.append(formats.message_item('user', prompt))
+                start = len(transcript)
+                for cid, tool, args in calls:
+                    originals[cid] = copy.deepcopy(args)
+                allowed = {'Read', 'Write', 'Grep', 'WebSearch'}
+                advertised = [spec['definition'] for name, spec in loki.TOOL_REGISTRY.items()
+                              if name in allowed]
+                loki._remember_session_toolset(advertised)
+                result = await asyncio.wait_for(loki.run_tool_loop_async(
+                    transcript, allowed=allowed,
+                    max_loops=len(calls) + 2, on_event=events.append), 20)
+                self.assertEqual(result, answer)
+                self.assertEqual(phase['queue'], [])
+                self.assertEqual([item['type'] for item in transcript[start:]],
+                                 ['model_response', 'tool_result'] * len(calls) + ['model_response'])
+                self.assertEqual(loki.current_toolsets(), [advertised])
+                expected_replay.append(('user', prompt, ('message', 'user')))
+                expected_terminal.append(('message', f'User: {prompt}'))
+                for cid, tool, args in calls:
+                    if protocol == protocols.OPENAI_CHAT:
+                        expected_replay.append(('agent', 'first block\nsecond block', ('message', 'assistant')))
+                        expected_terminal.append(('message', 'model-CHAT: first block\nsecond block'))
+                    expected_replay.append(('tool', tool, cid))
+                    rendered_args = '\n'.join(f'    {key}: {value!r}' for key, value in args.items())
+                    expected_terminal.append(('tool_call', f'Tool call: {tool}\n{rendered_args}'))
+                    event = next(item for item in transcript[start:] if item.get('type') == 'tool_result' and item['call_id'] == cid)
+                    self.assertFalse(event.get('is_error', False), event)
+                    outcomes[cid] = formats.item_text(event)
+                    expected_replay.append(('tool', f'Tool result: {tool}\n{outcomes[cid]}', cid))
+                    expected_terminal.append(('tool_result', f'Tool result: {tool}\n{outcomes[cid]}'))
+                    call = next(call for item in transcript[start:] if item.get('type') == 'model_response'
+                                for call in formats.response_tool_calls(item) if call['call_id'] == cid)
+                    self.assertEqual(formats.tool_call_input(call), args)
+                expected_replay.append(('agent', answer, ('message', 'assistant')))
+                expected_terminal.append(('message', f'model-{name}: {answer}'))
                 loki.mark_chat_log_dirty()
                 loki.save_chat_log()
+                formats.validate_events(transcript)
+                return transcript[start:]
 
-                blob = json.loads(pathlib.Path(path).read_text(
-                    encoding="utf-8"))
-                loki.current_session().session_toolsets = []
-                with contextlib.redirect_stdout(io.StringIO()):
+            def reopen():
+                new_owner = credential_supervisors.CredentialSupervisor(store)
+                new = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / 'reopened-jobs')))
+                new.credential_authority = new_owner.broker
+                self.addAsyncCleanup(new.job_manager.close_session_owned)
+                return new
+
+            with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                    mock.patch.object(loki, 'CREDENTIALS', owner.inventory), \
+                    mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()), \
+                    mock.patch.object(loki, 'file_state', {}), \
+                    mock.patch.object(loki, 'dispatch_tool_async', new=dispatch), \
+                    mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn), \
+                    mock.patch.object(http_client, 'async_http_request', new=request), \
+                    contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
+                loki.apply_runtime_config(provider_config('A', protocols.OPENAI_RESPONSES))
+                loki.new_chat_log(path)
+                malformed_path = os.path.join(directory, '[source.txt](http://source.txt)')
+                await turn('A', protocols.OPENAI_RESPONSES, [
+                    ('a-read', 'Read', {'file_path': malformed_path}),
+                    ('a-search', 'WebSearch', {'query': 'loki', 'allowed_domains': '["example.com"]', 'blocked_domains': None}),
+                ], 'read and search', private=True)
+                self.assertEqual(dispatched[0], ('Read', {'file_path': str(source)}))
+                self.assertIn(source_key, loki.file_state)
+                self.assertEqual(loki.configure_tool_hook_pipeline({'LOKI_HOOKS': str(hook_config)}), str(hook_config))
+                pipeline = loki.TOOL_HOOK_PIPELINE
+                pipeline.add_pre('custom.transform', transform, matcher=lambda name: name == 'WebSearch')
+                pipeline.add_gate('observing.gate', gate, matcher=lambda name: name == 'WebSearch')
+                pipeline.add_post('observing.post', post, matcher=lambda name: name == 'WebSearch')
+                self.assertEqual(source.read_text(), 'marker original\n')
+                await turn('B', protocols.OPENAI_RESPONSES, [
+                    ('b-grep', 'Grep', {'pattern': 'marker', 'path': str(source), 'output_mode': 'content'}),
+                    ('b-write', 'Write', {'file_path': os.path.join(directory, '[notes.md](http://notes.md)'), 'content': '[notes.md](http://notes.md)'}),
+                ], 'switch and write', private=True)
+                self.assertEqual(notes.read_text(), '[notes.md](http://notes.md)')
+                self.assertIn('marker original', outcomes['b-grep'])
+                self.assertIn('opaque-A', json.dumps(captured[2][1]))
+                self.assertIn('opaque-B', json.dumps(captured[-1][1]))
+                saved = json.loads(pathlib.Path(path).read_text())
+                self.assertNotIn('calls', saved)
+                self.assertNotIn('"start":', json.dumps(saved))
+                self.assertEqual(saved['toolsets'], [[
+                    spec['definition'] for name, spec in loki.TOOL_REGISTRY.items()
+                    if name in {'Read', 'Write', 'Grep', 'WebSearch'}]])
+                first_toolsets = copy.deepcopy(saved['toolsets'])
+                await session.job_manager.close_session_owned()
+                resumed = reopen()
+                with mock.patch.object(loki, '_DEFAULT_SESSION', resumed):
+                    loki.file_state.clear()
                     loki.load_chat_log(path)
-                loaded_toolsets = copy.deepcopy(loki.current_toolsets())
-
-            self.assertEqual(
-                [item["type"] for item in blob["events"]],
-                ["message", "message", "model_response"],
-            )
-            self.assertNotIn("calls", blob)
-            response = blob["events"][2]
-            self.assertEqual(response["protocol"], "openai_chat")
-            self.assertEqual(response["provider"], "provider")
-            self.assertEqual(response["model"], "model-a")
-            self.assertEqual(
-                response["usage"],
-                {"total_tokens": 3},
-            )
-            self.assertEqual(blob["toolsets"], [loki.TOOLS])
-            self.assertEqual(loaded_toolsets, blob["toolsets"])
-            self.assertNotIn('"start":', json.dumps(blob))
-            self.assertNotIn('"end":', json.dumps(blob))
-        finally:
-            restore_loki_state(old_values)
+                    self.assertEqual(loki.current_toolsets(), first_toolsets)
+                    descriptor = loki.connection_from_session_state(loki.current_state())
+                    self.assertEqual((descriptor.provider_id, descriptor.model), ('B', 'model-B'))
+                    loki.apply_runtime_config(loki.config_from_connection_descriptor(descriptor, owner.inventory))
+                    await turn('B', protocols.OPENAI_RESPONSES, [
+                        ('b-resumed-read', 'Read', {'file_path': str(source)}),
+                        ('b-resumed-grep', 'Grep', {'pattern': 'notes', 'path': str(notes), 'output_mode': 'content'})], 'resume B', restored=True)
+                    await turn('CHAT', protocols.OPENAI_CHAT, [
+                        ('chat-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'chat exact')
+                    self.assertNotIn(source_key, loki.file_state)
+                    self.assertEqual(source.read_text(), 'marker post\n')
+                    chat_followup = captured[-1][1]
+                    native = next(m for m in chat_followup['messages'] if m.get('tool_calls', [{}])[0].get('id') == 'chat-search')
+                    self.assertEqual(native['content'], phase['exact_content'])
+                    self.assertEqual(native['tool_calls'], [{'id': 'chat-search', 'type': 'function', 'function': {
+                        'name': 'WebSearch', 'arguments': json.dumps(originals['chat-search'])}}])
+                    await turn('ANTHROPIC', protocols.ANTHROPIC_MESSAGES, [
+                        ('anthropic-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'anthropic turn', private=True)
+                    self.assertIn('anthropic-signature', json.dumps(captured[-1][1]))
+                    await turn('C', protocols.OPENAI_RESPONSES, [
+                        ('c-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'foreign replay')
+                    loki.apply_runtime_config(provider_config('ANTHROPIC', protocols.ANTHROPIC_MESSAGES))
+                    loki.set_session_connection(loki.active_connection_descriptor())
+                    loki.save_chat_log()
+                    await resumed.job_manager.close_session_owned()
+                final_session = reopen()
+                with mock.patch.object(loki, '_DEFAULT_SESSION', final_session):
+                    loki.file_state.clear()
+                    loki.load_chat_log(path)
+                    descriptor = loki.connection_from_session_state(loki.current_state())
+                    self.assertEqual(descriptor.provider_id, 'ANTHROPIC')
+                    loki.apply_runtime_config(loki.config_from_connection_descriptor(descriptor, owner.inventory))
+                    hooks_before = hook_records()
+                    child_count = len(children)
+                    self.assertIsNone(loki.configure_tool_hook_pipeline({'LOKI_HOOKS': 'off'}))
+                    self.assertFalse(loki.TOOL_HOOK_PIPELINE.has_custom_hooks)
+                    await turn('ANTHROPIC', protocols.ANTHROPIC_MESSAGES, [
+                        ('off-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'final resume', restored=True)
+                    self.assertEqual(hook_records(), hooks_before)
+                    self.assertEqual(len(children), child_count)
+                    self.assertEqual(search_queries, ['loki'] + ['loki external custom'] * 3 + ['loki'])
+                    final_blob = json.loads(pathlib.Path(path).read_text())
+                    persisted = final_blob['events']
+                    for cid, original in originals.items():
+                        call = next(call for event in persisted if event.get('type') == 'model_response'
+                                    for call in formats.response_tool_calls(event) if call['call_id'] == cid)
+                        self.assertEqual(formats.tool_call_input(call), original)
+                        result = next(item for item in persisted if item.get('type') == 'tool_result' and item['call_id'] == cid)
+                        self.assertEqual(formats.item_text(result), outcomes[cid])
+                    # Assert execution effects independently before using their text as replay goldens.
+                    self.assertEqual(outcomes['a-read'].split('\n\n')[-1], '1\tmarker original')
+                    self.assertEqual(outcomes['b-resumed-read'], '1\tmarker original')
+                    for cid, file, line in [('b-grep', source, 'marker original'),
+                                            ('b-resumed-grep', notes, '[notes.md](http://notes.md)')]:
+                        self.assertEqual(outcomes[cid].split('[results]\n')[1], f'{file}:1:{line}')
+                    for cid in ('a-search', 'chat-search', 'anthropic-search', 'c-search', 'off-search'):
+                        query = 'loki external custom' if cid in ('chat-search', 'anthropic-search', 'c-search') else 'loki'
+                        self.assertEqual(
+                            outcomes[cid].split('\n\n')[-1],
+                            f"WebSearch results for {query!r} (1 results):\n1. Sentinel result\n   https://example.com/result")
+                    self.assertEqual(outcomes['b-write'].split('\n\n')[-1], f'Successfully wrote to {notes}')
+                    self.assertEqual(dispatched, [
+                        ('Read', {'file_path': str(source)}),
+                        ('WebSearch', {'query': 'loki', 'allowed_domains': ['example.com']}),
+                        ('Grep', {'pattern': 'marker', 'path': str(source), 'output_mode': 'content'}),
+                        ('Write', {'file_path': str(notes), 'content': '[notes.md](http://notes.md)'}),
+                        ('Read', {'file_path': str(source)}),
+                        ('Grep', {'pattern': 'notes', 'path': str(notes), 'output_mode': 'content'}),
+                        ('WebSearch', {'query': 'loki external custom', 'allowed_domains': ['example.com']}),
+                        ('WebSearch', {'query': 'loki external custom', 'allowed_domains': ['example.com']}),
+                        ('WebSearch', {'query': 'loki external custom', 'allowed_domains': ['example.com']}),
+                        ('WebSearch', {'query': 'loki', 'allowed_domains': ['example.com']}),
+                    ])
+                    self.assertEqual(final_blob['toolsets'], first_toolsets)
+                    response_records = [i for i in persisted if i.get('type') == 'model_response']
+                    self.assertEqual([i['provider'] for i in response_records],
+                                     ['A'] * 3 + ['B'] * 6 + ['CHAT'] * 2 + ['ANTHROPIC'] * 2 + ['C'] * 2 + ['ANTHROPIC'] * 2)
+                    for record in response_records:
+                        name = record['provider']
+                        protocol = {'CHAT': protocols.OPENAI_CHAT,
+                                    'ANTHROPIC': protocols.ANTHROPIC_MESSAGES}.get(name, protocols.OPENAI_RESPONSES)
+                        suffix = {protocols.OPENAI_RESPONSES: 'responses',
+                                  protocols.OPENAI_CHAT: 'chat/completions',
+                                  protocols.ANTHROPIC_MESSAGES: 'messages'}[protocol]
+                        self.assertEqual(record['protocol'], protocol)
+                        self.assertEqual(record['endpoint'], f'https://{name.lower()}.example/v1/{suffix}')
+                        self.assertEqual(record['requested_model'], f'model-{name}')
+                        self.assertEqual(record['status'], 'completed')
+                        self.assertEqual(record['model'], f'model-{name}')
+                        self.assertEqual(record['usage'], {'total_tokens': 3} if name == 'CHAT' else
+                                         {'input_tokens': 2, 'output_tokens': 1})
+                    for cid in ('chat-search', 'anthropic-search', 'c-search'):
+                        metadata = next(i['execution'] for i in persisted if i.get('call_id') == cid and i.get('type') == 'tool_result')
+                        self.assertEqual([(r['hook'], r['phase'], r['status']) for r in metadata['hooks']], [
+                            ('external.transform', 'pre_tool_call', 'ok'),
+                            ('custom.transform', 'pre_tool_call', 'ok'),
+                            ('observing.gate', 'pre_tool_gate', 'ok'),
+                            ('external.post', 'post_tool_call', 'ok'),
+                            ('observing.post', 'post_tool_call', 'ok'),
+                        ])
+                        self.assertEqual(metadata['changed_paths'], [str(source)])
+                    event_pairs = [(event['type'], event['call_id']) for event in events
+                                   if event['type'] in ('tool_input_repaired', 'tool_call')]
+                    repaired_ids = {'a-read', 'a-search', 'b-write', 'chat-search', 'anthropic-search', 'c-search', 'off-search'}
+                    self.assertEqual(event_pairs, [
+                        (event_type, cid) for cid in originals
+                        for event_type in (['tool_input_repaired', 'tool_call'] if cid in repaired_ids else ['tool_call'])])
+                    self.assertTrue(all(event['cwd'] == directory for event in events if event['type'] == 'tool_call'))
+                    repairs = {item['call_id']: item.get('execution', {}).get('adjustments', [])
+                               for item in persisted if item.get('type') == 'tool_result'}
+                    self.assertEqual([r['rule'] for r in repairs['a-read']], ['path_markdown_autolink'])
+                    self.assertEqual([r['rule'] for r in repairs['a-search'][:2]], ['json_encoded_array', 'optional_null_omission'])
+                    for cid in ('chat-search', 'anthropic-search', 'c-search', 'off-search'):
+                        self.assertEqual(repairs[cid][0]['rule'], 'bare_string_array')
+                        self.assertEqual(repairs[cid][0]['value'], ['example.com'])
+                    for cid in ('chat-search', 'anthropic-search', 'c-search'):
+                        self.assertEqual([r['hook'] for r in repairs[cid]][-2:], ['external.transform', 'custom.transform'])
+                    self.assertEqual([row[:2] for row in hook_records()], [
+                        [event, cid] for cid in ('chat-search', 'anthropic-search', 'c-search')
+                        for event in ('pre_tool_call', 'post_tool_call')])
+                    self.assertEqual(replays.classify_transcript(persisted), expected_replay)
+                    presentation = savefiles.ResumeTranscriptRenderer('current').presentation(persisted)
+                    self.assertEqual([(kind, ''.join(text for _, text in segments))
+                                      for kind, segments in presentation], expected_terminal)
+                    terminal_text = '\n\n'.join(''.join(text for _, text in segments) for _, segments in presentation)
+                    for name, prompt in [('A', 'read and search'), ('B', 'switch and write'), ('B', 'resume B'),
+                                         ('CHAT', 'chat exact'), ('ANTHROPIC', 'anthropic turn'), ('C', 'foreign replay'),
+                                         ('ANTHROPIC', 'final resume')]:
+                        self.assertIn(f'model-{name}: {prompt} done', terminal_text)
+                    self.assertNotIn('private anthropic thought', terminal_text)
+                    self.assertNotIn('opaque-A', terminal_text)
+                    durable = pathlib.Path(path).read_text()
+                    for name in ('A', 'B', 'CHAT', 'ANTHROPIC', 'C'):
+                        self.assertNotIn(f'leased-{name}-secret', durable + diagnostics.getvalue())
+                    self.assertEqual(len(children), 8)
+                    self.assertTrue(all(child.returncode == 0 for child in children))
+                    await final_session.job_manager.close_session_owned()
 
 
 class PrimaryModelSwitchResumeTests(unittest.TestCase):
@@ -3078,451 +3429,6 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             "Anthropic payload contains dangling server calls: "
             f"{provider_pending!r}",
         )
-
-    def test_switch_and_resume_lease_the_selected_request_credential(self):
-        session = loki.current_session()
-        old_authority = session.credential_authority
-        old_credentials = loki.CREDENTIALS
-        try:
-            with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
-                store = CredentialStore({
-                    "PROVIDER_A_API_KEY": "key-a",
-                    "PROVIDER_B_API_KEY": "key-b",
-                })
-                broker = authentications.CredentialBroker()
-                store.install_static_credentials(broker)
-                session.credential_authority = broker
-                loki.CREDENTIALS = CredentialInventory(
-                    store.sanitized_environment(),
-                    store.credential_refs(),
-                )
-
-                provider_a = loki.make_runtime_config(
-                    "https://provider-a.example/v1/responses",
-                    protocols.OPENAI_RESPONSES,
-                    model="model-a",
-                    provider_id="provider-a",
-                    provider_name="Provider A",
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "PROVIDER_A_API_KEY")),
-                )
-                provider_b = loki.make_runtime_config(
-                    "https://provider-b.example/v1/messages",
-                    protocols.ANTHROPIC_MESSAGES,
-                    model="model-b",
-                    provider_id="provider-b",
-                    provider_name="Provider B",
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "PROVIDER_B_API_KEY")),
-                )
-                requests = []
-
-                async def request(method, url, **kwargs):
-                    requests.append({
-                        "method": method,
-                        "url": url,
-                        "headers": dict(kwargs["headers_in"]),
-                    })
-                    return http_client.HttpResponse(
-                        url, 200, "OK",
-                        {"content-type": "application/json"},
-                        b"{}",
-                    )
-
-                path = os.path.join(tmpdir, "credential-resume.json")
-                with mock.patch.object(
-                        http_client, "async_http_request", new=request):
-                    loki.apply_runtime_config(provider_a)
-                    asyncio.run(loki.async_provider_request(
-                        "POST",
-                        provider_a.chat_provider.chat_url,
-                        {},
-                    ))
-
-                    loki.apply_runtime_config(provider_b)
-                    loki.new_chat_log(path)
-                    asyncio.run(loki.async_provider_request(
-                        "POST",
-                        provider_b.chat_provider.chat_url,
-                        {},
-                    ))
-                    loki.save_chat_log()
-
-                    loki.apply_runtime_config(provider_a)
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        loki.load_chat_log(path)
-                    descriptor = loki.connection_from_session_state(
-                        loki.current_state())
-                    resumed = loki.config_from_connection_descriptor(
-                        descriptor, loki.CREDENTIALS)
-                    loki.apply_runtime_config(resumed)
-                    asyncio.run(loki.async_provider_request(
-                        "POST",
-                        resumed.chat_provider.chat_url,
-                        {},
-                    ))
-
-                self.assertEqual(
-                    [request["url"] for request in requests],
-                    [
-                        provider_a.chat_provider.chat_url,
-                        provider_b.chat_provider.chat_url,
-                        provider_b.chat_provider.chat_url,
-                    ],
-                )
-                self.assertEqual(
-                    requests[0]["headers"]["Authorization"],
-                    "Bearer key-a",
-                )
-                self.assertNotIn("x-api-key", requests[0]["headers"])
-                for request in requests[1:]:
-                    self.assertEqual(
-                        request["headers"]["x-api-key"], "key-b")
-                    self.assertNotIn(
-                        "Authorization", request["headers"])
-        finally:
-            session.credential_authority = old_authority
-            loki.CREDENTIALS = old_credentials
-
-    def test_same_protocol_provider_switch_continues_tools_and_resumes(self):
-        with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "chat-acceptance.json")
-            provider_a = loki.make_runtime_config(
-                "https://provider-a.example/v1/responses",
-                protocols.OPENAI_RESPONSES,
-                model="model-a",
-                provider_id="provider-a",
-                provider_name="Provider A",
-                credential_ref=authentications.CredentialRef.environment(
-                    "PROVIDER_A_API_KEY"),
-            )
-            loki.apply_runtime_config(provider_a)
-            loki.new_chat_log(path)
-            loki.current_transcript().append(
-                formats.message_item("user", "read the file"))
-
-            captured_a = []
-            requests_a = self._request_sequence([
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "reasoning",
-                            "id": "reasoning_a",
-                            "summary": [],
-                            "encrypted_content": "provider-a-secret",
-                        },
-                        {
-                            "type": "message",
-                            "id": "message_a",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "Provider A will read it.",
-                                "annotations": [],
-                            }],
-                        },
-                        {
-                            "type": "function_call",
-                            "id": "function_a",
-                            "status": "completed",
-                            "call_id": "call_a",
-                            "name": "Read",
-                            "arguments": '{"file_path":"README.md"}',
-                        },
-                    ],
-                },
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "id": "message_a_final",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "Provider A finished.",
-                            "annotations": [],
-                        }],
-                    }],
-                },
-            ], captured_a)
-            dispatched = []
-
-            async def dispatch(
-                    name, args, allowed=None, extra_context=None):
-                dispatched.append((name, copy.deepcopy(args)))
-                return {
-                    "ok": True,
-                    "content": f"{name} result from provider A",
-                }
-
-            with mock.patch(
-                    "loki_agent.loki.async_provider_request",
-                    new=requests_a), mock.patch(
-                        "loki_agent.loki.dispatch_tool_async",
-                        new=dispatch):
-                result_a = asyncio.run(loki.run_tool_loop_async(
-                    loki.current_transcript(),
-                    allowed={"Read", "Grep"},
-                    max_loops=4,
-                ))
-
-            requests_a.assert_exhausted()
-            self.assertEqual(result_a, "Provider A finished.")
-            self.assertEqual(
-                dispatched, [("Read", {"file_path": "README.md"})])
-            self.assertEqual(len(captured_a), 2)
-            self.assertTrue(all(
-                request["url"] == provider_a.chat_provider.chat_url
-                for request in captured_a))
-            self.assertTrue(all(
-                "Authorization" not in request["headers"]
-                for request in captured_a))
-            self._assert_responses_payload_valid(
-                captured_a[1]["payload"])
-            serialized_a_continuation = json.dumps(
-                captured_a[1]["payload"])
-            self.assertIn("provider-a-secret",
-                          serialized_a_continuation)
-            self.assertIn("call_a", serialized_a_continuation)
-            self.assertIn(
-                "Read result from provider A",
-                serialized_a_continuation,
-            )
-            loki.mark_chat_log_dirty()
-            loki.save_chat_log()
-
-            provider_b = loki.make_runtime_config(
-                "https://provider-b.example/v1/responses",
-                protocols.OPENAI_RESPONSES,
-                model="model-b",
-                provider_id="provider-b",
-                provider_name="Provider B",
-                credential_ref=authentications.CredentialRef.environment(
-                    "PROVIDER_B_API_KEY"),
-            )
-            loki.apply_runtime_config(provider_b)
-            loki.set_session_connection(
-                loki.active_connection_descriptor())
-            loki.current_transcript().append(
-                formats.message_item("user", "continue with grep"))
-
-            captured_b = []
-            requests_b = self._request_sequence([
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "reasoning",
-                            "id": "reasoning_b",
-                            "summary": [],
-                            "encrypted_content": "provider-b-secret",
-                        },
-                        {
-                            "type": "message",
-                            "id": "message_b",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "Provider B will grep.",
-                                "annotations": [],
-                            }],
-                        },
-                        {
-                            "type": "function_call",
-                            "id": "function_b",
-                            "status": "completed",
-                            "call_id": "call_b",
-                            "name": "Grep",
-                            "arguments": '{"pattern":"marker"}',
-                        },
-                    ],
-                },
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "id": "message_b_final",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "Provider B finished.",
-                            "annotations": [],
-                        }],
-                    }],
-                },
-            ], captured_b)
-
-            async def dispatch_b(
-                    name, args, allowed=None, extra_context=None):
-                dispatched.append((name, copy.deepcopy(args)))
-                return {
-                    "ok": True,
-                    "content": f"{name} result from provider B",
-                }
-
-            with mock.patch(
-                    "loki_agent.loki.async_provider_request",
-                    new=requests_b), mock.patch(
-                        "loki_agent.loki.dispatch_tool_async",
-                        new=dispatch_b):
-                result_b = asyncio.run(loki.run_tool_loop_async(
-                    loki.current_transcript(),
-                    allowed={"Read", "Grep"},
-                    max_loops=4,
-                ))
-
-            requests_b.assert_exhausted()
-            self.assertEqual(result_b, "Provider B finished.")
-            self.assertEqual(
-                dispatched[-1], ("Grep", {"pattern": "marker"}))
-            self.assertEqual(len(captured_b), 2)
-            self.assertTrue(all(
-                request["url"] == provider_b.chat_provider.chat_url
-                for request in captured_b))
-            self.assertTrue(all(
-                "Authorization" not in request["headers"]
-                for request in captured_b))
-            for captured in captured_b:
-                self._assert_responses_payload_valid(
-                    captured["payload"])
-            first_b = json.dumps(captured_b[0]["payload"])
-            second_b = json.dumps(captured_b[1]["payload"])
-            self.assertIn("Provider A will read it.", first_b)
-            self.assertIn("Read result from provider A", first_b)
-            self.assertNotIn("provider-a-secret", first_b)
-            self.assertNotIn("reasoning_a", first_b)
-            self.assertNotIn("provider-a-secret", second_b)
-            self.assertIn("provider-b-secret", second_b)
-            self.assertIn("Grep result from provider B", second_b)
-
-            loki.mark_chat_log_dirty()
-            loki.save_chat_log()
-            loki.current_session().transcript_items = []
-            with contextlib.redirect_stdout(io.StringIO()):
-                loki.load_chat_log(path)
-            descriptor = loki.connection_from_session_state(
-                loki.current_state())
-            self.assertEqual(descriptor.provider_id, "provider-b")
-            self.assertEqual(
-                descriptor.chat_url,
-                provider_b.chat_provider.chat_url,
-            )
-            restored_b = loki.config_from_connection_descriptor(
-                descriptor,
-                CredentialStore({"PROVIDER_B_API_KEY": "key-b"}),
-            )
-            loki.apply_runtime_config(restored_b)
-            loki.current_transcript().append(
-                formats.message_item("user", "answer after resume"))
-            loki.mark_chat_log_dirty()
-
-            captured_resume = []
-            requests_resume = self._request_sequence([
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "message",
-                            "id": "message_b_resumed_call",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "Resumed provider will grep.",
-                                "annotations": [],
-                            }],
-                        },
-                        {
-                            "type": "function_call",
-                            "id": "function_b_resumed",
-                            "status": "completed",
-                            "call_id": "call_b_resumed",
-                            "name": "Grep",
-                            "arguments": '{"pattern":"after-resume"}',
-                        },
-                    ],
-                },
-                {
-                    "object": "response",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "id": "message_b_resumed_final",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "Resumed on provider B.",
-                            "annotations": [],
-                        }],
-                    }],
-                },
-            ], captured_resume)
-            resumed_dispatches = []
-
-            async def dispatch_resumed(
-                    name, args, allowed=None, extra_context=None):
-                resumed_dispatches.append(
-                    (name, copy.deepcopy(args)))
-                return {
-                    "ok": True,
-                    "content": "tool result after resume",
-                }
-
-            with mock.patch(
-                    "loki_agent.loki.async_provider_request",
-                    new=requests_resume), mock.patch(
-                        "loki_agent.loki.dispatch_tool_async",
-                        new=dispatch_resumed):
-                resumed_result = asyncio.run(
-                    loki.run_tool_loop_async(
-                        loki.current_transcript(),
-                        allowed={"Read", "Grep"},
-                        max_loops=4,
-                    ))
-
-            requests_resume.assert_exhausted()
-            self.assertEqual(
-                resumed_result, "Resumed on provider B.")
-            self.assertEqual(
-                resumed_dispatches,
-                [("Grep", {"pattern": "after-resume"})],
-            )
-            self.assertEqual(len(captured_resume), 2)
-            self.assertTrue(all(
-                request["url"] == provider_b.chat_provider.chat_url
-                for request in captured_resume))
-            self.assertTrue(all(
-                "Authorization" not in request["headers"]
-                for request in captured_resume))
-            for request in captured_resume:
-                self._assert_responses_payload_valid(
-                    request["payload"])
-            serialized_resume = json.dumps(
-                captured_resume[0]["payload"])
-            serialized_resume_continuation = json.dumps(
-                captured_resume[1]["payload"])
-            self.assertNotIn("provider-a-secret", serialized_resume)
-            self.assertIn("provider-b-secret", serialized_resume)
-            self.assertIn(
-                "Grep result from provider B", serialized_resume)
-            self.assertIn(
-                "tool result after resume",
-                serialized_resume_continuation,
-            )
-            formats.validate_events(loki.current_transcript())
 
     def test_incomplete_tool_call_and_media_survive_resume_and_switch(self):
         with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
@@ -3862,296 +3768,6 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             self.assertIn("tool_use", projected_types)
             self.assertIn("tool_result", projected_types)
             formats.validate_events(loki.current_transcript())
-
-    def test_chat_exact_replay_runs_through_runtime_and_tool_loop(self):
-        with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "chat-exact.json")
-            config = loki.make_runtime_config(
-                "https://chat-origin.example/v1/chat/completions",
-                protocols.OPENAI_CHAT,
-                model="chat-model",
-                provider_id="chat-origin",
-                provider_name="Chat Origin",
-                credential_ref=authentications.CredentialRef.environment(
-                    "CHAT_ORIGIN_API_KEY"),
-            )
-            loki.apply_runtime_config(config)
-            loki.new_chat_log(path)
-            loki.current_transcript().append(
-                formats.message_item("user", "read exactly"))
-
-            exact_content = [
-                {"type": "text", "text": "first block"},
-                {"type": "text", "text": "second block"},
-            ]
-            exact_call = {
-                "id": "call_exact",
-                "type": "function",
-                "function": {
-                    "name": "Read",
-                    "arguments": '{"file_path":"README.md"}',
-                },
-            }
-            captured = []
-            requests = self._request_sequence([
-                {
-                    "id": "chat_first",
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": exact_content,
-                            "tool_calls": [exact_call],
-                        },
-                        "finish_reason": "tool_calls",
-                    }],
-                },
-                {
-                    "id": "chat_final",
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "Exact replay completed.",
-                        },
-                        "finish_reason": "stop",
-                    }],
-                },
-            ], captured)
-            dispatches = []
-
-            async def dispatch(
-                    name, args, allowed=None, extra_context=None):
-                dispatches.append((name, copy.deepcopy(args)))
-                return {"ok": True, "content": "exact tool result"}
-
-            with mock.patch(
-                    "loki_agent.loki.async_provider_request",
-                    new=requests), mock.patch(
-                        "loki_agent.loki.dispatch_tool_async",
-                        new=dispatch):
-                answer = asyncio.run(loki.run_tool_loop_async(
-                    loki.current_transcript(),
-                    allowed={"Read"},
-                    max_loops=4,
-                ))
-
-            requests.assert_exhausted()
-            self.assertEqual(answer, "Exact replay completed.")
-            self.assertEqual(
-                dispatches, [("Read", {"file_path": "README.md"})])
-            self.assertEqual(len(captured), 2)
-            self.assertTrue(all(
-                request["url"] == config.chat_provider.chat_url
-                for request in captured))
-            self.assertTrue(all(
-                "Authorization" not in request["headers"]
-                for request in captured))
-            continuation = captured[1]["payload"]
-            self._assert_chat_payload_valid(continuation)
-            historical = next(
-                message for message in continuation["messages"]
-                if message.get("tool_calls"))
-            self.assertEqual(historical["content"], exact_content)
-            self.assertEqual(historical["tool_calls"], [exact_call])
-            tool_result = next(
-                message for message in continuation["messages"]
-                if message.get("role") == "tool")
-            self.assertEqual(
-                tool_result["tool_call_id"], "call_exact")
-            self.assertEqual(
-                tool_result["content"], "exact tool result")
-            formats.validate_events(loki.current_transcript())
-
-    def test_projection_smoke_switches_provider_and_protocol(self):
-        names = [
-            "runtime_config", "chat_log_path", "session_state",
-            "chat_log_dirty", "transcript_items", "session_todos",
-            "session_toolsets", "shell_cwd", "previous_shell_cwd",
-        ]
-        old_values = {
-            name: copy.deepcopy(loki.current_session().__dict__[name])
-            for name in names
-        }
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-primary.json")
-                source = loki.make_runtime_config(
-                    "https://provider-a.example/v1/messages",
-                    protocols.ANTHROPIC_MESSAGES,
-                    model="model-a",
-                    provider_id="provider-a",
-                    provider_name="Provider A",
-                )
-                loki.apply_runtime_config(source)
-                loki.new_chat_log(path)
-                loki.current_transcript().append(
-                    formats.message_item("user", "inspect README"))
-                source_turn = formats.anthropic_response_to_items({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "thinking",
-                            "thinking": "private thought",
-                            "signature": "provider-a-signature",
-                        },
-                        {
-                            "type": "text",
-                            "text": "I will inspect it.",
-                        },
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_a",
-                            "name": "Read",
-                            "input": {"file_path": "README.md"},
-                        },
-                    ],
-                    "stop_reason": "tool_use",
-                })
-                source_turn.metadata.update({
-                    "provider_id": "provider-a",
-                    "endpoint": source.chat_provider.chat_url,
-                    "model": "model-a",
-                })
-                loki.current_transcript().append(source_turn.to_event())
-                call = formats.response_tool_calls(source_turn)[0]
-                loki.current_transcript().append(
-                    formats.tool_result_for_call(
-                        call, "README contents"))
-                loki.mark_chat_log_dirty()
-                loki.save_chat_log()
-
-                loki.current_session().transcript_items = []
-                with contextlib.redirect_stdout(io.StringIO()):
-                    loki.load_chat_log(path)
-                self.assertEqual(
-                    loki.current_transcript()[2]["endpoint"],
-                    source.chat_provider.chat_url,
-                )
-
-                target_b = loki.make_runtime_config(
-                    "https://provider-b.example/v1/responses",
-                    protocols.OPENAI_RESPONSES,
-                    model="model-b",
-                    provider_id="provider-b",
-                    provider_name="Provider B",
-                )
-                loki.apply_runtime_config(target_b)
-                loki.set_session_connection(
-                    loki.active_connection_descriptor())
-                captured = []
-
-                async def fake_request(
-                        method, request_url, payload=None,
-                        request_headers=None,
-                        report_errors=False, show_timing=False,
-                        codex_turn_state=None):
-                    self.assertEqual(method, "POST")
-                    captured.append(copy.deepcopy(payload))
-                    return protocols.ProviderResponse({
-                        "object": "response",
-                        "status": "completed",
-                        "output": [
-                            {
-                                "type": "reasoning",
-                                "id": "reasoning_b",
-                                "summary": [],
-                                "encrypted_content": "provider-b-only",
-                            },
-                            {
-                                "type": "message",
-                                "id": "message_b",
-                                "status": "completed",
-                                "role": "assistant",
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": "Provider B answer",
-                                    "annotations": [],
-                                }],
-                            },
-                            {
-                                "type": "function_call",
-                                "id": "function_b",
-                                "status": "completed",
-                                "call_id": "call_b",
-                                "name": "Grep",
-                                "arguments": '{"pattern":"marker"}',
-                            },
-                        ],
-                    })
-
-                with mock.patch(
-                        "loki_agent.loki.async_provider_request",
-                        side_effect=fake_request):
-                    target_turn = asyncio.run(
-                        loki.async_chat_completion(
-                            loki.current_transcript(), tools=[]))
-
-                first_switched_payload = json.dumps(captured[0])
-                self.assertIn("I will inspect it.", first_switched_payload)
-                self.assertIn("README contents", first_switched_payload)
-                self.assertNotIn(
-                    "provider-a-signature", first_switched_payload)
-                self.assertNotIn("private thought", first_switched_payload)
-                self.assertEqual(
-                    target_turn.metadata["endpoint"],
-                    target_b.chat_provider.chat_url,
-                )
-                loki.current_transcript().append(target_turn.to_event())
-                target_call = formats.response_tool_calls(target_turn)[0]
-                loki.current_transcript().append(
-                    formats.tool_result_for_call(
-                        target_call, "grep result"))
-                loki.mark_chat_log_dirty()
-                loki.save_chat_log()
-
-                loki.current_session().transcript_items = []
-                with contextlib.redirect_stdout(io.StringIO()):
-                    loki.load_chat_log(path)
-                saved_connection = loki.connection_from_session_state(
-                    loki.current_state())
-                self.assertEqual(
-                    saved_connection.provider_id, "provider-b")
-
-                target_c = loki.make_runtime_config(
-                    "https://provider-c.example/v1/responses",
-                    protocols.OPENAI_RESPONSES,
-                    model="model-c",
-                    provider_id="provider-c",
-                    provider_name="Provider C",
-                )
-                responses_payload = target_c.chat_provider.chat_payload(
-                    loki.current_transcript(), [], "model-c")
-                rendered_responses = json.dumps(responses_payload)
-                self.assertIn("Provider B answer", rendered_responses)
-                self.assertIn("grep result", rendered_responses)
-                self.assertNotIn(
-                    "provider-b-only", rendered_responses)
-                self.assertNotIn("reasoning_b", rendered_responses)
-
-                target_d = loki.make_runtime_config(
-                    "https://provider-d.example/v1/chat/completions",
-                    protocols.OPENAI_CHAT,
-                    model="model-d",
-                    provider_id="provider-d",
-                    provider_name="Provider D",
-                )
-                chat_payload = target_d.chat_provider.chat_payload(
-                    loki.current_transcript(), [], "model-d")
-                rendered_chat = json.dumps(chat_payload)
-                self.assertIn("I will inspect it.", rendered_chat)
-                self.assertIn("README contents", rendered_chat)
-                self.assertIn("Provider B answer", rendered_chat)
-                self.assertIn("grep result", rendered_chat)
-                self.assertNotIn(
-                    "provider-a-signature", rendered_chat)
-                self.assertNotIn("provider-b-only", rendered_chat)
-                formats.validate_events(loki.current_transcript())
-        finally:
-            restore_loki_state(old_values)
 
 
 class ChatLogPathTests(unittest.TestCase):
@@ -6858,63 +6474,6 @@ class ResponsesToolLoopTests(unittest.TestCase):
         self.assertIsNot(inner_states[0], outer_states[0])
         self.assertEqual(inner_states[0].value, "inner-state")
         self.assertEqual(outer_states[0].value, "outer-state")
-
-    def test_function_call_only_response_executes_tool_and_continues(self):
-        transcript = [formats.message_item("user", "read README")]
-        seen_inputs = []
-        events = []
-
-        async def chat_fn(items, *, codex_turn_state):
-            seen_inputs.append([item.get("type") for item in items])
-            if len(seen_inputs) == 1:
-                return formats.DecodedTurn(
-                    [formats.tool_call_item(
-                        "call_1", "Read",
-                        {"file_path": "README.md"})],
-                    {
-                        "protocol": "openai_responses",
-                        "response": {
-                            "id": "resp_1",
-                            "object": "response",
-                            "status": "completed",
-                            "model": "gpt-test",
-                        },
-                    },
-                )
-            return [formats.message_item("assistant", "done")]
-
-        async def fake_dispatch(fn_name, args, allowed=None, extra_context=None):
-            self.assertEqual(fn_name, "Read")
-            self.assertEqual(args, {"file_path": "README.md"})
-            return {"ok": True, "content": "file contents"}
-
-        old_dispatch = loki.dispatch_tool_async
-        try:
-            loki.dispatch_tool_async = fake_dispatch
-            result = asyncio.run(loki.run_tool_loop_async(
-                transcript,
-                chat_fn=chat_fn,
-                on_event=events.append,
-                max_loops=3,
-            ))
-        finally:
-            loki.dispatch_tool_async = old_dispatch
-
-        self.assertEqual(result, "done")
-        self.assertEqual(
-            [item.get("type") for item in transcript],
-            [
-                "message", "model_response", "tool_result",
-                "model_response",
-            ],
-        )
-        self.assertEqual(transcript[2]["call_id"], "call_1")
-        self.assertEqual(formats.item_text(transcript[2]), "file contents")
-        self.assertEqual(
-            seen_inputs[1],
-            ["message", "model_response", "tool_result"],
-        )
-        self.assertEqual([event.get("type") for event in events], ["tool_call", "tool_result", "assistant_message"])
 
     def test_autonomous_loop_limit_is_hard_and_closes_pending_call(self):
         transcript = [formats.message_item("user", "keep calling")]

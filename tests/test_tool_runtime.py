@@ -239,42 +239,6 @@ class HookPipelineTests(unittest.TestCase):
             cwd=os.getcwd(),
         )
 
-    def test_repairs_then_custom_transforms_then_gate_observes_final(self):
-        pipeline = tool_runtime.ToolHookPipeline()
-        seen = []
-
-        async def transform(invocation):
-            seen.append(("transform", invocation.effective_arguments))
-            arguments = copy.deepcopy(invocation.effective_arguments)
-            arguments["content"] = "added"
-            return tool_runtime.PreHookDecision(arguments=arguments)
-
-        async def gate(invocation):
-            seen.append(("gate", invocation.effective_arguments))
-            return tool_runtime.PreHookDecision()
-
-        pipeline.add_pre("custom.transform", transform)
-        pipeline.add_gate("custom.gate", gate)
-
-        result = asyncio.run(pipeline.prepare(
-            self.invocation({"values": "a"})))
-
-        self.assertEqual(
-            seen,
-            [
-                ("transform", {"values": ["a"]}),
-                ("gate", {
-                    "values": ["a"],
-                    "content": "added",
-                }),
-            ],
-        )
-        self.assertEqual(result.validation_issues, [])
-        self.assertEqual(
-            [item.hook for item in result.adjustments],
-            ["loki.input-repair", "custom.transform"],
-        )
-
     def test_invalid_custom_mutation_is_rejected_before_gate(self):
         pipeline = tool_runtime.ToolHookPipeline()
         gate_calls = []
@@ -350,41 +314,6 @@ class ExternalHookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Hook configuration error:", result.stderr)
         self.assertNotIn("\x1b", result.stdout + result.stderr)
-
-    def test_loki_hook_configuration_uses_explicit_path_and_off_switch(self):
-        old_pipeline = loki.TOOL_HOOK_PIPELINE
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
-            with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({
-                    "pre_tool_call": [{
-                        "id": "configured",
-                        "command": [
-                            sys.executable,
-                            "-c",
-                            "print('{}')",
-                        ],
-                    }],
-                }, stream)
-            try:
-                selected = loki.configure_tool_hook_pipeline({
-                    "LOKI_HOOKS": config_path,
-                })
-                self.assertEqual(selected, config_path)
-                self.assertEqual(
-                    [hook.hook_id
-                     for hook in loki.TOOL_HOOK_PIPELINE.pre_hooks],
-                    ["configured"],
-                )
-
-                selected = loki.configure_tool_hook_pipeline({
-                    "LOKI_HOOKS": "off",
-                })
-                self.assertIsNone(selected)
-                self.assertFalse(
-                    loki.TOOL_HOOK_PIPELINE.has_custom_hooks)
-            finally:
-                loki.TOOL_HOOK_PIPELINE = old_pipeline
 
     def test_hook_environment_carries_scratch_but_not_credentials(self):
         source = dict(os.environ)
@@ -684,42 +613,6 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
         self.assertIsNone(execution)
         self.assertIn("registered as function", result["content"])
 
-    def test_repaired_call_executes_effective_args_but_keeps_original(self):
-        call = formats.tool_call_item(
-            "call_repair",
-            "WebSearch",
-            {
-                "query": "loki",
-                "allowed_domains": '["example.com","example.org"]',
-                "blocked_domains": None,
-            },
-        )
-        original = copy.deepcopy(call)
-
-        result, execution, dispatched, events = (
-            self.execute_with_fake_dispatch(call))
-
-        self.assertEqual(call, original)
-        self.assertEqual(dispatched, [(
-            "WebSearch",
-            {
-                "query": "loki",
-                "allowed_domains": [
-                    "example.com", "example.org"],
-            },
-        )])
-        self.assertTrue(result["ok"])
-        self.assertIn("parsed JSON-encoded array", result["content"])
-        self.assertEqual(
-            [item["rule"] for item in execution["adjustments"]],
-            ["json_encoded_array", "optional_null_omission"],
-        )
-        self.assertEqual(
-            [event["type"] for event in events],
-            ["tool_input_repaired", "tool_call"],
-        )
-        self.assertEqual(events[-1]["cwd"], loki.current_cwd())
-
     def test_bash_uses_the_cwd_shown_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             initial = loki.current_cwd()
@@ -744,37 +637,6 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(run_bash.await_args.kwargs["cwd"], shown_cwd)
             finally:
                 loki.current_session().shell_cwd = initial
-
-    def test_path_autolink_is_repaired_only_for_execution(self):
-        call = formats.tool_call_item(
-            "call_path",
-            "Write",
-            {
-                "file_path":
-                    "/tmp/[notes.md](http://notes.md)",
-                "content": "[notes.md](http://notes.md)",
-            },
-        )
-
-        result, execution, dispatched, _ = (
-            self.execute_with_fake_dispatch(call))
-
-        self.assertEqual(
-            dispatched[0][1],
-            {
-                "file_path": "/tmp/notes.md",
-                "content": "[notes.md](http://notes.md)",
-            },
-        )
-        self.assertEqual(
-            formats.tool_call_input(call)["file_path"],
-            "/tmp/[notes.md](http://notes.md)",
-        )
-        self.assertEqual(
-            execution["adjustments"][0]["rule"],
-            "path_markdown_autolink",
-        )
-        self.assertIn("auto-link", result["content"])
 
     def test_read_relational_defaults_are_transparent_not_errors(self):
         call = formats.tool_call_item(
@@ -816,30 +678,6 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
         self.assertIn("already executed", result["content"])
         self.assertEqual(
             execution["hooks"][0]["status"], "error")
-
-    def test_post_hook_workspace_changes_invalidate_remembered_files(self):
-        # The record must be keyed the way production keys it: ``_file_key``
-        # folds case and separators.  Seeding the raw resolved path happens to
-        # be the same key where normcase is identity (POSIX), but on Windows
-        # the invalidation pops the folded key and the raw one would survive.
-        remembered = loki._file_key(loki._resolve_path("README.md"))
-        loki.file_state[remembered] = "old contents"
-        pipeline = tool_runtime.ToolHookPipeline()
-
-        def changed_file(invocation, outcome):
-            return tool_runtime.PostHookDecision(
-                changed_paths=["README.md"])
-
-        pipeline.add_post("changed.file", changed_file)
-        call = formats.tool_call_item(
-            "call_changes", "TodoRead", {})
-
-        _, execution, _, _ = self.execute_with_fake_dispatch(
-            call, pipeline)
-
-        self.assertNotIn(remembered, loki.file_state)
-        self.assertEqual(
-            execution["changed_paths"], ["README.md"])
 
     def test_pre_hook_denial_skips_dispatch_and_reaches_post_hook(self):
         pipeline = tool_runtime.ToolHookPipeline()
@@ -926,177 +764,19 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
             ["tool_input_invalid", "tool_rejected"],
         )
 
-    def test_every_protocol_uses_the_same_post_decode_repair_boundary(self):
-        provider_turns = [
-            formats.openai_chat_response_to_items({
-                "id": "chat_1",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": "call_chat",
-                            "type": "function",
-                            "function": {
-                                "name": "WebSearch",
-                                "arguments": json.dumps({
-                                    "query": "loki",
-                                    "allowed_domains": "example.com",
-                                }),
-                            },
-                        }],
-                    },
-                    "finish_reason": "tool_calls",
-                }],
-            }),
-            formats.anthropic_response_to_items({
-                "id": "message_1",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-test",
-                "content": [{
-                    "type": "tool_use",
-                    "id": "call_anthropic",
-                    "name": "WebSearch",
-                    "input": {
-                        "query": "loki",
-                        "allowed_domains": "example.com",
-                    },
-                }],
-                "stop_reason": "tool_use",
-                "usage": {},
-            }),
-            formats.openai_responses_response_to_items({
-                "id": "response_1",
-                "object": "response",
-                "status": "completed",
-                "output": [{
-                    "type": "function_call",
-                    "id": "item_1",
-                    "call_id": "call_responses",
-                    "name": "WebSearch",
-                    "arguments": json.dumps({
-                        "query": "loki",
-                        "allowed_domains": "example.com",
-                    }),
-                }],
-            }),
-        ]
-
-        for source_turn in provider_turns:
-            with self.subTest(protocol=source_turn.metadata["protocol"]):
-                transcript = [
-                    formats.message_item("user", "search"),
-                ]
-                calls = 0
-                dispatched = []
-
-                async def chat_fn(items, *, codex_turn_state):
-                    nonlocal calls
-                    calls += 1
-                    if calls == 1:
-                        return source_turn
-                    return formats.DecodedTurn([
-                        formats.message_item("assistant", "done"),
-                    ], {"protocol": formats.OPENAI_CHAT})
-
-                async def dispatch(
-                        name, args, allowed=None, extra_context=None):
-                    dispatched.append((name, copy.deepcopy(args)))
-                    return {"ok": True, "content": "searched"}
-
-                with mock.patch.object(
-                        loki, "dispatch_tool_async", new=dispatch):
-                    result = asyncio.run(loki.run_tool_loop_async(
-                        transcript,
-                        chat_fn=chat_fn,
-                        max_loops=3,
-                        hook_pipeline=tool_runtime.ToolHookPipeline(),
-                    ))
-
-                self.assertEqual(result, "done")
-                self.assertEqual(
-                    dispatched,
-                    [("WebSearch", {
-                        "query": "loki",
-                        "allowed_domains": ["example.com"],
-                    })],
-                )
-                original_call = formats.response_tool_calls(
-                    transcript[1])[0]
-                self.assertEqual(
-                    formats.tool_call_input(
-                        original_call)["allowed_domains"],
-                    "example.com",
-                )
-                self.assertEqual(
-                    transcript[2]["execution"]["adjustments"][0]["rule"],
-                    "bare_string_array",
-                )
-                formats.items_to_openai_chat_messages(transcript)
-                formats.items_to_anthropic_parts(transcript)
-                formats.items_to_openai_responses_parts(transcript)
-
-    def test_execution_adjustment_round_trips_without_rewriting_call(self):
-        call = formats.tool_call_item(
-            "call_saved",
-            "WebSearch",
-            {
-                "query": "loki",
-                "allowed_domains": "example.com",
-            },
-        )
-        response = formats.model_response_event(
-            formats.OPENAI_CHAT,
-            [call],
-        )
-        result, execution, _, _ = self.execute_with_fake_dispatch(
-            call)
-        result_event = formats.tool_result_for_call(
-            call,
-            result["content"],
-            is_error=False,
-            execution=execution,
-        )
-        blob = formats.new_log_blob(
-            [
-                formats.message_item("user", "search"),
-                response,
-                result_event,
-            ],
-            [],
-        )
-
-        loaded, _ = formats.load_log_blob(
-            json.loads(json.dumps(blob)))
-        loaded_call = formats.response_tool_calls(loaded[1])[0]
-
-        self.assertEqual(
-            formats.tool_call_input(
-                loaded_call)["allowed_domains"],
-            "example.com",
-        )
-        self.assertEqual(
-            loaded[2]["execution"]["adjustments"][0]["value"],
-            ["example.com"],
-        )
-        chat = formats.items_to_openai_chat_messages(loaded)
-        self.assertEqual(
-            json.loads(
-                chat[1]["tool_calls"][0]["function"]["arguments"])
-            ["allowed_domains"],
-            "example.com",
-        )
-        self.assertNotIn("execution", chat[2])
-
-        malformed = copy.deepcopy(blob)
-        malformed["events"][2]["execution"] = []
+    def test_malformed_execution_metadata_is_rejected(self):
+        call = formats.tool_call_item('call_saved', 'WebSearch', {
+            'query': 'loki', 'allowed_domains': 'example.com'})
+        blob = formats.new_log_blob([
+            formats.message_item('user', 'search'),
+            formats.model_response_event(formats.OPENAI_CHAT, [call]),
+            formats.tool_result_for_call(call, 'parser fixture result'),
+        ], [])
+        blob['events'][2]['execution'] = []
         with self.assertRaisesRegex(
                 formats.TranscriptFormatError,
-                "execution metadata must be an object"):
-            formats.load_log_blob(malformed)
+                'execution metadata must be an object'):
+            formats.load_log_blob(blob)
 
 
 class JobCwdVisibilityTests(unittest.TestCase):
