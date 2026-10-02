@@ -324,7 +324,7 @@ class ToolAdjustment:
     rule: str
     path: tuple
     operation: str
-    value: object = _UNSET
+    value: object = None
 
     def to_dict(self):
         result = {
@@ -334,7 +334,8 @@ class ToolAdjustment:
             "display_path": format_path(self.path),
             "operation": self.operation,
         }
-        if self.value is not _UNSET:
+        # The operation owns value presence; None is a valid JSON replacement.
+        if self.operation in ("add", "replace"):
             result["value"] = copy.deepcopy(self.value)
         return result
 

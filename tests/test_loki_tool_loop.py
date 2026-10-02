@@ -2984,10 +2984,23 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             script = (
                 'import json,pathlib,sys\n'
                 'p=json.load(sys.stdin); i=p["invocation"]; a=i["effective_arguments"]\n'
+                'if i["call_id"] in ("chat-search", "c-search"):\n'
+                ' assert i["adjustments"][1] == {"hook":"loki.input-repair",\n'
+                '  "rule":"optional_null_omission", "path":["blocked_domains"],\n'
+                '  "display_path":"$.blocked_domains", "operation":"remove"}\n'
                 'with open(sys.argv[1], "a") as f: f.write(json.dumps([p["event"],i["call_id"],a])+"\\n")\n'
                 'if p["event"]=="pre_tool_call":\n'
                 ' assert isinstance(a["allowed_domains"],list)\n'
                 ' assert "blocked_domains" not in a\n'
+                ' if i["call_id"] in ("chat-search", "c-search"):\n'
+                '  assert i["original_arguments"]["blocked_domains"] is None\n'
+                '  assert i["adjustments"][:2] == [\n'
+                '   {"hook":"loki.input-repair", "rule":"json_encoded_array",\n'
+                '    "path":["allowed_domains"], "display_path":"$.allowed_domains",\n'
+                '    "operation":"replace", "value":["example.com"]},\n'
+                '   {"hook":"loki.input-repair", "rule":"optional_null_omission",\n'
+                '    "path":["blocked_domains"], "display_path":"$.blocked_domains",\n'
+                '    "operation":"remove"}]\n'
                 ' a["query"] += " external"\n'
                 ' json.dump({"arguments":a},sys.stdout)\n'
                 'else:\n'
@@ -3266,7 +3279,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         ('b-resumed-read', 'Read', {'file_path': str(source)}),
                         ('b-resumed-grep', 'Grep', {'pattern': 'notes', 'path': str(notes), 'output_mode': 'content'})], 'resume B', restored=True)
                     await turn('CHAT', protocols.OPENAI_CHAT, [
-                        ('chat-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'chat exact')
+                        ('chat-search', 'WebSearch', {'query': 'loki', 'allowed_domains': '["example.com"]', 'blocked_domains': None})], 'chat exact')
                     self.assertNotIn(source_key, loki.file_state)
                     self.assertEqual(source.read_text(), 'marker post\n')
                     chat_followup = captured[-1][1]
@@ -3278,7 +3291,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         ('anthropic-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'anthropic turn', private=True)
                     self.assertIn('anthropic-signature', json.dumps(captured[-1][1]))
                     await turn('C', protocols.OPENAI_RESPONSES, [
-                        ('c-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'foreign replay')
+                        ('c-search', 'WebSearch', {'query': 'loki', 'allowed_domains': '["example.com"]', 'blocked_domains': None})], 'foreign replay')
                     loki.apply_runtime_config(provider_config('ANTHROPIC', protocols.ANTHROPIC_MESSAGES))
                     loki.set_session_connection(loki.active_connection_descriptor())
                     loki.save_chat_log()
@@ -3371,8 +3384,15 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual([r['rule'] for r in repairs['a-read']], ['path_markdown_autolink'])
                     self.assertEqual([r['rule'] for r in repairs['a-search'][:2]], ['json_encoded_array', 'optional_null_omission'])
                     for cid in ('chat-search', 'anthropic-search', 'c-search', 'off-search'):
-                        self.assertEqual(repairs[cid][0]['rule'], 'bare_string_array')
+                        self.assertEqual(repairs[cid][0]['rule'],
+                                         'json_encoded_array' if cid in ('chat-search', 'c-search')
+                                         else 'bare_string_array')
                         self.assertEqual(repairs[cid][0]['value'], ['example.com'])
+                    for cid in ('a-search', 'chat-search', 'c-search'):
+                        self.assertEqual(repairs[cid][1], {
+                            'hook': 'loki.input-repair', 'rule': 'optional_null_omission',
+                            'path': ['blocked_domains'], 'display_path': '$.blocked_domains',
+                            'operation': 'remove'})
                     for cid in ('chat-search', 'anthropic-search', 'c-search'):
                         self.assertEqual([r['hook'] for r in repairs[cid]][-2:], ['external.transform', 'custom.transform'])
                     self.assertEqual([row[:2] for row in hook_records()], [

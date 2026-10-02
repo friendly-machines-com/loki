@@ -227,6 +227,48 @@ class InputRepairTests(unittest.TestCase):
                 self.assertEqual(second.adjustments, [])
 
 
+class AdjustmentSerializationTests(unittest.TestCase):
+    def test_operations_preserve_value_presence_through_copy_and_json(self):
+        cases = [
+            ("remove", None, {}),
+            ("add", None, {"value": None}),
+            ("replace", None, {"value": None}),
+            ("add", {"nested": ["original"]},
+             {"value": {"nested": ["original"]}}),
+            ("replace", {"nested": ["original"]},
+             {"value": {"nested": ["original"]}}),
+        ]
+        for operation, value, expected_value in cases:
+            with self.subTest(operation=operation, value=value):
+                adjustment = tool_runtime.ToolAdjustment(
+                    "custom.transform", "custom_hook", ("optional",),
+                    operation, value)
+                copied = copy.deepcopy(adjustment)
+                wire = copied.to_dict()
+                expected = {
+                    "hook": "custom.transform", "rule": "custom_hook",
+                    "path": ["optional"], "display_path": "$.optional",
+                    "operation": operation, **expected_value,
+                }
+                self.assertEqual(wire, expected)
+                self.assertEqual(json.loads(json.dumps(wire)), expected)
+                if isinstance(value, dict):
+                    wire["value"]["nested"].append("wire mutation")
+                    self.assertEqual(copied.value, {"nested": ["original"]})
+                    copied.value["nested"].append("copy mutation")
+                    self.assertEqual(adjustment.value, {"nested": ["original"]})
+
+        removed = tool_runtime.diff_values({"optional": "old"}, {}, "custom")
+        repaired = tool_runtime.repair_tool_input(
+            ARRAY_SCHEMA, {"values": [], "optional": None})
+        for adjustment in removed + repaired.adjustments:
+            with self.subTest(rule=adjustment.rule):
+                wire = copy.deepcopy(adjustment).to_dict()
+                self.assertEqual(wire["operation"], "remove")
+                self.assertNotIn("value", wire)
+                self.assertEqual(json.loads(json.dumps(wire)), wire)
+
+
 class HookPipelineTests(unittest.TestCase):
     def invocation(self, args):
         return tool_runtime.ToolInvocation(
