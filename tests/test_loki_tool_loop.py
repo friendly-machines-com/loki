@@ -2830,38 +2830,6 @@ class ResumeTranscriptRendererTests(unittest.TestCase):
             "".join(text for _kind, text in segments)
             for _block_kind, segments in renderer.presentation(events))
 
-    def test_resume_renderer_replays_visible_conversation_without_metadata_dump(self):
-        items = [
-            formats.instruction_item("internal startup instruction"),
-            formats.message_item("user", "hello"),
-            formats.model_response_event(
-                "openai_responses",
-                [
-                    formats.message_item("assistant", "hi there"),
-                    formats.tool_call_item(
-                        "call_1", "Read",
-                        {"file_path": "README.md"}),
-                ],
-            ),
-            formats.tool_result_item("call_1", "file contents", name="Read"),
-        ]
-
-        text = self._render(
-            savefiles.ResumeTranscriptRenderer(assistant_label="Assistant"),
-            items)
-
-        self.assertEqual(
-            text,
-            "User: hello\n\n"
-            "Assistant: hi there\n\n"
-            "Tool call: Read\n"
-            "    file_path: 'README.md'\n\n"
-            "Tool result: Read\n"
-            "file contents",
-        )
-        self.assertNotIn("internal startup instruction", text)
-        self.assertNotIn("response_metadata", text)
-
     def test_resume_renderer_shows_provider_notice_without_assistant_text(
             self):
         event = formats.model_response_event(
@@ -3968,6 +3936,233 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             formats.validate_events(loki.current_transcript())
 
 
+class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generated_chats_pick_render_resume_and_continue(self):
+        from datetime import datetime
+        import uuid
+
+        for selected_index in (2, 3):
+            with self.subTest(selected_index=selected_index), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                chat_dir = root / 'missing' / '.loki' / 'chats'
+                self.assertFalse(chat_dir.exists())
+                output, errors, terminal_calls, requests = io.StringIO(), io.StringIO(), [], []
+                tasks_before = set(asyncio.all_tasks())
+                process_cwd = os.getcwd()
+                phase = {}
+
+                class RecordingTerminal(terminals._TerminalTextOutput):
+                    def goto_position(self, *args):
+                        terminal_calls.append(('goto_position', *args))
+
+                    def clear_to_end_of_screen(self):
+                        terminal_calls.append(('clear_to_end_of_screen',))
+
+                    def flush(self):
+                        terminal_calls.append(('flush',))
+
+                    def set_foreground_color(self, color):
+                        pass
+
+                    def set_background_color(self, color):
+                        pass
+
+                    def reset_colors_and_flags(self):
+                        pass
+
+                terminal = RecordingTerminal()
+                terminal.assistant_markdown = terminals.AssistantMarkdownPresentation(terminal)
+
+                class PickerInput(ScriptedInputSession):
+                    active = False
+                    modal_active = False
+
+                    async def __aenter__(self):
+                        self.active = True
+                        return self
+
+                    async def __aexit__(self, *args):
+                        self.active = False
+
+                    @contextlib.asynccontextmanager
+                    async def modal(self):
+                        if not self.active or self.modal_active:
+                            raise AssertionError('invalid modal ownership')
+                        self.modal_active = True
+                        try:
+                            yield self
+                        finally:
+                            self.modal_active = False
+
+                    async def prompt(self, prompt=None, history=None):
+                        if not self.modal_active:
+                            raise AssertionError('picker prompt outside modal')
+                        self.menu = output.getvalue()
+                        return str(selected_index)
+
+                input_session = PickerInput(['continued request', '/quit'])
+                input_session.reader.cancel_event = asyncio.Event()
+                input_session.menu = ''
+                store = CredentialStore({
+                    'LOKI_API_BASE': 'https://picker.example/v1/chat/completions',
+                    'LOKI_PROVIDER': protocols.OPENAI_CHAT, 'LOKI_MODEL': 'picker-model',
+                })
+                config = loki.build_config_from_env(credentials=store)
+                paths, saved, mtimes = {}, {}, {'oldest': 1000, 'middle': 2000, 'newest': 3000}
+                selected_label = {2: 'middle', 3: 'newest'}[selected_index]
+
+                async def completion(items, tools=None, *args, **kwargs):
+                    requests.append(copy.deepcopy(items))
+                    label, count = phase['label'], phase['count']
+                    phase['count'] += 1
+                    if count == 0:
+                        if label == 'continued':
+                            self.assertEqual(items[:len(saved[selected_label]['events'])],
+                                             saved[selected_label]['events'])
+                            self.assertEqual(formats.item_text(items[-1]), 'continued request')
+                        return formats.DecodedTurn([
+                            formats.message_item('assistant', f'prelude {label}'),
+                            formats.tool_call_item(f'read-{label}', 'Read',
+                                                   {'file_path': f'{label}.txt'}),
+                        ])
+                    self.assertEqual(count, 1)
+                    result = items[-1]
+                    self.assertEqual(result['type'], 'tool_result')
+                    self.assertEqual(result['call_id'], f'read-{label}')
+                    self.assertEqual(formats.item_text(result), f'1\tevidence {label}')
+                    self.assertIn(loki._file_key(str(root / f'{label}.txt')), loki.file_state)
+                    return formats.DecodedTurn([
+                        formats.message_item('assistant', f'answer {label}')])
+
+                async def fresh_session():
+                    session = loki.Session(shell_cwd=directory,
+                                           job_manager=loki.JobManager(str(root / 'jobs')))
+                    self.addAsyncCleanup(session.job_manager.close_session_owned)
+                    return session
+
+                def read_blob(path):
+                    return json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
+
+                rendered = []
+                real_present = terminal_frontend._ResumeTranscriptPresenter.write
+
+                def observe_present(presenter, events):
+                    self.assertEqual(terminal_calls[-3:], [
+                        ('goto_position', 1, 1), ('clear_to_end_of_screen',), ('flush',)])
+                    self.assertTrue(input_session.active)
+                    self.assertFalse(input_session.modal_active)
+                    self.assertEqual(events, saved[selected_label]['events'])
+                    self.assertEqual(pathlib.Path(paths[selected_label]).read_bytes(), before[selected_label])
+                    start = output.tell()
+                    real_present(presenter, events)
+                    rendered.append(output.getvalue()[start:])
+
+                with mock.patch.object(loki, 'CHAT_LOG_DIR', str(chat_dir)), \
+                        mock.patch.object(loki, 'CREDENTIALS', store), \
+                        mock.patch.object(loki, 'file_state', {}), \
+                        mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', loki.tool_runtime.ToolHookPipeline()), \
+                        mock.patch.object(terminal_frontend, '_terminal_activity', terminal_frontend.TerminalActivityStatus()), \
+                        mock.patch.object(terminal_frontend, 'terminal', terminal), \
+                        mock.patch.object(terminal_frontend, 'async_chat_completion', new=completion), \
+                        mock.patch.object(terminals, 'redraw_status_bar'), \
+                        mock.patch.object(terminals, 'open_terminal_stdin'), \
+                        mock.patch.object(terminal_frontend, 'restore_output_area_after_input'), \
+                        contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    # Creation order differs from mtime order, so creation-order picking cannot pass.
+                    for label in ('newest', 'oldest', 'middle'):
+                        session = await fresh_session()
+                        with mock.patch.object(loki, '_DEFAULT_SESSION', session):
+                            loki.apply_runtime_config(config)
+                            path = loki.new_chat_log_path()
+                            self.assertEqual(pathlib.Path(path).parent, chat_dir)
+                            uuid.UUID(pathlib.Path(path).stem.removeprefix('chat-'))
+                            self.assertTrue(chat_dir.is_dir())
+                            if not paths:
+                                chat_dir.rmdir()
+                                self.assertFalse(chat_dir.exists())
+                            loki.new_chat_log(path)
+                            self.assertTrue(chat_dir.is_dir())
+                            self.assertEqual(loki.current_chat_log_path(), os.path.realpath(path))
+                            self.assertTrue(session.chat_log_dirty)
+                            self.assertFalse(pathlib.Path(path).exists())
+                            (root / f'{label}.txt').write_text(f'evidence {label}\n', encoding='utf-8')
+                            session.transcript_items.append(formats.message_item('user', f'{label} request'))
+                            phase.update(label=label, count=0)
+                            self.assertEqual(await asyncio.wait_for(
+                                terminal_frontend.run_terminal_turn_async(session.transcript_items), 5),
+                                f'answer {label}')
+                            loki.mark_chat_log_dirty()
+                            self.assertTrue(loki.save_chat_log())
+                            self.assertFalse(session.chat_log_dirty)
+                            paths[label], saved[label] = path, read_blob(path)
+                            formats.validate_events(saved[label]['events'])
+                            self.assertEqual(saved[label]['events'], session.transcript_items)
+                            os.utime(path, (mtimes[label], mtimes[label]))
+                            await session.job_manager.close_session_owned()
+                    self.assertEqual(len(set(paths.values())), 3)
+                    before = {label: pathlib.Path(path).read_bytes() for label, path in paths.items()}
+                    (root / 'continued.txt').write_text('evidence continued\n', encoding='utf-8')
+                    resumed = await fresh_session()
+                    self.assertEqual(resumed.transcript_items, [])
+                    output.seek(0)
+                    output.truncate()
+                    phase.update(label='continued', count=0)
+                    with mock.patch.object(loki, '_DEFAULT_SESSION', resumed), \
+                            mock.patch.object(terminal_frontend, 'input_session', return_value=input_session), \
+                            mock.patch.object(terminal_frontend._ResumeTranscriptPresenter, 'write', new=observe_present):
+                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main(['resume']), 5), 0)
+                        self.assertEqual(resumed.chat_log_path, paths[selected_label])
+                        self.assertFalse(resumed.chat_log_dirty)
+                        self.assertFalse(input_session.active)
+                        self.assertFalse(input_session.modal_active)
+                        self.assertEqual(input_session.messages, [])
+                        final = read_blob(paths[selected_label])
+                        self.assertEqual(final['events'][:len(saved[selected_label]['events'])],
+                                         saved[selected_label]['events'])
+                        self.assertEqual(final['events'], resumed.transcript_items)
+                        self.assertEqual(formats.item_text(final['events'][-1]['items'][-1]), 'answer continued')
+                        self.assertEqual(final['session_state']['connection'], saved[selected_label]['session_state']['connection'])
+                        await resumed.job_manager.close_session_owned()
+                        self.assertFalse(resumed.job_manager.jobs)
+                    self.assertEqual(len(requests), 8)
+                    for label in mtimes:
+                        if label != selected_label:
+                            self.assertEqual(pathlib.Path(paths[label]).read_bytes(), before[label])
+                    self.assertTrue(input_session.menu.startswith('\nSaved sessions:\n'))
+                    rows = [line for line in input_session.menu.splitlines()
+                            if line.startswith(('  1.', '  2.', '  3.'))]
+                    self.assertEqual(rows, [
+                        f'  {index}. {datetime.fromtimestamp(mtimes[label]):%Y-%m-%d %H:%M}  '
+                        f'{pathlib.Path(paths[label]).stem[5:13]}  {label} request'
+                        for index, label in enumerate(('oldest', 'middle', 'newest'), 1)])
+                    self.assertEqual(rendered, [
+                        f'User: {selected_label} request\n\n'
+                        f'picker-model: prelude {selected_label}\n\n'
+                        f"Tool call: 'Read'\n    file_path: '{selected_label}.txt'\n\n"
+                        f"Tool result: 'Read'\n1^Ievidence {selected_label}\n\n"
+                        f'picker-model: answer {selected_label}\n----\n'])
+                    logical = '\n\n'.join(
+                        ''.join(text for _, text in segments)
+                        for _, segments in savefiles.ResumeTranscriptRenderer(
+                            'picker-model').presentation(saved[selected_label]['events']))
+                    self.assertEqual(logical,
+                                     f'User: {selected_label} request\n\n'
+                                     f'picker-model: prelude {selected_label}\n\n'
+                                     f"Tool call: Read\n    file_path: '{selected_label}.txt'\n\n"
+                                     f'Tool result: Read\n1\tevidence {selected_label}\n\n'
+                                     f'picker-model: answer {selected_label}')
+                    instructions = [event for event in saved[selected_label]['events']
+                                    if event.get('role') in ('system', 'developer')]
+                    self.assertTrue(instructions)
+                    for event in instructions:
+                        self.assertNotIn(formats.item_text(event), rendered[0])
+                    self.assertNotIn('response_metadata', rendered[0])
+                    self.assertNotIn('protocol_data', rendered[0])
+                    self.assertEqual(errors.getvalue(), '')
+                    self.assertEqual(os.getcwd(), process_cwd)
+                    self.assertFalse(set(asyncio.all_tasks()) - tasks_before)
+
+
 class ChatLogPathTests(unittest.TestCase):
     def test_bare_resume_names_resolve_to_local_loki_chat_directory(self):
         self.assertEqual(
@@ -3991,34 +4186,6 @@ class ChatLogPathTests(unittest.TestCase):
             os.path.normpath(
                 os.path.join(loki.STARTUP_CWD, "logs", "chat-abc.json")),
         )
-
-    def test_new_chat_log_path_uses_local_loki_chat_directory(self):
-        path = loki.new_chat_log_path()
-
-        self.assertEqual(os.path.dirname(path), loki.CHAT_LOG_DIR)
-        self.assertTrue(os.path.basename(path).startswith("chat-"))
-        self.assertTrue(path.endswith(".json"))
-        self.assertTrue(os.path.isdir(loki.CHAT_LOG_DIR))
-
-    def test_new_chat_log_creates_parent_directory(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos",
-        ]
-        old_values = save_loki_state(names)
-
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, ".loki", "chats", "chat-test.json")
-                loki.new_chat_log(path)
-
-                self.assertTrue(os.path.isdir(os.path.dirname(path)))
-                self.assertEqual(
-                    loki.current_chat_log_path(), os.path.realpath(path))
-                self.assertTrue(loki.current_session().chat_log_dirty)
-                self.assertFalse(os.path.exists(path))
-        finally:
-            restore_loki_state(old_values)
 
 
 class SessionPickerTests(unittest.TestCase):
@@ -4076,9 +4243,6 @@ class SessionPickerTests(unittest.TestCase):
         saved_terminal = terminal_frontend.terminal
 
         class _FakeTerminal:
-            def __init__(self):
-                self.calls = []
-
             def save_cursor_position(self, *a, **k):
                 pass
 
@@ -4086,13 +4250,13 @@ class SessionPickerTests(unittest.TestCase):
                 pass
 
             def clear_to_end_of_screen(self, *a, **k):
-                self.calls.append(("clear_to_end_of_screen",))
+                pass
 
             def goto_position(self, *a, **k):
-                self.calls.append(("goto_position", *a))
+                pass
 
             def flush(self, *a, **k):
-                self.calls.append(("flush",))
+                pass
 
             def write_text(
                     self, text, *, multiline=False, file=None):
@@ -4106,54 +4270,6 @@ class SessionPickerTests(unittest.TestCase):
             terminal_frontend.terminal = saved_terminal
 
         return restore, session
-
-    def test_picker_selects_by_number(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self._write_chat(tmpdir, "aaa", '{"text":"alpha chat"}', mtime=1000)
-            self._write_chat(tmpdir, "bbb", '{"text":"beta chat"}', mtime=2000)
-            self._write_chat(tmpdir, "ccc", '{"text":"gamma chat"}', mtime=3000)
-            restore, session = self._make_picker(tmpdir, ["2"])
-            try:
-                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
-            # mtime-sorted oldest->newest: aaa(1000), bbb(2000), ccc(3000).
-            # "2" selects the middle one = bbb.
-            self.assertTrue(result.endswith("chat-bbb.json"))
-
-    def test_picker_prints_saved_sessions_header(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self._write_chat(
-                tmpdir, "aaa", '{"text":"alpha chat"}', mtime=1000)
-            restore, session = self._make_picker(tmpdir, ["1"])
-            output = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(output):
-                    result = asyncio.run(
-                        terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
-
-            self.assertTrue(result.endswith("chat-aaa.json"))
-            self.assertTrue(
-                output.getvalue().startswith("\nSaved sessions:\n"))
-
-    def test_picker_finishes_clear_before_returning(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
-            restore, session = self._make_picker(tmpdir, ["1"])
-            picker_terminal = terminal_frontend.terminal
-            try:
-                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
-
-            self.assertTrue(result.endswith("chat-aaa.json"))
-            self.assertEqual(picker_terminal.calls[-3:], [
-                ("goto_position", 1, 1),
-                ("clear_to_end_of_screen",),
-                ("flush",),
-            ])
 
     def test_picker_filter_matches_all_words_in_any_order(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4204,19 +4320,6 @@ class SessionPickerTests(unittest.TestCase):
             finally:
                 restore()
             self.assertIsNone(result)
-
-    def test_picker_mtime_newest_last(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self._write_chat(tmpdir, "old", '{"text":"old session"}', mtime=1000)
-            self._write_chat(tmpdir, "mid", '{"text":"mid session"}', mtime=2000)
-            self._write_chat(tmpdir, "new", '{"text":"new session"}', mtime=3000)
-            restore, session = self._make_picker(tmpdir, ["3"])
-            try:
-                result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
-            # Oldest->newest: old, mid, new. "3" = newest.
-            self.assertTrue(result.endswith("chat-new.json"))
 
     def test_picker_preview_handles_partial_json(self):
         # A truncated/garbled log file must not crash preview extraction.
