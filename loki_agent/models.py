@@ -106,35 +106,48 @@ class ExplicitConnectionOption:
     protocol: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ReasoningEffortProfile:
-    """Exact selectable effort values for one provider/model leaf, and which of
-    them is used when the user has not selected one."""
+    """Selectable effort values for one provider/model leaf, verbatim from
+    its catalog entry, and the entry's own advertised default.
 
-    values: tuple[str, ...]
+    Choices are catalog data, not wire policy: strings exactly as
+    advertised, order preserved, published as copies from a frozen
+    record. A JSON-null catalog entry is not an effort value: where a
+    provider documents null as its off control, that control belongs to
+    the wire layer's mode axis and never appears here.
+    """
+
+    _values: list[str]
     default: str | None = None
 
-    def __post_init__(self):
-        if (not isinstance(self.values, tuple)
-                or not self.values
+    def __init__(self, values, default=None):
+        if (not isinstance(values, list)
+                or not values
                 or any(
                     not isinstance(value, str) or not value
-                    for value in self.values
+                    for value in values
                 )):
             raise ValueError(
                 "reasoning effort profile requires non-empty string values")
-        if len(set(self.values)) != len(self.values):
+        if len(set(values)) != len(values):
             raise ValueError(
                 "reasoning effort profile contains duplicate values")
+        object.__setattr__(self, "_values", values.copy())
+        object.__setattr__(self, "default", default)
+
+    @property
+    def values(self) -> list[str]:
+        return self._values.copy()
 
     def supports(self, value) -> bool:
-        return isinstance(value, str) and value in self.values
+        return isinstance(value, str) and value in self._values
 
     def to_dict(self):
         return {
             "options": [
                 {"value": value, "description": None}
-                for value in self.values
+                for value in self._values
             ],
             "default_value": self.default,
         }
@@ -156,7 +169,146 @@ class ReasoningEffortProfile:
         default = value.get("default_value")
         if not isinstance(default, str) or not default:
             default = None
-        return cls(tuple(values), default=default)
+        return cls(values, default=default)
+
+
+@dataclass(frozen=True, init=False)
+class ReasoningCapabilities:
+    """Validated import of one catalog entry's advertised control hints.
+
+    Catalog hints say what a model advertises: a thinking toggle, effort
+    choices, a numerical allowance with its bounds, the response field
+    interleaved reasoning arrives in. They carry no request spellings and
+    no wire authority. ``controls`` is None when the entry says nothing
+    (unknown) and an empty list when it explicitly advertises no
+    controls; the distinction is real and preserved. Collections are
+    copies at every published boundary.
+    """
+
+    reasoning: bool | None = None
+    _controls: list[str] | None = None
+    budget_min: int | None = None
+    budget_max: int | None = None
+    interleaved_field: str | None = None
+
+    def __init__(self, reasoning=None, controls=None, budget_min=None,
+                 budget_max=None, interleaved_field=None):
+        object.__setattr__(self, "reasoning", reasoning)
+        if controls is not None and not isinstance(controls, list):
+            raise ValueError("reasoning controls must be an array or null")
+        object.__setattr__(self, "_controls",
+                           controls.copy() if controls is not None else None)
+        object.__setattr__(self, "budget_min", budget_min)
+        object.__setattr__(self, "budget_max", budget_max)
+        object.__setattr__(self, "interleaved_field", interleaved_field)
+        self._validate()
+
+    @property
+    def controls(self):
+        return self._controls.copy() if self._controls is not None else None
+
+    def supports(self, control) -> bool:
+        """Whether the entry affirms this control. Unknown controls
+        (None) affirm nothing; only a listed control does."""
+        return self._controls is not None and control in self._controls
+
+    def _validate(self):
+        if self.reasoning is not None and not isinstance(
+                self.reasoning, bool):
+            raise ValueError("reasoning capability must be boolean or null")
+        if self._controls is not None:
+            if any(control not in ["toggle", "effort", "budget_tokens"]
+                   for control in self._controls):
+                raise ValueError("invalid reasoning control")
+            if len(set(self._controls)) != len(self._controls):
+                raise ValueError("duplicate reasoning control")
+            if self.reasoning is False and self._controls:
+                raise ValueError(
+                    "non-reasoning model cannot advertise controls")
+        for name in ["budget_min", "budget_max"]:
+            value = getattr(self, name)
+            if value is not None and (
+                    not isinstance(value, int) or isinstance(value, bool)
+                    or value < 0):
+                raise ValueError(f"invalid reasoning {name}")
+        if (self.budget_min is not None and self.budget_max is not None
+                and self.budget_min > self.budget_max):
+            raise ValueError("reasoning budget bounds are reversed")
+        if ((self.budget_min is not None or self.budget_max is not None)
+                and not self.supports("budget_tokens")):
+            raise ValueError("budget bounds require a budget control")
+        if self.interleaved_field not in [
+                None, "reasoning_content", "reasoning_details"]:
+            raise ValueError("invalid interleaved reasoning field")
+
+    def to_dict(self):
+        return {
+            "reasoning": self.reasoning,
+            "controls": self.controls,
+            "budget_min": self.budget_min,
+            "budget_max": self.budget_max,
+            "interleaved_field": self.interleaved_field,
+        }
+
+    @classmethod
+    def from_dict(cls, value):
+        if not isinstance(value, dict) or set(value) - {
+                "reasoning", "controls", "budget_min", "budget_max",
+                "interleaved_field"}:
+            raise ValueError("invalid reasoning capabilities object")
+        return cls(
+            reasoning=value.get("reasoning"),
+            controls=value.get("controls"),
+            budget_min=value.get("budget_min"),
+            budget_max=value.get("budget_max"),
+            interleaved_field=value.get("interleaved_field"))
+
+
+def reasoning_capabilities(model):
+    """Build the validated capability record of one catalog model entry.
+
+    Malformed optional hints never become authority: each drops to
+    unknown rather than invalidating the model. An entry with no hints
+    at all yields None; an explicitly empty ``reasoning_options`` array
+    yields a record advertising no controls.
+    """
+    if not isinstance(model, dict):
+        return None
+    reasoning = model.get("reasoning")
+    if not isinstance(reasoning, bool):
+        reasoning = None
+    options = model.get("reasoning_options")
+    controls = None
+    budget = {}
+    if isinstance(options, list) and all(
+            isinstance(option, dict) for option in options):
+        try:
+            controls = ReasoningCapabilities(
+                reasoning,
+                [option.get("type") for option in options]).controls
+        except ValueError:
+            controls = None
+        budgets = [
+            option for option in options
+            if option.get("type") == "budget_tokens"]
+        if len(budgets) == 1 and controls is not None:
+            budget = budgets[0]
+    interleaved = model.get("interleaved")
+    field = interleaved.get("field") if isinstance(interleaved, dict) else None
+    if field not in ["reasoning_content", "reasoning_details"]:
+        field = None
+    for args in [
+            (reasoning, controls, budget.get("min"), budget.get("max"),
+             field),
+            (reasoning, controls),
+    ]:
+        try:
+            record = ReasoningCapabilities(*args)
+        except ValueError:
+            continue
+        if record != ReasoningCapabilities():
+            return record
+    return None
 
 
 def validate_reasoning_effort(value, field_name="reasoning effort") -> str:
@@ -235,12 +387,12 @@ def _codex_reasoning_effort_profile(model, request_profile):
             level.get("effort"), "OpenAI Codex reasoning effort"))
     return (
         ReasoningEffortProfile(
-            tuple(values), default=request_profile.default_reasoning_level)
+            values, default=request_profile.default_reasoning_level)
         if values else None
     )
 
 
-def _modelsdev_reasoning_effort_profile(model, default=None):
+def _modelsdev_reasoning_effort_profile(model):
     if not isinstance(model, dict):
         raise ValueError("models.dev model must be an object")
     controls = model.get("reasoning_options")
@@ -265,13 +417,16 @@ def _modelsdev_reasoning_effort_profile(model, default=None):
     chosen_default = (
         model_default
         if isinstance(model_default, str) and model_default
-        else default)
+        else None)
+    # A JSON-null entry is not an effort value; where a provider documents
+    # null as its off control, that control is the wire layer's mode axis.
+    values = [value for value in values if value is not None]
     return ReasoningEffortProfile(
-        tuple(
+        [
             validate_reasoning_effort(
                 value, "models.dev reasoning effort value")
             for value in values
-        ),
+        ],
         default=chosen_default,
     )
 
@@ -424,21 +579,31 @@ def context_capacity(provider_entry, model_entry):
 
 def reasoning_effort_profile(
         provider_id, provider_entry, model_entry):
-    """Return validated effort choices for one usable provider/model leaf."""
+    """Return validated effort choices for one usable provider/model leaf.
+
+    The catalog entry owns the choices; the connection's protocol merely
+    needs an effort spelling (any compatible endpoint speaks its
+    protocol's standard fields, so an unknown provider is not excluded).
+    """
     protocol = provider_protocol(effective_provider(provider_entry, model_entry))
     if not protocols.reasoning_effort_supported(provider_id, protocol):
         return None
     if provider_entry.get(_LOKI_SYNTHETIC_KEY) is (
             _OPENAI_SUBSCRIPTION_SENTINEL):
+        # The authenticated catalog is this request contract; its stored
+        # profile was validated when the entry was built.
         profile = model_entry.get(_LOKI_REASONING_EFFORT_PROFILE_KEY)
         return (
             profile
             if isinstance(profile, ReasoningEffortProfile)
             else None
         )
+    if model_entry.get("reasoning") is False:
+        # The entry affirms this model does not reason; effort choices
+        # for it cannot authorize a request.
+        return None
     try:
-        default = protocols.default_reasoning_effort(provider_id)
-        return _modelsdev_reasoning_effort_profile(model_entry, default=default)
+        return _modelsdev_reasoning_effort_profile(model_entry)
     except ValueError:
         # Malformed optional metadata must not make an otherwise usable model
         # disappear. It merely cannot authorize an effort selector/request.

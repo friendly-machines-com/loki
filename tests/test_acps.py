@@ -2294,7 +2294,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
 
     @staticmethod
     def _profile(*values):
-        return models.ReasoningEffortProfile(tuple(values))
+        return models.ReasoningEffortProfile(list(values))
 
     def test_model_changes_return_dependent_agent_shell_option(self):
         from loki_agent import loki

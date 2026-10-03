@@ -738,11 +738,13 @@ def config_from_connection_descriptor(
         descriptor.openai_request_profile
         if not configured_model or configured_model == descriptor.model
         else None)
+    # Connection-bound metadata travels only with the same connection:
+    # a protocol override builds a different connection, whose facts the
+    # saved descriptor cannot vouch for.
     reasoning_effort_profile = (
         descriptor.reasoning_effort_profile
         if ((not configured_model or configured_model == descriptor.model)
-            and protocols.reasoning_effort_supported(
-                descriptor.provider_id, resolved_provider_kind))
+            and resolved_provider_kind == descriptor.protocol)
         else None)
     max_tokens = (
         _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)

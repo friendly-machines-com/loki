@@ -177,12 +177,6 @@ def openai_response_model_header(headers):
     return _header_string(headers, "openai-model")
 
 
-def reasoning_effort_supported(provider_id, protocol) -> bool:
-    """Whether Loki implements this provider's effort request contract."""
-    spec = _REASONING_SPECS.get(provider_id)
-    return spec is not None and spec.protocol == protocol
-
-
 def default_reasoning_effort(provider_id: str | None) -> str | None:
     """The effort level this provider is asked for when none is selected."""
     spec = _REASONING_SPECS.get(provider_id)
@@ -211,8 +205,35 @@ def reasoning_provider_id(provider_id, protocol, endpoint=None):
 
 
 def reasoning_provider_spec(provider_id, protocol, endpoint=None):
+    """The wire spec for a connection: its native vendor's override when
+    identity resolves, else the protocol's standard field spellings.
+
+    Standard protocol options are not restricted to the protocol's
+    original vendor: any compatible endpoint may advertise them in its
+    catalog entry, and the request syntax is the protocol's. A gateway
+    never inherits a vendor's native controls (modes, allowances,
+    preservation) -- those ride the identity, not the protocol.
+    """
     identity = reasoning_provider_id(provider_id, protocol, endpoint)
-    return _REASONING_SPECS.get(identity) if identity else None
+    if identity:
+        return _REASONING_SPECS[identity]
+    return _PROTOCOL_REASONING_SPECS.get(protocol)
+
+
+# Per-protocol standard spellings, used when no native identity resolves.
+_PROTOCOL_REASONING_SPECS = {
+    OPENAI_RESPONSES: ReasoningProviderSpec(
+        OPENAI_RESPONSES, wire_format="openai"),
+    ANTHROPIC_MESSAGES: ReasoningProviderSpec(
+        ANTHROPIC_MESSAGES, wire_format="anthropic"),
+    OPENAI_CHAT: ReasoningProviderSpec(
+        OPENAI_CHAT, wire_format="openai_chat"),
+}
+
+
+def reasoning_effort_supported(provider_id, protocol, endpoint=None) -> bool:
+    """Whether the connection's protocol has an effort request spelling."""
+    return reasoning_provider_spec(provider_id, protocol, endpoint) is not None
 
 
 # --- Native thinking controls ---------------------------------------------
@@ -448,6 +469,9 @@ class Provider:
             return _ANTHROPIC_THINKING_MODES.get(model, [])
         if identity in ["zai", "zhipuai"]:
             return _GLM_THINKING_MODES.get(model, [])
+        if identity == "sarvam":
+            # The documented off control; "on" has no verified spelling.
+            return ["off"]
         return []
 
     def thinking_default_mode(self, model):

@@ -665,7 +665,7 @@ class CatalogNormalizationTests(unittest.TestCase):
             provider["models"]["gpt-test"],
         )
 
-        self.assertEqual(profile.values, ("low", "high"))
+        self.assertEqual(profile.values, ["low", "high"])
         self.assertEqual(
             models.openai_request_profile(
                 provider, provider["models"]["gpt-test"])
@@ -695,7 +695,7 @@ class CatalogNormalizationTests(unittest.TestCase):
             provider,
             provider["models"]["gpt-test"],
         )
-        self.assertEqual(profile.values, ("max", "ultra"))
+        self.assertEqual(profile.values, ["max", "ultra"])
         self.assertEqual(
             models.openai_request_profile(
                 provider, provider["models"]["gpt-test"])
@@ -730,7 +730,7 @@ class CatalogNormalizationTests(unittest.TestCase):
             for item in diagnostics
         ))
 
-    def test_reasoning_effort_requires_registered_wire_surface(self):
+    def test_reasoning_effort_uses_the_protocol_spelling(self):
         model = {
             "reasoning_options": [
                 None,
@@ -758,34 +758,54 @@ class CatalogNormalizationTests(unittest.TestCase):
             "api": "https://open.bigmodel.cn/api/paas/v4",
         }
 
-        self.assertEqual(
-            models.reasoning_effort_profile(
-                "openrouter", openrouter, model).values,
-            ("low", "provider-deep"),
-        )
-        self.assertIsNone(models.reasoning_effort_profile(
-            "unknown", unknown, model))
-        self.assertEqual(
-            models.reasoning_effort_profile(
-                "zhipuai", zhipuai, model).values,
-            ("low", "provider-deep"),
-        )
+        # Any OpenAI-Chat-compatible endpoint speaks the protocol's
+        # standard effort parameter; the advertised choices are unchanged
+        # by which vendor (or none) serves them.
+        for provider_id, provider in [
+                ("openrouter", openrouter),
+                ("unknown", unknown),
+                ("zhipuai", zhipuai)]:
+            with self.subTest(provider_id=provider_id):
+                self.assertEqual(
+                    models.reasoning_effort_profile(
+                        provider_id, provider, model).values,
+                    ["low", "provider-deep"],
+                )
 
-    def test_malformed_optional_effort_does_not_drop_model(self):
+    def test_optional_effort_metadata_never_drops_the_model(self):
         provider = {
             "id": "openrouter",
             "npm": "@openrouter/ai-sdk-provider",
             "api": "https://openrouter.ai/api/v1",
         }
-        model = {
+        # A JSON-null entry is not an effort value; it is filtered, not
+        # fatal -- where a provider documents null as its off control,
+        # that control is the wire's mode axis, never a listed choice.
+        nullable = {
             "reasoning_options": [{
                 "type": "effort",
                 "values": ["high", None],
             }],
         }
-
+        self.assertEqual(models.reasoning_effort_profile(
+            "openrouter", provider, nullable).values, ["high"])
+        malformed = {
+            "reasoning_options": [{
+                "type": "effort",
+                "values": ["high", {"invalid": True}],
+            }],
+        }
         self.assertIsNone(models.reasoning_effort_profile(
-            "openrouter", provider, model))
+            "openrouter", provider, malformed))
+        non_reasoning = {
+            "reasoning": False,
+            "reasoning_options": [{
+                "type": "effort",
+                "values": ["high"],
+            }],
+        }
+        self.assertIsNone(models.reasoning_effort_profile(
+            "openrouter", provider, non_reasoning))
 
     def test_bad_request_fields_drop_only_the_affected_model(self):
         diagnostics = []
@@ -1426,6 +1446,72 @@ class ConfigOptionAvailabilityTests(unittest.TestCase):
             ["loki-explicit"],
         )
         self.assertIs(choices[0][1], explicit)
+
+
+class ReasoningCapabilitiesTests(unittest.TestCase):
+    def test_unknown_and_explicitly_empty_controls_differ(self):
+        self.assertIsNone(models.reasoning_capabilities({}))
+        affirmed = models.reasoning_capabilities({"reasoning": True})
+        self.assertIs(affirmed.reasoning, True)
+        self.assertIsNone(affirmed.controls)
+        fixed = models.reasoning_capabilities(
+            {"reasoning": True, "reasoning_options": []})
+        self.assertEqual(fixed.controls, [])
+        self.assertFalse(fixed.supports("toggle"))
+        self.assertTrue(models.reasoning_capabilities(
+            {"reasoning": True,
+             "reasoning_options": [{"type": "toggle"}]}).supports("toggle"))
+
+    def test_advertised_controls_bounds_and_field_are_imported(self):
+        record = models.reasoning_capabilities({
+            "reasoning": True,
+            "reasoning_options": [
+                {"type": "toggle"},
+                {"type": "effort", "values": ["low"]},
+                {"type": "budget_tokens", "min": 1024, "max": 81920}],
+            "interleaved": {"field": "reasoning_details"}})
+        self.assertEqual(
+            record.controls, ["toggle", "effort", "budget_tokens"])
+        self.assertEqual((record.budget_min, record.budget_max),
+                         (1024, 81920))
+        self.assertEqual(record.interleaved_field, "reasoning_details")
+        self.assertEqual(
+            models.ReasoningCapabilities.from_dict(record.to_dict()),
+            record)
+
+    def test_malformed_hints_never_become_authority(self):
+        for options in ("toggle", [{"type": "evil"}],
+                        [{"type": "toggle"}] * 2,
+                        [{"type": "budget_tokens", "min": True}],
+                        [{"type": "budget_tokens", "min": 4000, "max": 1000}]):
+            with self.subTest(options=options):
+                record = models.reasoning_capabilities(
+                    {"reasoning": False, "reasoning_options": options})
+                self.assertIs(record.reasoning, False)
+                self.assertIsNone(record.controls)
+                self.assertIsNone(record.budget_min)
+        unknown_field = models.reasoning_capabilities({
+            "reasoning": True, "interleaved": {"field": "signature"}})
+        self.assertIsNone(unknown_field.interleaved_field)
+
+
+class EffortProfileOwnershipTests(unittest.TestCase):
+    def test_collections_are_copies_at_every_boundary(self):
+        values = ["low", "provider-specific"]
+        profile = models.ReasoningEffortProfile(values)
+        values.append("invented")
+        published = profile.values
+        published.clear()
+        exported = profile.to_dict()
+        exported["options"].clear()
+        self.assertEqual(profile.values, ["low", "provider-specific"])
+        self.assertEqual(
+            models.ReasoningEffortProfile.from_dict(profile.to_dict()),
+            profile)
+        with self.assertRaises(Exception):
+            profile.default = "low"
+        with self.assertRaises(Exception):
+            profile.values = ["high"]
 
 
 if __name__ == "__main__":

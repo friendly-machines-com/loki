@@ -42,7 +42,9 @@ UNDISPLAYED_CONNECTION_FIELDS = {
     "openai_request_profile": (
         "subscription request shape, implied by the credential-scoped "
         "ChatGPT connection"),
-    "reasoning_effort_profile": "model capability metadata",
+    "reasoning_effort_profile": "model effort choices, not authorization facts",
+    "reasoning_capabilities": (
+        "advertised control hints, not authorization facts"),
     "context_capacity": "display-only model capacity metadata",
 }
 
@@ -124,6 +126,11 @@ class ConnectionDescriptor:
         openai_models.CodexModelRequestProfile | None) = None
     reasoning_effort_profile: (
         models.ReasoningEffortProfile | None) = None
+    # Connection-bound model facts: what the catalog advertised for this
+    # exact leaf. Metadata only -- it can never alter the endpoint,
+    # credential, or authorization of the connection it travels with.
+    reasoning_capabilities: (
+        models.ReasoningCapabilities | None) = None
 
     def __post_init__(self):
         if (self.context_capacity is not None
@@ -158,6 +165,12 @@ class ConnectionDescriptor:
             raise ConnectionDescriptorError(
                 "connection reasoning effort profile is not valid for this "
                 "provider protocol")
+        if (self.reasoning_capabilities is not None
+                and not isinstance(
+                    self.reasoning_capabilities,
+                    models.ReasoningCapabilities)):
+            raise ConnectionDescriptorError(
+                "connection reasoning capabilities have the wrong type")
 
     def to_dict(self) -> dict:
         return {
@@ -186,6 +199,9 @@ class ConnectionDescriptor:
             "reasoning_effort_profile": (
                 self.reasoning_effort_profile.to_dict()
                 if self.reasoning_effort_profile is not None else None),
+            "reasoning_capabilities": (
+                self.reasoning_capabilities.to_dict()
+                if self.reasoning_capabilities is not None else None),
         }
 
     @classmethod
@@ -257,6 +273,16 @@ class ConnectionDescriptor:
                         raw_reasoning_effort_profile))
             except ValueError as error:
                 raise ConnectionDescriptorError(str(error)) from error
+        raw_capabilities = value.get("reasoning_capabilities")
+        if raw_capabilities is None:
+            reasoning_capabilities = None
+        else:
+            try:
+                reasoning_capabilities = (
+                    models.ReasoningCapabilities.from_dict(
+                        raw_capabilities))
+            except ValueError as error:
+                raise ConnectionDescriptorError(str(error)) from error
         return cls(
             provider_id=_optional_string(value.get("provider_id"), "provider_id"),
             provider_name=_optional_string(value.get("provider_name"), "provider_name"),
@@ -279,4 +305,5 @@ class ConnectionDescriptor:
             prompt_cache=prompt_cache,
             openai_request_profile=openai_request_profile,
             reasoning_effort_profile=reasoning_effort_profile,
+            reasoning_capabilities=reasoning_capabilities,
         )

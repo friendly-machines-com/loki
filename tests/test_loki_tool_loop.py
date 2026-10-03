@@ -58,7 +58,7 @@ def _codex_model(slug="gpt-5-codex", **overrides):
 
 
 def _effort_profile(*values):
-    return modelsdev.ReasoningEffortProfile(tuple(values))
+    return modelsdev.ReasoningEffortProfile(list(values))
 
 
 def save_loki_state(names):
@@ -628,7 +628,7 @@ class RuntimeConfigTests(unittest.TestCase):
             "https://api.z.ai/api/paas/v4/chat/completions",
             protocols.OPENAI_CHAT, model="model", provider_id="zai",
             reasoning_effort_profile=modelsdev.ReasoningEffortProfile(
-                ("low", "medium", "high")),
+                ["low", "medium", "high"]),
         )
         session = loki.Session(runtime_config=config)
         with mock.patch.object(loki, "_DEFAULT_SESSION", session):
@@ -644,7 +644,7 @@ class RuntimeConfigTests(unittest.TestCase):
             self.assertIn("Model default (medium)", loki.reasoning_effort_default_text())
             session.reasoning_effort_preference = None
             config.reasoning_effort_profile = modelsdev.ReasoningEffortProfile(
-                ("low", "medium", "high"), default="low")
+                ["low", "medium", "high"], default="low")
             self.assertEqual(loki.reasoning_effort_status_text(), "low")
 
     def test_delegated_config_reconstructs_reasoning_profile(self):
@@ -2513,7 +2513,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(resumed.conversation_id, chat_id)
                     self.assertTrue(loki.current_config().chat_provider.responses_lite)
                     self.assertTrue(loki.current_config().chat_provider.openai_request_profile.supports_parallel_tool_calls)
-                    self.assertEqual(loki.current_config().reasoning_effort_profile.values, ("high",))
+                    self.assertEqual(loki.current_config().reasoning_effort_profile.values, ["high"])
                     loki.save_chat_log()
                     await resumed.job_manager.close_session_owned()
                 saved = json.loads(pathlib.Path(path).read_bytes())

@@ -441,7 +441,10 @@ else:
 class ConnectionDescriptorTests(unittest.TestCase):
     def test_round_trip_contains_names_but_no_values(self):
         effort_profile = models.ReasoningEffortProfile(
-            ("low", "high"))
+            ["low", "high"])
+        capabilities = models.ReasoningCapabilities(
+            True, ["toggle", "budget_tokens"],
+            budget_min=1024, interleaved_field="reasoning_content")
         descriptor = ConnectionDescriptor(
             provider_id="openrouter",
             provider_name="OpenRouter",
@@ -454,6 +457,7 @@ class ConnectionDescriptorTests(unittest.TestCase):
             model_status="deprecated",
             prompt_cache=True,
             reasoning_effort_profile=effort_profile,
+            reasoning_capabilities=capabilities,
         )
 
         encoded = descriptor.to_dict()
@@ -469,6 +473,10 @@ class ConnectionDescriptorTests(unittest.TestCase):
         self.assertEqual(
             restored.to_dict()["reasoning_effort_profile"],
             effort_profile.to_dict(),
+        )
+        self.assertEqual(
+            restored.to_dict()["reasoning_capabilities"],
+            capabilities.to_dict(),
         )
         self.assertNotIn("api_url", encoded)
         self.assertNotIn("secret", repr(encoded))
