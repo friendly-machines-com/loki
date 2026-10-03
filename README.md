@@ -115,11 +115,27 @@ appears in `/model` as `Explicit LOKI_* connection`, so it can be selected
 again after switching to a catalog provider or while models.dev is
 unavailable.
 
-Use `/effort` to select reasoning effort when the selected model supports it.
-The initial setting is `Model default`. Your preference is remembered across
-model changes: unsupported models use their default, and a later compatible
-model restores your preference. ACP clients also offer an effort selector;
-changes made during a response apply to the next turn.
+Use `/thinking` to see and change the current model's thinking settings:
+
+- `/thinking effort high` chooses an available effort level.
+- `/thinking mode off` turns thinking off when the model allows it.
+- `/thinking mode adaptive` lets a model that supports it manage its thinking.
+- `/thinking mode manual budget 2048` enables manual thinking with an explicit
+  token allowance. The output limit must be larger than the allowance.
+- `/thinking retention preserve` asks a supported provider to reuse earlier
+  thinking; this may increase input tokens and cost.
+
+Use `default` instead of a value to clear a setting. Preferences are remembered
+with the conversation. Settings that do not apply to a different model stay
+inactive, and switching back restores them. ACP clients offer the same settings;
+use the commands for numerical allowances or changes that need to happen together.
+Changes made during a response apply to the next turn.
+
+Use `/trace thinking on` to show thinking or summaries returned by the provider,
+and `/trace thinking off` to hide them. These commands do not turn thinking on
+or change its settings. Hidden thinking and continuation data remain in history.
+Some models do not return readable thinking; OpenAI returns summaries, not its
+complete internal reasoning.
 
 Set `LOKI_STREAM=1` to display assistant text as it arrives. Streaming is
 disabled by default. If the server rejects it, set `LOKI_STREAM=0`.

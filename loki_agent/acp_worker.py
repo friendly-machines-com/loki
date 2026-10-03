@@ -25,7 +25,6 @@ from .sessions import Session
 
 _DISCONNECTED = object()
 _UNCHANGED = object()
-_PROMPT_EFFORT_UNSET = object()
 _MODEL_DEFAULT_CONFIG_VALUE = "default"
 _EFFORT_CONFIG_VALUE_PREFIX = "effort:"
 
@@ -83,11 +82,18 @@ class Worker:
                 return
             # Snapshot before scheduling so a following configuration request
             # cannot race the logical turn's first provider request.
-            reasoning_effort = loki.effective_reasoning_effort()
+            try:
+                user_text = self._prompt_text(message.get("params") or {})
+            except acps.TransportError:
+                await self._answer(message)
+                return
+            command = acp_commands.parse(user_text)
+            thinking = (loki.capture_turn_settings()
+                        if command is None or command[0] == "!" else None)
             self._prompt_task = asyncio.create_task(
                 self._answer(
                     message,
-                    prompt_reasoning_effort=reasoning_effort,
+                    thinking=thinking,
                 ),
                 name=f"acp-worker-prompt-{request_id}",
             )
@@ -112,13 +118,13 @@ class Worker:
 
     async def _answer(
             self, message: dict,
-            prompt_reasoning_effort=_PROMPT_EFFORT_UNSET):
+            thinking: loki.TurnThinkingSettings | None = None):
         request_id = message.get("id")
         try:
             result = await self.dispatch(
                 message.get("method"),
                 message.get("params") or {},
-                prompt_reasoning_effort=prompt_reasoning_effort,
+                thinking=thinking,
             )
         except acps.TransportError as error:
             self.write(acps.response(
@@ -136,11 +142,11 @@ class Worker:
 
     async def dispatch(
             self, method: str, params: dict,
-            prompt_reasoning_effort=_PROMPT_EFFORT_UNSET):
+            thinking: loki.TurnThinkingSettings | None = None):
         if method == "session/prompt":
             return await self.prompt(
                 params,
-                reasoning_effort=prompt_reasoning_effort,
+                thinking=thinking,
             )
         if method == "session/cancel":
             self.cancel_event.set()
@@ -154,11 +160,12 @@ class Worker:
         # approval or persist a pin for a change we would subsequently refuse.
         # The worker remains the authority on its active prompt, including the
         # existing exception for next-turn reasoning-effort updates.
-        if (method in ("session/set_config_option",
-                       "session/describe_config_selection")
+        if (method in ["session/set_config_option",
+                       "session/describe_config_selection"]
                 and self._prompt_task is not None
                 and not self._prompt_task.done()
-                and params.get("configId") != "reasoning_effort"):
+                and params.get("configId") not in [
+                    "reasoning_effort", "thinking_mode", "thinking_budget", "reasoning_retention", "reasoning_traces"]):
             raise acps.TransportError(
                 "cannot change session configuration while a prompt is running",
                 code=acps.INVALID_PARAMS)
@@ -227,6 +234,34 @@ class Worker:
         reasoning_option = self._reasoning_config_option()
         if reasoning_option is not None:
             options.append(reasoning_option)
+        config = loki.current_config()
+        mode, budget, retention = loki.effective_thinking_settings()
+        if config is not None:
+            provider = config.chat_provider
+            modes = provider.thinking_modes(config.model)
+            if modes:
+                options.append({
+                    "id": "thinking_mode", "name": "Thinking mode", "category": "other", "type": "select",
+                    "currentValue": mode or "default",
+                    "options": [{"value": "default", "name": "Model default"}]
+                    + [{"value": value, "name": value} for value in modes]})
+            if "manual" in modes:
+                values = [{"value": "default", "name": "Not selected"}]
+                if budget is not None:
+                    values.append({"value": str(budget), "name": str(budget)})
+                options.append({
+                    "id": "thinking_budget", "name": "Thinking-token allowance", "category": "other", "type": "select",
+                    "currentValue": str(budget) if budget is not None else "default", "options": values,
+                    "description": "Set a number with /thinking budget N; enable manual thinking with /thinking mode manual budget N."})
+            if provider.reasoning_preservation(config.model) is not None:
+                options.append({
+                    "id": "reasoning_retention", "name": "Reuse earlier thinking", "category": "other", "type": "select",
+                    "currentValue": retention,
+                    "options": [{"value": "default", "name": "Default"}, {"value": "preserve", "name": "Preserve"}]})
+        options.append({
+            "id": "reasoning_traces", "name": "Thinking traces", "category": "other", "type": "select",
+            "currentValue": self.session.reasoning_traces,
+            "options": [{"value": "off", "name": "Hidden"}, {"value": "on", "name": "Show thinking"}]})
         return options
 
     def _reasoning_config_option(self):
@@ -251,7 +286,7 @@ class Worker:
         values.extend({
             "value": _EFFORT_CONFIG_VALUE_PREFIX + value,
             "name": value,
-        } for value in profile.values)
+        } for value in profile.values if isinstance(value, str))
         return {
             "id": "reasoning_effort",
             "name": "Reasoning effort",
@@ -559,6 +594,24 @@ class Worker:
 
     def set_config_option(self, params: dict) -> dict:
         config_id = params.get("configId")
+        if config_id in ["thinking_mode", "thinking_budget", "reasoning_retention", "reasoning_traces"]:
+            available = next((option for option in self.config_options() if option["id"] == config_id), None)
+            value = params.get("value")
+            if available is None or value not in [option["value"] for option in available["options"]]:
+                raise acps.TransportError("use /thinking for this update", code=acps.INVALID_PARAMS)
+            try:
+                if config_id == "reasoning_traces":
+                    loki.set_reasoning_traces(value)
+                else:
+                    name = {"thinking_mode": "mode", "thinking_budget": "budget", "reasoning_retention": "retention"}[config_id]
+                    if name != "retention" and value == "default":
+                        value = None
+                    elif name == "budget":
+                        value = int(value)
+                    loki.set_thinking_controls({name: value})
+            except (ValueError, OSError) as error:
+                raise acps.TransportError(str(error), code=acps.INVALID_PARAMS) from error
+            return {"configOptions": self.config_options()}
         if config_id == "reasoning_effort":
             value = params.get("value")
             if value == _MODEL_DEFAULT_CONFIG_VALUE:
@@ -617,9 +670,13 @@ class Worker:
 
     def _replay_transcript(self) -> None:
         blocks = replays.classify_transcript(
-            self.session.transcript_items)
+            self.session.transcript_items, show_reasoning=self.session.reasoning_traces == "on")
         replay_call = 0
+        previous_kind = None
         for kind, text, key in blocks:
+            if kind == "thought" and previous_kind == "thought":
+                text = "\n\n" + text
+            previous_kind = kind
             if kind == "user":
                 update = {
                     "sessionUpdate": "user_message_chunk",
@@ -638,7 +695,7 @@ class Worker:
                 }
             else:
                 update = {
-                    "sessionUpdate": "agent_message_chunk",
+                    "sessionUpdate": "agent_thought_chunk" if kind == "thought" else "agent_message_chunk",
                     "content": {"type": "text", "text": text},
                 }
             self.write(acps.notification("session/update", {
@@ -648,11 +705,8 @@ class Worker:
 
     # -- prompting --------------------------------------------------------
 
-    async def prompt(
-            self, params: dict,
-            reasoning_effort=_PROMPT_EFFORT_UNSET) -> dict:
-        if reasoning_effort is _PROMPT_EFFORT_UNSET:
-            reasoning_effort = loki.effective_reasoning_effort()
+    @staticmethod
+    def _prompt_text(params):
         blocks = params.get("prompt")
         if not isinstance(blocks, list):
             raise acps.TransportError(
@@ -691,9 +745,9 @@ class Worker:
                 )
             resource = {
                 key: block[key]
-                for key in (
+                for key in [
                     "name", "uri", "title", "description",
-                    "mimeType", "size")
+                    "mimeType", "size"]
                 if block.get(key) is not None
             }
             parts.append(
@@ -703,6 +757,13 @@ class Worker:
         if not user_text:
             raise acps.TransportError(
                 "prompt contains no text", code=acps.INVALID_PARAMS)
+
+        return user_text
+
+    async def prompt(
+            self, params: dict,
+            thinking: loki.TurnThinkingSettings | None = None) -> dict:
+        user_text = self._prompt_text(params)
 
         self.cancel_event.clear()
         self.session_id = params.get("sessionId") or self.session_id
@@ -719,6 +780,11 @@ class Worker:
                 outcome = acp_commands.Outcome(
                     text=f"Command failed: {error}")
         if outcome is not None:
+            command = acp_commands.parse(user_text)
+            if command is not None and command[0] in ["thinking", "trace"]:
+                self.write(acps.notification("session/update", {
+                    "sessionId": self.session_id,
+                    "update": {"sessionUpdate": "config_option_update", "configOptions": self.config_options()}}))
             if outcome.text:
                 self.write(acps.notification(
                     "session/update",
@@ -730,6 +796,8 @@ class Worker:
                 return {"stopReason": "end_turn"}
             user_text = outcome.model_text
 
+        if thinking is None:
+            thinking = loki.capture_turn_settings()
         user_content = []
         if user_text:
             user_content.append(formats.text_block(user_text))
@@ -752,7 +820,7 @@ class Worker:
         turn_failed = False
         try:
             try:
-                turn_text = await self._run_turn(on_event, reasoning_effort) or ""
+                turn_text = await self._run_turn(on_event, thinking) or ""
             except BaseException:
                 if not self.cancel_event.is_set():
                     turn_failed = True
@@ -780,7 +848,7 @@ class Worker:
         if update is not None:
             self.write(acps.notification("session/update", update))
 
-    async def _run_turn(self, on_event, reasoning_effort):
+    async def _run_turn(self, on_event, thinking):
         try:
             if not loki.current_model():
                 detail = self._configuration_error or (
@@ -793,13 +861,15 @@ class Worker:
             cancel_check = self.cancel_event.is_set
 
             async def chat_fn(
-                    items, on_text_delta, *, codex_turn_state):
+                    items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
                 kwargs = {
                     "on_text_delta": on_text_delta,
                     "cancel_check": cancel_check,
                     "codex_turn_state": codex_turn_state,
-                    "reasoning_effort": reasoning_effort,
+                    "thinking": thinking,
                 }
+                if on_reasoning_delta is not None:
+                    kwargs["on_reasoning_delta"] = on_reasoning_delta
                 return await loki.async_chat_completion(
                     items, loki.TOOLS, True, False, **kwargs)
 
@@ -815,7 +885,7 @@ class Worker:
                 cancel_event=self.cancel_event,
                 stream_chat=True,
                 on_response=on_response,
-                reasoning_effort=reasoning_effort,
+                thinking=thinking,
             )
         finally:
             loki.save_chat_log()

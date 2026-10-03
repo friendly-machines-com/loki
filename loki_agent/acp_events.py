@@ -95,6 +95,17 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
     attach updates to the wrong tool.
     """
     kind = event.get("type")
+    if kind == "reasoning_start":
+        if state.get("last_content_kind") == "thought":
+            return [{"sessionId": session_id, "update": {
+                "sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "\n\n"}}}]
+        return []
+    if kind == "reasoning_delta":
+        state["last_content_kind"] = "thought"
+        return [{"sessionId": session_id, "update": {
+            "sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": event.get("text", "")}}}]
+    if kind in ["assistant_start", "assistant_delta", "assistant_message", "tool_call", "tool_result", "tool_rejected"]:
+        state["last_content_kind"] = "other"
     if kind == "assistant_start":
         state["message_id"] = state.get("message_counter", 0) + 1
         state["message_counter"] = state["message_id"]

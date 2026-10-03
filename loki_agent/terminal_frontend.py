@@ -163,7 +163,7 @@ class _ResumeTranscriptPresenter:
 
     def __init__(self, assistant_label):
         self.renderer = savefiles.ResumeTranscriptRenderer(
-            assistant_label=assistant_label)
+            assistant_label=assistant_label, show_reasoning=current_session().reasoning_traces == "on")
 
     def write(self, events):
         blocks = self.renderer.presentation(events)
@@ -238,6 +238,22 @@ def _terminal_agent_event(event: dict):
         terminal.write_text(str(error), multiline=True)
         terminal.reset_colors_and_flags()
         print()
+        sys.stdout.flush()
+    elif kind == "reasoning_start":
+        print()
+        terminal.set_foreground_color(8)
+        print("Reasoning summary:" if event.get("kind") == "summary" else "Thinking:")
+        terminal.reset_colors_and_flags()
+        sys.stdout.flush()
+    elif kind == "reasoning_delta":
+        terminal.set_foreground_color(8)
+        terminal.write_text(event["text"], multiline=True)
+        terminal.reset_colors_and_flags()
+        sys.stdout.flush()
+    elif kind == "reasoning_end":
+        print()
+        if not event.get("complete", True):
+            print("[thinking output incomplete; partial transport output not saved]")
         sys.stdout.flush()
     elif kind == "assistant_message":
         print()
@@ -360,7 +376,8 @@ def _terminal_agent_event(event: dict):
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None,
                                   turn_events=None) -> str:
-    reasoning_effort = _core.effective_reasoning_effort()
+    thinking = _core.capture_turn_settings()
+    reasoning_effort = thinking.effort
     read_only = current_agent_mode() in ("explore", "plan")
     mode_tools = (
         PLAN_TOOLS if current_agent_mode() == "plan" else EXPLORE_TOOLS)
@@ -373,13 +390,16 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     )
 
     async def chat_fn(
-            items, on_text_delta, *, codex_turn_state):
+            items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
         kwargs = {
             "on_text_delta": on_text_delta,
             "cancel_check": cancel_check,
             "codex_turn_state": codex_turn_state,
             "reasoning_effort": reasoning_effort,
+            "thinking": thinking,
         }
+        if on_reasoning_delta is not None:
+            kwargs["on_reasoning_delta"] = on_reasoning_delta
         return await async_chat_completion(
             items, active_tools, True, False, **kwargs)
 
@@ -415,6 +435,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         report_timing=True,
         cancel_event=cancel_event,
         reasoning_effort=reasoning_effort,
+        thinking=thinking,
         on_response=on_response,
     )
 
@@ -447,9 +468,7 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
     if fields["effort"] is not None:
         remote += ', Effort: {}'.format(fields["effort"])
     remote += ', Context: {}; /model'.format(fields["context"])
-    if fields["effort"] is not None:
-        remote += ', /effort'
-    remote += ', /status, /account'
+    remote += ', /thinking, /trace thinking, /status, /account'
     return (
         remote + '\n'
         'Local: CWD: {}, turn: {}, queued messages: {}, queued images: {}, '
@@ -475,9 +494,7 @@ def _write_status_text():
     print(", Context: ", end="")
     terminal.write_text(fields["context"])
     print("; /model", end="")
-    if fields["effort"] is not None:
-        print(", /effort", end="")
-    print(", /status, /account\nLocal: CWD: ", end="")
+    print(", /thinking, /trace thinking, /status, /account\nLocal: CWD: ", end="")
     terminal.write_text(fields["cwd"])
     print(", turn: ", end="")
     for label, value, active in (
@@ -498,45 +515,81 @@ def _write_status_text():
 
 terminals.set_status_text_provider(_write_status_text)
 
-_REASONING_EFFORT_PICKER_CANCELLED = object()
-
 
 def _reasoning_effort_rows():
     profile = _core.current_reasoning_effort_profile()
     if profile is None:
         return []
-    rows = [(
-        None,
-        _core.reasoning_effort_default_text() or "Model default",
-    )]
-    rows.extend(
-        (value, value)
-        for value in profile.values
-    )
-    return rows
+    return [(None, _core.reasoning_effort_default_text() or "Model default")] + [
+        (value, value) for value in profile.values if isinstance(value, str)]
 
 
-async def run_reasoning_effort_picker_async(session):
-    rows = _reasoning_effort_rows()
-    if not rows:
-        return None
+async def run_thinking_picker_async(session):
+    config = current_config()
+    if config is None or not config.model:
+        return _core.thinking_status_text()
+    provider = config.chat_provider
+    fields = []
+    effort = _reasoning_effort_rows()
+    if effort:
+        fields.append(("effort", "Effort", effort))
+    modes = provider.thinking_modes(config.model)
+    if modes:
+        fields.append(("mode", "Thinking mode", [(None, "Model default")] + [(mode, mode) for mode in modes]))
+    if "manual" in modes:
+        fields.append(("budget", "Thinking-token allowance", None))
+    if provider.reasoning_preservation(config.model) is not None:
+        fields.append(("retention", "Reuse earlier thinking", [("default", "Default"), ("preserve", "Preserve")]))
+    if not fields:
+        return _core.thinking_status_text()
     async with session.modal() as modal:
+        terminal.write_text(_core.thinking_status_text(), multiline=True)
         print()
-        print("Reasoning effort:")
-        for index, (_value, label) in enumerate(rows, start=1):
-            terminal.write_text(f"{index}. {label}", multiline=True)
-            print()
-        while True:
-            choice = await modal.prompt(
-                "Effort choice (number selects, empty cancels): ")
+        for index, (_name, label, _rows) in enumerate(fields, 1):
+            print(f"{index}. {label}")
+        choice = await modal.prompt("Control (number selects, empty cancels): ")
+        if not choice:
+            return "Thinking selection cancelled."
+        try:
+            index = int(choice)
+            if not 1 <= index <= len(fields):
+                raise ValueError()
+            name, label, rows = fields[index - 1]
+        except ValueError:
+            return "Invalid thinking control."
+        if rows is None:
+            choice = await modal.prompt("Thinking tokens (integer or default, empty cancels): ")
             if not choice:
-                return _REASONING_EFFORT_PICKER_CANCELLED
+                return "Thinking selection cancelled."
+            try:
+                value = None if choice == "default" else int(choice)
+            except ValueError:
+                return "Thinking tokens must be an integer."
+        else:
+            for index, (_value, text) in enumerate(rows, 1):
+                terminal.write_text(f"{index}. {text}", multiline=True)
+                print()
+            choice = await modal.prompt("Choice (number selects, empty cancels): ")
+            if not choice:
+                return "Thinking selection cancelled."
             try:
                 index = int(choice)
+                if not 1 <= index <= len(rows):
+                    raise ValueError()
+                value = rows[index - 1][0]
             except ValueError:
-                continue
-            if 1 <= index <= len(rows):
-                return rows[index - 1][0]
+                return "Invalid thinking choice."
+        changes = {name: value}
+        if name == "mode" and value == "manual" and current_session().thinking_budget is None:
+            choice = await modal.prompt("Manual thinking tokens (empty cancels): ")
+            if not choice:
+                return "Thinking selection cancelled."
+            try:
+                changes["budget"] = int(choice)
+            except ValueError:
+                return "Thinking tokens must be an integer."
+        _core.set_thinking_controls(changes)
+        return _core.thinking_status_text()
 
 
 def _report_unavailable_reasoning_preference():
@@ -1117,43 +1170,26 @@ async def async_main(args) -> int:
                     _report_unavailable_reasoning_preference()
                     sys.stderr.flush()
                     continue
-                case '/effort':
-                    if _core.current_reasoning_effort_profile() is None:
-                        print(
-                            "The selected model does not advertise reasoning "
-                            "effort choices.",
-                            file=sys.stderr,
-                        )
-                        sys.stderr.flush()
-                        continue
-                    picked = await run_reasoning_effort_picker_async(session)
-                    if picked is _REASONING_EFFORT_PICKER_CANCELLED:
-                        print(
-                            "Reasoning effort selection cancelled.",
-                            file=sys.stderr,
-                        )
-                        sys.stderr.flush()
-                        continue
+                case _ if command_text == '/thinking' or command_text.startswith('/thinking '):
                     try:
-                        _core.set_reasoning_effort(picked)
-                    except (OSError, ValueError) as error:
-                        _print_text_line(
-                            "Could not change reasoning effort: ",
-                            error,
-                            file=sys.stderr,
-                            multiline=True,
-                        )
-                        sys.stderr.flush()
-                        continue
-                    print("Selected reasoning effort: ", end="",
-                          file=sys.stderr)
-                    terminal.write_text(
-                        _core.reasoning_effort_status_text() or
-                        "Model default",
-                        file=sys.stderr,
-                    )
+                        argument = command_text[9:].strip()
+                        text = (_core.thinking_command(argument) if argument
+                                else await run_thinking_picker_async(session))
+                    except (ValueError, OSError) as error:
+                        text = str(error)
+                    terminal.write_text(text, multiline=True, file=sys.stderr)
                     print(file=sys.stderr)
-                    sys.stderr.flush()
+                    continue
+                case _ if command_text == '/trace' or command_text.startswith('/trace '):
+                    try:
+                        text = _core.trace_command(command_text[6:].strip())
+                    except (ValueError, OSError) as error:
+                        text = str(error)
+                    terminal.write_text(text, multiline=True, file=sys.stderr)
+                    print(file=sys.stderr)
+                    continue
+                case _ if command_text == '/effort' or command_text.startswith('/effort '):
+                    print("Use /thinking effort VALUE.", file=sys.stderr)
                     continue
                 case '/pwd':
                     print_shell_cwd(

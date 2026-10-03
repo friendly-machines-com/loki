@@ -1706,8 +1706,8 @@ async def _command_status(environment):
 class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     def _advertisement(self, commands):
         names = [command["name"] for command in commands]
-        self.assertEqual(set(names), {"status", "account", "pwd", "cd", "ps", "image"})
-        self.assertEqual(len(names), 6)
+        self.assertEqual(set(names), {"status", "account", "pwd", "cd", "ps", "image", "thinking", "trace"})
+        self.assertEqual(len(names), 8)
         self.assertTrue(all(command["description"] for command in commands))
         self.assertNotIn("model", names)
         self.assertNotIn("effort", names)
@@ -2255,7 +2255,7 @@ class ConfigOptionTests(unittest.TestCase):
                         break
                 session_id = m["result"]["sessionId"]
                 options = m["result"]["configOptions"]
-                self.assertEqual(len(options), 1)
+                self.assertEqual([option["id"] for option in options], ["model", "reasoning_traces"])
                 model_option = options[0]
                 self.assertEqual(model_option["id"], "model")
                 self.assertEqual(model_option["category"], "model")
@@ -2366,7 +2366,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                 thought = initial[1]
                 self.assertEqual(
                     [option["category"] for option in initial],
-                    ["model", "thought_level"],
+                    ["model", "thought_level", "other"],
                 )
                 self.assertEqual(thought["id"], "reasoning_effort")
                 self.assertEqual(thought["currentValue"], "default")
@@ -2387,7 +2387,8 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                     "configId": "model",
                     "value": "openrouter/plain-model",
                 })
-                self.assertEqual(len(plain["configOptions"]), 1)
+                self.assertEqual([option["id"] for option in plain["configOptions"]],
+                                 ["model", "reasoning_traces"])
                 self.assertEqual(
                     loki.current_reasoning_effort_preference(), "high")
                 restored = worker.set_config_option({
@@ -2463,8 +2464,8 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                 ({'value': 'model', 'name': 'Model'}, object())], 'model')
             started, release = asyncio.Event(), asyncio.Event()
 
-            async def completion(items, tools, *args, reasoning_effort, **kwargs):
-                snapshots.append(reasoning_effort)
+            async def completion(items, tools, *args, thinking, **kwargs):
+                snapshots.append(thinking.effort)
                 if len(snapshots) == 1:
                     started.set()
                     await release.wait()

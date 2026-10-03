@@ -1742,7 +1742,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
             }],
         }
         session = ScriptedInputSession(
-            ["/model", "/effort", "/quit"])
+            ["/model", "/thinking effort high", "/quit"])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
@@ -1761,10 +1761,6 @@ class TerminalReasoningEffortTests(unittest.TestCase):
                         "run_model_picker_async",
                         new=mock.AsyncMock(return_value=(
                             "openrouter", provider, model))),
-                    mock.patch(
-                        "loki_agent.terminal_frontend."
-                        "run_reasoning_effort_picker_async",
-                        new=mock.AsyncMock(return_value="high")),
                     contextlib.redirect_stdout(io.StringIO()),
                     contextlib.redirect_stderr(io.StringIO())):
                 status = asyncio.run(terminal_frontend.async_main([]))
@@ -1777,7 +1773,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         self.assertEqual(
             saved["session_state"]["reasoning_effort"], "high")
         self.assertIn(
-            "Effort: high, Context: unknown; /model, /effort",
+            "Effort: high, Context: unknown; /model, /thinking",
             terminal_frontend.status_text(),
         )
 
@@ -2652,7 +2648,9 @@ class StatusTextTests(unittest.TestCase):
                 self.assertNotIn("/status", local)
                 self.assertIn("/account", remote)
                 self.assertNotIn("/account", local)
-                self.assertEqual("/effort" in remote, effort is not None)
+                self.assertNotIn("/effort", remote)
+                self.assertIn("/thinking", remote)
+                self.assertIn("/trace thinking", remote)
 
     def test_status_text_shows_none_when_no_model_is_selected(self):
         names = ["runtime_config"]
@@ -2720,7 +2718,7 @@ class StatusTextTests(unittest.TestCase):
             text,
             "Remote: API: example.test:8443/base/path, Model: model-x, "
             "Context: unknown; "
-            "/model, /status, /account\n"
+            "/model, /thinking, /trace thinking, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
             "queued messages: 2, queued images: 1, "
             f"mode: {loki.current_agent_mode()}; "

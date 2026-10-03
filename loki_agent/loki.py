@@ -399,7 +399,7 @@ def thinking_command(argument):
                 or name in changes):
             raise ValueError("expected distinct thinking field/value pairs")
         if value == "default":
-            value = None
+            value = "default" if name == "retention" else None
         elif name == "effort":
             value = modelsdev.validate_reasoning_effort(value)
         elif name == "budget":
@@ -450,7 +450,7 @@ def thinking_status_text():
     if profile is not None:
         lines.append(
             "Effort: " + (reasoning_effort_status_text() or "unknown"))
-        lines.append("Effort choices: default, " + ", ".join(profile.values))
+        lines.append("Effort choices: default, " + ", ".join(value for value in profile.values if isinstance(value, str)))
     if modes:
         lines.append(
             "Mode: " + (mode or provider.thinking_default_mode(model)

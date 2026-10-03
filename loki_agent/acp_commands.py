@@ -34,16 +34,18 @@ class Outcome:
         self.image = image
 
 
-# Advertised local commands.  /model and /effort are deliberately absent:
-# ACP carries them as native session configuration options.
-LOCAL_COMMANDS = (
+# Model selection is native ACP configuration; commands also express atomic
+# thinking updates and numerical allowances that select widgets cannot.
+LOCAL_COMMANDS = [
     ("status", "Show provider response status (--json, all, save)"),
     ("account", "Live account data: usage and reset cards"),
     ("pwd", "Show the shell working directory"),
     ("cd", "Change the shell working directory"),
     ("ps", "List background jobs"),
     ("image", "Stage a local image for the next prompt"),
-)
+    ("thinking", "Choose effort, thinking mode, token allowance, or retention"),
+    ("trace", "Show or hide thinking: /trace thinking on|off"),
+]
 
 _SKILL_MARKER = "SKILL.md"
 _SKILL_READ_BYTES = 32 * 1024
@@ -236,6 +238,20 @@ async def _account(argument: str, session) -> Outcome:
     return Outcome(text="\n".join(lines))
 
 
+async def _thinking(argument: str, session) -> Outcome:
+    try:
+        return Outcome(text=loki.thinking_command(argument))
+    except (ValueError, OSError) as error:
+        return Outcome(text=str(error))
+
+
+async def _trace(argument: str, session) -> Outcome:
+    try:
+        return Outcome(text=loki.trace_command(argument))
+    except (ValueError, OSError) as error:
+        return Outcome(text=str(error))
+
+
 async def _pwd(argument: str, session) -> Outcome:
     return Outcome(text=f"cwd: {loki.current_cwd()}")
 
@@ -280,6 +296,8 @@ async def _bang(command: str) -> Outcome:
 
 
 _HANDLERS = {
+    "thinking": _thinking,
+    "trace": _trace,
     "status": _status,
     "account": _account,
     "pwd": _pwd,
