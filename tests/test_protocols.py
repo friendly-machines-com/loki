@@ -466,7 +466,7 @@ class OpenAIChatReasoningTests(unittest.TestCase):
             explicit_payload["reasoning"], {"effort": "max"})
         self.assertTrue(explicit_payload["stream"])
 
-    def test_zai_effort_explicitly_enables_thinking(self):
+    def test_zai_effort_is_guidance_and_never_enables_thinking(self):
         for provider_id, url in [
                 ("zai", "https://api.z.ai/api/paas/v4/chat/completions"),
                 (
@@ -506,10 +506,10 @@ class OpenAIChatReasoningTests(unittest.TestCase):
                 self.assertNotIn("thinking", default_payload)
                 self.assertEqual(
                     explicit_payload["reasoning_effort"], "max")
-                self.assertEqual(
-                    explicit_payload["thinking"], {"type": "enabled"})
+                # Enablement is the mode control's job, not effort's.
+                self.assertNotIn("thinking", explicit_payload)
 
-    def test_zai_none_disables_thinking_and_omits_effort(self):
+    def test_zai_disablement_is_the_mode_control(self):
         provider = protocols.make_provider(
             "https://api.z.ai/api/paas/v4/chat/completions",
             provider=protocols.OPENAI_CHAT,
@@ -519,13 +519,295 @@ class OpenAIChatReasoningTests(unittest.TestCase):
         payload = provider.chat_payload(
             [formats.message_item("user", "hello")],
             [],
-            "glm",
-            reasoning_effort="none",
+            "glm-5.2",
+            thinking_mode="off",
         )
 
         self.assertEqual(
             payload["thinking"], {"type": "disabled"})
         self.assertNotIn("reasoning_effort", payload)
+        with self.assertRaises(protocols.ProtocolError):
+            provider.chat_payload(
+                [formats.message_item("user", "hello")],
+                [],
+                "glm-5.2",
+                reasoning_effort="none",
+                thinking_mode="off",
+            )
+
+
+class NativeIdentityTests(unittest.TestCase):
+    def test_native_hosts_establish_identity(self):
+        for url, expected in [
+                ("https://api.anthropic.com/v1/messages", "anthropic"),
+                ("https://api.z.ai/api/paas/v4/chat/completions", "zai"),
+                ("https://api.z.ai/api/coding/paas/v4/chat/completions",
+                 "zai"),
+                ("https://api.sarvam.ai/v1/chat/completions", "sarvam"),
+        ]:
+            with self.subTest(url=url):
+                provider = protocols.make_provider(url)
+                self.assertEqual(provider.reasoning_provider_id, expected)
+
+    def test_labels_and_plain_http_never_establish_identity(self):
+        for url, provider_id in [
+                ("https://relay.example/v1/chat/completions", "zai"),
+                ("https://api.anthropic.com.example/v1/messages",
+                 "anthropic"),
+                ("http://api.anthropic.com/v1/messages", "anthropic"),
+        ]:
+            with self.subTest(url=url):
+                provider = protocols.make_provider(url, provider_id=provider_id)
+                self.assertIsNone(provider.reasoning_provider_id)
+                self.assertEqual(provider.thinking_modes("claude-opus-4-6"), [])
+                self.assertIsNone(provider.thinking_default_mode("glm-5.2"))
+
+
+class ClaudeThinkingContractTests(unittest.TestCase):
+    def provider(self, **kwargs):
+        return protocols.make_provider(
+            "https://api.anthropic.com/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES, **kwargs)
+
+    def test_supported_modes_follow_the_documented_table(self):
+        provider = self.provider()
+        cases = [
+            ("claude-opus-4-5", ["manual", "off"], "off"),
+            ("claude-sonnet-4-6", ["adaptive", "manual", "off"], "off"),
+            ("claude-opus-4-7", ["adaptive", "off"], "off"),
+            ("claude-opus-5", ["adaptive", "off"], "adaptive"),
+            ("claude-opus-5-5", ["adaptive"], "adaptive"),
+            ("claude-sonnet-5-5", ["adaptive", "between-tools"], "adaptive"),
+            ("claude-mythos-preview", ["adaptive", "manual"], "adaptive"),
+        ]
+        for model, modes, default in cases:
+            with self.subTest(model=model):
+                self.assertEqual(provider.thinking_modes(model), modes)
+                self.assertEqual(
+                    provider.thinking_default_mode(model), default)
+                for mode in modes:
+                    self.assertEqual(
+                        provider.thinking_control_status(
+                            model, "mode", mode),
+                        "supported")
+
+    def test_documented_rejections_raise(self):
+        provider = self.provider()
+        for model, mode in [
+                ("claude-opus-4-5", "adaptive"),
+                ("claude-opus-4-7", "manual"),
+                ("claude-opus-5-5", "off"),
+                ("claude-sonnet-5-5", "off"),
+                ("claude-fable-5", "manual"),
+        ]:
+            with self.subTest(model=model, mode=mode):
+                with self.assertRaises(protocols.ProtocolError):
+                    provider.thinking_control_status(
+                        model, "mode", mode)
+
+    def test_unlisted_models_are_trials_not_rejections(self):
+        provider = self.provider()
+        self.assertEqual(
+            provider.thinking_control_status(
+                "claude-future", "mode", "adaptive"),
+            "trial")
+        self.assertEqual(
+            provider.thinking_control_status(
+                "claude-future", "budget", 2048),
+            "trial")
+
+    def test_manual_allowance_is_required_and_bounded(self):
+        provider = self.provider(max_tokens=4096)
+        for budget in [None, 1023, 4096]:
+            with self.subTest(budget=budget):
+                with self.assertRaises(protocols.ProtocolError):
+                    provider.chat_payload(
+                        [], None, "claude-opus-4-5",
+                        thinking_mode="manual", thinking_budget=budget)
+        payload = provider.chat_payload(
+            [], None, "claude-opus-4-5",
+            thinking_mode="manual", thinking_budget=2048)
+        self.assertEqual(
+            payload["thinking"],
+            {"type": "enabled", "budget_tokens": 2048})
+        with self.assertRaises(protocols.ProtocolError):
+            provider.chat_payload(
+                [], None, "claude-opus-4-5", thinking_budget=2048)
+        with self.assertRaises(protocols.ProtocolError):
+            provider.chat_payload(
+                [], None, "claude-opus-4-7",
+                thinking_mode="manual", thinking_budget=2048)
+
+    def test_low_thinking_modes_cap_effort(self):
+        provider = self.provider()
+        for model, mode in [
+                ("claude-opus-5", "off"),
+                ("claude-sonnet-5-5", "between-tools"),
+        ]:
+            with self.subTest(model=model):
+                with self.assertRaises(protocols.ProtocolError):
+                    provider.chat_payload(
+                        [], None, model, reasoning_effort="xhigh",
+                        thinking_mode=mode)
+                payload = provider.chat_payload(
+                    [], None, model, reasoning_effort="high",
+                    thinking_mode=mode)
+                self.assertEqual(
+                    payload["thinking"]["type"],
+                    "disabled" if mode == "off" else "between_tools")
+                # Anthropic effort guides non-thinking output too.
+                self.assertEqual(
+                    payload["output_config"], {"effort": "high"})
+
+
+class SarvamOffControlTests(unittest.TestCase):
+    def provider(self, url="https://api.sarvam.ai/v1/chat/completions"):
+        return protocols.make_provider(
+            url, provider=protocols.OPENAI_CHAT, provider_id="sarvam")
+
+    def test_off_is_the_documented_json_null(self):
+        provider = self.provider()
+        self.assertEqual(
+            provider.thinking_control_status(
+                "sarvam-105b", "mode", "off"),
+            "supported")
+        payload = provider.chat_payload(
+            [], None, "sarvam-105b", thinking_mode="off")
+        self.assertIn("reasoning_effort", payload)
+        self.assertIsNone(payload["reasoning_effort"])
+        self.assertNotIn("thinking", payload)
+
+    def test_no_selection_omits_the_field_entirely(self):
+        provider = self.provider()
+        payload = provider.chat_payload([], None, "sarvam-105b")
+        self.assertNotIn("reasoning_effort", payload)
+
+    def test_a_gateway_labelled_sarvam_has_no_off_spelling(self):
+        provider = self.provider("https://relay.example/v1/chat/completions")
+        with self.assertRaises(protocols.ProtocolError):
+            provider.chat_payload(
+                [], None, "sarvam-105b", thinking_mode="off")
+
+    def test_effort_levels_are_plain_strings(self):
+        provider = self.provider()
+        payload = provider.chat_payload(
+            [], None, "sarvam-105b", reasoning_effort="low")
+        self.assertEqual(payload["reasoning_effort"], "low")
+
+
+class GlmThinkingContractTests(unittest.TestCase):
+    def test_glm_52_toggle_and_default(self):
+        provider = protocols.make_provider(
+            "https://api.z.ai/api/paas/v4/chat/completions",
+            provider=protocols.OPENAI_CHAT, provider_id="zai")
+        self.assertEqual(provider.thinking_modes("glm-5.2"), ["on", "off"])
+        self.assertEqual(provider.thinking_default_mode("glm-5.2"), "on")
+        self.assertEqual(
+            provider.chat_payload(
+                [], None, "glm-5.2", thinking_mode="off")["thinking"],
+            {"type": "disabled"})
+
+    def test_glm_53_cannot_disable(self):
+        provider = protocols.make_provider(
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            provider=protocols.OPENAI_CHAT, provider_id="zhipuai")
+        self.assertEqual(provider.thinking_modes("glm-5.3"), [])
+        with self.assertRaises(protocols.ProtocolError):
+            provider.chat_payload(
+                [], None, "glm-5.3", thinking_mode="off")
+        self.assertEqual(
+            provider.thinking_control_status("glm-5.3", "mode", "on"),
+            "trial")
+
+
+class TraceOutputFieldTests(unittest.TestCase):
+    def test_anthropic_display_follows_an_established_mode_only(self):
+        provider = protocols.make_provider(
+            "https://api.anthropic.com/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES)
+        computation = provider.chat_payload(
+            [], None, "claude-opus-4-5",
+            thinking_mode="manual", thinking_budget=2048)
+        visible = provider.chat_payload(
+            [], None, "claude-opus-4-5",
+            thinking_mode="manual", thinking_budget=2048,
+            reasoning_traces="on")
+        self.assertEqual(
+            visible["thinking"]["display"], "summarized")
+        visible["thinking"].pop("display")
+        self.assertEqual(visible, computation)
+        # Opt-in models stay off; traces never enable them.
+        self.assertNotIn("thinking", provider.chat_payload(
+            [], None, "claude-sonnet-4-6", reasoning_traces="on"))
+        # between_tools accepts no display field.
+        self.assertNotIn("display", provider.chat_payload(
+            [], None, "claude-sonnet-5-5",
+            thinking_mode="between-tools", reasoning_traces="on")["thinking"])
+
+    def test_anthropic_restates_only_documented_on_defaults(self):
+        provider = protocols.make_provider(
+            "https://api.anthropic.com/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES)
+        self.assertEqual(
+            provider.chat_payload(
+                [], None, "claude-opus-5-5", reasoning_traces="on")[
+                "thinking"],
+            {"type": "adaptive", "display": "summarized"})
+
+    def test_public_openai_summary_is_display_only(self):
+        provider = protocols.make_provider(
+            "https://api.openai.com/v1", provider=protocols.OPENAI_RESPONSES)
+        computation = provider.chat_payload(
+            [], None, "gpt-6.1-sol", reasoning_effort="high")
+        visible = provider.chat_payload(
+            [], None, "gpt-6.1-sol", reasoning_effort="high",
+            reasoning_traces="on")
+        self.assertEqual(visible["reasoning"]["summary"], "auto")
+        visible["reasoning"].pop("summary")
+        self.assertEqual(visible, computation)
+
+    def test_no_fabricated_fields_for_gateways(self):
+        provider = protocols.make_provider(
+            "https://relay.example/v1/chat/completions",
+            provider=protocols.OPENAI_CHAT, provider_id="relay")
+        payload = provider.chat_payload(
+            [], None, "model", reasoning_traces="on")
+        self.assertNotIn("reasoning", payload)
+        self.assertNotIn("thinking", payload)
+
+
+class PreservationControlTests(unittest.TestCase):
+    def test_glm_clear_thinking_is_preservation_only(self):
+        provider = protocols.make_provider(
+            "https://api.z.ai/api/paas/v4/chat/completions",
+            provider=protocols.OPENAI_CHAT, provider_id="zai")
+        payload = provider.chat_payload(
+            [], None, "glm-5.2", reasoning_retention="preserve")
+        self.assertEqual(payload["thinking"], {"clear_thinking": False})
+        self.assertEqual(
+            provider.chat_payload(
+                [], None, "glm-5.2", thinking_mode="off",
+                reasoning_retention="preserve")["thinking"],
+            {"type": "disabled", "clear_thinking": False})
+
+    def test_public_responses_all_turns_family(self):
+        provider = protocols.make_provider(
+            "https://api.openai.com/v1", provider=protocols.OPENAI_RESPONSES)
+        payload = provider.chat_payload(
+            [], None, "gpt-5.6-terra", reasoning_retention="preserve")
+        self.assertEqual(payload["reasoning"], {"context": "all_turns"})
+        self.assertNotIn("include", payload)
+        with self.assertRaises(protocols.ProtocolError):
+            provider.chat_payload(
+                [], None, "gpt-5.5", reasoning_retention="preserve")
+
+    def test_unverified_preservation_is_rejected(self):
+        provider = protocols.make_provider(
+            "https://api.anthropic.com/v1/messages",
+            provider=protocols.ANTHROPIC_MESSAGES)
+        with self.assertRaises(protocols.ProtocolError):
+            provider.chat_payload(
+                [], None, "claude-opus-5-5", reasoning_retention="preserve")
 
 
 class AnthropicMessagesProviderTests(unittest.TestCase):

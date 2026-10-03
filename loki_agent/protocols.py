@@ -2,7 +2,7 @@ import copy
 import json
 import re
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import formats
 from . import openai_models
@@ -17,29 +17,48 @@ AUTO = "auto"
 
 @dataclass(frozen=True)
 class ReasoningProviderSpec:
-    """One provider's reasoning contract: which protocol carries it, how the
-    request spells it, and the effort level to use when none is asked for."""
+    """One provider's reasoning contract: which protocol carries it and how
+    the request spells it.
+
+    ``hosts`` names the native service endpoints that own this contract.
+    A provider label alone never establishes native identity: a gateway
+    speaking the same protocol is not the vendor, and model facts
+    documented for the native service do not transfer to it. Coding-plan
+    endpoints share their vendor's host, so they resolve to the vendor
+    identity and share its documented controls.
+    """
 
     protocol: str
     default_effort: str | None = None
-    # "openai", "openrouter", "thinking_toggle", "anthropic",
+    # "openai", "openai_chat", "openrouter", "thinking_toggle", "anthropic",
     # "openai_subscription"
     wire_format: str = "openai"
+    _hosts: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        object.__setattr__(self, "_hosts", self._hosts.copy())
+
+    @property
+    def hosts(self):
+        return self._hosts.copy()
 
 
 _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
     "anthropic": ReasoningProviderSpec(
         protocol=ANTHROPIC_MESSAGES,
         wire_format="anthropic",
+        _hosts=["api.anthropic.com"],
     ),
     "deepseek": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         default_effort="high",
         wire_format="thinking_toggle",
+        _hosts=["api.deepseek.com"],
     ),
     "openai": ReasoningProviderSpec(
         protocol=OPENAI_RESPONSES,
         wire_format="openai",
+        _hosts=["api.openai.com"],
     ),
     "openai-subscription": ReasoningProviderSpec(
         protocol=OPENAI_RESPONSES,
@@ -48,11 +67,18 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
     "openrouter": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="openrouter",
+        _hosts=["openrouter.ai"],
+    ),
+    "sarvam": ReasoningProviderSpec(
+        protocol=OPENAI_CHAT,
+        wire_format="openai_chat",
+        _hosts=["api.sarvam.ai"],
     ),
     "zai": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         default_effort="medium",
         wire_format="thinking_toggle",
+        _hosts=["api.z.ai"],
     ),
     "zai-coding-plan": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
@@ -63,6 +89,7 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
         protocol=OPENAI_CHAT,
         default_effort="medium",
         wire_format="thinking_toggle",
+        _hosts=["open.bigmodel.cn"],
     ),
     "zhipuai-coding-plan": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
@@ -160,6 +187,119 @@ def default_reasoning_effort(provider_id: str | None) -> str | None:
     """The effort level this provider is asked for when none is selected."""
     spec = _REASONING_SPECS.get(provider_id)
     return spec.default_effort if spec else None
+
+
+def reasoning_provider_id(provider_id, protocol, endpoint=None):
+    """Resolve the native provider identity that owns a wire contract.
+
+    With an endpoint, only its native host establishes identity; a provider
+    label on a foreign host means nothing. Without one (identity asked for
+    a catalog entry that carries the vendor's own API URL), the label may
+    match its spec. Never returns an identity for a plain http endpoint.
+    """
+    if endpoint is None:
+        spec = _REASONING_SPECS.get(provider_id)
+        return provider_id if spec and spec.protocol == protocol else None
+    url = urllib.parse.urlparse(endpoint)
+    if url.scheme != "https":
+        return None
+    host = url.hostname
+    for identity, spec in _REASONING_SPECS.items():
+        if spec.protocol == protocol and host in spec.hosts:
+            return identity
+    return None
+
+
+def reasoning_provider_spec(provider_id, protocol, endpoint=None):
+    identity = reasoning_provider_id(provider_id, protocol, endpoint)
+    return _REASONING_SPECS.get(identity) if identity else None
+
+
+# --- Native thinking controls ---------------------------------------------
+#
+# The tables below are wire facts the models.dev catalog does not carry.
+# Each cites the provider document that establishes it and is keyed by
+# exact identifiers under a resolved native identity -- never by a
+# version-prefix match, never by a display name, and never lent to a
+# gateway that merely hosts a similarly named model. Catalog-advertised
+# values (effort lists, toggles, budget bounds) are deliberately absent:
+# they arrive with the model metadata layer.
+
+# Claude thinking modes. Source: platform.claude.com/docs/en/
+# build-with-claude/thinking and the model overview / fable-5 migration
+# pages (checked 2026-10). Manual = thinking.type "enabled" plus an
+# explicit budget_tokens allowance; "between-tools" = thinking.type
+# "between_tools". The default is what a request with no thinking field
+# gets: off for the 4.x models (thinking is opt-in), adaptive for the
+# models documented as thinking-on by default.
+_ANTHROPIC_THINKING_MODES: dict[str, list[str]] = {
+    "claude-opus-4-5": ["manual", "off"],
+    "claude-opus-4-5-20251101": ["manual", "off"],
+    "claude-sonnet-4-5": ["manual", "off"],
+    "claude-sonnet-4-5-20250929": ["manual", "off"],
+    "claude-haiku-4-5": ["manual", "off"],
+    "claude-haiku-4-5-20251001": ["manual", "off"],
+    "claude-opus-4-6": ["adaptive", "manual", "off"],
+    "claude-sonnet-4-6": ["adaptive", "manual", "off"],
+    "claude-opus-4-7": ["adaptive", "off"],
+    "claude-opus-4-8": ["adaptive", "off"],
+    "claude-opus-5": ["adaptive", "off"],
+    "claude-sonnet-5": ["adaptive", "off"],
+    "claude-opus-5-5": ["adaptive"],
+    "claude-sonnet-5-5": ["adaptive", "between-tools"],
+    "claude-fable-5": ["adaptive"],
+    "claude-fable-5-1": ["adaptive"],
+    "claude-mythos-5": ["adaptive"],
+    "claude-mythos-5-1": ["adaptive"],
+    "claude-mythos-preview": ["adaptive", "manual"],
+}
+# Models documented as thinking-on by default: "On Claude Opus 5.5, Claude
+# Opus 5, Claude Sonnet 5.5, Claude Sonnet 5, Claude Fable 5.1, Claude
+# Mythos 5.1, Claude Fable 5, Claude Mythos 5, and Claude Mythos Preview,
+# thinking is already on and needs no configuration." Every other model
+# in the table (4.5 through 4.8) defaults to thinking off.
+_ANTHROPIC_ADAPTIVE_DEFAULT_MODELS = [
+    "claude-opus-5", "claude-sonnet-5", "claude-opus-5-5",
+    "claude-sonnet-5-5", "claude-fable-5", "claude-fable-5-1",
+    "claude-mythos-5", "claude-mythos-5-1", "claude-mythos-preview",
+]
+
+# Documented effort ceilings for low-thinking modes: Opus 5 accepts
+# thinking.type "disabled" only at effort "high" or below, and Sonnet 5.5
+# accepts "between_tools" only at "high" or below (same source pages).
+_ANTHROPIC_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
+_ANTHROPIC_MODE_EFFORT_CEILINGS: dict[str, dict[str, str]] = {
+    "claude-opus-5": {"off": "high"},
+    "claude-sonnet-5-5": {"between-tools": "high"},
+}
+
+# GLM disablement facts. Source: docs.z.ai/api-reference/llm/
+# chat-completion (checked 2026-10). GLM-5.2 has a verified independent
+# disablement control; GLM-5.3 and GLM-5.3-FLASH reject disablement.
+# clear_thinking governs historical reasoning, not current-turn
+# enablement, so it is a preservation control, never a mode.
+_GLM_THINKING_MODES: dict[str, list[str]] = {
+    "glm-5.2": ["on", "off"],
+    "glm-5.3": [],
+    "glm-5.3-flash": [],
+}
+_GLM_DEFAULT_MODES: dict[str, str] = {
+    "glm-5.2": "on",
+    "glm-5.3": "on",
+    "glm-5.3-flash": "on",
+}
+
+# Cross-turn reasoning reuse on the public Responses API. Source:
+# developers.openai.com/api/docs/guides/reasoning (checked 2026-10):
+# "The GPT-5.6 model family supports all_turns and uses it by default.
+# Earlier models default to current_turn. GPT-6.1 Sol also supports
+# all_turns." Exact documented identifiers only; no family-prefix
+# extrapolation. The legacy reasoning.encrypted_content include is not
+# required and is not sent.
+_OPENAI_ALL_TURNS_MODELS = [
+    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra",
+    "gpt-5.6-luna", "gpt-6.1-sol",
+]
 
 
 def _codex_reasoning_parameter(profile, reasoning_effort=None):
@@ -275,7 +415,236 @@ class Provider:
             model=model,
         )
 
+    # -- thinking controls --------------------------------------------------
+    #
+    # Enablement, numerical allowance, and preservation are separate wire
+    # controls; effort is guidance and never implies enablement. Facts not
+    # carried by the catalog live in the supplement tables above, each
+    # cited and bound to a resolved native identity.
+
+    @property
+    def reasoning_provider_id(self):
+        """Native vendor identity of this connection, or None for a
+        gateway. A provider label on a foreign host establishes nothing."""
+        if (self.provider_id == "openai-subscription"
+                and self.kind == OPENAI_RESPONSES):
+            return "openai-subscription"
+        return reasoning_provider_id(
+            self.provider_id, self.kind, self.chat_url)
+
+    @property
+    def reasoning_spec(self):
+        if self.reasoning_provider_id == "openai-subscription":
+            return _REASONING_SPECS["openai-subscription"]
+        return reasoning_provider_spec(
+            self.provider_id, self.kind, self.chat_url)
+
+    def thinking_modes(self, model):
+        """Thinking modes documented for this native connection. Catalog
+        controls join in the metadata layer; empty means "no disablement
+        or mode control documented", not unknown."""
+        identity = self.reasoning_provider_id
+        if identity == "anthropic":
+            return _ANTHROPIC_THINKING_MODES.get(model, [])
+        if identity in ["zai", "zhipuai"]:
+            return _GLM_THINKING_MODES.get(model, [])
+        return []
+
+    def thinking_default_mode(self, model):
+        identity = self.reasoning_provider_id
+        if identity == "anthropic":
+            if model in _ANTHROPIC_THINKING_MODES:
+                return ("adaptive"
+                        if model in _ANTHROPIC_ADAPTIVE_DEFAULT_MODELS
+                        else "off")
+            return None
+        if identity in ["zai", "zhipuai"]:
+            return _GLM_DEFAULT_MODES.get(model)
+        return None
+
+    def thinking_control_status(self, model, control, value):
+        """Classify one requested control against the wire contract.
+
+        Returns "supported" (documented for this model) or "trial"
+        (spelling verified for the wire, model acceptance unverified).
+        Raises for verified rejections and unknown spellings: neither may
+        become request bytes. Trial policy -- explicit, labelled, one
+        turn -- belongs to the command layer, not the wire.
+        """
+        spec = self.reasoning_spec
+        wire = spec.wire_format if spec else None
+        identity = self.reasoning_provider_id
+        if control == "mode":
+            spellings = []
+            if wire == "anthropic":
+                spellings = ["manual", "adaptive", "between-tools", "off"]
+            elif wire == "thinking_toggle":
+                spellings = ["on", "off"]
+            elif wire == "openai_chat" and identity == "sarvam":
+                # Sarvam's documented off control is the JSON-null
+                # effort value; nothing else on this wire is a mode.
+                spellings = ["off"]
+            if value not in spellings:
+                raise ProtocolError(
+                    "no verified request spelling for this thinking mode")
+            if identity == "sarvam" and value == "off":
+                return "supported"
+            if identity == "anthropic":
+                modes = _ANTHROPIC_THINKING_MODES.get(model)
+                if modes is None:
+                    return "trial"
+                if value in modes:
+                    return "supported"
+                raise ProtocolError(
+                    "this mode is rejected by the documented native Claude "
+                    "contract for this model")
+            if identity in ["zai", "zhipuai"]:
+                modes = _GLM_THINKING_MODES.get(model)
+                if modes is None:
+                    return "trial"
+                if value in modes:
+                    return "supported"
+                if value == "off":
+                    raise ProtocolError(
+                        "this native GLM model cannot disable thinking")
+            return "trial"
+        if control == "budget":
+            if wire != "anthropic":
+                raise ProtocolError(
+                    "no verified thinking-allowance request spelling for "
+                    "this connection")
+            modes = _ANTHROPIC_THINKING_MODES.get(model)
+            if modes is None:
+                return "trial"
+            if "manual" in modes:
+                return "supported"
+            raise ProtocolError(
+                "this native Claude model rejects manual thinking "
+                "allowances")
+        raise ProtocolError("unknown thinking control")
+
+    def reasoning_preservation(self, model):
+        """The provider-side reuse control documented for this connection,
+        or None when reuse has no verified request spelling."""
+        identity = self.reasoning_provider_id
+        if identity in ["zai", "zhipuai"]:
+            # clear_thinking governs historical reasoning only; it never
+            # selects current-turn enablement.
+            return "clear_thinking"
+        if identity == "openai" and model in _OPENAI_ALL_TURNS_MODELS:
+            return "all_turns"
+        return None
+
+    def validate_thinking(
+            self, model, effort, mode, budget, retention):
+        """Reject combinations the wire contract cannot carry. Trials pass
+        validation; their one-shot consent policy lives above this layer."""
+        if mode is not None:
+            self.thinking_control_status(model, "mode", mode)
+        if budget is not None:
+            if (not isinstance(budget, int) or isinstance(budget, bool)
+                    or budget < 0):
+                raise ProtocolError(
+                    "thinking budget must be a nonnegative integer")
+            self.thinking_control_status(model, "budget", budget)
+        spec = self.reasoning_spec
+        wire = spec.wire_format if spec else None
+        if mode == "manual":
+            if budget is None:
+                raise ProtocolError(
+                    "manual thinking requires an explicit budget")
+            # Documented floor, and the output limit it must stay below.
+            if budget < 1024 or budget >= self.max_tokens:
+                raise ProtocolError(
+                    "manual thinking budget must be at least 1024 and "
+                    "below the output limit")
+        elif budget is not None:
+            raise ProtocolError("a thinking budget requires manual mode")
+        ceiling = _ANTHROPIC_MODE_EFFORT_CEILINGS.get(model, {}).get(mode)
+        if (ceiling is not None and effort in _ANTHROPIC_EFFORT_ORDER
+                and _ANTHROPIC_EFFORT_ORDER.index(effort)
+                > _ANTHROPIC_EFFORT_ORDER.index(ceiling)):
+            raise ProtocolError(
+                "this thinking mode requires effort high or below")
+        if retention not in ["default", "preserve"]:
+            raise ProtocolError("invalid thinking retention preference")
+        if (retention == "preserve"
+                and self.reasoning_preservation(model) is None):
+            raise ProtocolError(
+                "no verified preservation control for this model")
+        if (wire == "thinking_toggle" and effort == "none"
+                and mode is not None):
+            raise ProtocolError(
+                "disablement is requested through the thinking mode, not "
+                "an effort value")
+
+    def _apply_thinking(self, payload, model, effort, mode, budget,
+                        retention, traces):
+        self.validate_thinking(model, effort, mode, budget, retention)
+        spec = self.reasoning_spec
+        wire = spec.wire_format if spec else None
+        if mode is not None:
+            if wire == "anthropic":
+                payload["thinking"] = {"type": {
+                    "manual": "enabled", "off": "disabled",
+                    "between-tools": "between_tools",
+                    "adaptive": "adaptive"}[mode]}
+            elif wire == "thinking_toggle":
+                payload["thinking"] = {
+                    "type": "enabled" if mode == "on" else "disabled"}
+            elif mode == "off" and self.reasoning_provider_id == "sarvam":
+                # The one boundary line (design section 1): JSON null
+                # exists only here. Sarvam's documented off control is
+                # reasoning_effort: null; it is never a value, marker, or
+                # stored state anywhere else in the program.
+                payload["reasoning_effort"] = None
+        if budget is not None:
+            payload["thinking"]["budget_tokens"] = budget
+        if retention == "preserve":
+            preservation = self.reasoning_preservation(model)
+            if preservation == "clear_thinking":
+                payload.setdefault("thinking", {})["clear_thinking"] = False
+            elif preservation == "all_turns":
+                payload.setdefault("reasoning", {})["context"] = "all_turns"
+        if traces == "on":
+            self._apply_trace_output(payload, model, mode)
+        return payload
+
+    def _apply_trace_output(self, payload, model, mode):
+        """Display-only readable-output fields: never enablement, effort,
+        allowance, or preservation."""
+        spec = self.reasoning_spec
+        wire = spec.wire_format if spec else None
+        if wire == "anthropic":
+            # Restate only an established mode: the user's selection or a
+            # documented thinking-on default. between_tools accepts no
+            # display field at all.
+            effective = mode or self.thinking_default_mode(model)
+            if effective in ["manual", "adaptive"]:
+                payload.setdefault("thinking", {
+                    "type": ("enabled" if effective == "manual"
+                             else "adaptive")})["display"] = "summarized"
+        elif wire == "openai":
+            if self.reasoning_provider_id == "openai":
+                payload.setdefault("reasoning", {})["summary"] = "auto"
+
     def chat_payload(
+            self, items, tools, model, *, prompt_cache_key=None,
+            reasoning_effort=None, thinking_mode=None,
+            thinking_budget=None, reasoning_retention="default",
+            reasoning_traces="off"):
+        payload = self._chat_payload(
+            items, tools, model, prompt_cache_key=prompt_cache_key,
+            reasoning_effort=reasoning_effort)
+        if (thinking_mode is None and thinking_budget is None
+                and reasoning_retention == "default"
+                and reasoning_traces == "off"):
+            return payload
+        return self._apply_thinking(
+            payload, model, reasoning_effort, thinking_mode,
+            thinking_budget, reasoning_retention, reasoning_traces)
+
+    def _chat_payload(
             self, items, tools, model, *, prompt_cache_key=None,
             reasoning_effort=None):
         if reasoning_effort is not None:
@@ -292,20 +661,16 @@ class Provider:
             if tools is not None:
                 payload["tools"] = tools
             if reasoning_effort is not None:
-                spec = _REASONING_SPECS.get(self.provider_id)
+                spec = self.reasoning_spec
                 wire_format = spec.wire_format if spec else None
+                # Effort is guidance only. It never adds or removes a
+                # thinking field: enablement is the mode control's job.
                 if wire_format == "openrouter":
                     payload["reasoning"] = {
                         "effort": reasoning_effort,
                     }
-                elif wire_format == "thinking_toggle":
-                    payload["thinking"] = {
-                        "type": (
-                            "disabled"
-                            if reasoning_effort == "none" else "enabled"),
-                    }
-                    if reasoning_effort != "none":
-                        payload["reasoning_effort"] = reasoning_effort
+                elif wire_format in ["thinking_toggle", "openai_chat"]:
+                    payload["reasoning_effort"] = reasoning_effort
                 else:
                     raise ProtocolError(
                         "reasoning effort is not implemented for this "
@@ -433,13 +798,19 @@ class Provider:
 
     def streaming_chat_payload(
             self, items, tools, model, *, prompt_cache_key=None,
-            reasoning_effort=None):
+            reasoning_effort=None, thinking_mode=None,
+            thinking_budget=None, reasoning_retention="default",
+            reasoning_traces="off"):
         payload = self.chat_payload(
             items,
             tools,
             model,
             prompt_cache_key=prompt_cache_key,
             reasoning_effort=reasoning_effort,
+            thinking_mode=thinking_mode,
+            thinking_budget=thinking_budget,
+            reasoning_retention=reasoning_retention,
+            reasoning_traces=reasoning_traces,
         )
         if self.kind != DUMMY:
             payload["stream"] = True
