@@ -52,6 +52,18 @@ class Session:
     # concrete value remains dormant so it can become active again after a
     # later model change.
     reasoning_effort_preference: str | None = None
+    # Thinking controls, same convention: None means "no choice" and an
+    # inapplicable saved value stays dormant until it applies again.
+    thinking_mode: str | None = None
+    thinking_budget: int | None = None
+    reasoning_retention: str = "default"
+    # Readable-output display preference. Observation only: it never
+    # selects computation.
+    reasoning_traces: str = "off"
+    # One connection-bound, one-shot request for controls whose spelling
+    # is verified but whose model acceptance is not. Applied to the next
+    # inference turn, then consumed; never persisted, never a preference.
+    thinking_request: dict | None = None
 
     # Async request-time credential authority. Top-level processes install a
     # local broker; workers and subagents install a delegated client.

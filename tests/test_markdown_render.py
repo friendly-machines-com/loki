@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import io
 import random
-import types
 import unittest
 from unittest import mock
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
@@ -465,7 +464,10 @@ class DifferentialTests(unittest.TestCase):
 class TerminalWiringTests(unittest.TestCase):
     def setUp(self):
         self._old_config = loki.current_session().runtime_config
-        loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
+        # The tool loop consults the real provider interface for thinking
+        # settings; a fake config object no longer matches it.
+        loki.current_session().runtime_config = loki.make_runtime_config(
+            "dummy://local", loki.protocols.DUMMY, model="local-model")
         terminal_frontend.terminal.assistant_markdown.reset()
 
     def tearDown(self):
@@ -735,7 +737,10 @@ class TerminalWiringTests(unittest.TestCase):
 class ToolLoopWiringTests(unittest.TestCase):
     def setUp(self):
         self._old_config = loki.current_session().runtime_config
-        loki.current_session().runtime_config = types.SimpleNamespace(model="local-model")
+        # The tool loop consults the real provider interface for thinking
+        # settings; a fake config object no longer matches it.
+        loki.current_session().runtime_config = loki.make_runtime_config(
+            "dummy://local", loki.protocols.DUMMY, model="local-model")
         terminal_frontend.terminal.assistant_markdown.reset()
 
     def tearDown(self):

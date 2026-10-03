@@ -632,8 +632,12 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         session = loki.Session(runtime_config=config)
         with mock.patch.object(loki, "_DEFAULT_SESSION", session):
+            # No fabricated provider default: with no selection and no
+            # advertised default, the level is the model's own, unknown
+            # to the catalog.
             for preference, expected in (
-                    (None, "medium"), ("high", "high"), ("unavailable", "medium")):
+                    (None, "unknown"), ("high", "high"),
+                    ("unavailable", "unknown")):
                 with self.subTest(preference=preference):
                     session.reasoning_effort_preference = preference
                     self.assertEqual(loki.reasoning_effort_status_text(), expected)
@@ -641,8 +645,9 @@ class RuntimeConfigTests(unittest.TestCase):
                     self.assertIn(f"Effort: {expected}, Context:", text)
                     self.assertNotIn("Model default", text)
                     self.assertNotIn("preferred", text)
-            self.assertIn("Model default (medium)", loki.reasoning_effort_default_text())
             session.reasoning_effort_preference = None
+            self.assertEqual(
+                loki.reasoning_effort_default_text(), "Model default")
             config.reasoning_effort_profile = modelsdev.ReasoningEffortProfile(
                 ["low", "medium", "high"], default="low")
             self.assertEqual(loki.reasoning_effort_status_text(), "low")
@@ -6889,7 +6894,7 @@ class HarnessProjectionTests(unittest.TestCase):
             requests = []
 
             async def completion(items, tools, model=None, *, codex_turn_state,
-                                 reasoning_effort=None):
+                                 reasoning_effort=None, thinking=None):
                 self.assertEqual({tool['function']['name'] for tool in tools},
                                  {'Read', 'Grep'})
                 requests.append(copy.deepcopy(items))
@@ -6933,7 +6938,7 @@ class HarnessProjectionTests(unittest.TestCase):
     def test_toolless_completion_returns_all_assistant_phases(self):
         async def fake_completion(
                 items, tools, *, codex_turn_state,
-                reasoning_effort=None):
+                reasoning_effort=None, thinking=None):
             self.assertEqual(tools, [])
             return formats.DecodedTurn([
                 formats.message_item("assistant", "commentary"),
@@ -7220,6 +7225,105 @@ class QuestionGuardTests(unittest.TestCase):
             part.strip()
             for part in description[start + len(marker):end].split(",")}
         self.assertEqual(advertised, loki.EXPLORE_TOOLS)
+
+
+class ThinkingControlsTests(unittest.TestCase):
+    def setUp(self):
+        self.session = loki.Session()
+        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.session.runtime_config = loki.make_runtime_config(
+            "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
+            model="claude-opus-4-5", provider_id="anthropic",
+            reasoning_effort_profile=modelsdev.ReasoningEffortProfile(
+                ["low", "high"]))
+
+    def test_command_parser_is_atomic_and_manual_requires_budget(self):
+        for argument in [
+                "mode manual", "mode manual budget 1023", "effort nope",
+                "budget zero", "mode manual mode off", "effort high mode",
+                "effort high mode invented"]:
+            with self.subTest(argument=argument), self.assertRaises(ValueError):
+                loki.thinking_command(argument)
+            self.assertIsNone(self.session.thinking_mode)
+            self.assertIsNone(self.session.thinking_budget)
+            self.assertIsNone(self.session.reasoning_effort_preference)
+        loki.thinking_command("mode manual budget 2048 effort high")
+        self.assertEqual(
+            (self.session.thinking_mode, self.session.thinking_budget),
+            ("manual", 2048))
+        self.assertEqual(loki.effective_reasoning_effort(), "high")
+
+    def test_unverified_acceptance_is_a_one_shot_trial(self):
+        # An unlisted model has a verified spelling but unknown
+        # acceptance: requestable once, labelled, never a preference.
+        loki.reinstall_provider(model="claude-future")
+        text = loki.thinking_command("mode adaptive")
+        self.assertIn("Unverified model acceptance", text)
+        self.assertIsNone(self.session.thinking_mode)
+        first = loki.capture_turn_settings()
+        self.assertEqual(first.mode, "adaptive")
+        self.assertIsNotNone(first.trial)
+        second = loki.capture_turn_settings()
+        self.assertIsNone(second.mode)
+        self.assertIsNone(second.trial)
+
+    def test_dormant_preferences_survive_and_restore(self):
+        loki.thinking_command("mode manual budget 2048")
+        loki.thinking_command("mode default")
+        self.assertEqual(self.session.thinking_budget, 2048)
+        self.assertEqual(
+            loki.effective_thinking_settings()[:2], (None, None))
+        self.assertIn(
+            "Inactive budget preference: 2048", loki.thinking_status_text())
+        loki.thinking_command("mode manual")
+        self.assertEqual(
+            loki.effective_thinking_settings()[:2], ("manual", 2048))
+
+    def test_controls_round_trip_and_saved_state_is_validated(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "chat.json")
+            loki.new_chat_log(path)
+            loki.thinking_command("mode manual budget 2048 effort high")
+            loki.trace_command("thinking on")
+            state = dict(loki.current_session().session_state)
+            loki.new_chat_log(path)
+            loki.load_session_state(state)
+            restored = loki.current_session()
+            self.assertEqual(
+                (restored.thinking_mode, restored.thinking_budget),
+                ("manual", 2048))
+            self.assertEqual(restored.reasoning_traces, "on")
+            self.assertEqual(restored.reasoning_effort_preference, "high")
+        for bad in [{"thinking_mode": "bogus"}, {"thinking_budget": True},
+                    {"thinking_traces": "loud"},
+                    {"reasoning_retention": "keep"}]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                loki.load_session_state(bad)
+
+    def test_snapshot_governs_the_whole_turn(self):
+        loki.thinking_command("mode manual budget 2048")
+        seen = []
+
+        async def completion(items, tools, *, codex_turn_state,
+                             reasoning_effort=None, thinking=None):
+            seen.append(thinking)
+            if len(seen) == 1:
+                # A mid-turn preference change must not affect this turn.
+                self.session.thinking_mode = None
+                return formats.DecodedTurn([formats.tool_call_item(
+                    "call", "Read", {"file_path": "x"})])
+            return formats.DecodedTurn(
+                [formats.message_item("assistant", "done")])
+
+        execute = mock.AsyncMock(return_value=({"ok": True, "content": "ok"}, {}))
+        with mock.patch.object(loki, "async_chat_completion", completion), \
+                mock.patch.object(loki, "execute_tool_call_async", execute):
+            asyncio.run(loki.run_tool_loop_async(
+                [formats.message_item("user", "go")]))
+        self.assertEqual([settings.mode for settings in seen],
+                         ["manual", "manual"])
 
 
 if __name__ == "__main__":

@@ -29,7 +29,6 @@ class ReasoningProviderSpec:
     """
 
     protocol: str
-    default_effort: str | None = None
     # "openai", "openai_chat", "openrouter", "thinking_toggle", "anthropic",
     # "openai_subscription"
     wire_format: str = "openai"
@@ -51,7 +50,6 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
     ),
     "deepseek": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
-        default_effort="high",
         wire_format="thinking_toggle",
         _hosts=["api.deepseek.com"],
     ),
@@ -76,24 +74,20 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
     ),
     "zai": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
-        default_effort="medium",
         wire_format="thinking_toggle",
         _hosts=["api.z.ai"],
     ),
     "zai-coding-plan": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
-        default_effort="medium",
         wire_format="thinking_toggle",
     ),
     "zhipuai": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
-        default_effort="medium",
         wire_format="thinking_toggle",
         _hosts=["open.bigmodel.cn"],
     ),
     "zhipuai-coding-plan": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
-        default_effort="medium",
         wire_format="thinking_toggle",
     ),
 }
@@ -175,12 +169,6 @@ def _header_string(headers, name):
 def openai_response_model_header(headers):
     """Read OpenAI's effective-model header case-insensitively."""
     return _header_string(headers, "openai-model")
-
-
-def default_reasoning_effort(provider_id: str | None) -> str | None:
-    """The effort level this provider is asked for when none is selected."""
-    spec = _REASONING_SPECS.get(provider_id)
-    return spec.default_effort if spec else None
 
 
 def reasoning_provider_id(provider_id, protocol, endpoint=None):
