@@ -151,6 +151,7 @@ class ProviderResponse:
     payload: object
     effective_model: str | None = None
     notice_codes: tuple[str, ...] = ()
+    reasoning_field: str | None = None
 
 
 def _header_string(headers, name):
@@ -407,6 +408,9 @@ class Provider:
     prompt_cache: bool = False
     openai_request_profile: (
         openai_models.CodexModelRequestProfile | None) = None
+    # Catalog hint naming the response field interleaved reasoning
+    # arrives in. Display metadata only; never a request fact.
+    reasoning_field: str | None = None
 
     @property
     def responses_lite(self):
@@ -832,14 +836,18 @@ class Provider:
             payload["stream_options"] = {"include_usage": True}
         return payload
 
-    def stream_accumulator(self, on_text_delta=None):
+    def stream_accumulator(self, on_text_delta=None, on_reasoning_delta=None):
         callback = on_text_delta or (lambda text: None)
         if self.kind == OPENAI_CHAT:
-            return OpenAIChatStreamAccumulator(callback)
+            return OpenAIChatStreamAccumulator(
+                callback, on_reasoning_delta,
+                reasoning_field=self.reasoning_field)
         if self.kind == ANTHROPIC_MESSAGES:
-            return AnthropicMessagesStreamAccumulator(callback)
+            return AnthropicMessagesStreamAccumulator(
+                callback, on_reasoning_delta)
         if self.kind == OPENAI_RESPONSES:
-            return OpenAIResponsesStreamAccumulator(callback)
+            return OpenAIResponsesStreamAccumulator(
+                callback, on_reasoning_delta)
         raise StreamProtocolError(
             f"streaming is not implemented for protocol {self.kind!r}")
 
@@ -875,8 +883,15 @@ class Provider:
 
 
 class OpenAIChatStreamAccumulator:
-    def __init__(self, on_text_delta):
+    def __init__(self, on_text_delta, on_reasoning_delta=None, *,
+                 reasoning_field=None):
         self.on_text_delta = on_text_delta
+        # Display-only: reasoning deltas leave the assembled response
+        # byte-identical to the buffered decoder's output.
+        self.on_reasoning_delta = on_reasoning_delta or (
+            lambda key, kind, text: None)
+        self.reasoning_field = reasoning_field
+        self.reasoning_delivered = {}
         self.response = {}
         self.choice = {
             "index": 0,
@@ -956,6 +971,13 @@ class OpenAIChatStreamAccumulator:
             role = delta.get("role")
             if isinstance(role, str):
                 self.choice["message"]["role"] = role
+            # Reasoning is assembled and delivered before the answer text
+            # of the same chunk: a gateway that puts thinking and content
+            # in one delta still reads thought-first.
+            for key in formats.OPENAI_CHAT_REASONING_FIELDS:
+                self._accumulate_message_delta_field(
+                    key, delta.get(key))
+            self._deliver_reasoning_delta()
             if "content" in delta:
                 content = delta["content"]
                 message = self.choice["message"]
@@ -982,9 +1004,6 @@ class OpenAIChatStreamAccumulator:
                     self.choice["message"][key] = copy.deepcopy(delta[key])
             self._accumulate_message_delta_field(
                 "audio", delta.get("audio"))
-            for key in formats.OPENAI_CHAT_REASONING_FIELDS:
-                self._accumulate_message_delta_field(
-                    key, delta.get(key))
             self._accumulate_tool_calls(delta.get("tool_calls"))
             self._accumulate_legacy_function_call(
                 delta.get("function_call"))
@@ -1002,12 +1021,63 @@ class OpenAIChatStreamAccumulator:
                 # it, instead of printing one diagnostic per token.
                 self._accumulate_message_delta_field(key, value)
 
+    def _deliver_reasoning_delta(self):
+        # The final message already carries the merged reasoning fields;
+        # project them and deliver only the not-yet-delivered suffix.
+        message = self.choice["message"]
+        segments = formats.chat_reasoning_segments(message, source=self.reasoning_field)
+        if not segments and not self.reasoning_delivered:
+            segments = formats.chat_reasoning_segments(message)
+        if segments and not self.reasoning_delivered:
+            self.reasoning_field = segments[0][0][1]
+        for key, kind, text in segments:
+            delivered = self.reasoning_delivered.get(key, "")
+            if text.startswith(delivered) and len(text) > len(delivered):
+                self.on_reasoning_delta(key, kind, text[len(delivered):])
+                self.reasoning_delivered[key] = text
+
     def _accumulate_message_delta_field(self, key, value):
         if value is None:
             return
         message = self.choice["message"]
+        if key == "reasoning_details" and isinstance(value, list):
+            self._accumulate_reasoning_details(value)
+            return
         message[key] = self._merge_delta_value(
             message.get(key), value)
+
+    def _accumulate_reasoning_details(self, value):
+        # Typed detail entries arrive fragmented: identity fields repeat
+        # while text payloads concatenate. Merge by index (or id) so the
+        # assembled message equals the buffered response's.
+        message = self.choice["message"]
+        details = message.setdefault("reasoning_details", [])
+        if not isinstance(details, list):
+            raise StreamProtocolError("reasoning_details changed type")
+        for detail in value:
+            if not isinstance(detail, dict):
+                details.append(copy.deepcopy(detail))
+                continue
+            index = detail.get("index")
+            identity = detail.get("id")
+            previous = next(
+                (position for position, entry in enumerate(details)
+                 if isinstance(entry, dict) and (
+                     (isinstance(index, int) and not isinstance(index, bool)
+                      and entry.get("index") == index)
+                     or (index is None and isinstance(identity, str)
+                         and entry.get("id") == identity))),
+                None)
+            if previous is None:
+                details.append(copy.deepcopy(detail))
+                continue
+            entry = details[previous]
+            for name, child in detail.items():
+                if name in ["text", "summary", "signature", "data"]:
+                    entry[name] = self._merge_delta_value(
+                        entry.get(name), child)
+                else:
+                    entry[name] = copy.deepcopy(child)
 
     @classmethod
     def _merge_delta_value(cls, current, value):
@@ -1112,10 +1182,15 @@ class OpenAIChatStreamAccumulator:
 
 
 class AnthropicMessagesStreamAccumulator:
-    def __init__(self, on_text_delta):
+    def __init__(self, on_text_delta, on_reasoning_delta=None):
         self.on_text_delta = on_text_delta
+        # Display-only: thinking deltas leave the assembled message
+        # identical to the buffered decoder's output.
+        self.on_reasoning_delta = on_reasoning_delta or (
+            lambda key, kind, text: None)
         self.message = None
         self.blocks = {}
+        self.thinking_keys = {}
         self.tool_json = {}
         self.stream_extensions = []
         self.complete = False
@@ -1164,6 +1239,12 @@ class AnthropicMessagesStreamAccumulator:
                 raise StreamProtocolError(
                     "Anthropic content_block_start is missing content_block")
             self.blocks[index] = copy.deepcopy(block)
+            if block.get("type") == "thinking":
+                key = ("anthropic", len(self.thinking_keys))
+                self.thinking_keys[index] = key
+                text = block.get("thinking")
+                if isinstance(text, str) and text:
+                    self.on_reasoning_delta(key, "thinking", text)
             if self._uses_streamed_json(block):
                 self.tool_json[index] = ""
         elif event_type == "content_block_delta":
@@ -1220,6 +1301,9 @@ class AnthropicMessagesStreamAccumulator:
             if isinstance(thinking, str):
                 block["thinking"] = (
                     str(block.get("thinking", "")) + thinking)
+                if thinking and index in self.thinking_keys:
+                    self.on_reasoning_delta(
+                        self.thinking_keys[index], "thinking", thinking)
         elif delta_type == "signature_delta":
             signature = delta.get("signature")
             if isinstance(signature, str):
@@ -1270,14 +1354,20 @@ class AnthropicMessagesStreamAccumulator:
 
 
 class OpenAIResponsesStreamAccumulator:
-    def __init__(self, on_text_delta):
+    def __init__(self, on_text_delta, on_reasoning_delta=None):
         self.on_text_delta = on_text_delta
+        # Completed items own continuation data. Readable fragments also
+        # retain text if an endpoint omits the completed item events.
+        self.on_reasoning_delta = on_reasoning_delta or (
+            lambda key, kind, text: None)
         self.completed_response = None
         self.incomplete_response = None
         self.failed_response = None
         self.stream_error = None
         self.stream_extensions = []
         self.output_items = []
+        self._reasoning_items = {}
+        self.output_indexes = []
         self._nested_effective_model = None
         self._top_level_effective_model = None
         self.notice_codes = []
@@ -1287,6 +1377,39 @@ class OpenAIResponsesStreamAccumulator:
         return (
             self._nested_effective_model
             or self._top_level_effective_model)
+
+    def _feed_reasoning_text(self, data, event_type):
+        done = event_type.endswith(".done")
+        text = data.get("text" if done else "delta")
+        if not isinstance(text, str):
+            raise StreamProtocolError("reasoning text must be a string")
+        output_index = _stream_index({"index": data.get("output_index", 0)}, "Responses output")
+        summary = event_type in ["response.reasoning_summary_text.delta",
+                                 "response.reasoning_summary_text.done",
+                                 "response.reasoning_summary_part.done"]
+        field = "summary" if summary else "content"
+        part_index = _stream_index(
+            {"index": data.get("summary_index" if summary else "content_index", 0)}, "reasoning part")
+        identity = data.get("item_id")
+        if identity is not None and not isinstance(identity, str):
+            raise StreamProtocolError("reasoning item_id must be a string")
+        item = self._reasoning_items.setdefault(output_index, {"type": "reasoning"})
+        if identity:
+            item["id"] = identity
+        parts = item.setdefault(field, [])
+        if not isinstance(parts, list) or part_index > len(parts):
+            raise StreamProtocolError("reasoning part preceded earlier parts")
+        if part_index == len(parts):
+            parts.append({"type": "summary_text" if summary else "reasoning_text", "text": ""})
+        part = parts[part_index]
+        previous = part.get("text", "")
+        if not isinstance(previous, str):
+            raise StreamProtocolError("reasoning text must be a string")
+        part["text"] = text if done else previous + text
+        delta = (text[len(previous):] if text.startswith(previous) else "") if done else text
+        key = ("responses", item.get("id") or output_index, field, part_index)
+        if delta:
+            self.on_reasoning_delta(key, "summary" if summary else "thinking", delta)
 
     def _observe_effective_model(self, data):
         # Codex reports the model selected by the private backend in headers,
@@ -1367,12 +1490,30 @@ class OpenAIResponsesStreamAccumulator:
             delta = data.get("delta")
             if isinstance(delta, str) and delta:
                 self.on_text_delta(delta)
+        elif event_type in [
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done"]:
+            self._feed_reasoning_text(data, event_type)
+        elif event_type == "response.reasoning_summary_part.done":
+            part = data.get("part")
+            if isinstance(part, dict) and part.get("type") == "summary_text":
+                self._feed_reasoning_text(
+                    dict(data, text=part.get("text", "")), event_type)
+        elif event_type == "response.output_item.added":
+            item = data.get("item")
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                index = _stream_index({"index": data.get("output_index", 0)}, "Responses output")
+                self._reasoning_items[index] = copy.deepcopy(item)
         elif event_type == "response.output_item.done":
             item = data.get("item")
             if not isinstance(item, dict):
                 raise StreamProtocolError(
                     "response.output_item.done is missing its item")
             self.output_items.append(copy.deepcopy(item))
+            index = data.get("output_index")
+            self.output_indexes.append(_stream_index({"index": index}, "Responses output") if index is not None else None)
         elif event_type == "response.completed":
             response = data.get("response")
             if not isinstance(response, dict):
@@ -1421,19 +1562,31 @@ class OpenAIResponsesStreamAccumulator:
         return False
 
     def _finish_response(self, response):
-        # In the Responses streaming protocol, output_item.done carries each
-        # completed conversational item. response.completed is the terminal
-        # event and carries response metadata such as id and usage; Codex's
-        # own decoder does not read output items from it. Preserve a populated
-        # terminal output only as a compatibility fallback for implementations
-        # that omit the standard item events.
-        if self.output_items:
-            response["output"] = copy.deepcopy(self.output_items)
-        else:
-            response.setdefault("output", [])
+        # Completed items own native continuation fields. Reconcile the final
+        # envelope with item events instead of discarding either collection.
+        output = copy.deepcopy(response.get("output") or [])
+        if not isinstance(output, list) or any(not isinstance(item, dict) for item in output):
+            raise StreamProtocolError("Responses output must be an array of objects")
+        completed = list(zip(self.output_items, self.output_indexes))
+        if not output and all(index is not None for item, index in completed):
+            completed.sort(key=lambda pair: pair[1])
+        for item, index in completed:
+            position = next((i for i, entry in enumerate(output)
+                             if item.get("id") is not None and entry.get("id") == item["id"]), None)
+            if position is None and index is not None and index < len(output):
+                position = index
+            if position is None:
+                output.append(copy.deepcopy(item))
+            else:
+                output[position] = copy.deepcopy(item)
+        for index, item in sorted(self._reasoning_items.items()):
+            if not any((item.get("id") is not None and entry.get("id") == item["id"])
+                       or (i == index and entry.get("type") == "reasoning")
+                       for i, entry in enumerate(output)):
+                output.insert(min(index, len(output)), copy.deepcopy(item))
+        response["output"] = output
         if self.stream_extensions:
-            response["_loki_stream_extensions"] = (
-                self.stream_extensions)
+            response["_loki_stream_extensions"] = self.stream_extensions
         return response
 
     def finish(self):
@@ -1706,7 +1859,7 @@ def build_headers(protocol, anthropic_version="2023-06-01"):
 def make_provider(input_url, provider=AUTO, models_url=None,
                   max_tokens=4096, anthropic_version="2023-06-01",
                   provider_id=None, provider_name=None, prompt_cache=False,
-                  openai_request_profile=None):
+                  openai_request_profile=None, reasoning_field=None):
     protocol = resolve_protocol(input_url, provider)
     if (openai_request_profile is not None
             and not isinstance(
@@ -1760,4 +1913,5 @@ def make_provider(input_url, provider=AUTO, models_url=None,
         provider_name=provider_name,
         prompt_cache=prompt_cache,
         openai_request_profile=openai_request_profile,
+        reasoning_field=reasoning_field,
     )

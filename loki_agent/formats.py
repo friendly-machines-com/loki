@@ -328,6 +328,116 @@ def item_text(item):
     return blocks_text(item.get("content", []))
 
 
+def reasoning_field(value):
+    """Response-local display source; never a native continuation field."""
+    metadata = value.metadata if isinstance(value, DecodedTurn) else value
+    protocol_data = metadata.get("protocol_data") if isinstance(metadata, dict) else None
+    local = protocol_data.get("loki") if isinstance(protocol_data, dict) else None
+    source = local.get("reasoning_field") if isinstance(local, dict) else None
+    return source if source in ["reasoning_content", "reasoning", "reasoning_details"] else None
+
+
+def chat_reasoning_segments(fields, *, source=None):
+    """Project readable Chat-protocol reasoning fields.
+
+    Only documented readable fields are returned -- never signatures,
+    encrypted blobs, or other opaque provider data. ``source`` is the
+    catalog's interleaved-field hint when one is known; without it the
+    aggregate string aliases are preferred over typed details, so a
+    model that sends both is not projected twice.
+    """
+    if not isinstance(fields, dict):
+        return []
+    if source is None:
+        for name in ["reasoning_content", "reasoning"]:
+            if isinstance(fields.get(name), str) and fields[name]:
+                source = name
+                break
+    if source in ["reasoning_content", "reasoning"]:
+        text = fields.get(source)
+        if isinstance(text, str) and text:
+            return [(("chat", source, 0), "thinking", text)]
+        return []
+    if source is not None and source != "reasoning_details":
+        return []
+    details = fields.get("reasoning_details")
+    if not isinstance(details, list):
+        return []
+    result = []
+    for position, detail in enumerate(details):
+        if not isinstance(detail, dict):
+            continue
+        field = {
+            "reasoning.text": "text",
+            "reasoning.summary": "summary",
+        }.get(detail.get("type"))
+        text = detail.get(field) if field else None
+        if not isinstance(text, str) or not text:
+            continue
+        index = detail.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            index = position
+        result.append((
+            ("chat", "reasoning_details", index),
+            "summary" if field == "summary" else "thinking",
+            text,
+        ))
+    return result
+
+
+def reasoning_segments(items, *, source=None):
+    """Project readable reasoning from canonical items for display.
+
+    One projection shared by live delivery, buffered delivery, terminal
+    resume, and ACP replay, so every surface shows the same text.
+    Readable text only: native continuation data (signatures, encrypted
+    reasoning) is never returned. Keys are response-local display
+    identities shared with the streaming adapters.
+    """
+    segments = []
+    thinking_index = 0
+    for item_index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message" and item.get("role") == "assistant":
+            native = item.get("protocol_data")
+            native = native.get(OPENAI_CHAT) if isinstance(native, dict) else None
+            fields = native.get("fields") if isinstance(native, dict) else None
+            segments.extend(chat_reasoning_segments(fields, source=source))
+        elif item_type == "anthropic_thinking":
+            text = item.get("thinking")
+            if isinstance(text, str) and text:
+                segments.append((
+                    ("anthropic", thinking_index), "thinking", text))
+            thinking_index += 1
+        elif item_type == "openai_reasoning":
+            value = item.get("value")
+            if isinstance(value, dict):
+                identity = value.get("id")
+                if not isinstance(identity, str) or not identity:
+                    identity = item_index
+                for name in ["summary", "content"]:
+                    parts = value.get(name)
+                    if not isinstance(parts, list):
+                        continue
+                    for part_index, part in enumerate(parts):
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") not in [
+                                "summary_text", "reasoning_text", "text"]:
+                            continue
+                        text = part.get("text")
+                        if isinstance(text, str) and text:
+                            segments.append((
+                                ("responses", identity, name, part_index),
+                                "summary" if name == "summary" else "thinking",
+                                text,
+                            ))
+            thinking_index += 1
+    return segments
+
+
 def _parse_json_arguments(raw):
     if not isinstance(raw, str):
         return _copy(raw), None

@@ -205,8 +205,9 @@ class ResumeTranscriptRenderer:
     module importing terminal code.
     """
 
-    def __init__(self, assistant_label: str = "Assistant"):
+    def __init__(self, assistant_label: str = "Assistant", *, show_reasoning=False):
         self.assistant_label = assistant_label
+        self.show_reasoning = show_reasoning
 
     def _message_label(self, item: dict):
         role = item.get("role")
@@ -281,16 +282,14 @@ class ResumeTranscriptRenderer:
         return [("tool_error" if item.get("is_error") else "tool_result",
                  block)]
 
-    @staticmethod
-    def _reasoning_blocks(item: dict):
-        value = item.get("value", item)
-        summary = value.get("summary") if isinstance(value, dict) else None
-        if not summary:
+    def _reasoning_blocks(self, item: dict, response: dict):
+        if not self.show_reasoning:
             return []
         return [("reasoning", [
-            ("literal", "Reasoning summary:\n"),
-            ("text", pformat(summary, width=100)),
-        ])]
+            ("literal", "Reasoning summary:\n" if kind == "summary" else "Thinking:\n"),
+            ("text", text),
+        ]) for key, kind, text in formats.reasoning_segments(
+            [item], source=formats.reasoning_field(response))]
 
     @staticmethod
     def _native_item_blocks(item: dict, response_protocol=None):
@@ -365,15 +364,15 @@ class ResumeTranscriptRenderer:
         for item in event.get("items", []):
             item_type = item.get("type")
             if item_type == "message":
-                rendered = self._message_blocks(item, label=label)
+                rendered = self._reasoning_blocks(item, event) + self._message_blocks(item, label=label)
             elif item_type == "function_call":
                 rendered = self._tool_call_blocks(item)
             elif item_type == "openai_reasoning":
-                rendered = self._reasoning_blocks(item)
+                rendered = self._reasoning_blocks(item, event)
             elif item_type in [
                     "anthropic_thinking",
                     "anthropic_redacted_thinking"]:
-                rendered = []
+                rendered = self._reasoning_blocks(item, event)
             elif item_type in ["native_output", "provider_output"]:
                 rendered = self._native_item_blocks(
                     item, response_protocol=event.get("protocol"))

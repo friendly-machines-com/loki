@@ -57,20 +57,23 @@ def classify_message(item: dict):
     return blocks
 
 
-def classify_response_item(item: dict, response: dict):
+def classify_response_item(item: dict, response: dict, *, show_reasoning=False):
     """Classify one item inside a `model_response` event."""
     item_type = item.get("type")
+    thoughts = ([('thought', text, key)
+                 for key, kind, text in formats.reasoning_segments(
+                     [item], source=formats.reasoning_field(response))]
+                if show_reasoning else [])
     if item_type == "message":
-        return classify_message(item)
+        return thoughts + classify_message(item)
     if item_type == "function_call":
         name = formats.tool_call_name(item) or "<unknown>"
         return [("tool", name, item.get("call_id"))]
-    # Reasoning items and provider-internal outputs carry no
-    # user-visible conversation content.
-    return []
+    # Opaque continuation data is never part of the readable projection.
+    return thoughts
 
 
-def classify_response(event: dict):
+def classify_response(event: dict, *, show_reasoning=False):
     """Classify a `model_response` event into replay tuples."""
     blocks = []
     # Provider notices are persisted for terminal replay but ACP has no
@@ -81,7 +84,7 @@ def classify_response(event: dict):
             "agent", f"[Model response {status}]",
             ("response", event.get("model") or "")))
     for item in event.get("items", []):
-        blocks.extend(classify_response_item(item, event))
+        blocks.extend(classify_response_item(item, event, show_reasoning=show_reasoning))
     return blocks
 
 
@@ -94,13 +97,13 @@ def classify_tool_result(item: dict):
              item.get("call_id"))]
 
 
-def classify_event(event: dict):
+def classify_event(event: dict, *, show_reasoning=False):
     """Classify one canonical transcript event into replay tuples."""
     event_type = event.get("type")
     if event_type == "message":
         return classify_message(event)
     if event_type == "model_response":
-        return classify_response(event)
+        return classify_response(event, show_reasoning=show_reasoning)
     if event_type == "tool_result":
         return classify_tool_result(event)
     # Unknown event types become visible text rather than being dropped.
@@ -111,9 +114,9 @@ def classify_event(event: dict):
              ("session_event", str(event_type)))]
 
 
-def classify_transcript(events: list):
+def classify_transcript(events: list, *, show_reasoning=False):
     """Classify a full transcript into a flat list of replay tuples."""
     blocks = []
     for event in events:
-        blocks.extend(classify_event(event))
+        blocks.extend(classify_event(event, show_reasoning=show_reasoning))
     return blocks

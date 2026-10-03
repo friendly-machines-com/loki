@@ -700,6 +700,8 @@ class RuntimeConfig:
     context_capacity: usages.ContextCapacity | None = None
     reasoning_effort_profile: (
         modelsdev.ReasoningEffortProfile | None) = None
+    reasoning_capabilities: (
+        modelsdev.ReasoningCapabilities | None) = None
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
@@ -781,7 +783,8 @@ def make_runtime_config(
         auth_header=None, auth_scheme=None, provider_id=None,
         provider_name=None, credential_ref=None, model_status=None,
         stream=False, prompt_cache=False, openai_request_profile=None,
-        reasoning_effort_profile=None, context_capacity=None):
+        reasoning_effort_profile=None, context_capacity=None,
+        reasoning_capabilities=None):
     """Build a RuntimeConfig (and its Provider) from explicit parameters.
 
     The single place a production Provider is constructed. Startup reads the
@@ -798,6 +801,12 @@ def make_runtime_config(
                 modelsdev.ReasoningEffortProfile)):
         raise ValueError(
             "reasoning_effort_profile must be ReasoningEffortProfile or null")
+    if (reasoning_capabilities is not None
+            and not isinstance(
+                reasoning_capabilities,
+                modelsdev.ReasoningCapabilities)):
+        raise ValueError(
+            "reasoning_capabilities must be ReasoningCapabilities or null")
     chat_provider = protocols.make_provider(
         url,
         provider=provider_kind,
@@ -808,6 +817,9 @@ def make_runtime_config(
         provider_name=provider_name,
         prompt_cache=prompt_cache,
         openai_request_profile=openai_request_profile,
+        reasoning_field=(
+            reasoning_capabilities.interleaved_field
+            if reasoning_capabilities is not None else None),
     )
     if (reasoning_effort_profile is not None
             and not protocols.reasoning_effort_supported(
@@ -839,6 +851,7 @@ def make_runtime_config(
         stream=stream,
         reasoning_effort_profile=reasoning_effort_profile,
         context_capacity=context_capacity,
+        reasoning_capabilities=reasoning_capabilities,
     )
 
 
@@ -3584,13 +3597,17 @@ async def run_tool_loop_async(
                 if name in allowed
             ])
 
-        def chat_fn(items, *, codex_turn_state):
+        def chat_fn(items, on_text_delta=None, *, codex_turn_state, on_reasoning_delta=None):
             kwargs = {
                 "tools": advertised_tools,
                 "codex_turn_state": codex_turn_state,
                 "reasoning_effort": reasoning_effort,
                 "thinking": thinking,
             }
+            if on_text_delta is not None:
+                kwargs["on_text_delta"] = on_text_delta
+            if on_reasoning_delta is not None:
+                kwargs["on_reasoning_delta"] = on_reasoning_delta
             if completion_cancel_check is not None:
                 kwargs["cancel_check"] = completion_cancel_check
             return async_chat_completion(items, **kwargs)
@@ -3630,11 +3647,34 @@ async def run_tool_loop_async(
         loop_count += 1
         live_text_started = False
         live_text_parts = []
+        live_reasoning = {}
+        open_reasoning = None
+
+        def close_reasoning(complete=True, reason=None):
+            nonlocal open_reasoning
+            if open_reasoning is not None:
+                on_event({"type": "reasoning_end", "key": open_reasoning,
+                          "complete": complete, "reason": reason})
+                open_reasoning = None
+
+        def on_reasoning_delta(key, kind, text):
+            nonlocal open_reasoning
+            if thinking.traces != "on" or not text:
+                return
+            if open_reasoning != key:
+                close_reasoning()
+                if live_text_started:
+                    finish_live_text(True)
+                open_reasoning = key
+                on_event({"type": "reasoning_start", "key": key, "kind": kind})
+            live_reasoning[key] = live_reasoning.get(key, "") + text
+            on_event({"type": "reasoning_delta", "key": key, "kind": kind, "text": text})
 
         def on_text_delta(text):
             nonlocal live_text_started
             if not text:
                 return
+            close_reasoning()
             live_text_parts.append(text)
             if not live_text_started:
                 live_text_started = True
@@ -3642,20 +3682,23 @@ async def run_tool_loop_async(
             on_event({"type": "assistant_delta", "content": text})
 
         def finish_live_text(complete, reason=None):
+            nonlocal live_text_started
+            close_reasoning(complete, reason)
             if live_text_started:
                 on_event({
                     "type": "assistant_end",
                     "complete": complete,
                     "reason": reason,
                 })
+                live_text_started = False
 
         request_start = time.perf_counter()
         try:
             if stream_chat:
-                response_items = await chat_fn(
-                    transcript_items,
-                    on_text_delta,
-                    codex_turn_state=codex_turn_state)
+                stream_kwargs = {"codex_turn_state": codex_turn_state}
+                if thinking.traces == "on":
+                    stream_kwargs["on_reasoning_delta"] = on_reasoning_delta
+                response_items = await chat_fn(transcript_items, on_text_delta, **stream_kwargs)
             else:
                 response_items = await chat_fn(
                     transcript_items,
@@ -3664,7 +3707,7 @@ async def run_tool_loop_async(
             finish_live_text(False, "cancelled")
             on_event({
                 "type": "response_cancelled",
-                "partial": live_text_started,
+                "partial": bool(live_text_parts or live_reasoning),
                 "saved": False,
             })
             return ""
@@ -3673,7 +3716,7 @@ async def run_tool_loop_async(
                 finish_live_text(False, "cancelled")
                 on_event({
                     "type": "response_cancelled",
-                    "partial": live_text_started,
+                    "partial": bool(live_text_parts or live_reasoning),
                     "saved": False,
                 })
                 return ""
@@ -3685,7 +3728,7 @@ async def run_tool_loop_async(
                 finish_live_text(False, "cancelled")
                 on_event({
                     "type": "response_cancelled",
-                    "partial": live_text_started,
+                    "partial": bool(live_text_parts or live_reasoning),
                     "saved": False,
                 })
                 return ""
@@ -3697,7 +3740,7 @@ async def run_tool_loop_async(
                 finish_live_text(False, "cancelled")
                 on_event({
                     "type": "response_cancelled",
-                    "partial": live_text_started,
+                    "partial": bool(live_text_parts or live_reasoning),
                     "saved": False,
                 })
                 return ""
@@ -3709,7 +3752,7 @@ async def run_tool_loop_async(
                 finish_live_text(False, "cancelled")
                 on_event({
                     "type": "response_cancelled",
-                    "partial": live_text_started,
+                    "partial": bool(live_text_parts or live_reasoning),
                     "saved": False,
                 })
                 return ""
@@ -3721,7 +3764,7 @@ async def run_tool_loop_async(
                 finish_live_text(False, "cancelled")
                 on_event({
                     "type": "response_cancelled",
-                    "partial": live_text_started,
+                    "partial": bool(live_text_parts or live_reasoning),
                     "saved": False,
                 })
                 return ""
@@ -3733,7 +3776,7 @@ async def run_tool_loop_async(
                 finish_live_text(False, "cancelled")
                 on_event({
                     "type": "response_cancelled",
-                    "partial": live_text_started,
+                    "partial": bool(live_text_parts or live_reasoning),
                     "saved": False,
                 })
                 return ""
@@ -3741,15 +3784,25 @@ async def run_tool_loop_async(
             msg = str(e) or f"{type(e).__name__}() (errno={e.errno!r}, no OS message)"
             on_event({"type": "network_error", "error": msg})
             return ""
+        except BaseException:
+            finish_live_text(False, "cancelled" if cancel_check() else "error")
+            raise
         if cancel_check():
             finish_live_text(False, "cancelled")
             on_event({
                 "type": "response_cancelled",
-                "partial": live_text_started,
+                "partial": bool(live_text_parts or live_reasoning),
                 "saved": False,
             })
             return ""
         turn = formats.coerce_decoded_turn(response_items)
+        buffered_reasoning = thinking.traces == "on" and not (live_reasoning or live_text_parts)
+        if thinking.traces == "on" and not buffered_reasoning:
+            source = next((key[1] for key in live_reasoning if key[0] == "chat"), formats.reasoning_field(turn))
+            for key, kind, text in formats.reasoning_segments(turn.items, source=source):
+                delivered = live_reasoning.get(key, "")
+                if text.startswith(delivered) and len(text) > len(delivered):
+                    on_reasoning_delta(key, kind, text[len(delivered):])
         finish_live_text(turn.complete, None if turn.complete else "incomplete")
         if report_timing:
             on_event({
@@ -3763,6 +3816,19 @@ async def run_tool_loop_async(
                 "code": notice_code,
             })
 
+        buffered_answer_displayed = False
+        if buffered_reasoning:
+            for index, item in enumerate(turn.items):
+                for key, kind, text in formats.reasoning_segments([item], source=formats.reasoning_field(turn)):
+                    on_reasoning_delta(("buffered", index, key), kind, text)
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    text = formats.item_text(item)
+                    if text:
+                        close_reasoning(turn.complete)
+                        on_event({"type": "assistant_message", "content": text})
+                        buffered_answer_displayed = True
+            close_reasoning(turn.complete)
+
         tool_calls = formats.response_tool_calls(turn.items)
         assistant_items = [
             item for item in turn.items
@@ -3772,7 +3838,7 @@ async def run_tool_loop_async(
             text for text in (
                 formats.item_text(item) for item in assistant_items)
             if text)
-        if assistant_text and not live_text_started:
+        if assistant_text and not live_text_parts and not buffered_answer_displayed:
             on_event({"type": "assistant_message", "content": assistant_text})
 
         if _turn_is_refusal(turn):
@@ -3837,7 +3903,7 @@ async def run_tool_loop_async(
             append_unexecuted_results(tool_calls, reason)
             on_event({
                 "type": "response_cancelled",
-                "partial": live_text_started,
+                "partial": bool(live_text_parts or live_reasoning),
                 "saved": True,
             })
             return assistant_text
@@ -5353,7 +5419,7 @@ async def _first_body_chunk(iterator, cancel_check):
 
 async def _async_chat_stream_request_once(
         request_url, payload, request_headers, on_text_delta, cancel_check,
-        codex_turn_state=None, observe=None) -> protocols.ProviderResponse:
+        codex_turn_state=None, observe=None, on_reasoning_delta=None) -> protocols.ProviderResponse:
     body = json.dumps(payload).encode("utf-8")
     async with http_client.async_http_stream(
             "POST",
@@ -5413,7 +5479,7 @@ async def _async_chat_stream_request_once(
                     f"{e}") from e
 
         accumulator = current_config().chat_provider.stream_accumulator(
-            on_text_delta)
+            on_text_delta, on_reasoning_delta)
 
         def observed_model():
             return (
@@ -5428,6 +5494,7 @@ async def _async_chat_stream_request_once(
                     return protocols.ProviderResponse(
                         accumulator.finish(),
                         effective_model=observed_model(),
+                        reasoning_field=getattr(accumulator, "reasoning_field", None),
                         notice_codes=tuple(
                             getattr(accumulator, "notice_codes", ())),
                     )
@@ -5443,6 +5510,7 @@ async def _async_chat_stream_request_once(
                         return protocols.ProviderResponse(
                             accumulator.finish(),
                             effective_model=observed_model(),
+                            reasoning_field=getattr(accumulator, "reasoning_field", None),
                             notice_codes=tuple(
                                 getattr(
                                     accumulator, "notice_codes", ())),
@@ -5452,6 +5520,7 @@ async def _async_chat_stream_request_once(
                     return protocols.ProviderResponse(
                         accumulator.finish(),
                         effective_model=observed_model(),
+                        reasoning_field=getattr(accumulator, "reasoning_field", None),
                         notice_codes=tuple(
                             getattr(accumulator, "notice_codes", ())),
                     )
@@ -5472,6 +5541,7 @@ async def _async_chat_stream_request_once(
         return protocols.ProviderResponse(
             accumulator.finish(),
             effective_model=observed_model(),
+            reasoning_field=getattr(accumulator, "reasoning_field", None),
             notice_codes=tuple(
                 getattr(accumulator, "notice_codes", ())),
         )
@@ -5482,11 +5552,24 @@ async def async_chat_stream_request(
         on_text_delta=None, cancel_check=None,
         report_errors: bool = False, show_timing: bool = False,
         codex_turn_state=None,
-        opencode_session_id=None) -> protocols.ProviderResponse:
+        opencode_session_id=None, on_reasoning_delta=None) -> protocols.ProviderResponse:
     start = time.perf_counter()
     config = current_config()
     observe = _chat_response_observer(config, request_url)
-    callback = on_text_delta or (lambda text: None)
+    output_started = False
+
+    def callback(text):
+        nonlocal output_started
+        output_started = output_started or bool(text)
+        if on_text_delta is not None:
+            on_text_delta(text)
+
+    def reasoning_callback(key, kind, text):
+        nonlocal output_started
+        output_started = output_started or bool(text)
+        if on_reasoning_delta is not None:
+            on_reasoning_delta(key, kind, text)
+
     cancel = cancel_check or (lambda: False)
     turn_state = _codex_turn_state_for_request(
         config, request_url, codex_turn_state)
@@ -5522,9 +5605,11 @@ async def async_chat_stream_request(
         _prepare_codex_turn_headers(headers_to_use, turn_state)
         transport_attempt += 1
         try:
+            stream_kwargs = {"codex_turn_state": turn_state, "observe": observe}
+            if on_reasoning_delta is not None:
+                stream_kwargs["on_reasoning_delta"] = reasoning_callback
             response = await _async_chat_stream_request_once(
-                request_url, payload, headers_to_use, callback, cancel,
-                codex_turn_state=turn_state, observe=observe)
+                request_url, payload, headers_to_use, callback, cancel, **stream_kwargs)
             break
         except http_client.HttpRequestCancelled:
             raise StreamCancelled()
@@ -5543,7 +5628,7 @@ async def async_chat_stream_request(
             retryable_response_error = (
                 isinstance(exc, protocols.ResponseApiError)
                 and exc.retryable)
-            if (transport_attempt >= HTTP_RETRY_MAX_ATTEMPTS_LLM
+            if (output_started or transport_attempt >= HTTP_RETRY_MAX_ATTEMPTS_LLM
                     or not (
                         retryable_response_error
                         or http_client.is_transient_error(exc))):
@@ -5577,6 +5662,7 @@ async def async_chat_stream_request(
 async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
                                 show_timing: bool = False,
                                 on_text_delta=None,
+                                on_reasoning_delta=None,
                                 cancel_check=None,
                                 codex_turn_state=None,
                                 reasoning_effort=_UNSET,
@@ -5603,6 +5689,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             "reasoning effort is not supported by the selected model")
     effective_model = current_model()
     notice_codes = ()
+    reasoning_source = current_config().chat_provider.reasoning_field
 
     if current_config().chat_provider.kind == protocols.DUMMY:
         # No-op LLM for testing: never touches the network.  The reply is a
@@ -5706,6 +5793,8 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
             "report_errors": report_errors,
             "show_timing": False,
         }
+        if on_reasoning_delta is not None:
+            request_kwargs["on_reasoning_delta"] = on_reasoning_delta
         if codex_turn_state is not None:
             request_kwargs["codex_turn_state"] = codex_turn_state
         if opencode_session_id is not None:
@@ -5718,6 +5807,7 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
         data = response.payload
         effective_model = response.effective_model or effective_model
         notice_codes = response.notice_codes
+        reasoning_source = response.reasoning_field or reasoning_source
     else:
         payload = current_config().chat_provider.chat_payload(
             transcript_items,
@@ -5782,12 +5872,14 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     turn.metadata["model"] = effective_model
     turn.metadata["requested_model"] = current_model()
     turn.metadata["protocol"] = current_config().chat_provider.kind
+    if reasoning_source in ["reasoning", "reasoning_content", "reasoning_details"]:
+        native = copy.deepcopy(turn.metadata.get("protocol_data") or {})
+        native.setdefault("loki", {})["reasoning_field"] = reasoning_source
+        turn.metadata["protocol_data"] = native
     if notice_codes:
         protocol_data = copy.deepcopy(
             turn.metadata.get("protocol_data") or {})
-        protocol_data["loki"] = {
-            "provider_notices": list(notice_codes),
-        }
+        protocol_data.setdefault("loki", {})["provider_notices"] = list(notice_codes)
         turn.metadata["protocol_data"] = protocol_data
     return turn
 
