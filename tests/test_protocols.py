@@ -563,6 +563,48 @@ class NativeIdentityTests(unittest.TestCase):
                 self.assertIsNone(provider.thinking_default_mode("glm-5.2"))
 
 
+class ContractOwnershipTests(unittest.TestCase):
+    def test_returned_modes_cannot_modify_active_contract(self):
+        for url, model, rejected in [
+                ["https://api.anthropic.com/v1/messages", "claude-opus-4-7", "manual"],
+                ["https://api.z.ai/api/paas/v4/chat/completions", "glm-5.3", "off"]]:
+            provider = protocols.make_provider(url)
+            published = provider.thinking_modes(model)
+            published.append(rejected)
+            with self.subTest(model=model), self.assertRaises(protocols.ProtocolError):
+                provider.thinking_control_status(model, "mode", rejected)
+
+    def test_gateway_uses_standard_spelling_without_native_facts(self):
+        provider = protocols.make_provider(
+            "https://relay.example/v1/chat/completions", provider_id="openrouter")
+        self.assertTrue(protocols.reasoning_effort_supported(
+            "openrouter", protocols.OPENAI_CHAT, provider.chat_url))
+        self.assertEqual(provider.chat_payload([], None, "model", reasoning_effort="high")[
+            "reasoning_effort"], "high")
+        messages = protocols.make_provider(
+            "https://relay.example/v1/messages", provider=protocols.ANTHROPIC_MESSAGES)
+        self.assertEqual(messages.thinking_control_status("claude-opus-4-7", "mode", "manual"), "trial")
+        self.assertEqual(messages.thinking_control_status("claude-opus-4-7", "budget", 2048), "trial")
+        self.assertEqual(messages.thinking_modes("claude-opus-4-7"), [])
+        self.assertIsNone(messages.thinking_default_mode("claude-opus-5-5"))
+
+    def test_model_name_alone_cannot_import_claude_effort_ceiling(self):
+        provider = protocols.make_provider("https://api.z.ai/api/paas/v4/chat/completions")
+        self.assertEqual(provider.thinking_control_status("claude-opus-5", "mode", "off"), "trial")
+        payload = provider.chat_payload([], None, "claude-opus-5", thinking_mode="off", reasoning_effort="xhigh")
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+
+    def test_documented_family_rule_does_not_extrapolate_versions_or_gateways(self):
+        provider = protocols.make_provider("https://api.openai.com/v1", provider=protocols.OPENAI_RESPONSES)
+        for model in ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-variant"]:
+            self.assertEqual(provider.reasoning_preservation(model), "all_turns")
+        for model in ["gpt-5.60", "gpt-5.7", "gpt-5.5"]:
+            self.assertIsNone(provider.reasoning_preservation(model))
+        gateway = protocols.make_provider("https://relay.example/v1", provider=protocols.OPENAI_RESPONSES,
+                                          provider_id="openai")
+        self.assertIsNone(gateway.reasoning_preservation("gpt-5.6"))
+
+
 class ClaudeThinkingContractTests(unittest.TestCase):
     def provider(self, **kwargs):
         return protocols.make_provider(

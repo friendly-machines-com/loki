@@ -277,10 +277,14 @@ _ANTHROPIC_ADAPTIVE_DEFAULT_MODELS = [
 # Documented effort ceilings for low-thinking modes: Opus 5 accepts
 # thinking.type "disabled" only at effort "high" or below, and Sonnet 5.5
 # accepts "between_tools" only at "high" or below (same source pages).
-_ANTHROPIC_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
-_ANTHROPIC_MODE_EFFORT_CEILINGS: dict[str, dict[str, str]] = {
-    "claude-opus-5": {"off": "high"},
-    "claude-sonnet-5-5": {"between-tools": "high"},
+_REASONING_MODE_EFFORT_LIMITS = {
+    "anthropic": {
+        "order": ["low", "medium", "high", "xhigh", "max"],
+        "models": {
+            "claude-opus-5": {"off": "high"},
+            "claude-sonnet-5-5": {"between-tools": "high"},
+        },
+    },
 }
 
 # GLM disablement facts. Source: docs.z.ai/api-reference/llm/
@@ -299,17 +303,15 @@ _GLM_DEFAULT_MODES: dict[str, str] = {
     "glm-5.3-flash": "on",
 }
 
-# Cross-turn reasoning reuse on the public Responses API. Source:
-# developers.openai.com/api/docs/guides/reasoning (checked 2026-10):
-# "The GPT-5.6 model family supports all_turns and uses it by default.
-# Earlier models default to current_turn. GPT-6.1 Sol also supports
-# all_turns." Exact documented identifiers only; no family-prefix
-# extrapolation. The legacy reasoning.encrypted_content include is not
-# required and is not sent.
-_OPENAI_ALL_TURNS_MODELS = [
-    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra",
-    "gpt-5.6-luna", "gpt-6.1-sol",
-]
+# Public Responses reuse: developers.openai.com/api/docs/guides/reasoning
+# (checked 2026-10). The documented GPT-5.6 family is one version family,
+# including its variants, not an extrapolation to GPT-5.7 or GPT-5.60.
+_REASONING_PRESERVATION = {
+    "openai": {"control": "all_turns", "families": ["gpt-5.6"], "models": ["gpt-6.1-sol"]},
+    # docs.z.ai/api-reference/llm/chat-completion: historical clearing only.
+    "zai": {"control": "clear_thinking"},
+    "zhipuai": {"control": "clear_thinking"},
+}
 
 
 def _codex_reasoning_parameter(profile, reasoning_effort=None):
@@ -458,9 +460,9 @@ class Provider:
         or mode control documented", not unknown."""
         identity = self.reasoning_provider_id
         if identity == "anthropic":
-            return _ANTHROPIC_THINKING_MODES.get(model, [])
+            return _ANTHROPIC_THINKING_MODES.get(model, []).copy()
         if identity in ["zai", "zhipuai"]:
-            return _GLM_THINKING_MODES.get(model, [])
+            return _GLM_THINKING_MODES.get(model, []).copy()
         if identity == "sarvam":
             # The documented off control; "on" has no verified spelling.
             return ["off"]
@@ -529,6 +531,8 @@ class Provider:
                 raise ProtocolError(
                     "no verified thinking-allowance request spelling for "
                     "this connection")
+            if identity != "anthropic":
+                return "trial"
             modes = _ANTHROPIC_THINKING_MODES.get(model)
             if modes is None:
                 return "trial"
@@ -542,13 +546,15 @@ class Provider:
     def reasoning_preservation(self, model):
         """The provider-side reuse control documented for this connection,
         or None when reuse has no verified request spelling."""
-        identity = self.reasoning_provider_id
-        if identity in ["zai", "zhipuai"]:
-            # clear_thinking governs historical reasoning only; it never
-            # selects current-turn enablement.
-            return "clear_thinking"
-        if identity == "openai" and model in _OPENAI_ALL_TURNS_MODELS:
-            return "all_turns"
+        rule = _REASONING_PRESERVATION.get(self.reasoning_provider_id)
+        if rule is None:
+            return None
+        if "families" not in rule and "models" not in rule:
+            return rule["control"]
+        if model in rule.get("models", []):
+            return rule["control"]
+        if any(model == family or model.startswith(family + "-") for family in rule.get("families", [])):
+            return rule["control"]
         return None
 
     def validate_thinking(
@@ -576,10 +582,11 @@ class Provider:
                     "below the output limit")
         elif budget is not None:
             raise ProtocolError("a thinking budget requires manual mode")
-        ceiling = _ANTHROPIC_MODE_EFFORT_CEILINGS.get(model, {}).get(mode)
-        if (ceiling is not None and effort in _ANTHROPIC_EFFORT_ORDER
-                and _ANTHROPIC_EFFORT_ORDER.index(effort)
-                > _ANTHROPIC_EFFORT_ORDER.index(ceiling)):
+        limits = _REASONING_MODE_EFFORT_LIMITS.get(self.reasoning_provider_id, {})
+        order = limits.get("order", [])
+        ceiling = limits.get("models", {}).get(model, {}).get(mode)
+        if (ceiling is not None and effort in order
+                and order.index(effort) > order.index(ceiling)):
             raise ProtocolError(
                 "this thinking mode requires effort high or below")
         if retention not in ["default", "preserve"]:
