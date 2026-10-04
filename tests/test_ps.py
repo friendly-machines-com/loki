@@ -34,6 +34,29 @@ class PsTests(unittest.TestCase):
         self.manager.jobs[job_id] = job
         return job
 
+    def test_job_changes_notify_after_the_state_is_updated(self):
+        job = self.add_job("1", "running")
+        observed = []
+        self.manager.on_change = lambda: observed.append(job.status)
+        with mock.patch.object(loki.host_process, "signal_group"):
+            loki.run_ps("stop 1")
+        job.process.returncode = -15
+        self.manager._refresh_job(job)
+        self.assertEqual(observed, ["stopping", "stopped"])
+
+    def test_display_failure_does_not_replace_job_or_metadata_outcomes(self):
+        job = self.add_job("1", "running")
+        self.manager.on_change = mock.Mock(side_effect=RuntimeError("display failed"))
+        job.process.returncode = 0
+        with self.assertLogs("loki_agent.loki", level="ERROR"):
+            self.manager._refresh_job(job)
+        self.assertEqual(job.status, "exited")
+        self.assertEqual(job.exit_code, 0)
+        with mock.patch.object(loki, "_atomic_write_text", side_effect=OSError("metadata failed")), \
+                self.assertLogs("loki_agent.loki", level="ERROR"), \
+                self.assertRaisesRegex(OSError, "metadata failed"):
+            self.manager._write_metadata(job)
+
     def listed_ids(self, text):
         return [line.split(".", 1)[0] for line in text.splitlines()
                 if line.partition(". ")[0].isdecimal()]

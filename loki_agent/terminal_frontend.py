@@ -9,6 +9,7 @@ log machinery -- importing it no longer touches the tty.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import getopt
 import json
 import logging
@@ -88,6 +89,14 @@ from .terminals import (
 logger = logging.getLogger(__name__)
 
 
+def _redraw_status():
+    try:
+        terminals.redraw_status_bar()
+    except (AssertionError, OSError):
+        # A display failure must not interrupt input, jobs, or the turn loop.
+        pass
+
+
 def _image_command_path(command_text: str) -> str:
     return attachments.image_argument_path(command_text[len("/image"):])
 
@@ -102,12 +111,7 @@ class TerminalActivityStatus:
         if getattr(self, field_name) == value:
             return
         setattr(self, field_name, value)
-        try:
-            terminals.redraw_status_bar()
-        except (AssertionError, OSError):
-            # Activity state is authoritative; a transient tiny terminal or
-            # output error must not undo the state transition.
-            pass
+        _redraw_status()
 
     def set_turn_running(self, running: bool):
         self._set("turn_running", bool(running))
@@ -402,28 +406,21 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         return await async_chat_completion(
             items, active_tools, True, False, **kwargs)
 
-    def redraw_status():
-        try:
-            terminals.redraw_status_bar()
-        except (AssertionError, OSError):
-            # A display failure must not interrupt the response/tool loop.
-            pass
-
     def on_response(turn, event):
         _remember_session_toolset(active_tools)
         current_session().context_snapshot(live=True)
-        redraw_status()
+        _redraw_status()
 
     def on_event(event):
         if turn_events is not None:
             turn_events.append(event)
         if event.get("type") in ("tool_result", "response_cancelled", "max_loops"):
-            redraw_status()
+            _redraw_status()
         _terminal_agent_event(event)
 
     # The user/mode input has already been appended: the old report is stale
     # during this request, even before the first response or tool result.
-    redraw_status()
+    _redraw_status()
     return await run_tool_loop_async(
         transcript_items,
         allowed=mode_tools if read_only else None,
@@ -509,7 +506,19 @@ def _write_status_text():
             print(terminals.BOLD_OFF, end="")
     print(", mode: ", end="")
     terminal.write_text(fields["mode"])
-    print("; /pwd, /cd DIR, /ps, /image PATH, !foo, /quit", end="")
+    manager = current_session().job_manager
+    # The reaper can lag a process exit. Read returncode without refreshing
+    # job metadata from the renderer.
+    has_running_jobs = manager is not None and any(
+        job.status == "running" and job.process.returncode is None
+        for job in manager.jobs.values())
+    print("; /pwd, /cd DIR, ", end="")
+    if has_running_jobs:
+        print(terminals.BOLD, end="")
+    print("/ps", end="")
+    if has_running_jobs:
+        print(terminals.BOLD_OFF, end="")
+    print(", /image PATH, !foo, /quit", end="")
 
 
 terminals.set_status_text_provider(_write_status_text)
@@ -870,7 +879,12 @@ async def async_main(args) -> int:
             history_provider=lambda: user_prompt_history(
                 current_transcript()),
             on_queue_size_change=(
-                _terminal_activity.set_queued_prompts)) as session:
+                _terminal_activity.set_queued_prompts)) as session, contextlib.AsyncExitStack() as status_cleanup:
+        # Background exits can occur without input or tool-result events.
+        # Detach this display observer before terminal input ownership ends.
+        manager = _core.current_job_manager()
+        status_cleanup.callback(setattr, manager, "on_change", manager.on_change)
+        manager.on_change = _redraw_status
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel

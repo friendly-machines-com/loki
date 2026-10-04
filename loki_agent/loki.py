@@ -1857,6 +1857,8 @@ class JobManager:
         self.jobs = {}
         self._counter = 0
         self._active_subagents = 0
+        # A local synchronous observer, bound only while a frontend owns it.
+        self.on_change = None
 
     def _reserve_subagent_slot(self, job: Job):
         # This check-and-increment contains no await and JobManager belongs to
@@ -1910,7 +1912,16 @@ class JobManager:
         }
 
     def _write_metadata(self, job: Job):
-        _atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
+        try:
+            _atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
+        finally:
+            # State has already changed, even if persistence failed. Display
+            # errors must neither change the job outcome nor mask an IO error.
+            if self.on_change is not None:
+                try:
+                    self.on_change()
+                except Exception:
+                    logging.getLogger(__name__).exception("Job status observer failed")
 
     @staticmethod
     def _close_owner_signal(job: Job):

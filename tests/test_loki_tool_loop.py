@@ -421,6 +421,35 @@ class TerminalImageCommandTests(unittest.TestCase):
         self.assertFalse(
             terminal_frontend._terminal_activity.turn_running)
 
+    def test_job_redraw_observer_is_scoped_to_terminal_input(self):
+        for fail in [False, True]:
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                manager = loki.JobManager(directory)
+                previous = mock.Mock()
+                manager.on_change = previous
+                loki.current_session().job_manager = manager
+                with mock.patch.object(terminals, "redraw_status_bar") as redraw:
+                    async def turn(_items, **_kwargs):
+                        before = redraw.call_count
+                        manager.on_change()
+                        self.assertEqual(redraw.call_count, before + 1)
+                        if fail:
+                            raise RuntimeError("turn failed")
+                        return ""
+
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "turn failed"):
+                            self._run_terminal(["test"], directory, turn_runner=turn)
+                    else:
+                        self.assertEqual(self._run_terminal(
+                            ["test", "/quit"], directory, turn_runner=turn)[0], 0)
+                    previous.assert_not_called()
+                    self.assertIs(manager.on_change, previous)
+                    redraw.reset_mock()
+                    manager.on_change()
+                    previous.assert_called_once_with()
+                    redraw.assert_not_called()
+
     def test_turn_status_resets_after_unexpected_failure(self):
         observed = []
 
@@ -2641,6 +2670,48 @@ class StatusTextTests(unittest.TestCase):
                 self.assertNotIn("\033[0m", rendered)
                 self.assertNotIn("\033[", terminal_frontend.status_text(activity))
 
+    def test_ps_bold_tracks_running_jobs_and_stops_at_the_command(self):
+        finished = types.SimpleNamespace(
+            status="exited", process=types.SimpleNamespace(returncode=0))
+        for state, returncode, bold in [
+                ["starting", None, False], ["running", None, True],
+                ["running", 0, False], ["running", 42, False],
+                ["stopping", None, False], ["failed", None, False],
+                ["exited", 0, False], ["signaled", -15, False],
+                ["timed_out", -15, False]]:
+            with self.subTest(state=state, returncode=returncode):
+                job = types.SimpleNamespace(
+                    status=state, process=types.SimpleNamespace(returncode=returncode))
+                session = loki.Session(job_manager=types.SimpleNamespace(
+                    jobs={"1": finished, "2": job}))
+                activity = terminal_frontend.TerminalActivityStatus()
+                with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                        mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    terminal_frontend._write_status_text()
+                    plain = terminal_frontend.status_text()
+                rendered = output.getvalue()
+                expected = "\033[1m/ps\033[22m" if bold else "/ps"
+                self.assertIn(f", {expected}, /image PATH", rendered)
+                self.assertEqual(rendered.count("\033[1m"), int(bold))
+                self.assertEqual(
+                    rendered.replace("\033[1m", "").replace("\033[22m", ""), plain)
+                self.assertNotIn("\033[0m", rendered)
+
+    def test_ps_is_plain_without_a_job_manager_or_with_no_jobs(self):
+        for manager in [None, types.SimpleNamespace(jobs={})]:
+            with self.subTest(manager=manager):
+                session = loki.Session(job_manager=manager)
+                with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                        mock.patch.object(terminal_frontend, "_terminal_activity",
+                                          terminal_frontend.TerminalActivityStatus()), \
+                        mock.patch.object(loki, "current_job_manager",
+                                          side_effect=AssertionError("status must not create jobs")), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    terminal_frontend._write_status_text()
+                self.assertIn(", /ps, /image PATH", output.getvalue())
+                self.assertNotIn("\033[1m/ps", output.getvalue())
+
     def test_remote_side_advertises_status_with_and_without_effort(self):
         for effort in (None, "high"):
             with self.subTest(effort=effort), mock.patch.object(
@@ -2754,6 +2825,84 @@ class StatusTextTests(unittest.TestCase):
             "Local: CWD: /tmp/unsafe^[[2J^Jnext, turn: ", displayed)
         self.assertNotIn("\x1b", displayed)
         self.assertEqual(displayed.count("\n"), 1)
+
+
+@unittest.skipUnless(os.name == "posix", "requires a POSIX pseudo-terminal")
+class TerminalJobStatusTtyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_background_job_unbolds_ps_without_further_input(self):
+        await self._exercise_job(background=True)
+
+    async def test_foreground_job_repaints_ps_while_the_turn_is_running(self):
+        await self._exercise_job(background=False)
+
+    async def _exercise_job(self, background):
+        import fcntl
+        import pty
+        import struct
+        import termios
+        from process_lifecycle_fixtures import ProcessResources
+
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 240, 0, 0))
+
+        def child_setup():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader()
+        transport, _protocol = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader),
+            os.fdopen(master, "rb", buffering=0))
+        process = None
+        resources = None
+        with tempfile.TemporaryDirectory() as directory:
+            environment = child_environment(
+                PATH=os.environ.get("PATH", ""), HOME=directory,
+                XDG_CONFIG_HOME=os.path.join(directory, "config"),
+                XDG_STATE_HOME=os.path.join(directory, "state"),
+                TERM="xterm-256color", LOKI_API_BASE="http://dummy.invalid/v1",
+                LOKI_PROVIDER="dummy", LOKI_MODEL="dummy",
+                LOKI_DUMMY_TOOL_CALL=json.dumps({
+                    "name": "Bash", "arguments": {
+                        "command": "sleep 2", "run_in_background": background}}))
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    entrypoint("loki"), "--dangerously-skip-permissions",
+                    stdin=slave, stdout=slave, stderr=slave,
+                    cwd=directory, env=environment, preexec_fn=child_setup)
+                resources = ProcessResources(process)
+                os.close(slave)
+                slave = None
+
+                async def read_until(marker):
+                    captured = bytearray()
+                    try:
+                        async with asyncio.timeout(10):
+                            while marker not in captured:
+                                chunk = await reader.read(65536)
+                                self.assertTrue(chunk, captured.decode("utf-8", errors="replace"))
+                                captured.extend(chunk)
+                    except TimeoutError:
+                        self.fail("No terminal update for " + repr(marker)
+                                  + "\n" + captured.decode("utf-8", errors="replace"))
+                    return captured
+
+                await read_until(b"User: ")
+                os.write(master, b"run a job\n")
+                started = await read_until(b"\033[1m/ps\033[22m")
+                self.assertIn(b"turn: \033[1mrunning\033[22m", started)
+                # No keystrokes or tool calls between these two observations.
+                await read_until(b"/cd DIR, /ps, /image PATH")
+                os.write(master, b"/quit\n")
+                self.assertEqual(await asyncio.wait_for(process.wait(), 5), 0)
+                resources.assert_released(self)
+            finally:
+                if resources is not None:
+                    await resources.cleanup()
+                if slave is not None:
+                    os.close(slave)
+                transport.close()
 
 
 class TerminalOverlayLifecycleTests(unittest.TestCase):
