@@ -406,3 +406,25 @@ control makes a live provider request:
 Redeeming a reset is irreversible and never automatic. Account results are not
 saved to the response-header file.
 
+## Running tests
+
+Local development and CI use the same root-level driver:
+
+```sh
+python3 run_tests.py
+python3 run_tests.py -p 'test_acp*' -j 4 -v -k prompt
+```
+
+Files run concurrently in separate Python processes. `-p` selects filenames,
+`-j` limits parallel workers, and unittest options such as `-v`, `-q`, `-b`,
+`-f`, and `-k` are forwarded to each selected file. `-s` selects another test
+directory. Live output is tagged with its test file, including partial
+progress and stack diagnostics; any failing file makes the driver exit
+nonzero.
+
+Execution and diagnostic timers are **unlimited/off by default**.
+`LOKI_SUITE_STALL_SECONDS=60` explicitly enables repeating worker stack dumps;
+it does not kill tests or change their verdicts. For a deliberately bounded
+debug run, `--timeout SECONDS` enables a per-file execution limit. CI's job
+budget and diagnostic interval are configured in `.github/workflows/python-app.yml`,
+not hardcoded as test-driver defaults.

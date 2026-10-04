@@ -113,11 +113,11 @@ jobs:
       shell: pwsh
       run: '"LOKI_TRACE=1" | Out-File -FilePath $env:GITHUB_ENV -Append'
     - name: Test
-      run: |
-        # tests/run_suite.py writes progress through and dumps every thread's
-        # stack if the suite stalls, so a hang names its frame before the
-        # job timeout instead of being canceled invisibly.
-        python -u tests/run_suite.py
+      env:
+        # Opt-in diagnostics only. The job's timeout-minutes owns its budget;
+        # the shared local/CI driver has no default execution deadline.
+        LOKI_SUITE_STALL_SECONDS: "300"
+      run: python -u run_tests.py
     - name: Create the portable ZIP (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
@@ -138,6 +138,9 @@ jobs:
     name: Windows storage primitives (${{ matrix.runtime }})
     runs-on: windows-latest
     timeout-minutes: 10
+    env:
+      # Report probe stacks before the supervisor's explicit probe budget.
+      LOKI_SUITE_STALL_SECONDS: "60"
     strategy:
       fail-fast: false
       matrix:
@@ -176,7 +179,7 @@ jobs:
         python -c "import sys; print('python=' + sys.executable)" >> "$GITHUB_OUTPUT"
         {
           python -c "import os, sys; print(sys.executable, sys.version, flush=True); assert os.name == 'nt', 'native Windows Python required'" &&
-          python -u tests/test_windows_primitives.py
+          python -u run_tests.py -p test_windows_primitives.py
         } 2>&1 | tee windows-diagnostics/primitives.log
     - name: Probe Windows storage primitives (MSYS2 UCRT)
       id: msys2-probes
@@ -188,7 +191,7 @@ jobs:
         python -c "import sys; print('python=' + sys.executable)" >> "$GITHUB_OUTPUT"
         {
           python -c "import os, sys; print(sys.executable, sys.version, flush=True); assert os.name == 'nt', 'native Windows Python required'" &&
-          python -u tests/test_windows_primitives.py
+          python -u run_tests.py -p test_windows_primitives.py
         } 2>&1 | tee windows-diagnostics/primitives.log
     - name: Probe storage as a separate standard user
       # Run even when an elevated control probe fails (currently relative

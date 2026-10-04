@@ -139,9 +139,14 @@ try {
     # Copying avoids granting this user access to the administrator's toolcache
     # or MSYS2 installation. Reset only the copies to the CI stage's ACL.
     Copy-Item -LiteralPath $layout.prefix -Destination $runtime -Recurse
+    # The same root-level driver runs the staged standard-user suite. Keep
+    # probe files beside their gate/fixture files: their __file__-relative
+    # security bootstrap and contained-child entrypoints depend on this layout.
+    $driver = Join-Path $root 'run_tests.py'
+    Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'run_tests.py') -Destination $driver
     $script = Join-Path $root 'test_windows_primitives.py'
     Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tests/test_windows_primitives.py') -Destination $script
-    foreach ($copy in @($runtime, $script)) {
+    foreach ($copy in @($runtime, $script, $driver)) {
         & "$env:SystemRoot/System32/icacls.exe" $copy /reset /T /Q
         if ($LASTEXITCODE -ne 0) { throw 'Cannot set stage ACLs on probe copies' }
     }
@@ -423,7 +428,8 @@ public static extern IntPtr LocalFree(IntPtr memory);
     $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    foreach ($argument in @('-I', '-u', $script, '--standard-user', $sid)) {
+    foreach ($argument in @('-I', '-u', $driver, '-s', $root,
+                             '-p', (Split-Path $script -Leaf), '--', '--standard-user', $sid)) {
         $start.ArgumentList.Add($argument)
     }
     # Do not give the child the runner's credentials, Python configuration,
@@ -435,6 +441,11 @@ public static extern IntPtr LocalFree(IntPtr memory);
     $start.Environment['PATH'] = (Split-Path $executable) + ';' + (Join-Path $env:SystemRoot 'System32')
     $start.Environment['TEMP'] = $temporary
     $start.Environment['TMP'] = $temporary
+    # Forward this named diagnostic setting only; never inherit the runner's
+    # credentials or general Python environment into the standard-user suite.
+    if ($env:LOKI_SUITE_STALL_SECONDS) {
+        $start.Environment['LOKI_SUITE_STALL_SECONDS'] = $env:LOKI_SUITE_STALL_SECONDS
+    }
 
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
