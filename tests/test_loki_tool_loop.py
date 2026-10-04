@@ -593,7 +593,7 @@ class RuntimeConfigTests(unittest.TestCase):
             loki.current_session().session_state = {}
             loki.current_session().chat_log_path = None
             loki.apply_runtime_config(first)
-            loki.install_reasoning_effort_preference("high")
+            loki.current_session().reasoning_effort_preference = "high"
             self.assertEqual(loki.effective_reasoning_effort(), "high")
 
             loki.apply_runtime_config(narrower)
@@ -691,8 +691,7 @@ class RuntimeConfigTests(unittest.TestCase):
                         "low", "high"),
                 ))
                 loki.new_chat_log(path)
-                loki.install_reasoning_effort_preference(
-                    "high", persist=True)
+                loki.set_thinking_controls({"effort": "high"})
 
                 with open(path, "r", encoding="utf-8") as stream:
                     blob = json.load(stream)
@@ -723,7 +722,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 reasoning_effort=None, **kwargs):
             seen.append(reasoning_effort)
             if len(seen) == 1:
-                loki.install_reasoning_effort_preference("low")
+                loki.current_session().reasoning_effort_preference = "low"
                 return formats.DecodedTurn([
                     formats.tool_call_item(
                         "call_1", "Read", {"file_path": "README.md"}),
@@ -746,7 +745,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 provider_id="openai",
                 reasoning_effort_profile=_effort_profile("low", "high"),
             ))
-            loki.install_reasoning_effort_preference("high")
+            loki.current_session().reasoning_effort_preference = "high"
             with (
                     mock.patch.object(
                         loki, "async_chat_completion", new=completion),
@@ -776,7 +775,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 items, tools=None, *, codex_turn_state,
                 reasoning_effort="not-passed", **kwargs):
             seen.append(reasoning_effort)
-            loki.install_reasoning_effort_preference("high")
+            loki.current_session().reasoning_effort_preference = "high"
             return formats.DecodedTurn([
                 formats.message_item("assistant", "done"),
             ])
@@ -791,7 +790,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 provider_id="openai",
                 reasoning_effort_profile=_effort_profile("low", "high"),
             ))
-            loki.install_reasoning_effort_preference(None)
+            loki.current_session().reasoning_effort_preference = None
             with mock.patch.object(
                     loki, "async_chat_completion", new=completion):
                 result = asyncio.run(loki.run_tool_loop_async(
@@ -1787,7 +1786,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         ))
         loki.current_session().session_state = {}
         loki.current_session().chat_log_path = None
-        loki.install_reasoning_effort_preference("high")
+        loki.current_session().reasoning_effort_preference = "high"
 
         self.assertEqual(
             terminal_frontend._reasoning_effort_rows(),
@@ -4975,7 +4974,7 @@ class SubagentLaunchTests(unittest.TestCase):
             ))
             loki.current_session().session_state = {}
             loki.current_session().chat_log_path = None
-            loki.install_reasoning_effort_preference("high")
+            loki.current_session().reasoning_effort_preference = "high"
             with mock.patch.object(
                     loki, "current_job_manager",
                     return_value=manager):
@@ -5007,8 +5006,8 @@ class SubagentLaunchTests(unittest.TestCase):
                 kwargs["env"]["LOKI_REASONING_EFFORT_PROFILE"]),
             effort_profile.to_dict(),
         )
-        self.assertEqual(
-            kwargs["env"]["LOKI_REASONING_EFFORT"], "high")
+        self.assertNotIn("LOKI_REASONING_EFFORT", kwargs["env"])
+        self.assertEqual(json.loads(kwargs["env"]["LOKI_TURN_THINKING"])["settings"]["effort"], "high")
 
     def test_subagent_depth_is_bounded_at_the_entrypoint(self):
         self.assertEqual(
@@ -5030,7 +5029,8 @@ class SubagentLaunchTests(unittest.TestCase):
         session.subagent_depth = loki.MAX_SUBAGENT_DEPTH
         captured = {}
 
-        async def fake_loop(messages, allowed):
+        async def fake_loop(messages, allowed, *, thinking):
+            self.assertEqual(thinking.traces, "off")
             captured["messages"] = messages
             captured["allowed"] = allowed
             return "done"
@@ -5065,7 +5065,8 @@ class SubagentLaunchTests(unittest.TestCase):
         session.subagent_depth = loki.MAX_SUBAGENT_DEPTH - 1
         captured = {}
 
-        async def fake_loop(messages, allowed):
+        async def fake_loop(messages, allowed, *, thinking):
+            self.assertEqual(thinking.traces, "off")
             captured["messages"] = messages
             captured["allowed"] = allowed
             return "done"
@@ -5353,7 +5354,8 @@ class SubagentLaunchTests(unittest.TestCase):
         previous_root = session.delegated_root_conversation_id
         thread = session.conversation_id
 
-        async def run(*args):
+        async def run(*args, thinking):
+            self.assertEqual(thinking.traces, "off")
             self.assertEqual(session.root_conversation_id, root)
             self.assertEqual(session.conversation_id, thread)
             argv = loki._subagent_argv("Explore", "nested search")

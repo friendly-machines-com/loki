@@ -143,7 +143,8 @@ def parse_args(args) -> SubagentOptions:
     return SubagentOptions(subagent_type=subagent_type, **values)
 
 
-async def run_prompt_async(subagent_type: str, prompt: str) -> str:
+async def run_prompt_async(subagent_type: str, prompt: str,
+                           thinking: _core.TurnThinkingSettings | None = None) -> str:
     if subagent_type != "Explore":
         return (
             f"Error: unknown subagent_type {subagent_type!r} "
@@ -168,14 +169,20 @@ async def run_prompt_async(subagent_type: str, prompt: str) -> str:
     allowed = _core.EXPLORE_TOOLS
     if not may_delegate:
         allowed = allowed - {"Agent"}
+    if thinking is None:
+        thinking = _core.capture_turn_settings()
+    # This answer-only helper has no thought renderer. Keep computation while
+    # excluding the parent's presentation setting from acquisition and output.
+    thinking = _core.replace(thinking, traces="off")
     return await _core.run_tool_loop_async(
-        messages, allowed=allowed)
+        messages, allowed=allowed, thinking=thinking)
 
 
 async def run_cli_async(
-        subagent_type: str, prompt: str | None = None) -> None:
+        subagent_type: str, prompt: str | None = None,
+        thinking: _core.TurnThinkingSettings | None = None) -> None:
     prompt = prompt if prompt is not None else sys.stdin.read().strip()
-    result = await run_prompt_async(subagent_type, prompt)
+    result = await run_prompt_async(subagent_type, prompt, thinking=thinking)
     if result:
         print(
             texts.escape_terminal_text(result, multiline=True),
@@ -266,16 +273,9 @@ async def async_main(args) -> int:
         try:
             _core.apply_runtime_config(_core.build_config_from_env(
                 credentials=_core.CREDENTIALS))
-            preference = _core.reasoning_effort_preference_setting(
-                _core.CREDENTIALS)
-            profile = _core.current_reasoning_effort_profile()
-            if (preference is not None
-                    and (profile is None
-                         or not profile.supports(preference))):
-                raise ValueError(
-                    "delegated reasoning effort is not supported by the "
-                    "delegated model profile")
-            _core.install_reasoning_effort_preference(preference)
+            # Delegated settings cross only in LOKI_TURN_THINKING; with no
+            # envelope the child captures its own defaults.
+            thinking = _core.delegated_turn_settings(_core.CREDENTIALS)
         except (protocols.ProtocolError, ValueError) as error:
             _print_text_line(
                 "Configuration error: ", error, file=sys.stderr)
@@ -288,7 +288,7 @@ async def async_main(args) -> int:
             return 2
 
         operation = run_cli_async(
-            options.subagent_type, options.prompt)
+            options.subagent_type, options.prompt, thinking=thinking)
         completed, _result = await runtime.run(operation)
         return 0 if completed else 1
     finally:

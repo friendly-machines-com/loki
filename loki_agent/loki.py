@@ -181,18 +181,6 @@ def current_agent_mode() -> str:
     return current_session().agent_mode
 
 
-def install_reasoning_effort_preference(
-        preference: str | None, *, persist=False):
-    """Install validated conversation state and optionally save it."""
-    if preference is not None:
-        preference = modelsdev.validate_reasoning_effort(preference)
-    session = current_session()
-    session.reasoning_effort_preference = preference
-    mark_chat_log_dirty()
-    if persist:
-        save_chat_log()
-
-
 def set_reasoning_effort(value: str | None):
     """Apply one advertised effort value; the /thinking effort control."""
     set_thinking_controls({"effort": value})
@@ -921,16 +909,6 @@ def _reasoning_effort_profile_setting(credentials):
             f"invalid LOKI_REASONING_EFFORT_PROFILE: {error}") from error
 
 
-def reasoning_effort_preference_setting(credentials):
-    value = credentials.get("LOKI_REASONING_EFFORT")
-    if not value:
-        return None
-    try:
-        return modelsdev.validate_reasoning_effort(value)
-    except ValueError as error:
-        raise ValueError(f"invalid LOKI_REASONING_EFFORT: {error}") from error
-
-
 def build_config_from_env(
         environ=os.environ,
         credentials: CredentialStore | CredentialInventory | None = None):
@@ -975,9 +953,7 @@ def build_config_from_env(
         credentials, subscription)
     reasoning_effort_profile = _reasoning_effort_profile_setting(
         credentials)
-    delegated_provider_id = (
-        credentials.get("LOKI_PROVIDER_ID")
-        if reasoning_effort_profile is not None else None)
+    delegated_provider_id = credentials.get("LOKI_PROVIDER_ID") or None
     config_provider_id = (
         modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
         if subscription else delegated_provider_id)
@@ -3088,7 +3064,8 @@ async def _handle_agent_async(args: dict, extra_context=None) -> str:
                                  args.get("subagent_type", "Explore"),
                                  cancel_event=context.get("cancel_event"),
                                  reasoning_effort=context.get(
-                                     "reasoning_effort", _UNSET))
+                                     "reasoning_effort", _UNSET),
+                                 thinking=context.get("thinking"))
 
 
 def _handle_skill(args: dict) -> str:
@@ -3100,7 +3077,8 @@ async def _handle_webfetch_async(args: dict, extra_context=None) -> str:
     return await run_webfetch_async(
         args["url"], args["prompt"],
         cancel_event=context.get("cancel_event"),
-        reasoning_effort=context.get("reasoning_effort", _UNSET))
+        reasoning_effort=context.get("reasoning_effort", _UNSET),
+        thinking=context.get("thinking"))
 
 
 async def _handle_websearch_async(args: dict, extra_context=None) -> str:
@@ -3622,6 +3600,7 @@ async def run_tool_loop_async(
 
     tool_loop_extra_context = get_tool_loop_extra_context(transcript_items)
     tool_loop_extra_context["reasoning_effort"] = reasoning_effort
+    tool_loop_extra_context["thinking"] = thinking
     if cancel_event is not None:
         tool_loop_extra_context["cancel_event"] = cancel_event
 
@@ -3968,6 +3947,7 @@ async def run_toolless_completion_async(
     codex_turn_state = CodexTurnState()
     if thinking is None:
         thinking = capture_turn_settings()
+    thinking = replace(thinking, traces="off")
     if reasoning_effort is _UNSET:
         reasoning_effort = thinking.effort
     try:
@@ -4023,7 +4003,8 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
     return "\n".join(parts)
 
 
-def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
+def _subagent_env(reasoning_effort=_UNSET, *, environ=None,
+                  thinking: TurnThinkingSettings | None = None) -> dict:
     source_environ = os.environ if environ is None else environ
     # LOKI_DUMMY_TOOL_CALL makes the DUMMY provider emit a tool call instead of
     # text; a subagent that inherited it would emit the same call and recurse,
@@ -4032,10 +4013,17 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
         name: value for name, value in source_environ.items()
         if not is_credential_name(name) and name != "LOKI_DUMMY_TOOL_CALL"
     }
+    env.pop("LOKI_TURN_THINKING", None)
+    env.pop("LOKI_REASONING_EFFORT", None)
+    env.pop("LOKI_REASONING_TRACES", None)
     # Subagents receive only non-secret provider configuration. The request
     # credential travels through a fresh capability socket, never through
     # argv or the process environment.
     if current_config():
+        if thinking is None:
+            thinking = capture_turn_settings()
+        if reasoning_effort is _UNSET:
+            reasoning_effort = thinking.effort
         config = current_config()
         provider = config.chat_provider
         auth_spec = config.auth_spec
@@ -4046,9 +4034,20 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
         env['LOKI_STREAM'] = '1' if config.stream else '0'
         env['LOKI_PROMPT_CACHE'] = (
             '1' if provider.prompt_cache else '0')
+        capabilities = config.reasoning_capabilities
+        env["LOKI_TURN_THINKING"] = json.dumps({
+            "connection": _thinking_connection(),
+            "settings": {"effort": reasoning_effort, "mode": thinking.mode,
+                         "budget": thinking.budget, "retention": thinking.retention,
+                         "trial": thinking.trial is not None},
+            "capabilities": capabilities.to_dict() if capabilities is not None else None,
+        }, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
         profile = config.reasoning_effort_profile
-        if profile is not None:
+        if provider.provider_id is not None:
             env['LOKI_PROVIDER_ID'] = provider.provider_id
+        else:
+            env.pop('LOKI_PROVIDER_ID', None)
+        if profile is not None:
             env['LOKI_REASONING_EFFORT_PROFILE'] = json.dumps(
                 profile.to_dict(),
                 ensure_ascii=True,
@@ -4057,19 +4056,13 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
                 sort_keys=True,
             )
         else:
-            env.pop('LOKI_PROVIDER_ID', None)
             env.pop('LOKI_REASONING_EFFORT_PROFILE', None)
-        if reasoning_effort is _UNSET:
-            reasoning_effort = effective_reasoning_effort()
         if reasoning_effort is not None:
             reasoning_effort = modelsdev.validate_reasoning_effort(
                 reasoning_effort)
             if profile is None or not profile.supports(reasoning_effort):
                 raise ValueError(
                     "cannot delegate an unsupported reasoning effort")
-            env['LOKI_REASONING_EFFORT'] = reasoning_effort
-        else:
-            env.pop('LOKI_REASONING_EFFORT', None)
         if provider.openai_request_profile is not None:
             # This compact, non-secret request profile is process
             # configuration. Credentials still cross only the anonymous
@@ -4115,6 +4108,49 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None) -> dict:
         else:
             env.pop('LOKI_MODELS_URL', None)
     return env
+
+
+def delegated_turn_settings(credentials) -> TurnThinkingSettings:
+    """Import non-secret delegation data without importing request authority."""
+    encoded = credentials.get("LOKI_TURN_THINKING")
+    if not encoded:
+        return replace(capture_turn_settings(), traces="off")
+    envelope = json.loads(encoded)
+    if not isinstance(envelope, dict) or set(envelope) != {"connection", "settings", "capabilities"}:
+        raise ValueError("invalid delegated thinking envelope")
+    if envelope["connection"] != _thinking_connection():
+        raise ValueError("delegated thinking settings do not match the connection")
+    values = envelope["settings"]
+    if not isinstance(values, dict) or set(values) != {"effort", "mode", "budget", "retention", "trial"}:
+        raise ValueError("invalid delegated thinking settings")
+    if not isinstance(values["trial"], bool):
+        raise ValueError("delegated trial permission must be boolean")
+    effort = values["effort"]
+    profile = current_reasoning_effort_profile()
+    if effort is not None:
+        modelsdev.validate_reasoning_effort(effort)
+        if profile is None or not profile.supports(effort):
+            raise ValueError("delegated effort is not in the model's profile")
+    if values["mode"] is not None and not isinstance(values["mode"], str):
+        raise ValueError("delegated mode must be a string or null")
+    config = current_config()
+    provider = config.chat_provider
+    provider.validate_thinking(config.model, effort, values["mode"], values["budget"], values["retention"])
+    for name in ["mode", "budget"]:
+        value = values[name]
+        if value is not None and provider.thinking_control_status(config.model, name, value) == "trial" and not values["trial"]:
+            raise ValueError("delegated unverified controls require the parent's one-turn request")
+    raw_capabilities = envelope["capabilities"]
+    capabilities = (modelsdev.ReasoningCapabilities.from_dict(raw_capabilities)
+                    if raw_capabilities is not None else None)
+    # The endpoint, authentication recipe, and executable remain owned by the
+    # established launch/capability protocol; only model hints are imported.
+    apply_runtime_config(replace(
+        config, reasoning_capabilities=capabilities,
+        chat_provider=replace(provider, reasoning_field=capabilities.interleaved_field if capabilities else None)))
+    return TurnThinkingSettings(
+        effort=effort, mode=values["mode"], budget=values["budget"], retention=values["retention"], traces="off",
+        trial={"connection": envelope["connection"], "values": {}} if values["trial"] else None)
 
 
 def _subagent_credential_refs():
@@ -4171,7 +4207,8 @@ def run_agent(description: str, prompt: str, run_in_background: bool = False,
 async def run_agent_async(description: str, prompt: str, run_in_background: bool = False,
                           subagent_type: str = "Explore",
                           cancel_event: asyncio.Event | None = None,
-                          reasoning_effort=_UNSET) -> str:
+                          reasoning_effort=_UNSET,
+                          thinking: TurnThinkingSettings | None = None) -> str:
     agent_type = subagent_type or "Explore"
     if not prompt:
         return "Error: prompt is required"
@@ -4181,13 +4218,15 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         argv = _subagent_argv(agent_type, prompt)
     except ValueError as error:
         return f"Error: {error}"
+    if thinking is None:
+        thinking = capture_turn_settings()
     manager = current_job_manager()
     if run_in_background:
         try:
             job = await manager.run_background_exec(
                 argv,
                 description=description or "subagent task",
-                env=_subagent_env(reasoning_effort),
+                env=_subagent_env(reasoning_effort, thinking=thinking),
                 cwd=os.getcwd(),
                 session_owned=True,
                 credential_refs=_subagent_credential_refs(),
@@ -4200,7 +4239,7 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         job, status, stdout, stderr = await manager.run_exec(
             argv,
             description=description or "subagent task",
-            env=_subagent_env(reasoning_effort), cwd=os.getcwd(),
+            env=_subagent_env(reasoning_effort, thinking=thinking), cwd=os.getcwd(),
             cancel_event=cancel_event,
             session_owned=True,
             credential_refs=_subagent_credential_refs(),
@@ -4434,7 +4473,8 @@ async def _fetch_url_async(url: str, cancel_check=None) -> dict:
 async def run_webfetch_async(
         url: str, prompt: str,
         cancel_event: asyncio.Event | None = None,
-        reasoning_effort=_UNSET) -> str:
+        reasoning_effort=_UNSET,
+        thinking: TurnThinkingSettings | None = None) -> str:
     if not url:
         return "Error: url is required"
     if not prompt:
@@ -4488,6 +4528,7 @@ async def run_webfetch_async(
         cancel_check=(
             cancel_event.is_set if cancel_event is not None else None),
         reasoning_effort=reasoning_effort,
+        thinking=thinking,
     ) or "(no answer returned)"
     header = f"[WebFetch status={status} cache_hit={cache_hit} bytes~={len(content_text)} url={final_url}]"
     return f"{header}\n{answer}"
