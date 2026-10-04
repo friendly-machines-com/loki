@@ -551,6 +551,7 @@ class ToolOutcome:
     executed: bool
     ok: bool
     content: str
+    process_output: dict | None = None
 
     def to_hook_dict(self):
         return {

@@ -14,6 +14,7 @@ import uuid
 from pprint import pformat
 
 from . import formats
+from . import process_outputs
 from . import texts
 
 
@@ -205,9 +206,12 @@ class ResumeTranscriptRenderer:
     module importing terminal code.
     """
 
-    def __init__(self, assistant_label: str = "Assistant", *, show_reasoning=False):
+    def __init__(self, assistant_label: str = "Assistant", *, show_reasoning=False,
+                 show_bash_stdout=None):
         self.assistant_label = assistant_label
         self.show_reasoning = show_reasoning
+        # None preserves the canonical text used by non-terminal consumers.
+        self.show_bash_stdout = show_bash_stdout
 
     def _message_label(self, item: dict):
         role = item.get("role")
@@ -268,11 +272,15 @@ class ResumeTranscriptRenderer:
             ("text", texts.format_tool_args(input_value)),
         ])]
 
-    @staticmethod
-    def _tool_result_blocks(item: dict):
+    def _tool_result_blocks(self, item: dict):
         name = item.get("name") or item.get("call_id") or "<unknown>"
         label = "Tool error" if item.get("is_error") else "Tool result"
         text = formats.item_text(item).strip()
+        if self.show_bash_stdout is not None:
+            text = process_outputs.presentation_text(
+                text, item.get("process_output"),
+                show_bash_stdout=self.show_bash_stdout,
+                legacy_bash=name == "Bash")
         block = [
             ("literal", label + ": "),
             ("program_atom", name),

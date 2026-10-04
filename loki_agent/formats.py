@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 
 from .diagnostics import debug_json
+from . import process_outputs
 
 
 logger = logging.getLogger(__name__)
@@ -181,7 +182,7 @@ def tool_call_item(call_id, name, input_value=None, raw_arguments=None,
 
 
 def tool_result_item(tool_call_id, content, name=None, is_error=False,
-                     tool_kind="function", execution=None):
+                     tool_kind="function", execution=None, process_output=None):
     item = {
         "type": "tool_result",
         "call_id": tool_call_id,
@@ -193,10 +194,12 @@ def tool_result_item(tool_call_id, content, name=None, is_error=False,
         item["tool_kind"] = tool_kind
     if execution:
         item["execution"] = _copy(execution)
+    if process_output is not None:
+        item["process_output"] = process_outputs.ProcessOutput.from_dict(process_output).to_dict()
     return item
 
 
-def tool_result_for_call(call, content, is_error=False, execution=None):
+def tool_result_for_call(call, content, is_error=False, execution=None, process_output=None):
     return tool_result_item(
         tool_call_id(call),
         content,
@@ -204,6 +207,7 @@ def tool_result_for_call(call, content, is_error=False, execution=None):
         is_error=is_error,
         tool_kind=call.get("tool_kind", "function"),
         execution=execution,
+        process_output=process_output,
     )
 
 
@@ -678,6 +682,12 @@ def validate_events(events):
                 raise TranscriptFormatError(
                     f"event {index} tool result execution metadata "
                     "must be an object")
+            if "process_output" in event:
+                try:
+                    process_outputs.ProcessOutput.from_dict(event["process_output"])
+                except ValueError as error:
+                    raise TranscriptFormatError(
+                        f"event {index} invalid process output: {error}") from error
             matches = pending.get(call_id, [])
             if not matches:
                 raise TranscriptFormatError(

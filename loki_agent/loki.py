@@ -41,6 +41,7 @@ from . import models as modelsdev
 from . import openai_models
 from . import paths
 from . import protocols
+from . import process_outputs
 from . import authentications
 from . import credential_capabilities
 from . import endpoint_pins
@@ -1600,22 +1601,22 @@ def _format_numbered_lines(lines: list[str], first_line_number: int = 1) -> str:
     return "\n".join(f"{i}\t{line}" for i, line in enumerate(lines, start=first_line_number))
 
 
-def _format_bash_result(stdout: str, stderr: str, exit_code: int | None,
-                        status: str = "completed", no_output_expected: bool = False) -> str:
-    # Keep stdout and stderr separate in normal mode. The model can still ask
-    # for shell-level merging with 2>&1 inside the command when that is desired.
+def _bash_output(stdout: str, stderr: str, exit_code: int | None,
+                 status: str = "completed", no_output_expected: bool = False):
     parts = [f"status: {status}"]
     if exit_code is not None:
         parts.append(f"exit_code: {exit_code}")
     if no_output_expected:
         parts.append("no_output_expected: true")
-    # The whole result is assembled after the process exits, so an empty stream
-    # is left out rather than announced: no placeholder and no blank line.
-    if stdout:
-        parts.extend(["[stdout]", stdout])
-    if stderr:
-        parts.extend(["[stderr]", stderr])
-    return _truncate_text("\n".join(parts), BASH_MAX_OUTPUT_CHARS)
+    return process_outputs.ProcessOutput("\n".join(parts), stdout, stderr)
+
+
+def _shell_result(output, *, structured, ok=True, content=None):
+    text = (_truncate_text(output.render(), BASH_MAX_OUTPUT_CHARS)
+            if content is None else content)
+    if structured:
+        return _tool_result(ok, text, process_output=output.to_dict())
+    return text if ok else _tool_result(False, text)
 
 
 def _write_destination(file_path: str) -> str:
@@ -2301,11 +2302,12 @@ class JobManager:
     async def run_shell(self, command: str, timeout: int = None, description: str = "",
                         run_in_background: bool = False,
                         cancel_event: asyncio.Event | None = None,
-                        cwd: str | None = None) -> str:
+                        cwd: str | None = None, *, structured=False):
         if command is None:
             return "Error: command is required"
         if command.strip() == "":
-            return _format_bash_result("", "", 0, no_output_expected=True)
+            return _shell_result(
+                _bash_output("", "", 0, no_output_expected=True), structured=structured)
 
         timeout_ms = int(timeout) if timeout else BASH_DEFAULT_TIMEOUT_MS
         timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
@@ -2319,7 +2321,7 @@ class JobManager:
                 # If no loop can accept the monitor task, the job still exists
                 # with stdout/stderr/metadata paths for manual inspection.
                 pass
-            return "\n".join([
+            header = "\n".join([
                 f"Started background job {job.id}",
                 f"cwd: {job.cwd}",
                 f"pid: {job.pid}",
@@ -2328,25 +2330,30 @@ class JobManager:
                 f"stdout: {job.stdout_path}",
                 f"stderr: {job.stderr_path}",
             ])
+            return _shell_result(
+                process_outputs.ProcessOutput(header, "", ""),
+                structured=structured, content=header)
 
         job, status, stdout, stderr = await self.run_foreground(
             command, command, timeout_ms, description=description, shell=True,
             cwd=cwd, cancel_event=cancel_event)
         if status == "cancelled":
-            return _tool_result(
-                False,
-                "Tool call interrupted by user (SIGINT to the job's process "
-                "group)" + (f"; partial output:\n{stdout}" if stdout else ""))
+            message = (
+                "Tool call interrupted by user (SIGINT to the job's process group)")
+            return _shell_result(
+                process_outputs.ProcessOutput(message, stdout, stderr),
+                structured=structured, ok=False,
+                content=message + (f"; partial output:\n{stdout}" if stdout else ""))
         if status == "timed_out":
             if stderr:
                 stderr += "\n"
             stderr += f"command timed out after {timeout_ms}ms"
-            return _tool_result(
-                False,
-                _format_bash_result(
-                    stdout, stderr, job.exit_code, status="timed_out"))
+            return _shell_result(
+                _bash_output(stdout, stderr, job.exit_code, status="timed_out"),
+                structured=structured, ok=False)
 
-        return _format_bash_result(stdout, stderr, job.exit_code)
+        return _shell_result(
+            _bash_output(stdout, stderr, job.exit_code), structured=structured)
 
     async def run_exec(self, argv: list[str], timeout_ms: int | None = None, description: str = "",
                        output_chars: int = BASH_MAX_OUTPUT_CHARS,
@@ -2480,7 +2487,7 @@ class JobManager:
             )
         return "\n".join(lines)
 
-    def job_status(self, job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
+    def job_status(self, job_id: str, tail_chars: int = JOB_TAIL_CHARS, *, structured=False):
         job = self._get_job(job_id)
         if job is None:
             return f"Error: unknown job id {job_id!r}"
@@ -2499,13 +2506,12 @@ class JobManager:
             f"stdout_path: {job.stdout_path}",
             f"stderr_path: {job.stderr_path}",
         ]
-        # A snapshot, not a stream: an empty tail is left out, like a tool
-        # result's empty stream.
-        if stdout:
-            parts.extend(["[stdout_tail]", stdout])
-        if stderr:
-            parts.extend(["[stderr_tail]", stderr])
-        return "\n".join(parts)
+        output = process_outputs.ProcessOutput(
+            "\n".join(parts), stdout, stderr, shell=job.shell, tail=True)
+        text = output.render()
+        if structured and job.shell:
+            return _tool_result(True, text, process_output=output.to_dict())
+        return text
 
     def stop_job(self, job_id: str, force: bool = False) -> str:
         job = self._get_job(job_id)
@@ -2542,11 +2548,11 @@ def run_bash(command: str, timeout: int = None, description: str = "",
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
                          run_in_background: bool = False,
                          cancel_event: asyncio.Event | None = None,
-                         cwd: str | None = None) -> str:
+                         cwd: str | None = None, *, structured=False):
     return await current_job_manager().run_shell(
         command, timeout=timeout, description=description,
         run_in_background=run_in_background,
-        cancel_event=cancel_event, cwd=cwd)
+        cancel_event=cancel_event, cwd=cwd, structured=structured)
 
 
 def run_jobs() -> str:
@@ -2572,7 +2578,7 @@ def run_ps(argument: str = "") -> str:
     return "usage: /ps [all | ID | stop ID | kill ID]"
 
 
-def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
+def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS, *, structured=False):
     if not job_id:
         return "Error: job_id is required"
     try:
@@ -2581,7 +2587,7 @@ def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
         return f"Error: invalid tail_chars: {e}"
     if tail_chars < 0:
         return "Error: tail_chars must be non-negative"
-    return current_job_manager().job_status(job_id, tail_chars=tail_chars)
+    return current_job_manager().job_status(job_id, tail_chars=tail_chars, structured=structured)
 
 
 def run_job_stop(job_id: str, force: bool = False) -> str:
@@ -2980,21 +2986,19 @@ def run_todowrite(todos: list) -> str:
     return f"Updated todos: {summary}"
 
 
-def _handle_bash(args: dict) -> str:
-    return run_bash(args["command"],
-                    timeout=args.get("timeout"),
-                    description=args.get("description"),
-                    run_in_background=args.get("run_in_background", False))
+def _handle_bash(args: dict):
+    return asyncio.run(_handle_bash_async(args))
 
 
-async def _handle_bash_async(args: dict, extra_context=None) -> str:
+async def _handle_bash_async(args: dict, extra_context=None):
     return await run_bash_async(args["command"],
                                 timeout=args.get("timeout"),
                                 description=args.get("description", ""),
                                 run_in_background=args.get("run_in_background", False),
                                 cancel_event=(extra_context or {}).get("cancel_event")
                                 if isinstance(extra_context, dict) else None,
-                                cwd=(extra_context or {}).get("tool_cwd"))
+                                cwd=(extra_context or {}).get("tool_cwd"),
+                                structured=True)
 
 
 def _handle_read(args: dict) -> str:
@@ -3050,8 +3054,8 @@ def _handle_jobs(args: dict) -> str:
     return run_jobs()
 
 
-def _handle_job_status(args: dict) -> str:
-    return run_job_status(args["job_id"], args.get("tail_chars", JOB_TAIL_CHARS))
+def _handle_job_status(args: dict):
+    return run_job_status(args["job_id"], args.get("tail_chars", JOB_TAIL_CHARS), structured=True)
 
 
 def _handle_job_stop(args: dict) -> str:
@@ -3106,8 +3110,11 @@ async def _handle_websearch_async(args: dict, extra_context=None) -> str:
                                          "cancel_event"))
 
 
-def _tool_result(ok: bool, content) -> dict:
-    return {"ok": ok, "content": str(content)}
+def _tool_result(ok: bool, content, *, process_output=None) -> dict:
+    result = {"ok": ok, "content": str(content)}
+    if process_output is not None:
+        result["process_output"] = process_outputs.ProcessOutput.from_dict(process_output).to_dict()
+    return result
 
 
 def _looks_like_tool_error(content: str) -> bool:
@@ -3133,9 +3140,10 @@ async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
         return _tool_result(False, f"Failed while {context}: {type(e).__name__}: {e}")
 
     if (isinstance(content, dict)
-            and set(content) == {"ok", "content"}
+            and {"ok", "content"} <= set(content) <= {"ok", "content", "process_output"}
             and isinstance(content["ok"], bool)):
-        return _tool_result(content["ok"], content["content"])
+        return _tool_result(
+            content["ok"], content["content"], process_output=content.get("process_output"))
     text = str(content)
     return _tool_result(not _looks_like_tool_error(text), text)
 
@@ -3434,6 +3442,7 @@ async def execute_tool_call_async(
                 True,
                 result["ok"],
                 result["content"],
+                process_output=result.get("process_output"),
             )
 
     default_notes, defaults = _read_default_notes(invocation)
@@ -3453,6 +3462,11 @@ async def execute_tool_call_async(
     invocation, outcome = await hook_pipeline.finish(
         invocation, outcome)
     _invalidate_hook_file_state(invocation)
+    if fn_name == "Bash" and not outcome.ok and outcome.process_output is None:
+        # Rejection and launch errors contain diagnostics, not captured stdout.
+        # Preserve that distinction in replay rather than treating a new error
+        # as an older combined stream result.
+        outcome.process_output = process_outputs.ProcessOutput(outcome.content, "", "").to_dict()
     outcome.content = _prepend_tool_notes(
         outcome.content, invocation.notes)
     if not outcome.executed:
@@ -3464,7 +3478,12 @@ async def execute_tool_call_async(
                 invocation.effective_arguments),
             "cwd": invocation.cwd,
         })
-    result = _tool_result(outcome.ok, outcome.content)
+    if outcome.process_output is not None:
+        output = process_outputs.ProcessOutput.from_dict(outcome.process_output)
+        outcome.process_output = replace(
+            output, preamble=_prepend_tool_notes(output.preamble, invocation.notes)).to_dict()
+    result = _tool_result(
+        outcome.ok, outcome.content, process_output=outcome.process_output)
     return result, _execution_metadata(
         invocation, outcome, defaults)
 
@@ -3931,15 +3950,19 @@ async def run_tool_loop_async(
                 result["content"],
                 is_error=not result["ok"],
                 execution=execution,
+                process_output=result.get("process_output"),
             )
             transcript_items.append(result_item)
-            on_event({
+            event = {
                 "type": "tool_result",
                 "name": formats.tool_call_name(tc),
                 "call_id": formats.tool_call_id(tc),
                 "content": result["content"],
                 "is_error": not result["ok"],
-            })
+            }
+            if "process_output" in result:
+                event["process_output"] = copy.deepcopy(result["process_output"])
+            on_event(event)
             if cancel_check():
                 append_unexecuted_results(
                     tool_calls[call_index + 1:],

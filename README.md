@@ -146,6 +146,34 @@ exact count of the next prompt. `*` marks an older or incomplete measurement;
 context capacity, set `LOKI_CONTEXT_WINDOW` to a positive token count. This
 changes the display only, not the model's limits.
 
+## User settings
+
+Terminal preferences are read from the optional `~/.config/loki/settings.ini`
+(or `$XDG_CONFIG_HOME/loki/settings.ini`). No file is needed: every preference
+has a built-in default, and startup never creates or rewrites the file.
+
+Bash stdout is hidden from automatic terminal tool-result display by default.
+To show it, add:
+
+```ini
+[terminal]
+show_bash_stdout = true
+```
+
+Restart the terminal session after editing the file. Stderr, status, and tool
+notes remain visible. This also applies to automatic shell-job status results,
+but not subagent output or explicit inspection with `!command` or `/ps ID`.
+Stdout is still captured, saved, and supplied to the model; this is a display
+preference, not redaction, and it does not change ACP output.
+
+New saved results retain stream identity for terminal replay. Older combined
+Bash results cannot be reliably split and show a notice when stdout is hidden;
+enable the setting to display those older results in full.
+
+Application code reads and updates preferences through `loki_agent.settings`,
+not through frontend file parsing. Explicit updates preserve unrelated INI
+values but rewrite formatting and do not retain comments.
+
 ## Tool hooks
 
 Tool-call output shows the session shell cwd separately from the model-supplied

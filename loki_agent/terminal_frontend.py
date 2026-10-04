@@ -27,6 +27,8 @@ from . import credential_capabilities
 from . import credential_runtimes
 from . import models as modelsdev
 from . import protocols
+from . import process_outputs
+from . import settings
 from . import savefiles
 from . import subagents
 from . import terminals
@@ -536,9 +538,12 @@ def _report_hook_stderr(command, text):
 class _ResumeTranscriptPresenter:
     """Write a saved transcript without mixing untrusted text with ANSI."""
 
-    def __init__(self, assistant_label):
+    def __init__(self, assistant_label, *, ui_settings=None):
+        preferences = ui_settings or settings.Settings()
         self.renderer = savefiles.ResumeTranscriptRenderer(
-            assistant_label=assistant_label, show_reasoning=current_session().reasoning_traces == "on")
+            assistant_label=assistant_label,
+            show_reasoning=current_session().reasoning_traces == "on",
+            show_bash_stdout=preferences.terminal.show_bash_stdout)
 
     def write(self, events):
         blocks = self.renderer.presentation(events)
@@ -573,7 +578,7 @@ class _ResumeTranscriptPresenter:
         print("----")
 
 
-def _terminal_agent_event(event: dict):
+def _terminal_agent_event(event: dict, *, ui_settings=None):
     # Error branches reset attributes before emitting their final newline. That
     # prevents terminal scroll-fill from inheriting the red background.
     kind = event.get("type")
@@ -741,7 +746,11 @@ def _terminal_agent_event(event: dict):
         print(f"{computer}: {label}: ", end="")
         terminal.write_text(repr(event["name"]))
         print()
-        terminal.write_text(str(event["content"]), multiline=True)
+        preferences = ui_settings or settings.Settings()
+        text = process_outputs.presentation_text(
+            event["content"], event.get("process_output"),
+            show_bash_stdout=preferences.terminal.show_bash_stdout)
+        terminal.write_text(text, multiline=True)
         if event.get("is_error"):
             # Reset precedes the newline so terminal scroll-fill stays neutral.
             terminal.reset_colors_and_flags()
@@ -750,7 +759,7 @@ def _terminal_agent_event(event: dict):
 
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None,
-                                  turn_events=None) -> str:
+                                  turn_events=None, ui_settings=None) -> str:
     thinking = _core.capture_turn_settings()
     reasoning_effort = thinking.effort
     read_only = current_agent_mode() in ("explore", "plan")
@@ -788,7 +797,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
             turn_events.append(event)
         if event.get("type") in ("tool_result", "response_cancelled", "max_loops"):
             _redraw_status()
-        _terminal_agent_event(event)
+        _terminal_agent_event(event, ui_settings=ui_settings)
 
     # The user/mode input has already been appended: the old report is stale
     # during this request, even before the first response or tool result.
@@ -1273,6 +1282,8 @@ async def async_main(args) -> int:
             toolset or "Explore", prompt_arg)
         return 0
 
+    ui_settings = await settings.load_settings(on_error=lambda error: _print_text_line(
+        "Could not load settings: ", error, file=sys.stderr, multiline=True))
     log_filename = None
     for option_name, option_value in options:
         if option_name == '--resume' or option_name == '-r':
@@ -1410,7 +1421,7 @@ async def async_main(args) -> int:
                 set_session_connection(refreshed_descriptor)
                 save_chat_log()
             _ResumeTranscriptPresenter(
-                current_model() or "Assistant",
+                current_model() or "Assistant", ui_settings=ui_settings,
             ).write(current_transcript())
         else:
             new_chat_log(new_chat_log_path())
@@ -1675,7 +1686,7 @@ async def async_main(args) -> int:
                     current_transcript(),
                     cancel_check=lambda: session.reader.cancel_requested,
                     cancel_event=session.reader.cancel_event,
-                    turn_events=turn_events)
+                    turn_events=turn_events, ui_settings=ui_settings)
             except KeyboardInterrupt:
                 if turn_events is not None:
                     turn_events.append({"type": "response_cancelled"})
