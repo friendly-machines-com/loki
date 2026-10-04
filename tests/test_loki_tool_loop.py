@@ -403,12 +403,19 @@ class TerminalImageCommandTests(unittest.TestCase):
             terminal_frontend._terminal_activity.turn_running)
 
     def test_slash_commands_do_not_start_a_turn(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            status, captured, _stdout, _stderr = self._run_terminal(
-                ["/pwd", "/ps", "/quit"],
-                tmpdir,
-            )
-
+        arguments = ["", "all", "99", "stop 99", "kill 99", "stop"]
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+                loki, "run_ps", wraps=loki.run_ps) as ps:
+            status, captured, stdout, _stderr = self._run_terminal(
+                ["/pwd"] + ["/ps " + argument for argument in arguments]
+                + ["/quit"], tmpdir)
+        self.assertEqual(
+            [call.args[0].strip() for call in ps.call_args_list], arguments)
+        self.assertIn("unknown job id", stdout)
+        self.assertIn("usage: /ps", stdout)
+        self.assertIn("No running, starting, or failed jobs.", stdout)
+        self.assertIn("/ps all - history; /ps ID - tail", stdout)
+        self.assertIn("/ps stop ID - stop; /ps kill ID - force termination", stdout)
         self.assertEqual(status, 0)
         self.assertEqual(captured, [])
         self.assertFalse(

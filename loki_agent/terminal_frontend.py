@@ -76,7 +76,6 @@ from .loki import (
     reinstall_provider,
     resolve_chat_log_path,
     run_bash_async,
-    run_jobs,
     run_tool_loop_async,
     save_chat_log,
     set_session_connection,
@@ -1195,8 +1194,9 @@ async def async_main(args) -> int:
                     print_shell_cwd(
                         text_writer=terminal.write_text)
                     continue
-                case '/ps':
-                    terminal.write_text(run_jobs(), multiline=True)
+                case _ if command_text == '/ps' or command_text.startswith('/ps '):
+                    terminal.write_text(
+                        _core.run_ps(command_text[3:]), multiline=True)
                     print()
                     continue
                 case _ if command_text == '/cd' or command_text.startswith('/cd '):

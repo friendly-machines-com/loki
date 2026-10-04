@@ -555,8 +555,8 @@ class JobOwnershipContractTests(unittest.TestCase):
                             await asyncio.sleep(.01)
                     self.assertEqual(manager._active_subagents, 1)
                     outcome = await acp_commands.run('/ps', session)
-                    self.assertEqual(outcome.text, manager.list_jobs())
-                    self.assertEqual(len(outcome.text.splitlines()), 3)
+                    self.assertTrue(outcome.text.startswith(manager.list_jobs() + '\n'))
+                    self.assertIn('/ps ID', outcome.text)
                     self.assertEqual(outcome.text.splitlines()[0], 'Jobs:')
                     for job in (owned, ordinary):
                         self.assertIsNone(job.process.returncode)

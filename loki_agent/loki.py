@@ -2445,12 +2445,20 @@ class JobManager:
             self._refresh_job(job)
         return job
 
-    def list_jobs(self) -> str:
+    def list_jobs(self, *, show_all=True) -> str:
         jobs = list(self.jobs.values())
         for job in jobs:
             self._refresh_job(job)
+        if not show_all:
+            jobs = [job for job in jobs
+                    if job.status in ["running", "starting", "failed", "signaled", "timed_out"]]
+        # _now_iso() emits fixed-width UTC timestamps. _next_job_id() stores
+        # decimal counter IDs as text for job keys and paths; int(id) orders
+        # that counter numerically, so "10" follows "2" at equal timestamps.
+        jobs.sort(key=lambda job: (job.started_at_iso, int(job.id)))
         if not jobs:
-            return "No jobs."
+            return ("No jobs." if show_all
+                    else "No running, starting, or failed jobs.")
         lines = ["Jobs:"]
         for job in jobs:
             lines.append(
@@ -2531,6 +2539,22 @@ async def run_bash_async(command: str, timeout: int = None, description: str = "
 
 def run_jobs() -> str:
     return current_job_manager().list_jobs()
+
+
+def run_ps(argument: str = "") -> str:
+    parts = argument.split()
+    if not parts or parts == ["all"]:
+        listing = current_job_manager().list_jobs(show_all=parts == ["all"])
+        if not parts:
+            listing += "\nfailed = job setup/launch failure, not command exit code."
+        return (listing + "\n/ps all - history; /ps ID - tail; "
+                "/ps stop ID - stop; /ps kill ID - force termination")
+    if len(parts) == 1 and parts[0].isdecimal():
+        return run_job_status(parts[0])
+    if (len(parts) == 2 and parts[0] in ["stop", "kill"]
+            and parts[1].isdecimal()):
+        return run_job_stop(parts[1], force=parts[0] == "kill")
+    return "usage: /ps [all | ID | stop ID | kill ID]"
 
 
 def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS) -> str:
