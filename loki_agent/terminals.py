@@ -2132,6 +2132,7 @@ class InputModal:
                     initial_text=initial_text)
                 # /ps stays immediate even in a picker/confirmation. It is
                 # job control, never an answer to this modal prompt.
+                # (command_deliveries declares which commands are immediate.)
                 if not self.session.on_submit(text):
                     return text
         finally:
@@ -2226,8 +2227,9 @@ class InputSession:
         self._reader_entered = False
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
         self.history_provider = history_provider
-        # The frontend consumes /ps synchronously here, before queueing. This
-        # callback must not await a turn or take ownership of the input reader.
+        # The frontend consumes immediate commands (command_deliveries) here,
+        # synchronously, before queueing. This callback must not await a turn
+        # or take ownership of the input reader.
         self.on_submit = on_submit or (lambda text: False)
 
     async def __aenter__(self):
@@ -2281,8 +2283,9 @@ class InputSession:
                 text = await get_input_async(session=self.reader,
                                              history_provider=self.history_provider,
                                              on_mode_cycle=self.on_mode_cycle)
-                # /ps is deliberately allowed during a busy turn and must
-                # bypass the FIFO, including ordinary prompts already queued.
+                # Immediate commands (command_deliveries) are deliberately
+                # allowed during a busy turn and must bypass the FIFO,
+                # including past ordinary prompts already queued.
                 if self.on_submit(text):
                     continue
             except EOFError:

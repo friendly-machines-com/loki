@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from . import attachments
 from .diagnostics import debug_json
+from . import command_deliveries
 from . import formats
 from .attachments import ImageAttachmentError, load_image_attachment
 from . import authentications
@@ -97,12 +98,9 @@ def _redraw_status():
         pass
 
 
-def _submit_job_control(text: str) -> bool:
-    # /ps is immediate user job control, not a queued prompt. This runs from
-    # the sole input owner even while inference, a tool, or a modal is busy.
-    argument = _core.ps_argument(text)
-    if argument is None:
-        return False
+def _echo_immediate(text: str):
+    # Synchronous, at admission: the submitted line must appear before
+    # anything the command produces, exactly like a queued prompt's echo.
     restore_output_area_after_input()
     print()
     terminal.set_background_color(terminals.INPUT_COLOR)
@@ -110,6 +108,11 @@ def _submit_job_control(text: str) -> bool:
     terminal.write_text(text, multiline=True)
     terminal.reset_colors_and_flags()
     print()
+
+
+def _immediate_ps(argument: str):
+    # Sync by contract: JobManager transitions contain no awaits, so they
+    # cannot interleave with a running turn.
     try:
         result = _core.run_ps(argument)
     except Exception as error:
@@ -118,6 +121,153 @@ def _submit_job_control(text: str) -> bool:
     terminal.write_text(result, multiline=True)
     print()
     sys.stdout.flush()
+
+
+def _immediate_status(argument: str):
+    # Like the account read, the connection context is captured at
+    # admission, not when the scheduled task first runs: config, session,
+    # and the response-header store are all bound here, synchronously.
+    config = current_config()
+    session = current_session()
+    store = session.response_headers
+
+    async def report():
+        from . import response_headers
+        try:
+            if argument == "save":
+                await store.save()
+                print("Response status saved (this runtime only).")
+                return
+            tokens = argument.split()
+            show_all = "all" in tokens
+            as_json = "--json" in tokens
+            connected = (config is not None
+                         and config.chat_provider.kind != protocols.DUMMY)
+            if show_all:
+                document = store.snapshot()
+            elif connected:
+                credential = (config.auth_spec.credential
+                              if config.auth_spec else None)
+                document = store.snapshot(
+                    config.chat_provider.chat_url,
+                    credential=credential.encode() if credential else None)
+            else:
+                document = {"version": 1, "endpoints": []}
+            if as_json:
+                text = json.dumps(document, indent=2, ensure_ascii=True)
+            else:
+                scope = ("All known connections" if show_all
+                         else "Current endpoint and credential")
+                text = (
+                    f"{scope} (last observed, not live balances).\n"
+                    "Saved observations plus this runtime's memory; other "
+                    "runtimes' unsaved observations are not visible.\n")
+                if not show_all and not connected:
+                    text += ("No active HTTP chat connection. "
+                             "Use /status all.")
+                elif not show_all and not document["endpoints"]:
+                    text += "No observations for the current connection."
+                else:
+                    text += response_headers.render(document)
+            terminal.write_text(text, multiline=True)
+            print()
+            # /status stays offline; this only points at live provider data
+            # when the connection supports it.
+            from . import provider_controls
+            hint = provider_controls.live_hint(
+                provider_controls.ControlContext(config=config))
+            if hint is not None:
+                terminal.write_text(hint, multiline=True)
+                print()
+        except (OSError, ValueError, OverflowError) as error:
+            _print_text_line("Could not read response status: ",
+                             error, file=sys.stderr)
+
+    return report()
+
+
+def _immediate_account_read(argument: str):
+    # The connection context is captured at admission, synchronously here --
+    # not when the scheduled task first runs: a config change submitted
+    # after this line must not redirect a read the user already sent.
+    from . import provider_controls
+    tokens = [token for token in argument.split() if token != "--json"]
+    as_json = "--json" in argument.split()
+    context = provider_controls.ControlContext(
+        config=current_config(),
+        credential_authority=current_session().credential_authority)
+
+    async def read():
+        result = await _read_account_control(context, tokens[0], as_json)
+        if result is not None:
+            # Discoverability without interaction: naming the action is the
+            # confirmation, so no modal may appear from the monitor plane.
+            _account_actions_hint(tokens[0], result.actions)
+
+    return read()
+
+
+async def _run_immediate(outcome):
+    # Monitor-plane work runs detached from admission; a failure is reported
+    # and must never propagate into a turn or the input owner.
+    try:
+        await outcome
+    except Exception as error:  # noqa: BLE001 - reported, not fatal
+        _print_text_line("Immediate command failed: ", error,
+                         file=sys.stderr, multiline=True)
+        sys.stderr.flush()
+
+
+_immediate_tasks: set = set()
+
+
+async def _cancel_immediate_tasks():
+    # Frontend exit must not leave monitor-plane work running detached: its
+    # output would race terminal teardown. Cancelling is safe -- immediate
+    # commands are reads and edits of user-owned queues, never mutations
+    # whose abandonment would corrupt state.
+    tasks = list(_immediate_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+_IMMEDIATE_HANDLERS = {
+    # Handlers receive the classified argument. Sync handlers run inline in
+    # the input owner (atomic against other event-loop work, like /ps);
+    # async handlers are scheduled as tasks and must never own the reader,
+    # await a turn, or touch transcript state -- monitor-plane only, per the
+    # contract in command_deliveries.
+    "ps": _immediate_ps,
+    "status": _immediate_status,
+    "account": _immediate_account_read,
+}
+
+
+def _dispatch_immediate(parsed: command_deliveries.ParsedCommand):
+    """Run one immediate command's handler; return its outcome.
+
+    A None outcome means a sync handler already ran inline. Any other value
+    is a coroutine the caller either awaits (queue-fed dispatch) or schedules
+    (input-owner dispatch).
+    """
+    return _IMMEDIATE_HANDLERS[parsed.name](parsed.argument)
+
+
+def _submit_immediate(text: str) -> bool:
+    # Immediate commands are hypervisor monitor-plane interaction, not queued
+    # prompts: they run from the sole input owner even while inference, a
+    # tool, or a modal is busy, and their output never becomes conversation.
+    parsed = command_deliveries.terminal_immediate(text)
+    if parsed is None:
+        return False
+    _echo_immediate(text)
+    outcome = _dispatch_immediate(parsed)
+    if outcome is not None:
+        task = asyncio.ensure_future(_run_immediate(outcome))
+        _immediate_tasks.add(task)
+        task.add_done_callback(_immediate_tasks.discard)
     return True
 
 
@@ -719,12 +869,66 @@ def _write_control_result(result, as_json):
     print()
 
 
+def _account_control_spec(context, chosen):
+    from . import provider_controls
+    spec = provider_controls.find_control(context, chosen)
+    if spec is not None:
+        return spec
+    print()
+    print(f"No such account control: {chosen}")
+    names = ", ".join(
+        item.id
+        for item in provider_controls.available_controls(context))
+    if names:
+        print(f"Available controls: {names}")
+    return None
+
+
+def _account_actions_hint(control_id, actions):
+    if not actions:
+        return
+    print(f"Actions (run /account {control_id} ACTION to perform one; "
+          "naming the action is the confirmation):")
+    for action in actions:
+        print(f"  {action.id} - {action.title}")
+
+
+async def _read_account_control(context, chosen, as_json):
+    """Read one control and print it; None when nothing was read."""
+    spec = _account_control_spec(context, chosen)
+    if spec is None:
+        return None
+    try:
+        result = await spec.read(context)
+    except (OSError, ValueError, OverflowError,
+            authentications.CredentialError) as error:
+        _print_text_line(
+            f"Could not read account {chosen}: ", error,
+            file=sys.stderr, multiline=True)
+        sys.stderr.flush()
+        return None
+    _write_control_result(result, as_json)
+    return result
+
+
+async def _confirm_account_action(modal, action, as_json):
+    answer = (await modal.prompt(f"{action.confirm} [y/N]: ") or "")
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Cancelled.")
+        return
+    _write_control_result(await action.run(), as_json)
+
+
 async def run_account_controls_async(command_text, session):
     """Dispatch the provider-dependent account-control entry point.
 
     The entry lists controls available for the active connection; an optional
     control id runs its read, and an optional action id performs one of the
-    actions that read offered.  Nothing here runs implicitly.
+    actions that read offered.  Nothing here runs implicitly.  The read-only
+    control form is normally delivered immediately (see _submit_immediate);
+    the interactive forms -- the bare listing and confirmed actions -- are
+    queued behind a running turn and take the reader only while a choice or
+    confirmation is actually on screen.
     """
     from . import provider_controls
     tokens = command_text.split()
@@ -734,66 +938,53 @@ async def run_account_controls_async(command_text, session):
         config=current_config(),
         credential_authority=current_session().credential_authority,
     )
-    async with session.modal() as modal:
-        if not rest:
-            specs = provider_controls.available_controls(context)
-            if not specs:
-                print()
-                print("No live account controls for the active connection.")
-                return
-            rows = [
-                (spec.id, f"{spec.title} - {spec.description}")
-                for spec in specs
-            ]
+    if not rest:
+        specs = provider_controls.available_controls(context)
+        if not specs:
+            print()
+            print("No live account controls for the active connection.")
+            return
+        async with session.modal() as modal:
             chosen = await _numbered_choice_async(
-                modal, "Account controls:", rows,
+                modal, "Account controls:",
+                [(spec.id, f"{spec.title} - {spec.description}")
+                 for spec in specs],
                 "Control choice (number selects, empty cancels): ")
             if chosen is None:
                 return
-        else:
-            chosen = rest[0]
-        spec = provider_controls.find_control(context, chosen)
-        if spec is None:
-            print()
-            print(f"No such account control: {chosen}")
-            names = ", ".join(
-                item.id
-                for item in provider_controls.available_controls(context))
-            if names:
-                print(f"Available controls: {names}")
-            return
-        action_id = rest[1] if len(rest) > 1 else None
-        try:
-            result = await spec.read(context)
-        except (OSError, ValueError, OverflowError,
-                authentications.CredentialError) as error:
-            _print_text_line(
-                f"Could not read account {chosen}: ", error,
-                file=sys.stderr, multiline=True)
-            sys.stderr.flush()
-            return
-        _write_control_result(result, as_json)
-        if action_id is not None:
-            action = next(
-                (item for item in result.actions if item.id == action_id),
-                None)
-            if action is None:
-                print(f"No such action: {action_id}")
+            result = await _read_account_control(context, chosen, as_json)
+            if result is None or not result.actions:
                 return
-        elif result.actions:
-            rows = [(item, item.title) for item in result.actions]
             action = await _numbered_choice_async(
-                modal, "Actions:", rows,
+                modal, "Actions:",
+                [(item, item.title) for item in result.actions],
                 "Action choice (number selects, empty cancels): ")
             if action is None:
                 return
-        else:
-            return
-        answer = (await modal.prompt(f"{action.confirm} [y/N]: ") or "")
-        if answer.strip().lower() not in ("y", "yes"):
-            print("Cancelled.")
-            return
-        _write_control_result(await action.run(), as_json)
+            await _confirm_account_action(modal, action, as_json)
+        return
+    if len(rest) == 1:
+        # The read-only form: modal-free, exactly like its immediate
+        # delivery. Reaching here means queue-fed input.
+        result = await _read_account_control(context, rest[0], as_json)
+        if result is not None:
+            _account_actions_hint(rest[0], result.actions)
+        return
+    chosen = rest[0]
+    # Extra operands beyond the action are ignored, like the pre-immediate
+    # behavior; they must never crash the dispatch with an unpack error.
+    action_id = rest[1] if len(rest) > 1 else None
+    result = await _read_account_control(context, chosen, as_json)
+    if result is None:
+        return
+    action = next(
+        (item for item in result.actions if item.id == action_id),
+        None)
+    if action is None:
+        print(f"No such action: {action_id}")
+        return
+    async with session.modal() as modal:
+        await _confirm_account_action(modal, action, as_json)
 
 
 USAGE = """\
@@ -906,13 +1097,19 @@ async def async_main(args) -> int:
                 current_transcript()),
             on_queue_size_change=(
                 _terminal_activity.set_queued_prompts),
-            # /ps must execute before the input FIFO, regardless of turn state.
-            on_submit=_submit_job_control) as session, contextlib.AsyncExitStack() as status_cleanup:
+            # Immediate commands execute before the input FIFO, regardless of
+            # turn state (command_deliveries is the single classifier).
+            on_submit=_submit_immediate) as session, contextlib.AsyncExitStack() as status_cleanup:
         # Background exits can occur without input or tool-result events.
         # Detach this display observer before terminal input ownership ends.
         manager = _core.current_job_manager()
         status_cleanup.callback(setattr, manager, "on_change", manager.on_change)
         manager.on_change = _redraw_status
+        # Detached monitor-plane work (async immediate commands) must end
+        # with the frontend, before terminal teardown races its output.
+        # push_async_callback: a plain callback would not await the
+        # cancellation gather.
+        status_cleanup.push_async_callback(_cancel_immediate_tasks)
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel
@@ -1040,70 +1237,24 @@ async def async_main(args) -> int:
             terminal.reset_colors_and_flags()
             print()
             command_text = user_in.strip()
-            # No /ps case here: the input owner runs it immediately, even
-            # during a turn. Putting it back here would silently queue it.
+            # Immediate commands never queue: the input owner consumed them
+            # before the FIFO (see _submit_immediate). Reaching this point
+            # means scripted or otherwise queue-fed input, so run the same
+            # handlers once and move on -- they must not start a turn.
+            parsed = command_deliveries.terminal_immediate(user_in)
+            if parsed is not None:
+                outcome = _dispatch_immediate(parsed)
+                if outcome is not None:
+                    await _run_immediate(outcome)
+                continue
             match command_text:
                 case '/quit':
                     break
-                case ('/status' | '/status --json' | '/status all'
-                      | '/status all --json' | '/status --json all'):
-                    from . import response_headers
-                    try:
-                        show_all = 'all' in command_text.split()
-                        as_json = '--json' in command_text.split()
-                        config = current_config()
-                        connected = (config is not None
-                                     and config.chat_provider.kind != protocols.DUMMY)
-                        store = current_session().response_headers
-                        if show_all:
-                            document = store.snapshot()
-                        elif connected:
-                            credential = (config.auth_spec.credential
-                                          if config.auth_spec else None)
-                            document = store.snapshot(
-                                config.chat_provider.chat_url,
-                                credential=credential.encode() if credential else None)
-                        else:
-                            document = {"version": 1, "endpoints": []}
-                        if as_json:
-                            text = json.dumps(document, indent=2, ensure_ascii=True)
-                        else:
-                            scope = ("All known connections" if show_all
-                                     else "Current endpoint and credential")
-                            text = (
-                                f"{scope} (last observed, not live balances).\n"
-                                "Saved observations plus this runtime's memory; other "
-                                "runtimes' unsaved observations are not visible.\n")
-                            if not show_all and not connected:
-                                text += "No active HTTP chat connection. Use /status all."
-                            elif not show_all and not document["endpoints"]:
-                                text += "No observations for the current connection."
-                            else:
-                                text += response_headers.render(document)
-                        terminal.write_text(text, multiline=True)
-                        print()
-                        # /status stays offline; this only points at live
-                        # provider data when the connection supports it.
-                        from . import provider_controls
-                        hint = provider_controls.live_hint(
-                            provider_controls.ControlContext(config=config))
-                        if hint is not None:
-                            terminal.write_text(hint, multiline=True)
-                            print()
-                    except (OSError, ValueError, OverflowError) as error:
-                        _print_text_line("Could not read response status: ",
-                                         error, file=sys.stderr)
-                    continue
-                case '/status save':
-                    try:
-                        await current_session().response_headers.save()
-                        print("Response status saved (this runtime only).")
-                    except (OSError, ValueError) as error:
-                        _print_text_line("Could not save response status: ",
-                                         error, file=sys.stderr)
-                    continue
                 case _ if (command_text == '/account'
                            or command_text.startswith('/account ')):
+                    # Only the interactive (queued) forms reach here; the
+                    # read-only form was claimed by the immediate dispatch
+                    # above.
                     await run_account_controls_async(command_text, session)
                     continue
                 case '/model':

@@ -185,14 +185,22 @@ class PsTests(unittest.TestCase):
             stop.assert_not_called()
 
     def test_terminal_ps_recognition_does_not_intercept_paths_or_other_commands(self):
+        from loki_agent import command_deliveries
         for text, expected in [
                 [" /ps ", ""], ["/ps all", "all"], ["/ps stop 1", "stop 1"],
                 ["/ps kill 1", "kill 1"], ["/ps bad argument", "bad argument"]]:
             with self.subTest(text=text):
-                self.assertEqual(loki.ps_argument(text), expected)
-        for text in ["/ps/file.py", "/ps-extra", "/PS", "/ps\t1", "/status", "prompt"]:
+                parsed = command_deliveries.terminal_immediate(text)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.name, "ps")
+                self.assertEqual(parsed.argument, expected)
+        for text in ["/ps/file.py", "/ps-extra", "/PS", "/ps\t1", "prompt"]:
             with self.subTest(text=text):
-                self.assertIsNone(loki.ps_argument(text))
+                self.assertIsNone(command_deliveries.terminal_immediate(text))
+        # /ps recognition must not swallow other commands: /status classifies
+        # under its own declaration, not as a ps argument.
+        parsed = command_deliveries.terminal_immediate("/status")
+        self.assertEqual((parsed.name, parsed.argument), ("status", ""))
 
     def test_acp_does_not_advertise_or_handle_ps(self):
         with mock.patch.object(loki, "LOKI_CONFIG_DIR", self.manager.base_dir):
@@ -230,7 +238,7 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     return await self.keys.get()
 
             def submit(text):
-                consumed = terminal_frontend._submit_job_control(text)
+                consumed = terminal_frontend._submit_immediate(text)
                 if consumed:
                     handled.append(text)
                 return consumed

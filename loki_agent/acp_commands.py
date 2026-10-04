@@ -8,6 +8,14 @@ agent-shell can run the same commands and see the same data.
 Skills are advertised but not intercepted.  Their execution belongs to the
 model's Skill tool in both fronts, so listing them makes ``/<skill>``
 discoverable and lets the existing tool-calling path handle it.
+
+Delivery: every command here is queued behind a running prompt on ACP, by
+declaration in command_deliveries (decision D2). ACP has no out-of-band
+output channel whose output could not splice into a streaming agent
+message, so do not route these around the worker's prompt gate
+(``acp_worker._prepare_prompt``) without solving that first. On the
+terminal front these same commands may instead be immediate; that is
+declared, not inferred from here.
 """
 
 from __future__ import annotations

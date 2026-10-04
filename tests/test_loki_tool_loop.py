@@ -99,8 +99,9 @@ class ScriptedInputSession:
     async def get(self):
         while True:
             text = self.messages.pop(0)
-            # Model the input owner's /ps interception, not a consumer-side
-            # slash-command handler. Native PTY tests cover actual queue timing.
+            # Model the input owner's immediate-command interception, not a
+            # consumer-side slash-command handler. Native PTY tests cover
+            # actual queue timing.
             if text is None or not self.on_submit(text):
                 return text
 
