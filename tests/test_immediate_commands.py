@@ -11,6 +11,7 @@ import contextlib
 import io
 import os
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -300,6 +301,131 @@ class ImmediateCommandTests(unittest.TestCase):
         for text in ["/account", "/account usage reset"]:
             with self.subTest(text=text):
                 self.assertFalse(terminal_frontend._submit_immediate(text))
+
+
+class ImmediateQueueTests(unittest.TestCase):
+    """/queue snapshots the FIFO and staged images without consuming."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = directory.name
+        self.session = Session(
+            shell_cwd=self.root,
+            transcript_items=[formats.message_item("user", "busy")])
+        self.initial = list(self.session.transcript_items)
+        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.output = io.StringIO()
+        self.handled = []
+        self.addCleanup(terminal_frontend._immediate_tasks.clear)
+        self.addCleanup(terminal_frontend._queued_inputs.reset, None)
+
+    async def enqueue(self, session, text):
+        session.reader.keys.put_nowait(terminals.KeyEvent("TEXT", text))
+        session.reader.keys.put_nowait(terminals.KeyEvent("ENTER"))
+        async with asyncio.timeout(3):
+            while text not in session.user_messages.pending_texts():
+                await asyncio.sleep(0)
+
+    async def command(self, session, text):
+        previous = len(self.handled)
+        session.reader.keys.put_nowait(terminals.KeyEvent("TEXT", text))
+        session.reader.keys.put_nowait(terminals.KeyEvent("ENTER"))
+        async with asyncio.timeout(3):
+            while len(self.handled) == previous:
+                await asyncio.sleep(0)
+        self.assertEqual(self.handled[-1], text)
+        self.assertEqual(self.session.transcript_items, self.initial)
+
+    def run_queue_scenario(self, script):
+        async def scenario():
+            def submit(text):
+                consumed = terminal_frontend._submit_immediate(text)
+                if consumed:
+                    self.handled.append(text)
+                return consumed
+
+            with mock.patch.object(terminals.os, "isatty",
+                                   return_value=False), \
+                    mock.patch.object(
+                        terminal_frontend,
+                        "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output):
+                session = terminals.InputSession(
+                    fd=0, on_submit=submit,
+                    on_queue_size_change=lambda count: None)
+                session.reader = _FakeReader()
+                terminal_frontend._queued_inputs.reset(session)
+                session._producer = asyncio.create_task(session._produce())
+                try:
+                    await script(session)
+                finally:
+                    await session._pause()
+
+        asyncio.run(scenario())
+
+    def test_bare_queue_lists_counts_and_subcommands(self):
+        async def script(session):
+            await self.enqueue(session, "first")
+            await self.enqueue(session, "second")
+            terminal_frontend._queued_inputs.staged_images.append(
+                types.SimpleNamespace(
+                    path="/tmp/x.png", media_type="image/png",
+                    byte_size=12))
+            await self.command(session, "/queue")
+            # Listing never consumes: both prompts are still queued.
+            self.assertEqual(session.user_messages.message_count, 2)
+            self.assertEqual(
+                session.user_messages.pending_texts(),
+                ["first", "second"])
+
+        self.run_queue_scenario(script)
+        rendered = self.output.getvalue()
+        self.assertIn("Queued texts: 2; staged images: 1.", rendered)
+        self.assertIn("Subcommands: /queue texts, /queue images.", rendered)
+
+    def test_queue_texts_numbers_by_send_order_and_escapes_ansi(self):
+        async def script(session):
+            await self.enqueue(session, "first")
+            await self.enqueue(session, "evil\x1b]777;QUEUE_ATTACK\x07tail")
+            await self.command(session, "/queue texts")
+            self.assertEqual(session.user_messages.message_count, 2)
+
+        self.run_queue_scenario(script)
+        rendered = self.output.getvalue()
+        self.assertIn("Queued texts (1 = next sent):", rendered)
+        self.assertIn("1. first", rendered)
+        self.assertIn("2. evil^[]777;QUEUE_ATTACK^Gtail", rendered)
+        self.assertNotIn("\x1b]777", rendered)
+
+    def test_queue_images_lists_staged_entries_and_empty_state(self):
+        async def script(session):
+            await self.command(session, "/queue images")
+            terminal_frontend._queued_inputs.staged_images.append(
+                types.SimpleNamespace(
+                    path="/home/dannym/x.webp", media_type="image/webp",
+                    byte_size=4096))
+            await self.command(session, "/queue images")
+
+        self.run_queue_scenario(script)
+        rendered = self.output.getvalue()
+        self.assertIn("No staged images.", rendered)
+        self.assertIn("Staged images (sent with the next prompt):", rendered)
+        self.assertIn(
+            "1. /home/dannym/x.webp (image/webp, 4096 bytes)", rendered)
+
+    def test_queue_texts_empty_state_and_unknown_subcommand(self):
+        async def script(session):
+            await self.command(session, "/queue texts")
+            await self.command(session, "/queue bogus")
+
+        self.run_queue_scenario(script)
+        rendered = self.output.getvalue()
+        self.assertIn("No queued texts.", rendered)
+        self.assertIn("usage: /queue [texts | images]", rendered)
+        self.assertEqual(len(self.handled), 2)
 
 
 if __name__ == "__main__":

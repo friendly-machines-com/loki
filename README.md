@@ -162,12 +162,15 @@ and are also available during terminal pickers and confirmations. `/ps` is
 not an ACP command.
 
 The same immediate delivery covers `/status` (with `--json`, `all`, and
-`save` forms) and the read-only `/account CONTROL` form: they answer while a
-turn is running and their output never becomes conversation. `/account`
-without a control id, and `/account CONTROL ACTION`, stay queued behind a
-running turn because they interact. Immediate commands are declared in one
-place (`loki_agent/command_deliveries.py`); on ACP every command stays queued
-until an out-of-band output channel exists there.
+`save` forms), the read-only `/account CONTROL` form, and `/queue`: they
+answer while a turn is running and their output never becomes conversation.
+`/queue` snapshots what is waiting -- bare `/queue` lists its subcommands,
+`/queue texts` numbers the queued prompts (1 = next sent), and
+`/queue images` lists images staged for the next prompt -- without consuming
+anything. `/account` without a control id, and `/account CONTROL ACTION`,
+stay queued behind a running turn because they interact. Immediate commands
+are declared in one place (`loki_agent/command_deliveries.py`); on ACP every
+command stays queued until an out-of-band output channel exists there.
 
 Loki checks tool input before execution, corrects some unambiguous formatting
 mistakes, and reports any corrections. Other invalid calls are rejected.

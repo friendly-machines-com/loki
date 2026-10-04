@@ -116,6 +116,10 @@ _COMMANDS: dict[str, _CommandSpec] = {
     # Only the direct read-only control form.
     "account": _CommandSpec(
         Delivery(terminal=IMMEDIATE), _account_read_argument("account")),
+    # /queue inspects the FIFO and staged images: a snapshot while any number
+    # of prompts waits behind a running turn.
+    "queue": _CommandSpec(
+        Delivery(terminal=IMMEDIATE), _any_argument("queue")),
 }
 
 

@@ -2190,6 +2190,14 @@ class UserMessageQueue(asyncio.Queue):
         if old_count:
             self._notify_size_change()
 
+    def pending_texts(self) -> list:
+        """Snapshot of queued messages, oldest first (index 0 = next sent).
+
+        Read-only view of the internal deque; the queue is not consumed.
+        The EOF sentinel never appears in the snapshot.
+        """
+        return [item for item in self._queue if item is not None]
+
 
 class InputSession:
     """Session-long input owner: raw mode, one stdin reader, producer, queue.

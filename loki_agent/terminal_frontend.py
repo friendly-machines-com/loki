@@ -98,6 +98,33 @@ def _redraw_status():
         pass
 
 
+class _QueuedInputs:
+    """What /queue reports on: the input FIFO and the staged images.
+
+    Both lifetimes belong to the running frontend; async_main registers its
+    input session here so the immediate /queue handler can snapshot them
+    without consuming from the queue or touching the turn loop.
+    """
+
+    def __init__(self):
+        self.session = None
+        self.staged_images = []
+
+    def reset(self, session):
+        """Bind SESSION's queue view and return the fresh staged-images list."""
+        self.session = session
+        self.staged_images.clear()
+        return self.staged_images
+
+    def pending_texts(self) -> list:
+        if self.session is None:
+            return []
+        return self.session.user_messages.pending_texts()
+
+
+_queued_inputs = _QueuedInputs()
+
+
 def _echo_immediate(text: str):
     # Synchronous, at admission: the submitted line must appear before
     # anything the command produces, exactly like a queued prompt's echo.
@@ -207,6 +234,43 @@ def _immediate_account_read(argument: str):
     return read()
 
 
+def _immediate_queue(argument: str):
+    # Snapshot only: read the FIFO and the staged images, never consume or
+    # mutate them. Numbers are positions (1 = next sent) and stay stable
+    # until the queue itself changes.
+    subcommand = argument.split()[0] if argument else ""
+    if not subcommand:
+        texts = _queued_inputs.pending_texts()
+        print(f"Queued texts: {len(texts)}; "
+              f"staged images: {len(_queued_inputs.staged_images)}.")
+        print("Subcommands: /queue texts, /queue images.")
+        return
+    if subcommand == "texts":
+        texts = _queued_inputs.pending_texts()
+        if not texts:
+            print("No queued texts.")
+            return
+        print("Queued texts (1 = next sent):")
+        # Queued text is untrusted (it may contain pasted control bytes);
+        # write_text never emits its ANSI.
+        for number, text in enumerate(texts, start=1):
+            _print_text_line(f"{number}. ", text)
+        return
+    if subcommand == "images":
+        images = list(_queued_inputs.staged_images)
+        if not images:
+            print("No staged images.")
+            return
+        print("Staged images (sent with the next prompt):")
+        for number, image in enumerate(images, start=1):
+            _print_text_line(
+                f"{number}. ",
+                f"{display_path(image.path)} "
+                f"({image.media_type}, {image.byte_size} bytes)")
+        return
+    print("usage: /queue [texts | images]")
+
+
 async def _run_immediate(outcome):
     # Monitor-plane work runs detached from admission; a failure is reported
     # and must never propagate into a turn or the input owner.
@@ -242,6 +306,7 @@ _IMMEDIATE_HANDLERS = {
     "ps": _immediate_ps,
     "status": _immediate_status,
     "account": _immediate_account_read,
+    "queue": _immediate_queue,
 }
 
 
@@ -1006,6 +1071,7 @@ Use /status for the current connection, /status all for all known connections.
 Add --json for JSON; /status save saves this runtime's response observations.
 Use loki status [--json] [--endpoint URL] to inspect saved response headers.
 Use /account for live provider usage and limit resets, when supported.
+Use /queue to inspect queued prompts and staged images while a turn runs.
 """
 
 
@@ -1108,8 +1174,10 @@ async def async_main(args) -> int:
         # Detached monitor-plane work (async immediate commands) must end
         # with the frontend, before terminal teardown races its output.
         # push_async_callback: a plain callback would not await the
-        # cancellation gather.
+        # cancellation gather. The queue-view binding is released the same
+        # way so an abnormal exit cannot leave a dead session referenced.
         status_cleanup.push_async_callback(_cancel_immediate_tasks)
+        status_cleanup.callback(_queued_inputs.reset, None)
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel
@@ -1218,7 +1286,9 @@ async def async_main(args) -> int:
         else:
             new_chat_log(new_chat_log_path())
 
-        pending_images = []
+        # The staged-images list is shared with the immediate /queue command
+        # (see _QueuedInputs); the loop keeps using this local name.
+        pending_images = _queued_inputs.reset(session)
         while True:
             user_in = await session.user_messages.get()
             restore_output_area_after_input()

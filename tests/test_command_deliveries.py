@@ -63,6 +63,17 @@ class ClassifyTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(command_deliveries.terminal_immediate(text))
 
+    def test_queue_is_immediate_in_any_form(self):
+        for text in ["/queue", "/queue texts", "/queue images",
+                     "/queue bogus future-subcommand"]:
+            with self.subTest(text=text):
+                parsed = command_deliveries.terminal_immediate(text)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.name, "queue")
+        for text in ["/queuex", "/queue/file", "/QUEUE"]:
+            with self.subTest(text=text):
+                self.assertIsNone(command_deliveries.terminal_immediate(text))
+
     def test_undeclared_and_non_command_lines_are_never_immediate(self):
         for text in ["", "prompt text", "!ls", "/model", "/thinking high",
                      "/pwd", "/cd /tmp", "/image /tmp/x.png", "/quit",
