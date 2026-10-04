@@ -8,12 +8,13 @@ things fix that here:
 
 * stderr is written through, so the in-progress test name reaches the log
   before that test finishes;
-* ``faulthandler.dump_traceback_later`` prints every thread's stack if the
-  suite is still running after the stall timeout, so a hang names its frame
-  instead of costing one job timeout per attempt.
+* when explicitly enabled with a positive, finite
+  ``LOKI_SUITE_STALL_SECONDS``, ``faulthandler.dump_traceback_later`` prints
+  every thread's stack after that interval, so a hang names its frame.
 
-The timeout is a stall detector, not a test timeout: a healthy but slow suite
-prints nothing it did not need.
+No timer is enabled by default and execution may run indefinitely. The
+opt-in timer is diagnostic only: it never kills the suite or changes its
+verdict.
 
 Usage: ``python -u tests/run_suite.py`` from the repository root.
 """
@@ -21,20 +22,22 @@ Usage: ``python -u tests/run_suite.py`` from the repository root.
 from __future__ import annotations
 
 import faulthandler
+import math
 import os
 import sys
 import unittest
 
 
-STALL_SECONDS_DEFAULT = 300.0
-
-
-def stall_seconds() -> float:
+def stall_seconds() -> float | None:
+    """No timer unless an explicit positive, finite debug interval is set."""
+    value = os.environ.get("LOKI_SUITE_STALL_SECONDS")
+    if value is None:
+        return None
     try:
-        return float(os.environ.get(
-            "LOKI_SUITE_STALL_SECONDS", STALL_SECONDS_DEFAULT))
+        seconds = float(value)
     except ValueError:
-        return STALL_SECONDS_DEFAULT
+        return None
+    return seconds if seconds > 0 and math.isfinite(seconds) else None
 
 
 def main() -> int:
@@ -50,11 +53,16 @@ def main() -> int:
         # the faulthandler dump below still works.
         pass
     faulthandler.enable()
-    faulthandler.dump_traceback_later(
-        stall_seconds(), repeat=True, exit=False)
-    suite = unittest.TestLoader().discover(os.path.join(root, "tests"))
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    return 0 if result.wasSuccessful() else 1
+    interval = stall_seconds()
+    if interval is not None:
+        faulthandler.dump_traceback_later(interval, repeat=True, exit=False)
+    try:
+        suite = unittest.TestLoader().discover(os.path.join(root, "tests"))
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        return 0 if result.wasSuccessful() else 1
+    finally:
+        if interval is not None:
+            faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":
