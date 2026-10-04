@@ -195,11 +195,15 @@ answer while a turn is running and their output never becomes conversation.
 Delayed answers display immediately on completion as separate, labelled
 blocks, without waiting for the running turn. `/queue` inspects and edits
 what is waiting: bare `/queue` lists its
-subcommands, `/queue texts` numbers the queued prompts (1 = next sent), and
-`/queue images` lists images staged for the next prompt. Entries are edited
-by number -- `/queue texts delete N`, `/queue texts move N M`,
-`/queue texts edit N TEXT`, and for images `delete N` / `move N M` -- and
-every edit re-lists, so the numbers on screen always match the queue. A
+subcommands, `/queue texts` lists queued prompts in send order, and
+`/queue images` lists images staged for the next prompt. Each entry has a
+stable ID, not a position: IDs survive edits and moves and are not reused
+when entries are consumed or deleted. Identical submissions have different
+IDs. Use `/queue texts delete ID`, `/queue texts edit ID TEXT`,
+`/queue texts move ID before OTHER_ID`, or `/queue texts move ID end`;
+images support the same delete and move forms. Both IDs in a move must
+still be pending. A stale ID is rejected without changing another entry.
+Every successful edit re-lists the entries. A
 staged image cannot be re-pointed; delete it and stage another with
 `/image PATH`. Listing and editing never touch a running turn. `/account`
 without a control id, and `/account CONTROL ACTION`, stay queued behind a

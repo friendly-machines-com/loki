@@ -544,14 +544,22 @@ class ImmediateQueueTests(unittest.TestCase):
         self.addCleanup(patch.stop)
         self.output = io.StringIO()
         self.handled = []
+        queue_patch = mock.patch.object(
+            terminal_frontend, "_queued_inputs", terminal_frontend._QueuedInputs())
+        queue_patch.start()
+        self.addCleanup(queue_patch.stop)
         self.addCleanup(terminal_frontend._immediate_tasks.clear)
         self.addCleanup(terminal_frontend._queued_inputs.reset, None)
+
+    @staticmethod
+    def pending_texts(session):
+        return [entry.text for entry in session.user_messages.pending_entries()]
 
     async def enqueue(self, session, text):
         session.reader.keys.put_nowait(terminals.KeyEvent("TEXT", text))
         session.reader.keys.put_nowait(terminals.KeyEvent("ENTER"))
         async with asyncio.timeout(3):
-            while text not in session.user_messages.pending_texts():
+            while text not in self.pending_texts(session):
                 await asyncio.sleep(0)
 
     async def command(self, session, text):
@@ -595,7 +603,7 @@ class ImmediateQueueTests(unittest.TestCase):
         async def script(session):
             await self.enqueue(session, "first")
             await self.enqueue(session, "second")
-            terminal_frontend._queued_inputs.staged_images.append(
+            terminal_frontend._queued_inputs.stage_image(
                 types.SimpleNamespace(
                     path="/tmp/x.png", media_type="image/png",
                     byte_size=12))
@@ -603,7 +611,7 @@ class ImmediateQueueTests(unittest.TestCase):
             # Listing never consumes: both prompts are still queued.
             self.assertEqual(session.user_messages.message_count, 2)
             self.assertEqual(
-                session.user_messages.pending_texts(),
+                self.pending_texts(session),
                 ["first", "second"])
 
         self.run_queue_scenario(script)
@@ -611,7 +619,7 @@ class ImmediateQueueTests(unittest.TestCase):
         self.assertIn("Queued texts: 2; staged images: 1.", rendered)
         self.assertIn("Subcommands: /queue texts, /queue images.", rendered)
 
-    def test_queue_texts_numbers_by_send_order_and_escapes_ansi(self):
+    def test_queue_texts_lists_ids_in_send_order_and_escapes_ansi(self):
         async def script(session):
             await self.enqueue(session, "first")
             await self.enqueue(session, "evil\x1b]777;QUEUE_ATTACK\x07tail")
@@ -620,15 +628,15 @@ class ImmediateQueueTests(unittest.TestCase):
 
         self.run_queue_scenario(script)
         rendered = self.output.getvalue()
-        self.assertIn("Queued texts (1 = next sent):", rendered)
-        self.assertIn("1. first", rendered)
-        self.assertIn("2. evil^[]777;QUEUE_ATTACK^Gtail", rendered)
+        self.assertIn("Queued texts (send order):", rendered)
+        self.assertIn("[id 1] first", rendered)
+        self.assertIn("[id 2] evil^[]777;QUEUE_ATTACK^Gtail", rendered)
         self.assertNotIn("\x1b]777", rendered)
 
     def test_queue_images_lists_staged_entries_and_empty_state(self):
         async def script(session):
             await self.command(session, "/queue images")
-            terminal_frontend._queued_inputs.staged_images.append(
+            terminal_frontend._queued_inputs.stage_image(
                 types.SimpleNamespace(
                     path="/home/dannym/x.webp", media_type="image/webp",
                     byte_size=4096))
@@ -639,7 +647,7 @@ class ImmediateQueueTests(unittest.TestCase):
         self.assertIn("No staged images.", rendered)
         self.assertIn("Staged images (sent with the next prompt):", rendered)
         self.assertIn(
-            "1. /home/dannym/x.webp (image/webp, 4096 bytes)", rendered)
+            "[id 1] /home/dannym/x.webp (image/webp, 4096 bytes)", rendered)
 
     def test_queue_texts_empty_state_and_unknown_subcommand(self):
         async def script(session):
@@ -651,7 +659,7 @@ class ImmediateQueueTests(unittest.TestCase):
         self.assertIn("No queued texts.", rendered)
         self.assertIn(
             "usage: /queue [texts | images] "
-            "[delete N | move N M | edit N TEXT]", rendered)
+            "[delete ID | move ID before OTHER_ID | move ID end | edit ID TEXT]", rendered)
         self.assertEqual(len(self.handled), 2)
 
     def test_queue_texts_delete_removes_and_relists(self):
@@ -660,29 +668,29 @@ class ImmediateQueueTests(unittest.TestCase):
                 await self.enqueue(session, text)
             await self.command(session, "/queue texts delete 2")
             self.assertEqual(
-                session.user_messages.pending_texts(), ["first", "third"])
+                self.pending_texts(session), ["first", "third"])
             self.assertEqual(session.user_messages.message_count, 2)
 
         self.run_queue_scenario(script)
         rendered = self.output.getvalue()
-        self.assertNotIn("2. second\n", rendered)
-        self.assertIn("1. first", rendered)
-        self.assertIn("2. third", rendered)
-        self.assertNotIn("3. third", rendered)
+        self.assertNotIn("[id 2] second\n", rendered)
+        self.assertIn("[id 1] first", rendered)
+        self.assertIn("[id 3] third", rendered)
+        self.assertNotIn("[id 2] third", rendered)
 
     def test_queue_texts_move_reorders_and_relists(self):
         async def script(session):
             for text in ["first", "second", "third"]:
                 await self.enqueue(session, text)
-            await self.command(session, "/queue texts move 1 3")
+            await self.command(session, "/queue texts move 1 end")
             self.assertEqual(
-                session.user_messages.pending_texts(),
+                self.pending_texts(session),
                 ["second", "third", "first"])
 
         self.run_queue_scenario(script)
         rendered = self.output.getvalue()
-        self.assertIn("1. second", rendered)
-        self.assertIn("3. first", rendered)
+        self.assertIn("[id 2] second", rendered)
+        self.assertIn("[id 1] first", rendered)
 
     def test_queue_texts_edit_replaces_text_only(self):
         async def script(session):
@@ -691,22 +699,22 @@ class ImmediateQueueTests(unittest.TestCase):
             await self.command(
                 session, "/queue texts edit 2 replacement text")
             self.assertEqual(
-                session.user_messages.pending_texts(),
+                self.pending_texts(session),
                 ["first", "replacement text"])
             self.assertEqual(session.user_messages.message_count, 2)
 
         self.run_queue_scenario(script)
         rendered = self.output.getvalue()
-        self.assertIn("2. replacement text", rendered)
-        self.assertNotIn("2. second\n", rendered)
-        self.assertIn("1. first", rendered)
+        self.assertIn("[id 2] replacement text", rendered)
+        self.assertNotIn("[id 2] second\n", rendered)
+        self.assertIn("[id 1] first", rendered)
 
     def test_queue_texts_edit_escapes_replacement_ansi(self):
         async def script(session):
             await self.enqueue(session, "first")
             await self.command(session, "/queue texts edit 1 x\x1b]777;EDIT^G")
             self.assertEqual(
-                session.user_messages.pending_texts(),
+                self.pending_texts(session),
                 ["x\x1b]777;EDIT^G"])
 
         self.run_queue_scenario(script)
@@ -714,44 +722,44 @@ class ImmediateQueueTests(unittest.TestCase):
         self.assertIn("x^[]777;EDIT^G", rendered)
         self.assertNotIn("\x1b]777", rendered)
 
-    def test_queue_texts_positions_name_real_entries(self):
+    def test_queue_texts_rejects_missing_and_malformed_ids(self):
         async def script(session):
             await self.enqueue(session, "first")
             await self.command(session, "/queue texts delete 9")
-            await self.command(session, "/queue texts move 1 nope")
+            await self.command(session, "/queue texts move 1 before nope")
             await self.command(session, "/queue texts edit 1")
             self.assertEqual(
-                session.user_messages.pending_texts(), ["first"])
+                self.pending_texts(session), ["first"])
 
         self.run_queue_scenario(script)
         rendered = self.output.getvalue()
-        self.assertIn("No queued text 9.", rendered)
+        self.assertIn("Queued text ID 9 is no longer pending.", rendered)
         self.assertIn(
             "usage: /queue [texts | images] "
-            "[delete N | move N M | edit N TEXT]", rendered)
+            "[delete ID | move ID before OTHER_ID | move ID end | edit ID TEXT]", rendered)
         # Nothing changed, so no listing was re-printed either.
-        self.assertNotIn("Queued texts (1 = next sent):", rendered)
+        self.assertNotIn("Queued texts (send order):", rendered)
 
     def test_queue_images_delete_and_move_keep_the_status_count(self):
         async def script(session):
             staged = terminal_frontend._queued_inputs.staged_images
             for name in ("a.png", "b.png", "c.png"):
-                staged.append(types.SimpleNamespace(
+                terminal_frontend._queued_inputs.stage_image(types.SimpleNamespace(
                     path=f"/tmp/{name}", media_type="image/png",
                     byte_size=len(name)))
             await self.command(session, "/queue images delete 1")
-            self.assertEqual([image.path for image in staged],
+            self.assertEqual([entry.image.path for entry in staged],
                              ["/tmp/b.png", "/tmp/c.png"])
             self.assertEqual(
                 terminal_frontend._terminal_activity.queued_images, 2)
-            await self.command(session, "/queue images move 2 1")
-            self.assertEqual([image.path for image in staged],
+            await self.command(session, "/queue images move 3 before 2")
+            self.assertEqual([entry.image.path for entry in staged],
                              ["/tmp/c.png", "/tmp/b.png"])
 
         self.run_queue_scenario(script)
         rendered = self.output.getvalue()
-        self.assertIn("1. /tmp/c.png (image/png, 5 bytes)", rendered)
-        self.assertIn("2. /tmp/b.png (image/png, 5 bytes)", rendered)
+        self.assertIn("[id 3] /tmp/c.png (image/png, 5 bytes)", rendered)
+        self.assertIn("[id 2] /tmp/b.png (image/png, 5 bytes)", rendered)
 
     def test_queue_images_edit_is_refused_with_guidance(self):
         async def script(session):
@@ -763,22 +771,94 @@ class ImmediateQueueTests(unittest.TestCase):
             "A staged image cannot be edited; delete it and stage another "
             "with /image PATH.", rendered)
 
-    def test_queue_positions_out_of_range_for_images(self):
+    def test_queue_images_rejects_missing_ids(self):
         async def script(session):
             await self.command(session, "/queue images delete 3")
 
         self.run_queue_scenario(script)
-        self.assertIn("No staged image 3.", self.output.getvalue())
+        self.assertIn("Staged image ID 3 is no longer pending.", self.output.getvalue())
 
-    def test_oversized_queue_number_does_not_kill_input(self):
+    def test_oversized_queue_id_does_not_kill_input(self):
         async def script(session):
             await self.enqueue(session, "first")
             await self.command(session, "/queue texts delete " + "9" * 5000)
             await self.command(session, "/queue texts")
-            self.assertEqual(session.user_messages.pending_texts(), ["first"])
+            self.assertEqual(self.pending_texts(session), ["first"])
 
         self.run_queue_scenario(script)
-        self.assertIn("1. first", self.output.getvalue())
+        self.assertIn("[id 1] first", self.output.getvalue())
+
+    def test_stale_text_ids_never_target_surviving_submissions(self):
+        async def script(session):
+            await self.enqueue(session, "A")
+            await self.enqueue(session, "B")
+            await self.command(session, "/queue texts")
+            self.assertEqual(await session.user_messages.get(), "A")
+            for command in [
+                    "/queue texts delete 1", "/queue texts edit 1 wrong",
+                    "/queue texts move 1 end",
+                    "/queue texts move 2 before 1"]:
+                await self.command(session, command)
+                self.assertEqual(self.pending_texts(session), ["B"])
+            await self.enqueue(session, "A")
+            await self.command(session, "/queue texts delete 1")
+            self.assertEqual(self.pending_texts(session), ["B", "A"])
+            await self.command(session, "/queue texts delete 2")
+            self.assertEqual(self.pending_texts(session), ["A"])
+            self.assertEqual(session.user_messages.pending_entries()[0].id, 3)
+
+        self.run_queue_scenario(script)
+        self.assertIn("Queued text ID 1 is no longer pending.",
+                      self.output.getvalue())
+
+    def test_stale_image_ids_cannot_target_new_staging(self):
+        async def script(session):
+            owner = terminal_frontend._queued_inputs
+            image = types.SimpleNamespace(
+                path="/tmp/same.png", media_type="image/png", byte_size=1)
+            owner.stage_image(image)
+            owner.stage_image(image)
+            await self.command(session, "/queue images")
+            self.assertEqual([entry.id for entry in owner.staged_images], [1, 2])
+            owner.staged_images.clear()
+            owner.stage_image(image)
+            for command in [
+                    "/queue images delete 1", "/queue images move 2 end",
+                    "/queue images move 3 before 1"]:
+                await self.command(session, command)
+                self.assertEqual([entry.id for entry in owner.staged_images], [3])
+            owner.reset(session)
+            owner.stage_image(image)
+            await self.command(session, "/queue images delete 3")
+            self.assertEqual([entry.id for entry in owner.staged_images], [4])
+
+        self.run_queue_scenario(script)
+        self.assertIn("Staged image ID 1 is no longer pending.",
+                      self.output.getvalue())
+
+    def test_id_moves_preserve_identity_and_reject_position_syntax(self):
+        async def script(session):
+            for text in ["A", "B", "C"]:
+                await self.enqueue(session, text)
+            await self.command(session, "/queue texts move 3 before 1")
+            await self.command(session, "/queue texts edit 3 replacement")
+            await self.command(session, "/queue texts move 3 before 3")
+            await self.command(session, "/queue texts move 1 2")
+            self.assertEqual(self.pending_texts(session),
+                             ["replacement", "A", "B"])
+            self.assertEqual([entry.id for entry in
+                              session.user_messages.pending_entries()], [3, 1, 2])
+            owner = terminal_frontend._queued_inputs
+            for name in ["A", "B", "C"]:
+                owner.stage_image(types.SimpleNamespace(
+                    path=name, media_type="image/png", byte_size=1))
+            await self.command(session, "/queue images move 1 end")
+            await self.command(session, "/queue images move 2 before 2")
+            await self.command(session, "/queue images move 2 before 99")
+            await self.command(session, "/queue images move 1 2")
+            self.assertEqual([entry.id for entry in owner.staged_images], [2, 3, 1])
+
+        self.run_queue_scenario(script)
 
     def test_queue_view_is_released_after_abnormal_frontend_exit(self):
         from loki_agent.credentials import CredentialStore

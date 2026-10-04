@@ -794,6 +794,55 @@ class AsyncKeyReaderTests(unittest.TestCase):
 
 
 class UserMessageQueueTests(unittest.TestCase):
+    def test_identical_submissions_have_distinct_nonreused_ids(self):
+        queue = terminals.UserMessageQueue()
+        queue.put_nowait("same")
+        queue.put_nowait("same")
+        first, second = queue.pending_entries()
+        self.assertNotEqual(first.id, second.id)
+        queue.delete_text(first.id)
+        queue.edit_text(second.id, "edited")
+        self.assertEqual(queue.pending_entries()[0].id, second.id)
+        self.assertEqual(queue.get_nowait(), "edited")
+        queue.put_nowait("same")
+        third = queue.pending_entries()[0]
+        self.assertGreater(third.id, second.id)
+        queue.discard_pending_messages()
+        queue.put_nowait("same")
+        self.assertGreater(queue.pending_entries()[0].id, third.id)
+        with self.assertRaises(KeyError):
+            queue.delete_text(first.id)
+        self.assertEqual([entry.text for entry in queue.pending_entries()], ["same"])
+
+    def test_id_mutations_preserve_eof_and_size_accounting(self):
+        counts = []
+        queue = terminals.UserMessageQueue(counts.append)
+        for text in ["A", "B", "", None]:
+            queue.put_nowait(text)
+        first, second, third = queue.pending_entries()
+        queue.move_text(first.id)
+        queue.move_text(third.id, second.id)
+        queue.move_text(third.id, third.id)
+        self.assertEqual([entry.id for entry in queue.pending_entries()],
+                         [third.id, second.id, first.id])
+        before = queue.pending_entries()
+        with self.assertRaises(KeyError):
+            queue.move_text(second.id, 99)
+        with self.assertRaises(KeyError):
+            queue.move_text(99, second.id)
+        with self.assertRaises(KeyError):
+            queue.edit_text(99, "wrong")
+        self.assertEqual(queue.pending_entries(), before)
+        queue.edit_text(second.id, "replacement")
+        queue.delete_text(first.id)
+        self.assertEqual(queue.message_count, 2)
+        self.assertEqual(counts, [1, 2, 3, 2])
+        self.assertEqual(queue.get_nowait(), "")
+        self.assertEqual(queue.get_nowait(), "replacement")
+        self.assertIsNone(queue.get_nowait())
+        self.assertTrue(queue.empty())
+        self.assertEqual(counts, [1, 2, 3, 2, 1, 0])
+
     def test_reports_non_sentinel_messages_on_enqueue_and_dequeue(self):
         counts = []
         queue = terminals.UserMessageQueue(counts.append)

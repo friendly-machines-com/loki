@@ -2139,17 +2139,22 @@ class InputModal:
             self.reading = False
 
 
-class UserMessageQueue(asyncio.Queue):
-    """Queue that reports submitted, non-sentinel messages explicitly.
+@dataclass(frozen=True)
+class QueuedText:
+    id: int
+    text: str
 
-    Normal flow is producer ``put_nowait`` and the frontend loop ``get``.
-    ``pending_texts``/``replace_pending_texts`` are the non-consuming view
-    and edit used by the immediate /queue command; both run on the event
-    loop thread like every other mutation of this queue.
+
+class UserMessageQueue(asyncio.Queue):
+    """FIFO with stable submission IDs and plain-text consumer delivery.
+
+    Admission, consumption and editor mutations are synchronous on the event
+    loop thread. IDs are never reused, including after discard or consumption.
     """
 
     def __init__(self, on_size_change=None):
         super().__init__()
+        self._next_id = 1
         self._message_count = 0
         self._on_size_change = on_size_change or (lambda count: None)
 
@@ -2172,18 +2177,21 @@ class UserMessageQueue(asyncio.Queue):
                 pass
 
     def put_nowait(self, item):
-        super().put_nowait(item)
-        if item is not None:
+        entry = None if item is None else QueuedText(self._next_id, item)
+        super().put_nowait(entry)
+        if entry is not None:
+            self._next_id += 1
             self._message_count += 1
             self._notify_size_change()
 
     def get_nowait(self):
-        item = super().get_nowait()
-        if item is not None:
+        entry = super().get_nowait()
+        if entry is not None:
             assert self._message_count > 0
             self._message_count -= 1
             self._notify_size_change()
-        return item
+            return entry.text
+        return None
 
     def discard_pending_messages(self):
         old_count = self._message_count
@@ -2196,34 +2204,37 @@ class UserMessageQueue(asyncio.Queue):
         if old_count:
             self._notify_size_change()
 
-    def pending_texts(self) -> list:
-        """Snapshot of queued messages, oldest first (index 0 = next sent).
+    def pending_entries(self) -> list:
+        """Identified queued submissions in send order, excluding EOF."""
+        return [entry for entry in self._queue if entry is not None]
 
-        Read-only view of the internal deque; the queue is not consumed.
-        The EOF sentinel never appears in the snapshot.
-        """
-        return [item for item in self._queue if item is not None]
+    def _entry_index(self, entry_id):
+        for index, entry in enumerate(self._queue):
+            if entry is not None and entry.id == entry_id:
+                return index
+        raise KeyError(entry_id)
 
-    def replace_pending_texts(self, texts):
-        """Replace every queued message with TEXTS (oldest first).
+    def delete_text(self, entry_id):
+        del self._queue[self._entry_index(entry_id)]
+        self._message_count -= 1
+        self._notify_size_change()
 
-        Size accounting and its notification are corrected here, so the
-        status display stays truthful. An already-queued EOF sentinel stays
-        last. Like every mutation of this queue, callers run on the event
-        loop thread (the input owner or the frontend loop), never in
-        parallel with them.
-        """
-        texts = [text for text in texts if text is not None]
-        has_sentinel = bool(self._queue) and self._queue[-1] is None
-        old_count = self._message_count
-        self._queue.clear()
-        for text in texts:
-            super().put_nowait(text)
-        if has_sentinel:
-            super().put_nowait(None)
-        self._message_count = len(texts)
-        if old_count != self._message_count:
-            self._notify_size_change()
+    def edit_text(self, entry_id, text):
+        index = self._entry_index(entry_id)
+        self._queue[index] = QueuedText(entry_id, text)
+
+    def move_text(self, entry_id, before_id=None):
+        index = self._entry_index(entry_id)
+        # Validate both operands before changing anything.
+        target = (self._entry_index(before_id) if before_id is not None
+                  else len(self.pending_entries()))
+        if entry_id == before_id:
+            return
+        entry = self._queue[index]
+        del self._queue[index]
+        if index < target:
+            target -= 1
+        self._queue.insert(target, entry)
 
 
 class InputSession:

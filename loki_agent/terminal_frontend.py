@@ -100,6 +100,12 @@ def _redraw_status():
         pass
 
 
+@dataclass(frozen=True)
+class _QueuedImage:
+    id: int
+    image: attachments.StagedImage
+
+
 class _QueuedInputs:
     """What /queue reports on and edits: the input FIFO and staged images.
 
@@ -111,6 +117,7 @@ class _QueuedInputs:
     def __init__(self):
         self.session = None
         self.staged_images = []
+        self._next_image_id = 1
 
     def reset(self, session):
         """Bind SESSION's queue view and return the fresh staged-images list."""
@@ -118,10 +125,14 @@ class _QueuedInputs:
         self.staged_images.clear()
         return self.staged_images
 
-    def pending_texts(self) -> list:
+    def stage_image(self, image):
+        self.staged_images.append(_QueuedImage(self._next_image_id, image))
+        self._next_image_id += 1
+
+    def pending_entries(self) -> list:
         if self.session is None:
             return []
-        return self.session.user_messages.pending_texts()
+        return self.session.user_messages.pending_entries()
 
 
 _queued_inputs = _QueuedInputs()
@@ -236,67 +247,64 @@ def _immediate_account_read(argument: str):
 
 
 def _queue_usage():
-    print("usage: /queue [texts | images] [delete N | move N M | edit N TEXT]")
+    print("usage: /queue [texts | images] "
+          "[delete ID | move ID before OTHER_ID | move ID end | edit ID TEXT]")
 
 
 def _print_queued_texts():
-    texts = _queued_inputs.pending_texts()
-    if not texts:
+    entries = _queued_inputs.pending_entries()
+    if not entries:
         print("No queued texts.")
         return
-    print("Queued texts (1 = next sent):")
-    # Queued text is untrusted (it may contain pasted control bytes);
-    # write_text never emits its ANSI.
-    for number, text in enumerate(texts, start=1):
-        _print_text_line(f"{number}. ", text)
-    print("/queue texts delete N - remove; /queue texts move N M - reorder; "
-          "/queue texts edit N TEXT - replace")
+    print("Queued texts (send order):")
+    # Queued text is untrusted; write_text never emits its ANSI.
+    for entry in entries:
+        _print_text_line(f"[id {entry.id}] ", entry.text)
+    print("/queue texts delete ID - remove; "
+          "/queue texts move ID before OTHER_ID | move ID end - reorder; "
+          "/queue texts edit ID TEXT - replace")
 
 
 def _print_staged_images():
-    images = list(_queued_inputs.staged_images)
-    if not images:
+    entries = list(_queued_inputs.staged_images)
+    if not entries:
         print("No staged images.")
         return
     print("Staged images (sent with the next prompt):")
-    for number, image in enumerate(images, start=1):
+    for entry in entries:
+        image = entry.image
         _print_text_line(
-            f"{number}. ",
+            f"[id {entry.id}] ",
             f"{display_path(image.path)} "
             f"({image.media_type}, {image.byte_size} bytes)")
-    print("/queue images delete N - remove; /queue images move N M - reorder")
+    print("/queue images delete ID - remove; "
+          "/queue images move ID before OTHER_ID | move ID end - reorder")
 
 
-def _queue_position(word, count, label):
-    """Resolve WORD to a 1-based position among COUNT items, else None.
-
-    A malformed word is a usage error; a number naming nothing reports the
-    missing entry, so the user can see which list it is not in.
-    """
+def _queue_entry(word, entries, label):
     if not word.isdecimal():
         _queue_usage()
         return None
     try:
-        position = int(word)
+        entry_id = int(word)
     except ValueError:
-        # Python may reject a decimal exceeding its conversion limit. A
-        # malformed /queue number must not kill the immediate input owner.
+        # Oversized decimal input must not kill the immediate input owner.
         _queue_usage()
         return None
-    if not 1 <= position <= count:
-        print(f"No {label} {word}.")
-        return None
-    return position
+    for entry in entries:
+        if entry.id == entry_id:
+            return entry
+    print(f"{label} ID {word} is no longer pending.")
+    return None
 
 
 def _immediate_queue(argument: str):
-    # Reads snapshot the FIFO and staged images; delete/move/edit are
-    # explicit edits by number (1 = next sent). Every mutation re-lists,
-    # so the numbers on screen always describe the queue as it now stands.
+    # Selectors name submissions, never live positions. Resolution and the
+    # entire mutation are synchronous, so a resolved entry cannot disappear
+    # between validation and mutation on the event-loop thread.
     words = argument.split()
     if not words:
-        texts = _queued_inputs.pending_texts()
-        print(f"Queued texts: {len(texts)}; "
+        print(f"Queued texts: {len(_queued_inputs.pending_entries())}; "
               f"staged images: {len(_queued_inputs.staged_images)}.")
         print("Subcommands: /queue texts, /queue images.")
         return
@@ -306,69 +314,61 @@ def _immediate_queue(argument: str):
     if words == ["images"]:
         _print_staged_images()
         return
-    if words[:2] == ["texts", "delete"] and len(words) == 3:
-        texts = _queued_inputs.pending_texts()
-        number = _queue_position(words[2], len(texts), "queued text")
-        if number is None:
-            return
-        del texts[number - 1]
-        _queued_inputs.session.user_messages.replace_pending_texts(texts)
-        _print_queued_texts()
+    if words[:2] == ["images", "edit"]:
+        print("A staged image cannot be edited; delete it and stage "
+              "another with /image PATH.")
         return
-    if words[:2] == ["texts", "move"] and len(words) == 4:
-        texts = _queued_inputs.pending_texts()
-        number = _queue_position(words[2], len(texts), "queued text")
-        if number is None:
-            return
-        target = _queue_position(words[3], len(texts), "position")
-        if target is None:
-            return
-        texts.insert(target - 1, texts.pop(number - 1))
-        _queued_inputs.session.user_messages.replace_pending_texts(texts)
-        _print_queued_texts()
+    if len(words) < 3 or words[0] not in ["texts", "images"]:
+        _queue_usage()
         return
-    if words[:2] == ["texts", "edit"]:
+    operation = words[1]
+    replacement = None
+    before = None
+    if operation == "delete" and len(words) == 3:
+        pass
+    elif operation == "move" and (
+            (len(words) == 4 and words[3] == "end")
+            or (len(words) == 5 and words[3] == "before")):
+        pass
+    elif operation == "edit" and words[0] == "texts":
         parts = argument.split(None, 3)
         if len(parts) < 4 or not parts[3].strip():
             _queue_usage()
             return
-        texts = _queued_inputs.pending_texts()
-        number = _queue_position(parts[2], len(texts), "queued text")
-        if number is None:
+        replacement = parts[3]
+    else:
+        _queue_usage()
+        return
+    is_text = words[0] == "texts"
+    entries = (_queued_inputs.pending_entries() if is_text
+               else list(_queued_inputs.staged_images))
+    label = "Queued text" if is_text else "Staged image"
+    entry = _queue_entry(words[2], entries, label)
+    if entry is None:
+        return
+    if operation == "move" and words[3] == "before":
+        before = _queue_entry(words[4], entries, label)
+        if before is None:
             return
-        texts[number - 1] = parts[3]
-        _queued_inputs.session.user_messages.replace_pending_texts(texts)
+    if is_text:
+        queue = _queued_inputs.session.user_messages
+        if operation == "delete":
+            queue.delete_text(entry.id)
+        elif operation == "edit":
+            queue.edit_text(entry.id, replacement)
+        else:
+            queue.move_text(entry.id, before.id if before else None)
         _print_queued_texts()
-        return
-    if words[:2] == ["images", "delete"] and len(words) == 3:
+    else:
         images = _queued_inputs.staged_images
-        number = _queue_position(words[2], len(images), "staged image")
-        if number is None:
-            return
-        del images[number - 1]
+        if operation == "delete":
+            images.remove(entry)
+        elif entry != before:
+            images.remove(entry)
+            target = images.index(before) if before else len(images)
+            images.insert(target, entry)
         _terminal_activity.set_queued_images(len(images))
         _print_staged_images()
-        return
-    if words[:2] == ["images", "move"] and len(words) == 4:
-        images = _queued_inputs.staged_images
-        number = _queue_position(words[2], len(images), "staged image")
-        if number is None:
-            return
-        target = _queue_position(words[3], len(images), "position")
-        if target is None:
-            return
-        images.insert(target - 1, images.pop(number - 1))
-        _terminal_activity.set_queued_images(len(images))
-        _print_staged_images()
-        return
-    if words[:2] == ["images", "edit"]:
-        # A staged image is loaded bytes: re-pointing it at another file
-        # means loading that file, which /image already does after a
-        # delete. Not offered.
-        print("A staged image cannot be edited; delete it and stage "
-              "another with /image PATH.")
-        return
-    _queue_usage()
 
 
 def _emit_immediate_output(command, text, *, file=None):
@@ -1619,7 +1619,7 @@ async def async_main(args) -> int:
                         print(file=sys.stderr)
                         sys.stderr.flush()
                         continue
-                    pending_images.append(image)
+                    _queued_inputs.stage_image(image)
                     _terminal_activity.set_queued_images(
                         len(pending_images))
                     sys.stdout.flush()
@@ -1666,7 +1666,7 @@ async def async_main(args) -> int:
             if user_in:
                 user_content.append(formats.text_block(user_in))
             user_content.extend(
-                image.content_block() for image in pending_images)
+                entry.image.content_block() for entry in pending_images)
             current_transcript().append(
                 formats.message_item("user", user_content))
             pending_images.clear()
