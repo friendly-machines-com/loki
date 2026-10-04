@@ -33,6 +33,17 @@ class ReasoningProviderSpec:
     # "openai_subscription"
     wire_format: str = "openai"
     _hosts: list[str] = field(default_factory=list)
+    # Declarative request spellings.
+    # mode_spellings: control value -> wire spelling. The keys are the
+    # verified spellings thinking_control_status accepts on this wire.
+    # effort_field: the request field carrying an effort selection, as a
+    # string field name or a {field: {key: value}} nesting. None means no
+    # verified effort spelling exists on this wire.
+    # trace_field: the display-only readable-output request field, or None
+    # when this wire has no display control.
+    mode_spellings: dict = field(default_factory=dict)
+    effort_field: object = None
+    trace_field: object = None
 
     def __post_init__(self):
         object.__setattr__(self, "_hosts", self._hosts.copy())
@@ -47,16 +58,28 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
         protocol=ANTHROPIC_MESSAGES,
         wire_format="anthropic",
         _hosts=["api.anthropic.com"],
+        # platform.claude.com/docs/en/build-with-claude/thinking: manual =
+        # thinking.type "enabled", off = "disabled", adaptive/between-tools
+        # carry their own spellings.
+        mode_spellings={
+            "manual": "enabled", "off": "disabled",
+            "between-tools": "between_tools", "adaptive": "adaptive"},
+        effort_field={"output_config": {"effort": None}},
+        trace_field={"thinking": {"display": "summarized"}},
     ),
     "deepseek": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="thinking_toggle",
         _hosts=["api.deepseek.com"],
+        mode_spellings={"on": "enabled", "off": "disabled"},
+        effort_field="reasoning_effort",
     ),
     "openai": ReasoningProviderSpec(
         protocol=OPENAI_RESPONSES,
         wire_format="openai",
         _hosts=["api.openai.com"],
+        effort_field={"reasoning": {"effort": None}},
+        trace_field={"reasoning": {"summary": "auto"}},
     ),
     "openai-subscription": ReasoningProviderSpec(
         protocol=OPENAI_RESPONSES,
@@ -66,29 +89,42 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
         protocol=OPENAI_CHAT,
         wire_format="openrouter",
         _hosts=["openrouter.ai"],
+        effort_field={"reasoning": {"effort": None}},
     ),
     "sarvam": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="openai_chat",
         _hosts=["api.sarvam.ai"],
+        # Sarvam's documented off control is the JSON-null effort value;
+        # nothing else on this wire is a mode. See _apply_thinking.
+        mode_spellings={"off": "_effort_null"},
+        effort_field="reasoning_effort",
     ),
     "zai": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="thinking_toggle",
         _hosts=["api.z.ai"],
+        mode_spellings={"on": "enabled", "off": "disabled"},
+        effort_field="reasoning_effort",
     ),
     "zai-coding-plan": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="thinking_toggle",
+        mode_spellings={"on": "enabled", "off": "disabled"},
+        effort_field="reasoning_effort",
     ),
     "zhipuai": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="thinking_toggle",
         _hosts=["open.bigmodel.cn"],
+        mode_spellings={"on": "enabled", "off": "disabled"},
+        effort_field="reasoning_effort",
     ),
     "zhipuai-coding-plan": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="thinking_toggle",
+        mode_spellings={"on": "enabled", "off": "disabled"},
+        effort_field="reasoning_effort",
     ),
 }
 
@@ -210,19 +246,41 @@ def reasoning_provider_spec(provider_id, protocol, endpoint=None):
 
 
 # Per-protocol standard spellings, used when no native identity resolves.
+# A gateway never inherits a vendor's native display control, so these
+# specs carry spellings but no trace fields.
 _PROTOCOL_REASONING_SPECS = {
     OPENAI_RESPONSES: ReasoningProviderSpec(
-        OPENAI_RESPONSES, wire_format="openai"),
+        OPENAI_RESPONSES, wire_format="openai",
+        effort_field={"reasoning": {"effort": None}}),
     ANTHROPIC_MESSAGES: ReasoningProviderSpec(
-        ANTHROPIC_MESSAGES, wire_format="anthropic"),
+        ANTHROPIC_MESSAGES, wire_format="anthropic",
+        mode_spellings={
+            "manual": "enabled", "off": "disabled",
+            "between-tools": "between_tools", "adaptive": "adaptive"},
+        effort_field={"output_config": {"effort": None}}),
     OPENAI_CHAT: ReasoningProviderSpec(
-        OPENAI_CHAT, wire_format="openai_chat"),
+        OPENAI_CHAT, wire_format="openai_chat",
+        effort_field="reasoning_effort"),
 }
 
 
 def reasoning_effort_supported(provider_id, protocol, endpoint=None) -> bool:
     """Whether the connection's protocol has an effort request spelling."""
     return reasoning_provider_spec(provider_id, protocol, endpoint) is not None
+
+
+def _apply_effort_field(payload, effort_field, value):
+    """Write one effort selection through its declarative field spec:
+    a string names the request field; a dict nests it, with the value
+    replacing any null leaf."""
+    if isinstance(effort_field, str):
+        payload[effort_field] = value
+        return payload
+    for name, values in effort_field.items():
+        target = payload.setdefault(name, {})
+        for key, leaf in values.items():
+            target[key] = value if leaf is None else leaf
+    return payload
 
 
 # --- Native thinking controls ---------------------------------------------
@@ -241,7 +299,10 @@ def reasoning_effort_supported(provider_id, protocol, endpoint=None) -> bool:
 # explicit budget_tokens allowance; "between-tools" = thinking.type
 # "between_tools". The default is what a request with no thinking field
 # gets: off for the 4.x models (thinking is opt-in), adaptive for the
-# models documented as thinking-on by default.
+# models documented as thinking-on by default: "On Claude Opus 5.5,
+# Claude Opus 5, Claude Sonnet 5.5, Claude Sonnet 5, Claude Fable 5.1,
+# Claude Mythos 5.1, Claude Fable 5, Claude Mythos 5, and Claude Mythos
+# Preview, thinking is already on and needs no configuration."
 _ANTHROPIC_THINKING_MODES: dict[str, list[str]] = {
     "claude-opus-4-5": ["manual", "off"],
     "claude-opus-4-5-20251101": ["manual", "off"],
@@ -263,16 +324,13 @@ _ANTHROPIC_THINKING_MODES: dict[str, list[str]] = {
     "claude-mythos-5-1": ["adaptive"],
     "claude-mythos-preview": ["adaptive", "manual"],
 }
-# Models documented as thinking-on by default: "On Claude Opus 5.5, Claude
-# Opus 5, Claude Sonnet 5.5, Claude Sonnet 5, Claude Fable 5.1, Claude
-# Mythos 5.1, Claude Fable 5, Claude Mythos 5, and Claude Mythos Preview,
-# thinking is already on and needs no configuration." Every other model
-# in the table (4.5 through 4.8) defaults to thinking off.
-_ANTHROPIC_ADAPTIVE_DEFAULT_MODELS = [
-    "claude-opus-5", "claude-sonnet-5", "claude-opus-5-5",
-    "claude-sonnet-5-5", "claude-fable-5", "claude-fable-5-1",
-    "claude-mythos-5", "claude-mythos-5-1", "claude-mythos-preview",
-]
+_ANTHROPIC_DEFAULT_MODES: dict[str, str] = {
+    model: "adaptive" for model in [
+        "claude-opus-5", "claude-sonnet-5", "claude-opus-5-5",
+        "claude-sonnet-5-5", "claude-fable-5", "claude-fable-5-1",
+        "claude-mythos-5", "claude-mythos-5-1", "claude-mythos-preview",
+    ]
+}
 
 # Documented effort ceilings for low-thinking modes: Opus 5 accepts
 # thinking.type "disabled" only at effort "high" or below, and Sonnet 5.5
@@ -297,10 +355,25 @@ _GLM_THINKING_MODES: dict[str, list[str]] = {
     "glm-5.3": [],
     "glm-5.3-flash": [],
 }
+# Every documented GLM model defaults to thinking on.
 _GLM_DEFAULT_MODES: dict[str, str] = {
     "glm-5.2": "on",
     "glm-5.3": "on",
     "glm-5.3-flash": "on",
+}
+
+# Native mode facts per vendor identity: documented modes per model, and
+# the default a request with no thinking field gets. A model absent from
+# ``modes`` has no documented mode control and no documented default.
+# The vendor-wide "" entry supplies modes that hold for every model.
+_NATIVE_THINKING_MODES = {
+    "anthropic": (_ANTHROPIC_THINKING_MODES, _ANTHROPIC_DEFAULT_MODES),
+    "zai": (_GLM_THINKING_MODES, _GLM_DEFAULT_MODES),
+    "zhipuai": (_GLM_THINKING_MODES, _GLM_DEFAULT_MODES),
+    # Sarvam's documented off control is the JSON-null effort value; "on"
+    # has no verified spelling, so the only mode fact is the vendor-wide
+    # off control.
+    "sarvam": ({"": ["off"]}, {}),
 }
 
 # Public Responses reuse: developers.openai.com/api/docs/guides/reasoning
@@ -458,27 +531,22 @@ class Provider:
         """Thinking modes documented for this native connection. Catalog
         controls join in the metadata layer; empty means "no disablement
         or mode control documented", not unknown."""
-        identity = self.reasoning_provider_id
-        if identity == "anthropic":
-            return _ANTHROPIC_THINKING_MODES.get(model, []).copy()
-        if identity in ["zai", "zhipuai"]:
-            return _GLM_THINKING_MODES.get(model, []).copy()
-        if identity == "sarvam":
-            # The documented off control; "on" has no verified spelling.
-            return ["off"]
-        return []
+        modes, _defaults = _NATIVE_THINKING_MODES.get(
+            self.reasoning_provider_id, ({}, {}))
+        if model in modes:
+            return modes[model].copy()
+        return modes.get("", []).copy()
 
     def thinking_default_mode(self, model):
-        identity = self.reasoning_provider_id
-        if identity == "anthropic":
-            if model in _ANTHROPIC_THINKING_MODES:
-                return ("adaptive"
-                        if model in _ANTHROPIC_ADAPTIVE_DEFAULT_MODELS
-                        else "off")
+        modes, defaults = _NATIVE_THINKING_MODES.get(
+            self.reasoning_provider_id, ({}, {}))
+        if model not in modes:
+            # A model with no documented mode control has no documented
+            # default either.
             return None
-        if identity in ["zai", "zhipuai"]:
-            return _GLM_DEFAULT_MODES.get(model)
-        return None
+        # A model with documented mode control defaults to the vendor's
+        # documented default, or off when the vendor documents opt-in.
+        return defaults.get(model, "off")
 
     def thinking_control_status(self, model, control, value):
         """Classify one requested control against the wire contract.
@@ -490,44 +558,37 @@ class Provider:
         turn -- belongs to the command layer, not the wire.
         """
         spec = self.reasoning_spec
-        wire = spec.wire_format if spec else None
         identity = self.reasoning_provider_id
+        modes, _defaults = _NATIVE_THINKING_MODES.get(identity, ({}, {}))
         if control == "mode":
-            spellings = []
-            if wire == "anthropic":
-                spellings = ["manual", "adaptive", "between-tools", "off"]
-            elif wire == "thinking_toggle":
-                spellings = ["on", "off"]
-            elif wire == "openai_chat" and identity == "sarvam":
-                # Sarvam's documented off control is the JSON-null
-                # effort value; nothing else on this wire is a mode.
-                spellings = ["off"]
-            if value not in spellings:
+            # The spec's spelling keys are the verified spellings.
+            if spec is None or value not in spec.mode_spellings:
                 raise ProtocolError(
                     "no verified request spelling for this thinking mode")
-            if identity == "sarvam" and value == "off":
+            # A model entry holds the documented modes; the "" entry holds
+            # vendor-wide modes; anything else is undocumented ("trial").
+            if model in modes:
+                documented = modes[model]
+            elif "" in modes:
+                documented = modes[""]
+            else:
+                documented = None
+            if documented is None:
+                return "trial"
+            if value in documented:
                 return "supported"
+            # A mode spelling the native vendor's documented contract
+            # rejects for this model never becomes request bytes.
             if identity == "anthropic":
-                modes = _ANTHROPIC_THINKING_MODES.get(model)
-                if modes is None:
-                    return "trial"
-                if value in modes:
-                    return "supported"
                 raise ProtocolError(
                     "this mode is rejected by the documented native Claude "
                     "contract for this model")
-            if identity in ["zai", "zhipuai"]:
-                modes = _GLM_THINKING_MODES.get(model)
-                if modes is None:
-                    return "trial"
-                if value in modes:
-                    return "supported"
-                if value == "off":
-                    raise ProtocolError(
-                        "this native GLM model cannot disable thinking")
+            if identity in ["zai", "zhipuai"] and value == "off":
+                raise ProtocolError(
+                    "this native GLM model cannot disable thinking")
             return "trial"
         if control == "budget":
-            if wire != "anthropic":
+            if (spec is None or spec.wire_format != "anthropic"):
                 raise ProtocolError(
                     "no verified thinking-allowance request spelling for "
                     "this connection")
@@ -605,22 +666,16 @@ class Provider:
                         retention, traces):
         self.validate_thinking(model, effort, mode, budget, retention)
         spec = self.reasoning_spec
-        wire = spec.wire_format if spec else None
-        if mode is not None:
-            if wire == "anthropic":
-                payload["thinking"] = {"type": {
-                    "manual": "enabled", "off": "disabled",
-                    "between-tools": "between_tools",
-                    "adaptive": "adaptive"}[mode]}
-            elif wire == "thinking_toggle":
-                payload["thinking"] = {
-                    "type": "enabled" if mode == "on" else "disabled"}
-            elif mode == "off" and self.reasoning_provider_id == "sarvam":
+        if mode is not None and spec is not None:
+            spelling = spec.mode_spellings.get(mode)
+            if spelling == "_effort_null":
                 # The one boundary line (design section 1): JSON null
                 # exists only here. Sarvam's documented off control is
                 # reasoning_effort: null; it is never a value, marker, or
                 # stored state anywhere else in the program.
                 payload["reasoning_effort"] = None
+            else:
+                payload["thinking"] = {"type": spelling}
         if budget is not None:
             payload["thinking"]["budget_tokens"] = budget
         if retention == "preserve":
@@ -635,21 +690,27 @@ class Provider:
 
     def _apply_trace_output(self, payload, model, mode):
         """Display-only readable-output fields: never enablement, effort,
-        allowance, or preservation."""
-        spec = self.reasoning_spec
-        wire = spec.wire_format if spec else None
-        if wire == "anthropic":
-            # Restate only an established mode: the user's selection or a
-            # documented thinking-on default. between_tools accepts no
+        allowance, or preservation. Restates only an established mode:
+        the user's selection or a documented thinking-on default."""
+        identity = self.reasoning_provider_id
+        # Trace fields belong to native identities; a gateway speaking the
+        # same protocol never inherits the vendor's display control.
+        spec = _REASONING_SPECS.get(identity)
+        if spec is None or spec.trace_field is None:
+            return
+        if spec.wire_format == "anthropic":
+            # Restate only an established mode; between_tools accepts no
             # display field at all.
             effective = mode or self.thinking_default_mode(model)
-            if effective in ["manual", "adaptive"]:
-                payload.setdefault("thinking", {
-                    "type": ("enabled" if effective == "manual"
-                             else "adaptive")})["display"] = "summarized"
-        elif wire == "openai":
-            if self.reasoning_provider_id == "openai":
-                payload.setdefault("reasoning", {})["summary"] = "auto"
+            if effective not in ["manual", "adaptive"]:
+                return
+            payload.setdefault("thinking", {
+                "type": ("enabled" if effective == "manual"
+                         else "adaptive")})
+        for name, values in spec.trace_field.items():
+            target = payload.setdefault(name, {})
+            for key, value in values.items():
+                target[key] = value
 
     def chat_payload(
             self, items, tools, model, *, prompt_cache_key=None,
@@ -685,19 +746,14 @@ class Provider:
                 payload["tools"] = tools
             if reasoning_effort is not None:
                 spec = self.reasoning_spec
-                wire_format = spec.wire_format if spec else None
                 # Effort is guidance only. It never adds or removes a
                 # thinking field: enablement is the mode control's job.
-                if wire_format == "openrouter":
-                    payload["reasoning"] = {
-                        "effort": reasoning_effort,
-                    }
-                elif wire_format in ["thinking_toggle", "openai_chat"]:
-                    payload["reasoning_effort"] = reasoning_effort
-                else:
+                if spec is None or spec.effort_field is None:
                     raise ProtocolError(
                         "reasoning effort is not implemented for this "
                         "OpenAI Chat provider")
+                _apply_effort_field(
+                    payload, spec.effort_field, reasoning_effort)
             return payload
         if self.kind == ANTHROPIC_MESSAGES:
             system, messages = formats.items_to_anthropic_parts(
@@ -718,9 +774,13 @@ class Provider:
             if anthropic_tools:
                 payload["tools"] = anthropic_tools
             if reasoning_effort is not None:
-                payload["output_config"] = {
-                    "effort": reasoning_effort,
-                }
+                spec = self.reasoning_spec
+                if spec is None or spec.effort_field is None:
+                    raise ProtocolError(
+                        "reasoning effort is not implemented for this "
+                        "Anthropic endpoint")
+                _apply_effort_field(
+                    payload, spec.effort_field, reasoning_effort)
             return payload
         if self.kind == OPENAI_RESPONSES:
             instructions, input_items = (
@@ -778,9 +838,13 @@ class Provider:
                 # not copy default_service_tier into a request unless a tier
                 # was selected by client configuration.
             elif reasoning_effort is not None:
-                payload["reasoning"] = {
-                    "effort": reasoning_effort,
-                }
+                spec = self.reasoning_spec
+                if spec is None or spec.effort_field is None:
+                    raise ProtocolError(
+                        "reasoning effort is not implemented for this "
+                        "OpenAI Responses endpoint")
+                _apply_effort_field(
+                    payload, spec.effort_field, reasoning_effort)
             if self.responses_lite:
                 # Responses-Lite is a distinct ChatGPT Codex request
                 # contract. Its header requires all-turn reasoning context,
