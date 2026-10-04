@@ -1,7 +1,10 @@
 """User job commands reuse the job manager without changing job lifetimes."""
 
 import asyncio
+import contextlib
+import io
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -181,6 +184,16 @@ class PsTests(unittest.TestCase):
                     self.assertTrue(loki.run_ps(argument).startswith("usage:"))
             stop.assert_not_called()
 
+    def test_terminal_ps_recognition_does_not_intercept_paths_or_other_commands(self):
+        for text, expected in [
+                [" /ps ", ""], ["/ps all", "all"], ["/ps stop 1", "stop 1"],
+                ["/ps kill 1", "kill 1"], ["/ps bad argument", "bad argument"]]:
+            with self.subTest(text=text):
+                self.assertEqual(loki.ps_argument(text), expected)
+        for text in ["/ps/file.py", "/ps-extra", "/PS", "/ps\t1", "/status", "prompt"]:
+            with self.subTest(text=text):
+                self.assertIsNone(loki.ps_argument(text))
+
     def test_acp_does_not_advertise_or_handle_ps(self):
         with mock.patch.object(loki, "LOKI_CONFIG_DIR", self.manager.base_dir):
             self.assertNotIn("ps", [command["name"]
@@ -191,6 +204,141 @@ class PsTests(unittest.TestCase):
                 self.assertIsNone(asyncio.run(acp_commands.run(text, self.session)))
                 run_ps.assert_not_called()
         self.assertEqual(self.session.transcript_items, [])
+
+
+class ImmediateTerminalPsTests(unittest.TestCase):
+    def test_input_owner_lists_tails_stops_and_kills_without_dequeueing(self):
+        from loki_agent import formats, terminal_frontend, terminals
+        from process_lifecycle_fixtures import ProcessResources
+
+        async def scenario(root):
+            manager = loki.JobManager(os.path.join(root, "jobs"))
+            conversation = Session(job_manager=manager, shell_cwd=root,
+                                   transcript_items=[formats.message_item("user", "busy")])
+            initial = list(conversation.transcript_items)
+            output = io.StringIO()
+            counts = []
+            handled = []
+
+            class Reader:
+                def __init__(self):
+                    self.keys = asyncio.Queue()
+                    self.cancel_requested = False
+                    self.cancel_event = asyncio.Event()
+
+                async def read_key(self):
+                    return await self.keys.get()
+
+            def submit(text):
+                consumed = terminal_frontend._submit_job_control(text)
+                if consumed:
+                    handled.append(text)
+                return consumed
+
+            with mock.patch.object(loki, "_DEFAULT_SESSION", conversation), \
+                    mock.patch.object(terminals.os, "isatty", return_value=False), \
+                    contextlib.redirect_stdout(output):
+                session = terminals.InputSession(
+                    fd=0, on_submit=submit, on_queue_size_change=counts.append)
+                session.reader = Reader()
+                session._producer = asyncio.create_task(session._produce())
+                script = (
+                    "import signal,time\n"
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                    "if hasattr(signal, 'SIGBREAK'):\n"
+                    "    signal.signal(signal.SIGBREAK, signal.SIG_IGN)\n"
+                    "print('job-ready\\x1b]777;PS_TAIL_ATTACK\\x07', flush=True)\n"
+                    "time.sleep(60)\n"
+                )
+                foreground = asyncio.create_task(manager.run_foreground(
+                    [sys.executable, "-c", script], "controlled job", 60_000, cwd=root))
+                resources = None
+
+                def feed(text):
+                    session.reader.keys.put_nowait(terminals.KeyEvent("TEXT", text))
+                    session.reader.keys.put_nowait(terminals.KeyEvent("ENTER"))
+
+                async def command(text):
+                    previous = len(handled)
+                    feed(text)
+                    async with asyncio.timeout(3):
+                        while len(handled) == previous:
+                            await asyncio.sleep(0)
+                    self.assertEqual(handled[-1], text)
+                    self.assertEqual(session.user_messages.message_count, 1)
+                    self.assertEqual(counts, [1])
+                    self.assertEqual(conversation.transcript_items, initial)
+
+                try:
+                    async with asyncio.timeout(5):
+                        while True:
+                            job = next(iter(manager.jobs.values()), None)
+                            if job is not None and job.process is not None:
+                                if "job-ready" in loki._read_spool_tail(job.stdout_path):
+                                    break
+                            await asyncio.sleep(.01)
+                    resources = ProcessResources(job.process)
+                    feed("ordinary prompt")
+                    async with asyncio.timeout(3):
+                        while session.user_messages.message_count != 1:
+                            await asyncio.sleep(0)
+                    await command("/ps")
+                    await command("/ps all")
+                    self.assertIn(f"{job.id}. status=running", output.getvalue())
+                    await command("/ps " + job.id)
+                    self.assertIn("[stdout_tail]\njob-ready^[]777;PS_TAIL_ATTACK^G", output.getvalue())
+                    self.assertNotIn("\x1b]777", output.getvalue())
+                    await command("/ps stop " + job.id)
+                    self.assertEqual(job.status, "stopping")
+                    self.assertFalse(session.reader.cancel_requested)
+                    self.assertFalse(session.reader.cancel_event.is_set())
+                    await command("/ps kill " + job.id)
+                    result_job, outcome, _stdout, _stderr = await asyncio.wait_for(foreground, 5)
+                    self.assertIs(result_job, job)
+                    self.assertEqual(outcome, "completed")
+                    self.assertEqual(job.status, "stopped")
+                    self.assertIsNotNone(job.exit_code)
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    resources.assert_released(self)
+
+                    # /ps remains immediate during exclusive modal input, and
+                    # must neither answer the modal nor consume pending input.
+                    session.reader.cancel_requested = True
+                    session.reader.cancel_event.set()
+                    async with session.modal() as modal:
+                        answer = asyncio.create_task(modal.prompt("Confirm: "))
+                        try:
+                            await command("/ps all")
+                            self.assertFalse(answer.done())
+                            self.assertTrue(session.reader.cancel_requested)
+                            self.assertTrue(session.reader.cancel_event.is_set())
+                            feed("no")
+                            self.assertEqual(await asyncio.wait_for(answer, 3), "no")
+                        finally:
+                            if not answer.done():
+                                answer.cancel()
+                            await asyncio.gather(answer, return_exceptions=True)
+                    with mock.patch.object(loki, "run_ps", side_effect=OSError("inspect failed\x1b[2J")):
+                        await command("/ps")
+                    self.assertIn("Could not inspect or control jobs: inspect failed^[[2J", output.getvalue())
+                    await command("/ps all")
+                    self.assertEqual(session.user_messages.get_nowait(), "ordinary prompt")
+                    self.assertEqual(counts, [1, 0])
+                finally:
+                    await session._pause()
+                    for job in manager.jobs.values():
+                        if job.process is not None and job.process.returncode is None:
+                            loki.host_process.signal_group(job.process, job.pgid, loki.host_process.FORCE)
+                            await asyncio.wait_for(job.process.wait(), 3)
+                    if not foreground.done():
+                        foreground.cancel()
+                    await asyncio.wait_for(asyncio.gather(foreground, return_exceptions=True), 3)
+                    if resources is not None:
+                        await resources.cleanup()
+
+        with tempfile.TemporaryDirectory() as root:
+            asyncio.run(scenario(root))
 
 
 if __name__ == "__main__":

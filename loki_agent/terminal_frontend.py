@@ -97,6 +97,30 @@ def _redraw_status():
         pass
 
 
+def _submit_job_control(text: str) -> bool:
+    # /ps is immediate user job control, not a queued prompt. This runs from
+    # the sole input owner even while inference, a tool, or a modal is busy.
+    argument = _core.ps_argument(text)
+    if argument is None:
+        return False
+    restore_output_area_after_input()
+    print()
+    terminal.set_background_color(terminals.INPUT_COLOR)
+    print("User: ", end="")
+    terminal.write_text(text, multiline=True)
+    terminal.reset_colors_and_flags()
+    print()
+    try:
+        result = _core.run_ps(argument)
+    except Exception as error:
+        result = f"Could not inspect or control jobs: {error}"
+    # Spool contents and command text are untrusted; do not emit their ANSI.
+    terminal.write_text(result, multiline=True)
+    print()
+    sys.stdout.flush()
+    return True
+
+
 def _image_command_path(command_text: str) -> str:
     return attachments.image_argument_path(command_text[len("/image"):])
 
@@ -513,6 +537,8 @@ def _write_status_text():
         job.status == "running" and job.process.returncode is None
         for job in manager.jobs.values())
     print("; /pwd, /cd DIR, ", end="")
+    # /ps is available immediately, including during a turn; this label is
+    # only a job-state snapshot, never an instruction to queue the command.
     if has_running_jobs:
         print(terminals.BOLD, end="")
     print("/ps", end="")
@@ -879,7 +905,9 @@ async def async_main(args) -> int:
             history_provider=lambda: user_prompt_history(
                 current_transcript()),
             on_queue_size_change=(
-                _terminal_activity.set_queued_prompts)) as session, contextlib.AsyncExitStack() as status_cleanup:
+                _terminal_activity.set_queued_prompts),
+            # /ps must execute before the input FIFO, regardless of turn state.
+            on_submit=_submit_job_control) as session, contextlib.AsyncExitStack() as status_cleanup:
         # Background exits can occur without input or tool-result events.
         # Detach this display observer before terminal input ownership ends.
         manager = _core.current_job_manager()
@@ -1012,6 +1040,8 @@ async def async_main(args) -> int:
             terminal.reset_colors_and_flags()
             print()
             command_text = user_in.strip()
+            # No /ps case here: the input owner runs it immediately, even
+            # during a turn. Putting it back here would silently queue it.
             match command_text:
                 case '/quit':
                     break
@@ -1207,11 +1237,6 @@ async def async_main(args) -> int:
                 case '/pwd':
                     print_shell_cwd(
                         text_writer=terminal.write_text)
-                    continue
-                case _ if command_text == '/ps' or command_text.startswith('/ps '):
-                    terminal.write_text(
-                        _core.run_ps(command_text[3:]), multiline=True)
-                    print()
                     continue
                 case _ if command_text == '/cd' or command_text.startswith('/cd '):
                     change_shell_cwd_from_text(

@@ -90,13 +90,19 @@ class ScriptedInputSession:
     def __init__(self, messages):
         self.messages = list(messages)
         self.user_messages = self
+        self.on_submit = lambda text: False
         self.reader = types.SimpleNamespace(
             cancel_requested=False,
             cancel_event=mock.Mock(),
         )
 
     async def get(self):
-        return self.messages.pop(0)
+        while True:
+            text = self.messages.pop(0)
+            # Model the input owner's /ps interception, not a consumer-side
+            # slash-command handler. Native PTY tests cover actual queue timing.
+            if text is None or not self.on_submit(text):
+                return text
 
     async def __aenter__(self):
         return self
@@ -239,9 +245,14 @@ class TerminalImageCommandTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         path = os.path.join(tmpdir, "chat-test.json")
+
+        def input_session(**kwargs):
+            session.on_submit = kwargs["on_submit"]
+            return session
+
         with mock.patch(
                 "loki_agent.terminal_frontend.input_session",
-                return_value=session), mock.patch(
+                side_effect=input_session), mock.patch(
                     "loki_agent.terminal_frontend.new_chat_log_path",
                     return_value=path), mock.patch(
                         "loki_agent.terminal_frontend."

@@ -2553,7 +2553,20 @@ def run_jobs() -> str:
     return current_job_manager().list_jobs()
 
 
+def ps_argument(text: str) -> str | None:
+    """Recognize terminal /ps before input queueing or modal submission."""
+    text = text.strip()
+    if text == "/ps":
+        return ""
+    if text.startswith("/ps "):
+        return text[3:].strip()
+    return None
+
+
 def run_ps(argument: str = "") -> str:
+    # /ps is immediate user job control, allowed even during a running turn.
+    # Keep it synchronous: JobManager transitions cannot interleave, and this
+    # must never reset cancellation, mutate the transcript, or start inference.
     parts = argument.split()
     if not parts or parts == ["all"]:
         listing = current_job_manager().list_jobs(show_all=parts == ["all"])

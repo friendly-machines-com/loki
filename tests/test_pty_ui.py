@@ -440,6 +440,24 @@ class PtyUiTests(unittest.TestCase):
         )
         self.assertIn(b"queued prompts: 0, queued images: 0", output)
 
+    def test_ps_result_is_visible_during_stream_without_joining_prompt_queue(self):
+        output, before_release = run_loki_pty_reply(
+            stream=True, stream_chunks=["partial **bold", "word** and `codeword` done"],
+            queued_inputs=["second", "/ps"])
+        # An echoed /ps is not proof of execution: its actual local result
+        # must appear while the real frontend's provider is still blocked.
+        self.assertIn(b"No running, starting, or failed jobs.", before_release)
+        self.assertNotIn(b"codeword", before_release)
+        plain = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
+        self.assertIn(b"queued prompts: 1, queued images: 0", plain)
+        self.assertNotIn(b"queued prompts: 2", plain)
+        self._assert_styled_output(output)
+        tracker = _SgrStreamTracker()
+        tracker.feed(output)
+        self.assertEqual(tracker.unterminated, 0)
+        self.assertFalse(tracker.bold)
+        self.assertEqual(tracker.fg, "default")
+
     def test_status_bar_tracks_image_after_queued_command_is_validated(self):
         output, before_release = run_loki_pty_reply(
             stream=True,

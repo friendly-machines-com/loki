@@ -157,7 +157,9 @@ In the terminal, `/ps` lists running, starting, and failed jobs;
 `/ps all` includes finished jobs. Lists are ordered oldest first.
 Use `/ps ID` to see a job's status and recent stdout/stderr, `/ps stop ID`
 to request a graceful stop, or `/ps kill ID` to force termination.
-`/ps` is not an ACP command.
+These commands execute immediately, without queueing behind a running turn,
+and are also available during terminal pickers and confirmations. `/ps` is
+not an ACP command.
 
 Loki checks tool input before execution, corrects some unambiguous formatting
 mistakes, and reports any corrections. Other invalid calls are rejected.
