@@ -358,8 +358,8 @@ class TerminalImageCommandTests(unittest.TestCase):
             }],
         })
         self.assertIn("Attached image for next prompt:", stderr)
-        self.assertIn("queued images: 1", status_updates[0])
-        self.assertIn("queued images: 0", status_updates[1])
+        self.assertIn("images: 1)", status_updates[0])
+        self.assertIn("images: 0)", status_updates[1])
 
     def test_empty_prompt_submits_all_staged_images_without_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2655,6 +2655,20 @@ class ExitStatusTests(unittest.TestCase):
 
 
 class StatusTextTests(unittest.TestCase):
+    def test_local_status_groups_queue_counts_with_the_queue_command(self):
+        activity = terminal_frontend.TerminalActivityStatus()
+        with mock.patch.object(terminal_frontend, "current_cwd",
+                               return_value="/home/dannym/src/loki"), \
+                mock.patch.object(terminal_frontend, "current_agent_mode",
+                                  return_value="normal"):
+            local = terminal_frontend.status_text(activity).split("\n", 1)[1]
+        self.assertEqual(
+            local,
+            "Local: CWD: /home/dannym/src/loki, turn: idle, mode: normal; "
+            "/queue(texts: 0, images: 0), /pwd, /cd DIR, /ps, /image PATH, !foo, /quit")
+        self.assertNotIn("queued prompts:", local)
+        self.assertNotIn("queued images:", local)
+
     def test_status_bar_bolds_only_nonidle_and_nonzero_activity_values(self):
         for running, messages, images in (
                 (True, 0, 0), (False, 2, 0), (False, 0, 3),
@@ -2673,12 +2687,12 @@ class StatusTextTests(unittest.TestCase):
                     "Local: CWD: /status/cwd, turn: "))
                 self.assertEqual(
                     rendered.replace("\033[1m", "").replace("\033[22m", ""), plain)
-                for label, value, bold in (
-                        ("turn", "running" if running else "idle", running),
-                        ("queued prompts", str(messages), messages != 0),
-                        ("queued images", str(images), images != 0)):
+                for label, value, bold, suffix in [
+                        ["turn", "running" if running else "idle", running, ","],
+                        ["texts", str(messages), messages != 0, ","],
+                        ["images", str(images), images != 0, ")"]]:
                     expected = f"\033[1m{value}\033[22m" if bold else value
-                    self.assertIn(f"{label}: {expected},", rendered)
+                    self.assertIn(f"{label}: {expected}{suffix}", rendered)
                 self.assertEqual(rendered.count("\033[1m"),
                                  sum((running, messages != 0, images != 0)))
                 self.assertNotIn("\033[0m", rendered)
@@ -2811,8 +2825,7 @@ class StatusTextTests(unittest.TestCase):
             "Context: unknown; "
             "/model, /thinking, /trace thinking, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
-            "queued prompts: 2, queued images: 1, "
-            f"mode: {loki.current_agent_mode()}; "
+            f"mode: {loki.current_agent_mode()}; /queue(texts: 2, images: 1), "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)

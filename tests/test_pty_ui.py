@@ -401,8 +401,8 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"Remote: API: dummy.invalid", output)
         self.assertRegex(
             output,
-            rb"Local: CWD: [^\r\n]*, turn: idle, queued prompts: 0, "
-            rb"queued images: 0, mode: normal;",
+            rb"Local: CWD: [^\r\n]*, turn: idle, mode: normal; "
+            rb"/queue\(texts: 0, images: 0\), /pwd",
         )
 
     def test_streamed_plain_prefix_is_visible_before_completion(self):
@@ -428,17 +428,17 @@ class PtyUiTests(unittest.TestCase):
         # These assertions concern queue transitions, independently of styling.
         before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
-        self.assertIn(b"queued prompts: 1, queued images: 0", before_release)
-        self.assertIn(b"queued prompts: 2, queued images: 0", before_release)
+        self.assertIn(b"/queue(texts: 1, images: 0)", before_release)
+        self.assertIn(b"/queue(texts: 2, images: 0)", before_release)
         self.assertIn(
-            b"turn: running, queued prompts: 2, queued images: 0",
+            b"turn: running, mode: normal; /queue(texts: 2, images: 0)",
             before_release,
         )
         self.assertIn(
-            b"turn: idle, queued prompts: 0, queued images: 0",
+            b"turn: idle, mode: normal; /queue(texts: 0, images: 0)",
             output,
         )
-        self.assertIn(b"queued prompts: 0, queued images: 0", output)
+        self.assertIn(b"/queue(texts: 0, images: 0)", output)
 
     def test_ps_result_is_visible_during_stream_without_joining_prompt_queue(self):
         output, before_release = run_loki_pty_reply(
@@ -449,7 +449,7 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"No running, starting, or failed jobs.", before_release)
         self.assertNotIn(b"codeword", before_release)
         plain = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
-        self.assertIn(b"queued prompts: 1, queued images: 0", plain)
+        self.assertIn(b"/queue(texts: 1, images: 0)", plain)
         self.assertNotIn(b"queued prompts: 2", plain)
         self._assert_styled_output(output)
         tracker = _SgrStreamTracker()
@@ -469,7 +469,7 @@ class PtyUiTests(unittest.TestCase):
         # These assertions concern queue transitions, independently of styling.
         before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
-        self.assertIn(b"queued prompts: 1, queued images: 0", before_release)
+        self.assertIn(b"/queue(texts: 1, images: 0)", before_release)
         self.assertIn(b"queued prompts: 0, queued images: 1", output)
 
     def test_full_stream_parses_and_styles_land(self):

@@ -839,15 +839,15 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
     remote += ', /thinking, /trace thinking, /status, /account'
     return (
         remote + '\n'
-        'Local: CWD: {}, turn: {}, queued prompts: {}, queued images: {}, '
-        'mode: {}; '
+        'Local: CWD: {}, turn: {}, mode: {}; '
+        '/queue(texts: {}, images: {}), '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         fields["cwd"],
         fields["turn"],
+        fields["mode"],
         fields["queued_prompts"],
-        fields["queued_images"],
-        fields["mode"])
+        fields["queued_images"])
 
 
 def _write_status_text():
@@ -865,10 +865,11 @@ def _write_status_text():
     print(", /thinking, /trace thinking, /status, /account\nLocal: CWD: ", end="")
     terminal.write_text(fields["cwd"])
     print(", turn: ", end="")
-    for label, value, active in (
-            ("", fields["turn"], fields["turn"] != "idle"),
-            (", queued prompts: ", fields["queued_prompts"], fields["queued_prompts"] != 0),
-            (", queued images: ", fields["queued_images"], fields["queued_images"] != 0)):
+    for label, value, active in [
+            ["", fields["turn"], fields["turn"] != "idle"],
+            [", mode: ", fields["mode"], False],
+            ["; /queue(texts: ", fields["queued_prompts"], fields["queued_prompts"] != 0],
+            [", images: ", fields["queued_images"], fields["queued_images"] != 0]]:
         print(label, end="")
         if active:
             print(terminals.BOLD, end="")
@@ -876,15 +877,13 @@ def _write_status_text():
         if active:
             # End only bold, preserving the status area's background color.
             print(terminals.BOLD_OFF, end="")
-    print(", mode: ", end="")
-    terminal.write_text(fields["mode"])
     manager = current_session().job_manager
     # The reaper can lag a process exit. Read returncode without refreshing
     # job metadata from the renderer.
     has_running_jobs = manager is not None and any(
         job.status == "running" and job.process.returncode is None
         for job in manager.jobs.values())
-    print("; /pwd, /cd DIR, ", end="")
+    print("), /pwd, /cd DIR, ", end="")
     # /ps is available immediately, including during a turn; this label is
     # only a job-state snapshot, never an instruction to queue the command.
     if has_running_jobs:
