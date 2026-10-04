@@ -153,10 +153,11 @@ arguments; Bash runs in that directory, and relative file paths are resolved
 against it. The ACP tool-call title also shows the cwd. Background Jobs and
 JobStatus report the cwd captured at launch.
 
-In the terminal or ACP, `/ps` lists running, starting, and failed jobs;
+In the terminal, `/ps` lists running, starting, and failed jobs;
 `/ps all` includes finished jobs. Lists are ordered oldest first.
 Use `/ps ID` to see a job's status and recent stdout/stderr, `/ps stop ID`
 to request a graceful stop, or `/ps kill ID` to force termination.
+`/ps` is not an ACP command.
 
 Loki checks tool input before execution, corrects some unambiguous formatting
 mistakes, and reports any corrections. Other invalid calls are rejected.

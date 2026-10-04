@@ -41,7 +41,6 @@ LOCAL_COMMANDS = [
     ("account", "Live account data: usage and reset cards"),
     ("pwd", "Show the shell working directory"),
     ("cd", "Change the shell working directory"),
-    ("ps", "List jobs; all, ID, stop ID, kill ID"),
     ("image", "Stage a local image for the next prompt"),
     ("thinking", "Choose effort, thinking mode, token allowance, or retention"),
     ("trace", "Show or hide thinking: /trace thinking on|off"),
@@ -267,10 +266,6 @@ async def _cd(argument: str, session) -> Outcome:
     return Outcome(text="cd: " + ("\n".join(captured) or "failed"))
 
 
-async def _ps(argument: str, session) -> Outcome:
-    return Outcome(text=loki.run_ps(argument))
-
-
 async def _image(argument: str, session) -> Outcome:
     try:
         path = attachments.image_argument_path(argument)
@@ -302,6 +297,5 @@ _HANDLERS = {
     "account": _account,
     "pwd": _pwd,
     "cd": _cd,
-    "ps": _ps,
     "image": _image,
 }

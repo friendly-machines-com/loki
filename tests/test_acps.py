@@ -1706,8 +1706,9 @@ async def _command_status(environment):
 class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     def _advertisement(self, commands):
         names = [command["name"] for command in commands]
-        self.assertEqual(set(names), {"status", "account", "pwd", "cd", "ps", "image", "thinking", "trace"})
-        self.assertEqual(len(names), 8)
+        self.assertEqual(set(names), {"status", "account", "pwd", "cd", "image", "thinking", "trace"})
+        self.assertEqual(len(names), 7)
+        self.assertNotIn("ps", names)
         self.assertTrue(all(command["description"] for command in commands))
         self.assertNotIn("model", names)
         self.assertNotIn("effort", names)
@@ -2065,8 +2066,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 worker = channel.process.worker
                 initial = copy.deepcopy(worker.session.transcript_items)
                 worker.cancel_event.set()
-                for text in ["/ps", "/ps all", "/ps 1", "/ps stop 1", "/ps kill 1",
-                             "/ps bad argument", "/status --json", "/pwd"]:
+                for text in ["/status --json", "/pwd"]:
                     messages.clear()
                     reply = await asyncio.wait_for(
                         channel.request("session/prompt", self._params(text)), 5)
@@ -2074,12 +2074,35 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(worker.cancel_event.is_set())
                     self.assertEqual(worker.session.transcript_items, initial)
                     self.assertEqual(len(_tool_updates(messages, "prompt-owner")), 1)
-                self.assertEqual(await worker.prompt(self._params("/ps")),
+                self.assertEqual(await worker.prompt(self._params("/pwd")),
                                  {"stopReason": "end_turn"})
                 self.assertTrue(worker.cancel_event.is_set())
                 self.assertIsNone(worker._prompt_task)
                 self.assertFalse(os.path.exists(worker.session.chat_log_path))
                 completion.assert_not_awaited()
+
+    async def test_ps_is_ordinary_text_without_local_control_or_fake_tool_updates(self):
+        from loki_agent import formats, loki, protocols
+        messages = []
+        completion = mock.AsyncMock(return_value=formats.DecodedTurn(
+            [formats.message_item("assistant", "ordinary text response")],
+            {"protocol": protocols.OPENAI_CHAT}))
+        with tempfile.TemporaryDirectory() as root:
+            async with self._channel(root, messages, completion) as channel:
+                worker = channel.process.worker
+                with mock.patch.object(loki, "run_ps") as run_ps:
+                    result = await asyncio.wait_for(channel.request(
+                        "session/prompt", self._params("/ps all")), 3)
+                run_ps.assert_not_called()
+                self.assertEqual(result, {"stopReason": "end_turn"})
+                completion.assert_awaited_once()
+                self.assertEqual(_tool_updates(messages, "prompt-owner"),
+                                 _assistant_chunks("ordinary text response"))
+                with open(worker.session.chat_log_path, encoding="utf-8") as stream:
+                    self.assertEqual(_conversation_pairs(json.load(stream)), [
+                        ("user", [{"type": "text", "text": "/ps all"}]),
+                        ("assistant", [{"type": "text", "text": "ordinary text response"}]),
+                    ])
 
     async def test_all_prompt_entry_paths_preserve_active_owner_and_updates(self):
         import copy

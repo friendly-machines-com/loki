@@ -635,7 +635,6 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertEqual(metadata["exit_code"], job.process.returncode)
 
     def test_worker_owned_and_ordinary_job_lifecycle(self):
-        from loki_agent import acp_commands
         from loki_agent.acp_worker import Worker
         from loki_agent.sessions import Session
         from process_lifecycle_fixtures import ProcessResources
@@ -688,14 +687,14 @@ class JobOwnershipContractTests(unittest.TestCase):
                                 self.fail('children did not become ready')
                             await asyncio.sleep(.01)
                     self.assertEqual(manager._active_subagents, 1)
-                    outcome = await acp_commands.run('/ps', session)
-                    self.assertTrue(outcome.text.startswith(manager.list_jobs() + '\n'))
-                    self.assertIn('/ps ID', outcome.text)
-                    self.assertEqual(outcome.text.splitlines()[0], 'Jobs:')
+                    listing = loki.run_ps()
+                    self.assertTrue(listing.startswith(manager.list_jobs() + '\n'))
+                    self.assertIn('/ps ID', listing)
+                    self.assertEqual(listing.splitlines()[0], 'Jobs:')
                     for job in (owned, ordinary):
                         self.assertIsNone(job.process.returncode)
                         self.assertEqual(job.status, 'running')
-                        lines = [line for line in outcome.text.splitlines()
+                        lines = [line for line in listing.splitlines()
                                  if line.startswith(f'{job.id}. ')]
                         self.assertEqual(len(lines), 1)
                         line, = lines

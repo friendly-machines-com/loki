@@ -81,7 +81,7 @@ class PsTests(unittest.TestCase):
         self.assertIn("No jobs.", loki.run_ps("all"))
         self.assertEqual(loki.run_jobs(), "No jobs.")
 
-    def test_nonempty_list_keeps_commands_discoverable_in_both_frontends(self):
+    def test_nonempty_list_keeps_terminal_commands_discoverable(self):
         self.add_job("1", "running")
         for argument in ["", "all"]:
             with self.subTest(argument=argument):
@@ -93,10 +93,6 @@ class PsTests(unittest.TestCase):
                     self.assertIn(
                         "failed = job setup/launch failure, not command exit code.",
                         text)
-                outcome = asyncio.run(acp_commands.run(
-                    "/ps " + argument, self.session))
-                self.assertEqual(outcome.text, text)
-                self.assertIsNone(outcome.model_text)
         self.assertNotIn("/ps", loki.run_jobs())
 
     def test_default_filters_history_but_all_and_jobs_tool_keep_it(self):
@@ -142,8 +138,6 @@ class PsTests(unittest.TestCase):
         self.assertEqual(self.listed_ids(loki.run_ps("")), [])
         self.assertEqual(self.manager.jobs["2"].status, "exited")
         self.assertEqual(self.manager.jobs["2"].exit_code, 42)
-        outcome = asyncio.run(acp_commands.run("/ps", self.session))
-        self.assertEqual(self.listed_ids(outcome.text), [])
         self.assertEqual(self.listed_ids(loki.run_ps("all")), ["1", "2", "3", "4"])
 
     def test_tail_includes_both_streams_of_a_finished_job(self):
@@ -187,15 +181,15 @@ class PsTests(unittest.TestCase):
                     self.assertTrue(loki.run_ps(argument).startswith("usage:"))
             stop.assert_not_called()
 
-    def test_acp_routes_all_variants_as_local_commands(self):
-        for argument in ["", "1", "all", "stop 1", "kill 1", "stop"]:
-            with self.subTest(argument=argument), mock.patch.object(
-                    loki, "run_ps", return_value="result") as run_ps:
-                outcome = asyncio.run(acp_commands.run(
-                    "/ps " + argument, self.session))
-                run_ps.assert_called_once_with(argument)
-                self.assertEqual(outcome.text, "result")
-                self.assertIsNone(outcome.model_text)
+    def test_acp_does_not_advertise_or_handle_ps(self):
+        with mock.patch.object(loki, "LOKI_CONFIG_DIR", self.manager.base_dir):
+            self.assertNotIn("ps", [command["name"]
+                                    for command in acp_commands.advertised_commands()])
+        for text in ["/ps", "/ps 1", "/ps all", "/ps stop 1", "/ps kill 1", "/ps stop"]:
+            with self.subTest(text=text), mock.patch.object(loki, "run_ps") as run_ps:
+                self.assertIsNone(acp_commands.parse(text))
+                self.assertIsNone(asyncio.run(acp_commands.run(text, self.session)))
+                run_ps.assert_not_called()
         self.assertEqual(self.session.transcript_items, [])
 
 
