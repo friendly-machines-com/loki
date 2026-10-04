@@ -2140,7 +2140,13 @@ class InputModal:
 
 
 class UserMessageQueue(asyncio.Queue):
-    """Queue that reports submitted, non-sentinel messages explicitly."""
+    """Queue that reports submitted, non-sentinel messages explicitly.
+
+    Normal flow is producer ``put_nowait`` and the frontend loop ``get``.
+    ``pending_texts``/``replace_pending_texts`` are the non-consuming view
+    and edit used by the immediate /queue command; both run on the event
+    loop thread like every other mutation of this queue.
+    """
 
     def __init__(self, on_size_change=None):
         super().__init__()
@@ -2197,6 +2203,27 @@ class UserMessageQueue(asyncio.Queue):
         The EOF sentinel never appears in the snapshot.
         """
         return [item for item in self._queue if item is not None]
+
+    def replace_pending_texts(self, texts):
+        """Replace every queued message with TEXTS (oldest first).
+
+        Size accounting and its notification are corrected here, so the
+        status display stays truthful. An already-queued EOF sentinel stays
+        last. Like every mutation of this queue, callers run on the event
+        loop thread (the input owner or the frontend loop), never in
+        parallel with them.
+        """
+        texts = [text for text in texts if text is not None]
+        has_sentinel = bool(self._queue) and self._queue[-1] is None
+        old_count = self._message_count
+        self._queue.clear()
+        for text in texts:
+            super().put_nowait(text)
+        if has_sentinel:
+            super().put_nowait(None)
+        self._message_count = len(texts)
+        if old_count != self._message_count:
+            self._notify_size_change()
 
 
 class InputSession:
