@@ -4730,7 +4730,6 @@ TOOLS = [
                 "",
                 "# Git",
                 "- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.",
-                "- Commit or push only when the user asks. If on the default branch, branch first."
             ]),
             "parameters": {
                 "type": "object",
