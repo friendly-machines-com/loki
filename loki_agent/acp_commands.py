@@ -9,13 +9,12 @@ Skills are advertised but not intercepted.  Their execution belongs to the
 model's Skill tool in both fronts, so listing them makes ``/<skill>``
 discoverable and lets the existing tool-calling path handle it.
 
-Delivery: every command here is queued behind a running prompt on ACP, by
-declaration in command_deliveries (decision D2). ACP has no out-of-band
-output channel whose output could not splice into a streaming agent
-message, so do not route these around the worker's prompt gate
-(``acp_worker._prepare_prompt``) without solving that first. On the
-terminal front these same commands may instead be immediate; that is
-declared, not inferred from here.
+Delivery: every command here uses ordinary ACP prompt admission; the worker
+rejects it while another prompt is running rather than queueing it. Do not
+route these around ``acp_worker._prepare_prompt`` without an out-of-band
+output channel: agent_message_chunk would splice monitor output into the
+streaming agent message (decision D2). The separate terminal delivery policy
+in command_deliveries does not change this gate.
 """
 
 from __future__ import annotations

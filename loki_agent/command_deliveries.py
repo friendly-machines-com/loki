@@ -7,11 +7,11 @@ Command text is classified here and nowhere else: frontends consult
 ``terminal_immediate``/``classify`` instead of comparing command names at
 their admission points.
 
-Delivery is declared per command and per frontend. Nothing is immediate on
-ACP yet (decision D2): ``agent_message_chunk`` carries no message boundary, so
-mid-turn monitor output would splice into the client's streaming agent
-message. Relaxing the ACP admission gate requires an out-of-band output
-channel first; until then every ACP delivery stays ``QUEUED``.
+This table owns terminal delivery only. ACP commands use ordinary prompt
+admission in ``acp_worker._prepare_prompt``, which rejects overlap rather
+than queueing. There is deliberately no unused ACP delivery flag here:
+``agent_message_chunk`` has no message boundary, so ACP immediacy needs an
+out-of-band output channel before that gate can be changed (decision D2).
 """
 
 from __future__ import annotations
@@ -20,16 +20,15 @@ from dataclasses import dataclass
 from typing import Callable
 
 
-QUEUED = "queued"
+PROMPT = "prompt"
 IMMEDIATE = "immediate"
 
 
 @dataclass(frozen=True)
 class Delivery:
-    """Queueing semantics of one command family, per frontend."""
+    """Terminal command delivery; ordinary prompts enter the input FIFO."""
 
-    terminal: str = QUEUED
-    acp: str = QUEUED
+    terminal: str = PROMPT
 
 
 @dataclass(frozen=True)

@@ -43,10 +43,13 @@ class ImmediateCommandTests(unittest.TestCase):
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
         self.addCleanup(patch.stop)
-        # Module-global delivery state must not leak between tests when one
-        # fails mid-scenario.
         self.addCleanup(terminal_frontend._immediate_tasks.clear)
-        self.addCleanup(terminal_frontend._queued_inputs.reset, None)
+        self.addCleanup(terminal_frontend.terminal.assistant_markdown.reset)
+        activity_patch = mock.patch.object(
+            terminal_frontend, "_terminal_activity",
+            terminal_frontend.TerminalActivityStatus())
+        activity_patch.start()
+        self.addCleanup(activity_patch.stop)
         self.output = io.StringIO()
         self.handled = []
 
@@ -183,6 +186,116 @@ class ImmediateCommandTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def assert_delayed_account_block(self, *, error=None):
+        from loki_agent import provider_controls
+
+        async def scenario():
+            read_started = asyncio.Event()
+            release_read = asyncio.Event()
+            turn_started = asyncio.Event()
+            release_turn = asyncio.Event()
+
+            async def gated_read(context):
+                read_started.set()
+                await release_read.wait()
+                if error is not None:
+                    raise error
+                return ControlResult(lines=["ACCOUNT-RESULT"])
+
+            async def streaming_turn():
+                terminal_frontend._terminal_activity.set_turn_running(True)
+                terminal_frontend._terminal_agent_event({
+                    "type": "assistant_start"})
+                turn_started.set()
+                await release_turn.wait()
+                terminal_frontend._terminal_agent_event({
+                    "type": "assistant_delta", "content": "ASSISTANT-PART-B"})
+                terminal_frontend._terminal_agent_event({"type": "assistant_end"})
+                terminal_frontend._terminal_activity.set_turn_running(False)
+
+            spec = mock.Mock(read=gated_read)
+            with mock.patch.object(terminals.os, "isatty", return_value=False), \
+                    mock.patch.object(terminal_frontend.terminal,
+                                      "markdown_style", False), \
+                    mock.patch.object(terminal_frontend, "current_model",
+                                      return_value="model"), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    mock.patch.object(provider_controls, "find_control",
+                                      return_value=spec), \
+                    contextlib.redirect_stdout(self.output), \
+                    contextlib.redirect_stderr(self.output):
+                session = self.make_session()
+                session._producer = asyncio.create_task(session._produce())
+                turn = asyncio.create_task(streaming_turn())
+                try:
+                    async with asyncio.timeout(3):
+                        await turn_started.wait()
+                        self.feed(session, "/account usage")
+                        await read_started.wait()
+                        # Move the streaming cursor AFTER the admission echo,
+                        # before completing the delayed network read.
+                        terminal_frontend._terminal_agent_event({
+                            "type": "assistant_delta",
+                            "content": "ASSISTANT-PART-A"})
+                        release_read.set()
+                        if error is None:
+                            answer = "ACCOUNT-RESULT"
+                        elif isinstance(error, OSError):
+                            answer = f"Could not read account usage: {error}"
+                        else:
+                            answer = f"Command failed: {error}"
+                        while answer not in self.output.getvalue():
+                            await asyncio.sleep(0)
+                        # Assert visibility while the turn is STILL BLOCKED,
+                        # without draining tasks or releasing that turn.
+                        self.assertFalse(turn.done())
+                        self.assertTrue(terminal_frontend._terminal_activity.turn_running)
+                        self.assertIn(
+                            f"ASSISTANT-PART-A\n/account usage:\n{answer}\n",
+                            self.output.getvalue())
+                        self.assertTrue(terminal_frontend.terminal.assistant_markdown.active)
+                        self.assertEqual(session.user_messages.message_count, 0)
+                        self.assertEqual(self.session.transcript_items, self.initial)
+                        self.assertFalse(session.reader.cancel_event.is_set())
+                finally:
+                    release_turn.set()
+                    await turn
+                    await session._pause()
+                    await terminal_frontend._cancel_immediate_tasks(session)
+            self.assertIn("\nASSISTANT-PART-B", self.output.getvalue())
+
+        asyncio.run(scenario())
+
+    def test_delayed_account_answer_is_isolated_and_visible_during_turn(self):
+        self.assert_delayed_account_block()
+
+    def test_delayed_account_error_is_isolated_and_visible_during_turn(self):
+        self.assert_delayed_account_block(error=OSError("account unavailable"))
+
+    def test_unexpected_delayed_error_is_isolated_and_visible_during_turn(self):
+        self.assert_delayed_account_block(error=RuntimeError("account failed"))
+
+    def test_monitor_output_preserves_split_markdown_and_escapes_ansi(self):
+        with mock.patch.object(terminal_frontend.terminal, "markdown_style", True), \
+                mock.patch.object(terminal_frontend, "current_model",
+                                  return_value="model"), \
+                mock.patch.object(terminal_frontend,
+                                  "restore_output_area_after_input"), \
+                contextlib.redirect_stdout(self.output):
+            terminal_frontend._terminal_agent_event({"type": "assistant_start"})
+            terminal_frontend._terminal_agent_event({
+                "type": "assistant_delta", "content": "before **pen"})
+            terminal_frontend._emit_immediate_output(
+                "/account usage", "ACCOUNT\x1b]777;ATTACK\x07")
+            terminal_frontend._terminal_agent_event({
+                "type": "assistant_delta", "content": "ding** after"})
+            terminal_frontend._terminal_agent_event({"type": "assistant_end"})
+        rendered = self.output.getvalue()
+        self.assertIn("before \n/account usage:\nACCOUNT^[]777;ATTACK^G\n", rendered)
+        self.assertNotIn("\x1b]777", rendered)
+        self.assertIn(terminals.BOLD + "pending" + terminals.RESET, rendered)
+
     def test_account_read_failure_is_reported_not_fatal(self):
         async def scenario():
             from loki_agent import provider_controls, authentications
@@ -206,92 +319,204 @@ class ImmediateCommandTests(unittest.TestCase):
                     await self.command(session, "/account usage")
                 finally:
                     await session._pause()
-            self.assertIn("Could not read account usage", errors.getvalue())
+            self.assertIn(
+                "/account usage:\nCould not read account usage: no key\n",
+                self.output.getvalue())
 
         asyncio.run(scenario())
 
-    def test_extra_account_operands_never_crash_the_dispatch(self):
+    def test_extra_account_operands_report_usage_without_reading_or_acting(self):
         from loki_agent import provider_controls
-        with mock.patch.object(
-                provider_controls, "find_control", return_value=None), \
-                mock.patch.object(
-                    provider_controls, "available_controls",
-                    return_value=[]), \
-                contextlib.redirect_stdout(io.StringIO()):
-            # Three operands must be ignored past the action id, not raise
-            # an unpack ValueError out of the queued dispatch.
-            asyncio.run(terminal_frontend.run_account_controls_async(
-                "/account usage reset extra", self.session))
+        for command in ["/account usage reset extra",
+                        "/account usage reset extra --json"]:
+            with self.subTest(command=command), \
+                    mock.patch.object(provider_controls, "find_control") as lookup, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                asyncio.run(terminal_frontend.run_account_controls_async(
+                    command, self.session))
+                self.assertIn("usage: /account [CONTROL [ACTION]] [--json]",
+                              output.getvalue())
+                lookup.assert_not_called()
 
-    def test_account_read_captures_the_connection_at_admission(self):
-        from loki_agent import command_deliveries
-        from loki_agent.provider_controls import ControlResult
+    def test_account_read_captures_connection_and_authority_before_scheduling(self):
+        from loki_agent import provider_controls
         admitted, later = object(), object()
+        authority_a, authority_b = object(), object()
         holder = {"config": admitted}
         seen = {}
 
-        async def fake_read(context, chosen, as_json):
+        async def read(context):
             seen["config"] = context.config
-            return ControlResult(lines=("ok",))
+            seen["authority"] = context.credential_authority
+            return ControlResult(lines=["ACCOUNT-A"])
 
         async def scenario():
+            self.session.credential_authority = authority_a
+            spec = mock.Mock(read=read)
             with mock.patch.object(terminal_frontend, "current_config",
                                    lambda: holder["config"]), \
-                    mock.patch.object(
-                        terminal_frontend, "_read_account_control",
-                        fake_read), \
-                    mock.patch.object(terminals.os, "isatty",
-                                      return_value=False), \
-                    mock.patch.object(
-                        terminal_frontend,
-                        "restore_output_area_after_input"), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                parsed = command_deliveries.terminal_immediate("/account usage")
-                outcome = terminal_frontend._dispatch_immediate(parsed)
-                # Admission has happened; the connection moves on before
-                # the scheduled task first runs.
+                    mock.patch.object(provider_controls, "find_control",
+                                      return_value=spec), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output):
+                self.assertTrue(terminal_frontend._submit_immediate("/account usage"))
+                # Change both before yielding: the submitted task cannot
+                # have started yet.
                 holder["config"] = later
-                await outcome
+                self.session.credential_authority = authority_b
+                async with asyncio.timeout(3):
+                    while "ACCOUNT-A" not in self.output.getvalue():
+                        await asyncio.sleep(0)
+            self.assertIs(seen["config"], admitted)
+            self.assertIs(seen["authority"], authority_a)
 
         asyncio.run(scenario())
-        self.assertIs(seen["config"], admitted)
 
-    def test_pending_immediate_read_does_not_survive_frontend_exit(self):
+    def test_status_save_captures_store_before_scheduling(self):
+        async def scenario():
+            first = types.SimpleNamespace(save=mock.AsyncMock())
+            later = types.SimpleNamespace(save=mock.AsyncMock())
+            self.session.response_headers = first
+            with mock.patch.object(terminal_frontend,
+                                   "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output):
+                self.assertTrue(terminal_frontend._submit_immediate("/status save"))
+                self.session.response_headers = later
+                async with asyncio.timeout(3):
+                    while "Response status saved" not in self.output.getvalue():
+                        await asyncio.sleep(0)
+            first.save.assert_awaited_once()
+            later.save.assert_not_awaited()
+
+        asyncio.run(scenario())
+
+    def test_pending_reads_are_cancelled_and_joined_before_every_frontend_exit(self):
+        from loki_agent import provider_controls
+        from loki_agent.credentials import CredentialStore
         from test_loki_tool_loop import ScriptedInputSession
 
-        async def slow_read(context, chosen, as_json):
-            await asyncio.sleep(30)
-            self.fail("the read outlived the frontend")
+        async def scenario(mode):
+            started = asyncio.Event()
+            release = asyncio.Event()
+            cancellation = asyncio.Event()
+            events = []
+            attempted_admissions = []
+
+            class GatedInput(ScriptedInputSession):
+                async def get(inner):
+                    self.assertTrue(inner.on_submit("/account usage"))
+                    await started.wait()
+                    if mode == "exception":
+                        raise RuntimeError("input failed")
+                    if mode == "cancel":
+                        await asyncio.Event().wait()
+                    return None if mode == "eof" else "/quit"
+
+                async def __aexit__(inner, *args):
+                    events.append("input closed")
+
+            input_owner = GatedInput([])
+
+            async def read(context):
+                started.set()
+                try:
+                    await release.wait()
+                    return ControlResult(lines=["LATE-ANSWER"])
+                except asyncio.CancelledError:
+                    cancellation.set()
+                    # Shutdown must close admission before it awaits reads;
+                    # otherwise the still-running producer can add a task.
+                    attempted_admissions.append(
+                        input_owner.on_submit("/account usage"))
+                    raise
+                finally:
+                    events.append("read ended")
+
+            def open_input(**kwargs):
+                input_owner.on_submit = kwargs["on_submit"]
+                return input_owner
+
+            spec = mock.Mock(read=read)
+            with mock.patch.object(loki, "CREDENTIALS", CredentialStore({})), \
+                    mock.patch.object(terminal_frontend, "input_session",
+                                      side_effect=open_input), \
+                    mock.patch.object(terminal_frontend, "new_chat_log_path",
+                                      return_value=os.path.join(self.root, "chat.json")), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    mock.patch.object(provider_controls, "find_control",
+                                      return_value=spec), \
+                    contextlib.redirect_stdout(self.output), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                frontend = asyncio.create_task(terminal_frontend.async_main([]))
+                async with asyncio.timeout(3):
+                    if mode == "cancel":
+                        await started.wait()
+                        frontend.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await frontend
+                    elif mode == "exception":
+                        with self.assertRaisesRegex(RuntimeError, "input failed"):
+                            await frontend
+                    else:
+                        self.assertEqual(await frontend, 0)
+                self.assertTrue(cancellation.is_set())
+                self.assertEqual(events, ["read ended", "input closed"])
+                self.assertEqual(attempted_admissions, [False])
+                self.assertFalse(terminal_frontend._immediate_tasks)
+                output_at_exit = self.output.getvalue()
+                release.set()
+                await asyncio.sleep(0)
+                self.assertEqual(self.output.getvalue(), output_at_exit)
+                self.assertNotIn("LATE-ANSWER", output_at_exit)
+
+        for mode in ["quit", "eof", "exception", "cancel"]:
+            with self.subTest(mode=mode):
+                asyncio.run(scenario(mode))
+
+    def test_cancellation_before_task_start_closes_the_handler_coroutine(self):
+        import gc
+        import warnings
 
         async def scenario():
-            from loki_agent.credentials import CredentialStore
-            loki.CREDENTIALS = CredentialStore({})
-            session = ScriptedInputSession(["/account usage", "/quit"])
-            session.on_submit = terminal_frontend._submit_immediate
-            with tempfile.TemporaryDirectory() as tmpdir:
-                with mock.patch.object(
-                        terminal_frontend, "input_session",
-                        return_value=session), \
-                        mock.patch.object(
-                            terminal_frontend, "new_chat_log_path",
-                            return_value=os.path.join(tmpdir, "chat.json")), \
-                        mock.patch.object(
-                            terminal_frontend,
-                            "restore_output_area_after_input"), \
-                        mock.patch.object(
-                            terminal_frontend, "_read_account_control",
-                            slow_read), \
-                        mock.patch.object(
-                            terminal_frontend, "run_terminal_turn_async",
-                            mock.AsyncMock()), \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    status = await terminal_frontend.async_main([])
-            self.assertEqual(status, 0)
+            input_owner = types.SimpleNamespace(
+                on_submit=terminal_frontend._submit_immediate)
+            with mock.patch.object(terminal_frontend,
+                                   "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output):
+                self.assertTrue(input_owner.on_submit("/account usage"))
+                # No event-loop tick between admission and shutdown.
+                await terminal_frontend._cancel_immediate_tasks(input_owner)
             self.assertFalse(terminal_frontend._immediate_tasks)
-            leftover = [
-                task for task in asyncio.all_tasks()
-                if task is not asyncio.current_task() and not task.done()]
-            self.assertEqual(leftover, [])
+
+        with warnings.catch_warnings(record=True) as warnings_seen:
+            warnings.simplefilter("always", RuntimeWarning)
+            asyncio.run(scenario())
+            gc.collect()
+        self.assertFalse(any("was never awaited" in str(item.message)
+                             for item in warnings_seen))
+
+    def test_output_failure_is_observed_without_affecting_the_turn(self):
+        from loki_agent import provider_controls
+
+        async def scenario():
+            spec = mock.Mock(read=mock.AsyncMock(
+                return_value=ControlResult(lines=["answer"])))
+            with mock.patch.object(provider_controls, "find_control",
+                                   return_value=spec), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    mock.patch.object(terminal_frontend, "_emit_immediate_output",
+                                      side_effect=OSError("display closed")), \
+                    contextlib.redirect_stdout(self.output), \
+                    self.assertLogs("loki_agent.terminal_frontend", level="ERROR") as logs:
+                self.assertTrue(terminal_frontend._submit_immediate("/account usage"))
+                async with asyncio.timeout(3):
+                    while terminal_frontend._immediate_tasks:
+                        await asyncio.sleep(0)
+            self.assertIn("display closed", logs.output[0])
+            self.assertEqual(self.session.transcript_items, self.initial)
 
         asyncio.run(scenario())
 
@@ -544,6 +769,44 @@ class ImmediateQueueTests(unittest.TestCase):
 
         self.run_queue_scenario(script)
         self.assertIn("No staged image 3.", self.output.getvalue())
+
+    def test_oversized_queue_number_does_not_kill_input(self):
+        async def script(session):
+            await self.enqueue(session, "first")
+            await self.command(session, "/queue texts delete " + "9" * 5000)
+            await self.command(session, "/queue texts")
+            self.assertEqual(session.user_messages.pending_texts(), ["first"])
+
+        self.run_queue_scenario(script)
+        self.assertIn("1. first", self.output.getvalue())
+
+    def test_queue_view_is_released_after_abnormal_frontend_exit(self):
+        from loki_agent.credentials import CredentialStore
+        from test_loki_tool_loop import ScriptedInputSession
+
+        class FailingInput(ScriptedInputSession):
+            async def get(inner):
+                self.assertIs(terminal_frontend._queued_inputs.session, inner)
+                terminal_frontend._queued_inputs.staged_images.append(object())
+                raise RuntimeError("input failed")
+
+        async def scenario():
+            input_owner = FailingInput([])
+            with mock.patch.object(loki, "CREDENTIALS", CredentialStore({})), \
+                    mock.patch.object(terminal_frontend, "input_session",
+                                      return_value=input_owner), \
+                    mock.patch.object(terminal_frontend, "new_chat_log_path",
+                                      return_value=os.path.join(self.root, "chat.json")), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "input failed"):
+                    await terminal_frontend.async_main([])
+                self.assertIsNone(terminal_frontend._queued_inputs.session)
+                self.assertEqual(terminal_frontend._queued_inputs.staged_images, [])
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

@@ -2,9 +2,9 @@
 
 Immediate commands are hypervisor monitor-plane interaction (invariant H, see
 the command_deliveries module docstring): their output never becomes
-conversation. These tests pin the classification itself -- the single source
-both frontends consult -- and the delivery declarations, including decision
-D2 (nothing immediate on ACP).
+conversation. These tests pin terminal classification and exercise the
+separate ACP admission gate, including decision D2 (nothing immediate on
+ACP; overlapping requests are rejected, not queued).
 """
 
 import unittest
@@ -84,20 +84,38 @@ class ClassifyTests(unittest.TestCase):
 
 
 class DeliveryDeclarationTests(unittest.TestCase):
-    def test_every_declared_command_is_queued_on_acp(self):
-        # Decision D2 (command_deliveries docstring): no out-of-band output channel
-        # exists on ACP, so nothing is immediate there. Declared, not
-        # assumed -- this pins it until that decision is revisited.
-        for name, spec in command_deliveries._COMMANDS.items():
-            with self.subTest(name=name):
-                self.assertEqual(spec.delivery.terminal,
-                                 command_deliveries.IMMEDIATE)
-                self.assertEqual(spec.delivery.acp, command_deliveries.QUEUED)
+    def test_delivery_defaults_to_ordinary_terminal_prompt(self):
+        self.assertEqual(command_deliveries.Delivery().terminal,
+                         command_deliveries.PROMPT)
 
-    def test_delivery_defaults_to_queued(self):
-        delivery = command_deliveries.Delivery()
-        self.assertEqual(delivery.terminal, command_deliveries.QUEUED)
-        self.assertEqual(delivery.acp, command_deliveries.QUEUED)
+    def test_acp_rejects_overlapping_commands_without_changing_the_turn(self):
+        # Exercise the actual ACP gate, not unused delivery metadata. The
+        # terminal's immediate classification does not alter ACP admission.
+        import asyncio
+        from loki_agent import acps
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        async def scenario():
+            session = Session()
+            worker = Worker(session, lambda message: None)
+            worker.cancel_event.set()
+            turn = asyncio.create_task(asyncio.Event().wait())
+            worker._prompt_task = turn
+            try:
+                for text in ["/status", "/status save", "/account usage"]:
+                    with self.subTest(text=text), self.assertRaisesRegex(
+                            acps.TransportError, "a prompt is already running"):
+                        worker._prepare_prompt({
+                            "prompt": [{"type": "text", "text": text}]})
+                    self.assertFalse(turn.done())
+                    self.assertTrue(worker.cancel_event.is_set())
+                    self.assertEqual(session.transcript_items, [])
+            finally:
+                turn.cancel()
+                await asyncio.gather(turn, return_exceptions=True)
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

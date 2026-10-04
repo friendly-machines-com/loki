@@ -748,13 +748,12 @@ class Worker:
         return user_text
 
     def _prepare_prompt(self, params, thinking=None):
-        # This gate is the ACP queueing decision point: it is what keeps
-        # local commands queued behind a running prompt on ACP, by their
-        # delivery declaration in command_deliveries (decision D2).
-        # agent_message_chunk has no message boundary, so mid-turn monitor
-        # output would splice into the client's streaming agent message.
-        # Relaxing this for a command requires an out-of-band output
-        # channel first.
+        # ACP local commands still use ordinary prompt admission: overlap
+        # is rejected, not queued. Terminal immediacy in command_deliveries
+        # does not bypass this gate (decision D2): agent_message_chunk has
+        # no message boundary, so monitor output could splice into the
+        # streaming agent message. An ACP bypass needs its own out-of-band
+        # output channel first.
         if self._prompt_task is not None and not self._prompt_task.done():
             raise acps.TransportError(
                 "a prompt is already running for this session",
