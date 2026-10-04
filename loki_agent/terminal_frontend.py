@@ -96,7 +96,7 @@ def _image_command_path(command_text: str) -> str:
 @dataclass
 class TerminalActivityStatus:
     turn_running: bool = False
-    queued_messages: int = 0
+    queued_prompts: int = 0
     queued_images: int = 0
 
     def _set(self, field_name: str, value):
@@ -113,15 +113,15 @@ class TerminalActivityStatus:
     def set_turn_running(self, running: bool):
         self._set("turn_running", bool(running))
 
-    def set_queued_messages(self, count: int):
-        self._set("queued_messages", max(0, int(count)))
+    def set_queued_prompts(self, count: int):
+        self._set("queued_prompts", max(0, int(count)))
 
     def set_queued_images(self, count: int):
         self._set("queued_images", max(0, int(count)))
 
     def reset(self):
         self.turn_running = False
-        self.queued_messages = 0
+        self.queued_prompts = 0
         self.queued_images = 0
 
 
@@ -454,7 +454,7 @@ def _status_fields(activity):
         "effort": _core.reasoning_effort_status_text(),
         "context": current_session().context_snapshot().text,
         "turn": "running" if activity.turn_running else "idle",
-        "queued_messages": activity.queued_messages,
+        "queued_prompts": activity.queued_prompts,
         "queued_images": activity.queued_images,
         "mode": current_agent_mode(),
         "cwd": display_path(current_cwd()),
@@ -471,13 +471,13 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
     remote += ', /thinking, /trace thinking, /status, /account'
     return (
         remote + '\n'
-        'Local: CWD: {}, turn: {}, queued messages: {}, queued images: {}, '
+        'Local: CWD: {}, turn: {}, queued prompts: {}, queued images: {}, '
         'mode: {}; '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         fields["cwd"],
         fields["turn"],
-        fields["queued_messages"],
+        fields["queued_prompts"],
         fields["queued_images"],
         fields["mode"])
 
@@ -499,7 +499,7 @@ def _write_status_text():
     print(", turn: ", end="")
     for label, value, active in (
             ("", fields["turn"], fields["turn"] != "idle"),
-            (", queued messages: ", fields["queued_messages"], fields["queued_messages"] != 0),
+            (", queued prompts: ", fields["queued_prompts"], fields["queued_prompts"] != 0),
             (", queued images: ", fields["queued_images"], fields["queued_images"] != 0)):
         print(label, end="")
         if active:
@@ -871,7 +871,7 @@ async def async_main(args) -> int:
             history_provider=lambda: user_prompt_history(
                 current_transcript()),
             on_queue_size_change=(
-                _terminal_activity.set_queued_messages)) as session:
+                _terminal_activity.set_queued_prompts)) as session:
         if args[0:1] == ['resume']:
             if len(args) < 2:
                 # Bare "resume" with no id opens the session picker. On cancel

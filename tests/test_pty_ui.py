@@ -401,7 +401,7 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"Remote: API: dummy.invalid", output)
         self.assertRegex(
             output,
-            rb"Local: CWD: [^\r\n]*, turn: idle, queued messages: 0, "
+            rb"Local: CWD: [^\r\n]*, turn: idle, queued prompts: 0, "
             rb"queued images: 0, mode: normal;",
         )
 
@@ -428,17 +428,17 @@ class PtyUiTests(unittest.TestCase):
         # These assertions concern queue transitions, independently of styling.
         before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
-        self.assertIn(b"queued messages: 1, queued images: 0", before_release)
-        self.assertIn(b"queued messages: 2, queued images: 0", before_release)
+        self.assertIn(b"queued prompts: 1, queued images: 0", before_release)
+        self.assertIn(b"queued prompts: 2, queued images: 0", before_release)
         self.assertIn(
-            b"turn: running, queued messages: 2, queued images: 0",
+            b"turn: running, queued prompts: 2, queued images: 0",
             before_release,
         )
         self.assertIn(
-            b"turn: idle, queued messages: 0, queued images: 0",
+            b"turn: idle, queued prompts: 0, queued images: 0",
             output,
         )
-        self.assertIn(b"queued messages: 0, queued images: 0", output)
+        self.assertIn(b"queued prompts: 0, queued images: 0", output)
 
     def test_status_bar_tracks_image_after_queued_command_is_validated(self):
         output, before_release = run_loki_pty_reply(
@@ -451,8 +451,8 @@ class PtyUiTests(unittest.TestCase):
         # These assertions concern queue transitions, independently of styling.
         before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
-        self.assertIn(b"queued messages: 1, queued images: 0", before_release)
-        self.assertIn(b"queued messages: 0, queued images: 1", output)
+        self.assertIn(b"queued prompts: 1, queued images: 0", before_release)
+        self.assertIn(b"queued prompts: 0, queued images: 1", output)
 
     def test_full_stream_parses_and_styles_land(self):
         # Whole-stream validation of the tty byte output: every escape

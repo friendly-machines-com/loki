@@ -2611,7 +2611,7 @@ class StatusTextTests(unittest.TestCase):
                 (True, 2, 3), (False, 0, 0)):
             with self.subTest(running=running, messages=messages, images=images):
                 activity = terminal_frontend.TerminalActivityStatus(
-                    turn_running=running, queued_messages=messages, queued_images=images)
+                    turn_running=running, queued_prompts=messages, queued_images=images)
                 with mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
                         mock.patch.object(terminal_frontend, "current_cwd",
                                           return_value="/status/cwd"), \
@@ -2625,7 +2625,7 @@ class StatusTextTests(unittest.TestCase):
                     rendered.replace("\033[1m", "").replace("\033[22m", ""), plain)
                 for label, value, bold in (
                         ("turn", "running" if running else "idle", running),
-                        ("queued messages", str(messages), messages != 0),
+                        ("queued prompts", str(messages), messages != 0),
                         ("queued images", str(images), images != 0)):
                     expected = f"\033[1m{value}\033[22m" if bold else value
                     self.assertIn(f"{label}: {expected},", rendered)
@@ -2672,14 +2672,14 @@ class StatusTextTests(unittest.TestCase):
         with mock.patch(
                 "loki_agent.terminal_frontend.terminals.redraw_status_bar"
         ) as redraw:
-            activity.set_queued_messages(2)
-            activity.set_queued_messages(2)
+            activity.set_queued_prompts(2)
+            activity.set_queued_prompts(2)
             activity.set_queued_images(1)
             activity.set_turn_running(True)
             activity.set_turn_running(True)
 
         self.assertTrue(activity.turn_running)
-        self.assertEqual(activity.queued_messages, 2)
+        self.assertEqual(activity.queued_prompts, 2)
         self.assertEqual(activity.queued_images, 1)
         self.assertEqual(redraw.call_count, 3)
 
@@ -2707,7 +2707,7 @@ class StatusTextTests(unittest.TestCase):
             text = terminal_frontend.status_text(
                 terminal_frontend.TerminalActivityStatus(
                     turn_running=True,
-                    queued_messages=2,
+                    queued_prompts=2,
                     queued_images=1,
                 ))
         finally:
@@ -2719,7 +2719,7 @@ class StatusTextTests(unittest.TestCase):
             "Context: unknown; "
             "/model, /thinking, /trace thinking, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
-            "queued messages: 2, queued images: 1, "
+            "queued prompts: 2, queued images: 1, "
             f"mode: {loki.current_agent_mode()}; "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
