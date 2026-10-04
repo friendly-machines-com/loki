@@ -69,27 +69,14 @@ class Worker:
         if method is None or request_id is None:
             return
         if concurrent and method == "session/prompt":
-            if (self._prompt_task is not None
-                    and not self._prompt_task.done()):
+            try:
+                thinking = self._prepare_prompt(message.get("params") or {})
+            except acps.TransportError as error:
                 self.write(acps.response(
                     request_id,
-                    error={
-                        "code": acps.INVALID_PARAMS,
-                        "message": (
-                            "a prompt is already running for this session"),
-                    },
+                    error={"code": error.code, "message": str(error)},
                 ))
                 return
-            # Snapshot before scheduling so a following configuration request
-            # cannot race the logical turn's first provider request.
-            try:
-                user_text = self._prompt_text(message.get("params") or {})
-            except acps.TransportError:
-                await self._answer(message)
-                return
-            command = acp_commands.parse(user_text)
-            thinking = (loki.capture_turn_settings()
-                        if command is None or command[0] == "!" else None)
             self._prompt_task = asyncio.create_task(
                 self._answer(
                     message,
@@ -760,12 +747,42 @@ class Worker:
 
         return user_text
 
+    def _prepare_prompt(self, params, thinking=None):
+        if self._prompt_task is not None and not self._prompt_task.done():
+            raise acps.TransportError(
+                "a prompt is already running for this session",
+                code=acps.INVALID_PARAMS)
+        user_text = self._prompt_text(params)
+        command = acp_commands.parse(user_text)
+        if command is None or command[0] == "!":
+            # Reset once, at admission, before a task is scheduled or a local
+            # bang command awaits. Later cancellation belongs to this turn.
+            # Local-only commands must not change turn cancellation state.
+            # A following preference update must not change the admitted
+            # turn's first request; continuations reuse this same snapshot.
+            if thinking is None:
+                thinking = loki.capture_turn_settings()
+            self.cancel_event.clear()
+        return thinking
+
     async def prompt(
             self, params: dict,
             thinking: loki.TurnThinkingSettings | None = None) -> dict:
-        user_text = self._prompt_text(params)
+        task = asyncio.current_task()
+        scheduled = self._prompt_task is task
+        if not scheduled:
+            thinking = self._prepare_prompt(params, thinking)
+            self._prompt_task = task
+        try:
+            return await self._prompt(params, thinking)
+        finally:
+            # Inline callers own the task only for this prompt. Scheduled
+            # callers remain owned through _answer's final response write.
+            if not scheduled:
+                self._prompt_task = None
 
-        self.cancel_event.clear()
+    async def _prompt(self, params, thinking):
+        user_text = self._prompt_text(params)
         self.session_id = params.get("sessionId") or self.session_id
 
         # A command is recognized before it reaches the transcript: like the
@@ -773,14 +790,17 @@ class Worker:
         # conversation.  Skills are advertised but not intercepted, so their
         # text falls through to the model's Skill tool.
         outcome = None
-        if user_text.lstrip().startswith(("/", "!")):
+        command = acp_commands.parse(user_text)
+        cancelled_bang = (command is not None and command[0] == "!"
+                          and self.cancel_event.is_set())
+        if not cancelled_bang and user_text.lstrip().startswith(("/", "!")):
             try:
-                outcome = await acp_commands.run(user_text, self.session)
+                outcome = await acp_commands.run(
+                    user_text, self.session, cancel_event=self.cancel_event)
             except Exception as error:  # noqa: BLE001 - answered, not fatal
                 outcome = acp_commands.Outcome(
                     text=f"Command failed: {error}")
         if outcome is not None:
-            command = acp_commands.parse(user_text)
             if command is not None and command[0] in ["thinking", "trace"]:
                 self.write(acps.notification("session/update", {
                     "sessionId": self.session_id,
@@ -796,8 +816,6 @@ class Worker:
                 return {"stopReason": "end_turn"}
             user_text = outcome.model_text
 
-        if thinking is None:
-            thinking = loki.capture_turn_settings()
         user_content = []
         if user_text:
             user_content.append(formats.text_block(user_text))

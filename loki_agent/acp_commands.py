@@ -130,14 +130,14 @@ def parse(text: str):
     return name, argument.strip()
 
 
-async def run(text: str, session):
+async def run(text: str, session, *, cancel_event=None):
     """Execute TEXT if it is a local command, else return None."""
     parsed = parse(text)
     if parsed is None:
         return None
     name, argument = parsed
     if name == "!":
-        return await _bang(argument)
+        return await _bang(argument, cancel_event)
     if name == "status" and argument == "save":
         return await _status_save(argument, session)
     handler = _HANDLERS[name]
@@ -285,8 +285,8 @@ async def _image(argument: str, session) -> Outcome:
     )
 
 
-async def _bang(command: str) -> Outcome:
-    output = await loki.run_bash_async(command)
+async def _bang(command: str, cancel_event=None) -> Outcome:
+    output = await loki.run_bash_async(command, cancel_event=cancel_event)
     return Outcome(
         text=f"{loki.computer}: [Running local command: {command}]\n{output}",
         model_text=(

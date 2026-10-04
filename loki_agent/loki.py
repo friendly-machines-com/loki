@@ -2208,7 +2208,9 @@ class JobManager:
             # Signal the job's whole process group so shell children are not
             # left behind.  The status check and the signal call contain no
             # await, so another task cannot reap the job between them.
-            if (job.status != "running"
+            # A user-requested stop is not proof of exit. Cancellation and
+            # timeout cleanup must still signal and escalate a stopping job.
+            if (job.status not in ["running", "stopping"]
                     or job.process.returncode is not None):
                 return False
             try:
@@ -2232,8 +2234,8 @@ class JobManager:
         # 1. Pre-wait cancellation check: Was the event set while self._spawn awaited?
         # Bypasses asyncio.wait entirely to avoid watcher/selector registration races.
         if cancel_event is not None and cancel_event.is_set():
-            # Send the termination signal while status is still "running" so
-            # that _signal_job is not locked out by the guard.
+            # Do not record cancellation until the live process has exited;
+            # the termination helper must remain able to escalate signals.
             exit_code = await terminate(signal.SIGINT, 2.0)
             job.status = "cancelled"
             self._write_metadata(job)
@@ -2251,6 +2253,9 @@ class JobManager:
                 watchers,
                 timeout=timeout_ms / 1000 if timeout_ms is not None else None,
                 return_when=asyncio.FIRST_COMPLETED)
+            # Decide the outcome before cancelling the unused watcher below.
+            # Its eventual done() state is not evidence of user cancellation.
+            interrupted = cancel_event is not None and cancel_event.is_set()
         except BaseException:
             # Any unwind of the owning Python task must not orphan the process
             # it owns. Wait for the process group to die before propagating
@@ -2274,18 +2279,14 @@ class JobManager:
         # job also exited in the same loop pass, the intent outranks the
         # race. A job that exited on its own (no cancel pending) records
         # completed.
-        interrupted = cancel_task is not None and (
-            cancel_task in done or cancel_task.done())
-        if interrupted and exit_task not in done:
-            pass  # Fall through to the kill path below
-        elif exit_task in done:
+        if not interrupted and exit_task in done:
             self._record_exit(job, exit_task.result())
             await self._close_credential_capability(job)
             return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
-        # The job is still running; either the user cancelled or the
-        # timeout fired. Send the signal first while status is still "running",
-        # then update state after the signal has successfully dispatched.
+        # Cancellation wins even if exit was observed in the same loop pass.
+        # Otherwise terminate the live job before recording cancellation or
+        # timeout, keeping signal escalation available until it exits.
         exit_code = await terminate(
             signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
 

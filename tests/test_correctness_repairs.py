@@ -326,6 +326,140 @@ class JobOwnershipContractTests(unittest.TestCase):
             self.assertEqual(job.signal, signal.SIGKILL)
             self.assertEqual(metadata["signal"], signal.SIGKILL)
 
+    def test_stopped_foreground_still_cancels_times_out_and_unwinds(self):
+        from process_lifecycle_fixtures import ProcessResources
+
+        async def scenario(tmpdir, cause):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            cancel_event = asyncio.Event()
+            release_spawn = asyncio.Event()
+            tasks_before = asyncio.all_tasks()
+            script = (
+                "import signal,time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                "if hasattr(signal, 'SIGBREAK'):\n"
+                "    signal.signal(signal.SIGBREAK, signal.SIG_IGN)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(60)\n"
+            )
+            real_spawn = manager._spawn
+
+            async def held_spawn(*args, **kwargs):
+                job = await real_spawn(*args, **kwargs)
+                await release_spawn.wait()
+                return job
+
+            spawn_gate = (
+                mock.patch.object(manager, "_spawn", side_effect=held_spawn)
+                if cause == "spawn_cancel" else contextlib.nullcontext())
+            with spawn_gate:
+                task = asyncio.create_task(manager.run_foreground(
+                    [sys.executable, "-c", script], "uncooperative command",
+                    5_000 if cause == "timeout" else 60_000,
+                    cwd=tmpdir, cancel_event=cancel_event))
+                try:
+                    deadline = asyncio.get_running_loop().time() + 4
+                    while True:
+                        job = next(iter(manager.jobs.values()), None)
+                        if job is not None and job.process is not None:
+                            self.assertIsNone(job.process.returncode)
+                            if "ready" in loki._read_spool_tail(job.stdout_path):
+                                break
+                        if asyncio.get_running_loop().time() >= deadline:
+                            self.fail("foreground process did not become ready")
+                        await asyncio.sleep(.01)
+                    resources = ProcessResources(job.process)
+                    with mock.patch.object(
+                            loki.current_session(), "job_manager", manager):
+                        self.assertIn("Sent", loki.run_ps("stop " + job.id))
+                    self.assertEqual(job.status, "stopping")
+                    self.assertIsNone(job.process.returncode)
+                    if cause in ["cancel", "spawn_cancel"]:
+                        cancel_event.set()
+                    elif cause == "unwind":
+                        task.cancel()
+                    release_spawn.set()
+                    done, _pending = await asyncio.wait({task}, timeout=9)
+                    self.assertTrue(done, "stopping job blocked foreground cleanup")
+                    expected = "timed_out" if cause == "timeout" else "cancelled"
+                    if cause == "unwind":
+                        with self.assertRaises(asyncio.CancelledError):
+                            task.result()
+                    else:
+                        result_job, outcome, stdout, stderr = task.result()
+                        self.assertIs(result_job, job)
+                        self.assertEqual(outcome, expected)
+                        self.assertIn("ready", stdout)
+                    self.assertEqual(job.status, expected)
+                    self.assertIsNotNone(job.process.returncode)
+                    if os.name == "posix":
+                        self.assertEqual(job.exit_code, -signal.SIGKILL)
+                        self.assertEqual(job.signal, signal.SIGKILL)
+                    with open(job.metadata_path, encoding="utf-8") as stream:
+                        metadata = json.load(stream)
+                    self.assertEqual(metadata["status"], expected)
+                    self.assertEqual(metadata["exit_code"], job.process.returncode)
+                    self.assertEqual(metadata["signal"], job.signal)
+                    self.assertEqual(cancel_event.is_set(),
+                                     cause in ["cancel", "spawn_cancel"])
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    resources.assert_released(self)
+                    self.assertFalse(asyncio.all_tasks() - tasks_before)
+                finally:
+                    # Backstop after the assertions, including a broken waiter.
+                    for job in manager.jobs.values():
+                        if job.process is not None and job.process.returncode is None:
+                            host_process.signal_group(job.process, job.pgid,
+                                                      host_process.FORCE)
+                            await asyncio.wait_for(job.process.wait(), 3)
+                    release_spawn.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.wait_for(
+                        asyncio.gather(task, return_exceptions=True), 3)
+
+        for cause in ["cancel", "timeout", "unwind", "spawn_cancel"]:
+            with self.subTest(cause=cause), tempfile.TemporaryDirectory() as tmpdir:
+                asyncio.run(scenario(tmpdir, cause))
+
+    def test_foreground_completion_and_simultaneous_cancellation(self):
+        async def scenario(tmpdir, simultaneous_cancel):
+            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            cancel_event = asyncio.Event()
+            real_wait = manager._wait_for_job
+
+            async def exit_then_cancel(job):
+                exit_code = await real_wait(job)
+                cancel_event.set()
+                return exit_code
+
+            waiter = (
+                mock.patch.object(manager, "_wait_for_job",
+                                  side_effect=exit_then_cancel)
+                if simultaneous_cancel else contextlib.nullcontext())
+            with waiter:
+                job, outcome, stdout, stderr = await asyncio.wait_for(
+                    manager.run_foreground(
+                        [sys.executable, "-c", "print('finished')"],
+                        "finite command", 5_000, cwd=tmpdir,
+                        cancel_event=cancel_event), 8)
+            self.assertEqual(outcome,
+                             "cancelled" if simultaneous_cancel else "completed")
+            self.assertEqual(job.status,
+                             "cancelled" if simultaneous_cancel else "exited")
+            self.assertEqual(job.exit_code, 0)
+            self.assertIn("finished", stdout)
+            self.assertEqual(stderr, "")
+            self.assertEqual(cancel_event.is_set(), simultaneous_cancel)
+            with open(job.metadata_path, encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], job.status)
+
+        for simultaneous_cancel in [False, True]:
+            with self.subTest(cancel=simultaneous_cancel), tempfile.TemporaryDirectory() as tmpdir:
+                asyncio.run(scenario(tmpdir, simultaneous_cancel))
+
     def test_failed_credential_relay_setup_closes_its_ends(self):
         async def scenario(tmpdir):
             manager = loki.JobManager(os.path.join(tmpdir, "jobs"))

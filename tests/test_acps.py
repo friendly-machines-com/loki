@@ -1971,6 +1971,242 @@ class _LocalWorkerProcess:
         return self.returncode
 
 
+class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    @asynccontextmanager
+    async def _channel(self, root, messages, completion):
+        from loki_agent import formats, loki
+        from loki_agent.sessions import Session
+        session = Session(
+            shell_cwd=root, chat_log_path=os.path.join(root, "chat.json"),
+            transcript_items=[formats.instruction_item("system")])
+        tasks_before = asyncio.all_tasks()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
+            stack.enter_context(mock.patch.object(loki, "CREDENTIALS", CredentialStore({})))
+            stack.enter_context(mock.patch.object(loki, "current_model", return_value="model"))
+            stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
+            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(root, "jobs")))
+            # The process seam owns byte transport, not an OS process.
+            stack.enter_context(mock.patch.object(
+                acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
+            process = _LocalWorkerProcess(session, "prompt-owner", lambda message: None)
+            channel = acp.WorkerChannel("prompt-owner", process, messages.append)
+            try:
+                yield channel
+                await asyncio.wait_for(channel.close(), 5)
+                self.assertEqual(process.returncode, 0)
+                self.assertTrue(process.close_task.done())
+                self.assertIsNone(process.close_task.exception())
+                self.assertFalse(channel._pending)
+                self.assertTrue(channel._reader_task.done())
+                self.assertFalse(asyncio.all_tasks() - tasks_before)
+            finally:
+                process.close()
+                await asyncio.wait_for(process.wait(), 5)
+                await asyncio.wait_for(channel.close(), 5)
+
+    def _params(self, text):
+        return {"sessionId": "prompt-owner", "prompt": [{"type": "text", "text": text}]}
+
+    async def test_wire_cancellation_before_prompt_task_starts_and_next_turn(self):
+        from loki_agent import formats, protocols
+        for text in ["ordinary prompt", "!echo should-not-run > executed.txt"]:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as root:
+                messages = []
+                completion = mock.AsyncMock(return_value=formats.DecodedTurn(
+                    [formats.message_item("assistant", "next answer")],
+                    {"protocol": protocols.OPENAI_CHAT}))
+                async with self._channel(root, messages, completion) as channel:
+                    process = channel.process
+                    worker = process.worker
+
+                    def before_request(message):
+                        if message["method"] == "session/prompt":
+                            # Both byte-framed requests are admitted before the
+                            # reader yields to the new prompt task.
+                            process.write((json.dumps(acps.request(
+                                "cancel-before-start", "session/cancel", {})) + "\n").encode())
+                            process.before_request = lambda message: None
+
+                    process.before_request = before_request
+                    reply = await asyncio.wait_for(
+                        channel.request("session/prompt", self._params(text)), 5)
+                    self.assertEqual(reply, {"stopReason": "cancelled"})
+                    self.assertEqual(completion.await_count, 0)
+                    self.assertTrue(worker.cancel_event.is_set())
+                    self.assertIsNone(worker.session.job_manager)
+                    self.assertFalse(os.path.exists(os.path.join(root, "executed.txt")))
+                    self.assertEqual(_tool_updates(messages, "prompt-owner"),
+                                     _assistant_chunks("[turn cancelled by user]"))
+                    with open(worker.session.chat_log_path, encoding="utf-8") as stream:
+                        self.assertEqual(_conversation_pairs(json.load(stream)),
+                                         [("user", [{"type": "text", "text": text}])])
+                    messages.clear()
+                    reply = await asyncio.wait_for(
+                        channel.request("session/prompt", self._params("next prompt")), 5)
+                    self.assertEqual(reply, {"stopReason": "end_turn"})
+                    self.assertFalse(worker.cancel_event.is_set())
+                    self.assertEqual(completion.await_count, 1)
+                    self.assertEqual(_tool_updates(messages, "prompt-owner"),
+                                     _assistant_chunks("next answer"))
+                    with open(worker.session.chat_log_path, encoding="utf-8") as stream:
+                        self.assertEqual(_conversation_pairs(json.load(stream)), [
+                            ("user", [{"type": "text", "text": text}]),
+                            ("user", [{"type": "text", "text": "next prompt"}]),
+                            ("assistant", [{"type": "text", "text": "next answer"}]),
+                        ])
+
+    async def test_local_commands_do_not_reset_cancellation_or_enter_history(self):
+        import copy
+        messages = []
+        completion = mock.AsyncMock(side_effect=AssertionError("local command requested inference"))
+        with tempfile.TemporaryDirectory() as root:
+            async with self._channel(root, messages, completion) as channel:
+                worker = channel.process.worker
+                initial = copy.deepcopy(worker.session.transcript_items)
+                worker.cancel_event.set()
+                for text in ["/ps", "/ps all", "/ps 1", "/ps stop 1", "/ps kill 1",
+                             "/ps bad argument", "/status --json", "/pwd"]:
+                    messages.clear()
+                    reply = await asyncio.wait_for(
+                        channel.request("session/prompt", self._params(text)), 5)
+                    self.assertEqual(reply, {"stopReason": "end_turn"})
+                    self.assertTrue(worker.cancel_event.is_set())
+                    self.assertEqual(worker.session.transcript_items, initial)
+                    self.assertEqual(len(_tool_updates(messages, "prompt-owner")), 1)
+                self.assertEqual(await worker.prompt(self._params("/ps")),
+                                 {"stopReason": "end_turn"})
+                self.assertTrue(worker.cancel_event.is_set())
+                self.assertIsNone(worker._prompt_task)
+                self.assertFalse(os.path.exists(worker.session.chat_log_path))
+                completion.assert_not_awaited()
+
+    async def test_all_prompt_entry_paths_preserve_active_owner_and_updates(self):
+        import copy
+        from loki_agent import formats, protocols
+        for origin in ["wire", "inline"]:
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as root:
+                entered = asyncio.Event()
+                release = asyncio.Event()
+                messages = []
+
+                async def completion(*args, **kwargs):
+                    entered.set()
+                    await worker.cancel_event.wait()
+                    await release.wait()
+                    return formats.DecodedTurn(
+                        [formats.message_item("assistant", "must not appear")],
+                        {"protocol": protocols.OPENAI_CHAT})
+
+                async with self._channel(root, messages, completion) as channel:
+                    worker = channel.process.worker
+                    active = asyncio.create_task(
+                        channel.request("session/prompt", self._params("active"))
+                        if origin == "wire" else worker.prompt(self._params("active")))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 3)
+                        owner = worker._prompt_task
+                        self.assertIsNotNone(owner)
+                        initial = copy.deepcopy(worker.session.transcript_items)
+                        await asyncio.wait_for(channel.request("session/cancel", {}), 3)
+                        for text in ["/ps", "/ps stop 1", "/status", "second prompt"]:
+                            with self.assertRaisesRegex(acps.TransportError, "already running"):
+                                await asyncio.wait_for(
+                                    channel.request("session/prompt", self._params(text)), 3)
+                            with self.assertRaisesRegex(acps.TransportError, "already running"):
+                                await worker.prompt(self._params(text))
+                            replies = []
+                            write = worker.write
+
+                            def record(message):
+                                replies.append(message)
+                                write(message)
+
+                            with mock.patch.object(worker, "write", new=record):
+                                await worker.handle(acps.request(
+                                    "inline-rejected", "session/prompt", self._params(text)))
+                            self.assertEqual(replies, [acps.response("inline-rejected", error={
+                                "code": acps.INVALID_PARAMS,
+                                "message": "a prompt is already running for this session",
+                            })])
+                            self.assertIs(worker._prompt_task, owner)
+                            self.assertFalse(owner.done())
+                            self.assertTrue(worker.cancel_event.is_set())
+                            self.assertEqual(worker.session.transcript_items, initial)
+                            self.assertEqual(messages, [])
+                        # Close must still wait for the original prompt, not a
+                        # rejected command or a substituted task.
+                        close = asyncio.create_task(worker.close())
+                        await asyncio.sleep(0)
+                        self.assertFalse(close.done())
+                        release.set()
+                        self.assertEqual(await asyncio.wait_for(active, 3),
+                                         {"stopReason": "cancelled"})
+                        await asyncio.wait_for(close, 3)
+                        await asyncio.sleep(0)
+                        self.assertEqual(_tool_updates(messages, "prompt-owner"),
+                                         _assistant_chunks("[turn cancelled by user]"))
+                    finally:
+                        worker.cancel_event.set()
+                        release.set()
+                        await asyncio.wait_for(asyncio.gather(active, return_exceptions=True), 3)
+
+    async def test_bang_cancellation_reaps_command_without_requesting_inference(self):
+        import shlex
+        from loki_agent import loki
+        from process_lifecycle_fixtures import ProcessResources
+        messages = []
+        completion = mock.AsyncMock(side_effect=AssertionError("cancelled bang requested inference"))
+        command_parts = [sys.executable, "-c",
+                         "import time; print('bang-ready', flush=True); time.sleep(60)"]
+        command = (subprocess.list2cmdline(command_parts)
+                   if os.name == "nt" else shlex.join(command_parts))
+        with tempfile.TemporaryDirectory() as root:
+            async with self._channel(root, messages, completion) as channel:
+                worker = channel.process.worker
+                active = asyncio.create_task(channel.request(
+                    "session/prompt", self._params("!" + command)))
+                resources = None
+                try:
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while True:
+                        manager = worker.session.job_manager
+                        job = next(iter(manager.jobs.values()), None) if manager is not None else None
+                        if job is not None and job.process is not None:
+                            self.assertIsNone(job.process.returncode)
+                            if "bang-ready" in loki._read_spool_tail(job.stdout_path):
+                                break
+                        if asyncio.get_running_loop().time() >= deadline:
+                            self.fail("bang command did not become ready")
+                        await asyncio.sleep(.01)
+                    resources = ProcessResources(job.process)
+                    await asyncio.wait_for(channel.request("session/cancel", {}), 3)
+                    done, _pending = await asyncio.wait({active}, timeout=5)
+                    self.assertTrue(done, "cancellation did not finish the bang command")
+                    self.assertEqual(active.result(), {"stopReason": "cancelled"})
+                    self.assertEqual(job.status, "cancelled")
+                    self.assertIsNotNone(job.process.returncode)
+                    with open(job.metadata_path, encoding="utf-8") as stream:
+                        self.assertEqual(json.load(stream)["status"], "cancelled")
+                    completion.assert_not_awaited()
+                    updates = _tool_updates(messages, "prompt-owner")
+                    self.assertEqual(updates[-1], _assistant_chunks("[turn cancelled by user]")[0])
+                    self.assertIn("bang-ready", updates[0]["content"]["text"])
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    resources.assert_released(self)
+                finally:
+                    if resources is not None:
+                        if job.process.returncode is None:
+                            loki.host_process.signal_group(
+                                job.process, job.pgid, loki.host_process.FORCE)
+                            await asyncio.wait_for(job.process.wait(), 3)
+                        await resources.cleanup()
+                    if not active.done():
+                        active.cancel()
+                    await asyncio.wait_for(asyncio.gather(active, return_exceptions=True), 3)
+
+
 class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorized_restore_continues_and_saves(self):
         from contextlib import ExitStack
