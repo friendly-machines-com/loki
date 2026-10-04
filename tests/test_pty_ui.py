@@ -450,7 +450,7 @@ class PtyUiTests(unittest.TestCase):
         self.assertNotIn(b"codeword", before_release)
         plain = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         self.assertIn(b"/queue(texts: 1, images: 0)", plain)
-        self.assertNotIn(b"queued prompts: 2", plain)
+        self.assertNotIn(b"/queue(texts: 2", plain)
         self._assert_styled_output(output)
         tracker = _SgrStreamTracker()
         tracker.feed(output)
@@ -470,7 +470,7 @@ class PtyUiTests(unittest.TestCase):
         before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
         self.assertIn(b"/queue(texts: 1, images: 0)", before_release)
-        self.assertIn(b"queued prompts: 0, queued images: 1", output)
+        self.assertIn(b"/queue(texts: 0, images: 1)", output)
 
     def test_full_stream_parses_and_styles_land(self):
         # Whole-stream validation of the tty byte output: every escape
