@@ -1962,18 +1962,21 @@ class PromptRenderer:
 
 class PromptController:
     def __init__(self, terminal, prompt: str = 'User: ', history=None, session=None,
-                 on_mode_cycle=None, history_provider=None):
+                 on_mode_cycle=None, history_provider=None, *, initial_text: str = ''):
         self.terminal = terminal
         self.prompt = prompt
+        self.initial_text = initial_text
         self.history = list(history or [])
         self.history_provider = history_provider
         self.session = session  # AsyncKeyReader held for the whole session
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
 
     async def read_text(self) -> str:
+        """Read editable input, starting with initial_text and the cursor at its end."""
         fd = new_stdin
         interactive = os.isatty(fd) and os.isatty(sys.stdout.fileno())
         buffer = InputBuffer()
+        buffer.insert(self.initial_text)
         renderer = PromptRenderer(self.terminal, self.prompt)
 
         output_row, output_col = 1, 1
@@ -2078,10 +2081,11 @@ class PromptController:
 
 
 async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle=None,
-                          history_provider=None):
+                          history_provider=None, *, initial_text: str = ''):
     return await PromptController(terminal, prompt or 'User: ', history=history, session=session,
                                   on_mode_cycle=on_mode_cycle,
-                                  history_provider=history_provider).read_text()
+                                  history_provider=history_provider,
+                                  initial_text=initial_text).read_text()
 
 
 class InputModal:
@@ -2115,7 +2119,7 @@ class InputModal:
             self.session._modal = None
         await self.session._resume()
 
-    async def prompt(self, prompt_text='User: ', history=None) -> str:
+    async def prompt(self, prompt_text='User: ', history=None, *, initial_text: str = '') -> str:
         if not self.active or self.session._modal is not self:
             raise RuntimeError("modal prompt used outside its active context")
         if self.reading:
@@ -2123,7 +2127,8 @@ class InputModal:
         self.reading = True
         try:
             return await get_input_async(
-                prompt_text, history, session=self.session.reader)
+                prompt_text, history, session=self.session.reader,
+                initial_text=initial_text)
         finally:
             self.reading = False
 

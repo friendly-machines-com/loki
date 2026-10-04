@@ -898,7 +898,7 @@ class InputBufferTests(unittest.TestCase):
 
 
 class PromptControllerTests(unittest.TestCase):
-    def read_with_events(self, events, history=None):
+    def read_with_events(self, events, history=None, *, initial_text=""):
         old_stdin = sys.stdin
         old_isatty = terminals.os.isatty
         old_key_reader = terminals.AsyncKeyReader
@@ -939,13 +939,56 @@ class PromptControllerTests(unittest.TestCase):
             terminals.os.isatty = lambda fd: False
             terminals.AsyncKeyReader = FakeKeyReader
             terminals.TerminalMode = FakeTerminalMode
-            controller = terminals.PromptController(RecordingTerminal(), history=history)
+            controller = terminals.PromptController(
+                RecordingTerminal(), history=history, initial_text=initial_text)
             return asyncio.run(controller.read_text())
         finally:
             sys.stdin = old_stdin
             terminals.os.isatty = old_isatty
             terminals.AsyncKeyReader = old_key_reader
             terminals.TerminalMode = old_terminal_mode
+
+    def test_initial_text_is_submitted_and_can_be_extended_or_replaced(self):
+        cases = [
+            ([terminals.KeyEvent("ENTER")], "filter "),
+            ([terminals.KeyEvent("TEXT", "GPT"), terminals.KeyEvent("ENTER")],
+             "filter GPT"),
+            ([terminals.KeyEvent("BACKSPACE"), terminals.KeyEvent("ENTER")],
+             "filter"),
+            ([terminals.KeyEvent("BACKSPACE_WORD"), terminals.KeyEvent("TEXT", "2"),
+              terminals.KeyEvent("ENTER")], "2"),
+            ([terminals.KeyEvent("BACKSPACE_WORD"), terminals.KeyEvent("ENTER")], ""),
+        ]
+        for events, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    self.read_with_events(events, initial_text="filter "), expected)
+
+    def test_get_input_renders_initial_text_before_reading_keys(self):
+        output_at_read = []
+
+        class TtyOutput(io.StringIO):
+            def fileno(self):
+                return 1
+
+        class Reader:
+            async def read_key(self):
+                output_at_read.append(output.getvalue())
+                return terminals.KeyEvent("ENTER")
+
+        output = TtyOutput()
+        with (
+            mock.patch.object(terminals, "terminal", RecordingTerminal()),
+            mock.patch.object(terminals.os, "isatty", return_value=True),
+            mock.patch.object(terminals, "refresh_terminal_layout"),
+            mock.patch.object(terminals, "update_status_bar"),
+            contextlib.redirect_stdout(output),
+        ):
+            result = asyncio.run(terminals.get_input_async(
+                "Choice: ", session=Reader(), initial_text="filter "))
+
+        self.assertEqual(result, "filter ")
+        self.assertEqual(output_at_read, ["Choice: filter  "])
 
     def test_read_text_applies_keyboard_editing(self):
         result = self.read_with_events(
@@ -1086,6 +1129,20 @@ class PromptControllerTests(unittest.TestCase):
 
         self.assertEqual(result, "draft")
 
+    def test_history_navigation_restores_edited_initial_text(self):
+        result = self.read_with_events(
+            [
+                terminals.KeyEvent("TEXT", "GPT"),
+                terminals.KeyEvent("CURSOR_UP"),
+                terminals.KeyEvent("CURSOR_DOWN"),
+                terminals.KeyEvent("ENTER"),
+            ],
+            history=["old"],
+            initial_text="filter ",
+        )
+
+        self.assertEqual(result, "filter GPT")
+
     def test_read_text_returns_history_selection(self):
         result = self.read_with_events(
             [
@@ -1108,6 +1165,22 @@ class PromptControllerTests(unittest.TestCase):
             self.read_with_events([terminals.KeyEvent("TEXT", "abc"), terminals.KeyEvent("CTRL_D")]),
             "abc",
         )
+
+    def test_initial_text_uses_normal_eof_and_cancellation_behavior(self):
+        for kind in ["EOF", "CTRL_D"]:
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    self.read_with_events(
+                        [terminals.KeyEvent(kind)], initial_text="filter "),
+                    "filter ",
+                )
+                with self.assertRaises(EOFError):
+                    self.read_with_events(
+                        [terminals.KeyEvent("BACKSPACE_WORD"), terminals.KeyEvent(kind)],
+                        initial_text="filter ",
+                    )
+        with self.assertRaises(KeyboardInterrupt):
+            self.read_with_events([terminals.KeyEvent("CTRL_C")], initial_text="filter ")
 
     def test_eof_ctrl_d_and_ctrl_c_on_empty_buffer_raise(self):
         with self.assertRaises(EOFError):
@@ -1182,8 +1255,8 @@ class InputModalTests(unittest.TestCase):
             calls.append("resume")
 
         async def fake_get_input_async(
-                prompt=None, history=None, session=None, on_mode_cycle=None):
-            calls.append(("prompt", prompt, history, session))
+                prompt=None, history=None, session=None, on_mode_cycle=None, *, initial_text=""):
+            calls.append(("prompt", prompt, history, session, initial_text))
             return "answer"
 
         session._pause = pause
@@ -1200,7 +1273,7 @@ class InputModalTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "already active"):
                     async with session.modal():
                         pass
-                return await modal.prompt("Question: ", ["old"])
+                return await modal.prompt("Question: ", ["old"], initial_text="filter ")
 
         try:
             result = asyncio.run(exercise())
@@ -1211,9 +1284,28 @@ class InputModalTests(unittest.TestCase):
         self.assertIsNone(session._modal)
         self.assertEqual(calls, [
             "pause",
-            ("prompt", "Question: ", ["old"], session.reader),
+            ("prompt", "Question: ", ["old"], session.reader, "filter "),
             "resume",
         ])
+
+    def test_modal_remains_usable_after_prefilled_prompt_is_cancelled(self):
+        async def exercise():
+            session = terminals.InputSession(fd=0)
+            session._pause = mock.AsyncMock()
+            session._resume = mock.AsyncMock()
+            with mock.patch.object(
+                    terminals, "get_input_async",
+                    new=mock.AsyncMock(side_effect=[KeyboardInterrupt(), "answer"])):
+                async with session.modal() as modal:
+                    with self.assertRaises(KeyboardInterrupt):
+                        await modal.prompt("Question: ", initial_text="filter ")
+                    self.assertFalse(modal.reading)
+                    self.assertEqual(await modal.prompt("Question: "), "answer")
+            self.assertIsNone(session._modal)
+            session._pause.assert_awaited_once()
+            session._resume.assert_awaited_once()
+
+        asyncio.run(exercise())
 
     def test_modal_restores_normal_input_after_exception(self):
         session = terminals.InputSession(fd=0)

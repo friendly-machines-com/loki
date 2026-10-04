@@ -77,7 +77,7 @@ def _input_script(inputs):
     """Async input_fn returning scripted strings; EOFError when exhausted."""
     iterator = iter(inputs)
 
-    async def fake(prompt=None, history=None):
+    async def fake(prompt=None, history=None, *, initial_text=""):
         try:
             return next(iterator)
         except StopIteration:
@@ -1109,6 +1109,33 @@ class MenuTests(unittest.TestCase):
             text_writer=_write_text))
         self.assertIsNone(result)
 
+    def test_menu_initial_text_only_prefills_first_prompt(self):
+        inputs = mock.AsyncMock(side_effect=["filter gpt", "0", "1"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = asyncio.run(models._numbered_menu_async(
+                [("claude", "Claude"), ("gpt", "GPT Test")],
+                "Choice: ", inputs, text_writer=_write_text, initial_text="filter "))
+
+        self.assertEqual(result, "gpt")
+        self.assertEqual(inputs.await_args_list, [
+            mock.call("Choice: ", initial_text="filter "),
+            mock.call("Choice: ", initial_text=""),
+            mock.call("Choice: ", initial_text=""),
+        ])
+
+    def test_unchanged_prefill_leaves_next_prompt_empty_for_cancellation(self):
+        inputs = mock.AsyncMock(side_effect=["filter ", ""])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = asyncio.run(models._numbered_menu_async(
+                [("a", "Alpha")], "Choice: ", inputs,
+                text_writer=_write_text, initial_text="filter "))
+
+        self.assertIsNone(result)
+        self.assertEqual(inputs.await_args_list, [
+            mock.call("Choice: ", initial_text="filter "),
+            mock.call("Choice: ", initial_text=""),
+        ])
+
     def test_terminal_writer_neutralizes_remote_menu_row_controls(self):
         rows = [(
             "a",
@@ -1205,6 +1232,34 @@ class MenuTests(unittest.TestCase):
 class PickerTests(unittest.TestCase):
     def setUp(self):
         assume_endpoints_approved(self)
+
+    def test_catalog_picker_prefills_model_filter_but_not_provider(self):
+        inputs = mock.AsyncMock(side_effect=["filter GLM", "1", "1"])
+        with (
+            mock.patch.object(models, "_index_cache", (DATA, models.build_groups(DATA))),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = asyncio.run(models.run_model_picker_async(
+                inputs, _credentials(), text_writer=_write_text))
+
+        self.assertEqual(result[2]["name"], "GLM-5.2")
+        self.assertEqual(
+            [call.kwargs["initial_text"] for call in inputs.await_args_list],
+            ["filter ", "", ""],
+        )
+        self.assertTrue(inputs.await_args_list[-1].args[0].startswith("Provider choice"))
+
+    def test_fallback_picker_prefills_model_filter(self):
+        inputs = mock.AsyncMock(side_effect=["filter GPT", "1"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = asyncio.run(models.run_flat_model_picker_async(
+                inputs, ["Claude", "GPT Test"], text_writer=_write_text))
+
+        self.assertEqual(result, "GPT Test")
+        self.assertEqual(
+            [call.kwargs["initial_text"] for call in inputs.await_args_list],
+            ["filter ", ""],
+        )
 
     def test_explicit_connection_is_selectable_without_catalog_models(self):
         explicit = models.ExplicitConnectionOption(

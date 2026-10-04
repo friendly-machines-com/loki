@@ -1606,8 +1606,9 @@ class ModelLoadingTests(unittest.TestCase):
                 self.addCleanup(lambda: asyncio.run(session.job_manager.close_session_owned()))
 
                 class Input(ScriptedInputSession):
-                    async def prompt(inner_self, prompt=None, history=None):
+                    async def prompt(inner_self, prompt=None, history=None, *, initial_text=""):
                         self.assertIn("filter WORDS", prompt)
+                        self.assertEqual(initial_text, "filter ")
                         return "2"
 
                 inputs = Input(["/model", "answer with fallback model", None])
@@ -2020,7 +2021,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             provider_prompt_seen = False
             last_input_render_end = len(output.getvalue())
 
-            async def input_fn(prompt=None, history=None):
+            async def input_fn(prompt=None, history=None, *, initial_text=""):
                 nonlocal provider_prompt_seen, last_input_render_end
                 if expected_pid == "openrouter" and prompt.startswith("Provider choice") and not provider_prompt_seen:
                     shown = output.getvalue()[render_start:]
@@ -2188,7 +2189,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             if variant == "credentialless":
                 # The actual terminal /model handler replaces a loaded connection
                 # and then selects the explicit credentialless option again.
-                answers = iter(["filter GPT Test", "1", "1", "yes", "filter beta", "1", "1"])
+                answers = iter(["GPT Test", "1", "1", "yes", "beta", "1", "1"])
 
                 class SwitchInput(ScriptedInputSession):
                     async def get(inner_self):
@@ -2209,8 +2210,9 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                             prepare("https://local.example/v1/chat/completions", "beta", protocols.OPENAI_CHAT, history=True)
                         return message
 
-                    async def prompt(inner_self, prompt=None, history=None):
+                    async def prompt(inner_self, prompt=None, history=None, *, initial_text=""):
                         answer = next(answers)
+                        self.assertEqual(initial_text, "filter " if answer in ["GPT Test", "beta"] else "")
                         if prompt == "Send this credential to this endpoint? [y/N] ":
                             self.assertEqual(
                                 endpoint_pins.status("openai", "https://api.openai.com/v1", "env:OPENAI_API_KEY"),
@@ -2218,7 +2220,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                             self.assertIn("env:OPENAI_API_KEY", output.getvalue())
                         else:
                             self.assertIn("filter WORDS", prompt)
-                        return answer
+                        return initial_text + answer
 
                 startup_values["LOKI_STREAM"] = "1"
                 inputs = SwitchInput(["/model", "normalized selection", "/model", "switch to credentialless", None])

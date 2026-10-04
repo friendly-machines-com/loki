@@ -1108,12 +1108,13 @@ def _row_matches(row, query):
 
 
 async def _numbered_menu_async(
-        rows, prompt, input_fn, *, text_writer, header=None):
+        rows, prompt, input_fn, *, text_writer, header=None, initial_text=""):
     """Numbered menu over rows=[(value, display_text)] (optionally a third
     search_text element for filtering beyond the visible line).
 
     Bare int selects that row; "filter WORDS" narrows (words in any order);
     empty cancels (returns None). Mirrors the session-picker gestures.
+    initial_text prefills only the first prompt; subsequent choices start empty.
     """
     query = ""
     while True:
@@ -1125,7 +1126,8 @@ async def _numbered_menu_async(
             print(f"{i}. ", end="")
             text_writer(row[1])
             print()
-        choice = (await input_fn(prompt) or "").strip()
+        choice = (await input_fn(prompt, initial_text=initial_text) or "").strip()
+        initial_text = ""
         if choice == "filter" or choice.startswith("filter "):
             query = choice[len("filter"):].strip()
             continue
@@ -1292,7 +1294,8 @@ async def run_flat_model_picker_async(
         'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
         input_fn,
         text_writer=text_writer,
-        header="Usable models:")
+        header="Usable models:",
+        initial_text="filter ")
 
 
 def flattened_config_option_choices(
@@ -1437,7 +1440,8 @@ async def run_model_picker_async(
         'Model choice (number selects, "filter WORDS" narrows, empty cancels): ',
         input_fn,
         text_writer=text_writer,
-        header="Usable models:")
+        header="Usable models:",
+        initial_text="filter ")
     if members is None:
         return None
 
