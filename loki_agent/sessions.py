@@ -60,10 +60,6 @@ class Session:
     # Readable-output display preference. Observation only: it never
     # selects computation.
     reasoning_traces: str = "off"
-    # One connection-bound, one-shot request for controls whose spelling
-    # is verified but whose model acceptance is not. Applied to the next
-    # inference turn, then consumed; never persisted, never a preference.
-    thinking_request: dict | None = None
 
     # Async request-time credential authority. Top-level processes install a
     # local broker; workers and subagents install a delegated client.

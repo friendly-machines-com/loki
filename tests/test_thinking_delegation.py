@@ -69,7 +69,7 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.effort, "high")
         self.assertIsNone(self.session.reasoning_effort_preference)
 
-    async def test_binding_and_trial_permission_are_validated(self):
+    async def test_binding_and_connection_are_validated(self):
         self.session.runtime_config = loki.make_runtime_config(
             "https://relay.example/v1/messages", protocols.ANTHROPIC_MESSAGES, model="custom")
         loki.thinking_command("mode adaptive")
@@ -77,13 +77,14 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         env = loki._subagent_env(thinking=snapshot, environ={})
         restored = loki.delegated_turn_settings(CredentialStore.capture(env))
         self.assertEqual(restored.mode, "adaptive")
-        self.assertIsNotNone(restored.trial)
+        self.assertFalse(hasattr(restored, "trial"))
         payload = json.loads(env["LOKI_TURN_THINKING"])
-        payload["settings"]["trial"] = False
-        env["LOKI_TURN_THINKING"] = json.dumps(payload)
-        with self.assertRaisesRegex(ValueError, "parent"):
-            loki.delegated_turn_settings(CredentialStore.capture(env))
+        self.assertNotIn("trial", payload["settings"])
         payload["settings"]["trial"] = True
+        env["LOKI_TURN_THINKING"] = json.dumps(payload)
+        with self.assertRaisesRegex(ValueError, "settings"):
+            loki.delegated_turn_settings(CredentialStore.capture(env))
+        del payload["settings"]["trial"]
         payload["connection"]["endpoint"] = "https://other.example/v1/messages"
         env["LOKI_TURN_THINKING"] = json.dumps(payload)
         with self.assertRaisesRegex(ValueError, "connection"):

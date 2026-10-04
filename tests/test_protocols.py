@@ -583,14 +583,15 @@ class ContractOwnershipTests(unittest.TestCase):
             "reasoning_effort"], "high")
         messages = protocols.make_provider(
             "https://relay.example/v1/messages", provider=protocols.ANTHROPIC_MESSAGES)
-        self.assertEqual(messages.thinking_control_status("claude-opus-4-7", "mode", "manual"), "trial")
-        self.assertEqual(messages.thinking_control_status("claude-opus-4-7", "budget", 2048), "trial")
+        # The wire spelling is known; acceptance rides the normal path.
+        self.assertEqual(messages.thinking_control_status("claude-opus-4-7", "mode", "manual"), "supported")
+        self.assertEqual(messages.thinking_control_status("claude-opus-4-7", "budget", 2048), "supported")
         self.assertEqual(messages.thinking_modes("claude-opus-4-7"), [])
         self.assertIsNone(messages.thinking_default_mode("claude-opus-5-5"))
 
     def test_model_name_alone_cannot_import_claude_effort_ceiling(self):
         provider = protocols.make_provider("https://api.z.ai/api/paas/v4/chat/completions")
-        self.assertEqual(provider.thinking_control_status("claude-opus-5", "mode", "off"), "trial")
+        self.assertEqual(provider.thinking_control_status("claude-opus-5", "mode", "off"), "supported")
         payload = provider.chat_payload([], None, "claude-opus-5", thinking_mode="off", reasoning_effort="xhigh")
         self.assertEqual(payload["thinking"], {"type": "disabled"})
 
@@ -647,16 +648,16 @@ class ClaudeThinkingContractTests(unittest.TestCase):
                     provider.thinking_control_status(
                         model, "mode", mode)
 
-    def test_unlisted_models_are_trials_not_rejections(self):
+    def test_unlisted_models_are_accepted_not_rejected(self):
         provider = self.provider()
         self.assertEqual(
             provider.thinking_control_status(
                 "claude-future", "mode", "adaptive"),
-            "trial")
+            "supported")
         self.assertEqual(
             provider.thinking_control_status(
                 "claude-future", "budget", 2048),
-            "trial")
+            "supported")
 
     def test_manual_allowance_is_required_and_bounded(self):
         provider = self.provider(max_tokens=4096)
@@ -759,7 +760,7 @@ class GlmThinkingContractTests(unittest.TestCase):
                 [], None, "glm-5.3", thinking_mode="off")
         self.assertEqual(
             provider.thinking_control_status("glm-5.3", "mode", "on"),
-            "trial")
+            "supported")
 
 
 class TraceOutputFieldTests(unittest.TestCase):

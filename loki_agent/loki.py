@@ -196,8 +196,7 @@ class TurnThinkingSettings:
     Every request in the turn -- terminal inference, tool continuations,
     tool-less helpers, delegated inference -- uses this same snapshot, so
     changes made mid-turn apply to the next turn, never halfway through
-    this one. ``trial`` is the connection-bound one-shot request queued
-    by /thinking; its identity is the consume token.
+    this one.
     """
 
     effort: str | None = None
@@ -205,7 +204,6 @@ class TurnThinkingSettings:
     budget: int | None = None
     retention: str = "default"
     traces: str = "off"
-    trial: dict | None = None
 
 
 def _thinking_connection():
@@ -248,55 +246,65 @@ def effective_thinking_settings():
 
 
 def capture_turn_settings() -> TurnThinkingSettings:
-    """Capture the turn's thinking settings; consume a pending trial.
+    """Project the saved thinking controls into this turn's settings.
 
-    This is the turn-admission snapshot: call it once, before the first
-    inference request, and pass the result to every request in the turn.
+    This is the turn-admission projection and the single point that
+    validates the joint state: assignment accepted each control
+    independently, so an invalid combination surfaces here, once, as an
+    error -- never silently, and never as an artifact of the order the
+    controls were set in. Dormant-but-applicable handling stays as it
+    was: a saved control that does not apply to this connection is
+    dropped from the projection, not from the session.
     """
     session = current_session()
-    mode, budget, retention = effective_thinking_settings()
+    config = current_config()
+    if config is None or not config.model:
+        return TurnThinkingSettings(traces=session.reasoning_traces)
+    provider = config.chat_provider
+    model = config.model
     settings = TurnThinkingSettings(
         effort=effective_reasoning_effort(),
-        mode=mode,
-        budget=budget,
-        retention=retention,
+        mode=session.thinking_mode,
+        budget=session.thinking_budget,
+        retention=session.reasoning_retention,
         traces=session.reasoning_traces,
     )
-    request = session.thinking_request
-    if request is not None:
-        session.thinking_request = None
-        if request["connection"] == _thinking_connection():
-            values = request["values"]
-            settings = replace(
-                settings,
-                effort=values.get("effort", settings.effort),
-                mode=values.get("mode", settings.mode),
-                budget=values.get("budget", settings.budget),
-                retention=values.get("retention", settings.retention),
-                trial=request,
-            )
     if settings.mode == "off":
         # The allowance and (outside Anthropic, whose effort guides
         # non-thinking output) the effort apply to thinking only; with
         # thinking off they are dormant, not erased.
         settings = replace(settings, budget=None)
-        spec = (current_config().chat_provider.reasoning_spec
-                if current_config() else None)
+        spec = provider.reasoning_spec
         if spec is None or spec.wire_format != "anthropic":
             settings = replace(settings, effort=None)
+    if settings.mode != "manual" or provider.kind != protocols.ANTHROPIC_MESSAGES:
+        # An allowance rides a request only in manual mode on the wire
+        # that spells manual; anything else is a dormant saved value.
+        settings = replace(settings, budget=None)
+    if settings.retention == "preserve":
+        if provider.reasoning_preservation(model) is None:
+            settings = replace(settings, retention="default")
+    # The wire contract sees what a request would carry and owns the
+    # joint verdict: an invalid combination is an error here, once,
+    # instead of an order-dependent rejection at assignment.
+    provider.validate_thinking(
+        model, settings.effort, settings.mode,
+        settings.budget if settings.mode == "manual" else None,
+        settings.retention)
     return settings
 
 
 def set_thinking_controls(changes, *, persist=True):
-    """Apply one atomic update to the thinking controls.
+    """Assign thinking controls in any order.
 
     ``changes`` maps a control name ("effort", "mode", "budget",
-    "retention") to its requested value; ``None`` clears it. The whole
-    combination must validate against the wire contract, and nothing is
-    written on failure. A control whose request spelling is verified but
-    whose model acceptance is not becomes a one-turn trial: applied to
-    the next inference turn, labelled in the status output, never saved
-    as a preference.
+    "retention") to its requested value; ``None`` clears it. Assignment
+    validates field-level syntax only: the joint state becomes valid or
+    invalid together, and that verdict belongs to projection
+    (``capture_turn_settings``, the status text) -- never to the order
+    of assignment. A saved value that does not apply to the current
+    connection stays saved and dormant; a value the endpoint rejects
+    surfaces as the endpoint's error, in the open.
     """
     session = current_session()
     config = current_config()
@@ -310,14 +318,9 @@ def set_thinking_controls(changes, *, persist=True):
     }
     if set(changes) - set(names):
         raise ValueError("unknown thinking control")
-    provider = config.chat_provider
-    model = config.model
     candidate = {
-        "effort": session.reasoning_effort_preference,
-        "mode": session.thinking_mode,
-        "budget": session.thinking_budget,
-        "retention": session.reasoning_retention,
-    }
+        name: getattr(session, attribute)
+        for name, attribute in names.items()}
     candidate.update(changes)
     if candidate["retention"] not in ["default", "preserve"]:
         raise ValueError("expected retention default or preserve")
@@ -329,41 +332,17 @@ def set_thinking_controls(changes, *, persist=True):
             or isinstance(candidate["budget"], bool)
             or candidate["budget"] < 0):
         raise ValueError("thinking budget must be a nonnegative integer")
-    # Effort choices belong to the selected model's catalog entry; an
-    # unlisted value is never sent.
-    effort = candidate["effort"]
-    profile = current_reasoning_effort_profile()
-    if effort is not None:
-        if profile is None or not profile.supports(effort):
+    if candidate["effort"] is not None:
+        modelsdev.validate_reasoning_effort(candidate["effort"])
+        # Advertised choices are model facts, not joint state: an
+        # unlisted value is invalid in every order.
+        profile = current_reasoning_effort_profile()
+        if profile is None or not profile.supports(candidate["effort"]):
             raise ValueError(
-                f"reasoning effort {effort!r} is not available for the "
-                "selected model")
-    # The wire contract validates the combination and classifies mode and
-    # allowance: supported values become preferences, verified rejections
-    # stop here, and unverified acceptance becomes the one-turn trial.
-    # Validation sees what a request would carry: a saved allowance whose
-    # mode is not selected stays dormant (capture drops it), so it does
-    # not fail the wire's budget-requires-manual rule here.
-    requested_budget = candidate["budget"] if (
-        candidate["mode"] == "manual"
-        and provider.kind == protocols.ANTHROPIC_MESSAGES) else None
-    trials = {}
-    for control, value in [
-            ("mode", candidate["mode"]),
-            ("budget", requested_budget)]:
-        if value is None:
-            continue
-        if provider.thinking_control_status(model, control, value) == "trial":
-            trials[control] = value
-    provider.validate_thinking(
-        model, effort, candidate["mode"], requested_budget,
-        candidate["retention"])
+                f"reasoning effort {candidate['effort']!r} is not "
+                "available for the selected model")
     for name, value in changes.items():
-        if name not in trials:
-            setattr(session, names[name], value)
-    session.thinking_request = (
-        {"connection": _thinking_connection(), "values": trials}
-        if trials else None)
+        setattr(session, names[name], value)
     mark_chat_log_dirty()
     if persist:
         try:
@@ -436,18 +415,26 @@ def thinking_status_text():
     lines = [f"Thinking controls for {model}"]
     profile = current_reasoning_effort_profile()
     if profile is not None:
-        lines.append(
-            "Effort: " + (reasoning_effort_status_text() or "unknown"))
-        lines.append("Effort choices: default, " + ", ".join(value for value in profile.values if isinstance(value, str)))
+        effective = effective_reasoning_effort()
+        if effective is not None:
+            lines.append(f"Effort: {effective}")
+        else:
+            default = reasoning_effort_default()
+            lines.append(
+                f"Effort: not selected (model default: {default})"
+                if default is not None else "Effort: not selected")
+        lines.append("Effort choices: default, " + ", ".join(
+            value for value in profile.values
+            if isinstance(value, str)))
     if modes:
         lines.append(
             "Mode: " + (mode or provider.thinking_default_mode(model)
-                        or "unknown"))
+                        or "not selected"))
         lines.append("Mode choices: default, " + ", ".join(modes))
     if provider.kind == protocols.ANTHROPIC_MESSAGES and "manual" in modes:
         lines.append("Allowance: " + (
             f"{budget} thinking tokens" if budget is not None
-            else "not selected; manual mode requires an explicit value"))
+            else "default"))
     if provider.reasoning_preservation(model) is not None:
         lines.append(f"Retention: {retention} (default, preserve)")
     for label, saved, active in [
@@ -461,14 +448,6 @@ def thinking_status_text():
              None if retention == "default" else retention)]:
         if saved != active:
             lines.append(f"Inactive {label} preference: {saved}")
-    request = session.thinking_request
-    if request is not None and request["connection"] == _thinking_connection():
-        listed = ", ".join(
-            f"{name} {value}"
-            for name, value in request["values"].items())
-        lines.append(
-            "Unverified model acceptance; requested once for the next "
-            f"inference turn: {listed}")
     if profile is None and not modes:
         lines.append("No verified computation controls for this connection.")
     return "\n".join(lines)
@@ -487,8 +466,7 @@ def reasoning_traces_status_text():
                 or effort == "none"
                 or (effort is None
                     and reasoning_effort_default() == "none")):
-            text += ("; thinking is disabled by model settings; "
-                     "use /thinking to change them")
+            text += "; thinking off"
     return text
 
 
@@ -4038,8 +4016,7 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None,
         env["LOKI_TURN_THINKING"] = json.dumps({
             "connection": _thinking_connection(),
             "settings": {"effort": reasoning_effort, "mode": thinking.mode,
-                         "budget": thinking.budget, "retention": thinking.retention,
-                         "trial": thinking.trial is not None},
+                         "budget": thinking.budget, "retention": thinking.retention},
             "capabilities": capabilities.to_dict() if capabilities is not None else None,
         }, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
         profile = config.reasoning_effort_profile
@@ -4121,10 +4098,8 @@ def delegated_turn_settings(credentials) -> TurnThinkingSettings:
     if envelope["connection"] != _thinking_connection():
         raise ValueError("delegated thinking settings do not match the connection")
     values = envelope["settings"]
-    if not isinstance(values, dict) or set(values) != {"effort", "mode", "budget", "retention", "trial"}:
+    if not isinstance(values, dict) or set(values) != {"effort", "mode", "budget", "retention"}:
         raise ValueError("invalid delegated thinking settings")
-    if not isinstance(values["trial"], bool):
-        raise ValueError("delegated trial permission must be boolean")
     effort = values["effort"]
     profile = current_reasoning_effort_profile()
     if effort is not None:
@@ -4136,10 +4111,6 @@ def delegated_turn_settings(credentials) -> TurnThinkingSettings:
     config = current_config()
     provider = config.chat_provider
     provider.validate_thinking(config.model, effort, values["mode"], values["budget"], values["retention"])
-    for name in ["mode", "budget"]:
-        value = values[name]
-        if value is not None and provider.thinking_control_status(config.model, name, value) == "trial" and not values["trial"]:
-            raise ValueError("delegated unverified controls require the parent's one-turn request")
     raw_capabilities = envelope["capabilities"]
     capabilities = (modelsdev.ReasoningCapabilities.from_dict(raw_capabilities)
                     if raw_capabilities is not None else None)
@@ -4149,8 +4120,7 @@ def delegated_turn_settings(credentials) -> TurnThinkingSettings:
         config, reasoning_capabilities=capabilities,
         chat_provider=replace(provider, reasoning_field=capabilities.interleaved_field if capabilities else None)))
     return TurnThinkingSettings(
-        effort=effort, mode=values["mode"], budget=values["budget"], retention=values["retention"], traces="off",
-        trial={"connection": envelope["connection"], "values": {}} if values["trial"] else None)
+        effort=effort, mode=values["mode"], budget=values["budget"], retention=values["retention"], traces="off")
 
 
 def _subagent_credential_refs():
@@ -6134,7 +6104,6 @@ def new_chat_log(filename):
     session.thinking_budget = None
     session.reasoning_retention = "default"
     session.reasoning_traces = "off"
-    session.thinking_request = None
     dirname = os.path.dirname(filename)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -6248,7 +6217,6 @@ def load_session_state(state: dict, *, apply_shell_cwd=True):
     session.reasoning_retention = retention
     session.thinking_mode = mode
     session.thinking_budget = budget
-    session.thinking_request = None
     if not apply_shell_cwd:
         # An explicit launch working directory outranks state restored from a
         # file; the caller decides that precedence, and this function must not

@@ -42,22 +42,19 @@ class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.assertEqual(self.session.thinking_mode, "manual")
 
-    async def test_local_commands_do_not_consume_trials_or_enter_transcript(self):
+    async def test_local_commands_do_not_enter_transcript(self):
         self.session.runtime_config = loki.make_runtime_config(
             "https://relay.example/v1/messages", protocols.ANTHROPIC_MESSAGES, model="custom")
         loki.thinking_command("mode adaptive")
-        pending = self.session.thinking_request
         messages = []
         worker = self.worker(messages.append)
         for text in ["/trace thinking on", "/thinking", "/thinking on", "/trace thinking wrong"]:
             await worker.handle({"id": 1, "method": "session/prompt", "params": {
                 "prompt": [{"type": "text", "text": text}]}}, concurrent=True)
             await worker._prompt_task
-            self.assertIs(self.session.thinking_request, pending)
         self.assertEqual(self.session.transcript_items, [])
         with self.assertRaises(acp_worker.acps.TransportError):
             await worker.prompt({"prompt": [{"type": "text", "text": 1}]})
-        self.assertIs(self.session.thinking_request, pending)
 
     async def test_acp_snapshot_is_captured_before_scheduling_and_not_mutated(self):
         loki.thinking_command("mode manual budget 2048")

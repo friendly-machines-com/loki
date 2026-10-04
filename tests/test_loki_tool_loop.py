@@ -7239,9 +7239,9 @@ class ThinkingControlsTests(unittest.TestCase):
             reasoning_effort_profile=modelsdev.ReasoningEffortProfile(
                 ["low", "high"]))
 
-    def test_command_parser_is_atomic_and_manual_requires_budget(self):
+    def test_command_parser_is_atomic_and_fields_are_order_free(self):
         for argument in [
-                "mode manual", "mode manual budget 1023", "effort nope",
+                "effort nope",
                 "budget zero", "mode manual mode off", "effort high mode",
                 "effort high mode invented"]:
             with self.subTest(argument=argument), self.assertRaises(ValueError):
@@ -7249,25 +7249,36 @@ class ThinkingControlsTests(unittest.TestCase):
             self.assertIsNone(self.session.thinking_mode)
             self.assertIsNone(self.session.thinking_budget)
             self.assertIsNone(self.session.reasoning_effort_preference)
-        loki.thinking_command("mode manual budget 2048 effort high")
+        # A manual budget below the documented floor is a joint-state
+        # error: assignment accepts it, projection raises once.
+        loki.thinking_command("mode manual budget 1023")
+        self.assertEqual(
+            (self.session.thinking_mode, self.session.thinking_budget),
+            ("manual", 1023))
+        with self.assertRaises(ValueError):
+            loki.capture_turn_settings()
+        loki.thinking_command("budget default mode default")
+        # Manual without a budget is a legal, order-free assignment; the
+        # allowance pairs with it from any order and projection carries it.
+        loki.thinking_command("mode manual")
+        self.assertEqual(self.session.thinking_mode, "manual")
+        self.assertIsNone(self.session.thinking_budget)
+        loki.thinking_command("budget 2048 effort high")
         self.assertEqual(
             (self.session.thinking_mode, self.session.thinking_budget),
             ("manual", 2048))
         self.assertEqual(loki.effective_reasoning_effort(), "high")
 
-    def test_unverified_acceptance_is_a_one_shot_trial(self):
-        # An unlisted model has a verified spelling but unknown
-        # acceptance: requestable once, labelled, never a preference.
+    def test_unlisted_model_ride_the_normal_path(self):
+        # An unlisted model has a verified spelling; acceptance is the
+        # endpoint's to answer, in the open. No trial state exists.
         loki.reinstall_provider(model="claude-future")
         text = loki.thinking_command("mode adaptive")
-        self.assertIn("Unverified model acceptance", text)
-        self.assertIsNone(self.session.thinking_mode)
-        first = loki.capture_turn_settings()
-        self.assertEqual(first.mode, "adaptive")
-        self.assertIsNotNone(first.trial)
-        second = loki.capture_turn_settings()
-        self.assertIsNone(second.mode)
-        self.assertIsNone(second.trial)
+        self.assertNotIn("Unverified model acceptance", text)
+        self.assertEqual(self.session.thinking_mode, "adaptive")
+        captured = loki.capture_turn_settings()
+        self.assertEqual(captured.mode, "adaptive")
+        self.assertFalse(hasattr(captured, "trial"))
 
     def test_dormant_preferences_survive_and_restore(self):
         loki.thinking_command("mode manual budget 2048")

@@ -551,11 +551,12 @@ class Provider:
     def thinking_control_status(self, model, control, value):
         """Classify one requested control against the wire contract.
 
-        Returns "supported" (documented for this model) or "trial"
-        (spelling verified for the wire, model acceptance unverified).
-        Raises for verified rejections and unknown spellings: neither may
-        become request bytes. Trial policy -- explicit, labelled, one
-        turn -- belongs to the command layer, not the wire.
+        Returns "supported" when the spelling is verified for this wire
+        and the model's acceptance is documented; raises for rejections
+        the native vendor documents and for unknown spellings: neither
+        may become request bytes. Acceptance no model documents is
+        neither -- it rides the ordinary path: saved, sent, and answered
+        by the endpoint's own error in the open.
         """
         spec = self.reasoning_spec
         identity = self.reasoning_provider_id
@@ -566,16 +567,14 @@ class Provider:
                 raise ProtocolError(
                     "no verified request spelling for this thinking mode")
             # A model entry holds the documented modes; the "" entry holds
-            # vendor-wide modes; anything else is undocumented ("trial").
+            # vendor-wide modes; anything else is undocumented.
             if model in modes:
                 documented = modes[model]
             elif "" in modes:
                 documented = modes[""]
             else:
                 documented = None
-            if documented is None:
-                return "trial"
-            if value in documented:
+            if documented is None or value in documented:
                 return "supported"
             # A mode spelling the native vendor's documented contract
             # rejects for this model never becomes request bytes.
@@ -586,17 +585,17 @@ class Provider:
             if identity in ["zai", "zhipuai"] and value == "off":
                 raise ProtocolError(
                     "this native GLM model cannot disable thinking")
-            return "trial"
+            return "supported"
         if control == "budget":
             if (spec is None or spec.wire_format != "anthropic"):
                 raise ProtocolError(
                     "no verified thinking-allowance request spelling for "
                     "this connection")
             if identity != "anthropic":
-                return "trial"
+                return "supported"
             modes = _ANTHROPIC_THINKING_MODES.get(model)
             if modes is None:
-                return "trial"
+                return "supported"
             if "manual" in modes:
                 return "supported"
             raise ProtocolError(
