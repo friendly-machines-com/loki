@@ -107,12 +107,6 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
         mode_spellings={"on": "enabled", "off": "disabled"},
         effort_field="reasoning_effort",
     ),
-    "zai-coding-plan": ReasoningProviderSpec(
-        protocol=OPENAI_CHAT,
-        wire_format="thinking_toggle",
-        mode_spellings={"on": "enabled", "off": "disabled"},
-        effort_field="reasoning_effort",
-    ),
     "zhipuai": ReasoningProviderSpec(
         protocol=OPENAI_CHAT,
         wire_format="thinking_toggle",
@@ -120,12 +114,15 @@ _REASONING_SPECS: dict[str, ReasoningProviderSpec] = {
         mode_spellings={"on": "enabled", "off": "disabled"},
         effort_field="reasoning_effort",
     ),
-    "zhipuai-coding-plan": ReasoningProviderSpec(
-        protocol=OPENAI_CHAT,
-        wire_format="thinking_toggle",
-        mode_spellings={"on": "enabled", "off": "disabled"},
-        effort_field="reasoning_effort",
-    ),
+}
+
+# Coding-plan endpoints speak their vendor's wire from the same host and
+# are catalogued under their own provider label; the vendor's spec is the
+# single owner of those wire facts. This alias keeps a vendor spelling
+# change from drifting between rows.
+_CODING_PLAN_ALIASES = {
+    "zai-coding-plan": "zai",
+    "zhipuai-coding-plan": "zhipuai",
 }
 
 # Wire protocols this client can actually speak. Single source of truth:
@@ -217,8 +214,9 @@ def reasoning_provider_id(provider_id, protocol, endpoint=None):
     match its spec. Never returns an identity for a plain http endpoint.
     """
     if endpoint is None:
-        spec = _REASONING_SPECS.get(provider_id)
-        return provider_id if spec and spec.protocol == protocol else None
+        label = _CODING_PLAN_ALIASES.get(provider_id, provider_id)
+        spec = _REASONING_SPECS.get(label)
+        return label if spec and spec.protocol == protocol else None
     url = urllib.parse.urlparse(endpoint)
     if url.scheme != "https":
         return None
