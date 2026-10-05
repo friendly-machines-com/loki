@@ -14,7 +14,6 @@ import re
 import shutil
 import sys
 import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -187,32 +186,49 @@ class _SgrStreamTracker:
         return False
 
 
-def _read_with_timeout(handle, total=4.0):
-    """Drain the pty; reset the deadline on each arriving chunk."""
-    buf = b""
-    deadline = time.time() + total
-    while time.time() < deadline:
-        remaining = max(0.05, deadline - time.time())
-        chunk = handle.read(65536, min(0.2, remaining))
+def _read_until(handle, output, expected, *, start=0):
+    """Wait for newly emitted text, retaining the unmodified terminal stream."""
+    previous = _SgrStreamTracker()
+    previous.feed(bytes(output[:start]))
+    text_start = len(previous.text)
+    while True:
+        # Reparse the complete capture: a read can split any VT sequence or
+        # UTF-8 character, and this tracker is not an incremental parser.
+        tracker = _SgrStreamTracker()
+        tracker.feed(bytes(output))
+        if expected in "".join(tracker.text[text_start:]):
+            return
+        chunk = handle.read(65536)
         if not chunk:
-            if buf:
-                break  # quiesced
-            continue
-        buf += chunk
-        deadline = time.time() + 0.5
-    return buf
+            raise AssertionError(
+                f"PTY exited with {handle.wait()} before emitting {expected!r}; "
+                f"output: {bytes(output)!r}")
+        output.extend(chunk)
+
+
+def _read_to_exit(handle, output=None):
+    """Drain through terminal EOF before waiting for the process."""
+    if output is None:
+        output = bytearray()
+    while True:
+        chunk = handle.read(65536)
+        if not chunk:
+            return handle.wait(), bytes(output)
+        output.extend(chunk)
 
 
 def run_loki_pty_reply(stream: bool, stream_chunks=None,
                        queued_inputs=None, create_image=False,
                        initial_input=b"hi", reply=None,
-                       raw_file_data=None):
+                       raw_file_data=None, stream_prefix=None):
     """Run one real TUI turn; optionally pause after its first delta.
 
     Returns ``(all_output, before_stream_release)``. The second value is only
     populated for a genuine dummy-provider delta stream, and is captured while
     the provider is still blocked before producing its remaining deltas.
     """
+    if stream_chunks and (not stream or not stream_prefix):
+        raise ValueError('a gated stream requires its expected visible prefix')
     root = tempfile.mkdtemp(prefix="loki-pty-test-")
     tmpdir = os.path.join(root, "workspace")
     os.mkdir(tmpdir)
@@ -240,37 +256,116 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
         env["LOKI_DUMMY_STREAM_GATE"] = gate
     env = child_environment(**env)
     handle = None
-    collected = b""
+    collected = bytearray()
     before_stream_release = b""
     try:
         configure_container(env, tmpdir)
         handle = pty_backend.spawn_pty(
             [entrypoint("loki")], env=env, cwd=tmpdir)
-        collected += _read_with_timeout(handle, 6.0)  # startup banner
-
+        _read_until(handle, collected, 'User: ')
+        turn_start = len(collected)
         handle.write(initial_input + b"\r")
-        reply_output = _read_with_timeout(handle, 4.0)
-        collected += reply_output
         if gate:
-            before_stream_release = reply_output
+            _read_until(handle, collected, stream_prefix)
+            queued_texts = 0
             for queued_input in queued_inputs or []:
                 handle.write(queued_input.encode() + b"\r")
-                queued_output = _read_with_timeout(handle, 2.0)
-                collected += queued_output
-                before_stream_release += queued_output
+                if queued_input == '/ps':
+                    _read_until(handle, collected,
+                                'No running, starting, or failed jobs.')
+                else:
+                    queued_texts += 1
+                    _read_until(
+                        handle, collected,
+                        'turn: running, mode: normal; '
+                        f'/queue(texts: {queued_texts}, images: 0)')
+            before_stream_release = bytes(collected[turn_start:])
+            release_start = len(collected)
             pathlib.Path(gate).touch()
-            collected += _read_with_timeout(handle, 4.0)
+            # With no queued inputs, wait for the turn to end before causing
+            # a prompt redraw: split model controls must remain observable as
+            # contiguous escaped text. Queued-input tests deliberately permit
+            # concurrent redraws and use the FIFO completion below.
+            if not queued_inputs:
+                _read_until(
+                    handle, collected,
+                    'turn: idle, mode: normal; /queue(texts: 0, images: 0)',
+                    start=release_start)
 
+        # /quit uses the same FIFO as prompts and /image. It cannot overtake
+        # them, so natural exit is our completion acknowledgment.
         handle.write(b"/quit\r")
-        collected += _read_with_timeout(handle, 2.0)
+        exit_code, output = _read_to_exit(handle, collected)
+        if exit_code != 0:
+            raise AssertionError(f'loki exited with {exit_code}; output: {output!r}')
     finally:
         try:
             if handle is not None:
-                handle.terminate()
-                handle.close()
+                try:
+                    handle.terminate()
+                finally:
+                    handle.close()
         finally:
             shutil.rmtree(root, ignore_errors=True)
-    return collected, before_stream_release
+    return output, before_stream_release
+
+
+class PtyCaptureTests(unittest.TestCase):
+    def test_marker_survives_split_controls_and_utf8(self):
+        handle = mock.Mock(spec=pty_backend.PtyHandle)
+        handle.read.side_effect = [b'\x1b[3', b'2mREA', b'DY \xc3', b'\xa9\x1b[0m']
+        output = bytearray()
+        _read_until(handle, output, 'READY \u00e9')
+        self.assertEqual(bytes(output), b'\x1b[32mREADY \xc3\xa9\x1b[0m')
+        handle.wait.assert_not_called()
+
+    def test_capture_keeps_trailing_controls_and_nonzero_exit(self):
+        handle = mock.Mock(spec=pty_backend.PtyHandle)
+        handle.read.side_effect = [b'first', b'last\x1b[0m', b'']
+        handle.wait.return_value = 2
+        self.assertEqual(_read_to_exit(handle), (2, b'firstlast\x1b[0m'))
+        handle.wait.assert_called_once_with()
+
+    def test_exit_before_marker_reports_output_and_status(self):
+        handle = mock.Mock(spec=pty_backend.PtyHandle)
+        handle.read.side_effect = [b'failed startup', b'']
+        handle.wait.return_value = 2
+        with self.assertRaisesRegex(AssertionError, '2.*READY.*failed startup'):
+            _read_until(handle, bytearray(), 'READY')
+
+    def test_new_observation_does_not_reuse_an_old_marker(self):
+        handle = mock.Mock(spec=pty_backend.PtyHandle)
+        handle.read.side_effect = [b'REA', b'DY']
+        output = bytearray(b'READY')
+        _read_until(handle, output, 'READY', start=len(output))
+        self.assertEqual(bytes(output), b'READYREADY')
+        self.assertEqual(handle.read.call_count, 2)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX preserves every emitted byte')
+    def test_real_capture_drains_output_beyond_one_read_and_preserves_exit(self):
+        handle = pty_backend.spawn_pty([
+            sys.executable, str(pathlib.Path(__file__).resolve()), '--pty-child', 'capture'])
+        try:
+            output = bytearray()
+            _read_until(handle, output, 'CAPTURE_READY')
+            handle.write(b'x')
+            exit_code, captured = _read_to_exit(handle, output)
+            self.assertEqual(exit_code, 2)
+            self.assertIn(b'z' * 131072 + b'\x1b[0mCAPTURE_END', captured)
+            self.assertEqual(handle.poll(), 2)
+            self.assertEqual(handle.wait(), 2)
+        finally:
+            try:
+                handle.terminate()
+            finally:
+                handle.close()
+
+    def test_read_failure_is_not_eof(self):
+        handle = mock.Mock(spec=pty_backend.PtyHandle)
+        handle.read.side_effect = OSError('read failed')
+        with self.assertRaisesRegex(OSError, 'read failed'):
+            _read_to_exit(handle)
+        handle.wait.assert_not_called()
 
 
 class PtyFixtureTests(unittest.TestCase):
@@ -297,7 +392,8 @@ class PtyFixtureTests(unittest.TestCase):
                 with (
                     mock.patch.object(module, 'configure_container', side_effect=configure),
                     mock.patch.object(module, 'entrypoint', return_value='/installed/loki'),
-                    mock.patch.object(module, '_read_with_timeout', return_value=b''),
+                    mock.patch.object(module, '_read_until'),
+                    mock.patch.object(module, '_read_to_exit', return_value=(0, b'')),
                     mock.patch.object(pty_backend, 'spawn_pty', side_effect=spawn),
                 ):
                     if cli:
@@ -337,7 +433,7 @@ class PtyUiTests(unittest.TestCase):
         batch, _ = run_loki_pty_reply(
             stream=False, reply=f"before {attack} **boldword**")
         streamed, _ = run_loki_pty_reply(
-            stream=True,
+            stream=True, stream_prefix="before ",
             stream_chunks=[
                 "before \x1b]",
                 "777;LOKI_MODEL_ATTACK",
@@ -411,7 +507,7 @@ class PtyUiTests(unittest.TestCase):
             " and **boldword** plus `codeword` done",
         ]
         output, before_release = run_loki_pty_reply(
-            stream=True, stream_chunks=chunks)
+            stream=True, stream_chunks=chunks, stream_prefix=chunks[0])
 
         self.assertIn(b"visible before completion", before_release)
         self.assertNotIn(b"boldword", before_release)
@@ -422,6 +518,7 @@ class PtyUiTests(unittest.TestCase):
         output, before_release = run_loki_pty_reply(
             stream=True,
             stream_chunks=["blocked prefix", " completed"],
+            stream_prefix="blocked prefix",
             queued_inputs=["second", "third"],
         )
 
@@ -443,7 +540,7 @@ class PtyUiTests(unittest.TestCase):
     def test_ps_result_is_visible_during_stream_without_joining_prompt_queue(self):
         output, before_release = run_loki_pty_reply(
             stream=True, stream_chunks=["partial **bold", "word** and `codeword` done"],
-            queued_inputs=["second", "/ps"])
+            stream_prefix="partial ", queued_inputs=["second", "/ps"])
         # An echoed /ps is not proof of execution: its actual local result
         # must appear while the real frontend's provider is still blocked.
         self.assertIn(b"No running, starting, or failed jobs.", before_release)
@@ -462,6 +559,7 @@ class PtyUiTests(unittest.TestCase):
         output, before_release = run_loki_pty_reply(
             stream=True,
             stream_chunks=["blocked prefix", " completed"],
+            stream_prefix="blocked prefix",
             queued_inputs=["/image image.png"],
             create_image=True,
         )
@@ -485,7 +583,8 @@ class PtyUiTests(unittest.TestCase):
                            "**boldword** and `codeword` done"]
                           if stream else None)
                 output, _before_release = run_loki_pty_reply(
-                    stream=stream, stream_chunks=chunks)
+                    stream=stream, stream_chunks=chunks,
+                    stream_prefix=chunks[0] if chunks else None)
 
                 tracker = _SgrStreamTracker()
                 tracker.feed(output)
@@ -529,25 +628,13 @@ class PtyCliUsageTests(unittest.TestCase):
         configure_container(env, workspace)
         handle = pty_backend.spawn_pty(
             [entrypoint("loki"), *cli_args], env=env, cwd=workspace)
-        output = b""
-        exit_code = None
         try:
-            output = _read_with_timeout(handle, 4.0)
-            # Bounded wait: a usage-path regression that waits for input
-            # instead of exiting must FAIL the test, not hang the suite.
-            for _ in range(50):  # up to 5s
-                exit_code = handle.poll()
-                if exit_code is not None:
-                    break
-                time.sleep(0.1)
+            return _read_to_exit(handle)
         finally:
-            handle.terminate()
-            handle.close()
-        if exit_code is None:
-            self.fail(
-                f"loki{tuple(cli_args)!r} never exited on the usage path; "
-                f"output captured: {output!r}")
-        return exit_code, output
+            try:
+                handle.terminate()
+            finally:
+                handle.close()
 
     def _assert_usage_exits_before_overlay(self, cli_args, expected_exit):
         # The usage path must return before initialize_terminal_overlay, so it
@@ -631,6 +718,18 @@ def _pty_child(argv):
         return (native._console_mode(native._handle(0)), native._GetConsoleCP(),
                 native._console_mode(native._GetStdHandle(native.STD_OUTPUT_HANDLE)))
 
+    if mode == 'capture':
+        async def capture():
+            with _terminals.TerminalMode(0, enabled=True):
+                async with _terminals.AsyncKeyReader(0) as reader:
+                    print('CAPTURE_READY', flush=True)
+                    event = await reader.read_key()
+                    assert event.kind == 'TEXT' and event.text == 'x', event
+            sys.stdout.buffer.write(b'z' * 131072 + b'\x1b[0mCAPTURE_END\n')
+            sys.stdout.buffer.flush()
+        asyncio.run(capture())
+        return 2
+
     if mode == 'control-settings':
         async def read_controls():
             before = terminal_state()
@@ -648,7 +747,7 @@ def _pty_child(argv):
                 with _terminals.TerminalMode(0, enabled=True):
                     async with reader:
                         print('CONTROL_READY', flush=True)
-                        events = [await asyncio.wait_for(reader.read_key(), 5) for _ in range(3)]
+                        events = [await reader.read_key() for _ in range(3)]
                         assert [event.kind for event in events] == ['BACKSPACE', 'BACKSPACE_WORD', 'CTRL_C'], events
                         assert reader.cancel_requested and reader.cancel_event.is_set()
             finally:
@@ -697,24 +796,18 @@ def _pty_child(argv):
                 with _terminals.TerminalMode(0, enabled=True):
                     async with reader:
                         print('RESIZE_READY', flush=True)
-                        event = await asyncio.wait_for(reader.read_key(), 5)
+                        event = await reader.read_key()
                         assert event.kind == 'RESIZE', event
                         size = os.get_terminal_size(1)
                         assert size == (100, 35), size
-                        try:
-                            event = await asyncio.wait_for(reader.read_key(), 0.35)
-                        except asyncio.TimeoutError:
-                            pass
-                        else:
-                            raise AssertionError(f'unexpected event at unchanged size: {event}')
-                        print('RESIZE_STABLE', flush=True)
+                        print('RESIZE_RECEIVED', flush=True)
                         stable.set()
                         if mode == 'resize-cancel':
                             await asyncio.Future()
 
             task = asyncio.create_task(watch())
             if mode == 'resize-cancel':
-                await asyncio.wait_for(stable.wait(), 6)
+                await stable.wait()
                 task.cancel()
                 try:
                     await task
@@ -724,9 +817,15 @@ def _pty_child(argv):
                 await task
             assert terminal_state() == before, 'exit changed terminal state'
             print('RESIZE_STOPPED', flush=True)
-            # Parent resizes again after STOPPED; no input thread/subscription
-            # may deliver a notification into the closed reader.
-            await asyncio.sleep(0.5)
+            # Parent resizes again, then acknowledges with Enter. A fresh
+            # reader without resize watching lets the loop run without
+            # reviving the closed reader, and decodes native newline forms.
+            acknowledgment = _terminals.AsyncKeyReader(0)
+            with _terminals.TerminalMode(0, enabled=True):
+                async with acknowledgment:
+                    event = await acknowledgment.read_key()
+                    assert event.kind == 'ENTER', event
+            assert terminal_state() == before, 'acknowledgment changed terminal settings'
             assert not reader.pending, reader.pending
             assert reader.byte_reader.queue.empty()
             print('RESIZE_QUIET', flush=True)
@@ -735,37 +834,28 @@ def _pty_child(argv):
         return 0
 
     if mode == "isig":
-        tmode = _terminals.TerminalMode(0, enabled=True)
-        tmode.__enter__()
-        sys.stdout.buffer.write(
-            b"ISIG_SET\n"
-            if _terminals.interrupt_processing_enabled(0)
-            else b"ISIG_CLEAR\n")
-        sys.stdout.buffer.flush()
-        tmode.__exit__(None, None, None)
+        with _terminals.TerminalMode(0, enabled=True):
+            sys.stdout.buffer.write(
+                b"ISIG_SET\n"
+                if _terminals.interrupt_processing_enabled(0)
+                else b"ISIG_CLEAR\n")
+            sys.stdout.buffer.flush()
         sys.stdout.buffer.write(
             b"RESTORED_ISIG_SET\n"
             if _terminals.interrupt_processing_enabled(0)
             else b"RESTORED_ISIG_CLEAR\n")
         sys.stdout.buffer.flush()
-        time.sleep(0.5)
         return 0
 
     async def read_cancel(clear_event):
-        tmode = _terminals.TerminalMode(0, enabled=True)
-        tmode.__enter__()
         reader = _terminals.AsyncKeyReader(0)
-        key_kind = None
-        async with reader:
-            if clear_event:
-                reader.cancel_event.clear()
-            try:
-                key = await asyncio.wait_for(reader.read_key(), timeout=3.0)
-                key_kind = key.kind
-            except asyncio.TimeoutError:
-                pass
-        tmode.__exit__(None, None, None)
-        return reader, key_kind
+        with _terminals.TerminalMode(0, enabled=True):
+            async with reader:
+                if clear_event:
+                    reader.cancel_event.clear()
+                print('READER_READY', flush=True)
+                key = await reader.read_key()
+        return reader, key.kind
 
     if mode == "cancel-flag":
         async def main():
@@ -775,11 +865,7 @@ def _pty_child(argv):
             else:
                 sys.stdout.buffer.write(
                     f"CANCEL_NOT_SET key={key_kind}\n".encode())
-            sys.stdout.buffer.write(
-                b"CANCEL_SET\n" if reader.cancel_requested
-                else b"CANCEL_NOT_SET\n")
             sys.stdout.buffer.flush()
-            time.sleep(0.3)
         asyncio.run(main())
         return 0
 
@@ -791,7 +877,6 @@ def _pty_child(argv):
             else:
                 sys.stdout.buffer.write(b"EVENT_NOT_SET\n")
             sys.stdout.buffer.flush()
-            time.sleep(0.2)
         asyncio.run(main())
         return 0
 
@@ -800,11 +885,9 @@ def _pty_child(argv):
 
 class PtyResourceTests(unittest.TestCase):
     def read_marker(self, handle, output, marker):
-        deadline = time.monotonic() + 7
-        while marker not in output and time.monotonic() < deadline:
-            output += handle.read(4096, timeout=0.1)
-        self.assertIn(marker, output, output.decode(errors='replace'))
-        return output
+        captured = bytearray(output)
+        _read_until(handle, captured, marker.decode())
+        return bytes(captured)
 
     def test_native_control_settings_drive_reader_actions(self):
         handle = pty_backend.spawn_pty([
@@ -814,11 +897,14 @@ class PtyResourceTests(unittest.TestCase):
             # POSIX has configurable control characters; the Windows console
             # uses its actual defaults. Both must drive the same reader actions.
             handle.write(b'\x15\x16\x18' if os.name == 'posix' else b'\x08\x17\x03')
-            self.read_marker(handle, output, b'CONTROL_ACTIONS_OK')
+            output = self.read_marker(handle, output, b'CONTROL_ACTIONS_OK')
+            exit_code, output = _read_to_exit(handle, bytearray(output))
+            self.assertEqual(exit_code, 0, output)
         finally:
-            if handle.poll() is None:
+            try:
                 handle.terminate()
-            handle.close()
+            finally:
+                handle.close()
 
     def test_native_resize_and_shutdown_without_keyboard_input(self):
         for mode in ('resize', 'resize-cancel'):
@@ -829,24 +915,31 @@ class PtyResourceTests(unittest.TestCase):
                     output = self.read_marker(handle, b'', b'RESIZE_READY')
                     handle.set_size(100, 35)
                     output = self.read_marker(handle, output, b'RESIZE_STOPPED')
-                    self.assertIn(b'RESIZE_STABLE', output)
+                    self.assertIn(b'RESIZE_RECEIVED', output)
                     handle.set_size(110, 40)
+                    handle.write(b'\r')
                     output = self.read_marker(handle, output, b'RESIZE_QUIET')
+                    exit_code, output = _read_to_exit(handle, bytearray(output))
+                    self.assertEqual(exit_code, 0, output)
                     self.assertNotIn(b'Traceback', output)
                 finally:
-                    if handle.poll() is None:
+                    try:
                         handle.terminate()
-                    handle.close()
+                    finally:
+                        handle.close()
 
     def test_failed_mode_entry_restores_real_terminal_settings(self):
         handle = pty_backend.spawn_pty([
             sys.executable, str(pathlib.Path(__file__).resolve()), '--pty-child', 'mode-rollback'])
         try:
-            self.read_marker(handle, b'', b'ROLLBACK_RESTORED')
+            output = self.read_marker(handle, b'', b'ROLLBACK_RESTORED')
+            exit_code, output = _read_to_exit(handle, bytearray(output))
+            self.assertEqual(exit_code, 0, output)
         finally:
-            if handle.poll() is None:
+            try:
                 handle.terminate()
-            handle.close()
+            finally:
+                handle.close()
 
 
 class PtyCtrlCTests(unittest.TestCase):
@@ -868,10 +961,13 @@ class PtyCtrlCTests(unittest.TestCase):
         # Direct: enter TerminalMode on a fresh pty and inspect the flag.
         handle = self._spawn_child("isig")
         try:
-            out = _read_with_timeout(handle, 4.0)
+            exit_code, out = _read_to_exit(handle)
+            self.assertEqual(exit_code, 0, out)
         finally:
-            handle.terminate()
-            handle.close()
+            try:
+                handle.terminate()
+            finally:
+                handle.close()
         self.assertIn(b"ISIG_CLEAR", out)
         self.assertNotIn(b"ISIG_SET\n", out.replace(b"ISIG_CLEAR", b""))
         self.assertIn(b"RESTORED_ISIG_SET", out)
@@ -881,12 +977,16 @@ class PtyCtrlCTests(unittest.TestCase):
         # seen by AsyncKeyReader as CTRL_C and sets cancel_requested.
         handle = self._spawn_child("cancel-flag")
         try:
-            _read_with_timeout(handle, 1.0)  # let child reach its wait
+            output = bytearray()
+            _read_until(handle, output, 'READER_READY')
             handle.write(b"\x03")
-            out = _read_with_timeout(handle, 4.0)
+            exit_code, out = _read_to_exit(handle, output)
+            self.assertEqual(exit_code, 0, out)
         finally:
-            handle.terminate()
-            handle.close()
+            try:
+                handle.terminate()
+            finally:
+                handle.close()
         self.assertIn(b"CANCEL_SET", out)
         self.assertNotIn(b"CANCEL_NOT_SET", out)
 
@@ -904,12 +1004,16 @@ class PtyTurnCancelTests(unittest.TestCase):
             [sys.executable, str(pathlib.Path(__file__).resolve()),
              "--pty-child", "cancel-event"])
         try:
-            _read_with_timeout(handle, 1.0)
+            output = bytearray()
+            _read_until(handle, output, 'READER_READY')
             handle.write(b"\x03")
-            out = _read_with_timeout(handle, 4.0)
+            exit_code, out = _read_to_exit(handle, output)
+            self.assertEqual(exit_code, 0, out)
         finally:
-            handle.terminate()
-            handle.close()
+            try:
+                handle.terminate()
+            finally:
+                handle.close()
         self.assertIn(b"EVENT_SET", out)
         self.assertNotIn(b"EVENT_NOT_SET", out)
 

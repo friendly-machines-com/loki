@@ -784,6 +784,7 @@ class FileFlags(enum.IntFlag):
 ERROR_FILE_NOT_FOUND = 2
 ERROR_PATH_NOT_FOUND = 3
 ERROR_ACCESS_DENIED = 5
+ERROR_BROKEN_PIPE = 109
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
@@ -1027,20 +1028,33 @@ def pseudoconsole_resize(hpc, cols, rows) -> None:
 
 
 def pseudoconsole_close(hpc) -> None:
-    """Close the pseudoconsole.  The attached client must have exited first."""
+    """Free HPCON after the caller has drained or closed its output pipe."""
     bind("kernel32", "ClosePseudoConsole", None, ctypes.c_void_p)(hpc)
 
 
-def peek_named_pipe(handle) -> int:
-    """Bytes available to read on ``handle`` without consuming them, or 0."""
-    peek = bind("kernel32", "PeekNamedPipe", wintypes.BOOL,
-                ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
-                ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
-                ctypes.POINTER(wintypes.DWORD))
-    available = wintypes.DWORD()
-    if not peek(handle, None, 0, None, ctypes.byref(available), None):
-        return 0
-    return available.value
+def pseudoconsole_release(hpc) -> None:
+    """Let the session end when its last client disconnects; retain HPCON.
+
+    The PTY test harness requires Windows 11 24H2 / Server 2025 for this
+    operation. Retaining the session reference while waiting for pipe EOF
+    would keep ConPTY alive indefinitely, even after all clients exit.
+    """
+    try:
+        release = bind("kernel32", "ReleasePseudoConsole", ctypes.c_long,
+                       ctypes.c_void_p)
+    except AttributeError as error:
+        raise WindowsUnavailableError(
+            "PTY tests require ReleasePseudoConsole "
+            "(Windows 11 24H2 / Server 2025)") from error
+    status = release(hpc)
+    if status < 0:
+        raise WindowsApiError(
+            "ReleasePseudoConsole failed", status=status & 0xffffffff)
+
+
+WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 258
+INFINITE = 0xffffffff
 
 
 def wait_for_single_object(handle, milliseconds: int) -> int:

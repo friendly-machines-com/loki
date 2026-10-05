@@ -40,9 +40,8 @@ import threading
 from ctypes import wintypes
 
 from . import windows_api
+from .windows_api import INFINITE, WAIT_OBJECT_0
 
-INFINITE = 0xFFFFFFFF
-WAIT_OBJECT_0 = 0
 FILE_TYPE_PIPE = 3
 
 

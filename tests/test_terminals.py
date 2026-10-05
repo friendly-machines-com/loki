@@ -2,6 +2,7 @@ import asyncio
 import ast
 import contextlib
 import io
+import os
 import pathlib
 import sys
 import unittest
@@ -765,6 +766,41 @@ class AsyncKeyReaderTests(unittest.TestCase):
 
         self.assertEqual(event, terminals.KeyEvent("EOF"))
 
+    def test_resize_poll_does_not_deliver_unchanged_size(self):
+        reader = terminals.AsyncKeyReader(fd=0, watch_resize=True, output_fd=1)
+        reader.loop = mock.Mock()
+        reader._watching_resize = True
+        reader._resize_size = os.terminal_size([100, 35])
+        with mock.patch.object(terminals.os, 'get_terminal_size',
+                               return_value=reader._resize_size):
+            reader._poll_resize()
+            reader._poll_resize()
+        self.assertFalse(reader.pending)
+        self.assertTrue(reader.byte_reader.queue.empty())
+        reader._stop_resize_watch()
+
+    def test_late_resize_callbacks_cannot_deliver_after_shutdown(self):
+        async def scenario():
+            reader = terminals.AsyncKeyReader(fd=0, watch_resize=True, output_fd=1)
+            loop = mock.Mock()
+            timer = mock.Mock()
+            reader.loop = loop
+            reader._watching_resize = True
+            reader._resize_timer = timer
+            reader._resize_registered = os.name == 'posix'
+            signal_callback = reader._on_resize
+            poll_callback = reader._poll_resize
+            await reader.__aexit__(None, None, None)
+            timer.cancel.assert_called_once_with()
+            if os.name == 'posix':
+                loop.remove_signal_handler.assert_called_once_with(terminals.signal.SIGWINCH)
+            signal_callback()
+            poll_callback()
+            self.assertFalse(reader.pending)
+            self.assertTrue(reader.byte_reader.queue.empty())
+            loop.call_later.assert_not_called()
+        asyncio.run(scenario())
+
     def test_resize_wakeup_is_not_mistaken_for_eof(self):
         class WakeByteReader:
             def __init__(self):
@@ -779,7 +815,7 @@ class AsyncKeyReaderTests(unittest.TestCase):
             # This test isolates wakeup decoding, not watcher registration.
             reader._watching_resize = True
             reader._on_resize()
-            resize = await asyncio.wait_for(reader.read_key(), 1)
+            resize = await reader.read_key()
             reader.byte_reader.queue.put_nowait(b"x")
             text = await reader.read_key()
             return resize, text

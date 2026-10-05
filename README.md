@@ -27,7 +27,12 @@ Supports Anthropic and OpenAI protocols.
 ## How to run
 
 On POSIX, requires Python 3.11.10 or later (on the 3.12 branch, 3.12.4 or
-later). On Windows, requires Python 3.12.4 or later.
+later).
+
+On Windows, requires Python 3.12.4 or later and one of:
+
+* Windows 11 24H2 (build 26100) or later (desktop apps only).
+* Windows Server 2025 (build 26100) or later.
 
 Run it in a VM or container.
 
