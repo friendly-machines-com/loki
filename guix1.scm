@@ -31,8 +31,7 @@
                               (not (string-suffix? ".scm" file))))))
   (build-system pyproject-build-system)
   (arguments
-   (list #:tests? #f ; unittest suite wants credentials/network; run separately
-         #:phases
+   (list #:phases
          #~(modify-phases %standard-phases
              (add-after 'unpack 'set-executable-paths
                (lambda* (#:key inputs #:allow-other-keys)
