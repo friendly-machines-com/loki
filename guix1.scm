@@ -44,6 +44,9 @@
                     (string-append "BASH = \""
                                    (search-input-file inputs "/bin/bash")
                                    "\"")))))
+             (replace 'check
+               (lambda _
+                 (invoke "python3" "run_tests.py")))
              ;; flit_core only ships the Python package; the desktop entry is
              ;; installed from the source tree.
              (add-after 'install 'install-desktop-file
