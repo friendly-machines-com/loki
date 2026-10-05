@@ -3199,6 +3199,19 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             source_key = loki._file_key(str(source))
 
             async def spawn(*args, **kwargs):
+                if args[0] == 'test-search-program':
+                    # Supply only this workflow's external search response;
+                    # tool dispatch, result formatting and child cleanup stay real.
+                    self.assertEqual(list(args[1:4]), [
+                        '--color=never', '--with-filename', '--line-number'])
+                    self.assertEqual(args[4], '--')
+                    self.assertIn(args[5], ['marker', 'notes'])
+                    args = [sys.executable, '-c',
+                            'import pathlib,sys\n'
+                            'path=sys.argv[2]\n'
+                            'for number,line in enumerate(pathlib.Path(path).read_text().splitlines(),1):\n'
+                            ' if sys.argv[1] in line: print(f"{path}:{number}:{line}")\n',
+                            *args[5:]]
                 child = await real_spawn(*args, **kwargs)
                 children.append(child)
 
@@ -3404,6 +3417,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(loki, 'file_state', {}), \
                     mock.patch.object(loki, 'dispatch_tool_async', new=dispatch), \
                     mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn), \
+                    mock.patch.object(loki, '_find_rg_binary', return_value='test-search-program'), \
                     mock.patch.object(http_client, 'async_http_request', new=request), \
                     contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
                 loki.apply_runtime_config(provider_config('A', protocols.OPENAI_RESPONSES))

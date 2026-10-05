@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
 import tempfile
 import unittest
@@ -13,7 +12,6 @@ from loki_agent.sessions import Session
 
 
 class GlobTests(unittest.TestCase):
-    @unittest.skipUnless(shutil.which('rg'), 'ripgrep required')
     def test_advertised_options_discover_read_and_reap_real_jobs(self):
         definition = next(tool['function'] for tool in loki.TOOLS
                           if tool['function']['name'] == 'Glob')
@@ -62,6 +60,35 @@ class GlobTests(unittest.TestCase):
                     order = list(contents)
                     expected.sort(key=order.index, reverse=True)
 
+                    run_exec = manager.run_exec
+
+                    async def external_search(argv, **kwargs):
+                        # Assert Loki's search request, then supply fixture paths
+                        # through a real child. Do not test ripgrep's own traversal.
+                        pattern, search_root = argv[-2:]
+                        flags = ['--hidden'] if hidden else []
+                        if no_ignore:
+                            flags.append('--no-ignore')
+                        self.assertEqual(argv, [
+                            'test-search-program', '--files', '--color=never',
+                            *flags, '--glob', pattern, search_root])
+                        if pattern == '*.txt':
+                            matches = [str(workspace / name) for name in reversed(expected)]
+                        elif pattern == '.loki/**/*':
+                            matches = ([str(workspace / '.loki/chats/artifact.txt'),
+                                        str(workspace / '.loki/chats/chat.json')]
+                                       if hidden and no_ignore else [])
+                        elif pattern == '*.json':
+                            matches = [str(Path(search_root) / 'chat.json')]
+                        else:
+                            self.assertEqual(pattern, 'chat-*.json')
+                            matches = []
+                        return await run_exec([
+                            sys.executable, '-c',
+                            'import sys; sys.stdout.write(sys.argv[1]); '
+                            'sys.exit(0 if sys.argv[1] else 1)',
+                            '\n'.join(matches)], **kwargs)
+
                     def search(pattern, path=workspace):
                         arguments = {'pattern': pattern, 'path': str(path),
                                      **options}
@@ -70,10 +97,11 @@ class GlobTests(unittest.TestCase):
                                 arguments, {'cancel_event': asyncio.Event()}))
                         return loki._handle_glob(arguments)
 
-                    with mock.patch.object(loki, '_DEFAULT_SESSION', session):
-                        # A positive glob can override ignore/hidden rules
-                        # for matching files. Test directory traversal with a
-                        # leaf-only glob that does not whitelist directories.
+                    with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                            mock.patch.object(loki, '_find_rg_binary', return_value='test-search-program'), \
+                            mock.patch.object(manager, 'run_exec', external_search):
+                        # Fixture responses exercise option forwarding, ordering
+                        # and Read without depending on an installed search tool.
                         result = search('*.txt')
                         lines = result.splitlines()
                         self.assertEqual(lines[1:4], [
@@ -87,8 +115,7 @@ class GlobTests(unittest.TestCase):
                             for line in contents[name].splitlines():
                                 self.assertIn(line, observed)
 
-                        # Explicit slash patterns still require both switches;
-                        # explicitly naming the hidden root does not.
+                        # Exercise empty results and explicit-root requests too.
                         chat = workspace / '.loki' / 'chats' / 'chat.json'
                         slash = search('.loki/**/*')
                         if hidden and no_ignore:
@@ -118,7 +145,6 @@ class GlobTests(unittest.TestCase):
                         if os.name == 'posix':
                             self.assertTrue(job.process._transport.is_closing())
 
-    @unittest.skipUnless(shutil.which('rg'), 'ripgrep required')
     def test_cancel_reaches_a_running_search_and_reaps_its_child(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = loki.JobManager(str(Path(directory) / 'jobs'))
@@ -137,7 +163,8 @@ class GlobTests(unittest.TestCase):
                         "import time; print('search-ready'); time.sleep(30)"],
                         **kwargs)
 
-                with mock.patch.object(manager, 'run_exec', gated_search):
+                with mock.patch.object(manager, 'run_exec', gated_search), \
+                        mock.patch.object(loki, '_find_rg_binary', return_value='test-search-program'):
                     search = asyncio.create_task(loki._handle_glob_async(
                         {'pattern': '*.txt', 'path': directory},
                         {'cancel_event': cancel}))
