@@ -15,6 +15,8 @@ import types
 import unittest
 from unittest import mock
 
+from settings_fixtures import setUpModule  # noqa: F401 - unittest hook
+
 from loki_agent import formats, loki, terminal_frontend, terminals
 from loki_agent.provider_controls import ControlAction, ControlResult
 from loki_agent.response_headers import Store

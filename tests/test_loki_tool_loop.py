@@ -15,7 +15,8 @@ import types
 import unittest
 from unittest import mock
 from loki_entrypoints import child_environment, configure_container, entrypoint
-from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
+from response_header_fixtures import setUpModule as set_up_response_headers
+from settings_fixtures import setUpModule as set_up_default_settings
 
 
 from loki_agent import formats
@@ -38,6 +39,11 @@ from loki_endpoints import assume_endpoints_approved
 
 
 _MISSING = object()
+
+
+def setUpModule():
+    set_up_response_headers()
+    set_up_default_settings()
 
 
 def _codex_model(slug="gpt-5-codex", **overrides):
@@ -1875,7 +1881,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self._workflow("credentialless")
 
     async def _workflow(self, variant):
-        from loki_agent import acp_worker, endpoint_pins, settings
+        from loki_agent import acp_worker, endpoint_pins
         from test_endpoint_pins import _StateDir
         from test_models_dev import DATA
 
@@ -2109,8 +2115,6 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with _StateDir() as state_directory, mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                 mock.patch.object(loki, "CREDENTIALS", owner.inventory), \
                 mock.patch.object(asyncio, "open_connection", side_effect=connect), \
-                mock.patch.object(settings.paths, 'loki_config_dir',
-                                  return_value=str(root / 'config' / 'loki')), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             # An explicit endpoint leases only LOKI_API_KEY, never a generic SDK key.
             env = {**values, "LOKI_API_BASE": "https://api.deepseek.com/anthropic",
@@ -4160,7 +4164,6 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
     async def test_generated_chats_pick_render_resume_and_continue(self):
         from datetime import datetime
-        from loki_agent import settings
         import uuid
 
         for selected_index in (2, 3):
@@ -4280,8 +4283,6 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     rendered.append(output.getvalue()[start:])
 
                 with mock.patch.object(loki, 'CHAT_LOG_DIR', str(chat_dir)), \
-                        mock.patch.object(settings.paths, 'loki_config_dir',
-                                          return_value=str(root / 'config' / 'loki')), \
                         mock.patch.object(loki, 'CREDENTIALS', store), \
                         mock.patch.object(loki, 'file_state', {}), \
                         mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', loki.tool_runtime.ToolHookPipeline()), \
