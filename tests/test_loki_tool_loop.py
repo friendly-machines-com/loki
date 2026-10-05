@@ -3417,7 +3417,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(loki, 'file_state', {}), \
                     mock.patch.object(loki, 'dispatch_tool_async', new=dispatch), \
                     mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn), \
-                    mock.patch.object(loki, '_find_rg_binary', return_value='test-search-program'), \
+                    mock.patch.object(loki.executables, 'RIPGREP', 'test-search-program'), \
                     mock.patch.object(http_client, 'async_http_request', new=request), \
                     contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
                 loki.apply_runtime_config(provider_config('A', protocols.OPENAI_RESPONSES))

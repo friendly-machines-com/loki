@@ -32,6 +32,7 @@ from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from pprint import pformat
 
+from . import executables
 from . import formats
 from . import host_ipc
 from . import private_files
@@ -2086,6 +2087,7 @@ class JobManager:
                 if shell:
                     proc = await asyncio.create_subprocess_shell(
                         spawn_command,
+                        executable=executables.BASH,
                         stdin=subprocess.DEVNULL,
                         stdout=stdout_file,
                         stderr=stderr_file,
@@ -2771,7 +2773,7 @@ async def run_glob_async(
         hidden: bool = False, no_ignore: bool = False) -> str:
     if not pattern:
         return "Error: pattern is required"
-    rg = _find_rg_binary()
+    rg = executables.RIPGREP
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
     root = _resolve_path(path) if path else current_cwd()
@@ -2826,10 +2828,6 @@ async def run_glob_async(
     ])
 
 
-def _find_rg_binary() -> str | None:
-    return shutil.which('rg')
-
-
 def _parse_nonnegative_int(value, name: str, default: int = None) -> tuple[int | None, str | None]:
     if value is None:
         return default, None
@@ -2861,7 +2859,7 @@ async def run_grep_async(pattern: str, path: str = None, glob: str = None,
         return "Error: pattern is required"
     if output_mode not in ['content', 'files_with_matches', 'count']:
         return f"Error: invalid output_mode {output_mode!r}"
-    rg = _find_rg_binary()
+    rg = executables.RIPGREP
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
     root = _resolve_path(path) if path else current_cwd()
