@@ -11,6 +11,12 @@ with the package, so anything vulture reports beyond this list is dead.
 # Kept APIs: batch and plain-text renderers used as independent oracles.
 render_markdown
 status_text
+# Settings write facade documented in README.md and exercised by test_settings
+# and presentation tests; frontends currently only load preferences.
+update_user_settings
+
+# ConfigParser calls this assigned transform while parsing and writing keys.
+_.optionxform
 
 # Windows constants tested against the native API; ctypes reads these fields.
 PROCESS_QUERY_LIMITED_INFORMATION
@@ -57,6 +63,10 @@ _.RootDirectory
 _.FileNameLength
 
 # Test seams: production never reads these; the tests exercise them.
+# ACP publication/cleanup assertions inspect Front's active workers.
+_.workers
+# The PTY resize test calls the platform backend through this shared interface.
+_.set_size
 _.credential_broker
 _.from_fd
 _.lock_path

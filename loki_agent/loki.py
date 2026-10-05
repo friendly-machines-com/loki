@@ -2539,12 +2539,6 @@ class JobManager:
                 f"(pgid={job.pgid}).")
 
 
-def run_bash(command: str, timeout: int = None, description: str = "",
-             run_in_background: bool = False) -> str:
-    return asyncio.run(run_bash_async(command, timeout, description,
-                                      run_in_background))
-
-
 async def run_bash_async(command: str, timeout: int = None, description: str = "",
                          run_in_background: bool = False,
                          cancel_event: asyncio.Event | None = None,
