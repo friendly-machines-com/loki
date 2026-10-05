@@ -49,9 +49,12 @@
                  ;; The Guix builder inherits SIGINT ignored, and an ignored
                  ;; disposition survives exec. That isn't the correct
                  ;; environment that loki would run in in production.
-                 ;; Undo the SSGINT ignore here.
-                 (sigaction SIGINT 0)
-                 (invoke "python3" "run_tests.py")))
+                 ;; Undo the SIGINT ignore here.
+                 (invoke "python3" "-c" (string-append
+                       "import os,signal,sys;"
+                       "signal.signal(signal.SIGINT,signal.SIG_DFL);"
+                       "os.execv(sys.executable,"
+                       " [sys.executable,'run_tests.py'])"))))
              ;; flit_core only ships the Python package; the desktop entry is
              ;; installed from the source tree.
              (add-after 'install 'install-desktop-file
