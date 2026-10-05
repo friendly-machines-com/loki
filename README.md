@@ -152,12 +152,13 @@ Terminal preferences are read from the optional `~/.config/loki/settings.ini`
 (or `$XDG_CONFIG_HOME/loki/settings.ini`). No file is needed: every preference
 has a built-in default, and startup never creates or rewrites the file.
 
-Bash stdout is hidden from automatic terminal tool-result display by default.
-To show it, add:
+Bash stdout and Read file contents are hidden from automatic terminal tool-result
+display by default. To show either, add its setting:
 
 ```ini
 [terminal]
 show_bash_stdout = true
+show_read_stdout = true
 ```
 
 Restart the terminal session after editing the file. Stderr, status, and tool
@@ -168,7 +169,9 @@ preference, not redaction, and it does not change ACP output.
 
 New saved results retain stream identity for terminal replay. Older combined
 Bash results cannot be reliably split and show a notice when stdout is hidden;
-enable the setting to display those older results in full.
+enable the setting to display those older results in full. Older Read results
+also show a notice when hidden (errors remain visible). New Read results keep
+errors, empty/binary/image notices, and tool notes visible in both views.
 
 Application code reads and updates preferences through `loki_agent.settings`,
 not through frontend file parsing. Explicit updates preserve unrelated INI

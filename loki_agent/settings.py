@@ -28,6 +28,7 @@ from . import file_locks, paths, private_files
 @dataclass(frozen=True)
 class TerminalSettings:
     show_bash_stdout: bool = False
+    show_read_stdout: bool = False
 
 
 @dataclass(frozen=True)

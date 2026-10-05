@@ -2596,7 +2596,7 @@ def run_job_stop(job_id: str, force: bool = False) -> str:
     return current_job_manager().stop_job(job_id, force=bool(force))
 
 
-def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
+def run_read(file_path: str, offset: int = None, limit: int = None, *, structured=False):
     if not file_path:
         return "Error: file_path is required"
     file_path = _resolve_path(file_path)
@@ -2683,6 +2683,9 @@ def run_read(file_path: str, offset: int = None, limit: int = None) -> str:
             file_path, expected_stat=st))
     except OSError as error:
         return f"Error reading file snapshot: {error}"
+    if structured:
+        output = process_outputs.ProcessOutput("", rendered, "", shell=False, read=True)
+        return _tool_result(True, rendered, process_output=output.to_dict())
     return rendered
 
 
@@ -3001,8 +3004,9 @@ async def _handle_bash_async(args: dict, extra_context=None):
                                 structured=True)
 
 
-def _handle_read(args: dict) -> str:
-    return run_read(args["file_path"], offset=args.get("offset"), limit=args.get("limit"))
+def _handle_read(args: dict):
+    return run_read(args["file_path"], offset=args.get("offset"), limit=args.get("limit"),
+                    structured=True)
 
 
 def _handle_write(args: dict) -> str:
@@ -3462,11 +3466,11 @@ async def execute_tool_call_async(
     invocation, outcome = await hook_pipeline.finish(
         invocation, outcome)
     _invalidate_hook_file_state(invocation)
-    if fn_name == "Bash" and not outcome.ok and outcome.process_output is None:
-        # Rejection and launch errors contain diagnostics, not captured stdout.
-        # Preserve that distinction in replay rather than treating a new error
-        # as an older combined stream result.
-        outcome.process_output = process_outputs.ProcessOutput(outcome.content, "", "").to_dict()
+    if (fn_name == "Read" or (fn_name == "Bash" and not outcome.ok)) and outcome.process_output is None:
+        # Rejections, errors and Read notices contain diagnostics, not stdout.
+        # Preserve that distinction for terminal display and transcript replay.
+        outcome.process_output = process_outputs.ProcessOutput(
+            outcome.content, "", "", shell=fn_name == "Bash", read=fn_name == "Read").to_dict()
     outcome.content = _prepend_tool_notes(
         outcome.content, invocation.notes)
     if not outcome.executed:

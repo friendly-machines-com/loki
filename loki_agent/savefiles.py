@@ -207,11 +207,12 @@ class ResumeTranscriptRenderer:
     """
 
     def __init__(self, assistant_label: str = "Assistant", *, show_reasoning=False,
-                 show_bash_stdout=None):
+                 show_bash_stdout=None, show_read_stdout=None):
         self.assistant_label = assistant_label
         self.show_reasoning = show_reasoning
         # None preserves the canonical text used by non-terminal consumers.
         self.show_bash_stdout = show_bash_stdout
+        self.show_read_stdout = show_read_stdout
 
     def _message_label(self, item: dict):
         role = item.get("role")
@@ -276,11 +277,14 @@ class ResumeTranscriptRenderer:
         name = item.get("name") or item.get("call_id") or "<unknown>"
         label = "Tool error" if item.get("is_error") else "Tool result"
         text = formats.item_text(item).strip()
-        if self.show_bash_stdout is not None:
+        if self.show_bash_stdout is not None or self.show_read_stdout is not None:
             text = process_outputs.presentation_text(
                 text, item.get("process_output"),
-                show_bash_stdout=self.show_bash_stdout,
-                legacy_bash=name == "Bash")
+                show_bash_stdout=True if self.show_bash_stdout is None else self.show_bash_stdout,
+                show_read_stdout=True if self.show_read_stdout is None else self.show_read_stdout,
+                legacy_bash=name == "Bash" and self.show_bash_stdout is not None,
+                legacy_read=name == "Read" and self.show_read_stdout is not None
+                and not item.get("is_error"))
         block = [
             ("literal", label + ": "),
             ("program_atom", name),

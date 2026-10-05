@@ -4341,7 +4341,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                         f'User: {selected_label} request\n\n'
                         f'picker-model: prelude {selected_label}\n\n'
                         f"Tool call: 'Read'\n    file_path: '{selected_label}.txt'\n\n"
-                        f"Tool result: 'Read'\n1^Ievidence {selected_label}\n\n"
+                        "Tool result: 'Read'\n\n"
                         f'picker-model: answer {selected_label}\n----\n'])
                     logical = '\n\n'.join(
                         ''.join(text for _, text in segments)
