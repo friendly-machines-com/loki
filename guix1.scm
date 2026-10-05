@@ -8,7 +8,9 @@
              (guix build utils)
              (guix gexp)
              ((guix licenses) #:prefix license:)
-             (gnu packages python-build))
+             (gnu packages bash)
+             (gnu packages python-build)
+             (gnu packages rust-apps))
 
 (define %source-directory
   (dirname (current-filename)))
@@ -32,6 +34,17 @@
    (list #:tests? #f ; unittest suite wants credentials/network; run separately
          #:phases
          #~(modify-phases %standard-phases
+             (add-after 'unpack 'set-executable-paths
+               (lambda* (#:key inputs #:allow-other-keys)
+                 (substitute* "loki_agent/executables.py"
+                   (("RIPGREP = \"rg\"")
+                    (string-append "RIPGREP = \""
+                                   (search-input-file inputs "/bin/rg")
+                                   "\""))
+                   (("BASH = \"bash\"")
+                    (string-append "BASH = \""
+                                   (search-input-file inputs "/bin/bash")
+                                   "\"")))))
              ;; flit_core only ships the Python package; the desktop entry is
              ;; installed from the source tree.
              (add-after 'install 'install-desktop-file
@@ -41,6 +54,7 @@
                    (copy-file "loki.desktop"
                               (string-append apps "/loki.desktop"))))))))
   (native-inputs (list python-flit-core))
+  (inputs (list ripgrep bash-minimal))
   (home-page #f)
   (synopsis "Really really minimal-dependency coding agent")
   (description
