@@ -391,7 +391,7 @@ class AppContainers(NativeCalls):
 
     def launch(self, command, sid, workspace, output, observe=None,
                deadline=None, extra_handles=(), stdio=None,
-               environment=None):
+               stdin_handle=None, environment=None):
         """Run one contained child under one monotonic budget.
 
         The deadline is fixed before the observer runs--an explicit one, or
@@ -422,13 +422,18 @@ class AppContainers(NativeCalls):
                 # stderr always goes to the log.  stdin/stdout default to the
                 # null device and the log; a caller-supplied (stdin, stdout)
                 # pair replaces them and is added to the handle list, so the
-                # child's fd 0 and fd 1 are those pipe ends.
+                # child's fd 0 and fd 1 are those pipe ends.  stdin_handle
+                # replaces stdin alone, for a child whose fd 1 must stay the
+                # log while its fd 0 is something else.
                 if stdio is None:
-                    child_stdin, child_stdout, stdio_handles = (
-                        null_handle, log_handle, ())
+                    child_stdin, child_stdout = null_handle, log_handle
+                    stdio_handles = () if stdin_handle is None else (
+                        stdin_handle,)
                 else:
                     child_stdin, child_stdout = stdio
                     stdio_handles = tuple(stdio)
+                if stdin_handle is not None and stdio is not None:
+                    raise ValueError('stdin_handle and stdio overlap')
                 inherited = (log_handle, null_handle, *stdio_handles,
                              *extra_handles)
                 handles = (HANDLE * len(inherited))(*inherited)
@@ -844,6 +849,104 @@ def environment_203_probe(native, sid, workspace, output):
             record[label] = {'started': False,
                              'winerror': getattr(error, 'winerror', None)}
     return record
+
+
+def eof_stdin_child(report_path):
+    """Contained half of the noninteractive-stdin experiment.
+
+    Reads fd 0 to end of file and records what it saw, so the broker can tell
+    "the pipe ended" from "the read blocked". Nothing can write to fd 0: the
+    broker closed the write end before the launch, so this child never has an
+    input source. The report goes to the granted workspace rather than the
+    diagnostic log, so the record is the child's own file and not console
+    rendering.
+    """
+    report = {'bytes': 0, 'error': None, 'readable': False}
+    try:
+        os.fstat(0)
+        report['readable'] = True
+        data = bytearray()
+        while True:
+            chunk = os.read(0, 4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+        report['bytes'] = len(data)
+    except OSError as error:
+        report['error'] = '%s: %s' % (type(error).__name__, error)
+    Path(report_path).write_text(json.dumps(report))
+    return 0
+
+
+def nul_open_child(report_path):
+    """Negative control: can this contained process open the NUL device itself?
+
+    ``subprocess.DEVNULL`` asks the runtime to open ``os.devnull`` and hand the
+    result to a child. This records what a contained child sees when it tries
+    that open itself, which is the access decision item 4 depends on. An
+    unexpected success is recorded, not asserted, so the broker can report it.
+    """
+    report = {'opened': False, 'error': None, 'devnull': os.devnull}
+    try:
+        handle = os.open(os.devnull, os.O_RDONLY)
+    except OSError as error:
+        report['error'] = '%s: %s' % (type(error).__name__, error)
+    else:
+        report['opened'] = True
+        os.close(handle)
+    Path(report_path).write_text(json.dumps(report))
+    return 0
+
+
+def eof_stdin_probe(native, sid, workspace, output):
+    """Confirm a contained child can read EOF from a pipe as its fd 0.
+
+    ``subprocess.DEVNULL`` cannot supply noninteractive stdin here: it asks
+    the runtime to open the NUL device, which the AppContainer denies. An
+    anonymous pipe with the write end already closed delivers end of file
+    without any device, so this establishes the topology an ordinary job's
+    stdin would use -- pipe read end as ``STARTF_USESTDHANDLES`` stdin, no
+    writer alive, contained token.
+    """
+    stdin_read, stdin_write = native.pipe_pair()
+    # Close the write end before the launch: nothing can ever write, so the
+    # child's read must reach end of file.
+    native.check(native.close(stdin_write))
+    child_report = workspace / 'eof-stdin-child.json'
+    nul_report = workspace / 'nul-open-child.json'
+    try:
+        # stdout stays the diagnostic log; only stdin is replaced.
+        code = native.launch(
+            [sys.executable, '-I', '-u', __file__, '--eof-stdin-child',
+             str(child_report)],
+            sid, workspace, output, stdin_handle=stdin_read)
+        if code != 0:
+            raise RuntimeError('AppContainer EOF-stdin child exited %d' % code)
+        report = json.loads(child_report.read_text())
+        print(json.dumps({'probe': 'contained-pipe-stdin', **report}), flush=True)
+        if not report['readable'] or report['error'] is not None:
+            raise RuntimeError('contained stdin was not readable: %r' % report)
+        if report['bytes'] != 0:
+            raise RuntimeError('contained stdin carried unexpected bytes: %r'
+                               % report)
+        # Negative control, in the same token: opening the device directly must
+        # still be refused, or the pipe result would prove nothing about why
+        # DEVNULL cannot be used here.
+        nul_code = native.launch(
+            [sys.executable, '-I', '-u', __file__, '--nul-open-child',
+             str(nul_report)],
+            sid, workspace, workspace / 'nul-open-child.log')
+        if nul_code != 0:
+            raise RuntimeError('NUL control child exited %d' % nul_code)
+        nul = json.loads(nul_report.read_text())
+        print(json.dumps({'probe': 'contained-nul-open', **nul}), flush=True)
+        if nul['opened'] or nul['error'] is None:
+            raise RuntimeError('contained NUL open was not refused: %r' % nul)
+        return {'probe': 'noninteractive-stdin',
+                'outcome': 'pipe-stdin-reached-eof',
+                'nul_open_error': nul['error']}
+    finally:
+        native.check(native.close(stdin_read))
 
 
 def scratch_probe(native, sid, workspace, report_path):
@@ -2819,6 +2922,13 @@ class AppContainerTests(unittest.TestCase):
             native, sid, workspace, root / 'inherited-nul.log')
         print(json.dumps(nul_result), flush=True)
         self.assertEqual(nul_result['outcome'], 'native-and-crt-writes-succeeded')
+        # Noninteractive jobs cannot use DEVNULL as stdin here: it asks the
+        # runtime to open the NUL device the container denies. A pipe with no
+        # writer delivers end of file instead.
+        stdin_result = eof_stdin_probe(
+            native, sid, workspace, root / 'eof-stdin.log')
+        print(json.dumps(stdin_result), flush=True)
+        self.assertEqual(stdin_result['outcome'], 'pipe-stdin-reached-eof')
         # Which environment the contained launch actually requires: the pty
         # tests fail 203 there, and the broker works only because its block was
         # restored from the profile.  Recorded, not asserted.
@@ -3327,6 +3437,10 @@ if __name__ == '__main__':
         sys.exit(stdio_child())
     if len(sys.argv) == 3 and sys.argv[1] == '--inherited-nul-child':
         sys.exit(inherited_nul_child(int(sys.argv[2])))
+    if len(sys.argv) == 3 and sys.argv[1] == '--eof-stdin-child':
+        sys.exit(eof_stdin_child(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == '--nul-open-child':
+        sys.exit(nul_open_child(sys.argv[2]))
     if len(sys.argv) == 4 and sys.argv[1] == '--scratch-child':
         sys.exit(scratch_child(sys.argv[2], sys.argv[3]))
     if len(sys.argv) == 4 and sys.argv[1] == '--peer':
