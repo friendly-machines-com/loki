@@ -1875,7 +1875,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self._workflow("credentialless")
 
     async def _workflow(self, variant):
-        from loki_agent import acp_worker, endpoint_pins
+        from loki_agent import acp_worker, endpoint_pins, settings
         from test_endpoint_pins import _StateDir
         from test_models_dev import DATA
 
@@ -1907,6 +1907,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(session.job_manager.close_session_owned)
         requests, prompts, approvals = [], [], []
         output = io.StringIO()
+        errors = io.StringIO()
         phase = {}
         saved_index = modelsdev._index_cache
         self.addCleanup(setattr, modelsdev, "_index_cache", saved_index)
@@ -2090,7 +2091,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             leaf = await modelsdev.run_model_picker_async(
                 input_fn, owner.inventory, text_writer=output.write)
             rendered = output.getvalue()[render_start:]
-            self.assertTrue(rendered.startswith("\nUsable models:\n"))
+            self.assertTrue(rendered.startswith("\nUsable models:\n"),
+                            {'stdout': repr(rendered), 'stderr': repr(errors.getvalue())})
             self.assertEqual(rendered.count("\nUsable models:\n"), 2 if answers[0].startswith("filter") else 1)
             self.assertEqual(rendered.count("\nUsable providers:\n"), 2 if len(answers) == 5 else 1)
             self.assertEqual(leaf[0], expected_pid)
@@ -2107,7 +2109,9 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with _StateDir() as state_directory, mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                 mock.patch.object(loki, "CREDENTIALS", owner.inventory), \
                 mock.patch.object(asyncio, "open_connection", side_effect=connect), \
-                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                mock.patch.object(settings.paths, 'loki_config_dir',
+                                  return_value=str(root / 'config' / 'loki')), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             # An explicit endpoint leases only LOKI_API_KEY, never a generic SDK key.
             env = {**values, "LOKI_API_BASE": "https://api.deepseek.com/anthropic",
                    "LOKI_PROVIDER": protocols.ANTHROPIC_MESSAGES, "LOKI_MODEL": "explicit-model"}
@@ -2375,7 +2379,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("calls", final)
             self.assertEqual(final["session_state"]["connection"]["chat_url"], descriptor["chat_url"])
             for secret in (value for name, value in values.items() if name.endswith("API_KEY")):
-                self.assertNotIn(secret, pathlib.Path(path).read_text() + pin_path.read_text() + output.getvalue())
+                self.assertNotIn(secret, pathlib.Path(path).read_text() + pin_path.read_text()
+                                 + output.getvalue() + errors.getvalue())
             self.assertTrue(any(prompt.startswith("Model choice") for prompt in prompts))
             self.assertTrue(any(prompt.startswith("Provider choice") for prompt in prompts))
             self.assertTrue(all("filter WORDS" in prompt and "empty cancels" in prompt
@@ -4155,6 +4160,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
     async def test_generated_chats_pick_render_resume_and_continue(self):
         from datetime import datetime
+        from loki_agent import settings
         import uuid
 
         for selected_index in (2, 3):
@@ -4274,6 +4280,8 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     rendered.append(output.getvalue()[start:])
 
                 with mock.patch.object(loki, 'CHAT_LOG_DIR', str(chat_dir)), \
+                        mock.patch.object(settings.paths, 'loki_config_dir',
+                                          return_value=str(root / 'config' / 'loki')), \
                         mock.patch.object(loki, 'CREDENTIALS', store), \
                         mock.patch.object(loki, 'file_state', {}), \
                         mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', loki.tool_runtime.ToolHookPipeline()), \
