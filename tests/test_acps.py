@@ -2240,7 +2240,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
         for explicit in (False, True):
             for method in acp.RESTORE_METHODS:
                 with self.subTest(explicit=explicit, method=method), tempfile.TemporaryDirectory() as root, ExitStack() as stack:
-                    workspace = os.path.join(root, 'workspace "quoted"')
+                    workspace = os.path.join(root, 'workspace with spaces')
                     os.mkdir(workspace)
                     environment = {key: value for key, value in os.environ.items()
                                    if not key.startswith("LOKI_")
