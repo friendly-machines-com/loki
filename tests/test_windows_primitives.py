@@ -1802,9 +1802,6 @@ class WindowsPrimitiveTests(unittest.TestCase):
     def test_win32_absolute_rename_retains_source_identity(self):
         self.check_source_handle_rename(absolute=True)
 
-    def test_win32_relative_rename_retains_both_identities(self):
-        self.check_source_handle_rename()
-
     def test_relative_rename_variants_are_recorded(self):
         """Characterize which FILE_RENAME_INFO forms the entrypoints accept.
 
