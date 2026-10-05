@@ -725,6 +725,8 @@ def _pty_child(argv):
                     print('CAPTURE_READY', flush=True)
                     event = await reader.read_key()
                     assert event.kind == 'TEXT' and event.text == 'x', event
+            # Exceed one capture read so draining must retain trailing bytes,
+            # including the reset and end marker, before reporting exit status.
             sys.stdout.buffer.write(b'z' * 131072 + b'\x1b[0mCAPTURE_END\n')
             sys.stdout.buffer.flush()
         asyncio.run(capture())
