@@ -46,6 +46,11 @@
                                    "\"")))))
              (replace 'check
                (lambda _
+                 ;; The Guix builder inherits SIGINT ignored, and an ignored
+                 ;; disposition survives exec. That isn't the correct
+                 ;; environment that loki would run in in production.
+                 ;; Undo the SSGINT ignore here.
+                 (sigaction SIGINT 0)
                  (invoke "python3" "run_tests.py")))
              ;; flit_core only ships the Python package; the desktop entry is
              ;; installed from the source tree.
