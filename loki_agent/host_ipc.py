@@ -154,6 +154,39 @@ def confirm_pair(first, second) -> None:
                 end.settimeout(timeout)
 
 
+def eof_stdin():
+    """A stdin end that is already at end of file, as a child-side object.
+
+    ``subprocess.DEVNULL`` asks this process to open the null device and hand
+    the result to the child.  That works on POSIX, but the AppContainer which
+    confines Loki's Windows workers denies the device, so the contained launch
+    cannot deliver stdin at all.  An anonymous pipe needs no device: the write
+    end is closed before the caller launches anything, so the child reads end
+    of file because no writer exists.
+
+    Returns the child-side object and a ``close`` callable for the caller's
+    copy.  The caller owns the returned end until it has been handed over, and
+    must release both on every path, including launch failure.
+    """
+    if os.name == "nt":
+        # A pipe the child inherits and reads; the write end never survives
+        # this call, so the read end cannot block.
+        read, write = windows_api.create_pipe(inherit=True)
+        windows_api.close_handle(write)
+
+        def close():
+            windows_api.close_handle(read)
+
+        return read, close
+    read, write = os.pipe()
+    os.close(write)
+
+    def close():
+        os.close(read)
+
+    return read, close
+
+
 def _private_pipe_pair():
     """Two anonymous pipes: a named-nothing bidirectional byte channel.
 

@@ -14,12 +14,14 @@ contained topology is covered natively in ``test_windows_appcontainers.py``.
 """
 
 import asyncio
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from loki_agent import loki
+from loki_agent import host_ipc, loki
 
 
 # Reads stdin to EOF and prints the byte count.  Real child, real reads: the
@@ -231,6 +233,29 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(
                 getattr(job.process, "stdin", None),
                 "a cancelled job still owns its stdin end")
+
+    async def test_the_pipe_end_releases_without_touching_the_null_device(self):
+        """The helper hands out a pipe end and releases it exactly once.
+
+        This pins the helper itself, not what a launch does with it: what the
+        job is *given* is not observable from a portable test, because
+        ``DEVNULL`` and a pipe read end are indistinguishable to a child on
+        both platforms.  Only the contained native probe can tell them apart,
+        and it does so by requiring the device open to be refused.
+        """
+        child, release = host_ipc.eof_stdin()
+        if os.name == "nt":
+            self.assertIsInstance(child, int)
+        else:
+            self.assertIsInstance(child, int)
+            # A pipe read end is a live descriptor this process owns, not the
+            # sentinel a caller would pass to mean "open the device".
+            self.assertNotEqual(child, subprocess.DEVNULL)
+            self.assertGreater(child, 2)
+        release()
+        if os.name != "nt":
+            with self.assertRaises(OSError):
+                os.fstat(child)
 
     async def test_a_released_job_does_not_leave_stdin_open(self):
         """A finished job holds nothing on stdin.

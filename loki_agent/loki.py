@@ -22,7 +22,6 @@ import json
 import random
 import time
 import urllib.parse
-import subprocess
 import signal
 import socket
 import stat
@@ -2084,33 +2083,45 @@ class JobManager:
 
             with open(stdout_path, 'wb') as stdout_file, \
                     open(stderr_path, 'wb') as stderr_file:
-                if shell:
-                    proc = await asyncio.create_subprocess_shell(
-                        spawn_command,
-                        executable=executables.BASH,
-                        stdin=subprocess.DEVNULL,
-                        stdout=stdout_file,
-                        stderr=stderr_file,
-                        close_fds=True,
-                        env=env,
-                        cwd=job.cwd,
-                        **host_process.spawn_kwargs(),
-                    )
-                else:
-                    child_ends = [
-                        end for end in (owner_child, credential_child)
-                        if end is not None]
-                    proc = await asyncio.create_subprocess_exec(
-                        *spawn_command,
-                        stdin=subprocess.DEVNULL,
-                        stdout=stdout_file,
-                        stderr=stderr_file,
-                        close_fds=True,
-                        env=env,
-                        cwd=job.cwd,
-                        **host_process.spawn_kwargs(),
-                        **host_ipc.spawn_kwargs(child_ends),
-                    )
+                # A job gets no input, so its stdin is a pipe with no writer
+                # rather than the null device: the AppContainer that confines
+                # the Windows runtime denies that device, so a DEVNULL stdin
+                # cannot be delivered there at all.  The parent copy is
+                # released as soon as the child owns the end, on the failure
+                # path too.
+                stdin, release_stdin = host_ipc.eof_stdin()
+                try:
+                    if shell:
+                        proc = await asyncio.create_subprocess_shell(
+                            spawn_command,
+                            executable=executables.BASH,
+                            stdin=stdin,
+                            stdout=stdout_file,
+                            stderr=stderr_file,
+                            close_fds=True,
+                            env=env,
+                            cwd=job.cwd,
+                            **host_process.spawn_kwargs(),
+                        )
+                    else:
+                        child_ends = [
+                            end for end in (owner_child, credential_child)
+                            if end is not None]
+                        proc = await asyncio.create_subprocess_exec(
+                            *spawn_command,
+                            stdin=stdin,
+                            stdout=stdout_file,
+                            stderr=stderr_file,
+                            close_fds=True,
+                            env=env,
+                            cwd=job.cwd,
+                            **host_process.spawn_kwargs(),
+                            **host_ipc.spawn_kwargs(child_ends),
+                        )
+                finally:
+                    # The child duplicated or inherited the end at launch, so
+                    # this copy is no longer needed either way.
+                    release_stdin()
 
             # The session may have revoked this job while it was launching.
             # Publishing it now would leave a live child nobody owns.
