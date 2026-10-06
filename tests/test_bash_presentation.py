@@ -349,6 +349,9 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
                 inner_self.user_messages = terminal_frontend.terminals.UserMessageQueue()
                 inner_self.user_messages.put_nowait("request")
                 inner_self.user_messages.put_nowait(None)
+                # Scripted input is never interactive, so terminal_ask_user
+                # yields no seam and the Ask tool stays unadvertised.
+                inner_self.interactive = False
                 inner_self.reader = types.SimpleNamespace(
                     cancel_requested=False, cancel_event=asyncio.Event())
 

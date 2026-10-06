@@ -97,6 +97,9 @@ class ScriptedInputSession:
         self.messages = list(messages)
         self.user_messages = self
         self.on_submit = lambda text: False
+        # Scripted input is never interactive, so terminal_ask_user yields
+        # no seam and the Ask tool stays unadvertised.
+        self.interactive = False
         self.reader = types.SimpleNamespace(
             cancel_requested=False,
             cancel_event=mock.Mock(),
@@ -7398,10 +7401,12 @@ class QuestionGuardTests(unittest.TestCase):
 
     def test_plan_tools_registry_shape_is_pinned(self):
         # Plan mode additionally allows TodoWrite (session-scoped plan
-        # state); anything else landing here must be a deliberate diff.
+        # state) and Ask (clarifying questions asked of the user before
+        # the plan is final); anything else landing here must be a
+        # deliberate diff.
         self.assertEqual(
             loki.PLAN_TOOLS,
-            loki.EXPLORE_TOOLS | {"TodoWrite"})
+            loki.EXPLORE_TOOLS | {"TodoWrite", "Ask"})
 
     def test_plan_mode_allows_todowrite_but_blocks_workspace_and_system(self):
         loki.current_session().agent_mode = "plan"

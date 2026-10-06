@@ -423,7 +423,8 @@ class SavedConnectionAuthorizationTests(
                 return None
 
         class Channel:
-            def __init__(self, session_id, process, forward, delegation):
+            def __init__(self, session_id, process, forward, delegation,
+                         reverse_handler=None):
                 self.session_id = session_id
                 self.closed = False
                 self._closed = False
@@ -764,7 +765,7 @@ args=(%r + str(__import__('os').getpid()), 'a')
         class FakeChannel:
             def __init__(
                     self, session_id, process, forward,
-                    credential_delegation):
+                    credential_delegation, reverse_handler=None):
                 self.session_id = session_id
                 self.credential_delegation = credential_delegation
                 self.process = process
@@ -2308,8 +2309,8 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
 
                     channel_type = acp.WorkerChannel
 
-                    def channel(*args):
-                        result = channel_type(*args)
+                    def channel(*args, **kwargs):
+                        result = channel_type(*args, **kwargs)
                         channels.append(result)
                         return result
 
@@ -4142,6 +4143,389 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
 
         front._request_client.assert_not_awaited()
+
+
+class _AskLoopProcess:
+    """Both transport ends in one object for model-question round trips.
+
+    The real WorkerChannel reads this object as its child process; the real
+    Worker writes reverse requests into it and consumes the front's reverse
+    responses. Front->worker session requests (session/cancel) are answered
+    with an empty result, matching the real worker's reply.
+    """
+
+    def __init__(self):
+        from loki_agent.acp_worker import Worker
+
+        class _StubSession:
+            job_manager = None
+
+        self.stdout = asyncio.StreamReader()
+        self.stdin = self
+        self.returncode = None
+        self.buffer = bytearray()
+        self.finished = asyncio.Event()
+        self.replies = []
+        self.methods = []
+        self.worker = Worker(_StubSession(), self._feed)
+        self._closed = False
+
+    def _feed(self, message):
+        self.stdout.feed_data(
+            (json.dumps(message) + "\n").encode("utf-8"))
+
+    async def readline(self):
+        return await self.stdout.readline()
+
+    def write(self, data):
+        self.buffer.extend(data)
+
+    async def drain(self):
+        while b"\n" in self.buffer:
+            line, _, rest = self.buffer.partition(b"\n")
+            self.buffer = bytearray(rest)
+            message = json.loads(line)
+            if message.get("method") is not None:
+                self.methods.append(message["method"])
+                self._feed(acps.response(message["id"], result={}))
+            else:
+                self.replies.append(message)
+                self.worker.resolve_reverse(message["id"], message)
+
+    def close(self):
+        self._closed = True
+
+    async def wait_closed(self):
+        return None
+
+    async def wait(self):
+        while not self._closed:
+            await asyncio.sleep(0.01)
+        self.returncode = 0
+        self.stdout.feed_eof()
+        self.finished.set()
+        return self.returncode
+
+
+class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
+    """Model questions travel worker -> front -> elicitation/create -> back."""
+
+    def _owner(self, front, session_id="ask-session"):
+        owner = front._reserve_session(session_id)
+        owner.state = "active"
+        return owner
+
+    @asynccontextmanager
+    async def _roundtrip(self, *, advertise=True):
+        messages = []
+
+        def client_write(message):
+            messages.append(message)
+
+        front = acp.Front(lambda: None, client_write, CredentialStore({}))
+        if advertise:
+            front.initialize({
+                "clientCapabilities": {"elicitation": {"form": {}}}})
+        owner = self._owner(front)
+        process = _AskLoopProcess()
+        channel = acp.WorkerChannel(
+            owner.session_id, process, lambda message: None, None,
+            reverse_handler=lambda message: front._worker_request(
+                owner, message))
+        owner.channel = channel
+        self._seen_elicitations = set()
+        try:
+            yield front, process, messages
+        finally:
+            await channel.close()
+            for task in list(front._tasks):
+                task.cancel()
+            await asyncio.gather(*front._tasks, return_exceptions=True)
+
+    @staticmethod
+    async def _next_elicitation(messages, seen):
+        async with asyncio.timeout(3):
+            while True:
+                for message in messages:
+                    if (message.get("method") == "elicitation/create"
+                            and message["id"] not in seen):
+                        seen.add(message["id"])
+                        return message
+                await asyncio.sleep(0.01)
+
+    async def _answer(self, front, messages, result):
+        elicitation = await self._next_elicitation(
+            messages, self._seen_elicitations)
+        front.handle(acps.response(elicitation["id"], result=result))
+        return elicitation
+
+    async def test_ask_roundtrip_builds_the_form_and_returns_the_answer(self):
+        async with self._roundtrip() as (front, process, messages):
+            ask_task = asyncio.create_task(process.worker._ask_user(
+                "Which storage?", [("Local", "on disk"), ("Remote", "S3")]))
+            elicitation = await self._answer(
+                front, messages,
+                {"action": "accept",
+                 "content": {"answer": "Remote", "custom": "via VPN"}})
+            self.assertEqual(await ask_task, {
+                "action": "answered", "answer": "Remote",
+                "custom": "via VPN"})
+
+            params = elicitation["params"]
+            self.assertEqual(params["sessionId"], "ask-session")
+            self.assertEqual(params["mode"], "form")
+            self.assertEqual(params["message"], "Which storage?")
+            self.assertNotIn("requestId", params)
+            self.assertNotIn("url", params)
+            schema = params["requestedSchema"]
+            self.assertEqual(schema["required"], [])
+            answer = schema["properties"]["answer"]
+            self.assertEqual(answer["type"], "string")
+            self.assertEqual(
+                answer["oneOf"],
+                [{"const": "Local", "title": "Local",
+                  "description": "on disk"},
+                 {"const": "Remote", "title": "Remote",
+                  "description": "S3"}])
+            self.assertEqual(schema["properties"]["custom"]["type"], "string")
+
+    async def test_custom_text_alone_becomes_the_answer(self):
+        async with self._roundtrip() as (front, process, messages):
+            ask_task = asyncio.create_task(process.worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            await self._answer(
+                front, messages,
+                {"action": "accept", "content": {"custom": " maybe later "}})
+            self.assertEqual(await ask_task, {
+                "action": "answered", "answer": "maybe later"})
+
+    async def test_multi_select_uses_an_array_schema_and_answer(self):
+        async with self._roundtrip() as (front, process, messages):
+            ask_task = asyncio.create_task(process.worker._ask_user(
+                "Which parts?", [("Legs", None), ("Roof", None)],
+                multi_select=True))
+            elicitation = await self._answer(
+                front, messages,
+                {"action": "accept",
+                 "content": {"answer": ["Legs", "Roof"]}})
+            self.assertEqual(await ask_task, {
+                "action": "answered", "answer": ["Legs", "Roof"]})
+            items = elicitation["params"]["requestedSchema"]["properties"]["answer"]
+            self.assertEqual(items["type"], "array")
+            self.assertEqual(len(items["items"]["anyOf"]), 2)
+
+    async def test_decline_is_not_a_cancel(self):
+        async with self._roundtrip() as (front, process, messages):
+            ask_task = asyncio.create_task(process.worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            await self._answer(front, messages, {"action": "decline"})
+            self.assertEqual(
+                await ask_task, {"action": "declined"})
+
+            ask_task = asyncio.create_task(process.worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            await self._answer(front, messages, {"action": "cancel"})
+            self.assertEqual(await ask_task, {"action": "cancelled"})
+
+    async def test_no_answer_in_an_accept_is_a_worker_error(self):
+        async with self._roundtrip() as (front, process, messages):
+            ask_task = asyncio.create_task(process.worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            await self._answer(front, messages,
+                               {"action": "accept", "content": {}})
+            with self.assertRaisesRegex(
+                    acps.TransportError, "contained no answer"):
+                await ask_task
+
+    async def test_missing_capability_fails_the_ask_closed(self):
+        async with self._roundtrip(advertise=False) as (
+                front, process, messages):
+            with self.assertRaisesRegex(
+                    acps.TransportError, "cannot answer model questions"):
+                await process.worker._ask_user(
+                    "Proceed?", [("Yes", None), ("No", None)])
+            self.assertFalse(any(
+                message.get("method") == "elicitation/create"
+                for message in messages))
+
+    async def test_session_cancel_settles_the_pending_ask(self):
+        async with self._roundtrip() as (front, process, messages):
+            ask_task = asyncio.create_task(process.worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            elicitation = await self._next_elicitation(messages, self._seen_elicitations)
+            front.handle(acps.request(
+                91, "session/cancel", {"sessionId": "ask-session"}))
+            self.assertEqual(
+                await asyncio.wait_for(ask_task, 3),
+                {"action": "cancelled"})
+            # The front answered the worker's reverse request.
+            async with asyncio.timeout(3):
+                while not any(
+                        reply.get("result") == {"action": "cancelled"}
+                        for reply in process.replies):
+                    await asyncio.sleep(0.01)
+            # A late client answer resolves nothing and raises nothing.
+            front.handle(acps.response(
+                elicitation["id"],
+                result={"action": "accept",
+                        "content": {"answer": "Yes"}}))
+            self.assertFalse(front._client_requests)
+
+    async def test_unknown_worker_method_is_refused_not_dropped(self):
+        async with self._roundtrip() as (front, process, messages):
+            process._feed(acps.request(
+                "ask-x", "session/plumb", {}))
+            async with asyncio.timeout(3):
+                while not process.replies:
+                    await asyncio.sleep(0.01)
+            error = process.replies[0]["error"]
+            self.assertEqual(error["code"], acps.METHOD_NOT_FOUND)
+            self.assertIn("session/plumb", error["message"])
+
+    async def test_ask_during_cancelled_turn_reports_cancelled(self):
+        async with self._roundtrip() as (front, process, messages):
+            worker = process.worker
+            worker.cancel_event.set()
+            ask_task = asyncio.create_task(worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            elicitation = await self._next_elicitation(messages, self._seen_elicitations)
+            front.handle(acps.response(
+                elicitation["id"],
+                result={"action": "accept", "content": {"answer": "Yes"}}))
+            # The ask still went out and was answered, but an answer that
+            # arrives after the turn's cancellation must not drive the
+            # cancelled turn onward.
+            self.assertEqual(
+                await asyncio.wait_for(ask_task, 3), {"action": "cancelled"})
+
+    async def test_worker_request_input_reaches_the_client_session_scoped(self):
+        async with self._roundtrip() as (front, process, messages):
+            ask_task = asyncio.create_task(process.worker.request_input(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            elicitation = await self._next_elicitation(messages, self._seen_elicitations)
+            front.handle(acps.response(elicitation["id"], result={
+                "action": "accept", "content": {"answer": "Yes"}}))
+            self.assertEqual(await ask_task, {
+                "action": "answered", "answer": "Yes"})
+            self.assertEqual(elicitation["params"]["sessionId"], "ask-session")
+            self.assertEqual(elicitation["params"]["mode"], "form")
+
+    async def test_late_reverse_reply_is_discarded(self):
+        async with self._roundtrip() as (front, process, messages):
+            worker = process.worker
+            process._feed(acps.response("ask-999", result={"action": "x"}))
+            await asyncio.sleep(0.05)
+            self.assertEqual(worker._reverse_requests, {})
+
+    async def test_close_fails_a_pending_question(self):
+        async with self._roundtrip() as (front, process, messages):
+            worker = process.worker
+            ask_task = asyncio.create_task(worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            await self._next_elicitation(messages, self._seen_elicitations)
+            await worker.close()
+            with self.assertRaises(acps.TransportError):
+                await ask_task
+
+
+class WorkerAskAdvertisementTests(unittest.TestCase):
+    def test_ask_is_withheld_without_capability(self):
+        from loki_agent.acp_worker import Worker
+        worker = Worker(None, lambda message: None)
+        advertised, withheld = worker._ask_advertised_tools()
+        self.assertEqual(withheld, "Ask")
+        self.assertNotIn("Ask", [
+            tool["function"]["name"] for tool in advertised])
+
+    def test_ask_is_advertised_with_capability(self):
+        from loki_agent.acp_worker import Worker
+        worker = Worker(None, lambda message: None)
+        worker.can_ask_user = True
+        advertised, withheld = worker._ask_advertised_tools()
+        self.assertIsNone(withheld)
+        self.assertIn("Ask", [
+            tool["function"]["name"] for tool in advertised])
+
+
+class FrontAskValidationTests(unittest.IsolatedAsyncioTestCase):
+    """The front builds the schema; workers may not set scope or mode."""
+
+    def _front(self, messages, *, advertise=True):
+        front = acp.Front(lambda: None, messages.append, CredentialStore({}))
+        if advertise:
+            front.initialize({
+                "clientCapabilities": {"elicitation": {"form": {}}}})
+        self.owner = front._reserve_session("s")
+        self.owner.state = "active"
+        return front
+
+    async def assert_refused(self, front, messages, params, pattern):
+        with self.assertRaisesRegex(acps.TransportError, pattern):
+            await front._ask_user_via_elicitation(params, owner=self.owner)
+        self.assertEqual(
+            [message for message in messages
+             if message.get("method") == "elicitation/create"],
+            [])
+
+    async def test_workers_may_not_set_scope_or_mode(self):
+        messages = []
+        for params in [
+                {"requestId": 5},
+                {"mode": "url"},
+                {"sessionId": "other"},
+                {"url": "https://example.com"},
+                {"elicitationId": "e1"}]:
+            with self.subTest(params=params):
+                front = self._front(messages)
+                await self.assert_refused(
+                    front, messages, {"question": "q?", "options": [
+                        {"label": "a"}, {"label": "b"}], **params},
+                    "belong to the front")
+
+    async def test_question_and_option_bounds(self):
+        messages = []
+        base = {"options": [{"label": "a"}, {"label": "b"}]}
+        cases = [
+            ({"question": "", **base}, "nonempty string"),
+            ({"question": "x" * 4001, **base}, "at most"),
+            ({**base}, "nonempty string"),
+            ({"question": "q?", "options": [{"label": "a"}]}, "2 to 8"),
+            ({"question": "q?", "options": [
+                {"label": "a"}, {"label": "a"}]}, "unique"),
+            ({"question": "q?", "options": [
+                {"label": ""}, {"label": "b"}]}, "nonempty strings"),
+            ({"question": "q?", "options": [
+                {"label": "a"}, {"label": "b"}], "multiSelect": "yes"},
+             "boolean"),
+        ]
+        for params, pattern in cases:
+            with self.subTest(params=params):
+                front = self._front(messages)
+                await self.assert_refused(front, messages, params, pattern)
+
+    async def test_schema_is_front_built_and_session_scoped(self):
+        messages = []
+
+        def write(message):
+            messages.append(message)
+            if message.get("method") == "elicitation/create":
+                front.handle(acps.response(message["id"], result={
+                    "action": "accept", "content": {"answer": "b"}}))
+
+        front = acp.Front(lambda: None, write, CredentialStore({}))
+        front.initialize({
+            "clientCapabilities": {"elicitation": {"form": {}}}})
+        self.owner = front._reserve_session("s")
+        self.owner.state = "active"
+        outcome = await front._ask_user_via_elicitation(
+            {"question": "q?", "options": [{"label": "a"}, {"label": "b"}]},
+            owner=self.owner)
+        self.assertEqual(outcome, {"action": "answered", "answer": "b"})
+        elicitation = next(
+            message for message in messages
+            if message.get("method") == "elicitation/create")
+        self.assertEqual(elicitation["params"]["sessionId"], "s")
+        self.assertEqual(elicitation["params"]["mode"], "form")
 
 
 if __name__ == "__main__":

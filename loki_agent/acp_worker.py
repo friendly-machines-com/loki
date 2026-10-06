@@ -55,6 +55,14 @@ class Worker:
         self.session_id = session_id
         self.cancel_event = asyncio.Event()
         self._prompt_task: asyncio.Task | None = None
+        # Reverse requests to the front (model questions). The front owns
+        # the client channel; the worker only ever asks within its session.
+        self._reverse_requests: dict[str, asyncio.Future] = {}
+        self._next_reverse_id = 0
+        # Set at session open from the front's report of the client's
+        # elicitation capability. It decides whether the model is offered
+        # the Ask tool at all.
+        self.can_ask_user = False
         self._model_options: list[dict] = []
         self._option_leaves: dict[str, object] = {}
         self._current_option_value: str | None = None
@@ -90,6 +98,10 @@ class Worker:
     async def close(self):
         try:
             self.cancel_event.set()
+            for future in list(self._reverse_requests.values()):
+                if not future.done():
+                    future.set_exception(acps.TransportError(
+                        "the session closed while a question was open"))
             task = self._prompt_task
             if task is not None and not task.done():
                 try:
@@ -405,6 +417,10 @@ class Worker:
                 code=acps.INVALID_PARAMS,
             )
         self.session_id = session_id
+        # The front relays the client's advertised elicitation capability.
+        # Absent means the client cannot render questions: the Ask tool is
+        # withheld from the model entirely.
+        self.can_ask_user = params.get("formElicitation") is True
 
         open_method = params.get("openMethod")
         if open_method not in (
@@ -690,6 +706,79 @@ class Worker:
                 "update": update,
             }))
 
+    # -- asking the user through the front --------------------------------
+
+    def resolve_reverse(self, request_id, message: dict) -> None:
+        """Settle one reverse request with the front's response.
+
+        A late response after its caller was cancelled has no future and
+        is discarded, mirroring the front's own reply handling.
+        """
+        future = self._reverse_requests.pop(str(request_id), None)
+        if future is None or future.done():
+            return
+        if "error" in message:
+            error = message.get("error") or {}
+            future.set_exception(acps.TransportError(
+                str(error.get("message") or "front error"),
+                code=error.get("code", acps.INTERNAL_ERROR),
+            ))
+        else:
+            future.set_result(message.get("result"))
+
+    async def request_input(
+            self, question: str, options: list, *,
+            multi_select: bool = False) -> dict:
+        """Ask the front to put one model-authored question to the user.
+
+        Scope and mode are deliberately absent: they belong to the front,
+        which binds the ask to this session and refuses url mode.
+        """
+        self._next_reverse_id += 1
+        request_id = f"ask-{self._next_reverse_id}"
+        future = asyncio.get_running_loop().create_future()
+        self._reverse_requests[request_id] = future
+        try:
+            self.write(acps.request(
+                request_id, "session/request_input", {
+                    "question": question,
+                    "options": [
+                        {"label": label, "description": description}
+                        for label, description in options
+                    ],
+                    "multiSelect": multi_select,
+                }))
+            return await future
+        finally:
+            self._reverse_requests.pop(request_id, None)
+
+    def _ask_advertised_tools(self) -> tuple[list, str | None]:
+        """Tool definitions offered to the model and the withheld name.
+
+        The Ask tool exists for the model exactly when the client can
+        answer it; otherwise it is not advertised at all, so the model is
+        never told about a question tool that would always fail.
+        """
+        if self.can_ask_user:
+            return loki.TOOLS, None
+        return (
+            [tool for tool in loki.TOOLS
+             if tool["function"]["name"] != "Ask"],
+            "Ask",
+        )
+
+    async def _ask_user(self, question: str, options: list, *,
+                        multi_select: bool = False) -> dict:
+        outcome = await self.request_input(
+            question, options, multi_select=multi_select)
+        if (isinstance(outcome, dict)
+                and outcome.get("action") == "answered"
+                and self.cancel_event.is_set()):
+            # The turn ended while the question was open. The answer must
+            # not drive a cancelled turn's continuation.
+            return {"action": "cancelled"}
+        return outcome
+
     # -- prompting --------------------------------------------------------
 
     @staticmethod
@@ -883,6 +972,7 @@ class Worker:
                 })
                 return
             cancel_check = self.cancel_event.is_set
+            advertised, withheld = self._ask_advertised_tools()
 
             async def chat_fn(
                     items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
@@ -895,7 +985,7 @@ class Worker:
                 if on_reasoning_delta is not None:
                     kwargs["on_reasoning_delta"] = on_reasoning_delta
                 return await loki.async_chat_completion(
-                    items, loki.TOOLS, True, False, **kwargs)
+                    items, advertised, True, False, **kwargs)
 
             def on_response(turn, event):
                 loki.mark_chat_log_dirty()
@@ -910,6 +1000,8 @@ class Worker:
                 stream_chat=True,
                 on_response=on_response,
                 thinking=thinking,
+                ask_user=(
+                    None if withheld is not None else self._ask_user),
             )
         finally:
             loki.save_chat_log()

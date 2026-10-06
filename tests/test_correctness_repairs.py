@@ -1070,14 +1070,16 @@ class AgentModeContractTests(unittest.TestCase):
                         new=fake_completion),
                     mock.patch.object(
                         terminal_frontend, "_terminal_agent_event")):
-                asyncio.run(terminal_frontend.run_terminal_turn_async([
-                    formats.message_item("user", "plan this"),
-                ]))
+                asyncio.run(terminal_frontend.run_terminal_turn_async(
+                    [formats.message_item("user", "plan this")],
+                    # Plan mode may ask the user clarifying questions; an
+                    # asker must be present for Ask to be advertised.
+                    ask_user=mock.AsyncMock(return_value=None)))
         finally:
             loki.current_session().agent_mode = old_mode
             loki.current_session().session_toolsets = old_toolsets
 
-        # Plan mode advertises the read-only set plus TodoWrite.
+        # Plan mode advertises the read-only set plus TodoWrite and Ask.
         self.assertEqual(set(captured), loki.PLAN_TOOLS)
 
 

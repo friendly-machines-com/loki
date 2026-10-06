@@ -93,6 +93,13 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
                     continue
                 # Keep reading while a prompt task runs so cancellation does
                 # not queue behind the operation it is meant to interrupt.
+                if (message.get("method") is None
+                        and message.get("id") is not None):
+                    # A response to a worker-initiated reverse request
+                    # (e.g. a model question the front relayed to the
+                    # client). Never a session operation.
+                    worker.resolve_reverse(message["id"], message)
+                    continue
                 await worker.handle(message, concurrent=True)
         finally:
             await worker.close()

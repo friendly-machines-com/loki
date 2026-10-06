@@ -3117,6 +3117,44 @@ async def _handle_websearch_async(args: dict, extra_context=None) -> str:
                                          "cancel_event"))
 
 
+async def _handle_ask_async(args: dict, extra_context=None) -> str:
+    asker = (extra_context or {}).get("ask_user")
+    if asker is None:
+        return (
+            "Ask is not available in this session: it has no interactive "
+            "user who could answer.")
+    options = args["options"]
+    if len(options) < 2:
+        return "Ask requires at least two options."
+    labels = [option["label"] for option in options]
+    if len(set(labels)) != len(labels):
+        return "Ask option labels must be unique so an answer is unambiguous."
+    question = args["question"]
+    outcome = await asker(
+        question,
+        [(option["label"], option.get("description")) for option in options],
+        multi_select=bool(args.get("multi_select", False)),
+    )
+    if not isinstance(outcome, dict):
+        return "The question could not be delivered to the user."
+    action = outcome.get("action")
+    if action == "declined":
+        # A refusal is information, not an error: the turn continues.
+        return "The user declined to answer the question."
+    if action != "answered":
+        return "The user dismissed the question without answering."
+    answer = outcome.get("answer")
+    if isinstance(answer, list):
+        rendered = ", ".join(f'"{item}"' for item in answer)
+    else:
+        rendered = f'"{answer}"'
+    note = outcome.get("custom")
+    if note:
+        return (f'The user answered "{question}" with {rendered}. '
+                f'The user also noted: {note}')
+    return f'The user answered "{question}" with {rendered}.'
+
+
 def _tool_result(ok: bool, content, *, process_output=None) -> dict:
     result = {"ok": ok, "content": str(content)}
     if process_output is not None:
@@ -3590,6 +3628,7 @@ async def run_tool_loop_async(
         stream_chat=False, report_timing=False,
         on_response=None, hook_pipeline=None,
         cancel_event: asyncio.Event | None = None,
+        ask_user=None,
         reasoning_effort=_UNSET,
         thinking: TurnThinkingSettings | None = None) -> str:
     """Run the model/tool loop over canonical session events.
@@ -3617,6 +3656,12 @@ async def run_tool_loop_async(
                 for name, spec in TOOL_REGISTRY.items()
                 if name in allowed
             ])
+        if ask_user is None:
+            # Without an interactive seam there is nobody to answer, so
+            # the model is never offered the question tool at all.
+            advertised_tools = [
+                tool for tool in advertised_tools
+                if tool["function"]["name"] != "Ask"]
 
         def chat_fn(items, on_text_delta=None, *, codex_turn_state, on_reasoning_delta=None):
             kwargs = {
@@ -3646,6 +3691,11 @@ async def run_tool_loop_async(
     tool_loop_extra_context["thinking"] = thinking
     if cancel_event is not None:
         tool_loop_extra_context["cancel_event"] = cancel_event
+    if ask_user is not None:
+        # The interactive-question seam. Only a frontend that can actually
+        # put a question to the user supplies one, and the Ask tool is
+        # advertised to the model only by such callers.
+        tool_loop_extra_context["ask_user"] = ask_user
 
     def append_turn(turn):
         response_event = turn.to_event()
@@ -5058,6 +5108,51 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "Ask",
+            "description": "\n".join([
+                "Asks the user one multiple-choice question and waits for the answer.",
+                "",
+                "Use this when a decision, preference, or missing detail changes what you do next and you cannot determine it yourself. Do not use it to ask permission for work you can simply do, and do not ask what you can already infer from the conversation.",
+                "",
+                "- Offer 2-8 concrete, mutually distinct options. The user can always answer with their own text instead of an option.",
+                "- Set multi_select only when the choices are not mutually exclusive.",
+                "- If you recommend an option, list it first and say why in its description.",
+                "- The user may decline or dismiss the question. Either way the turn continues without an answer; neither response is consent.",
+            ]),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string", "minLength": 1, "maxLength": 4000,
+                        "description": "The question to ask, phrased so it ends with a question mark"},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string", "minLength": 1, "maxLength": 200,
+                                    "description": "The answer text, shown as the option's name"},
+                                "description": {
+                                    "type": "string", "maxLength": 1000,
+                                    "description": "One line explaining what choosing this option means"}
+                            },
+                            "required": ["label"]
+                        },
+                        "maxItems": 8,
+                        "description": "The answer choices; at least two are required."
+                    },
+                    "multi_select": {
+                        "type": "boolean", "default": False,
+                        "description": "Allow the user to pick several options instead of exactly one"}
+                },
+                "required": ["question", "options"]
+            }
+        }
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -5110,6 +5205,9 @@ TOOL_HANDLERS = {
     "Skill": {"handler": _handle_skill},
     "WebFetch": {"async_handler": _handle_webfetch_async, "explore": True},
     "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
+    # A question has no side effects, and plan mode is exactly where "which
+    # approach?" decisions arise, so Ask joins PLAN_TOOLS (never EXPLORE).
+    "Ask": {"async_handler": _handle_ask_async, "plan": True},
 }
 TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]

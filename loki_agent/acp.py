@@ -54,15 +54,24 @@ RESTORE_METHODS = (
     "session/resume",
 )
 
+# Bounds for one model-authored question. The question and its options are
+# model output rendered by the client, so their size is capped before the
+# front will carry them.
+MAX_ASK_QUESTION_CHARS = 4000
+MAX_ASK_OPTIONS = 8
+MAX_ASK_LABEL_CHARS = 200
+MAX_ASK_DESCRIPTION_CHARS = 1000
+
 
 class WorkerChannel:
     """One request multiplexer around one worker subprocess."""
 
     def __init__(self, session_id: str, process: asyncio.subprocess.Process,
-                 forward, credential_delegation=None):
+                 forward, credential_delegation=None, reverse_handler=None):
         self.session_id = session_id
         self.process = process
         self.forward = forward
+        self.reverse_handler = reverse_handler
         self.credential_delegation = credential_delegation
         self._pending: dict[str, asyncio.Future] = {}
         self._next_request_id = 0
@@ -101,6 +110,25 @@ class WorkerChannel:
         finally:
             self._pending.pop(request_id, None)
 
+    async def respond(self, request_id, result=None, error=None):
+        """Answer one worker-initiated reverse request.
+
+        Best effort by design: a worker that is closing or gone cannot
+        receive the answer, and its pending request future dies with the
+        reader's failure fanout.
+        """
+        encoded = (
+            json.dumps(acps.response(request_id, result=result, error=error),
+                       ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            async with self._write_lock:
+                if self._closed or self.process.stdin is None:
+                    return
+                self.process.stdin.write(encoded)
+                await self.process.stdin.drain()
+        except (BrokenPipeError, ConnectionError, OSError):
+            pass
+
     async def _read_messages(self):
         failure = None
         try:
@@ -126,6 +154,18 @@ class WorkerChannel:
                     break
 
                 request_id = message.get("id")
+                method = message.get("method")
+                if method is not None:
+                    if request_id is not None:
+                        # A worker-initiated request. The front owns the only
+                        # sanctioned path back to the client, so reverse
+                        # requests dispatch there instead of forward.
+                        if self.reverse_handler is not None:
+                            self.reverse_handler(message)
+                        continue
+                    # Only notifications belong on the outward channel.
+                    self.forward(message)
+                    continue
                 if request_id is not None:
                     future = self._pending.get(str(request_id))
                     if future is None or future.done():
@@ -141,11 +181,6 @@ class WorkerChannel:
                         ))
                     else:
                         future.set_result(message.get("result"))
-                    continue
-
-                # Only notifications/requests belong on the outward channel.
-                if message.get("method"):
-                    self.forward(message)
         except asyncio.CancelledError:
             failure = acps.TransportError(
                 f"worker channel for {self.session_id} closed")
@@ -212,6 +247,9 @@ class SessionOperations:
         self.delegation = None
         self.changing = False
         self.tasks: set[asyncio.Task] = set()
+        # Ask-the-user operations awaiting the client. session/cancel
+        # cancels them so an abandoned question cannot outlive its turn.
+        self.pending_asks: set[asyncio.Task] = set()
         self.client_requests: set[str] = set()
         self.forwarded = asyncio.Event()
         self.forwarded.set()
@@ -601,6 +639,220 @@ class Front:
             self._client_requests.pop(request_id, None)
             owner.client_requests.discard(request_id)
 
+    def _worker_request(self, owner, message: dict):
+        """Admit one worker-initiated reverse request (reader callback).
+
+        The reader must not await: the ask lives as an owned task so
+        lifecycle controls keep flowing while a question is open.
+        """
+        request_id = message.get("id")
+        if request_id is None:
+            return
+        method = message.get("method")
+        if method == "session/request_input":
+            task = self._start_task(
+                self._run_request_input(
+                    request_id, message.get("params") or {}, owner=owner),
+                name=f"acp-worker-ask-{request_id}", owner=owner)
+            owner.pending_asks.add(task)
+            task.add_done_callback(owner.pending_asks.discard)
+            return
+        self._start_task(
+            self._refuse_worker_request(
+                owner.channel, request_id, method),
+            name=f"acp-worker-refused-{request_id}", owner=owner)
+
+    async def _refuse_worker_request(self, channel, request_id, method):
+        # A worker bug must surface as an answer, not as a hung model tool
+        # call awaiting a reply that will never come.
+        if channel is not None:
+            await channel.respond(request_id, error={
+                "code": acps.METHOD_NOT_FOUND,
+                "message": f"front does not accept {method!r} from workers",
+            })
+
+    async def _run_request_input(self, request_id, params, *, owner):
+        channel = owner.channel
+        try:
+            result = await self._ask_user_via_elicitation(params, owner=owner)
+        except asyncio.CancelledError:
+            if channel is not None:
+                await channel.respond(
+                    request_id, result={"action": "cancelled"})
+            raise
+        except acps.TransportError as error:
+            await channel.respond(request_id, error={
+                "code": error.code, "message": str(error)})
+            return
+        await channel.respond(request_id, result=result)
+
+    async def _ask_user_via_elicitation(self, params: dict, *, owner) -> dict:
+        """Ask the user one model-authored question through the client.
+
+        Worker asks are their own class, disjoint from the front-owned
+        security elicitations: always session-scoped and form mode, with
+        the schema built here from validated fields. A worker can never
+        send the user to a URL, leave its session scope, or re-shape an
+        approval form.
+        """
+        self._check_owner(owner)
+        if not self._client_supports_form_elicitation:
+            raise acps.TransportError(
+                "this ACP client cannot answer model questions: no form "
+                "elicitation support",
+                code=acps.INVALID_PARAMS)
+        forbidden = sorted({"requestId", "mode", "url", "elicitationId",
+                            "sessionId"} & set(params))
+        if forbidden:
+            raise acps.TransportError(
+                "model questions cannot set " + ", ".join(forbidden)
+                + "; scope and mode belong to the front",
+                code=acps.INVALID_PARAMS)
+        question = params.get("question")
+        if (not isinstance(question, str) or not question.strip()
+                or len(question) > MAX_ASK_QUESTION_CHARS):
+            raise acps.TransportError(
+                "model question must be a nonempty string of at most "
+                f"{MAX_ASK_QUESTION_CHARS} characters",
+                code=acps.INVALID_PARAMS)
+        multi_select = params.get("multiSelect", False)
+        if multi_select not in (True, False):
+            raise acps.TransportError(
+                "model question multiSelect must be a boolean",
+                code=acps.INVALID_PARAMS)
+        raw_options = params.get("options")
+        if (not isinstance(raw_options, list)
+                or not 2 <= len(raw_options) <= MAX_ASK_OPTIONS):
+            raise acps.TransportError(
+                f"model question requires 2 to {MAX_ASK_OPTIONS} options",
+                code=acps.INVALID_PARAMS)
+        options = []
+        for option in raw_options:
+            if not isinstance(option, dict):
+                raise acps.TransportError(
+                    "each model question option must be an object",
+                    code=acps.INVALID_PARAMS)
+            label = option.get("label")
+            if (not isinstance(label, str) or not label.strip()
+                    or len(label) > MAX_ASK_LABEL_CHARS):
+                raise acps.TransportError(
+                    "model question option labels must be nonempty strings"
+                    f" of at most {MAX_ASK_LABEL_CHARS} characters",
+                    code=acps.INVALID_PARAMS)
+            description = option.get("description")
+            if description is not None and (
+                    not isinstance(description, str)
+                    or len(description) > MAX_ASK_DESCRIPTION_CHARS):
+                raise acps.TransportError(
+                    "model question option descriptions must be strings of "
+                    f"at most {MAX_ASK_DESCRIPTION_CHARS} characters",
+                    code=acps.INVALID_PARAMS)
+            options.append((label, description))
+        # The answer value is the label itself, so equal labels would make
+        # an answer ambiguous.
+        labels = [label for label, _ in options]
+        if len(set(labels)) != len(labels):
+            raise acps.TransportError(
+                "model question option labels must be unique",
+                code=acps.INVALID_PARAMS)
+        choices = []
+        for label, description in options:
+            choice = {"const": label, "title": label}
+            if description is not None:
+                choice["description"] = description
+            choices.append(choice)
+        if multi_select:
+            answer_schema = {
+                "type": "array",
+                "title": "Answer",
+                "items": {"anyOf": choices},
+            }
+        else:
+            answer_schema = {
+                "type": "string",
+                "title": "Answer",
+                "oneOf": choices,
+            }
+        elicitation = {
+            "sessionId": owner.session_id,
+            "mode": "form",
+            "message": question,
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "answer": answer_schema,
+                    "custom": {
+                        "type": "string",
+                        "title": "Other",
+                        "description": (
+                            "Type your own answer instead (optional)"),
+                    },
+                },
+                "required": [],
+            },
+        }
+        result = await self._request_client(
+            "elicitation/create", elicitation, owner=owner)
+        if not isinstance(result, dict):
+            raise acps.TransportError(
+                "ACP client answer was not an object",
+                code=acps.INVALID_PARAMS)
+        action = result.get("action")
+        if action == "decline":
+            # A decline is an answer ("no"), not an abandoned question:
+            # the turn continues and the model learns the user refused.
+            return {"action": "declined"}
+        if action != "accept":
+            # cancel and any unknown action dismiss the question; the turn
+            # keeps running without an answer.
+            return {"action": "cancelled"}
+        content = result.get("content")
+        if not isinstance(content, dict):
+            raise acps.TransportError(
+                "ACP client answer was missing its content object",
+                code=acps.INVALID_PARAMS)
+        custom = content.get("custom")
+        if isinstance(custom, str) and custom.strip():
+            custom = custom.strip()
+        else:
+            custom = None
+        picks = content.get("answer")
+        if multi_select:
+            if picks is not None and not (
+                    isinstance(picks, list)
+                    and all(isinstance(item, str) for item in picks)):
+                raise acps.TransportError(
+                    "ACP client multi-select answer must be an array of "
+                    "strings",
+                    code=acps.INVALID_PARAMS)
+            answer = [item for item in (picks or []) if item]
+            if not answer and custom is not None:
+                answer = [custom]
+            if not answer:
+                raise acps.TransportError(
+                    "ACP client answer selected nothing",
+                    code=acps.INVALID_PARAMS)
+            answered = {"action": "answered", "answer": answer}
+            if custom is not None and answer != [custom]:
+                answered["custom"] = custom
+            return answered
+        if picks is not None and not isinstance(picks, str):
+            raise acps.TransportError(
+                "ACP client answer must be a string",
+                code=acps.INVALID_PARAMS)
+        if picks:
+            answered = {"action": "answered", "answer": picks}
+            if custom is not None:
+                # The typed text supplements, never replaces, a picked
+                # option.
+                answered["custom"] = custom
+            return answered
+        if custom is not None:
+            return {"action": "answered", "answer": custom}
+        raise acps.TransportError(
+            "ACP client answer contained no answer",
+            code=acps.INVALID_PARAMS)
+
     async def _authorize_saved_connection(
             self, descriptor: ConnectionDescriptor,
             restore_request_id, working_directory=None, *, owner) -> None:
@@ -728,7 +980,9 @@ class Front:
                 else:
                     delegation.child_spawned()
             channel = WorkerChannel(
-                session_id, process, self.write, delegation)
+                session_id, process, self.write, delegation,
+                reverse_handler=lambda message: self._worker_request(
+                    owner, message))
             owner.channel = channel
             channel._reader_task.add_done_callback(
                 lambda task: self._worker_finished(owner, task))
@@ -739,6 +993,10 @@ class Front:
                     "sessionId": session_id,
                     "cwd": cwd,
                     "openMethod": open_method,
+                    # The worker advertises its ask-the-user tool only when
+                    # the client can actually answer it, so the model is
+                    # never given a question tool that always fails.
+                    "formElicitation": self._client_supports_form_elicitation,
                 },
             )
             raw_descriptor = (prepared or {}).get(
@@ -884,6 +1142,13 @@ class Front:
             )
         self._check_owner(owner)
         channel = owner.channel
+        if method == "session/cancel":
+            # An in-flight model question belongs to the turn being
+            # cancelled. Answer it "cancelled" and abandon the client
+            # elicitation; a late client answer resolves no future.
+            for task in list(owner.pending_asks):
+                if not task.cancelling():
+                    task.cancel()
         if method == "session/set_config_option":
             # A catalog endpoint decides where a static credential is sent.
             # The worker knows which pair a config value selects; the front

@@ -761,7 +761,8 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
 
 async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None,
-                                  turn_events=None, ui_settings=None) -> str:
+                                  turn_events=None, ui_settings=None,
+                                  ask_user=None) -> str:
     thinking = _core.capture_turn_settings()
     reasoning_effort = thinking.effort
     read_only = current_agent_mode() in ("explore", "plan")
@@ -774,6 +775,12 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         ]
         if read_only else TOOLS
     )
+    if ask_user is None:
+        # Same rule as run_tool_loop_async: without somebody to answer, the
+        # model is never offered the question tool at all.
+        active_tools = [
+            tool for tool in active_tools
+            if tool["function"]["name"] != "Ask"]
 
     async def chat_fn(
             items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
@@ -815,6 +822,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         cancel_event=cancel_event,
         reasoning_effort=reasoning_effort,
         thinking=thinking,
+        ask_user=ask_user,
         on_response=on_response,
     )
 
@@ -1064,6 +1072,105 @@ async def _numbered_choice_async(modal, header, rows, prompt):
             continue
         if 1 <= index <= len(rows):
             return rows[index - 1][0]
+
+
+def parse_ask_answer(text, labels, *, multi_select=False):
+    """Classify one dialog answer against the offered labels.
+
+    Returns an outcome dict in the Ask seam's answered/declined/cancelled
+    shape, or None when the input names no offered choice (out of range,
+    duplicated, or more than one number for a single-select) and the dialog
+    should re-prompt. An empty answer dismisses the question and "d" declines
+    it; both are answers, not errors.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"action": "cancelled"}
+    if text.lower() == "d":
+        return {"action": "declined"}
+    indexes = []
+    for part in (chunk.strip() for chunk in text.split(",")):
+        try:
+            indexes.append(int(part))
+        except ValueError:
+            indexes = None
+            break
+    if indexes is not None:
+        if any(not 1 <= index <= len(labels) for index in indexes):
+            return None
+        if len(set(indexes)) != len(indexes):
+            return None
+        picked = [labels[index - 1] for index in indexes]
+        if multi_select:
+            return {"action": "answered", "answer": picked}
+        if len(picked) != 1:
+            return None
+        return {"action": "answered", "answer": picked[0]}
+    # Anything else is the user's own answer, in their own words.
+    return {"action": "answered", "answer": [text] if multi_select else text}
+
+
+async def run_ask_dialog_async(session, cancel_event, question, options,
+                               *, multi_select=False):
+    """Ask one model-authored question on the modal input path.
+
+    Options are (label, description) pairs. The returned outcome dict uses
+    the same answered/declined/cancelled shape as the ACP front, so the Ask
+    tool handler never learns which surface asked.
+    """
+    labels = [label for label, _ in options]
+    try:
+        async with session.modal() as modal:
+            print()
+            terminal.write_text(question, multiline=True)
+            print()
+            for index, (label, description) in enumerate(options, 1):
+                terminal.write_text(f"{index}. {label}", multiline=True)
+                if description:
+                    terminal.write_text(
+                        "\n".join(f"   {line}"
+                                  for line in description.splitlines()),
+                        multiline=True)
+                print()
+            prompt_text = (
+                "Choices (comma-separated numbers, your own answer, "
+                "'d' declines, empty dismisses): "
+                if multi_select else
+                "Choice (number, your own answer, 'd' declines, "
+                "empty dismisses): ")
+            while True:
+                text = await modal.prompt(prompt_text)
+                if cancel_event is not None and cancel_event.is_set():
+                    return {"action": "cancelled"}
+                outcome = parse_ask_answer(
+                    text, labels, multi_select=multi_select)
+                if outcome is not None:
+                    return outcome
+                print("Not one of the offered choices; answer again, "
+                      "or leave empty to dismiss.")
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C dismisses the question (and the ordinary per-turn checks
+        # will see the cancel request); EOF means nobody is left to answer.
+        # The turn continues either way, never hung on a silent dialog.
+        return {"action": "cancelled"}
+
+
+def terminal_ask_user(session):
+    """The Ask seam for one input session; None when nobody can answer.
+
+    Mirrors the ACP front's capability gating: a noninteractive session has
+    no one at the keyboard, so the model is not offered the question tool
+    at all.
+    """
+    if not session.interactive:
+        return None
+
+    async def ask_user(question, options, *, multi_select=False):
+        return await run_ask_dialog_async(
+            session, session.reader.cancel_event, question, options,
+            multi_select=multi_select)
+
+    return ask_user
 
 
 def _render_control_result(result, as_json):
@@ -1688,7 +1795,8 @@ async def async_main(args) -> int:
                     current_transcript(),
                     cancel_check=lambda: session.reader.cancel_requested,
                     cancel_event=session.reader.cancel_event,
-                    turn_events=turn_events, ui_settings=ui_settings)
+                    turn_events=turn_events, ui_settings=ui_settings,
+                    ask_user=terminal_ask_user(session))
             except KeyboardInterrupt:
                 if turn_events is not None:
                     turn_events.append({"type": "response_cancelled"})
