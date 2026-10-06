@@ -81,7 +81,7 @@ class AsyncDBusWireClient:
         for level, ctype, data in ancdata:
             if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
                 for i in range(0, len(data), 4):
-                    self._fd_queue.append(struct.unpack("i", data[i : i + 4])[0])
+                    self._fd_queue.append(struct.unpack("i", data[i: i + 4])[0])
 
         self._recv_buf.extend(chunk)
 
@@ -117,7 +117,7 @@ class AsyncDBusWireClient:
     @classmethod
     def _encode_field(cls, code: int, sig: str, val: str) -> bytes:
         entry = bytearray([code, len(sig)]) + sig.encode("ascii") + b"\x00"
-        if sig in ("s", "o"):
+        if sig in ["s", "o"]:
             entry += b"\x00" * (-len(entry) % 4) + cls._encode_str(val)
         elif sig == "g":
             val_b = val.encode("ascii")
@@ -168,8 +168,8 @@ class AsyncDBusWireClient:
         msg_raw = self._recv_buf[:total_len]
         del self._recv_buf[:total_len]
 
-        fields_raw = msg_raw[16 : 16 + fields_len]
-        body_raw = msg_raw[16 + header_fields_padded : total_len]
+        fields_raw = msg_raw[16: 16 + fields_len]
+        body_raw = msg_raw[16 + header_fields_padded: total_len]
 
         return msg_type, serial, fields_raw, body_raw
 
@@ -197,7 +197,7 @@ class AsyncDBusWireClient:
                 err_msg = ""
                 if len(body_raw) >= 4:
                     str_len = struct.unpack("<I", body_raw[:4])[0]
-                    err_msg = body_raw[4 : 4 + str_len].decode("utf-8", errors="replace")
+                    err_msg = body_raw[4: 4 + str_len].decode("utf-8", errors="replace")
                 raise DbusError("D-Bus Error received", err_msg or repr(body_raw))
 
             if msg_type == 2:  # METHOD_RETURN
@@ -281,8 +281,8 @@ class PortalInhibitor:
         dict_entry = reason_bytes + var_sig + pad + val_bytes
 
         # Body: string window ("") + uint32 flags (12) + array length + dict_entry
-        body = AsyncDBusWireClient._encode_str("")                 # 5 bytes
-        body += b"\x00" * (-len(body) % 4) + struct.pack("<I", 12) # flags=12 (Suspend|Idle)
+        body = AsyncDBusWireClient._encode_str("")                  # 5 bytes
+        body += b"\x00" * (-len(body) % 4) + struct.pack("<I", 12)  # flags=12 (Suspend|Idle)
         body += b"\x00" * (-len(body) % 4) + struct.pack("<I", len(dict_entry)) + dict_entry
 
         reply_body = await self.client.call_method(
@@ -297,7 +297,7 @@ class PortalInhibitor:
         # Reply returns object path 'o' of the request handle
         if len(reply_body) >= 4:
             path_len = struct.unpack("<I", reply_body[:4])[0]
-            self.request_handle = reply_body[4 : 4 + path_len].decode("utf-8")
+            self.request_handle = reply_body[4: 4 + path_len].decode("utf-8")
             return self.request_handle
 
         raise RuntimeError("Portal returned invalid request handle")
@@ -342,7 +342,7 @@ class LogindInhibitor:
 
     async def inhibit(self, who: str, why: str, what: str = "idle:sleep", mode: str = "block") -> int:
         body = bytearray()
-        for s in (what, who, why, mode):
+        for s in [what, who, why, mode]:
             body += b"\x00" * (-len(body) % 4) + AsyncDBusWireClient._encode_str(s)
 
         await self.client.call_method(
