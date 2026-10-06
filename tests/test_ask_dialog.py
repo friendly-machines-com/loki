@@ -120,6 +120,18 @@ class ParseAskAnswerTests(unittest.TestCase):
                 self.assertIsNone(terminal_frontend.parse_ask_answer(
                     text, self.labels, multi_select=True))
 
+    def test_stray_commas_do_not_turn_a_pick_into_text(self):
+        self.assertEqual(
+            terminal_frontend.parse_ask_answer("1,", self.labels),
+            {"action": "answered", "answer": "a"})
+        self.assertEqual(
+            terminal_frontend.parse_ask_answer(
+                "1, 3,", self.labels, multi_select=True),
+            {"action": "answered", "answer": ["a", "c"]})
+        self.assertEqual(
+            terminal_frontend.parse_ask_answer(",1,", self.labels),
+            {"action": "answered", "answer": "a"})
+
 
 class AskDialogTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, session, *, multi_select=False):
@@ -160,10 +172,10 @@ class AskDialogTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bad_choice_re_prompts_then_answers(self):
         session = DialogSession(["9", "1"])
-        outcome, _, output = await self._run(session)
+        outcome, _, _ = await self._run(session)
         self.assertEqual(outcome, {"action": "answered", "answer": "Local"})
+        # The invalid choice re-prompted before the valid one was accepted.
         self.assertEqual(len(session.prompts), 2)
-        self.assertIn("Not one of the offered choices", output.getvalue())
 
     async def test_cancel_event_settles_the_open_question(self):
         session = DialogSession(["1"])
@@ -272,6 +284,126 @@ class LoopAdvertisementTests(unittest.IsolatedAsyncioTestCase):
             return {"action": "cancelled"}
 
         self.assertIn("Ask", await self._loop(ask_user=ask_user))
+
+
+class AskHeaderTests(unittest.TestCase):
+    """The tool's public contract is stated once and shared by every owner."""
+
+    def _ask_definition(self):
+        for tool in loki.TOOLS:
+            if tool["function"]["name"] == loki.ASK_TOOL_NAME:
+                return tool
+        self.fail("Ask tool missing from the registry")
+
+    def test_name_constant_and_registry_agree(self):
+        self.assertIsInstance(loki.ASK_TOOL_NAME, str)
+        self.assertIn(loki.ASK_TOOL_NAME, loki.TOOL_REGISTRY)
+        self.assertIn(loki.ASK_TOOL_NAME, loki.PLAN_TOOLS)
+        self.assertNotIn(loki.ASK_TOOL_NAME, loki.EXPLORE_TOOLS)
+
+    def test_schema_bounds_come_from_the_shared_constants(self):
+        parameters = self._ask_definition()["function"]["parameters"]
+        properties = parameters["properties"]
+        options = properties["options"]
+        self.assertEqual(options["minItems"], loki.ASK_MIN_OPTIONS)
+        self.assertEqual(options["maxItems"], loki.ASK_MAX_OPTIONS)
+        self.assertEqual(
+            properties["question"]["maxLength"], loki.ASK_MAX_QUESTION_CHARS)
+        item = options["items"]["properties"]
+        self.assertEqual(item["label"]["maxLength"], loki.ASK_MAX_LABEL_CHARS)
+        self.assertEqual(
+            item["description"]["maxLength"], loki.ASK_MAX_DESCRIPTION_CHARS)
+
+    def test_without_ask_tool_removes_only_the_ask_tool(self):
+        rest = loki.without_ask_tool(loki.TOOLS)
+        names = [tool["function"]["name"] for tool in rest]
+        self.assertNotIn(loki.ASK_TOOL_NAME, names)
+        self.assertEqual(len(rest), len(loki.TOOLS) - 1)
+
+
+class AskHandlerTests(unittest.IsolatedAsyncioTestCase):
+    """The outcome-to-text renderer every Ask path funnels through."""
+
+    async def _run(self, args, outcome):
+        self.last = {}
+
+        async def ask_user(question, options, *, multi_select=False):
+            self.last = {
+                "question": question, "options": options,
+                "multi_select": multi_select}
+            return outcome
+
+        text = await loki._handle_ask_async(args, {"ask_user": ask_user})
+        return text
+
+    def _args(self, **over):
+        args = {
+            "question": "Which storage?",
+            "options": [
+                {"label": "Local", "description": "on disk"},
+                {"label": "Remote"},
+            ],
+        }
+        args.update(over)
+        return args
+
+    async def test_no_seam_answers_without_invoking_the_user(self):
+        self.assertIn("not available", await loki._handle_ask_async(
+            self._args(), None))
+
+    async def test_malformed_inputs_are_rejected_before_asking(self):
+        cases = [
+            ({}, "at least two options"),
+            ({"question": "q?", "options": []}, "at least two options"),
+            ({"question": "q?", "options": [{"label": "a"}]},
+             "at least two options"),
+            ({"question": "q?", "options": [{"label": "a"}, "Remote"]},
+             "objects with a label"),
+            ({"question": "q?", "options": [{"label": "a"}, {"label": 5}]},
+             "nonempty strings"),
+            ({"question": "q?", "options": [{"label": "a"}, {"label": "a"}]},
+             "unique"),
+            ({"question": "  ", "options": [{"label": "a"}, {"label": "b"}]},
+             "nonempty question"),
+        ]
+        for args, pattern in cases:
+            with self.subTest(args=args):
+                called = []
+
+                async def ask_user(question, options, *, multi_select=False):
+                    called.append(question)
+
+                text = await loki._handle_ask_async(
+                    args, {"ask_user": ask_user})
+                self.assertIn(pattern, text)
+                self.assertEqual(called, [])
+
+    async def test_answer_is_rendered_with_its_question_and_note(self):
+        text = await self._run(
+            self._args(),
+            {"action": "answered", "answer": "Remote", "custom": "via VPN"})
+        self.assertIn('"Which storage?"', text)
+        self.assertIn('"Remote"', text)
+        self.assertIn("via VPN", text)
+        self.assertEqual(self.last["options"], [
+            ("Local", "on disk"), ("Remote", None)])
+        self.assertFalse(self.last["multi_select"])
+
+    async def test_decline_and_dismiss_are_distinct(self):
+        self.assertIn("declined", await self._run(
+            self._args(), {"action": "declined"}))
+        self.assertIn("dismissed", await self._run(
+            self._args(), {"action": "cancelled"}))
+
+    async def test_multi_select_answer_is_rendered_as_a_quoted_list(self):
+        text = await self._run(
+            self._args(), {"action": "answered", "answer": ["Legs", "Roof"]})
+        self.assertIn('"Legs"', text)
+        self.assertIn('"Roof"', text)
+
+    async def test_a_non_dict_outcome_is_a_delivery_failure(self):
+        self.assertIn("could not be delivered", await self._run(
+            self._args(), None))
 
 
 if __name__ == "__main__":

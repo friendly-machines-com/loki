@@ -3123,13 +3123,22 @@ async def _handle_ask_async(args: dict, extra_context=None) -> str:
         return (
             "Ask is not available in this session: it has no interactive "
             "user who could answer.")
-    options = args["options"]
-    if len(options) < 2:
+    options = args.get("options")
+    if not isinstance(options, list) or len(options) < 2:
         return "Ask requires at least two options."
-    labels = [option["label"] for option in options]
+    labels = []
+    for option in options:
+        if not isinstance(option, dict):
+            return "Ask options must be objects with a label."
+        label = option.get("label")
+        if not isinstance(label, str) or not label.strip():
+            return "Ask option labels must be nonempty strings."
+        labels.append(label)
     if len(set(labels)) != len(labels):
         return "Ask option labels must be unique so an answer is unambiguous."
-    question = args["question"]
+    question = args.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return "Ask requires a nonempty question."
     outcome = await asker(
         question,
         [(option["label"], option.get("description")) for option in options],
@@ -3659,9 +3668,7 @@ async def run_tool_loop_async(
         if ask_user is None:
             # Without an interactive seam there is nobody to answer, so
             # the model is never offered the question tool at all.
-            advertised_tools = [
-                tool for tool in advertised_tools
-                if tool["function"]["name"] != "Ask"]
+            advertised_tools = without_ask_tool(advertised_tools)
 
         def chat_fn(items, on_text_delta=None, *, codex_turn_state, on_reasoning_delta=None):
             kwargs = {
@@ -4682,6 +4689,29 @@ async def run_websearch_async(query: str, allowed_domains: list = None,
     return "\n".join(out_lines)
 
 
+# Ask is the one tool whose response comes from a person, not a process or
+# the network. The bounds below are its public contract, stated here once
+# and reused by the tool schema and the ACP front's validation.
+ASK_TOOL_NAME = "Ask"
+ASK_MIN_OPTIONS = 2
+ASK_MAX_OPTIONS = 8
+ASK_MAX_QUESTION_CHARS = 4000
+ASK_MAX_LABEL_CHARS = 200
+ASK_MAX_DESCRIPTION_CHARS = 1000
+
+
+def without_ask_tool(tools):
+    """Tool definitions with the question tool removed.
+
+    The Ask tool is advertised exactly when the caller can put a question
+    to a user; seam-less callers (headless, subagents) must not offer a
+    tool that would always fail.
+    """
+    return [
+        tool for tool in tools
+        if tool["function"]["name"] != ASK_TOOL_NAME]
+
+
 TOOLS = [
     {
         "type": "function",
@@ -5111,13 +5141,13 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "Ask",
+            "name": ASK_TOOL_NAME,
             "description": "\n".join([
                 "Asks the user one multiple-choice question and waits for the answer.",
                 "",
                 "Use this when a decision, preference, or missing detail changes what you do next and you cannot determine it yourself. Do not use it to ask permission for work you can simply do, and do not ask what you can already infer from the conversation.",
                 "",
-                "- Offer 2-8 concrete, mutually distinct options. The user can always answer with their own text instead of an option.",
+                f"- Offer {ASK_MIN_OPTIONS}-{ASK_MAX_OPTIONS} concrete, mutually distinct options. The user can always answer with their own text instead of an option.",
                 "- Set multi_select only when the choices are not mutually exclusive.",
                 "- If you recommend an option, list it first and say why in its description.",
                 "- The user may decline or dismiss the question. Either way the turn continues without an answer; neither response is consent.",
@@ -5126,23 +5156,25 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "question": {
-                        "type": "string", "minLength": 1, "maxLength": 4000,
+                        "type": "string", "minLength": 1,
+                        "maxLength": ASK_MAX_QUESTION_CHARS,
                         "description": "The question to ask, phrased so it ends with a question mark"},
                     "options": {
                         "type": "array",
+                        "minItems": ASK_MIN_OPTIONS,
+                        "maxItems": ASK_MAX_OPTIONS,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "label": {
-                                    "type": "string", "minLength": 1, "maxLength": 200,
+                                    "type": "string", "minLength": 1, "maxLength": ASK_MAX_LABEL_CHARS,
                                     "description": "The answer text, shown as the option's name"},
                                 "description": {
-                                    "type": "string", "maxLength": 1000,
+                                    "type": "string", "maxLength": ASK_MAX_DESCRIPTION_CHARS,
                                     "description": "One line explaining what choosing this option means"}
                             },
                             "required": ["label"]
                         },
-                        "maxItems": 8,
                         "description": "The answer choices; at least two are required."
                     },
                     "multi_select": {
@@ -5207,7 +5239,7 @@ TOOL_HANDLERS = {
     "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
     # A question has no side effects, and plan mode is exactly where "which
     # approach?" decisions arise, so Ask joins PLAN_TOOLS (never EXPLORE).
-    "Ask": {"async_handler": _handle_ask_async, "plan": True},
+    ASK_TOOL_NAME: {"async_handler": _handle_ask_async, "plan": True},
 }
 TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]

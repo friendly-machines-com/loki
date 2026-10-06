@@ -31,7 +31,19 @@ from .connections import (
     connection_display_fields,
 )
 from .credentials import CredentialStore
-from .loki import CHAT_LOG_DIR, chat_log_dir_for
+# The Ask bounds are the tool's public contract and live with the tool
+# definition; the front validates against the same values instead of
+# restating them. Model-authored questions are rendered by the client,
+# so the caps exist to bound what the front will carry at all.
+from .loki import (
+    ASK_MAX_DESCRIPTION_CHARS,
+    ASK_MAX_LABEL_CHARS,
+    ASK_MAX_OPTIONS,
+    ASK_MAX_QUESTION_CHARS,
+    ASK_MIN_OPTIONS,
+    CHAT_LOG_DIR,
+    chat_log_dir_for,
+)
 from .runtime_isolation import RuntimeIsolationError
 
 logger = logging.getLogger(__name__)
@@ -53,14 +65,6 @@ RESTORE_METHODS = (
     "session/load",
     "session/resume",
 )
-
-# Bounds for one model-authored question. The question and its options are
-# model output rendered by the client, so their size is capped before the
-# front will carry them.
-MAX_ASK_QUESTION_CHARS = 4000
-MAX_ASK_OPTIONS = 8
-MAX_ASK_LABEL_CHARS = 200
-MAX_ASK_DESCRIPTION_CHARS = 1000
 
 
 class WorkerChannel:
@@ -162,6 +166,15 @@ class WorkerChannel:
                         # requests dispatch there instead of forward.
                         if self.reverse_handler is not None:
                             self.reverse_handler(message)
+                        else:
+                            # No handler is a front bug, and a worker bug must
+                            # surface as an answer, never as a dropped message
+                            # that leaves the worker awaiting a reply forever.
+                            await self.respond(request_id, error={
+                                "code": acps.METHOD_NOT_FOUND,
+                                "message": (
+                                    "front cannot accept worker requests"),
+                            })
                         continue
                     # Only notifications belong on the outward channel.
                     self.forward(message)
@@ -653,7 +666,7 @@ class Front:
             task = self._start_task(
                 self._run_request_input(
                     request_id, message.get("params") or {}, owner=owner),
-                name=f"acp-worker-ask-{request_id}", owner=owner)
+                name=f"acp-worker-{request_id}", owner=owner)
             owner.pending_asks.add(task)
             task.add_done_callback(owner.pending_asks.discard)
             return
@@ -710,10 +723,10 @@ class Front:
                 code=acps.INVALID_PARAMS)
         question = params.get("question")
         if (not isinstance(question, str) or not question.strip()
-                or len(question) > MAX_ASK_QUESTION_CHARS):
+                or len(question) > ASK_MAX_QUESTION_CHARS):
             raise acps.TransportError(
                 "model question must be a nonempty string of at most "
-                f"{MAX_ASK_QUESTION_CHARS} characters",
+                f"{ASK_MAX_QUESTION_CHARS} characters",
                 code=acps.INVALID_PARAMS)
         multi_select = params.get("multiSelect", False)
         if multi_select not in [True, False]:
@@ -722,9 +735,10 @@ class Front:
                 code=acps.INVALID_PARAMS)
         raw_options = params.get("options")
         if (not isinstance(raw_options, list)
-                or not 2 <= len(raw_options) <= MAX_ASK_OPTIONS):
+                or not ASK_MIN_OPTIONS <= len(raw_options) <= ASK_MAX_OPTIONS):
             raise acps.TransportError(
-                f"model question requires 2 to {MAX_ASK_OPTIONS} options",
+                f"model question requires {ASK_MIN_OPTIONS} to "
+                f"{ASK_MAX_OPTIONS} options",
                 code=acps.INVALID_PARAMS)
         options = []
         for option in raw_options:
@@ -734,18 +748,18 @@ class Front:
                     code=acps.INVALID_PARAMS)
             label = option.get("label")
             if (not isinstance(label, str) or not label.strip()
-                    or len(label) > MAX_ASK_LABEL_CHARS):
+                    or len(label) > ASK_MAX_LABEL_CHARS):
                 raise acps.TransportError(
                     "model question option labels must be nonempty strings"
-                    f" of at most {MAX_ASK_LABEL_CHARS} characters",
+                    f" of at most {ASK_MAX_LABEL_CHARS} characters",
                     code=acps.INVALID_PARAMS)
             description = option.get("description")
             if description is not None and (
                     not isinstance(description, str)
-                    or len(description) > MAX_ASK_DESCRIPTION_CHARS):
+                    or len(description) > ASK_MAX_DESCRIPTION_CHARS):
                 raise acps.TransportError(
                     "model question option descriptions must be strings of "
-                    f"at most {MAX_ASK_DESCRIPTION_CHARS} characters",
+                    f"at most {ASK_MAX_DESCRIPTION_CHARS} characters",
                     code=acps.INVALID_PARAMS)
             options.append((label, description))
         # The answer value is the label itself, so equal labels would make

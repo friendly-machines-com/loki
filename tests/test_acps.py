@@ -4187,6 +4187,13 @@ class _AskLoopProcess:
             message = json.loads(line)
             if message.get("method") is not None:
                 self.methods.append(message["method"])
+                if message["method"] != "session/cancel":
+                    # A new front->worker method flowing through this harness
+                    # would be silently no-oped below; fail loud instead so
+                    # the test author answers it deliberately.
+                    raise AssertionError(
+                        "test harness received unhandled front->worker "
+                        f"method {message['method']!r}")
                 self._feed(acps.response(message["id"], result={}))
             else:
                 self.replies.append(message)
@@ -4413,9 +4420,41 @@ class WorkerAskElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_reverse_reply_is_discarded(self):
         async with self._roundtrip() as (front, process, messages):
             worker = process.worker
-            process._feed(acps.response("ask-999", result={"action": "x"}))
-            await asyncio.sleep(0.05)
+            ask_task = asyncio.create_task(worker._ask_user(
+                "Proceed?", [("Yes", None), ("No", None)]))
+            elicitation = await self._next_elicitation(
+                messages, self._seen_elicitations)
+            front.handle(acps.response(elicitation["id"], result={
+                "action": "accept", "content": {"answer": "Yes"}}))
+            self.assertEqual(
+                await asyncio.wait_for(ask_task, 3),
+                {"action": "answered", "answer": "Yes"})
+            # The reverse request was settled and removed. A second response
+            # for it is a deterministic no-op: nothing raises, nothing stays
+            # pending.
+            reverse_id = process.replies[0]["id"]
+            worker.resolve_reverse(
+                reverse_id, {"result": {"action": "answered", "answer": "x"}})
             self.assertEqual(worker._reverse_requests, {})
+
+    async def test_worker_request_without_handler_is_refused(self):
+        # A channel built without a reverse handler must answer a worker
+        # request with an error, never drop it and leave the worker waiting.
+        process = _AskLoopProcess()
+        channel = acp.WorkerChannel("s", process, lambda message: None, None)
+        try:
+            process._feed(acps.request(
+                "ask-7", "session/request_input", {
+                    "question": "q?",
+                    "options": [{"label": "a"}, {"label": "b"}]}))
+            async with asyncio.timeout(3):
+                while not process.replies:
+                    await asyncio.sleep(0.01)
+            error = process.replies[0]["error"]
+            self.assertEqual(error["code"], acps.METHOD_NOT_FOUND)
+            self.assertIn("cannot accept", error["message"])
+        finally:
+            await channel.close()
 
     async def test_close_fails_a_pending_question(self):
         async with self._roundtrip() as (front, process, messages):

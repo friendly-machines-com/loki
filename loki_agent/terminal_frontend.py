@@ -778,9 +778,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     if ask_user is None:
         # Same rule as run_tool_loop_async: without somebody to answer, the
         # model is never offered the question tool at all.
-        active_tools = [
-            tool for tool in active_tools
-            if tool["function"]["name"] != "Ask"]
+        active_tools = _core.without_ask_tool(active_tools)
 
     async def chat_fn(
             items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
@@ -1081,7 +1079,9 @@ def parse_ask_answer(text, labels, *, multi_select=False):
     shape, or None when the input names no offered choice (out of range,
     duplicated, or more than one number for a single-select) and the dialog
     should re-prompt. An empty answer dismisses the question and "d" declines
-    it; both are answers, not errors.
+    it; both are answers, not errors. Comma-separated numbers are picks, and
+    stray commas around them are ignored; any non-numeric text is the user's
+    own answer.
     """
     text = (text or "").strip()
     if not text:
@@ -1090,12 +1090,14 @@ def parse_ask_answer(text, labels, *, multi_select=False):
         return {"action": "declined"}
     indexes = []
     for part in (chunk.strip() for chunk in text.split(",")):
+        if not part:
+            continue
         try:
             indexes.append(int(part))
         except ValueError:
             indexes = None
             break
-    if indexes is not None:
+    if indexes:
         if any(not 1 <= index <= len(labels) for index in indexes):
             return None
         if len(set(indexes)) != len(indexes):

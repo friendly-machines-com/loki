@@ -761,11 +761,7 @@ class Worker:
         """
         if self.can_ask_user:
             return loki.TOOLS, None
-        return (
-            [tool for tool in loki.TOOLS
-             if tool["function"]["name"] != "Ask"],
-            "Ask",
-        )
+        return loki.without_ask_tool(loki.TOOLS), loki.ASK_TOOL_NAME
 
     async def _ask_user(self, question: str, options: list, *,
                         multi_select: bool = False) -> dict:

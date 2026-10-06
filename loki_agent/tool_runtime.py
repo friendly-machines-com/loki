@@ -24,7 +24,7 @@ class HookExecutionError(RuntimeError):
 SCHEMA_ANNOTATION_KEYS = {"description", "default", "format"}
 SCHEMA_VALIDATION_KEYS = {
     "type", "properties", "required", "additionalProperties", "enum", "items",
-    "minLength", "maxLength", "minimum", "maximum", "maxItems",
+    "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems",
 }
 SCHEMA_ALLOWED_KEYS = SCHEMA_ANNOTATION_KEYS | SCHEMA_VALIDATION_KEYS
 
@@ -196,6 +196,15 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
                     subschema, value[key], list(path) + [key]))
 
     if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            issues.append(ValidationIssue(
+                list(path),
+                "min_items",
+                f"{format_path(path)} must contain at least "
+                f"{schema['minItems']} items",
+                expected=schema["minItems"],
+                actual_type="array",
+            ))
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             issues.append(ValidationIssue(
                 list(path),
