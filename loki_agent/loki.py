@@ -536,8 +536,8 @@ else:
         try:
             sddl = windows_api.dacl_sddl(file_path)
         except windows_api.WindowsApiError as error:
-            if error.status in (windows_api.ERROR_FILE_NOT_FOUND,
-                                windows_api.ERROR_PATH_NOT_FOUND):
+            if error.status in [windows_api.ERROR_FILE_NOT_FOUND,
+                                windows_api.ERROR_PATH_NOT_FOUND]:
                 # A destination that does not exist yet keeps the inherited
                 # default DACL; any other read failure must not be papered over.
                 return
@@ -689,9 +689,9 @@ def _bool_setting(name, default, credentials):
     if not value:
         return default
     normalized = value.strip().lower()
-    if normalized in ("1", "true", "yes", "on"):
+    if normalized in ["1", "true", "yes", "on"]:
         return True
-    if normalized in ("0", "false", "no", "off"):
+    if normalized in ["0", "false", "no", "off"]:
         return False
     raise ValueError(
         f"{name} must be one of: 1, 0, true, false, yes, no, on, off")
@@ -1631,7 +1631,7 @@ def _write_destination(file_path: str) -> str:
         observed = os.stat(file_path)
     except FileNotFoundError:
         directory, name = os.path.split(file_path)
-        if name in ('', '.', '..'):
+        if name in ['', '.', '..']:
             raise
         parent = _write_destination(directory or '.')
         try:
@@ -1662,7 +1662,7 @@ def _atomic_write_text(file_path: str, content: str):
     # target hand one that is not itself a link.
     directory, name = os.path.split(file_path)
     directory = directory or '.'
-    if not name or name in ('.', '..'):
+    if not name or name in ['.', '..']:
         raise IsADirectoryError(file_path)
     # Capture the desired final mode BEFORE writing so a write/replace failure
     # can never leave the public path's mode corrupted. For an existing file we
@@ -2105,7 +2105,7 @@ class JobManager:
                         )
                     else:
                         child_ends = [
-                            end for end in (owner_child, credential_child)
+                            end for end in [owner_child, credential_child]
                             if end is not None]
                         proc = await asyncio.create_subprocess_exec(
                             *spawn_command,
@@ -2532,7 +2532,7 @@ class JobManager:
             return f"Error: unknown job id {job_id!r}"
         # This whole transition contains no await, so the event-loop reaper
         # cannot run between signal dispatch and the new state being recorded.
-        if job.status not in ("running", "stopping"):
+        if job.status not in ["running", "stopping"]:
             return f"Job {job.id} is not running (status={job.status})."
         if job.status == "stopping" and not force:
             return (
@@ -3565,7 +3565,7 @@ def _last_user_question(transcript_items: list) -> bool:
 
 def get_tool_loop_extra_context(transcript_items: list):
     inhibit_edits = False
-    if current_agent_mode() in ("explore", "plan"):
+    if current_agent_mode() in ["explore", "plan"]:
         inhibit_edits = f"{current_agent_mode()} mode"
     if _last_user_question(transcript_items):
         inhibit_edits = "answering the user's question"
@@ -3601,7 +3601,7 @@ def record_agent_mode_instruction():
 
 def _turn_is_refusal(turn: formats.DecodedTurn) -> bool:
     stop_reason = str(turn.metadata.get("stop_reason") or "").lower()
-    if stop_reason in ("refusal", "content_filter", "safety"):
+    if stop_reason in ["refusal", "content_filter", "safety"]:
         return True
     for item in turn.items:
         if item.get("type") != "message":
@@ -3614,10 +3614,10 @@ def _turn_is_refusal(turn: formats.DecodedTurn) -> bool:
     protocol_data = turn.metadata.get("protocol_data")
     if isinstance(protocol_data, dict):
         encoded = json.dumps(protocol_data, default=str).lower()
-        if any(marker in encoded for marker in (
+        if any(marker in encoded for marker in [
                 '"reason": "content_filter"',
                 '"reason": "refusal"',
-                '"reason": "safety"')):
+                '"reason": "safety"']):
             return True
     return False
 
@@ -5330,7 +5330,7 @@ def _opencode_session_id_for_request(
         canonical_target = (
             parsed.scheme.lower() == "https"
             and parsed.hostname == "opencode.ai"
-            and parsed.port in (None, 443)
+            and parsed.port in [None, 443]
             and parsed.username is None
             and parsed.password is None
             and parsed.path.rstrip("/") in _OPENCODE_GO_INFERENCE_PATHS
@@ -5545,7 +5545,7 @@ def _stream_body_kind(content_type, first_chunk):
     media_type = content_type.partition(";")[0].strip().lower()
     if media_type == "text/event-stream":
         return "sse"
-    if media_type in ("application/json", "application/problem+json"):
+    if media_type in ["application/json", "application/problem+json"]:
         return "json"
     return "json"
 
@@ -5672,7 +5672,7 @@ async def _async_chat_stream_request_once(
                         accumulator.finish(),
                         effective_model=observed_model(),
                         reasoning_field=getattr(accumulator, "reasoning_field", None),
-                        notice_codes=tuple(
+                        notice_codes=list(
                             getattr(accumulator, "notice_codes", ())),
                     )
             while True:
@@ -5688,7 +5688,7 @@ async def _async_chat_stream_request_once(
                             accumulator.finish(),
                             effective_model=observed_model(),
                             reasoning_field=getattr(accumulator, "reasoning_field", None),
-                            notice_codes=tuple(
+                            notice_codes=list(
                                 getattr(
                                     accumulator, "notice_codes", ())),
                         )
@@ -5698,7 +5698,7 @@ async def _async_chat_stream_request_once(
                         accumulator.finish(),
                         effective_model=observed_model(),
                         reasoning_field=getattr(accumulator, "reasoning_field", None),
-                        notice_codes=tuple(
+                        notice_codes=list(
                             getattr(accumulator, "notice_codes", ())),
                     )
         except StreamCancelled:
@@ -5719,7 +5719,7 @@ async def _async_chat_stream_request_once(
             accumulator.finish(),
             effective_model=observed_model(),
             reasoning_field=getattr(accumulator, "reasoning_field", None),
-            notice_codes=tuple(
+            notice_codes=list(
                 getattr(accumulator, "notice_codes", ())),
         )
 
@@ -6233,7 +6233,7 @@ def _parse_cd_arg_text(arg_text: str) -> str:
     """
     target = arg_text.strip()
     if (len(target) >= 2 and target[0] == target[-1]
-            and target[0] in ("'", '"')):
+            and target[0] in ["'", '"']):
         target = target[1:-1]
     return target
 

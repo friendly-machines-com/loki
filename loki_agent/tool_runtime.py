@@ -99,7 +99,7 @@ def _expected_types(schema, path):
 
 @dataclass(frozen=True)
 class ValidationIssue:
-    path: tuple
+    path: list
     code: str
     message: str
     expected: object = None
@@ -136,7 +136,7 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
         expected_label = " or ".join(expected_types)
         actual_type = json_type_name(value)
         return [ValidationIssue(
-            tuple(path),
+            list(path),
             "type",
             f"{format_path(path)} must be {expected_label}, "
             f"got {actual_type}",
@@ -148,7 +148,7 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
     if "enum" in schema and value not in schema["enum"]:
         allowed = ", ".join(repr(item) for item in schema["enum"])
         issues.append(ValidationIssue(
-            tuple(path),
+            list(path),
             "enum",
             f"{format_path(path)} must be one of: {allowed}",
             expected=copy.deepcopy(schema["enum"]),
@@ -167,7 +167,7 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
                 f"{format_path(path)}: required must be a list of strings")
         for key in required:
             if key not in value:
-                child_path = tuple(path) + (key,)
+                child_path = list(path) + [key]
                 issues.append(ValidationIssue(
                     child_path,
                     "required",
@@ -178,7 +178,7 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
         additional = schema.get("additionalProperties", True)
         if additional is False:
             for key in sorted(set(value) - set(properties)):
-                child_path = tuple(path) + (key,)
+                child_path = list(path) + [key]
                 issues.append(ValidationIssue(
                     child_path,
                     "additional_property",
@@ -193,12 +193,12 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
         for key, subschema in properties.items():
             if key in value:
                 issues.extend(validate_schema(
-                    subschema, value[key], tuple(path) + (key,)))
+                    subschema, value[key], list(path) + [key]))
 
     if isinstance(value, list):
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             issues.append(ValidationIssue(
-                tuple(path),
+                list(path),
                 "max_items",
                 f"{format_path(path)} must contain at most "
                 f"{schema['maxItems']} items",
@@ -208,12 +208,12 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
         if "items" in schema:
             for index, item in enumerate(value):
                 issues.extend(validate_schema(
-                    schema["items"], item, tuple(path) + (index,)))
+                    schema["items"], item, list(path) + [index]))
 
     if isinstance(value, str):
         if "minLength" in schema and len(value) < schema["minLength"]:
             issues.append(ValidationIssue(
-                tuple(path),
+                list(path),
                 "min_length",
                 f"{format_path(path)} must be at least "
                 f"{schema['minLength']} characters",
@@ -222,7 +222,7 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
             ))
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             issues.append(ValidationIssue(
-                tuple(path),
+                list(path),
                 "max_length",
                 f"{format_path(path)} must be at most "
                 f"{schema['maxLength']} characters",
@@ -233,7 +233,7 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
             issues.append(ValidationIssue(
-                tuple(path),
+                list(path),
                 "minimum",
                 f"{format_path(path)} must be >= {schema['minimum']}",
                 expected=schema["minimum"],
@@ -241,7 +241,7 @@ def validate_schema(schema: dict, value, path=()) -> list[ValidationIssue]:
             ))
         if "maximum" in schema and value > schema["maximum"]:
             issues.append(ValidationIssue(
-                tuple(path),
+                list(path),
                 "maximum",
                 f"{format_path(path)} must be <= {schema['maximum']}",
                 expected=schema["maximum"],
@@ -289,7 +289,7 @@ def _remove_at(value, path):
 def _semantic_issues(value, semantics):
     issues = []
     for raw_path, semantic in (semantics or {}).items():
-        path = tuple(raw_path)
+        path = list(raw_path)
         if semantic != FILESYSTEM_PATH:
             raise ToolSchemaError(
                 f"unsupported argument semantic {semantic!r} at "
@@ -322,7 +322,7 @@ def validate_tool_input(schema, value, semantics=None):
 class ToolAdjustment:
     hook: str
     rule: str
-    path: tuple
+    path: list
     operation: str
     value: object = None
 
@@ -335,7 +335,7 @@ class ToolAdjustment:
             "operation": self.operation,
         }
         # The operation owns value presence; None is a valid JSON replacement.
-        if self.operation in ("add", "replace"):
+        if self.operation in ["add", "replace"]:
             result["value"] = copy.deepcopy(self.value)
         return result
 
@@ -442,28 +442,28 @@ def repair_tool_input(schema, value, semantics=None,
 def diff_values(before, after, hook_id, path=()):
     if type(before) is not type(after):
         return [ToolAdjustment(
-            hook_id, "custom_hook", tuple(path), "replace", after)]
+            hook_id, "custom_hook", list(path), "replace", after)]
     if isinstance(before, dict):
         changes = []
         for key in sorted(set(before) - set(after)):
             changes.append(ToolAdjustment(
-                hook_id, "custom_hook", tuple(path) + (key,), "remove"))
+                hook_id, "custom_hook", list(path) + [key], "remove"))
         for key in sorted(set(after) - set(before)):
             changes.append(ToolAdjustment(
-                hook_id, "custom_hook", tuple(path) + (key,),
+                hook_id, "custom_hook", list(path) + [key],
                 "add", after[key]))
         for key in sorted(set(before) & set(after)):
             changes.extend(diff_values(
-                before[key], after[key], hook_id, tuple(path) + (key,)))
+                before[key], after[key], hook_id, list(path) + [key]))
         return changes
     if isinstance(before, list):
         if before == after:
             return []
         return [ToolAdjustment(
-            hook_id, "custom_hook", tuple(path), "replace", after)]
+            hook_id, "custom_hook", list(path), "replace", after)]
     if before != after:
         return [ToolAdjustment(
-            hook_id, "custom_hook", tuple(path), "replace", after)]
+            hook_id, "custom_hook", list(path), "replace", after)]
     return []
 
 
@@ -891,8 +891,8 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
 @dataclass
 class ExternalHook:
     hook_id: str
-    tools: tuple
-    command: tuple
+    tools: list
+    command: list
     timeout_ms: int
     workspace_side_effects: bool = False
     event_name: str = "pre_tool_call"
@@ -1006,8 +1006,8 @@ def _external_hook_from_dict(
             f"{path}.on_error must be 'deny' or 'continue'")
     return ExternalHook(
         hook_id,
-        tuple(tools),
-        tuple(command),
+        list(tools),
+        list(command),
         timeout_ms,
         workspace_side_effects=side_effects,
         stderr_reporter=stderr_reporter,

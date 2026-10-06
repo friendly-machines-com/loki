@@ -265,7 +265,7 @@ class ReferenceTests(unittest.TestCase):
         if os.name != "posix":
             endpoint = host_ipc.PipeEndpoint(read=0x11, write=0x22)
             rebuilt = host_ipc.child_endpoint(host_ipc.reference(endpoint))
-            self.assertEqual(rebuilt.handles(), (0x11, 0x22))
+            self.assertEqual(rebuilt.handles(), [0x11, 0x22])
             return
         reader, writer = os.pipe()
         self.addCleanup(os.close, reader)
@@ -283,7 +283,7 @@ class ReferenceTests(unittest.TestCase):
             self.assertEqual(
                 startup.lpAttributeList["handle_list"], [0x21, 0x22])
             return
-        self.assertEqual(host_ipc.spawn_kwargs((4, 7)), {"pass_fds": (4, 7)})
+        self.assertEqual(host_ipc.spawn_kwargs((4, 7)), {"pass_fds": [4, 7]})
 
     def test_a_descriptor_that_was_not_inherited_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -295,18 +295,18 @@ class PipeEndpointTests(unittest.TestCase):
 
     def test_reference_round_trips_both_directions(self):
         endpoint = host_ipc.PipeEndpoint(read=0x11, write=0x22)
-        self.assertEqual(endpoint.handles(), (0x11, 0x22))
+        self.assertEqual(endpoint.handles(), [0x11, 0x22])
         self.assertEqual(endpoint.reference(), "r=17,w=34")
         rebuilt = host_ipc.PipeEndpoint.parse("r=17,w=34")
-        self.assertEqual(rebuilt.handles(), (0x11, 0x22))
+        self.assertEqual(rebuilt.handles(), [0x11, 0x22])
 
     def test_a_unidirectional_endpoint_round_trips(self):
         endpoint = host_ipc.PipeEndpoint(read=0x5)
-        self.assertEqual(endpoint.handles(), (0x5,))
+        self.assertEqual(endpoint.handles(), [0x5])
         self.assertEqual(host_ipc.PipeEndpoint.parse("r=5").read, 0x5)
 
     def test_malformed_references_are_refused(self):
-        for value in ("", "5", "r=", "r=0", "x=5", "r=1,r=2", "r=1,w=2,z=3"):
+        for value in ["", "5", "r=", "r=0", "x=5", "r=1,r=2", "r=1,w=2,z=3"]:
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     host_ipc.PipeEndpoint.parse(value)

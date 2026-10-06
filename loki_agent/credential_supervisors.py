@@ -125,7 +125,7 @@ class RuntimeDelegation:
                 credential_child,
             )
         except BaseException:
-            for end in (owner_parent, owner_child, credential_child):
+            for end in [owner_parent, owner_child, credential_child]:
                 if end is not None:
                     with contextlib.suppress(OSError):
                         host_ipc.close_end(end)
@@ -149,7 +149,7 @@ class RuntimeDelegation:
 
     def child_spawned(self) -> None:
         """Close the supervisor's copies of the ends the child owns."""
-        for attribute in ("owner_child", "credential_child"):
+        for attribute in ["owner_child", "credential_child"]:
             end = getattr(self, attribute)
             setattr(self, attribute, None)
             if end is not None:

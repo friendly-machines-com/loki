@@ -15,17 +15,17 @@ class GlobTests(unittest.TestCase):
     def test_advertised_options_discover_read_and_reap_real_jobs(self):
         definition = next(tool['function'] for tool in loki.TOOLS
                           if tool['function']['name'] == 'Glob')
-        for name in ('hidden', 'no_ignore'):
+        for name in ['hidden', 'no_ignore']:
             prop = definition['parameters']['properties'][name]
             self.assertEqual(prop['type'], 'boolean')
             self.assertIs(prop['default'], False)
             self.assertNotIn(name, definition['parameters']['required'])
 
-        for asynchronous in (False, True):
-            for options in ({}, {'hidden': False, 'no_ignore': False},
+        for asynchronous in [False, True]:
+            for options in [{}, {'hidden': False, 'no_ignore': False},
                             {'hidden': False, 'no_ignore': True},
                             {'hidden': True, 'no_ignore': False},
-                            {'hidden': True, 'no_ignore': True}):
+                            {'hidden': True, 'no_ignore': True}]:
                 with self.subTest(asynchronous=asynchronous, options=options), \
                         tempfile.TemporaryDirectory() as directory:
                     workspace = Path(directory) / 'workspace'

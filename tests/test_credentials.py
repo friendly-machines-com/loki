@@ -114,7 +114,7 @@ class CredentialStoreTests(unittest.TestCase):
 
         _validate_entries_in_range(matches, 100, 121)
 
-        for low, high in [(101, 121), (100, 120)]:
+        for low, high in ((101, 121), (100, 120)):
             with self.subTest(low=low, high=high):
                 with self.assertRaises(CredentialScrubError):
                     _validate_entries_in_range(matches, low, high)

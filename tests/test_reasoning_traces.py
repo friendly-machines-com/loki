@@ -214,7 +214,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(visible, ["before", "middle", "after"] if visibility == "on" else ["before\nafter"])
 
     async def test_partial_thinking_closes_without_persisting_transport_fragments(self):
-        for exception in [loki.StreamCancelled(), protocols.StreamProtocolError("broken"), asyncio.CancelledError()]:
+        for exception in (loki.StreamCancelled(), protocols.StreamProtocolError("broken"), asyncio.CancelledError()):
             events, transcript = [], []
 
             async def chat(items, on_text_delta, *, codex_turn_state, on_reasoning_delta):

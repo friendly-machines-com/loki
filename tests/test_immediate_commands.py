@@ -745,7 +745,7 @@ class ImmediateQueueTests(unittest.TestCase):
     def test_queue_images_delete_and_move_keep_the_status_count(self):
         async def script(session):
             staged = terminal_frontend._queued_inputs.staged_images
-            for name in ("a.png", "b.png", "c.png"):
+            for name in ["a.png", "b.png", "c.png"]:
                 terminal_frontend._queued_inputs.stage_image(types.SimpleNamespace(
                     path=f"/tmp/{name}", media_type="image/png",
                     byte_size=len(name)))

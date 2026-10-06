@@ -124,7 +124,7 @@ def _epoch_text(value) -> str | None:
 def _expiry_text(value) -> str:
     moment = _parse_time(value)
     if moment is None:
-        return "no expiry" if value in (None, "") else f"expires {_text(value)}"
+        return "no expiry" if value in [None, ""] else f"expires {_text(value)}"
     now = datetime.datetime.now(datetime.timezone.utc)
     seconds = (moment - now).total_seconds()
     if seconds <= 0:
@@ -166,7 +166,7 @@ def _auth_specs(context):
 
 
 def _refused_payload(payload) -> bool:
-    return isinstance(payload, dict) and payload.get("code") in (1001, 1003)
+    return isinstance(payload, dict) and payload.get("code") in [1001, 1003]
 
 
 async def _authorized_json(context, method, url, *, body=None,
@@ -183,7 +183,7 @@ async def _authorized_json(context, method, url, *, body=None,
             context, spec, method, url,
             body=body, content_type=content_type,
             retry_max_attempts=attempts)
-        if response.status in (401, 403):
+        if response.status in [401, 403]:
             # Refused at the HTTP layer; json_document would treat this as
             # a hard error, but another style may still be accepted.
             continue
@@ -314,7 +314,7 @@ async def _read_usage(context) -> provider_controls.ControlResult:
     payload, style = await _authorized_json(context, "GET", url)
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     return provider_controls.ControlResult(
-        lines=tuple(_usage_lines(data)),
+        lines=list(_usage_lines(data)),
         document={
             "endpoint": url,
             "auth": style,
@@ -341,13 +341,13 @@ async def _read_resets(context) -> provider_controls.ControlResult:
                 actions.append(
                     _use_action(context, reset_type, label, card))
     return provider_controls.ControlResult(
-        lines=tuple(_reset_lines(data)),
+        lines=list(_reset_lines(data)),
         document={
             "endpoint": url,
             "auth": style,
             "cards": documents,
         },
-        actions=tuple(actions),
+        actions=list(actions),
     )
 
 

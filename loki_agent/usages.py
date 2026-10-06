@@ -18,7 +18,7 @@ class ContextCapacity:
     def __post_init__(self):
         if token_count(self.tokens) is None or self.tokens == 0:
             raise ValueError("context capacity must be a positive integer")
-        if self.source not in ("configured", "models.dev", "openai-subscription"):
+        if self.source not in ["configured", "models.dev", "openai-subscription"]:
             raise ValueError("unknown context capacity source")
 
     def to_dict(self):
@@ -56,7 +56,7 @@ def normalize_usage(protocol, raw):
     if protocol == formats.OPENAI_CHAT:
         input_tokens = token_count(raw.get("prompt_tokens"))
         output_tokens = token_count(raw.get("completion_tokens"))
-    elif protocol in (formats.OPENAI_RESPONSES, formats.ANTHROPIC_MESSAGES):
+    elif protocol in [formats.OPENAI_RESPONSES, formats.ANTHROPIC_MESSAGES]:
         input_tokens = token_count(raw.get("input_tokens"))
         output_tokens = token_count(raw.get("output_tokens"))
         if protocol == formats.ANTHROPIC_MESSAGES:
@@ -64,7 +64,7 @@ def normalize_usage(protocol, raw):
             # Nested cache_creation fields only break down the write total.
             cached = token_count(raw.get("cache_read_input_tokens", 0))
             created = token_count(raw.get("cache_creation_input_tokens", 0))
-            if None in (input_tokens, cached, created):
+            if None in [input_tokens, cached, created]:
                 return None
             input_tokens += cached + created
     else:

@@ -172,7 +172,7 @@ class AskDialogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, {"action": "cancelled"})
 
     async def test_ctrl_c_and_eof_dismiss_without_hanging_the_turn(self):
-        for error in [KeyboardInterrupt(), EOFError()]:
+        for error in (KeyboardInterrupt(), EOFError()):
             with self.subTest(error=type(error).__name__):
                 outcome, _, _ = await self._run(DialogSession([error]))
                 self.assertEqual(outcome, {"action": "cancelled"})

@@ -193,9 +193,9 @@ def _credential_checks() -> list[Check]:
 def _credential_file_checks(asset: str, label: str) -> list[Check]:
     """Denials for one credential file, or a pass when it does not exist yet."""
     error = _attempt(asset, windows_api.AccessMask.GENERIC_READ)
-    if error is not None and error.status in (
+    if error is not None and error.status in [
             windows_api.ERROR_FILE_NOT_FOUND,
-            windows_api.ERROR_PATH_NOT_FOUND):
+            windows_api.ERROR_PATH_NOT_FOUND]:
         # Nothing to leak, and the directory refuses to let the container make
         # one; the per-direction denials have no object to test.
         return [Check(

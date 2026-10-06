@@ -1262,8 +1262,8 @@ def _numeric_parameter_fields(parameters):
         subfields = []
         for value in field_bytes.split(b":"):
             subfields.append(None if not value else int(value))
-        fields.append(tuple(subfields))
-    return tuple(fields)
+        fields.append(list(subfields))
+    return list(fields)
 
 
 def _modifier_field(field):
@@ -1293,9 +1293,9 @@ def _functional_parameters(parameters):
         return None
     if not fields:
         return KittyModifier(0), KittyEventType.PRESS
-    if fields == ((1,),):
+    if fields == [[1]]:
         return KittyModifier(0), KittyEventType.PRESS
-    if len(fields) != 2 or fields[0] != (1,):
+    if len(fields) != 2 or fields[0] != [1]:
         return None
     return _modifier_field(fields[1])
 
@@ -1375,7 +1375,7 @@ def parse_kitty_key(sequence):
                 code is None or not _kitty_text_scalar(code)
                 for code in fields[2]):
             return None
-        text = tuple(fields[2])
+        text = list(fields[2])
 
     return KittyKey(
         code=key_field[0],
@@ -1452,7 +1452,7 @@ def decode_legacy_control_sequence(sequence):
             return False, None
         number, modifiers, event_type = decoded
         if (
-                number in (200, 201)
+                number in [200, 201]
                 and not modifiers
                 and event_type == KittyEventType.PRESS):
             kind = "PASTE_START" if number == 200 else "PASTE_END"
@@ -1672,7 +1672,7 @@ class AsyncKeyReader:
             self._queue_event(KeyEvent("CTRL_C"))
         elif byte == 0x04:
             self._queue_event(KeyEvent("CTRL_D"))
-        elif byte in (0x0a, 0x0d):
+        elif byte in [0x0a, 0x0d]:
             self._queue_event(KeyEvent("ENTER"))
         elif byte in self.backspace_bytes:
             self._queue_event(KeyEvent("BACKSPACE"))
@@ -1685,7 +1685,7 @@ class AsyncKeyReader:
         return (
             byte in self.interrupt_bytes
             or byte == 0x04
-            or byte in (0x09, 0x0a, 0x0d)
+            or byte in [0x09, 0x0a, 0x0d]
             or byte in self.backspace_bytes
             or byte in self.backspace_word_bytes
         )
@@ -1703,7 +1703,7 @@ class AsyncKeyReader:
                 modifiers & KittyModifier.CTRL
                 and not modifiers & ~(
                     KittyModifier.CTRL | KittyModifier.SHIFT)):
-            for code in (key.code, key.base_layout_code):
+            for code in [key.code, key.base_layout_code]:
                 if code is None:
                     continue
                 byte = _kitty_control_byte(code)
@@ -1743,9 +1743,9 @@ class AsyncKeyReader:
         text_code = None
         if modifiers in (KittyModifier(0), KittyModifier.ALT):
             text_code = key.code
-        elif modifiers in (
+        elif modifiers in [
                 KittyModifier.SHIFT,
-                KittyModifier.SHIFT | KittyModifier.ALT):
+                KittyModifier.SHIFT | KittyModifier.ALT]:
             text_code = key.shifted_code
             if (
                     text_code is None

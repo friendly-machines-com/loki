@@ -237,7 +237,7 @@ class HttpClientRequestTests(unittest.TestCase):
                         self.assertTrue(writer.closed)
                         self.assertTrue(writer.wait_closed_called)
 
-        for phase in ("connect", "drain"):
+        for phase in ["connect", "drain"]:
             with self.subTest(phase=phase):
                 asyncio.run(scenario(phase))
 
@@ -828,7 +828,7 @@ class HttpClientStreamingTests(unittest.TestCase):
                         self.assertTrue(operation.done())
                         self.assertTrue(operation.cancelled())
 
-        for active in (False, True):
+        for active in [False, True]:
             with self.subTest(active=active):
                 asyncio.run(scenario(active))
 

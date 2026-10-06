@@ -166,7 +166,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stored.tokens.account_id, "account")
             self.assertTrue(stored.tokens.fedramp)
             from loki_agent import private_files
-            for path in (self.storage.directory, self.storage.file_path):
+            for path in [self.storage.directory, self.storage.file_path]:
                 self.assertFalse(private_files.describe_path(path).group_or_other_access)
             self.assertFalse(any(name.startswith(".tokens.json.")
                                  for name in os.listdir(self.storage.directory)))
@@ -214,8 +214,8 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
                 await logged_out.broker.lease(ref)
         self.assertEqual(errors.getvalue(), "")
         self.assertIn("Logged in: OpenAI ChatGPT subscription", output.getvalue())
-        for secret in (access, identity, "refresh-secret", "access-rotated-secret",
-                       "refresh-rotated-secret", "device-secret", "authorization-secret"):
+        for secret in [access, identity, "refresh-secret", "access-rotated-secret",
+                       "refresh-rotated-secret", "device-secret", "authorization-secret"]:
             self.assertNotIn(secret, output.getvalue())
 
     async def test_failed_login_preserves_previous_credential(self):

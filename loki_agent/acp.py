@@ -365,8 +365,8 @@ class Front:
             return
         if not self._connected:
             return
-        if request_id is None and method not in (
-                "session/cancel", "session/close"):
+        if request_id is None and method not in [
+                "session/cancel", "session/close"]:
             return
         params = message.get("params") or {}
         owner = None
@@ -716,7 +716,7 @@ class Front:
                 f"{MAX_ASK_QUESTION_CHARS} characters",
                 code=acps.INVALID_PARAMS)
         multi_select = params.get("multiSelect", False)
-        if multi_select not in (True, False):
+        if multi_select not in [True, False]:
             raise acps.TransportError(
                 "model question multiSelect must be a boolean",
                 code=acps.INVALID_PARAMS)

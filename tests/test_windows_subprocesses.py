@@ -125,12 +125,12 @@ class WorkerCleanupTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(transports[0]._connect_task.done())
 
     async def test_first_and_second_pipe_attachment_failure_reap_child(self):
-        for stage in (1, 2):
+        for stage in [1, 2]:
             with self.subTest(stage=stage):
                 await self.exercise(failure=stage)
 
     async def test_cancelled_launch_joins_attachment_and_reaps_child(self):
-        for stage in (0, 1, 2):
+        for stage in [0, 1, 2]:
             with self.subTest(stage=stage):
                 await self.exercise(failure=stage, cancel=True)
 

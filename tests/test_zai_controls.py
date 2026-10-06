@@ -115,7 +115,7 @@ REFUSED = {"code": 1001, "success": False,
 
 class AvailabilityTests(unittest.TestCase):
     def test_zai_connections_expose_usage_and_resets(self):
-        for config in (ZAI, BIGMODEL):
+        for config in [ZAI, BIGMODEL]:
             with self.subTest(config=config.chat_provider.chat_url):
                 specs = provider_controls.available_controls(context(config))
                 self.assertEqual(
@@ -269,7 +269,7 @@ class ResetsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("  (no reset cards were reported)", result.lines)
         self.assertIn("  Total: 0 available, 0 expired", result.lines)
-        self.assertEqual(result.actions, ())
+        self.assertEqual(result.actions, [])
 
     async def test_cards_endpoint_is_under_biz(self):
         request = _Request(response(CARDS_PAYLOAD))

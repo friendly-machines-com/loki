@@ -76,7 +76,7 @@ async def _read_balance(context):
     if not isinstance(payload, dict):
         payload = {}
     return provider_controls.ControlResult(
-        lines=tuple(_balance_lines(payload)),
+        lines=list(_balance_lines(payload)),
         document={
             "endpoint": DEEPSEEK_BALANCE_URL,
             "balance": payload,

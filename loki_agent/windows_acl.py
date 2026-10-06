@@ -95,7 +95,7 @@ def ace_fields(sddl: str):
     """
     _header, aces = dacl_parts(sddl)
     for ace in aces:
-        yield tuple(ace[1:-1].split(';'))
+        yield list(ace[1:-1].split(';'))
 
 
 def flag_codes(flags: str) -> set[str]:
@@ -112,9 +112,9 @@ def ace_mask(kind, rights, obj, inherited):
     which this check cannot evaluate; refuse rather than assume the mask
     applies unqualified.
     """
-    if kind in ("A", "D"):
+    if kind in ["A", "D"]:
         return rights_mask(rights)
-    if kind in ("OA", "OD"):
+    if kind in ["OA", "OD"]:
         if obj or inherited:
             raise windows_api.WindowsApiError(
                 "cannot evaluate an object ACE for the package SID")
@@ -140,7 +140,7 @@ def package_access(sddl: str, package: str) -> int:
         mask = ace_mask(kind, rights, obj, inherited)
         if mask is None:
             continue
-        if kind in ("D", "OD"):
+        if kind in ["D", "OD"]:
             denied |= mask
         else:
             allowed |= mask
@@ -162,7 +162,7 @@ def package_allow(sddl: str, package: str) -> int:
         if sid != package:
             continue
         mask = ace_mask(kind, rights, obj, inherited)
-        if mask is not None and kind in ("A", "OA"):
+        if mask is not None and kind in ["A", "OA"]:
             allowed |= mask
     return allowed
 
@@ -184,7 +184,7 @@ def allow_trustees(sddl: str, include_inherit_only: bool = False) -> set[str]:
     for kind, flags, rights, obj, inherited, sid in ace_fields(sddl):
         if not include_inherit_only and "IO" in flag_codes(flags):
             continue
-        if kind in ("A", "OA") and ace_mask(kind, rights, obj, inherited) is not None:
+        if kind in ["A", "OA"] and ace_mask(kind, rights, obj, inherited) is not None:
             trustees.add(sid)
     return trustees
 

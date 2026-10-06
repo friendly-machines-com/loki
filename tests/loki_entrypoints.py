@@ -60,7 +60,7 @@ def child_environment(**values) -> dict:
     """
     environment = dict(values)
     if os.name == "nt":
-        for name in ("SystemRoot", "SystemDrive", "LOCALAPPDATA"):
+        for name in ["SystemRoot", "SystemDrive", "LOCALAPPDATA"]:
             if name in os.environ:
                 environment.setdefault(name, os.environ[name])
     return environment
@@ -82,7 +82,7 @@ def configure_container(environment: dict, cwd: str) -> None:
     """
     if os.name != "nt":
         return
-    for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME"):
+    for name in ["XDG_CONFIG_HOME", "XDG_STATE_HOME"]:
         if not environment.get(name):
             raise RuntimeError(
                 f"{name} must be set so that setup stays inside the test")

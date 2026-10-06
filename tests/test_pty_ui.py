@@ -104,7 +104,7 @@ class _SgrStreamTracker:
             if data[j] == 0x6D:  # final 'm'
                 self._apply_sgr(data[i + 2:j])
             return j + 1
-        if c in (0x5D, 0x50, 0x58, 0x5E, 0x5F):  # OSC/DCS/SOS/PM/APC
+        if c in [0x5D, 0x50, 0x58, 0x5E, 0x5F]:  # OSC/DCS/SOS/PM/APC
             j = i + 2
             while j < n:
                 if data[j] == 0x07:                      # BEL terminator
@@ -371,13 +371,13 @@ class PtyCaptureTests(unittest.TestCase):
 class PtyFixtureTests(unittest.TestCase):
     def test_private_trees_are_outside_the_granted_workspace(self):
         module = sys.modules[__name__]
-        for cli in (False, True):
+        for cli in [False, True]:
             with self.subTest(cli=cli):
                 configured = []
 
                 def configure(env, workspace):
                     self.assertTrue(os.path.isdir(workspace))
-                    for key in ('XDG_CONFIG_HOME', 'XDG_STATE_HOME'):
+                    for key in ['XDG_CONFIG_HOME', 'XDG_STATE_HOME']:
                         self.assertNotEqual(os.path.commonpath([workspace, env[key]]),
                                             workspace)
                     configured.append(workspace)
@@ -577,7 +577,7 @@ class PtyUiTests(unittest.TestCase):
         # attributes actually active. This is a spec-shaped parser check
         # of Loki's output -- it does not emulate a screen and proves
         # nothing about any real terminal.
-        for stream in (False, True):
+        for stream in [False, True]:
             with self.subTest(stream=stream):
                 chunks = (["visible prefix ",
                            "**boldword** and `codeword` done"]
@@ -788,7 +788,7 @@ def _pty_child(argv):
         print('ROLLBACK_RESTORED', flush=True)
         return 0
 
-    if mode in ('resize', 'resize-cancel'):
+    if mode in ['resize', 'resize-cancel']:
         async def resized():
             before = terminal_state()
             reader = _terminals.AsyncKeyReader(0, watch_resize=True, output_fd=1)
@@ -909,7 +909,7 @@ class PtyResourceTests(unittest.TestCase):
                 handle.close()
 
     def test_native_resize_and_shutdown_without_keyboard_input(self):
-        for mode in ('resize', 'resize-cancel'):
+        for mode in ['resize', 'resize-cancel']:
             with self.subTest(mode=mode):
                 handle = pty_backend.spawn_pty([
                     sys.executable, str(pathlib.Path(__file__).resolve()), '--pty-child', mode])

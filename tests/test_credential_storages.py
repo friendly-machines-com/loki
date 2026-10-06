@@ -726,7 +726,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
     def test_a_name_that_is_not_one_component_is_refused(self):
         from loki_agent import _private_files_windows
 
-        for name in ("", ".", "..", "a/b", "a\\b", "C:name"):
+        for name in ["", ".", "..", "a/b", "a\\b", "C:name"]:
             with self.subTest(name=name), self.assertRaises(
                     credential_storages.CredentialStorageError):
                 _private_files_windows.open_read_at(object(), name)

@@ -29,7 +29,7 @@ def classify_message(item: dict):
     Returns a list of tuples; empty for system/developer messages.
     """
     role = item.get("role")
-    if role in ("system", "developer"):
+    if role in ["system", "developer"]:
         return []
     text = _message_text(item)
     if not text and not any(
@@ -45,7 +45,7 @@ def classify_message(item: dict):
         if not isinstance(content, dict):
             continue
         ctype = content.get("type")
-        if ctype in ("image", "file", "document", "audio"):
+        if ctype in ["image", "file", "document", "audio"]:
             label = {
                 "image": "[Image content]",
                 "file": "[File content]",

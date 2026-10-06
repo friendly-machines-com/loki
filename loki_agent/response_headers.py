@@ -124,7 +124,7 @@ def _read(path):
                            for name in latest["header_names"])
                 or not all(latest.get(key) is None
                            or isinstance(latest.get(key), str)
-                           for key in ("provider_id", "provider_name"))):
+                           for key in ["provider_id", "provider_name"])):
             raise ValueError("invalid latest response status")
         for name, observation in entry["headers"].items():
             if (not name or name != name.lower()

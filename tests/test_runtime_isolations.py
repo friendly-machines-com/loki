@@ -145,7 +145,7 @@ class LinuxIsolationTests(unittest.TestCase):
     def test_storage_free_runtime_sets_no_new_privileges_from_known_state(self):
         # A real child can inherit an already-set flag. This native-call seam
         # starts at zero as well as one, so omitting the setter cannot pass.
-        for initial in (0, 1):
+        for initial in [0, 1]:
             with self.subTest(initial=initial), \
                     tempfile.TemporaryDirectory() as directory:
                 state = initial
@@ -153,9 +153,9 @@ class LinuxIsolationTests(unittest.TestCase):
 
                 def prctl(*arguments):
                     nonlocal state
-                    values = tuple(argument.value for argument in arguments)
+                    values = list(argument.value for argument in arguments)
                     calls.append(values)
-                    self.assertEqual(values, (38, 1, 0, 0, 0))
+                    self.assertEqual(values, [38, 1, 0, 0, 0])
                     state = 1
                     return 0
 
@@ -169,13 +169,13 @@ class LinuxIsolationTests(unittest.TestCase):
                         runtime_isolations.isolate_credential_directory(
                             os.path.join(directory, "missing")))
                     self.assertEqual(state, 1)
-                    self.assertEqual(calls, [(38, 1, 0, 0, 0)])
+                    self.assertEqual(calls, [[38, 1, 0, 0, 0]])
                     # Repeated storage-free initialization is still protected.
                     self.assertFalse(
                         runtime_isolations.isolate_credential_directory(
                             os.path.join(directory, "missing")))
                     self.assertEqual(state, 1)
-                    self.assertEqual(calls, [(38, 1, 0, 0, 0)] * 2)
+                    self.assertEqual(calls, [[38, 1, 0, 0, 0]] * 2)
                     unshare.assert_not_called()
 
     def test_missing_credentials_native_privilege_transition_and_exec(self):
@@ -333,7 +333,7 @@ print(json.dumps({
     "unmount_errno": ctypes.get_errno(),
 }))
 """
-            for starting_cwd in (workspace, credentials):
+            for starting_cwd in [workspace, credentials]:
                 with self.subTest(starting_cwd=starting_cwd):
                     process = subprocess.run(
                         [sys.executable, "-c", code, credentials,
@@ -346,7 +346,7 @@ print(json.dumps({
                     self.assertTrue(result["hidden"])
                     self.assertTrue(result["marker_hidden"])
                     self.assertTrue(result["tool_hidden"], process.stderr)
-                    for key in ("CapEff", "CapPrm", "CapInh", "CapBnd"):
+                    for key in ["CapEff", "CapPrm", "CapInh", "CapBnd"]:
                         self.assertEqual(result["status"][key], "0" * 16)
                     self.assertEqual(result["status"]["NoNewPrivs"], "1")
                     self.assertEqual(result["unmount_result"], -1)
@@ -435,8 +435,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                     (terminal.broker, terminal.inventory),
                     (front.credential_broker, front.credentials)):
                 self.assertTrue(inventory.has_ref(credential))
-                for secret in (tokens.access_token, tokens.refresh_token,
-                               tokens.id_token):
+                for secret in [tokens.access_token, tokens.refresh_token,
+                               tokens.id_token]:
                     self.assertNotIn(secret, repr(terminal.environment))
                     self.assertNotIn(secret, repr(inventory))
                 lease = await broker.lease(credential)
@@ -469,8 +469,8 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             fresh_front = acp.Front(
                 lambda: None, lambda message: None,
                 CredentialStore({}), reopened)
-            for broker in (fresh_terminal.broker,
-                           fresh_front.credential_broker):
+            for broker in [fresh_terminal.broker,
+                           fresh_front.credential_broker]:
                 self.assertEqual((await broker.lease(credential)).value,
                                  "access-new")
             self.assertEqual(calls, ["refresh-secret"])
@@ -737,7 +737,7 @@ class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_supervisor_releases_process_after_success_error_and_cancellation(self):
         from process_lifecycle_fixtures import process_lifecycle
 
-        for outcome in ('success', 'error', 'cancel'):
+        for outcome in ['success', 'error', 'cancel']:
             with self.subTest(outcome=outcome):
                 async with process_lifecycle('loki') as fixture:
                     if outcome != 'success':
@@ -842,7 +842,7 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
                         "--credential-capability-fd", "9"]
 
             def child_spawn_kwargs(self):
-                return {"pass_fds": (7, 9)}
+                return {"pass_fds": [7, 9]}
 
         async def spawn(*args, **kwargs):
             spawned["args"] = args
@@ -868,7 +868,7 @@ class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(kwargs["stderr"])
         self.assertTrue(kwargs["close_fds"])
         self.assertEqual(kwargs["env"], {"SAFE": "value"})
-        self.assertEqual(kwargs["pass_fds"], (7, 9))
+        self.assertEqual(kwargs["pass_fds"], [7, 9])
         self.assertTrue(kwargs["start_new_session"])
 
 

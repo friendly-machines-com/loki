@@ -230,7 +230,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 )
                 return manager, first, second, third
             finally:
-                for job in (first, second, third):
+                for job in [first, second, third]:
                     if (job is not None
                             and job.process.returncode is None):
                         host_process.signal_group(
@@ -507,7 +507,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 continue
             if loki.host_ipc.is_endpoint(end):
                 # A closed Windows pipe endpoint has released its handles.
-                self.assertEqual(end.handles(), ())
+                self.assertEqual(end.handles(), [])
             else:
                 # A closed socket has no handle.
                 self.assertEqual(end.fileno(), -1)
@@ -691,7 +691,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                     self.assertTrue(listing.startswith(manager.list_jobs() + '\n'))
                     self.assertIn('/ps ID', listing)
                     self.assertEqual(listing.splitlines()[0], 'Jobs:')
-                    for job in (owned, ordinary):
+                    for job in [owned, ordinary]:
                         self.assertIsNone(job.process.returncode)
                         self.assertEqual(job.status, 'running')
                         lines = [line for line in listing.splitlines()

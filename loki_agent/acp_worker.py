@@ -423,8 +423,8 @@ class Worker:
         self.can_ask_user = params.get("formElicitation") is True
 
         open_method = params.get("openMethod")
-        if open_method not in (
-                "session/new", "session/load", "session/resume"):
+        if open_method not in [
+                "session/new", "session/load", "session/resume"]:
             raise acps.TransportError(
                 f"unsupported session opening method {open_method!r}",
                 code=acps.INVALID_PARAMS,
@@ -1015,8 +1015,8 @@ class Worker:
                 return (
                     error.formatted()
                     if hasattr(error, "formatted") else str(error))
-            if kind in ("network_error", "stream_error",
-                        "transcript_error", "provider_error"):
+            if kind in ["network_error", "stream_error",
+                        "transcript_error", "provider_error"]:
                 return f"{kind.replace('_', ' ')}: {event.get('error')}"
             if kind == "response_failed":
                 return (

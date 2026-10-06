@@ -42,8 +42,8 @@ class GuidTests(unittest.TestCase):
             bytes(guid), bytes.fromhex("db85b63ef965f64ca03ae3ef65729f3d"))
 
     def test_malformed_guid_is_rejected(self):
-        for text in ("", "nonsense", "{F1B32785-6FBA-4FCF}",
-                     "{F1B32785-6FBA-4FCF-9D55-7B8E7F15709Z}"):
+        for text in ["", "nonsense", "{F1B32785-6FBA-4FCF}",
+                     "{F1B32785-6FBA-4FCF-9D55-7B8E7F15709Z}"]:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 windows_api.guid_from_text(text)
 

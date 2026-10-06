@@ -125,7 +125,7 @@ async def _read_balance(context):
             document["credits"] = (
                 credits.get("data") if isinstance(credits, dict) else None)
     return provider_controls.ControlResult(
-        lines=tuple(lines), document=document)
+        lines=list(lines), document=document)
 
 
 BALANCE = provider_controls.ControlSpec(

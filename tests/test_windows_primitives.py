@@ -204,7 +204,7 @@ def conpty_probe(root):
     status = create_pseudo(Coord(80, 24), input_read, output_write, 0,
                            C.byref(hpc))
     if status < 0:
-        for handle in (input_read, input_write, output_read, output_write):
+        for handle in [input_read, input_write, output_read, output_write]:
             kernel.CloseHandle(handle)
         record.update({'created': False, 'hresult': '0x%08x' % (status & 0xffffffff)})
         print(json.dumps(record), flush=True)
@@ -321,7 +321,7 @@ def conpty_child(stage):
     harness would need: text over time, styled bytes, echoed input, and size
     changes.
     """
-    if stage in ('text', 'text-reply'):
+    if stage in ['text', 'text-reply']:
         print('MARK1', flush=True)
         time.sleep(1.0)
         print('MARK2', flush=True)
@@ -419,7 +419,7 @@ def conpty_interactive_probe(root, stage):
     status = create_pseudo(Coord(80, 24), input_read, output_write, 0,
                            C.byref(hpc))
     if status < 0:
-        for handle in (input_read, input_write, output_read, output_write):
+        for handle in [input_read, input_write, output_read, output_write]:
             kernel.CloseHandle(handle)
         record.update({'created': False,
                        'hresult': '0x%08x' % (status & 0xffffffff)})
@@ -510,14 +510,14 @@ def conpty_interactive_probe(root, stage):
         def service():
             """React once the channel has been read."""
             nonlocal resize_sent
-            for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
+            for marker in ['MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:']:
                 note(marker)
             # Both stages read a line back: ``text`` proves blind input, and
             # ``text-reply`` proves input alongside the mode responses.  Without
             # a line the child blocks in readline, and teardown then closes the
             # pseudoconsole under a live client.  Tracked separately from
             # ``input_written``, which the mode responses already set.
-            if (stage in ('text', 'text-reply') and 'MARK1_ms' in timings
+            if (stage in ['text', 'text-reply'] and 'MARK1_ms' in timings
                     and 'line_sent' not in record):
                 if send(b'probe-key\r\n'):
                     record['line_sent'] = True
@@ -549,11 +549,11 @@ def conpty_interactive_probe(root, stage):
         # The child exited; its final write may already be in the pipe.
         drain()
         service()
-        for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
+        for marker in ['MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:']:
             note(marker)
         if not timings:
             timings['first_byte_ms'] = None
-        for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:'):
+        for marker in ['MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:']:
             if marker.encode() not in output:
                 timings[marker + '_ms'] = None
         record['replied_queries'] = [r.decode('latin1') for r in replied]
@@ -572,7 +572,7 @@ def conpty_interactive_probe(root, stage):
             pass
         record['markers_before_close'] = {
             marker: marker.encode() in before_close
-            for marker in ('MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:')}
+            for marker in ['MARK1', 'MARK2', 'ECHO:', 'SGRDONE', 'SIZE:']}
         record['output'] = output.decode('latin1')[-600:]
     except OSError as error:
         record['error'] = str(error)
@@ -697,9 +697,9 @@ def environment_203_probe(root):
         'omit_current_drive': [entry for entry in entries
                                if not entry.startswith('=' + drive + '=')],
         # What production builds: the process block plus the entry for the
-        # directory the child will start in (kept as a variant so the drive
+        # directory the child will start in [kept as a variant so the drive
         # entry's effect stays visible even though production no longer adds
-        # one).
+        # one].
         'with_current_drive': [*entries, '=' + drive + '=' + str(root)],
     }
     # The reduced environment the pty tests hand the front: a handful of
@@ -708,7 +708,7 @@ def environment_203_probe(root):
     # the cause of the 203.
     reduced = [entry for entry in (
         *('%s=%s' % (name, os.environ[name])
-          for name in ('SystemRoot', 'SystemDrive', 'PATH')
+          for name in ['SystemRoot', 'SystemDrive', 'PATH']
           if name in os.environ),
         'HOME=' + str(root),
         'XDG_CONFIG_HOME=' + str(root / 'config'),
@@ -830,8 +830,8 @@ def conpty_split_stdio_probe(root):
     status = create_pseudo(Coord(80, 24), input_read, output_write, 0,
                            C.byref(hpc))
     if status < 0:
-        for handle in (input_read, input_write, output_read, output_write,
-                       stdout_read, stdout_write):
+        for handle in [input_read, input_write, output_read, output_write,
+                       stdout_read, stdout_write]:
             close(handle)
         record.update({'created': False,
                        'hresult': '0x%08x' % (status & 0xffffffff)})
@@ -1310,7 +1310,7 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
     """Portable boundary regressions; mocks are not native Windows evidence."""
 
     def test_rename_buffer_has_utf16_terminator_outside_counted_name(self):
-        for name in ('published', 'long-name-\U0001f600', 'C:\\dir\\published'):
+        for name in ['published', 'long-name-\U0001f600', 'C:\\dir\\published']:
             with self.subTest(name=name):
                 buffer = NativeCalls.rename_buffer(123, name)
                 info = RenameInfos.from_buffer(buffer)
@@ -1368,7 +1368,7 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
                 def rename_attempt(source, directory, name, **kwargs):
                     if outcome == 'rename-error':
                         raise OSError('rename failed')
-                    if outcome not in ('refused', 'missing-target'):
+                    if outcome not in ['refused', 'missing-target']:
                         target = live[directory] / name
                         if outcome == 'source-remains':
                             target.write_bytes(live[source].read_bytes())
@@ -1521,14 +1521,14 @@ class WindowsProbeMarshallingTests(unittest.TestCase):
                                            'attributes': 7}]}, 'expected')
 
     def test_standard_user_guard_rejects_wrong_user_and_elevation(self):
-        for user, elevation in [('other', 0), ('expected', 1)]:
+        for user, elevation in (('other', 0), ('expected', 1)):
             with self.subTest(user=user, elevation=elevation):
                 with self.assertRaises(RuntimeError):
                     require_standard_user({'user': user, 'elevation': elevation,
                                            'groups': []}, 'expected')
 
     def test_standard_user_guard_rejects_admin_sid_with_any_attributes(self):
-        for attributes in (0, 4, 16):
+        for attributes in [0, 4, 16]:
             with self.subTest(attributes=attributes):
                 with self.assertRaisesRegex(RuntimeError, 'Administrators'):
                     require_standard_user(
@@ -1816,7 +1816,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
             ('no-replace', {'replace_if_exists': 0}),
         )
         for index, (label, options) in enumerate(variants):
-            for native in (False, True):
+            for native in [False, True]:
                 directory = self.root / ('variants-%d-%s' % (
                     index, 'nt' if native else 'win32'))
                 directory.mkdir()
@@ -1860,7 +1860,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), b'decoy')
 
     def test_kill_at_write_checkpoints_preserves_complete_target(self):
-        for stage in ('create', 'write', 'flush', 'fsync', 'close', 'replace'):
+        for stage in ['create', 'write', 'flush', 'fsync', 'close', 'replace']:
             with self.subTest(stage=stage):
                 (self.root / 'temporary').unlink(missing_ok=True)
                 target = self.root / 'target'
@@ -2019,7 +2019,7 @@ class WindowsPrimitiveTests(unittest.TestCase):
         # (with and without answering conhost's mode queries).  These records
         # decide whether the pty_ui family can be ported onto ConPTY; the
         # assertions belong to that harness, not to conhost.
-        for stage in ('text', 'text-reply', 'sgr', 'resize'):
+        for stage in ['text', 'text-reply', 'sgr', 'resize']:
             with self.subTest(stage=stage):
                 result = subprocess.run(
                     self.command('conpty-interactive', stage),

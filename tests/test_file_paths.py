@@ -20,8 +20,8 @@ class StatIdentityTests(unittest.TestCase):
             payload = b'known independently hashed content'
             path.write_bytes(payload)
             original = path.stat()
-            for platform in ('posix', 'nt'):
-                for expected in (None, original):
+            for platform in ['posix', 'nt']:
+                for expected in [None, original]:
                     with self.subTest(platform=platform,
                                       expected_stat=expected is not None):
                         calls = 0
@@ -84,7 +84,7 @@ class FilePathTests(unittest.TestCase):
             alias.symlink_to('other')
             return atomic_write(path, content)
 
-        for operation in ('Write', 'Edit'):
+        for operation in ['Write', 'Edit']:
             with self.subTest(operation=operation):
                 original.write_text('reviewed')
                 other.write_text('unrelated')
@@ -186,10 +186,10 @@ class FilePathTests(unittest.TestCase):
 
     def test_cwd_read_edit_write_publish_atomically_through_aliases(self):
         process_cwd = os.getcwd()
-        for chained in (False, True):
+        for chained in [False, True]:
             with self.subTest(chained=chained):
                 case = f'case-{int(chained)}'
-                for base in (self.project, self.elsewhere):
+                for base in [self.project, self.elsewhere]:
                     (base / case).mkdir()
                 # POSIX follows link/.. into elsewhere; Windows cancels it
                 # lexically into project. The other copy must never change.
@@ -327,11 +327,11 @@ class FilePathTests(unittest.TestCase):
             # simplifies to the existing target, which is then read normally;
             # the run confirms that outcome.  A trailing slash on a file is
             # invalid outright.
-            for relative in ('missing/../target', 'plain/../target'):
+            for relative in ['missing/../target', 'plain/../target']:
                 self.assertIn('must not read', loki.run_read(relative))
             self.assertTrue(loki.run_read('target/').startswith('Error:'))
             return
-        for relative in ('missing/../target', 'plain/../target', 'target/'):
+        for relative in ['missing/../target', 'plain/../target', 'target/']:
             with self.subTest(path=relative):
                 with self.assertRaises(OSError):
                     with open(str(self.project) + '/' + relative):
@@ -377,7 +377,7 @@ class FilePathTests(unittest.TestCase):
             self.assertTrue(
                 loki.run_write('target/', 'wrong').startswith('Error:'))
             return
-        for relative in ('plain/../target', 'target/'):
+        for relative in ['plain/../target', 'target/']:
             with self.subTest(path=relative):
                 self.assertTrue(loki.run_write(relative, 'wrong').startswith('Error:'))
         self.assertEqual(target.read_text(), 'original')
@@ -448,7 +448,7 @@ class FilePathTests(unittest.TestCase):
                 image.path, self.elsewhere / 'image.png'))
             (self.elsewhere / 'image.png').write_bytes(b'changed after staging')
             self.assertEqual(base64.b64decode(image.encoded_data), correct)
-        for path in ('missing/../image.png', 'image.png/'):
+        for path in ['missing/../image.png', 'image.png/']:
             with self.subTest(path=path):
                 with self.assertRaises(terminal_frontend.ImageAttachmentError):
                     terminal_frontend.load_image_attachment(

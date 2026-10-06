@@ -909,14 +909,14 @@ class GroupingTests(unittest.TestCase):
         members = _groups()["GLM-5.2"]
         bits = models.minimal_feature_bits(members)
         # reasoning/tool_call/struct/temp on both; attachment on only openrouter.
-        self.assertEqual(bits, (True, True, True, True, False, False))
+        self.assertEqual(bits, [True, True, True, True, False, False])
         self.assertEqual(models.feature_names(bits), "reasoning, tools, struct, temp")
 
     def test_union_features_or_across_providers(self):
         members = _groups()["GLM-5.2"]
         bits = models.union_feature_bits(members)
         # attachment is on openrouter but not zhipuai, so the union includes it.
-        self.assertEqual(bits, (True, True, True, True, True, False))
+        self.assertEqual(bits, [True, True, True, True, True, False])
 
 
 class ProtocolAndKeyTests(unittest.TestCase):
@@ -1021,7 +1021,7 @@ class ProtocolAndKeyTests(unittest.TestCase):
                     "m": {"id": "m", "name": "Shared Model"},
                 },
             }
-            for pid in ("regional-a", "regional-b")
+            for pid in ["regional-a", "regional-b"]
         }
         groups = models.filter_supported_groups(
             models.build_groups(data),
@@ -1535,10 +1535,10 @@ class ReasoningCapabilitiesTests(unittest.TestCase):
             record)
 
     def test_malformed_hints_never_become_authority(self):
-        for options in ("toggle", [{"type": "evil"}],
+        for options in ["toggle", [{"type": "evil"}],
                         [{"type": "toggle"}] * 2,
                         [{"type": "budget_tokens", "min": True}],
-                        [{"type": "budget_tokens", "min": 4000, "max": 1000}]):
+                        [{"type": "budget_tokens", "min": 4000, "max": 1000}]]:
             with self.subTest(options=options):
                 record = models.reasoning_capabilities(
                     {"reasoning": False, "reasoning_options": options})

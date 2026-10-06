@@ -52,10 +52,10 @@ class StructuredValidationTests(unittest.TestCase):
         self.assertEqual(
             [(issue.path, issue.code) for issue in issues],
             [
-                (("missing",), "required"),
-                (("extra",), "additional_property"),
-                (("count",), "type"),
-                (("mode",), "enum"),
+                (["missing"], "required"),
+                (["extra"], "additional_property"),
+                (["count"], "type"),
+                (["mode"], "enum"),
             ],
         )
 
@@ -127,7 +127,7 @@ class InputRepairTests(unittest.TestCase):
         self.assertEqual(result.adjustments, [])
         self.assertEqual(
             [(issue.path, issue.code) for issue in result.issues],
-            [(("optional",), "type")],
+            [(["optional"], "type")],
         )
 
     def test_nonempty_object_is_not_guessed_as_array(self):
@@ -145,7 +145,7 @@ class InputRepairTests(unittest.TestCase):
         )
         self.assertEqual(
             [(issue.path, issue.code) for issue in result.issues],
-            [(("values", 1), "type")],
+            [(["values", 1], "type")],
         )
 
     def test_degenerate_markdown_path_component_is_unwrapped(self):
@@ -303,7 +303,7 @@ class HookPipelineTests(unittest.TestCase):
         self.assertEqual(
             [(issue.path, issue.code)
              for issue in result.validation_issues],
-            [(("values", 0), "type")],
+            [(["values", 0], "type")],
         )
 
     def test_post_hook_failure_preserves_executed_outcome(self):
@@ -877,11 +877,11 @@ class TurnEndHookTests(unittest.TestCase):
     def test_turn_end_rejects_tool_options_and_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "hooks.json")
-            for value in (
+            for value in [
                     {"turn_end": [{"id": "x", "command": ["true"],
                                    "tools": ["Bash"]}]},
                     {"pre_tool_call": [{"id": "x", "command": ["true"]}],
-                     "turn_end": [{"id": "x", "command": ["true"]}]}):
+                     "turn_end": [{"id": "x", "command": ["true"]}]}]:
                 with open(config_path, "w", encoding="utf-8") as stream:
                     json.dump(value, stream)
                 with self.assertRaises(tool_runtime.HookConfigurationError):

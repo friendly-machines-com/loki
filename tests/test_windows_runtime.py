@@ -231,7 +231,7 @@ class IsolationSeamTests(unittest.TestCase):
                 return []
 
         with mock.patch.object(runtime_isolation.host_ipc, 'handles',
-                               side_effect=lambda end: tuple(end)), \
+                               side_effect=lambda end: list(end)), \
                 mock.patch.object(runtime_isolation.windows_runtime,
                                   'launch', return_value=mock.Mock()) as launch:
             asyncio.run(runtime_isolation.start_runtime(
@@ -269,7 +269,7 @@ class IsolationSeamTests(unittest.TestCase):
                                'required_workspace',
                                return_value='/recorded/work') as gate, \
                 mock.patch.object(host_ipc, 'handles',
-                                  side_effect=lambda end: tuple(end)), \
+                                  side_effect=lambda end: list(end)), \
                 mock.patch.object(windows_subprocesses,
                                   'create_worker_process',
                                   new=mock.AsyncMock(return_value='worker')) as spawn:
@@ -444,8 +444,8 @@ class LaunchEnvironmentTests(unittest.TestCase):
                 PATH=os.environ.get("PATH", ""))
             configure_container(reduced, workspace)
             variants = {"reduced": dict(reduced)}
-            for name in ("USERPROFILE", "LOCALAPPDATA", "APPDATA",
-                         "PROGRAMDATA", "PROGRAMFILES"):
+            for name in ["USERPROFILE", "LOCALAPPDATA", "APPDATA",
+                         "PROGRAMDATA", "PROGRAMFILES"]:
                 if os.environ.get(name):
                     variants["with_" + name] = {**reduced, name: os.environ[name]}
             variants["full_process"] = dict(os.environ)

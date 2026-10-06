@@ -357,9 +357,9 @@ class EscapeSequenceParserTests(unittest.TestCase):
         self.assertFalse(parser.active)
 
 
-DEFAULT_CONTROL_BYTES = (
+DEFAULT_CONTROL_BYTES = [
     frozenset((0x08, 0x7f)), frozenset((0x17,)), frozenset((0x03,)),
-)
+]
 
 
 class TerminalControlBytesTests(unittest.TestCase):
@@ -385,23 +385,23 @@ class TerminalControlBytesTests(unittest.TestCase):
             ((b'\x15', b'\x16', b'\x18'), (0x15, 0x16, 0x18)),
             ((0x7f, 0x17, 0x18), (0x7f, 0x17, 0x18)),
         ):
-            yield repr(values), attrs(values), 0xff, tuple(frozenset((n,)) for n in numbers)
+            yield repr(values), attrs(values), 0xff, [frozenset((n,)) for n in numbers]
 
         # Retain the original invalid/disabled combination, then distinguish
         # per-field fallback from incorrectly discarding all valid settings.
         yield 'invalid and disabled', attrs((b'invalid', b'\x15', b'\x15')), 0x15, DEFAULT_CONTROL_BYTES
         valid = (0x08, 0x17, 0x18)
         for index, name in enumerate(('erase', 'word erase', 'interrupt')):
-            for bad in (b'invalid', b'', None, -1, 256, 0x15):
+            for bad in [b'invalid', b'', None, -1, 256, 0x15]:
                 values = list(valid)
                 values[index] = bad
                 expected = [frozenset((n,)) for n in valid]
                 expected[index] = DEFAULT_CONTROL_BYTES[index]
-                yield f'{name}={bad!r}', attrs(values), 0x15, tuple(expected)
+                yield f'{name}={bad!r}', attrs(values), 0x15, expected
 
         for disabled in (OSError('PC_VDISABLE unavailable'), None, 999):
-            yield f'disable query {disabled!r}', attrs((0, 255, 0x18)), disabled, (
-                DEFAULT_CONTROL_BYTES[0], DEFAULT_CONTROL_BYTES[1], frozenset((0x18,)))
+            yield f'disable query {disabled!r}', attrs((0, 255, 0x18)), disabled, [
+                DEFAULT_CONTROL_BYTES[0], DEFAULT_CONTROL_BYTES[1], frozenset((0x18,))]
         yield 'termios error', terminals.termios.error(25, 'not a tty'), 0xff, DEFAULT_CONTROL_BYTES
         yield 'malformed attributes', [], 0xff, DEFAULT_CONTROL_BYTES
         yield 'missing control entries', [0, 0, 0, 0, 0, 0, []], 0xff, DEFAULT_CONTROL_BYTES
@@ -423,7 +423,8 @@ class TerminalControlBytesTests(unittest.TestCase):
     def test_native_settings_selection_and_fallback_policy(self):
         for name, attributes, disabled, expected in self.native_cases():
             with self.subTest(case=name), self.native_settings(attributes, disabled):
-                self.assertEqual(terminals.terminal_control_bytes(123), expected)
+                self.assertEqual(
+                    list(terminals.terminal_control_bytes(123)), expected)
 
     def test_native_settings_reach_reader_actions(self):
         for name, attributes, disabled, expected in self.native_cases():

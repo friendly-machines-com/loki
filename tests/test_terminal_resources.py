@@ -34,7 +34,7 @@ class TerminalModeOwnershipTests(unittest.TestCase):
     def test_partial_setup_rolls_back_at_each_native_setter(self):
         with ModeEnvironment().installed() as environment:
             for key in environment.initial:
-                for position in ('before', 'after', 'reported'):
+                for position in ['before', 'after', 'reported']:
                     with self.subTest(setting=key, failure=position):
                         mode = terminals.TerminalMode(123, enabled=True)
                         environment.failures.add((key, 'setup', position))
@@ -156,7 +156,7 @@ class ByteReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(stage=stage):
                     reader = terminals.AsyncByteReader(environment.read_fd)
                     await reader.__aenter__()
-                    if stage in ('stop', 'signal'):
+                    if stage in ['stop', 'signal']:
                         environment.exit_gate.clear()
                     environment.failures.add(stage)
                     try:
@@ -188,7 +188,7 @@ class FrontendTerminalOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def test_output_mode_encloses_overlay_setup_and_teardown(self):
         from loki_agent import terminal_frontend as frontend
 
-        for fails in (False, True):
+        for fails in [False, True]:
             with self.subTest(frontend_failure=fails):
                 actions = []
                 mode = mock.MagicMock()
@@ -293,14 +293,14 @@ class InputSessionOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.wait_for(started.wait(), 1)
                         with self.assertRaisesRegex(RuntimeError, 'injected'):
                             await session.__aexit__(None, None, None)
-                    expected = {name.removesuffix('_exit') for name in faults if name in ('reader_exit', 'mode_exit')}
+                    expected = {name.removesuffix('_exit') for name in faults if name in ['reader_exit', 'mode_exit']}
                     self.assertEqual(active, expected)
                     if 'reader_exit' in actions and 'mode_exit' in actions:
                         self.assertLess(actions.index('reader_exit'), actions.index('mode_exit'))
                     faults.clear()
                     previous = len(actions)
                     await session.__aexit__(None, None, None)
-                    expected_actions = [name + '_exit' for name in ('reader', 'mode') if name in expected]
+                    expected_actions = [name + '_exit' for name in ['reader', 'mode'] if name in expected]
                     self.assertEqual(actions[previous:], expected_actions)
                     self.assertFalse(active)
                     previous = list(actions)

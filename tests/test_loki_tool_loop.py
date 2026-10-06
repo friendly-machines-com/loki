@@ -973,8 +973,8 @@ class RuntimeConfigTests(unittest.TestCase):
             })
 
     def test_no_builtin_connection_exists(self):
-        for credential_name in (
-                "OPENCODE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        for credential_name in [
+                "OPENCODE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
             with self.subTest(credential_name=credential_name):
                 env = {credential_name: "provider-key"}
                 with self.assertRaisesRegex(
@@ -983,7 +983,7 @@ class RuntimeConfigTests(unittest.TestCase):
                     loki.build_config_from_env(env)
 
     def test_unrelated_sdk_base_variables_do_not_configure_loki(self):
-        for base_name in ("OPENAI_API_BASE", "ANTHROPIC_BASE_URL"):
+        for base_name in ["OPENAI_API_BASE", "ANTHROPIC_BASE_URL"]:
             with self.subTest(base_name=base_name):
                 env = {
                     base_name: "https://unrelated.example.test/v1",
@@ -997,8 +997,8 @@ class RuntimeConfigTests(unittest.TestCase):
                         env, credentials=credentials)
 
     def test_custom_connection_does_not_use_generic_credentials(self):
-        for credential_name in (
-                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_API_KEY"):
+        for credential_name in [
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_API_KEY"]:
             with self.subTest(credential_name=credential_name):
                 env = {
                     "LOKI_API_BASE":
@@ -1502,7 +1502,7 @@ class ModelLoadingTests(unittest.TestCase):
     def test_status_defaults_to_current_endpoint_and_credential(self):
         from loki_agent.response_headers import Store
         endpoint = "https://example.test/v1/chat/completions"
-        for authenticated in (False, True):
+        for authenticated in [False, True]:
             with self.subTest(authenticated=authenticated), \
                     tempfile.TemporaryDirectory() as tmpdir:
                 environment = {"LOKI_API_BASE": endpoint, "LOKI_MODEL": "model"}
@@ -1948,7 +1948,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             credential = phase.get("credential")
             if credential:
                 self.assertEqual(headers[phase["header"]], phase.get("prefix", "") + credential)
-            for header in ("Authorization", "x-api-key", "X-Custom-Key"):
+            for header in ["Authorization", "x-api-key", "X-Custom-Key"]:
                 if not credential or header != phase["header"]:
                     self.assertNotIn(header, headers)
             payload = json.loads(kwargs["body"])
@@ -2441,7 +2441,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "default_reasoning_summary": "none",
                     "supported_reasoning_levels": [{"effort": "high" if updated else "low"}],
                     "default_reasoning_level": "high" if updated else "low",
-                } for slug in ("old-model", "gpt-test")]}
+                } for slug in ["old-model", "gpt-test"]]}
 
             def message(text):
                 return {"type": "message", "role": "assistant", "content": [
@@ -2470,7 +2470,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     kwargs["prepare_attempt_headers"](headers)
                 check_headers(headers)
                 self.assertEqual(headers[protocols.RESPONSES_LITE_HEADER], "true")
-                for name in ("session-id", "thread-id", "x-client-request-id"):
+                for name in ["session-id", "thread-id", "x-client-request-id"]:
                     self.assertEqual(headers[name], chat_id)
                 payload = json.loads(kwargs["body"])
                 self.assertEqual(payload["model"], "gpt-test")
@@ -2608,11 +2608,11 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("todo-call", json.dumps(payload))
                     self.assertEqual(payload["reasoning"]["effort"], "high")
                 durable = pathlib.Path(path).read_text()
-                for text in ("first durable answer", "resumed durable answer", "next durable answer",
-                             "todo-call", "inspect durable workflow"):
+                for text in ["first durable answer", "resumed durable answer", "next durable answer",
+                             "todo-call", "inspect durable workflow"]:
                     self.assertIn(text, durable)
-                for secret in ("leased-access-sentinel", "durable-refresh-sentinel", "identity-sentinel",
-                               "first-state-sentinel", "ignored-state-sentinel", "resumed-state-sentinel"):
+                for secret in ["leased-access-sentinel", "durable-refresh-sentinel", "identity-sentinel",
+                               "first-state-sentinel", "ignored-state-sentinel", "resumed-state-sentinel"]:
                     self.assertNotIn(secret, durable + output.getvalue() + errors.getvalue())
                 formats.validate_events(resumed.transcript_items)
 
@@ -2653,7 +2653,7 @@ class ExitStatusTests(unittest.TestCase):
         old_credentials = loki.CREDENTIALS
         stderr = io.StringIO()
         try:
-            for async_status, expected_status in [(0, 1), (2, 2)]:
+            for async_status, expected_status in ((0, 1), (2, 2)):
                 with self.subTest(async_status=async_status), mock.patch(
                             "loki_agent.terminal_frontend.signal.signal"), mock.patch(
                                 "loki_agent.terminal_frontend.signal.pthread_sigmask",
@@ -2756,7 +2756,7 @@ class StatusTextTests(unittest.TestCase):
                 self.assertNotIn("\033[0m", rendered)
 
     def test_ps_is_plain_without_a_job_manager_or_with_no_jobs(self):
-        for manager in [None, types.SimpleNamespace(jobs={})]:
+        for manager in (None, types.SimpleNamespace(jobs={})):
             with self.subTest(manager=manager):
                 session = loki.Session(job_manager=manager)
                 with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
@@ -2770,7 +2770,7 @@ class StatusTextTests(unittest.TestCase):
                 self.assertNotIn("\033[1m/ps", output.getvalue())
 
     def test_remote_side_advertises_status_with_and_without_effort(self):
-        for effort in (None, "high"):
+        for effort in [None, "high"]:
             with self.subTest(effort=effort), mock.patch.object(
                     loki, "reasoning_effort_status_text", return_value=effort):
                 text = terminal_frontend.status_text()
@@ -3166,7 +3166,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             script = (
                 'import json,pathlib,sys\n'
                 'p=json.load(sys.stdin); i=p["invocation"]; a=i["effective_arguments"]\n'
-                'if i["call_id"] in ("chat-search", "c-search"):\n'
+                'if i["call_id"] in ["chat-search", "c-search"]:\n'
                 ' assert i["adjustments"][1] == {"hook":"loki.input-repair",\n'
                 '  "rule":"optional_null_omission", "path":["blocked_domains"],\n'
                 '  "display_path":"$.blocked_domains", "operation":"remove"}\n'
@@ -3174,7 +3174,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 'if p["event"]=="pre_tool_call":\n'
                 ' assert isinstance(a["allowed_domains"],list)\n'
                 ' assert "blocked_domains" not in a\n'
-                ' if i["call_id"] in ("chat-search", "c-search"):\n'
+                ' if i["call_id"] in ["chat-search", "c-search"]:\n'
                 '  assert i["original_arguments"]["blocked_domains"] is None\n'
                 '  assert i["adjustments"][:2] == [\n'
                 '   {"hook":"loki.input-repair", "rule":"json_encoded_array",\n'
@@ -3197,7 +3197,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                                     'command': [sys.executable, '-c', script, str(hook_log), str(source)]}],
             }), encoding='utf-8')
             store = CredentialStore({f'{name}_API_KEY': f'leased-{name}-secret'
-                                     for name in ('A', 'B', 'CHAT', 'ANTHROPIC', 'C')})
+                                     for name in ['A', 'B', 'CHAT', 'ANTHROPIC', 'C']})
             owner = credential_supervisors.CredentialSupervisor(store)
             session = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / 'jobs')))
             session.credential_authority = owner.broker
@@ -3353,7 +3353,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 captured.append((phase['name'], copy.deepcopy(payload)))
                 # Opaque origin-only blocks must never reach a foreign provider.
                 serialized = json.dumps(payload)
-                for origin in ('A', 'B'):
+                for origin in ['A', 'B']:
                     if phase['name'] != origin:
                         self.assertNotIn(f'opaque-{origin}', serialized)
                         self.assertNotIn(f'private-{origin}', serialized)
@@ -3522,8 +3522,8 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     for cid, file, line in [('b-grep', source, 'marker original'),
                                             ('b-resumed-grep', notes, '[notes.md](http://notes.md)')]:
                         self.assertEqual(outcomes[cid].split('[results]\n')[1], f'{file}:1:{line}')
-                    for cid in ('a-search', 'chat-search', 'anthropic-search', 'c-search', 'off-search'):
-                        query = 'loki external custom' if cid in ('chat-search', 'anthropic-search', 'c-search') else 'loki'
+                    for cid in ['a-search', 'chat-search', 'anthropic-search', 'c-search', 'off-search']:
+                        query = 'loki external custom' if cid in ['chat-search', 'anthropic-search', 'c-search'] else 'loki'
                         self.assertEqual(
                             outcomes[cid].split('\n\n')[-1],
                             f"WebSearch results for {query!r} (1 results):\n1. Sentinel result\n   https://example.com/result")
@@ -3558,7 +3558,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(record['model'], f'model-{name}')
                         self.assertEqual(record['usage'], {'total_tokens': 3} if name == 'CHAT' else
                                          {'input_tokens': 2, 'output_tokens': 1})
-                    for cid in ('chat-search', 'anthropic-search', 'c-search'):
+                    for cid in ['chat-search', 'anthropic-search', 'c-search']:
                         metadata = next(i['execution'] for i in persisted if i.get('call_id') == cid and i.get('type') == 'tool_result')
                         self.assertEqual([(r['hook'], r['phase'], r['status']) for r in metadata['hooks']], [
                             ('external.transform', 'pre_tool_call', 'ok'),
@@ -3569,7 +3569,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         ])
                         self.assertEqual(metadata['changed_paths'], [str(source)])
                     event_pairs = [(event['type'], event['call_id']) for event in events
-                                   if event['type'] in ('tool_input_repaired', 'tool_call')]
+                                   if event['type'] in ['tool_input_repaired', 'tool_call']]
                     repaired_ids = {'a-read', 'a-search', 'b-write', 'chat-search', 'anthropic-search', 'c-search', 'off-search'}
                     self.assertEqual(event_pairs, [
                         (event_type, cid) for cid in originals
@@ -3579,21 +3579,21 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                                for item in persisted if item.get('type') == 'tool_result'}
                     self.assertEqual([r['rule'] for r in repairs['a-read']], ['path_markdown_autolink'])
                     self.assertEqual([r['rule'] for r in repairs['a-search'][:2]], ['json_encoded_array', 'optional_null_omission'])
-                    for cid in ('chat-search', 'anthropic-search', 'c-search', 'off-search'):
+                    for cid in ['chat-search', 'anthropic-search', 'c-search', 'off-search']:
                         self.assertEqual(repairs[cid][0]['rule'],
-                                         'json_encoded_array' if cid in ('chat-search', 'c-search')
+                                         'json_encoded_array' if cid in ['chat-search', 'c-search']
                                          else 'bare_string_array')
                         self.assertEqual(repairs[cid][0]['value'], ['example.com'])
-                    for cid in ('a-search', 'chat-search', 'c-search'):
+                    for cid in ['a-search', 'chat-search', 'c-search']:
                         self.assertEqual(repairs[cid][1], {
                             'hook': 'loki.input-repair', 'rule': 'optional_null_omission',
                             'path': ['blocked_domains'], 'display_path': '$.blocked_domains',
                             'operation': 'remove'})
-                    for cid in ('chat-search', 'anthropic-search', 'c-search'):
+                    for cid in ['chat-search', 'anthropic-search', 'c-search']:
                         self.assertEqual([r['hook'] for r in repairs[cid]][-2:], ['external.transform', 'custom.transform'])
                     self.assertEqual([row[:2] for row in hook_records()], [
-                        [event, cid] for cid in ('chat-search', 'anthropic-search', 'c-search')
-                        for event in ('pre_tool_call', 'post_tool_call')])
+                        [event, cid] for cid in ['chat-search', 'anthropic-search', 'c-search']
+                        for event in ['pre_tool_call', 'post_tool_call']])
                     self.assertEqual(replays.classify_transcript(persisted), expected_replay)
                     presentation = savefiles.ResumeTranscriptRenderer('current').presentation(persisted)
                     self.assertEqual([(kind, ''.join(text for _, text in segments))
@@ -3606,7 +3606,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn('private anthropic thought', terminal_text)
                     self.assertNotIn('opaque-A', terminal_text)
                     durable = pathlib.Path(path).read_text()
-                    for name in ('A', 'B', 'CHAT', 'ANTHROPIC', 'C'):
+                    for name in ['A', 'B', 'CHAT', 'ANTHROPIC', 'C']:
                         self.assertNotIn(f'leased-{name}-secret', durable + diagnostics.getvalue())
                     self.assertEqual(len(children), 8)
                     self.assertTrue(all(child.returncode == 0 for child in children))
@@ -4169,7 +4169,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
         from datetime import datetime
         import uuid
 
-        for selected_index in (2, 3):
+        for selected_index in [2, 3]:
             with self.subTest(selected_index=selected_index), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 chat_dir = root / 'missing' / '.loki' / 'chats'
@@ -4297,7 +4297,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                         mock.patch.object(terminal_frontend, 'restore_output_area_after_input'), \
                         contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                     # Creation order differs from mtime order, so creation-order picking cannot pass.
-                    for label in ('newest', 'oldest', 'middle'):
+                    for label in ['newest', 'oldest', 'middle']:
                         session = await fresh_session()
                         with mock.patch.object(loki, '_DEFAULT_SESSION', session):
                             loki.apply_runtime_config(config)
@@ -4380,7 +4380,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                                      f'Tool result: Read\n1\tevidence {selected_label}\n\n'
                                      f'picker-model: answer {selected_label}')
                     instructions = [event for event in saved[selected_label]['events']
-                                    if event.get('role') in ('system', 'developer')]
+                                    if event.get('role') in ['system', 'developer']]
                     self.assertTrue(instructions)
                     for event in instructions:
                         self.assertNotIn(formats.item_text(event), rendered[0])
@@ -5031,9 +5031,9 @@ class SubagentLaunchTests(unittest.TestCase):
         old_argv = sys.argv[:]
         try:
             results = []
-            for depth in (0, 2):
+            for depth in [0, 2]:
                 loki.current_session().subagent_depth = depth
-                for parent_entrypoint in ("./loki.py", "./loki-acp"):
+                for parent_entrypoint in ["./loki.py", "./loki-acp"]:
                     sys.argv = [parent_entrypoint]
                     results.append((
                         depth,
@@ -5117,7 +5117,7 @@ class SubagentLaunchTests(unittest.TestCase):
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                for parent_entrypoint in ("loki", "loki-acp"):
+                for parent_entrypoint in ["loki", "loki-acp"]:
                     with self.subTest(entrypoint=parent_entrypoint):
                         if os.name == "nt" and parent_entrypoint == "loki":
                             headless(tmpdir)
@@ -5419,7 +5419,7 @@ class SubagentLaunchTests(unittest.TestCase):
                     await asyncio.sleep(0)
                     loki.host_ipc.close_end(owner_parent)
                     result = await asyncio.wait_for(task, timeout=1)
-                    self.assertEqual(capability_fd.handles(), ())
+                    self.assertEqual(capability_fd.handles(), [])
                     return result
                 finally:
                     await owner.close()
@@ -5771,8 +5771,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 url, 200, "OK", {"content-type": "text/event-stream"}, body())
 
         session = loki.current_session()
-        for stream in (False, True):
-            for root in (None, "35b2d314-fdfb-466f-bbd6-4f479fc82eb4"):
+        for stream in [False, True]:
+            for root in [None, "35b2d314-fdfb-466f-bbd6-4f479fc82eb4"]:
                 with self.subTest(stream=stream, delegated_root=root):
                     self._install_subscription(stream=stream)
                     provider = loki.current_config().chat_provider
@@ -5797,8 +5797,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
                             payload = json.loads(request["body"])
                             self.assertEqual(
                                 headers["thread-id"], payload["prompt_cache_key"])
-                            for name in (
-                                    "SESSION-ID", "Thread-Id", "X-Client-Request-ID"):
+                            for name in [
+                                    "SESSION-ID", "Thread-Id", "X-Client-Request-ID"]:
                                 self.assertNotIn(name, headers)
                     self.assertEqual(provider.headers, original_headers)
 
@@ -5828,7 +5828,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 loki.current_config().chat_provider.chat_url, {}))
 
         for headers in requests:
-            for name in ("session-id", "thread-id", "x-client-request-id"):
+            for name in ["session-id", "thread-id", "x-client-request-id"]:
                 self.assertNotIn(name, headers)
 
     def test_buffered_401_refreshes_once_with_same_idempotency_key(self):
@@ -5947,7 +5947,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 self.assertEqual(turn.metadata["model"], expected)
                 self.assertEqual(
                     formats.provider_notice_codes(turn),
-                    (formats.TRUSTED_ACCESS_FOR_CYBER,),
+                    [formats.TRUSTED_ACCESS_FOR_CYBER],
                 )
 
     def test_public_responses_ignore_subscription_model_header(self):
@@ -6827,7 +6827,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
         )
         self.assertEqual(
             formats.provider_notice_codes(transcript[1]),
-            (formats.TRUSTED_ACCESS_FOR_CYBER,),
+            [formats.TRUSTED_ACCESS_FOR_CYBER],
         )
         _instructions, projected = (
             formats.items_to_openai_responses_parts(transcript))
@@ -7288,7 +7288,7 @@ class QuestionGuardTests(unittest.TestCase):
         self.assertIn("ok", str(transcript[before:]))
 
     def test_explore_and_plan_modes_inhibit(self):
-        for mode in ("explore", "plan"):
+        for mode in ["explore", "plan"]:
             with self.subTest(mode=mode):
                 loki.current_session().agent_mode = mode
                 self.assertEqual(
@@ -7412,11 +7412,11 @@ class QuestionGuardTests(unittest.TestCase):
         loki.current_session().agent_mode = "plan"
         context = loki.get_tool_loop_extra_context(
             [formats.message_item("user", "plan the refactor")])
-        for name in ("TodoWrite", "Read", "Grep"):
+        for name in ["TodoWrite", "Read", "Grep"]:
             with self.subTest(tool=name):
                 self.assertIsNone(
                     loki._tool_access_error(name, extra_context=context))
-        for name in ("Edit", "Write", "Bash", "Skill", "JobStop"):
+        for name in ["Edit", "Write", "Bash", "Skill", "JobStop"]:
             with self.subTest(tool=name):
                 self.assertIsNotNone(
                     loki._tool_access_error(name, extra_context=context))

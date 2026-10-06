@@ -132,7 +132,7 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
     async def _read(self, context):
         return provider_controls.ControlResult(
             lines=("Reset cards - live", "  5-hour reset cards: 1 available"),
-            actions=tuple(self._actions),
+            actions=list(self._actions),
         )
 
     def _patch(self, actions=()):
@@ -144,7 +144,7 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
             applies=lambda context: True,
             read=self._read,
         )
-        for name in ("available_controls", "find_control"):
+        for name in ["available_controls", "find_control"]:
             patch = mock.patch.object(
                 provider_controls, name, return_value=[spec]
                 if name == "available_controls" else spec)

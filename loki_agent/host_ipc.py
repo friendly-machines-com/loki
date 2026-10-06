@@ -219,8 +219,8 @@ def _private_pipe_pair():
         windows_api.clear_handle_inheritance(request_read)
         windows_api.clear_handle_inheritance(response_write)
     except BaseException:
-        for handle in (request_read, request_write,
-                       response_read, response_write):
+        for handle in [request_read, request_write,
+                       response_read, response_write]:
             windows_api.close_handle(handle)
         raise
     return (request_read, request_write), (response_read, response_write)
@@ -243,8 +243,8 @@ class PipeEndpoint:
 
     def handles(self) -> tuple:
         """The handles on this side, in a stable order (read, then write)."""
-        return tuple(handle for handle in (self.read, self.write)
-                     if handle is not None)
+        return list(handle for handle in [self.read, self.write]
+                    if handle is not None)
 
     def reference(self) -> str:
         """An argv value the child parses back with :meth:`parse`."""
@@ -473,7 +473,7 @@ if os.name == "posix":
         return (int(child_end),)
 
     def spawn_kwargs(references) -> dict:
-        return {"pass_fds": tuple(
+        return {"pass_fds": list(
             fd for end in references for fd in handles(end))}
 
     def close_end(end) -> None:

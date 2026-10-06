@@ -518,7 +518,7 @@ class PlatformGateTests(unittest.TestCase):
     def test_posix_refuses_the_setup_entrypoint_entirely(self):
         # Even --help: the flag vocabulary must not exist on POSIX, so an
         # unknown option fails instead of quietly doing nothing.
-        for argument in (["--help"], ["--edit", "/work"], ["--verify", "/w"]):
+        for argument in [["--help"], ["--edit", "/work"], ["--verify", "/w"]]:
             with self.subTest(argument=argument):
                 self.assertEqual(windows_setup.main(argument), 2)
 

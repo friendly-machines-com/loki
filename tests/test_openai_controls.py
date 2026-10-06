@@ -142,7 +142,7 @@ class ResetReadTests(unittest.IsolatedAsyncioTestCase):
             context(request=_Request(response(payload))))
 
         self.assertTrue(any("[brand_new]" in line for line in result.lines))
-        self.assertEqual(result.actions, ())
+        self.assertEqual(result.actions, [])
 
 
 class RedeemTests(unittest.IsolatedAsyncioTestCase):

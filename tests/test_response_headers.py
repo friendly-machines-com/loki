@@ -84,9 +84,9 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.dumps(document, sort_keys=True), original)
 
     async def test_retry_after_http_dates(self):
-        for value in ("Thu, 01 Jan 1970 00:02:00 GMT",
+        for value in ["Thu, 01 Jan 1970 00:02:00 GMT",
                       "Thursday, 01-Jan-70 00:02:00 GMT",
-                      "Thu Jan  1 00:02:00 1970"):
+                      "Thu Jan  1 00:02:00 1970"]:
             with self.subTest(value=value):
                 self.observe(headers={"retry-after": value}, status=429)
                 with mock.patch.object(response_headers.time, "time", return_value=60):
@@ -113,8 +113,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             self.observe(headers={"retry-after": "0"}, status=429)
         with mock.patch.object(response_headers.time, "time", return_value=1):
             self.assertIn("has passed", response_headers.render(self.store.snapshot()))
-        for value in ("", "-1", "+1", "1.5", "NaN", "soon", "9" * 400,
-                      "Thu, 99 Jan 1970 00:00:00 GMT", "120\n", "\x1b[31m"):
+        for value in ["", "-1", "+1", "1.5", "NaN", "soon", "9" * 400,
+                      "Thu, 99 Jan 1970 00:00:00 GMT", "120\n", "\x1b[31m"]:
             with self.subTest(value=value):
                 self.observe(headers={"retry-after": value}, status=429)
                 text = response_headers.render(self.store.snapshot())
@@ -263,10 +263,10 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("resets in 0", text)
 
     async def test_reset_must_match_usage_observation_even_in_same_clock_tick(self):
-        for newer in (
+        for newer in [
                 {"x-codex-primary-used-percent": "54",
                  "x-codex-primary-window-minutes": "10080"},
-                {"x-codex-primary-reset-at": "1704074401"}):
+                {"x-codex-primary-reset-at": "1704074401"}]:
             with self.subTest(newer=newer), mock.patch.object(
                     response_headers.time, "time_ns", return_value=1704067200 * 10**9):
                 observer = self.codex_observer()
@@ -282,8 +282,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("resets at", text)
 
     async def test_bad_reset_headers_leave_quota_readable(self):
-        for reset in ("", "NaN", "inf", "tomorrow", "1.5", "-1", "0",
-                      "9" * 100, "1704074400000", "1704074400\x1b[2J"):
+        for reset in ["", "NaN", "inf", "tomorrow", "1.5", "-1", "0",
+                      "9" * 100, "1704074400000", "1704074400\x1b[2J"]:
             with self.subTest(reset=reset):
                 self.codex_observer()(200, {
                     "x-codex-primary-used-percent": "54",
@@ -330,7 +330,7 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             200, {"remaining": "1"})
         live.observer(endpoint, "env:KEY", "model")(
             200, {"new-header": "live"})
-        for credential in ("env:KEY", "env:OTHER", None):
+        for credential in ["env:KEY", "env:OTHER", None]:
             with self.subTest(credential=credential):
                 entries = live.snapshot(
                     "https://EXAMPLE.com:443/chat", credential=credential)["endpoints"]
@@ -470,7 +470,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(child.communicate(), 5)
 
     async def test_child_cleanup_reaps_after_timeout_cancellation_or_assertion(self):
-        for outcome in ('timeout', 'cancel', 'assertion'):
+        for outcome in ['timeout', 'cancel', 'assertion']:
             with self.subTest(outcome=outcome):
                 expected_error = (
                     self.assertRaisesRegex(AssertionError, 'injected readiness assertion')
@@ -550,7 +550,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         await server.wait_closed()
 
     async def test_buffered_error_and_stream_body_failure_capture_headers(self):
-        for stream in (False, True):
+        for stream in [False, True]:
             with self.subTest(stream=stream):
                 response = (b"HTTP/1.1 429 Too Many Requests\r\n"
                             b"X-Remaining: 0\r\nContent-Length: 2\r\n\r\n{}")

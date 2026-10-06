@@ -442,7 +442,7 @@ async def complete_openai_device_login(
             challenge = data.get("code_challenge")
             if not all(
                     isinstance(value, str) and value
-                    for value in (code, verifier, challenge)):
+                    for value in [code, verifier, challenge]):
                 raise OAuthLoginError(
                     "OpenAI device-code poll returned invalid PKCE data")
             try:

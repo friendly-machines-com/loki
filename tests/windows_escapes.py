@@ -530,13 +530,13 @@ try {
         reply = json.loads(run_powershell(ps, 'wmi'))
         if reply['kind'] == 'exception':
             status = reply['hresult'] & 0xffffffff
-            if status not in (0x80070005, 0x80041003):
+            if status not in [0x80070005, 0x80041003]:
                 raise RuntimeError('unexpected WMI exception: %r' % reply)
             return {'outcome': 'access-denied', 'phase': 'wmi-exception',
                     'reply': reply}
         if reply['kind'] != 'return':
             raise RuntimeError('unexpected WMI reply: %r' % reply)
-        if reply['code'] in (2, 3):
+        if reply['code'] in [2, 3]:
             return {'outcome': 'access-denied', 'phase': 'wmi-create', 'reply': reply}
         if reply['code'] == 0:
             self.created += 1
@@ -631,7 +631,7 @@ try {
                                flags)
             if not success:
                 error = C.get_last_error()
-                if error in (5, 1314):  # ACCESS_DENIED, PRIVILEGE_NOT_HELD
+                if error in [5, 1314]:  # ACCESS_DENIED, PRIVILEGE_NOT_HELD
                     return {'outcome': 'access-denied', 'phase': 'create',
                             'winerror': error,
                             'startupinfo': 'plain' if plain else 'extended'}
@@ -793,7 +793,7 @@ def com_activation(clsid):
                                      C.POINTER(Guids), C.POINTER(C.c_void_p)]
     ole.CoUninitialize.restype = None
     hr = ole.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
-    if hr not in (0, 1):  # S_OK or S_FALSE; both require CoUninitialize
+    if hr not in [0, 1]:  # S_OK or S_FALSE; both require CoUninitialize
         print(json.dumps({'hresult': hr, 'phase': 'co-initialize'}), flush=True)
         return
     try:
@@ -873,7 +873,7 @@ def impersonation(api, manifest, classify):
                                        C.get_last_error())
                 current = api.snapshot(thread)
                 preserved = all(current[key] == before[key]
-                                for key in ('user', 'app', 'package'))
+                                for key in ['user', 'app', 'package'])
                 under = classify(
                     'impersonated-credential-read',
                     lambda: (Path(manifest['secret']) / 'read').read_bytes())
@@ -1038,10 +1038,10 @@ def probe(api, manifest, script, manifest_path, classify):
                 api.close(clone)
         run('duplicate-token-control', duplicate_control, ('unchanged',))
 
-        for privilege in ('SeDebugPrivilege', 'SeBackupPrivilege',
+        for privilege in ['SeDebugPrivilege', 'SeBackupPrivilege',
                           'SeRestorePrivilege', 'SeTakeOwnershipPrivilege',
                           'SeImpersonatePrivilege', 'SeAssignPrimaryTokenPrivilege',
-                          'SeTcbPrivilege', 'SeCreateTokenPrivilege'):
+                          'SeTcbPrivilege', 'SeCreateTokenPrivilege']:
             def enable(privilege=privilege):
                 clone = api.clone(source, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES)
                 try:
@@ -1098,7 +1098,7 @@ def probe(api, manifest, script, manifest_path, classify):
                 expected['privileges'][privilege] = after['privileges'].get(privilege)
                 attrs = after['privileges'].get(privilege)
                 valid = (after == expected and
-                         ((error == 0 and attrs in (2, 10)) or
+                         ((error == 0 and attrs in [2, 10]) or
                           (error == 1300 and attrs == 0)))
                 return {'outcome': 'contained-adjustment' if valid else 'unexpected-adjustment',
                         'winerror': error, 'before': before, 'after': after}

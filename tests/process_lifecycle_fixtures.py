@@ -37,7 +37,7 @@ class ProcessResources:
                        if os.name == 'nt' else None)
         self.pipes = []
         if os.name == 'posix' and self.transport is not None:
-            for fd in (0, 1, 2):
+            for fd in [0, 1, 2]:
                 pipe = self.transport.get_pipe_transport(fd)
                 if pipe is not None:
                     self.pipes.append(pipe.get_extra_info('pipe'))
@@ -108,7 +108,7 @@ class LifecycleObservations:
                 case.assertIsNone(server._writer._source.thread)
                 case.assertIsNone(server._writer._source.stop_event)
                 case.assertIsNone(server._writer._sink.thread)
-                case.assertEqual(server._writer._endpoint.handles(), ())
+                case.assertEqual(server._writer._endpoint.handles(), [])
                 case.assertTrue(server._writer._pump.done())
             else:
                 case.assertTrue(server._writer.is_closing())

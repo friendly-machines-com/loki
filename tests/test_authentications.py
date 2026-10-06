@@ -341,7 +341,7 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
                 await auth.request_openai_token_refresh("refresh")
 
     async def test_http_error_response_makes_refresh_outcome_indeterminate(self):
-        for body in (b'{"error":"temporarily_unavailable"}', b"not json"):
+        for body in [b'{"error":"temporarily_unavailable"}', b"not json"]:
             with self.subTest(body=body):
                 response = http_client.HttpResponse(
                     auth.OPENAI_REFRESH_URL,

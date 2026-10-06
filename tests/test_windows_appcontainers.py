@@ -431,7 +431,7 @@ class AppContainers(NativeCalls):
                         stdin_handle,)
                 else:
                     child_stdin, child_stdout = stdio
-                    stdio_handles = tuple(stdio)
+                    stdio_handles = list(stdio)
                 if stdin_handle is not None and stdio is not None:
                     raise ValueError('stdin_handle and stdio overlap')
                 inherited = (log_handle, null_handle, *stdio_handles,
@@ -498,7 +498,7 @@ class AppContainers(NativeCalls):
                 # has already exited. This is not proof against broker escapes.
                 with ExitStack() as cleanup:
                     cleanup.callback(self.delete_attributes, attributes)
-                    for handle in (process.process, process.thread, job):
+                    for handle in [process.process, process.thread, job]:
                         if handle:
                             cleanup.callback(
                                 lambda handle=handle: self.check(self.close(handle)))
@@ -760,8 +760,8 @@ def pipe_inheritance_probe(native, sid, workspace, output):
         return {'probe': 'inherited-anonymous-pipe',
                 'outcome': 'both-directions-used'}
     finally:
-        for handle in (request_read, request_write,
-                       response_read, response_write):
+        for handle in [request_read, request_write,
+                       response_read, response_write]:
             native.check(native.close(handle))
 
 
@@ -800,7 +800,7 @@ def pipe_stdio_probe(native, sid, workspace, output):
         return {'probe': 'inherited-pipe-as-stdio',
                 'outcome': 'stdio-both-directions-used'}
     finally:
-        for handle in (stdin_read, stdin_write, stdout_read, stdout_write):
+        for handle in [stdin_read, stdin_write, stdout_read, stdout_write]:
             native.check(native.close(handle))
 
 
@@ -838,7 +838,7 @@ def environment_203_probe(native, sid, workspace, output):
         buffers['add_' + name] = block(entries((*minimal, name)))
     record = {'probe': 'appcontainer-environment-203'}
     command = [sys.executable, '-I', '-u', '-c', 'pass']
-    for label, environment in [('inherited', None), *buffers.items()]:
+    for label, environment in (('inherited', None), *buffers.items()):
         try:
             code = native.launch(
                 command, sid, workspace, output,
@@ -1056,8 +1056,8 @@ def register_user_com_server(clsid, command):
 
 def unregister_user_com_server(clsid):
     import winreg
-    for path in (r'Software\Classes\CLSID\%s\LocalServer32' % clsid,
-                 r'Software\Classes\CLSID\%s' % clsid):
+    for path in [r'Software\Classes\CLSID\%s\LocalServer32' % clsid,
+                 r'Software\Classes\CLSID\%s' % clsid]:
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
         except FileNotFoundError:
@@ -1105,7 +1105,7 @@ def reap_activation_wrapper(process):
     except Exception as error:
         if failure is None:
             failure = error
-    for stream in (process.stdout, process.stderr):
+    for stream in [process.stdout, process.stderr]:
         if stream is not None:
             try:
                 stream.close()
@@ -1259,7 +1259,7 @@ def probe_failed(result):
     """
     expected = result.get('expected', 'access-denied')
     if expected == 'characterized':
-        return result['outcome'] not in ('allowed', 'access-denied')
+        return result['outcome'] not in ['allowed', 'access-denied']
     return result['outcome'] != expected
 
 
@@ -1584,7 +1584,7 @@ class EscapeResultTests(unittest.TestCase):
     def test_characterized_probe_reports_instead_of_judging(self):
         # Both outcomes are findings for a characterization; only a protocol
         # failure counts against it.
-        for outcome in ('allowed', 'access-denied'):
+        for outcome in ['allowed', 'access-denied']:
             with self.subTest(outcome=outcome):
                 self.assertFalse(probe_failed(
                     {'outcome': outcome, 'expected': 'characterized'}))
@@ -1648,7 +1648,7 @@ class EscapeResultTests(unittest.TestCase):
                      Path('report.json'), 'user', 'package')
         with mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
                 mock.patch('builtins.print'):
-            for code in (2, 3):
+            for code in [2, 3]:
                 reply = subprocess.CompletedProcess([], 0, json.dumps(
                     {'kind': 'return', 'code': code, 'pid': 0}), '')
                 with mock.patch.object(subprocess, 'run', return_value=reply):
@@ -1672,7 +1672,7 @@ class EscapeResultTests(unittest.TestCase):
         api.duplicate_handle = mock.Mock()
         target = {'pid': 42, 'address': 123, 'file_handle': 456}
         with mock.patch('builtins.print'):
-            for operation in (api.peer_memory, api.peer_handle):
+            for operation in [api.peer_memory, api.peer_handle]:
                 with self.assertRaises(PermissionError):
                     operation(target)
         api.read_memory.assert_not_called()
@@ -1690,7 +1690,7 @@ class EscapeResultTests(unittest.TestCase):
         target = {'pid': 42, 'address': 123, 'file_handle': 456}
         with mock.patch('builtins.print'), \
                 mock.patch.object(C, 'get_last_error', return_value=5, create=True):
-            for operation in (api.peer_memory, api.peer_handle):
+            for operation in [api.peer_memory, api.peer_handle]:
                 result = operation(target)
                 self.assertEqual(result['outcome'], 'process-access-granted')
                 self.assertEqual(result['winerror'], 5)
@@ -2018,7 +2018,7 @@ with mock.patch.object(C, 'set_last_error', create=True), \
         api, {'secret': 'unused'}, lambda *args: {'outcome': 'access-denied'})
 print('RETURNED', flush=True)
 '''
-        for mode in ('success', 'query-error'):
+        for mode in ['success', 'query-error']:
             with self.subTest(mode=mode):
                 result = subprocess.run(
                     [sys.executable, '-I', '-u', '-c', script, __file__, mode],
@@ -2092,7 +2092,7 @@ print('RETURNED', flush=True)
 
     def test_scheduled_task_invoke_outcomes(self):
         api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
-        for code, outcome in [(1, 'invoke-rejected'), (0, 'invoke-accepted')]:
+        for code, outcome in ((1, 'invoke-rejected'), (0, 'invoke-accepted')):
             reply = subprocess.CompletedProcess([], code, '', 'ERROR: Access is denied.')
             with self.subTest(exit=code), \
                     mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
@@ -2316,7 +2316,7 @@ print('RETURNED', flush=True)
 
     def test_watcher_slow_inspection_cannot_license_another(self):
         reports = {}
-        for name in ('a', 'b'):
+        for name in ['a', 'b']:
             report = mock.Mock()
             report.exists.return_value = True
             report.read_text.return_value = json.dumps({'pid': 1})
@@ -2424,8 +2424,8 @@ print('RETURNED', flush=True)
             self.assertEqual(result['outcome'], outcome)
             passed = escape_helpers['finalize_result'](
                 result, 0, ('activation-denied', 'class-not-registered'))['passed']
-            self.assertEqual(passed, outcome in ('activation-denied',
-                                                 'class-not-registered'))
+            self.assertEqual(passed, outcome in ['activation-denied',
+                                                 'class-not-registered'])
         with mock.patch('builtins.print'), \
                 mock.patch.object(subprocess, 'run', side_effect=(
                     subprocess.TimeoutExpired(['com'], 20))):
@@ -2560,7 +2560,7 @@ class AccessOutcomeTests(unittest.TestCase):
         self.assertEqual(result['message'], str(error))
 
     def test_native_error_takes_precedence_over_errno(self):
-        for code, expected in [(5, True), (32, False), (87, False), (0, False)]:
+        for code, expected in ((5, True), (32, False), (87, False), (0, False)):
             with self.subTest(winerror=code):
                 error = PermissionError(errno.EACCES, 'native result')
                 error.winerror = code
@@ -3155,7 +3155,7 @@ class AppContainerTests(unittest.TestCase):
                                         'broker_pid': os.getpid(), 'peer': target,
                                         'scheduled_task': task_name,
                                         'com': com_targets}))
-        for mode in ('normal-root-exit', 'terminated-root'):
+        for mode in ['normal-root-exit', 'terminated-root']:
             with self.subTest(cleanup=mode):
                 directory = workspace / mode
                 directory.mkdir()
@@ -3460,9 +3460,9 @@ if __name__ == '__main__':
         report = escape_helpers['impersonation'](
             api, json.loads(Path(sys.argv[2]).read_text()), access_outcome)
         print(json.dumps(report), flush=True)
-        sys.exit(0 if report['outcome'] in ('impersonated-contained',
-                                            'access-denied') else 1)
-    if len(sys.argv) == 3 and sys.argv[1] in ('--task-witness', '--com-witness'):
+        sys.exit(0 if report['outcome'] in ['impersonated-contained',
+                                            'access-denied'] else 1)
+    if len(sys.argv) == 3 and sys.argv[1] in ['--task-witness', '--com-witness']:
         manifest, report = task_witness(Path(sys.argv[2]))
         native = AppContainers()
         api = escape_helpers['Escapes'](
@@ -3471,7 +3471,7 @@ if __name__ == '__main__':
         sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] == '--runtime-gate':
         sys.exit(runtime_gate(sys.argv[2]))
-    if len(sys.argv) == 3 and sys.argv[1] in ('--contained', '--descendant'):
+    if len(sys.argv) == 3 and sys.argv[1] in ['--contained', '--descendant']:
         sys.exit(contained(sys.argv[2], sys.argv[1] == '--descendant'))
     if len(sys.argv) == 3 and sys.argv[1] == '--standard-user':
         native = AppContainers()

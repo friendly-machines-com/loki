@@ -39,7 +39,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
         # External response bytes only: application decoding stays real.
         if stream:
             chunks = []
-            for content in (answer[:3], answer[3:]):
+            for content in [answer[:3], answer[3:]]:
                 chunks.append('data: ' + json.dumps({
                     'object': 'chat.completion.chunk',
                     'choices': [{'index': 0, 'delta': {'content': content},
@@ -64,7 +64,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
         for event in events:
             items = event.get('items', []) if event['type'] == 'model_response' else [event]
             for item in items:
-                if item.get('type') == 'message' and item.get('role') in ('user', 'assistant'):
+                if item.get('type') == 'message' and item.get('role') in ['user', 'assistant']:
                     pairs.append((item['role'], formats.item_text(item)))
         return pairs
 
@@ -109,12 +109,12 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
             async with asyncio.timeout(5):
                 connector = FakeConnector([])
                 with PatchedOpenConnection(connector):
-                    for stream in (False, True):
+                    for stream in [False, True]:
                         config = self._config(
                             'https://opencode.ai/zen/go/v1/chat/completions', stream=stream)
                         with self.assertRaisesRegex(ValueError, 'require a conversation identity'):
                             loki._opencode_session_id_for_request(config, config.chat_provider.chat_url)
-                        for invalid in (None, '', 0, 1, False, True, [], ['id'], {}, {'id': 'x'}):
+                        for invalid in [None, '', 0, 1, False, True, [], ['id'], {}, {'id': 'x'}]:
                             with self.subTest(stream=stream, identity=invalid):
                                 loki.current_session().conversation_id = invalid
                                 with self.assertRaisesRegex(ValueError, 'require a conversation identity'):
@@ -217,7 +217,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                                 self.assertNotIn('stream', payload)
                             self.assertEqual([(message['role'], message['content'])
                                               for message in payload['messages']
-                                              if message['role'] in ('user', 'assistant')],
+                                              if message['role'] in ['user', 'assistant']],
                                              history + [('user', prompt)])
                             expected = history + [('user', prompt), ('assistant', answer)]
                             with open(path, 'rb') as saved:
@@ -256,7 +256,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                                 writer.close()
                                 await writer.wait_closed()
 
-        for stream in (False, True):
+        for stream in [False, True]:
             with self.subTest(stream=stream), tempfile.TemporaryDirectory() as directory:
                 with mock.patch.object(loki, '_DEFAULT_SESSION', Session(shell_cwd=directory)), \
                         mock.patch.object(loki, 'CREDENTIALS', CredentialStore({})):
@@ -268,7 +268,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                 canonical = 'https://opencode.ai/zen/go/v1/chat/completions'
                 non_go = 'https://opencode.ai/zen/v1/chat/completions'
                 mismatch = 'https://opencode.ai/zen/go/v1/responses'
-                for stream in (False, True):
+                for stream in [False, True]:
                     for configured, requested in ((non_go, non_go), (canonical, mismatch)):
                         with self.subTest(stream=stream, configured=configured, requested=requested):
                             self._config(configured, stream=stream)

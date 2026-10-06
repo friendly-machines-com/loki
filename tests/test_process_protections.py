@@ -18,7 +18,7 @@ class FakePrctl:
         self.restype = None
 
     def __call__(self, *args):
-        self.calls.append(tuple(
+        self.calls.append(list(
             value.value if hasattr(value, "value") else value
             for value in args))
         return next(self.results)
@@ -60,9 +60,9 @@ class ProcessProtectionTests(unittest.TestCase):
                                 process_protections.ProcessProtectionError,
                                 error):
                             process_protections.protect_credential_process()
-                expected = [(4, 0, 0, 0, 0)]  # SET_DUMPABLE must clear it.
+                expected = [[4, 0, 0, 0, 0]]  # SET_DUMPABLE must clear it.
                 if len(results) == 2:
-                    expected.append((3, 0, 0, 0, 0))  # GET_DUMPABLE
+                    expected.append([3, 0, 0, 0, 0])  # GET_DUMPABLE
                 self.assertEqual(prctl.calls, expected)
 
     def test_real_process_reports_protection(self):

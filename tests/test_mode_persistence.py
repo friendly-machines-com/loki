@@ -62,7 +62,7 @@ class ModePersistenceTests(unittest.TestCase):
 
     def test_missing_or_invalid_marker_is_unknown_without_text_inference(self):
         states = [{}, *({"last_instructed_agent_mode": value}
-                        for value in (None, 1, [], {}, "bogus", "Normal"))]
+                        for value in [None, 1, [], {}, "bogus", "Normal"])]
         for state in states:
             with self.subTest(state=state):
                 self.save_announcement("normal")

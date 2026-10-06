@@ -150,8 +150,8 @@ class RawMode:
 
     @property
     def needs_restore(self):
-        return any(value is not None for value in (
-            self.old_mode, self.old_cp, self.old_output_mode))
+        return any(value is not None for value in [
+            self.old_mode, self.old_cp, self.old_output_mode])
 
     def __enter__(self):
         if self.needs_restore:

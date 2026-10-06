@@ -144,7 +144,7 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
     def test_invalid_explicit_config_does_not_fall_back_to_trace(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'logging.ini'
-            for content in (None, '', '[invalid]\nvalue=1'):
+            for content in [None, '', '[invalid]\nvalue=1']:
                 if content is not None:
                     path.write_text(content)
                 result = self.run_code(
@@ -251,8 +251,8 @@ assert os.environ['LOKI_LOG_CONFIG'] == original
                 'if not configure_logging():',
                 f'import os\nos.chdir({directory!r})\n'
                 'if not configure_logging():')
-            for filename in ('project/link/../logging.ini',
-                             directory + '/project/link/../logging.ini'):
+            for filename in ['project/link/../logging.ini',
+                             directory + '/project/link/../logging.ini']:
                 with self.subTest(filename=filename):
                     result = self.run_code(code, LOKI_LOG_CONFIG=filename)
                     self.assertEqual(result.returncode, 0, result.stderr)

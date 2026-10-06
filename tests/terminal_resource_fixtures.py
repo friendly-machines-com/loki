@@ -202,7 +202,7 @@ class ReaderEnvironment:
                             join(3)
                             if thread.is_alive():
                                 raise RuntimeError('fixture reader did not stop')
-                    for event in tuple(self.events):
+                    for event in list(self.events):
                         close(event)
                 os.close(self.write_fd)
                 os.close(self.read_fd)

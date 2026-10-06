@@ -10,7 +10,7 @@ class CodexSessionIdentityTests(unittest.TestCase):
         resumed = Session()
         self.assertNotEqual(first.conversation_id, resumed.conversation_id)
         path = "chat-35b2d314-fdfb-466f-bbd6-4f479fc82eb4.json"
-        for session in (first, resumed):
+        for session in [first, resumed]:
             session.replace_transcript([], [], [], {
                 "delegated_root_conversation_id": "untrusted",
                 "root_conversation_id": "untrusted",
@@ -40,7 +40,7 @@ class CodexSessionIdentityTests(unittest.TestCase):
             "Explore", "--root-conversation-id", identity.upper(),
         ])
         self.assertEqual(options.root_conversation_id, identity)
-        for invalid in ("", "not-an-id", identity + "\r\nInjected: yes"):
+        for invalid in ["", "not-an-id", identity + "\r\nInjected: yes"]:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 subagents.parse_args([
                     "Explore", "--root-conversation-id", invalid,

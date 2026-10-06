@@ -78,8 +78,8 @@ def _check_name(name: str) -> None:
     containing a separator would still walk past it; the names the storage uses
     are constants, and this keeps it that way.
     """
-    if not name or name in (".", "..") or any(
-            part in name for part in ("/", "\\", ":")):
+    if not name or name in [".", ".."] or any(
+            part in name for part in ["/", "\\", ":"]):
         raise CredentialStorageError(
             f"credential file name is not a single path component: {name!r}")
 

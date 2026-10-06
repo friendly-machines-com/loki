@@ -282,7 +282,7 @@ def automatic_grants(workspace: str) -> list[Grant]:
     setup_bundle = os.path.dirname(sys.executable)
     release_bundle = os.path.dirname(setup_bundle)
     runtimes = [os.path.join(release_bundle, name)
-                for name in ("loki", "loki-acp")]
+                for name in ["loki", "loki-acp"]]
     return [
         Grant(workspace, Access.READ_WRITE, "workspace"),
         *(Grant(runtime, Access.READ, "runtime") for runtime in runtimes),
@@ -680,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         print("loki-setup: the Windows setup editor runs on Windows only",
               file=sys.stderr)
         return 2
-    if arguments and arguments[0] in ("-h", "--help"):
+    if arguments and arguments[0] in ["-h", "--help"]:
         print(USAGE, end="")
         return 0
     if not arguments:

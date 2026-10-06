@@ -215,7 +215,7 @@ class HttpBodyStream:
             if size == 0:
                 while True:
                     trailer = await self._read(self.reader.readline())
-                    if trailer in (b"\r\n", b"\n"):
+                    if trailer in [b"\r\n", b"\n"]:
                         return
                     if not trailer:
                         return

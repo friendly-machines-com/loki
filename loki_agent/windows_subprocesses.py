@@ -108,7 +108,7 @@ def pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
             # Another process holding this name cannot be distinguished from
             # a name collision here; try another random name either way.
             if (attempt == _MAX_NAME_ATTEMPTS - 1
-                    or status not in (ERROR_PIPE_BUSY, ERROR_ACCESS_DENIED)):
+                    or status not in [ERROR_PIPE_BUSY, ERROR_ACCESS_DENIED]):
                 raise api.WindowsApiError("CreateNamedPipeW failed",
                                           status=status)
         try:
@@ -128,7 +128,7 @@ def pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
                                           status=status)
         return server, client
     except BaseException:
-        for handle in (server, client):
+        for handle in [server, client]:
             if handle is not None:
                 api.close_handle(handle)
         raise
@@ -396,7 +396,7 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
             for proto in self._pipes.values():
                 if proto is not None:
                     proto.pipe.close()
-            for raw_pipe in (proc.stdin, proc.stdout, proc.stderr):
+            for raw_pipe in [proc.stdin, proc.stdout, proc.stderr]:
                 if raw_pipe is not None:
                     raw_pipe.close()
             if waiter is not None and not waiter.cancelled():
@@ -659,7 +659,7 @@ class ContainedWorkerTransport(BaseSubprocessTransport):
                     stdio=(child_read, child_write),
                     current_directory=kwargs['current_directory'])
         except BaseException:
-            for handle in (front_read, front_write, child_read, child_write):
+            for handle in [front_read, front_write, child_read, child_write]:
                 api.close_handle(handle)
             raise
         # The front's copies of the child's ends must not outlive the launch,
@@ -726,7 +726,7 @@ async def create_worker_process(*, workspace, environment, arguments,
                 # Attachment may have been cancelled before its coroutine
                 # started, in which case it never took ownership of these.
                 if proc is not None:
-                    for raw_pipe in (proc.stdin, proc.stdout):
+                    for raw_pipe in [proc.stdin, proc.stdout]:
                         raw_pipe.close()
             finally:
                 await transport._exit_task

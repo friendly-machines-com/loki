@@ -42,7 +42,7 @@ def _configured_workspace(tmpdir):
 
 
 def _close_process_streams(process):
-    for name in ("stdin", "stdout", "stderr"):
+    for name in ["stdin", "stdout", "stderr"]:
         stream = getattr(process, name, None)
         if stream is not None and not stream.closed:
             stream.close()
@@ -1085,8 +1085,8 @@ class EventMapperTests(unittest.TestCase):
 
     def test_ignored_events_map_to_nothing(self):
         from loki_agent import acp_events
-        for kind in ("assistant_end", "response_timing", "max_loops",
-                     "assistant_start", "provider_notice"):
+        for kind in ["assistant_end", "response_timing", "max_loops",
+                     "assistant_start", "provider_notice"]:
             self.assertEqual(
                 acp_events.map_event("s", {"type": kind}, {}), [])
 
@@ -1197,7 +1197,7 @@ def _conversation_pairs(blob):
             items.append(event)
     return [(item["role"], item["content"]) for item in items
             if item["type"] == "message"
-            and item["role"] in ("user", "assistant")]
+            and item["role"] in ["user", "assistant"]]
 
 
 def _expected_pairs(*turns):
@@ -1216,7 +1216,7 @@ def _historical_chunks(messages, session_id):
         params = message["params"]
         update = params["update"]
         kind = update["sessionUpdate"]
-        if kind in ("user_message_chunk", "agent_message_chunk"):
+        if kind in ["user_message_chunk", "agent_message_chunk"]:
             if params["sessionId"] != session_id:
                 raise AssertionError("replay belongs to a different session")
             chunks.append((kind, update["content"]))
@@ -1274,7 +1274,7 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                     },
                 })
                 self.assertEqual(initialized["agentCapabilities"]["sessionCapabilities"]["resume"], {})
-                for params in ({}, {"cwd": workspace}):
+                for params in [{}, {"cwd": workspace}]:
                     listed, _ = await self._request(front, 2, "session/list", params)
                     self.assertEqual(len(listed["sessions"]), 1)
                     entry = listed["sessions"][0]
@@ -1340,10 +1340,10 @@ class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
                 json.dump(saved, stream)
             with open(path, 'rb') as stream:
                 original = stream.read()
-            for name in ('LOKI_PROVIDER', 'LOKI_API_BASE', 'LOKI_MODEL'):
+            for name in ['LOKI_PROVIDER', 'LOKI_API_BASE', 'LOKI_MODEL']:
                 del env[name]
 
-            for decision in ('accept', 'decline', 'close then accept', 'eof'):
+            for decision in ['accept', 'decline', 'close then accept', 'eof']:
                 with self.subTest(decision=decision):
                     front, diagnostics = await self._front(env, workspace)
                     await self._request(front, 1, 'initialize', {
@@ -1427,9 +1427,9 @@ def _tool_updates(messages, session_id):
         if params["sessionId"] != session_id:
             raise AssertionError("tool update belongs to another session")
         update = params["update"]
-        if update["sessionUpdate"] in (
+        if update["sessionUpdate"] in [
                 "agent_message_chunk", "user_message_chunk",
-                "tool_call", "tool_call_update"):
+                "tool_call", "tool_call_update"]:
             updates.append(update)
     return updates
 
@@ -1563,13 +1563,13 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                 requests.append(copy.deepcopy(items))
                 self.assertLessEqual(len(requests), 2, "unexpected additional provider request")
                 if len(requests) == 1:
-                    for chunk in ("Inspecting ", "resource."):
+                    for chunk in ["Inspecting ", "resource."]:
                         kwargs["on_text_delta"](chunk)
                     return formats.DecodedTurn([
                         formats.message_item("assistant", "Inspecting resource."),
                         formats.tool_call_item(call_id, "Bash", args),
                     ], {"protocol": protocols.OPENAI_CHAT})
-                for chunk in ("Tool ", "complete."):
+                for chunk in ["Tool ", "complete."]:
                     kwargs["on_text_delta"](chunk)
                 return formats.DecodedTurn([
                     formats.message_item("assistant", "Tool complete."),
@@ -1759,7 +1759,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
             self.assertEqual(initialized["protocolVersion"], 1)
             self.assertEqual(initialized["agentInfo"]["name"], "loki")
             self.assertEqual(initialized["agentInfo"]["version"], __version__)
-            for capability in ("close", "list", "resume"):
+            for capability in ["close", "list", "resume"]:
                 self.assertEqual(initialized["agentCapabilities"]["sessionCapabilities"][capability], {})
             self.assertIs(initialized["agentCapabilities"]["promptCapabilities"]["image"], False)
             opened, preceding = await self._request(front, 2, "session/new", {"cwd": workspace})
@@ -2238,7 +2238,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
         from loki_agent import formats, http_client, loki
         from loki_agent.sessions import Session
 
-        for explicit in (False, True):
+        for explicit in [False, True]:
             for method in acp.RESTORE_METHODS:
                 with self.subTest(explicit=explicit, method=method), tempfile.TemporaryDirectory() as root, ExitStack() as stack:
                     workspace = os.path.join(root, 'workspace with spaces')
@@ -2251,7 +2251,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                     stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
                     stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
                     responses = []
-                    for answer in ("original answer", "continued answer"):
+                    for answer in ["original answer", "continued answer"]:
                         body = json.dumps({
                             "id": answer,
                             "choices": [{
@@ -2436,7 +2436,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                         payload = json.loads(body)
                         self.assertEqual(payload["model"], "explicit-model" if explicit else "saved-model")
                         self.assertEqual([(m["role"], m["content"]) for m in payload["messages"]
-                                          if m["role"] in ("user", "assistant")],
+                                          if m["role"] in ["user", "assistant"]],
                                          [("user", "original prompt"), ("assistant", "original answer"),
                                           ("user", "continued prompt")])
                         for writer in connector.writers:
@@ -2781,7 +2781,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                             if message.get('id') == 2)
             self.assertEqual(response['result']['configOptions'][1]
                              ['currentValue'], 'effort:low')
-            for request_id in (1, 3):
+            for request_id in [1, 3]:
                 response = next(message for message in written
                                 if message.get('id') == request_id)
                 self.assertEqual(response['result']['stopReason'], 'end_turn')
@@ -2907,7 +2907,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 os.makedirs(chat_dir)
                 loki.CREDENTIALS = CredentialStore({})
 
-                for stored_cwd in (saved_cwd, "invalid\x00cwd"):
+                for stored_cwd in [saved_cwd, "invalid\x00cwd"]:
                     blob = formats.new_log_blob(
                         loki.initial_transcript_items(), [])
                     blob["session_state"] = {"shell_cwd": stored_cwd}
@@ -3492,8 +3492,8 @@ class WorkerSessionContractTests(unittest.TestCase):
                 replay_text = [
                     update["content"]["text"]
                     for update in replay_updates
-                    if update.get("sessionUpdate") in (
-                        "user_message_chunk", "agent_message_chunk")
+                    if update.get("sessionUpdate") in [
+                        "user_message_chunk", "agent_message_chunk"]
                 ]
                 self.assertIn("unsafe", replay_text)
                 self.assertIn("No", replay_text)
@@ -3629,7 +3629,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     models, 'ensure_index',
                     new=mock.AsyncMock(return_value=(catalog, groups))))
                 packets = []
-                for answer in ('approved answer', 'pinned answer'):
+                for answer in ['approved answer', 'pinned answer']:
                     body = json.dumps({'id': answer, 'choices': [{
                         'index': 0, 'message': {'role': 'assistant', 'content': answer},
                         'finish_reason': 'stop'}]}).encode()
@@ -3903,7 +3903,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('stream', payload)
                 expected_context = expected_pairs + [('user', prompt)]
                 self.assertEqual([(message['role'], message['content']) for message in payload['messages']
-                                  if message['role'] in ('user', 'assistant')], expected_context)
+                                  if message['role'] in ['user', 'assistant']], expected_context)
                 expected_pairs.extend([('user', prompt), ('assistant', answer)])
                 with open(f.path, 'rb') as stream:
                     saved = stream.read()
@@ -3933,7 +3933,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         for refusal in refusals:
             with self.subTest(refusal=refusal):
                 async with self._approval_journey() as f:
-                    for request_id in (9, 10):
+                    for request_id in [9, 10]:
                         task, elicitation = await self._pending_approval(f, request_id)
                         await f.source.send(acps.response(elicitation['id'], result=refusal))
                         await asyncio.wait_for(task, 3)
@@ -3994,7 +3994,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 acps.request(12, 'session/prompt', {
                     'sessionId': 'other',
                     'prompt': [{'type': 'text', 'text': 'independent'}]}))
-            for request_id in (10, 11):
+            for request_id in [10, 11]:
                 reply = await f.wait_message(lambda m: m.get('id') == request_id)
                 self.assertEqual(reply['error']['code'], acps.INVALID_PARAMS)
                 self.assertIn('request was not executed', reply['error']['message'])
@@ -4043,7 +4043,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             await self._close_approval_journey(f)
 
     async def test_pending_approval_eof_and_worker_exit_release_authority(self):
-        for ending in ('eof', 'worker exit'):
+        for ending in ['eof', 'worker exit']:
             with self.subTest(ending=ending):
                 async with self._approval_journey() as f:
                     task, _ask = await self._pending_approval(f, 9)

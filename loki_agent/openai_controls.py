@@ -80,7 +80,7 @@ def _duration(minutes: int) -> str:
 def _expiry_text(value) -> str:
     moment = _parse_time(value)
     if moment is None:
-        return "no expiry" if value in (None, "") else f"expires {_text(value)}"
+        return "no expiry" if value in [None, ""] else f"expires {_text(value)}"
     now = datetime.datetime.now(datetime.timezone.utc)
     seconds = (moment - now).total_seconds()
     if seconds <= 0:
@@ -222,7 +222,7 @@ async def _read_usage(context) -> provider_controls.ControlResult:
         retry_max_attempts=provider_controls.READ_RETRY_MAX_ATTEMPTS)
     payload = provider_controls.json_document(response)
     return provider_controls.ControlResult(
-        lines=tuple(_usage_lines(payload)),
+        lines=list(_usage_lines(payload)),
         document={
             "endpoint": OPENAI_CHATGPT_USAGE_URL,
             "usage": payload,
@@ -238,12 +238,12 @@ async def _read_resets(context) -> provider_controls.ControlResult:
     payload = provider_controls.json_document(response)
     credits = payload.get("credits") if isinstance(payload, dict) else None
     credits = credits if isinstance(credits, list) else []
-    actions = tuple(
+    actions = list(
         _redeem_action(context, credit)
         for credit in credits
         if _is_available(credit) and isinstance(credit.get("id"), str))
     return provider_controls.ControlResult(
-        lines=tuple(_reset_lines(payload, credits)),
+        lines=list(_reset_lines(payload, credits)),
         document={
             "endpoint": OPENAI_CHATGPT_RESET_CREDITS_URL,
             "available_count": (

@@ -101,8 +101,8 @@ class ModelProviderOverrideTests(unittest.TestCase):
         self.assertIn("test", groups)
 
     def test_invalid_overrides_are_filtered_and_cannot_connect(self):
-        for override in ([], {"npm": None}, {"api": ""},
-                         {"shape": "unknown"}):
+        for override in [[], {"npm": None}, {"api": ""},
+                         {"shape": "unknown"}]:
             with self.subTest(override=override):
                 provider = dict(self.provider)
                 model = {"id": "bad", "provider": override}

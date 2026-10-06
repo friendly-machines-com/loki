@@ -672,7 +672,7 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
                 else "; partial transport output was not added to history")
         print(f"[model response cancelled{detail}]", file=sys.stderr)
         sys.stderr.flush()
-    elif kind in ("response_incomplete", "response_failed"):
+    elif kind in ["response_incomplete", "response_failed"]:
         sys.stdout.flush()
         status = "incomplete" if kind == "response_incomplete" else "failed"
         print(f"[model response {status}; provider output saved]",
@@ -765,7 +765,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   ask_user=None) -> str:
     thinking = _core.capture_turn_settings()
     reasoning_effort = thinking.effort
-    read_only = current_agent_mode() in ("explore", "plan")
+    read_only = current_agent_mode() in ["explore", "plan"]
     mode_tools = (
         PLAN_TOOLS if current_agent_mode() == "plan" else EXPLORE_TOOLS)
     active_tools = (
@@ -804,7 +804,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     def on_event(event):
         if turn_events is not None:
             turn_events.append(event)
-        if event.get("type") in ("tool_result", "response_cancelled", "max_loops"):
+        if event.get("type") in ["tool_result", "response_cancelled", "max_loops"]:
             _redraw_status()
         _terminal_agent_event(event, ui_settings=ui_settings)
 
@@ -1048,7 +1048,7 @@ async def confirm_saved_connection_async(
                 _print_repr_line(f"  {label}: ", value)
         answer = (await modal.prompt(
             "Use this saved connection? [y/N]: ") or "")
-        return answer.strip().lower() in ("y", "yes")
+        return answer.strip().lower() in ["y", "yes"]
 
 
 async def _numbered_choice_async(modal, header, rows, prompt):
@@ -1221,7 +1221,7 @@ async def _read_account_control(context, chosen):
 
 async def _confirm_account_action(modal, action, as_json):
     answer = (await modal.prompt(f"{action.confirm} [y/N]: ") or "")
-    if answer.strip().lower() not in ("y", "yes"):
+    if answer.strip().lower() not in ["y", "yes"]:
         print("Cancelled.")
         return
     _write_control_result(await action.run(), as_json)
@@ -1346,7 +1346,7 @@ async def async_main(args) -> int:
         print(USAGE, end='', file=sys.stderr)
         return 2
     for option_name, _option_value in options:
-        if option_name in ('-h', '--help'):
+        if option_name in ['-h', '--help']:
             print(USAGE, end='')
             return 0
     prompt_arg = None
@@ -1880,7 +1880,7 @@ async def _run_frontend(args) -> int:
         print(USAGE, end='', file=sys.stderr)
         return 2
     for option_name, _option_value in options:
-        if option_name in ('-h', '--help'):
+        if option_name in ['-h', '--help']:
             print(USAGE, end='')
             return 0
     try:

@@ -54,7 +54,7 @@ def report_unknown(protocol, context, value):
     debug_json(logger, f"Unknown {protocol} {context}:", value)
 
 
-def provider_notice_codes(value) -> tuple[str, ...]:
+def provider_notice_codes(value) -> list:
     """Read known, non-model-visible provider notices from a response."""
     metadata = (
         value.metadata if isinstance(value, DecodedTurn) else value)
@@ -73,7 +73,7 @@ def provider_notice_codes(value) -> tuple[str, ...]:
     for code in raw_codes:
         if code in _PROVIDER_NOTICE_MESSAGES and code not in codes:
             codes.append(code)
-    return tuple(codes)
+    return list(codes)
 
 
 def provider_notice_text(code: str) -> str | None:
@@ -899,9 +899,9 @@ def _chat_tool_call(tool_call, legacy=False):
     }
     extras = {
         key: value for key, value in tool_call.items()
-        if key not in (
+        if key not in [
             ["name", "arguments"] if legacy
-            else ["id", "type", "function"])
+            else ["id", "type", "function"]]
     }
     function_extras = {
         key: value for key, value in function.items()

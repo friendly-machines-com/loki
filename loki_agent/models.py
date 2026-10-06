@@ -759,7 +759,7 @@ def effective_provider(provider_entry, model_entry):
     if not isinstance(override, dict):
         resolved[_LOKI_API_REJECTION_KEY] = "invalid model provider override"
         return resolved
-    for key in ("npm", "api", "shape"):
+    for key in ["npm", "api", "shape"]:
         if key not in override:
             continue
         value = override[key]
@@ -767,8 +767,8 @@ def effective_provider(provider_entry, model_entry):
             resolved[_LOKI_API_REJECTION_KEY] = f"invalid model provider {key}"
             return resolved
         resolved[key] = value
-    if "shape" in override and override["shape"] not in (
-            "responses", "completions"):
+    if "shape" in override and override["shape"] not in [
+            "responses", "completions"]:
         resolved[_LOKI_API_REJECTION_KEY] = "invalid model provider shape"
     return resolved
 
@@ -856,7 +856,7 @@ async def ensure_index(
 # --------------------------------------------------------------------------
 
 def feature_bits(model_entry):
-    return tuple(bool(model_entry.get(k)) for k in FEATURE_KEYS)
+    return list(bool(model_entry.get(k)) for k in FEATURE_KEYS)
 
 
 def feature_names(bits):
@@ -868,7 +868,7 @@ def minimal_feature_bits(members):
     """Intersection of features over a model's providers (AND)."""
     bits = feature_bits(members[0][2])
     for _, _, m in members[1:]:
-        bits = tuple(a and b for a, b in zip(bits, feature_bits(m)))
+        bits = list(a and b for a, b in zip(bits, feature_bits(m)))
     return bits
 
 
@@ -876,7 +876,7 @@ def union_feature_bits(members):
     """Union of features over a model's providers (OR)."""
     bits = feature_bits(members[0][2])
     for _, _, m in members[1:]:
-        bits = tuple(a or b for a, b in zip(bits, feature_bits(m)))
+        bits = list(a or b for a, b in zip(bits, feature_bits(m)))
     return bits
 
 
@@ -1217,11 +1217,11 @@ def _model_rows(groups):
             + [
                 value
                 for explicit in explicit_members
-                for value in (
+                for value in [
                     "explicit LOKI connection",
                     explicit.api_url,
                     explicit.protocol,
-                )
+                ]
             ])
         rows.append((members, label, search))
     rows.sort(key=lambda r: r[1].lower())
@@ -1394,7 +1394,7 @@ async def _confirm_catalog_endpoint(
     print()
     answer = (await input_fn(
         "Send this credential to this endpoint? [y/N] ") or "")
-    if answer.strip().lower() not in ("y", "yes"):
+    if answer.strip().lower() not in ["y", "yes"]:
         return False
     endpoint_pins.record(provider_id, api, credential)
     return True

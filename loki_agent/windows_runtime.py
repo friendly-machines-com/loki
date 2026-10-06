@@ -410,7 +410,7 @@ def launch(executable, arguments, environment, workspace, inherited_handles,
         _checked(set_job(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)),
                  "SetInformationJobObject")
         # Duplicate stdio rather than changing inheritance on the parent's fds.
-        for fd in (0, 1, 2) if stdio is None else (2,):
+        for fd in [0, 1, 2] if stdio is None else (2,):
             handle = ctypes.c_void_p()
             _checked(duplicate(current, msvcrt.get_osfhandle(fd), current,
                                ctypes.byref(handle), 0, True, 2), "DuplicateHandle")

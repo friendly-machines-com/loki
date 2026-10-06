@@ -94,7 +94,7 @@ if sys.platform == "win32":
             _print_repr_line("loki: ", str(error), file=sys.stderr)
             print(USAGE, end='', file=sys.stderr)
             return 2
-        if any(name in ("-h", "--help") for name, _ in options):
+        if any(name in ["-h", "--help"] for name, _ in options):
             print(USAGE, end="")
             return 0
         windows_runtime.configured_workspace(arguments)

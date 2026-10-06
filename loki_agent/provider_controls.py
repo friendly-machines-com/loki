@@ -48,9 +48,9 @@ class ControlAction:
 class ControlResult:
     """Rendered lines plus an optional machine-readable document."""
 
-    lines: tuple[str, ...]
+    lines: list
     document: dict | None = None
-    actions: tuple[ControlAction, ...] = ()
+    actions: list = ()
 
 
 @dataclass(frozen=True)

@@ -68,10 +68,10 @@ class NormalizationTests(unittest.TestCase):
                 self.assertEqual(usage.used, 370)
 
     def test_missing_malformed_and_zero_are_distinct(self):
-        for raw in (None, [], {}, {"total_tokens": 123}):
+        for raw in [None, [], {}, {"total_tokens": 123}]:
             self.assertIsNone(usages.normalize_usage(protocols.OPENAI_CHAT, raw))
-        for invalid in (-1, True, 1.5, "100", None):
-            for field in ("prompt_tokens", "completion_tokens"):
+        for invalid in [-1, True, 1.5, "100", None]:
+            for field in ["prompt_tokens", "completion_tokens"]:
                 raw = {"prompt_tokens": 100, "completion_tokens": 10}
                 raw[field] = invalid
                 self.assertIsNone(
@@ -101,13 +101,13 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertNotIn("stream_options", provider.chat_payload([], [], "alias"))
         accumulator = provider.stream_accumulator()
-        for chunk in (
+        for chunk in [
             {"choices": [{"index": 0, "delta": {
                 "role": "assistant", "content": "Hi"},
                 "finish_reason": "stop"}], "usage": None},
             {"choices": [], "usage": {
                 "prompt_tokens": 300, "completion_tokens": 70}},
-        ):
+        ]:
             accumulator.feed(sse.SseEvent("message", json.dumps(chunk)))
         accumulator.feed(sse.SseEvent("message", "[DONE]"))
         turn = provider.parse_chat_response(accumulator.finish())
@@ -208,7 +208,7 @@ class SessionSnapshotTests(unittest.TestCase):
 
 class CapacityConfigurationTests(unittest.TestCase):
     def test_catalog_validation_and_distinct_limits(self):
-        for invalid in (None, 0, -1, True, "1000", 1000.5, {}):
+        for invalid in [None, 0, -1, True, "1000", 1000.5, {}]:
             self.assertIsNone(models.context_capacity({}, {
                 "limit": {"context": invalid, "input": 100, "output": 50}}))
         capacity = models.context_capacity({}, {
@@ -243,7 +243,7 @@ class CapacityConfigurationTests(unittest.TestCase):
         changed = loki.config_from_connection_descriptor(
             restored, CredentialInventory({"LOKI_MODEL": "other"}))
         self.assertIsNone(changed.context_capacity)
-        for invalid in (0, True, -1, "1000"):
+        for invalid in [0, True, -1, "1000"]:
             value = descriptor.to_dict()
             value["context_capacity"]["tokens"] = invalid
             with self.assertRaises(ConnectionDescriptorError):
@@ -255,7 +255,7 @@ class CapacityConfigurationTests(unittest.TestCase):
                   "LOKI_MODEL": "alias", "LOKI_CONTEXT_WINDOW": "1000"}
         runtime = loki.build_config_from_env(credentials=CredentialInventory(values))
         self.assertEqual(runtime.context_capacity, CAPACITY)
-        for invalid in ("0", "-1", "broken", "1.5"):
+        for invalid in ["0", "-1", "broken", "1.5"]:
             with self.assertRaisesRegex(ValueError, "LOKI_CONTEXT_WINDOW"):
                 loki.build_config_from_env(credentials=CredentialInventory(
                     dict(values, LOKI_CONTEXT_WINDOW=invalid)))
@@ -342,7 +342,7 @@ class PresentationTests(unittest.TestCase):
     def test_acp_load_restores_usage_but_resume_does_not_replay(self):
         from loki_agent.acp_worker import Worker, PendingSessionOpen, _UNCHANGED
 
-        for method in ("session/load", "session/resume"):
+        for method in ["session/load", "session/resume"]:
             with self.subTest(method=method):
                 session = Session(runtime_config=config())
                 session.transcript_items.append(response(session))

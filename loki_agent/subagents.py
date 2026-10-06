@@ -92,7 +92,7 @@ def _subagent_depth(value: str) -> int:
 def parse_args(args) -> SubagentOptions:
     if not args:
         raise getopt.GetoptError("subagent type is required")
-    if args[0] in ("-h", "--help"):
+    if args[0] in ["-h", "--help"]:
         return SubagentOptions("", help=True)
 
     subagent_type = args[0]
@@ -123,7 +123,7 @@ def parse_args(args) -> SubagentOptions:
         "help": False,
     }
     for option_name, option_value in options:
-        if option_name in ("-p", "--prompt"):
+        if option_name in ["-p", "--prompt"]:
             values["prompt"] = option_value
         elif option_name == "--shell-cwd":
             values["shell_cwd"] = option_value
@@ -137,7 +137,7 @@ def parse_args(args) -> SubagentOptions:
         elif option_name == "--credential-capability-fd":
             values["credential_capability_fd"] = _descriptor(
                 option_value, "credential capability")
-        elif option_name in ("-h", "--help"):
+        elif option_name in ["-h", "--help"]:
             values["help"] = True
 
     return SubagentOptions(subagent_type=subagent_type, **values)
@@ -192,9 +192,9 @@ async def run_cli_async(
 
 
 def _close_descriptors(options: SubagentOptions) -> None:
-    for end in (
+    for end in [
             options.session_owner_fd,
-            options.credential_capability_fd):
+            options.credential_capability_fd]:
         if end is not None:
             try:
                 # POSIX passes a descriptor; Windows a pipe endpoint.
