@@ -293,26 +293,26 @@ async def _redeem(context, credit_id: str) -> provider_controls.ControlResult:
             OPENAI_CHATGPT_CONSUME_RESET_URL,
             body=body, content_type="application/json")
     except Exception as error:  # noqa: BLE001 - reported, never retried
-        return provider_controls.ControlResult(lines=(
+        return provider_controls.ControlResult(lines=[
             f"Could not confirm the reset (request {request_id}).",
             f"Check the current status before retrying: {_text(error)}",
-        ))
+        ])
     if response.status == 403:
         detail = _ineligible_detail(response)
         if detail == "rate_limit_reset_ineligible":
-            return provider_controls.ControlResult(lines=(
+            return provider_controls.ControlResult(lines=[
                 "The account is not currently eligible for a reset; "
-                "no window is exhausted.",))
-        return provider_controls.ControlResult(lines=(
-            f"Reset refused: HTTP 403 {_text(response.reason)}",))
+                "no window is exhausted."])
+        return provider_controls.ControlResult(lines=[
+            f"Reset refused: HTTP 403 {_text(response.reason)}"])
     if not 200 <= response.status < 300:
         # An error status leaves the outcome ambiguous, so report the request
         # id instead of implying the reset did or did not happen.
-        return provider_controls.ControlResult(lines=(
+        return provider_controls.ControlResult(lines=[
             f"Could not confirm the reset (request {request_id}).",
             f"Provider returned HTTP {response.status} "
             f"{_text(response.reason)}.",
-        ))
+        ])
     payload = provider_controls.json_document(response)
     code = payload.get("code") if isinstance(payload, dict) else None
     windows = payload.get("windows_reset") if isinstance(payload, dict) else None
@@ -328,7 +328,7 @@ async def _redeem(context, credit_id: str) -> provider_controls.ControlResult:
     else:
         line = f"Reset result: {_text(code)}"
     return provider_controls.ControlResult(
-        lines=(line,),
+        lines=[line],
         document={
             "redeem_request_id": request_id,
             "code": code,

@@ -1,3 +1,4 @@
+# pytype: skip-file
 """Read a Windows handle from a thread, posting bytes to an asyncio loop.
 
 A handle cannot be registered with the proactor loop (``add_reader`` is

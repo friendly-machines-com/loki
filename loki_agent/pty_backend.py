@@ -235,14 +235,15 @@ class _WindowsPty(PtyHandle):
                         self.hpc = None
                 finally:
                     if self.information is not None:
+                        information = self.information
                         try:
-                            if self.information.hThread:
-                                windows_api.close_handle(self.information.hThread)
-                                self.information.hThread = None
+                            if information.hThread:
+                                windows_api.close_handle(information.hThread)
+                                information.hThread = None
                         finally:
-                            if self.information.hProcess:
-                                windows_api.close_handle(self.information.hProcess)
-                                self.information.hProcess = None
+                            if information.hProcess:
+                                windows_api.close_handle(information.hProcess)
+                                information.hProcess = None
                         self.information = None
 
 

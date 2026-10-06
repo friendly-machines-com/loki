@@ -159,7 +159,7 @@ class ImmediateCommandTests(unittest.TestCase):
                 id="reset", title="Reset", confirm="Reset?", run=None)
             spec = mock.Mock()
             spec.read = mock.AsyncMock(return_value=ControlResult(
-                lines=("usage: fine",), actions=(action,)))
+                lines=["usage: fine"], actions=[action]))
 
             from loki_agent import provider_controls
             with mock.patch.object(terminals.os, "isatty",

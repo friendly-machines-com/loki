@@ -14,7 +14,7 @@ the front-end, not here.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from . import authentications, http_client
@@ -50,7 +50,7 @@ class ControlResult:
 
     lines: list
     document: dict | None = None
-    actions: list = ()
+    actions: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)

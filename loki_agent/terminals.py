@@ -806,7 +806,7 @@ class AsyncByteReader:
             self.loop = None
             return
         try:
-            if self._reader_registered:
+            if self._reader_registered and self.loop is not None:
                 self.loop.remove_reader(self.fd)
                 self._reader_registered = False
         finally:
@@ -2154,6 +2154,12 @@ class UserMessageQueue(asyncio.Queue):
 
     def __init__(self, on_size_change=None):
         super().__init__()
+        # asyncio.Queue's public API is FIFO-only (put/get), but the editor
+        # must enumerate, index, delete-from-middle and reorder entries, so
+        # these methods reach into ``_queue`` -- the deque asyncio.Queue keeps
+        # its items in. It is a private attribute (type stubs omit it), so we
+        # name and type it here to keep the class self-describing.
+        self._queue: collections.deque = collections.deque()
         self._next_id = 1
         self._message_count = 0
         self._on_size_change = on_size_change or (lambda count: None)

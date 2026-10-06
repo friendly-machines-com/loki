@@ -445,7 +445,7 @@ class CredentialBroker:
     """Root-process credential registry and local authority."""
 
     def __init__(self):
-        self._records: dict[CredentialRef, object] = {}
+        self._records: dict[CredentialRef, StaticCredential | OpenAIChatGPTCredential] = {}
 
     def available(self) -> frozenset[CredentialRef]:
         return frozenset(self._records)

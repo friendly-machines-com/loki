@@ -42,8 +42,8 @@ class ReasoningProviderSpec:
     # trace_field: the display-only readable-output request field, or None
     # when this wire has no display control.
     mode_spellings: dict = field(default_factory=dict)
-    effort_field: object = None
-    trace_field: object = None
+    effort_field: str | dict | None = None
+    trace_field: dict | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "_hosts", self._hosts.copy())
@@ -267,7 +267,7 @@ def reasoning_effort_supported(provider_id, protocol, endpoint=None) -> bool:
     return reasoning_provider_spec(provider_id, protocol, endpoint) is not None
 
 
-def _apply_effort_field(payload, effort_field, value):
+def _apply_effort_field(payload: dict, effort_field: str | dict, value) -> dict:
     """Write one effort selection through its declarative field spec:
     a string names the request field; a dict nests it, with the value
     replacing any null leaf."""
@@ -333,7 +333,7 @@ _ANTHROPIC_DEFAULT_MODES: dict[str, str] = {
 # Documented effort ceilings for low-thinking modes: Opus 5 accepts
 # thinking.type "disabled" only at effort "high" or below, and Sonnet 5.5
 # accepts "between_tools" only at "high" or below (same source pages).
-_REASONING_MODE_EFFORT_LIMITS = {
+_REASONING_MODE_EFFORT_LIMITS: dict = {
     "anthropic": {
         "order": ["low", "medium", "high", "xhigh", "max"],
         "models": {
@@ -659,7 +659,7 @@ class Provider:
                 "disablement is requested through the thinking mode, not "
                 "an effort value")
 
-    def _apply_thinking(self, payload, model, effort, mode, budget,
+    def _apply_thinking(self, payload: dict, model, effort, mode, budget,
                         retention, traces):
         self.validate_thinking(model, effort, mode, budget, retention)
         spec = self.reasoning_spec
@@ -685,7 +685,7 @@ class Provider:
             self._apply_trace_output(payload, model, mode)
         return payload
 
-    def _apply_trace_output(self, payload, model, mode):
+    def _apply_trace_output(self, payload: dict, model, mode):
         """Display-only readable-output fields: never enablement, effort,
         allowance, or preservation. Restates only an established mode:
         the user's selection or a documented thinking-on default."""
@@ -960,14 +960,14 @@ class OpenAIChatStreamAccumulator:
             lambda key, kind, text: None)
         self.reasoning_field = reasoning_field
         self.reasoning_delivered = {}
-        self.response = {}
-        self.choice = {
+        self.response: dict = {}
+        self.choice: dict = {
             "index": 0,
             "message": {"role": "assistant"},
             "finish_reason": None,
         }
-        self.tool_calls = {}
-        self.legacy_function_call = None
+        self.tool_calls: dict = {}
+        self.legacy_function_call: dict | None = None
         self.stream_extensions = []
         self.complete = False
 
@@ -1173,7 +1173,7 @@ class OpenAIChatStreamAccumulator:
             if not isinstance(index, int) or isinstance(index, bool):
                 raise StreamProtocolError(
                     "OpenAI Chat tool call index must be an integer")
-            call = self.tool_calls.setdefault(index, {
+            call: dict = self.tool_calls.setdefault(index, {
                 "id": None,
                 "type": "function",
                 "function": {"name": "", "arguments": ""},

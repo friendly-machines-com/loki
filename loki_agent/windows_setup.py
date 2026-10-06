@@ -1,3 +1,4 @@
+# pytype: skip-file
 """Windows setup editor: the per-workspace container definition.
 
 Windows-only, and deliberately a separate process from the chat.  This module

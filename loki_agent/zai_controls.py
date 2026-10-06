@@ -369,16 +369,16 @@ async def _use(context, reset_type: str,
             context, "POST", _url(context, _RESET_USE_PATH),
             body=body, content_type="application/json", retry=False)
     except _AuthRefused as error:
-        return provider_controls.ControlResult(lines=(
-            f"Reset card not used: {_text(error)}",))
+        return provider_controls.ControlResult(lines=[
+            f"Reset card not used: {_text(error)}"])
     except Exception as error:  # noqa: BLE001 - reported, never retried
-        return provider_controls.ControlResult(lines=(
+        return provider_controls.ControlResult(lines=[
             f"Could not confirm the reset (request {request_id}).",
-            f"Check the current status before retrying: {_text(error)}",))
+            f"Check the current status before retrying: {_text(error)}"])
     return provider_controls.ControlResult(
-        lines=(
+        lines=[
             f"Reset card used: {label} quota is back to 100% "
-            f"(request {request_id}).",),
+            f"(request {request_id}).",],
         document={
             "endpoint": _url(context, _RESET_USE_PATH),
             "request_id": request_id,

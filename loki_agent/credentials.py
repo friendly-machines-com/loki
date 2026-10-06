@@ -324,6 +324,7 @@ def _scrub_windows_credentials(
     import ctypes
     from ctypes import wintypes
 
+    # pytype: disable=module-attr
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     get = kernel.GetEnvironmentVariableW
     get.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
@@ -342,6 +343,7 @@ def _scrub_windows_credentials(
             if not set_variable(name, None):
                 raise CredentialScrubError(
                     f"could not scrub {name}: {ctypes.get_last_error()}")
+    # pytype: enable=module-attr
     for name in names:
         environ.pop(name, None)
 

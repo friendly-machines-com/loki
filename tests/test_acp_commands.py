@@ -131,11 +131,11 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
 
     async def _read(self, context):
         return provider_controls.ControlResult(
-            lines=("Reset cards - live", "  5-hour reset cards: 1 available"),
+            lines=["Reset cards - live", "  5-hour reset cards: 1 available"],
             actions=list(self._actions),
         )
 
-    def _patch(self, actions=()):
+    def _patch(self, actions=[]):
         self._actions = actions
         spec = provider_controls.ControlSpec(
             id="resets",
@@ -165,7 +165,7 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
             id="use:7", title="Use 5-hour reset card",
             confirm="Use the card?",
             run=lambda: _ran(ran))
-        self._patch(actions=(action,))
+        self._patch(actions=[action])
 
         outcome = await acp_commands.run(
             "/account resets", loki.current_session())
@@ -180,13 +180,13 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
         async def run():
             ran.append(True)
             return provider_controls.ControlResult(
-                lines=("Reset card used: Weekly quota is back to 100%.",))
+                lines=["Reset card used: Weekly quota is back to 100%."])
 
         action = provider_controls.ControlAction(
             id="use:7", title="Use reset card",
             confirm="Use the card? This cannot be undone.",
             run=run)
-        self._patch(actions=(action,))
+        self._patch(actions=[action])
 
         outcome = await acp_commands.run(
             "/account resets use:7", loki.current_session())
@@ -200,7 +200,7 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
         action = provider_controls.ControlAction(
             id="use:7", title="Use reset card", confirm="Use?",
             run=lambda: _ran(ran))
-        self._patch(actions=(action,))
+        self._patch(actions=[action])
 
         outcome = await acp_commands.run(
             "/account resets use:999", loki.current_session())
@@ -211,7 +211,7 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
 
 async def _ran(bucket):
     bucket.append(True)
-    return provider_controls.ControlResult(lines=("done",))
+    return provider_controls.ControlResult(lines=["done"])
 
 
 if __name__ == "__main__":

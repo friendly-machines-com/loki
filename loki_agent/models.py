@@ -709,6 +709,9 @@ async def fetch_openai_subscription_models(
             {"Accept": "application/json"},
             rejected_generation,
         )
+        if lease is None:
+            raise authentications.CredentialUnavailable(
+                "OpenAI subscription credential produced no lease")
         response = await request_function(
             "GET",
             request_url,

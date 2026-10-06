@@ -1,3 +1,4 @@
+# pytype: skip-file
 """Contained worker processes over overlapped named pipes.
 
 The stream and orchestration layer below is copied from CPython 3.14.7 --

@@ -150,7 +150,7 @@ class RedeemTests(unittest.IsolatedAsyncioTestCase):
         request = _Request(response({"code": "reset", "windows_reset": 2}))
         result = await openai_controls._redeem(context(request=request), "credit-1")
 
-        self.assertEqual(result.lines, ("Reset redeemed: 2 window(s) reset.",))
+        self.assertEqual(result.lines, ["Reset redeemed: 2 window(s) reset."])
         method, url, kwargs = request.calls[0]
         self.assertEqual(method, "POST")
         self.assertEqual(url, openai_controls.OPENAI_CHATGPT_CONSUME_RESET_URL)
@@ -166,7 +166,7 @@ class RedeemTests(unittest.IsolatedAsyncioTestCase):
             context(request=_Request(response({"code": "already_redeemed"}))),
             "credit-1")
 
-        self.assertEqual(result.lines, ("Already redeemed (no change).",))
+        self.assertEqual(result.lines, ["Already redeemed (no change)."])
 
     async def test_ineligible_403_has_distinct_message(self):
         result = await openai_controls._redeem(

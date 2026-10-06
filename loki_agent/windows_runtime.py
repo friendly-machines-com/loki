@@ -1,3 +1,4 @@
+# pytype: skip-file
 """Windows runtime launch and startup gate. No profile or ACL mutation.
 
 The supervisor checks configuration, creates a suspended AppContainer process,

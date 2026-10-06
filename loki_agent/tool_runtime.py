@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from typing import Any, Callable
 
 
 class ToolSchemaError(ValueError):
@@ -574,9 +575,9 @@ class ToolOutcome:
 @dataclass
 class RegisteredHook:
     hook_id: str
-    callback: object
+    callback: Callable[..., Any]
     on_error: str
-    matcher: object = None
+    matcher: Callable[..., Any] | None = None
 
 
 async def _call_hook(callback, *args):
@@ -697,7 +698,7 @@ class ToolHookPipeline:
             invocation.validation_issues = repaired.issues
         else:
             invocation.validation_issues = [ValidationIssue(
-                (),
+                [],
                 "json_parse",
                 f"$ is not valid JSON: {invocation.parse_error}",
                 expected="object",
@@ -798,7 +799,7 @@ def _hook_environment(environ=None):
 async def _run_hook_command(command, payload, cwd, timeout_ms,
                             stdout_limit=1_000_000,
                             stderr_limit=100_000,
-                            stderr_reporter=None):
+                            stderr_reporter: Callable[..., Any] | None = None):
     try:
         stdin_data = json.dumps(
             payload,
@@ -905,7 +906,7 @@ class ExternalHook:
     timeout_ms: int
     workspace_side_effects: bool = False
     event_name: str = "pre_tool_call"
-    stderr_reporter: object = None
+    stderr_reporter: Callable[..., Any] | None = None
 
     def matches(self, tool_name):
         return "*" in self.tools or tool_name in self.tools

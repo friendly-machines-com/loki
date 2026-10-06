@@ -1,3 +1,4 @@
+# pytype: skip-file
 """Windows API declarations shared by the rest of Loki.
 
 Import-safe on every platform: nothing here binds a DLL or touches a

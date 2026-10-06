@@ -63,7 +63,7 @@ if os.name == "posix":
 else:
     def spawn_kwargs():
         """Give the child its own process group, for CTRL_BREAK_EVENT."""
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}  # pytype: disable=module-attr
 
     def process_group(proc, pid):
         # Windows has no queryable process group id; a new group is addressed
@@ -81,7 +81,7 @@ else:
             _terminate(proc)
             return
         try:
-            os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+            os.kill(proc.pid, signal.CTRL_BREAK_EVENT)  # pytype: disable=module-attr
         except OSError:
             _terminate(proc)
 

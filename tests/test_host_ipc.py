@@ -223,8 +223,8 @@ class SocketPairTests(unittest.TestCase):
                                       "clear_handle_inheritance",
                                       side_effect=cleared.append):
                 parent, child = host_ipc.socket_pair()
-            self.assertEqual(parent.handles(), (0x10, 0x13))
-            self.assertEqual(child.handles(), (0x12, 0x11))
+            self.assertEqual(parent.handles(), [0x10, 0x13])
+            self.assertEqual(child.handles(), [0x12, 0x11])
             self.assertEqual(cleared, [0x10, 0x13])
             return
         first, second = host_ipc.socket_pair()
@@ -326,7 +326,7 @@ class PipeEndpointTests(unittest.TestCase):
     def test_a_descriptor_reports_one_handle(self):
         if os.name != "posix":
             self.assertEqual(
-                host_ipc.handles(host_ipc.PipeEndpoint(read=4)), (4,))
+                host_ipc.handles(host_ipc.PipeEndpoint(read=4)), [4])
             return
         # POSIX path: spawn_kwargs flattens this to pass_fds.
         self.assertEqual(host_ipc.handles(4), (4,))

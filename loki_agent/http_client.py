@@ -354,7 +354,7 @@ async def _read_chunked_body(reader: asyncio.StreamReader, max_bytes: int) -> tu
     return b''.join(chunks), truncated
 
 
-def _build_raw_request(method: str, request_url: str, headers_in: dict = None,
+def _build_raw_request(method: str, request_url: str, headers_in: dict | None = None,
                        body: bytes = b''):
     parsed = urllib.parse.urlparse(request_url)
     if parsed.scheme not in ['http', 'https'] or not parsed.hostname:
@@ -382,7 +382,7 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict = None,
     return parsed, raw_request
 
 
-async def _async_http_request_once(method: str, request_url: str, *, headers_in: dict = None,
+async def _async_http_request_once(method: str, request_url: str, *, headers_in: dict | None = None,
                                    body: bytes = b'', timeout: int = 30,
                                    max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                    cancel_check=None,
@@ -466,7 +466,7 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
 
 @contextlib.asynccontextmanager
 async def async_http_stream(method: str, request_url: str, *,
-                            headers_in: dict = None, body: bytes = b"",
+                            headers_in: dict | None = None, body: bytes = b"",
                             timeout: int = 30,
                             max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                             cancel_check=None):
@@ -517,7 +517,7 @@ async def async_http_stream(method: str, request_url: str, *,
                 pass
 
 
-async def async_http_request(method: str, request_url: str, *, headers_in: dict = None,
+async def async_http_request(method: str, request_url: str, *, headers_in: dict | None = None,
                              body: bytes = b'', timeout: int = 30,
                              max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                              retry_max_attempts: int = 1,
@@ -563,7 +563,7 @@ def _redirect_location(response: HttpResponse) -> str | None:
 
 
 async def async_http_request_follow_same_host(method: str, request_url: str, *,
-                                              headers_in: dict = None, body: bytes = b'',
+                                              headers_in: dict | None = None, body: bytes = b'',
                                               timeout: int = 30,
                                               max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                               max_redirects: int = 5,

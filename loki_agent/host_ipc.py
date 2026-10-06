@@ -241,7 +241,7 @@ class PipeEndpoint:
         self.read = read
         self.write = write
 
-    def handles(self) -> tuple:
+    def handles(self) -> list:
         """The handles on this side, in a stable order (read, then write)."""
         return list(handle for handle in [self.read, self.write]
                     if handle is not None)
@@ -540,12 +540,12 @@ else:
         """The argv value that names the child endpoint's handles."""
         return child_end.reference()
 
-    def handles(child_end) -> tuple:
+    def handles(child_end) -> list:
         """The child handles that must cross for ``child_end``."""
         return child_end.handles()
 
     def spawn_kwargs(references) -> dict:
-        startup = subprocess.STARTUPINFO()
+        startup = subprocess.STARTUPINFO()  # pytype: disable=module-attr
         startup.lpAttributeList = {
             "handle_list": [handle for end in references
                             for handle in handles(end)]}

@@ -59,16 +59,16 @@ def provider_notice_codes(value) -> list:
     metadata = (
         value.metadata if isinstance(value, DecodedTurn) else value)
     if not isinstance(metadata, dict):
-        return ()
+        return []
     protocol_data = metadata.get("protocol_data")
     if not isinstance(protocol_data, dict):
-        return ()
+        return []
     loki_data = protocol_data.get("loki")
     if not isinstance(loki_data, dict):
-        return ()
+        return []
     raw_codes = loki_data.get("provider_notices")
     if not isinstance(raw_codes, list):
-        return ()
+        return []
     codes = []
     for code in raw_codes:
         if code in _PROVIDER_NOTICE_MESSAGES and code not in codes:
@@ -80,7 +80,7 @@ def provider_notice_text(code: str) -> str | None:
     return _PROVIDER_NOTICE_MESSAGES.get(code)
 
 
-def _protocol_data(target, protocol, value):
+def _protocol_data(target: dict, protocol: str, value) -> None:
     if value:
         target.setdefault("protocol_data", {})[protocol] = _copy(value)
 

@@ -1,3 +1,4 @@
+# pytype: skip-file
 """Windows console control for the terminal frontend.
 
 Only what differs from a POSIX tty lives here; ``terminals`` keeps the reader

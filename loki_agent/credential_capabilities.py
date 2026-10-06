@@ -34,7 +34,9 @@ class CapabilityError(CredentialError):
     pass
 
 
-def _endpoint_from_fd(fd: int) -> socket.socket:
+def _endpoint_from_fd(
+        fd: int | socket.socket | host_ipc.PipeEndpoint,
+) -> socket.socket | host_ipc.PipeEndpoint:
     """Take synchronous ownership of an inherited capability descriptor.
 
     This is deliberately not async. Delegated-process startup races capability
@@ -42,7 +44,7 @@ def _endpoint_from_fd(fd: int) -> socket.socket:
     that race can cancel the initialization task, or a task canceled before
     its first instruction could leave the inherited credential FD open.
     """
-    if host_ipc.is_endpoint(fd):
+    if isinstance(fd, host_ipc.PipeEndpoint):
         # Windows pipe endpoint: the handles already are the transport.
         return fd
     if isinstance(fd, socket.socket):
@@ -60,7 +62,8 @@ def _endpoint_from_fd(fd: int) -> socket.socket:
     return endpoint
 
 
-async def _streams_from_endpoint(endpoint: socket.socket):
+async def _streams_from_endpoint(
+        endpoint: socket.socket | host_ipc.PipeEndpoint):
     try:
         return await host_ipc.open_streams(
             endpoint,
@@ -112,7 +115,9 @@ def _safe_error_text(error: Exception) -> str:
 class _CredentialClientInitializer:
     """Own a capability socket until its async transport takes ownership."""
 
-    def __init__(self, client_class, endpoint: socket.socket):
+    def __init__(
+            self, client_class,
+            endpoint: socket.socket | host_ipc.PipeEndpoint):
         self._client_class = client_class
         self._endpoint = endpoint
 

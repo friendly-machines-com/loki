@@ -47,7 +47,7 @@ class SseDecoder:
             raise ValueError("SSE line exceeds event size limit")
 
     def _consume_lines(self, final: bool) -> list[SseEvent]:
-        events = []
+        events: list[SseEvent] = []
         while self._buffer:
             boundary = None
             separator_length = 0

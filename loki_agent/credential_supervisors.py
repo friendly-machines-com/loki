@@ -104,7 +104,7 @@ class CredentialSupervisor:
 class RuntimeDelegation:
     """Parent-owned lifetime and credential channels for one runtime."""
 
-    credential_server: object
+    credential_server: credential_capabilities.CredentialCapabilityServer
     owner_child: object | None
     owner_parent: object | None
     credential_child: object | None

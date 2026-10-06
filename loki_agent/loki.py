@@ -1414,7 +1414,7 @@ file_state = LruCache(READ_PATHS_LIMIT)
 _webfetch_cache = LruCache(WEBFETCH_CACHE_MAX_ENTRIES)  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
 
 
-def _resolve_path(path: str, base_dir: str = None) -> str:
+def _resolve_path(path: str, base_dir: str | None = None) -> str:
     if not path:
         return path
     # This is an operation pathname, not an identity key. Let the kernel
@@ -1481,7 +1481,7 @@ def display_path(path: str) -> str:
     return path
 
 
-def change_shell_cwd(path: str = None) -> str:
+def change_shell_cwd(path: str | None = None) -> str:
     session = current_session()
     target = (path or "").strip()
     if not target:
@@ -1827,7 +1827,7 @@ class Job:
     session_owned: bool = False
     # A descriptor on POSIX and a socket on Windows; see host_ipc.
     owner_signal_fd: object | None = field(default=None, repr=False)
-    credential_capability: object | None = field(
+    credential_capability: credential_capabilities.CredentialCapabilityServer | None = field(
         default=None, repr=False)
     # Live resource accounting only. This is deliberately absent from
     # job.json: after process exit it has no user-visible or recovery meaning.
@@ -2002,7 +2002,7 @@ class JobManager:
 
     async def _spawn(self, command, display_command: str, description: str,
                      background: bool, timeout_ms: int | None, shell: bool,
-                     env: dict | None = None, cwd: str = None,
+                     env: dict | None = None, cwd: str | None = None,
                      session_owned: bool = False,
                      credential_refs=None, subagent: bool = False) -> Job:
         if session_owned and shell:
@@ -2092,8 +2092,10 @@ class JobManager:
                 stdin, release_stdin = host_ipc.eof_stdin()
                 try:
                     if shell:
+                        # shell rejects session_owned/credential_refs above, so
+                        # spawn_command is still the original command string.
                         proc = await asyncio.create_subprocess_shell(
-                            spawn_command,
+                            str(spawn_command),
                             executable=executables.BASH,
                             stdin=stdin,
                             stdout=stdout_file,
@@ -2203,7 +2205,7 @@ class JobManager:
     async def run_foreground(self, command, display_command: str, timeout_ms: int | None,
                              description: str = "", shell: bool = False,
                              output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                             env: dict | None = None, cwd: str = None,
+                             env: dict | None = None, cwd: str | None = None,
                              cancel_event: asyncio.Event | None = None,
                              session_owned: bool = False,
                              credential_refs=None,
@@ -2312,7 +2314,7 @@ class JobManager:
         status = "cancelled" if interrupted else "timed_out"
         return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
 
-    async def run_shell(self, command: str, timeout: int = None, description: str = "",
+    async def run_shell(self, command: str, timeout: int | None = None, description: str = "",
                         run_in_background: bool = False,
                         cancel_event: asyncio.Event | None = None,
                         cwd: str | None = None, *, structured=False):
@@ -2370,7 +2372,7 @@ class JobManager:
 
     async def run_exec(self, argv: list[str], timeout_ms: int | None = None, description: str = "",
                        output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                       env: dict | None = None, cwd: str = None,
+                       env: dict | None = None, cwd: str | None = None,
                        cancel_event: asyncio.Event | None = None,
                        session_owned: bool = False,
                        credential_refs=None,
@@ -2387,7 +2389,7 @@ class JobManager:
                                          subagent=subagent)
 
     async def run_background_exec(self, argv: list[str], description: str = "",
-                                  env: dict | None = None, cwd: str = None,
+                                  env: dict | None = None, cwd: str | None = None,
                                   session_owned: bool = False,
                                   credential_refs=None,
                                   subagent: bool = False) -> Job:
@@ -2552,7 +2554,7 @@ class JobManager:
                 f"(pgid={job.pgid}).")
 
 
-async def run_bash_async(command: str, timeout: int = None, description: str = "",
+async def run_bash_async(command: str, timeout: int | None = None, description: str = "",
                          run_in_background: bool = False,
                          cancel_event: asyncio.Event | None = None,
                          cwd: str | None = None, *, structured=False):
@@ -2603,7 +2605,7 @@ def run_job_stop(job_id: str, force: bool = False) -> str:
     return current_job_manager().stop_job(job_id, force=bool(force))
 
 
-def run_read(file_path: str, offset: int = None, limit: int = None, *, structured=False):
+def run_read(file_path: str, offset: int | None = None, limit: int | None = None, *, structured=False):
     if not file_path:
         return "Error: file_path is required"
     file_path = _resolve_path(file_path)
@@ -2772,14 +2774,14 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
         return f"Error: {e}"
 
 
-def run_glob(pattern: str, path: str = None, *,
+def run_glob(pattern: str, path: str | None = None, *,
              hidden: bool = False, no_ignore: bool = False) -> str:
     return asyncio.run(run_glob_async(
         pattern, path, hidden=hidden, no_ignore=no_ignore))
 
 
 async def run_glob_async(
-        pattern: str, path: str = None,
+        pattern: str, path: str | None = None,
         cancel_event: asyncio.Event | None = None, *,
         hidden: bool = False, no_ignore: bool = False) -> str:
     if not pattern:
@@ -2839,7 +2841,7 @@ async def run_glob_async(
     ])
 
 
-def _parse_nonnegative_int(value, name: str, default: int = None) -> tuple[int | None, str | None]:
+def _parse_nonnegative_int(value, name: str, default: int | None = None) -> tuple[int | None, str | None]:
     if value is None:
         return default, None
     try:
@@ -2857,12 +2859,12 @@ def _select_limited(lines: list[str], offset: int, head_limit: int) -> tuple[lis
     return lines[offset:offset + head_limit], len(lines) > offset + head_limit
 
 
-def run_grep(pattern: str, path: str = None, glob: str = None,
+def run_grep(pattern: str, path: str | None = None, glob: str | None = None,
              output_mode: str = "files_with_matches", **kwargs) -> str:
     return asyncio.run(run_grep_async(pattern, path, glob, output_mode, **kwargs))
 
 
-async def run_grep_async(pattern: str, path: str = None, glob: str = None,
+async def run_grep_async(pattern: str, path: str | None = None, glob: str | None = None,
                          output_mode: str = "files_with_matches",
                          cancel_event: asyncio.Event | None = None,
                          **kwargs) -> str:
@@ -3239,12 +3241,16 @@ def _tool_access_error(fn_name: str, args=None, allowed=None, extra_context=None
 
 async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_context=None) -> dict:
     spec = TOOL_REGISTRY.get(fn_name)
+    if spec is None:
+        return _tool_result(False, f"Unknown function: {fn_name}")
     access_error = _tool_access_error(
         fn_name, args=args, allowed=allowed, extra_context=extra_context)
     if access_error:
         return _tool_result(False, access_error)
     cancel_event = (extra_context or {}).get("cancel_event")
-    if cancel_event is not None and cancel_event.is_set():
+    if (cancel_event is not None
+            and isinstance(cancel_event, asyncio.Event)
+            and cancel_event.is_set()):
         return _tool_result(
             False, "Tool call not executed because the user cancelled "
                    "the turn.")
@@ -4351,7 +4357,7 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
     return result
 
 
-def run_skill(skill: str, args: str = None) -> str:
+def run_skill(skill: str, args: str | None = None) -> str:
     if not skill:
         return "Error: skill is required"
     skill_root = os.path.join(LOKI_CONFIG_DIR, "skills")
@@ -4630,8 +4636,8 @@ async def run_webfetch_async(
     return f"{header}\n{answer}"
 
 
-async def run_websearch_async(query: str, allowed_domains: list = None,
-                              blocked_domains: list = None,
+async def run_websearch_async(query: str, allowed_domains: list | None = None,
+                              blocked_domains: list | None = None,
                               cancel_event: asyncio.Event | None = None) -> str:
     if not query or len(query) < 2:
         return "Error: query must be at least 2 characters"
@@ -5402,7 +5408,7 @@ def _chat_response_observer(config, request_url):
 
 async def async_provider_request(
         method: str, request_url: str, payload=None,
-        request_headers: dict = None, report_errors: bool = False,
+        request_headers: dict | None = None, report_errors: bool = False,
         show_timing: bool = False, cancel_check=None,
         codex_turn_state=None,
         opencode_session_id=None) -> protocols.ProviderResponse:
@@ -5531,7 +5537,7 @@ async def async_provider_request(
 async def _next_stream_chunk(iterator, cancel_check):
     if cancel_check():
         raise StreamCancelled()
-    task = asyncio.create_task(anext(iterator))
+    task = asyncio.ensure_future(anext(iterator))
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=0.05)
@@ -5704,7 +5710,7 @@ async def _async_chat_stream_request_once(
                         accumulator.finish(),
                         effective_model=observed_model(),
                         reasoning_field=getattr(accumulator, "reasoning_field", None),
-                        notice_codes=list(
+                        notice_codes=tuple(
                             getattr(accumulator, "notice_codes", ())),
                     )
             while True:
@@ -5720,7 +5726,7 @@ async def _async_chat_stream_request_once(
                             accumulator.finish(),
                             effective_model=observed_model(),
                             reasoning_field=getattr(accumulator, "reasoning_field", None),
-                            notice_codes=list(
+                            notice_codes=tuple(
                                 getattr(
                                     accumulator, "notice_codes", ())),
                         )
@@ -5730,7 +5736,7 @@ async def _async_chat_stream_request_once(
                         accumulator.finish(),
                         effective_model=observed_model(),
                         reasoning_field=getattr(accumulator, "reasoning_field", None),
-                        notice_codes=list(
+                        notice_codes=tuple(
                             getattr(accumulator, "notice_codes", ())),
                     )
         except StreamCancelled:
@@ -5751,13 +5757,13 @@ async def _async_chat_stream_request_once(
             accumulator.finish(),
             effective_model=observed_model(),
             reasoning_field=getattr(accumulator, "reasoning_field", None),
-            notice_codes=list(
+            notice_codes=tuple(
                 getattr(accumulator, "notice_codes", ())),
         )
 
 
 async def async_chat_stream_request(
-        request_url: str, payload, request_headers: dict = None,
+        request_url: str, payload, request_headers: dict | None = None,
         on_text_delta=None, cancel_check=None,
         report_errors: bool = False, show_timing: bool = False,
         codex_turn_state=None,
@@ -6083,11 +6089,15 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     turn.metadata["protocol"] = current_config().chat_provider.kind
     if reasoning_source in ["reasoning", "reasoning_content", "reasoning_details"]:
         native = copy.deepcopy(turn.metadata.get("protocol_data") or {})
+        if not isinstance(native, dict):
+            native = {}
         native.setdefault("loki", {})["reasoning_field"] = reasoning_source
         turn.metadata["protocol_data"] = native
     if notice_codes:
         protocol_data = copy.deepcopy(
             turn.metadata.get("protocol_data") or {})
+        if not isinstance(protocol_data, dict):
+            protocol_data = {}
         protocol_data.setdefault("loki", {})["provider_notices"] = list(notice_codes)
         turn.metadata["protocol_data"] = protocol_data
     return turn
