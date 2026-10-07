@@ -923,6 +923,15 @@ def _reasoning_effort_rows():
 
 
 async def run_thinking_picker_async(session):
+    """Select thinking controls atomically; Ctrl+C dismisses the workflow."""
+    try:
+        return await _run_thinking_picker_async(session)
+    except KeyboardInterrupt:
+        # A modal Ctrl+C dismisses the whole workflow, not the frontend.
+        return "Thinking selection cancelled."
+
+
+async def _run_thinking_picker_async(session):
     config = current_config()
     if config is None or not config.model:
         return _core.thinking_status_text()
@@ -1230,6 +1239,15 @@ async def _confirm_account_action(modal, action, as_json):
 
 
 async def run_account_controls_async(command_text, session):
+    """Run account controls; modal Ctrl+C cancels without authorizing actions."""
+    try:
+        return await _run_account_controls_async(command_text, session)
+    except KeyboardInterrupt:
+        # In particular, an interrupted confirmation must never run its action.
+        print("Cancelled.")
+
+
+async def _run_account_controls_async(command_text, session):
     """Dispatch the provider-dependent account-control entry point.
 
     The entry lists controls available for the active connection; an optional
@@ -1582,67 +1600,73 @@ async def async_main(args) -> int:
                     explicit_option = explicit_connection_option(_core.CREDENTIALS)
                     async with session.modal() as modal:
                         try:
-                            picked = await modelsdev.run_model_picker_async(
-                                input_fn=modal.prompt,
-                                credentials=_core.CREDENTIALS,
-                                explicit_connection=explicit_option,
-                                credential_authority=(
-                                    current_session().credential_authority),
-                                diagnostic_writer=(
-                                    _report_model_list_errors),
-                                text_writer=terminal.write_text)
-                        except (OSError, json.JSONDecodeError) as e:
-                            # models.dev unreachable (network errors) or answered
-                            # with non-JSON garbage: fall back to the current
-                            # provider's own /models list in the same modal.
-                            _print_text_line(
-                                "models.dev unavailable: ", e,
-                                file=sys.stderr, multiline=True)
-                            sys.stderr.flush()
-                            models_list = await load_models_async(
-                                diagnostic_writer=_report_model_list_errors)
-                            selected_model = (
-                                await modelsdev.run_flat_model_picker_async(
-                                    modal.prompt, models_list,
+                            try:
+                                picked = await modelsdev.run_model_picker_async(
+                                    input_fn=modal.prompt,
+                                    credentials=_core.CREDENTIALS,
                                     explicit_connection=explicit_option,
-                                    text_writer=terminal.write_text))
-                            if selected_model:
-                                if isinstance(
-                                        selected_model,
-                                        modelsdev.ExplicitConnectionOption):
-                                    apply_runtime_config(
-                                        build_config_from_env(
-                                            credentials=_core.CREDENTIALS))
-                                    selected_label = selected_model.model
-                                    selected_via = " via explicit LOKI_*"
-                                else:
-                                    reinstall_provider(
-                                        model=selected_model,
-                                        models_url=(
-                                            current_config().chat_provider.models_url
-                                            if current_config() else None),
-                                    )
-                                    selected_label = selected_model
-                                    selected_via = ""
-                                descriptor = active_connection_descriptor()
-                                if descriptor is not None:
-                                    set_session_connection(descriptor)
-                                save_chat_log()
-                                print(
-                                    "Selected model: ", end="",
-                                    file=sys.stderr)
-                                terminal.write_text(
-                                    repr(selected_label), file=sys.stderr)
-                                terminal.write_text(
-                                    selected_via, file=sys.stderr)
-                                print(file=sys.stderr)
-                                _report_unavailable_reasoning_preference()
+                                    credential_authority=(
+                                        current_session().credential_authority),
+                                    diagnostic_writer=(
+                                        _report_model_list_errors),
+                                    text_writer=terminal.write_text)
+                            except (OSError, json.JSONDecodeError) as e:
+                                # models.dev unreachable (network errors) or answered
+                                # with non-JSON garbage: fall back to the current
+                                # provider's own /models list in the same modal.
+                                _print_text_line(
+                                    "models.dev unavailable: ", e,
+                                    file=sys.stderr, multiline=True)
+                                sys.stderr.flush()
+                                models_list = await load_models_async(
+                                    diagnostic_writer=_report_model_list_errors)
+                                selected_model = (
+                                    await modelsdev.run_flat_model_picker_async(
+                                        modal.prompt, models_list,
+                                        explicit_connection=explicit_option,
+                                        text_writer=terminal.write_text))
+                                if selected_model:
+                                    if isinstance(
+                                            selected_model,
+                                            modelsdev.ExplicitConnectionOption):
+                                        apply_runtime_config(
+                                            build_config_from_env(
+                                                credentials=_core.CREDENTIALS))
+                                        selected_label = selected_model.model
+                                        selected_via = " via explicit LOKI_*"
+                                    else:
+                                        reinstall_provider(
+                                            model=selected_model,
+                                            models_url=(
+                                                current_config().chat_provider.models_url
+                                                if current_config() else None),
+                                        )
+                                        selected_label = selected_model
+                                        selected_via = ""
+                                    descriptor = active_connection_descriptor()
+                                    if descriptor is not None:
+                                        set_session_connection(descriptor)
+                                    save_chat_log()
+                                    print(
+                                        "Selected model: ", end="",
+                                        file=sys.stderr)
+                                    terminal.write_text(
+                                        repr(selected_label), file=sys.stderr)
+                                    terminal.write_text(
+                                        selected_via, file=sys.stderr)
+                                    print(file=sys.stderr)
+                                    _report_unavailable_reasoning_preference()
+                                    sys.stderr.flush()
+                                    continue
+                                print("Model selection cancelled.",
+                                      file=sys.stderr)
                                 sys.stderr.flush()
                                 continue
-                            print("Model selection cancelled.",
-                                  file=sys.stderr)
-                            sys.stderr.flush()
-                            continue
+                        except KeyboardInterrupt:
+                            # Includes the outage picker and endpoint approval.
+                            # Leave configuration untouched and use the normal
+                            # cancellation path after modal ownership is released.
+                            picked = None
                     if picked is None:
                         # User cancelled at either menu; keep the current model.
                         print("Model selection cancelled.", file=sys.stderr)
