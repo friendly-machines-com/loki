@@ -95,6 +95,17 @@ The `/model` picker uses models.dev and shows providers for which credentials
 were supplied at startup, such as `OPENROUTER_API_KEY`. Deprecated models remain
 selectable but are labeled in the picker and status bar.
 
+Before using a catalog connection, Loki asks whether the named credential may
+be sent to its concrete request URLs, including model-list alternatives and
+applicable account-control URLs. Approvals match full URLs, not entire hosts.
+They are saved in the protected credential database alongside login records;
+only the supervisor reads and updates them. The old state-directory
+`provider-endpoints.json` file is not used or imported. Explicit launch
+configuration and Loki's canonical subscription routes need no saved approval.
+Removing a saved approval affects subsequent credential requests; values
+already issued cannot be recalled. Saved-session confirmation remains separate
+and is still required when resuming a saved connection.
+
 `OpenAI Platform API` uses API billing. `OpenAI ChatGPT subscription` uses your
 saved ChatGPT login and lists the models available to that account; these may
 differ from the Platform API models. Subscription credentials are not sent to

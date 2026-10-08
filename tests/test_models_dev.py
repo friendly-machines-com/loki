@@ -16,7 +16,6 @@ from loki_agent import (
     terminals,
 )
 from loki_agent.credentials import CredentialInventory, CredentialStore
-from loki_endpoints import assume_endpoints_approved
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
 DATA = {
@@ -122,6 +121,7 @@ def _subscription_catalog(*slugs):
 
 class CatalogFetchTests(unittest.TestCase):
     def test_catalog_fetch_cache_reopen_normalize_and_filter(self):
+
         async def lifecycle():
             raw = dict(DATA, openai={
                 "id": "openai", "name": "OpenAI", "npm": "@ai-sdk/openai",
@@ -293,6 +293,7 @@ class CatalogFetchTests(unittest.TestCase):
         self.assertNotIn("refresh-secret", repr(transport.await_args))
 
     def test_subscription_fetch_refreshes_one_rejected_generation(self):
+
         async def rotate(_tokens):
             return authentications.OpenAITokenSet(
                 "access-b", "refresh-b", expires_at=10**12)
@@ -442,7 +443,7 @@ class CatalogNormalizationTests(unittest.TestCase):
                 normalized = models.normalize_catalog(raw)
                 # Which endpoint and credential are used is not decided by the
                 # catalog or by a signature check; it is approved on selection
-                # (endpoint_pins).  The repair only supplies a missing field.
+                # at credential issuance. The repair only supplies a missing field.
                 self.assertEqual(
                     normalized["openai"]["api"],
                     "https://api.openai.com/v1",
@@ -1231,7 +1232,22 @@ class MenuTests(unittest.TestCase):
 
 class PickerTests(unittest.TestCase):
     def setUp(self):
-        assume_endpoints_approved(self)
+        from loki_agent import loki
+        credentials = _credentials(PROVIDER_API_KEY="key")
+        self.authority = authentications.CredentialBroker()
+        credentials.install_static_credentials(self.authority)
+
+        async def grant():
+            for provider_id, provider in DATA.items():
+                for model in provider["models"].values():
+                    config = loki.config_from_modelsdev_selection(
+                        provider_id, provider, model, credentials)
+                    await self.authority.approve_destinations(
+                        config.auth_spec.credential, config.credential_destinations())
+            await self.authority.approve_destinations(
+                authentications.CredentialRef.environment("PROVIDER_API_KEY"),
+                ["https://provider.test/v1/chat/completions", "https://provider.test/v1/models"])
+        asyncio.run(grant())
 
     def test_catalog_picker_prefills_model_filter_but_not_provider(self):
         inputs = mock.AsyncMock(side_effect=["filter GLM", "1", "1"])
@@ -1240,7 +1256,7 @@ class PickerTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             result = asyncio.run(models.run_model_picker_async(
-                inputs, _credentials(), text_writer=_write_text))
+                inputs, _credentials(), text_writer=_write_text, credential_authority=self.authority))
 
         self.assertEqual(result[2]["name"], "GLM-5.2")
         self.assertEqual(
@@ -1277,7 +1293,7 @@ class PickerTests(unittest.TestCase):
                     CredentialStore({}),
                     explicit_connection=explicit,
                     text_writer=_write_text,
-                ))
+                    credential_authority=self.authority))
         finally:
             models._index_cache = saved
 
@@ -1328,7 +1344,7 @@ class PickerTests(unittest.TestCase):
                 _input_script(["1", "1"]),
                 CredentialStore({"PROVIDER_API_KEY": "key"}),
                 text_writer=_write_text,
-            ))
+                credential_authority=self.authority))
         finally:
             models._index_cache = saved
 
@@ -1387,7 +1403,7 @@ class PickerTests(unittest.TestCase):
         try:
             result = asyncio.run(models.run_model_picker_async(
                 _input_script([""]), _credentials(),
-                text_writer=_write_text))
+                text_writer=_write_text, credential_authority=self.authority))
         finally:
             models._index_cache = saved
         self.assertIsNone(result)
@@ -1399,7 +1415,7 @@ class PickerTests(unittest.TestCase):
         try:
             result = asyncio.run(models.run_model_picker_async(
                 _input_script(["1", ""]), _credentials(),
-                text_writer=_write_text))
+                text_writer=_write_text, credential_authority=self.authority))
         finally:
             models._index_cache = saved
         self.assertIsNone(result)
@@ -1424,7 +1440,7 @@ class PickerTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 asyncio.run(models.run_model_picker_async(
                     _input_script([]), _credentials(),
-                    text_writer=_write_text))
+                    text_writer=_write_text, credential_authority=self.authority))
 
     def test_model_rows_show_minimal_features_in_parentheses(self):
         rows = models._model_rows(_groups())

@@ -35,7 +35,6 @@ from . import terminals
 from . import texts
 from . import tool_runtime
 from .connections import (
-    ConnectionDescriptor,
     ConnectionDescriptorError,
     connection_display_fields,
 )
@@ -1029,12 +1028,9 @@ async def run_session_picker_async(session):
 
 
 async def confirm_saved_connection_async(
-        descriptor: ConnectionDescriptor, session,
-        config: RuntimeConfig | None = None,
+        config: RuntimeConfig, session,
         working_directory: str | None = None) -> bool:
-    displayed = (
-        connection_descriptor_from_config(config)
-        if config is not None else descriptor)
+    displayed = connection_descriptor_from_config(config)
     if displayed is None:
         raise ValueError("a dummy provider cannot be resumed")
 
@@ -1053,9 +1049,17 @@ async def confirm_saved_connection_async(
                 print(f"  {label}: {value}")
             else:
                 _print_repr_line(f"  {label}: ", value)
+        destinations = config.credential_destinations()
+        for destination in destinations:
+            _print_repr_line("  Request destination: ", destination)
         answer = (await modal.prompt(
             "Use this saved connection? [y/N]: ") or "")
-        return answer.strip().lower() in ["y", "yes"]
+        if answer.strip().lower() not in ["y", "yes"]:
+            return False
+        if config.auth_spec is not None:
+            await current_session().credential_authority.approve_destinations(
+                config.auth_spec.credential, destinations)
+        return True
 
 
 async def _numbered_choice_async(modal, header, rows, prompt):
@@ -1506,7 +1510,7 @@ async def async_main(args) -> int:
                     config = config_from_connection_descriptor(
                         refreshed_descriptor, _core.CREDENTIALS)
                     confirmed = await confirm_saved_connection_async(
-                        refreshed_descriptor, session, config=config,
+                        config, session,
                         working_directory=(
                             shell_cwd if shell_cwd is not None
                             else saved_state.get("shell_cwd")))
@@ -1514,7 +1518,7 @@ async def async_main(args) -> int:
                         print("Resume cancelled.", file=sys.stderr)
                         return 0
         except (ConnectionDescriptorError, protocols.ProtocolError,
-                ValueError) as e:
+                authentications.CredentialError, ValueError) as e:
             _print_text_line(
                 "Configuration error: ", e, file=sys.stderr,
                 multiline=True)
@@ -1666,6 +1670,12 @@ async def async_main(args) -> int:
                             # Includes the outage picker and endpoint approval.
                             # Leave configuration untouched and use the normal
                             # cancellation path after modal ownership is released.
+                            picked = None
+                        except (authentications.CredentialError,
+                                protocols.ProtocolError, ValueError) as error:
+                            _print_text_line(
+                                "Could not switch model: ", error,
+                                file=sys.stderr, multiline=True)
                             picked = None
                     if picked is None:
                         # User cancelled at either menu; keep the current model.

@@ -35,7 +35,6 @@ from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
 from loki_agent import savefiles
 from loki_agent import terminals
-from loki_endpoints import assume_endpoints_approved
 
 
 _MISSING = object()
@@ -633,9 +632,6 @@ class ProviderReinstallTests(unittest.TestCase):
 
 
 class RuntimeConfigTests(unittest.TestCase):
-    def setUp(self):
-        assume_endpoints_approved(self)
-
     def test_reasoning_preference_is_sticky_across_model_capabilities(self):
         saved = save_loki_state([
             "runtime_config",
@@ -1203,7 +1199,6 @@ class RuntimeConfigTests(unittest.TestCase):
 
 class ModelLoadingTests(unittest.TestCase):
     def setUp(self):
-        assume_endpoints_approved(self)
         names = [
             "runtime_config", "CREDENTIALS", "chat_log_path", "session_state", "chat_log_dirty",
             "transcript_items", "session_todos", "job_manager",
@@ -1790,7 +1785,6 @@ class TerminalReasoningEffortTests(unittest.TestCase):
     ]
 
     def setUp(self):
-        assume_endpoints_approved(self)
         self.saved = save_loki_state(self._state_names)
 
     def tearDown(self):
@@ -1884,8 +1878,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self._workflow("credentialless")
 
     async def _workflow(self, variant):
-        from loki_agent import acp_worker, endpoint_pins
-        from test_endpoint_pins import _StateDir
+        from loki_agent import acp_worker, credential_storages
         from test_models_dev import DATA
 
         temporary = tempfile.TemporaryDirectory()
@@ -1910,7 +1903,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "OPENAI_API_KEY": "selected-openai-secret", "ANTHROPIC_API_KEY": "selected-anthropic-secret",
             "ZHIPU_API_KEY": "unused-zhipu-secret", "LOKI_MAX_TOKENS": "1234",
             "LOKI_ANTHROPIC_VERSION": "2024-01-01", "LOKI_STREAM": "0"}
-        owner = credential_supervisors.CredentialSupervisor(CredentialStore(values))
+        storage = credential_storages.JsonCredentialStorage(str(root / "credentials"))
+        owner = credential_supervisors.CredentialSupervisor(CredentialStore(values), storage)
         session = loki.Session(shell_cwd=str(root), job_manager=loki.JobManager(str(root / "jobs")))
         session.credential_authority = owner.broker
         self.addAsyncCleanup(session.job_manager.close_session_owned)
@@ -2056,7 +2050,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         async def pick(answers, expected_pid, expected_api, expected_ref):
             script = iter(answers)
-            previous = endpoint_pins.load()
+            previous = storage.load_document().get("endpoint_approvals", {})
             provider_prompt_seen = False
             last_input_render_end = len(output.getvalue())
 
@@ -2069,10 +2063,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     provider_prompt_seen = True
                 prompts.append(prompt)
                 answer = next(script)
-                if prompt == "Send this credential to this endpoint? [y/N] ":
-                    self.assertEqual(endpoint_pins.load(), previous)
-                    self.assertEqual(endpoint_pins.status(expected_pid, expected_api, expected_ref)[0],
-                                     endpoint_pins.CHANGED if expected_pid in previous else endpoint_pins.NEW)
+                if prompt == "Approve these destinations? [y/N] ":
+                    self.assertEqual(storage.load_document().get("endpoint_approvals", {}), previous)
                     shown = output.getvalue()[last_input_render_end:]
                     self.assertIn(expected_api, shown)
                     self.assertIn(expected_ref, shown)
@@ -2083,39 +2075,39 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         and modelsdev.provider_access(leaf[1], owner.inventory).api_url == expected_api)}
                     active = loki.current_config()
                     requests_before = len(requests)
-                    with self.assertRaisesRegex(ValueError, "approve it once"):
-                        loki.config_from_modelsdev_selection(*worker._option_leaves["chosen"], owner.inventory)
+                    proposed = loki.config_from_modelsdev_selection(*worker._option_leaves["chosen"], owner.inventory)
+                    for destination in proposed.credential_destinations():
+                        with self.assertRaises(authentications.CredentialUnavailable):
+                            await owner.broker.lease(proposed.auth_spec.credential, destination)
                     self.assertIs(loki.current_config(), active)
                     self.assertEqual(len(requests), requests_before)
-                    description = worker.describe_config_selection({"value": "chosen"})
-                    self.assertEqual(description["providerId"], expected_pid)
-                    self.assertEqual(description["endpoint"], expected_api)
+                    description = worker.describe_config_selection({"configId": "model", "value": "chosen"})
                     self.assertEqual(description["credential"], expected_ref)
-                    self.assertEqual(description["changed"], expected_pid in previous)
+                    self.assertEqual(description["destinations"], proposed.credential_destinations())
                     approvals.append((expected_pid, expected_api, expected_ref))
                 last_input_render_end = len(output.getvalue())
                 return answer
 
             render_start = len(output.getvalue())
             leaf = await modelsdev.run_model_picker_async(
-                input_fn, owner.inventory, text_writer=output.write)
+                input_fn, owner.inventory, credential_authority=owner.broker, text_writer=output.write)
             rendered = output.getvalue()[render_start:]
             self.assertTrue(rendered.startswith("\nUsable models:\n"),
                             {'stdout': repr(rendered), 'stderr': repr(errors.getvalue())})
             self.assertEqual(rendered.count("\nUsable models:\n"), 2 if answers[0].startswith("filter") else 1)
             self.assertEqual(rendered.count("\nUsable providers:\n"), 2 if len(answers) == 5 else 1)
             self.assertEqual(leaf[0], expected_pid)
-            approved_pair = {"api": expected_api, "credential": expected_ref}
-            self.assertEqual(endpoint_pins.status(expected_pid, expected_api, expected_ref),
-                             (endpoint_pins.PINNED, approved_pair))
-            self.assertEqual(endpoint_pins.load(), {**previous, expected_pid: approved_pair})
-            self.assertEqual(json.loads(pathlib.Path(state_directory, "loki", "provider-endpoints.json").read_text()),
-                             {**previous, expected_pid: approved_pair})
+            selected = loki.config_from_modelsdev_selection(*leaf, owner.inventory)
+            self.assertEqual(await owner.broker.unapproved_destinations(
+                selected.auth_spec.credential, selected.credential_destinations()), [])
+            expected = {**previous, expected_ref: sorted(set(previous.get(expected_ref, []))
+                        | set(selected.credential_destinations()))}
+            self.assertEqual(storage.load_document()['endpoint_approvals'], expected)
             with self.assertRaises(StopIteration):
                 next(script)
             return leaf
 
-        with _StateDir() as state_directory, mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+        with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                 mock.patch.object(loki, "CREDENTIALS", owner.inventory), \
                 mock.patch.object(asyncio, "open_connection", side_effect=connect), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
@@ -2125,6 +2117,10 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             if variant == "custom":
                 env["LOKI_AUTH_HEADER"] = "X-Custom-Key"
             config = loki.build_config_from_env(env)
+            # This component journey authors its launch configuration here;
+            # grant those exact targets through the real root authority.
+            owner.broker.allow_startup_destinations(
+                config.auth_spec.credential, config.credential_destinations())
             self.assertEqual(config.auth_spec.scheme, "custom" if variant == "custom" else "anthropic")
             self.assertEqual(config.auth_spec.header_name, "X-Custom-Key" if variant == "custom" else None)
             self.assertNotIn("X-Custom-Key", config.chat_provider.headers)
@@ -2158,9 +2154,10 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(leaf[2]["id"], "z-ai/glm-5.2")
             worker = acp_worker.Worker(session, lambda message: None, "selection")
             worker._option_leaves = {"chosen": leaf}
-            self.assertEqual(worker.describe_config_selection({"value": "chosen"}), {})
             selection_credentials = CredentialStore({**values, "LOKI_STREAM": "1"}) if variant == "custom" else owner.inventory
             config = loki.config_from_modelsdev_selection(*leaf, selection_credentials)
+            self.assertEqual(await owner.broker.unapproved_destinations(
+                config.auth_spec.credential, config.credential_destinations()), [])
             self.assertEqual(config.model_status, "deprecated")
             self.assertEqual(config.auth_spec.credential, authentications.CredentialRef.environment("OPENROUTER_API_KEY"))
             self.assertIsNone(config.auth_spec.header_name)
@@ -2171,8 +2168,9 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             prepare("https://effective.example/v1/responses", "z-ai/glm-5.2", protocols.OPENAI_RESPONSES,
                     "selected-router-secret", tool=True)
             await turn("read the selection witness")
-            self.assertEqual(endpoint_pins.status("openrouter", raw["openrouter"]["api"], "env:OPENROUTER_API_KEY")[0],
-                             endpoint_pins.CHANGED)
+            unselected = raw["openrouter"]["api"] + "/responses"
+            self.assertEqual(await owner.broker.unapproved_destinations(
+                authentications.CredentialRef.environment("OPENROUTER_API_KEY"), [unselected]), [unselected])
             before_retry = len(prompts)
             await pick(["filter openrouter", "1", "1"], "openrouter", "https://effective.example/v1", "env:OPENROUTER_API_KEY")
             self.assertEqual(len(prompts) - before_retry, 3)
@@ -2194,7 +2192,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     "selected-router-secret", history=True)
             await turn("replace model on the same provider")
 
-            # Reapproval replaces, rather than accumulates, a provider's durable pair.
+            # A newly approved destination does not silently revoke an older grant.
             raw["openrouter"]["models"]["z-ai/glm-5.2"]["provider"]["api"] = "https://replacement.example/v1"
             modelsdev._index_cache = None
             leaf = await pick(["filter openrouter", "1", "1", "yes"], "openrouter",
@@ -2203,14 +2201,9 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             prepare("https://replacement.example/v1/responses", "z-ai/glm-5.2", protocols.OPENAI_RESPONSES,
                     "selected-router-secret", history=True)
             await turn("replace approved endpoint")
-            pin_path = pathlib.Path(state_directory, "loki", "provider-endpoints.json")
-            self.assertEqual(json.loads(pin_path.read_text())["openrouter"], {
-                "api": "https://replacement.example/v1", "credential": "env:OPENROUTER_API_KEY"})
-            self.assertEqual(endpoint_pins.load()["openrouter"], {
-                "api": "https://replacement.example/v1", "credential": "env:OPENROUTER_API_KEY"})
-            self.assertEqual(
-                endpoint_pins.status("openrouter", "https://effective.example/v1", "env:OPENROUTER_API_KEY")[0],
-                endpoint_pins.CHANGED)
+            self.assertEqual(await owner.broker.unapproved_destinations(
+                authentications.CredentialRef.environment("OPENROUTER_API_KEY"),
+                ["https://effective.example/v1/responses", "https://replacement.example/v1/responses"]), [])
 
             # Replace the provider/protocol through another real approved catalog selection.
             leaf = await pick(["filter anthropic", "1", "1", "y"], "anthropic",
@@ -2253,10 +2246,10 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     async def prompt(inner_self, prompt=None, history=None, *, initial_text=""):
                         answer = next(answers)
                         self.assertEqual(initial_text, "filter " if answer in ["GPT Test", "beta"] else "")
-                        if prompt == "Send this credential to this endpoint? [y/N] ":
-                            self.assertEqual(
-                                endpoint_pins.status("openai", "https://api.openai.com/v1", "env:OPENAI_API_KEY"),
-                                (endpoint_pins.NEW, None))
+                        if prompt == "Approve these destinations? [y/N] ":
+                            target = "https://api.openai.com/v1/responses"
+                            self.assertEqual(await owner.broker.unapproved_destinations(
+                                authentications.CredentialRef.environment("OPENAI_API_KEY"), [target]), [target])
                             self.assertIn("env:OPENAI_API_KEY", output.getvalue())
                         else:
                             self.assertIn("filter WORDS", prompt)
@@ -2314,7 +2307,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             fresh_values = {name: value for name, value in values.items() if name.endswith("API_KEY")}
             if variant == "custom":
                 fresh_values["LOKI_AUTH_HEADER"] = "X-Custom-Key"
-            fresh_owner = credential_supervisors.CredentialSupervisor(CredentialStore(fresh_values))
+            fresh_owner = credential_supervisors.CredentialSupervisor(CredentialStore(fresh_values), storage)
             self.assertIsNot(fresh_owner.broker, owner.broker)
             resumed = loki.Session(shell_cwd=str(root), job_manager=loki.JobManager(str(root / "resumed-jobs")))
             resumed.credential_authority = fresh_owner.broker
@@ -2386,7 +2379,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("calls", final)
             self.assertEqual(final["session_state"]["connection"]["chat_url"], descriptor["chat_url"])
             for secret in (value for name, value in values.items() if name.endswith("API_KEY")):
-                self.assertNotIn(secret, pathlib.Path(path).read_text() + pin_path.read_text()
+                self.assertNotIn(secret, pathlib.Path(path).read_text() + pathlib.Path(storage.file_path).read_text()
                                  + output.getvalue() + errors.getvalue())
             self.assertTrue(any(prompt.startswith("Model choice") for prompt in prompts))
             self.assertTrue(any(prompt.startswith("Provider choice") for prompt in prompts))
@@ -3198,7 +3191,9 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             }), encoding='utf-8')
             store = CredentialStore({f'{name}_API_KEY': f'leased-{name}-secret'
                                      for name in ['A', 'B', 'CHAT', 'ANTHROPIC', 'C']})
-            owner = credential_supervisors.CredentialSupervisor(store)
+            from loki_agent import credential_storages
+            approval_storage = credential_storages.JsonCredentialStorage(str(root / 'credentials'))
+            owner = credential_supervisors.CredentialSupervisor(store, approval_storage)
             session = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / 'jobs')))
             session.credential_authority = owner.broker
             self.addAsyncCleanup(session.job_manager.close_session_owned)
@@ -3369,6 +3364,10 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     {'type': 'text', 'text': 'first block'}, {'type': 'text', 'text': 'second block'}])
                 config = loki.current_config() if restored else provider_config(name, protocol)
                 if not restored:
+                    # This fixture authors each selection itself; authorize its
+                    # exact targets through the real protected-store path.
+                    await owner.broker.approve_destinations(
+                        config.auth_spec.credential, config.credential_destinations())
                     loki.apply_runtime_config(config)
                 loki.set_session_connection(loki.active_connection_descriptor())
                 phase['url'] = config.chat_provider.input_url
@@ -3417,7 +3416,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 return transcript[start:]
 
             def reopen():
-                new_owner = credential_supervisors.CredentialSupervisor(store)
+                new_owner = credential_supervisors.CredentialSupervisor(store, approval_storage)
                 new = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / 'reopened-jobs')))
                 new.credential_authority = new_owner.broker
                 self.addAsyncCleanup(new.job_manager.close_session_owned)
@@ -4971,11 +4970,20 @@ class ShellCwdTests(unittest.TestCase):
         no_session = FakeSession("")
         yes_session = FakeSession("yes")
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        credentials = CredentialStore({"OPENROUTER_API_KEY": "sample-value"})
+        broker = authentications.CredentialBroker()
+        credentials.install_static_credentials(broker)
+        config = loki.config_from_connection_descriptor(descriptor, credentials)
+        with contextlib.redirect_stdout(output), mock.patch.object(
+                loki.current_session(), "credential_authority", broker):
             declined = asyncio.run(
-                terminal_frontend.confirm_saved_connection_async(descriptor, no_session))
+                terminal_frontend.confirm_saved_connection_async(config, no_session))
+            self.assertEqual(asyncio.run(broker.unapproved_destinations(
+                config.auth_spec.credential, config.credential_destinations())), config.credential_destinations())
             accepted = asyncio.run(
-                terminal_frontend.confirm_saved_connection_async(descriptor, yes_session))
+                terminal_frontend.confirm_saved_connection_async(config, yes_session))
+            self.assertEqual(asyncio.run(broker.unapproved_destinations(
+                config.auth_spec.credential, config.credential_destinations())), [])
 
         self.assertFalse(declined)
         self.assertTrue(accepted)
@@ -6161,6 +6169,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
             "EXAMPLE_API_KEY")
         broker = authentications.CredentialBroker()
         broker.install_static(credential, "static-secret")
+        asyncio.run(broker.approve_destinations(
+            credential, ["https://example.test/v1/responses"]))
         loki.current_session().credential_authority = broker
         loki.apply_runtime_config(loki.make_runtime_config(
             "https://example.test/v1/responses",

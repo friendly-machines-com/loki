@@ -44,7 +44,6 @@ from . import protocols
 from . import process_outputs
 from . import authentications
 from . import credential_capabilities
-from . import endpoint_pins
 from . import savefiles
 from . import sse
 from . import tool_runtime
@@ -670,6 +669,17 @@ class RuntimeConfig:
     reasoning_capabilities: (
         modelsdev.ReasoningCapabilities | None) = None
 
+    def credential_destinations(self) -> list[str]:
+        """Concrete request destinations displayed/approved for this connection."""
+        if self.auth_spec is None:
+            return []
+        from . import provider_controls
+        destinations = [self.chat_provider.chat_url,
+                        *self.chat_provider.model_urls]
+        destinations.extend(provider_controls.account_destinations(
+            provider_controls.ControlContext(config=self)))
+        return list(dict.fromkeys(destinations))
+
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
 
@@ -729,17 +739,13 @@ def _auth_spec(provider_kind, credential_ref, request_urls,
         credential=credential_ref,
         scheme=scheme,
         header_name=auth_header if scheme == "custom" else None,
-        authorized_origins=frozenset(
-            authentications.authorization_origin(url)
-            for url in request_urls
-            if url is not None
-        ),
         # The subscription scheme is bound to the canonical Codex URLs here
         # rather than to whatever endpoints the provider happens to expose, so
         # a provider-configuration change cannot widen credential authority.
         authorized_urls=(
             authentications.OPENAI_CHATGPT_CODEX_URLS
-            if scheme == "openai-subscription" else frozenset()
+            if scheme == "openai-subscription"
+            else frozenset(url for url in request_urls if url is not None)
         ),
     )
 
@@ -797,7 +803,7 @@ def make_runtime_config(
     auth_spec = _auth_spec(
         provider_kind,
         credential_ref,
-        (chat_provider.chat_url, chat_provider.models_url),
+        [chat_provider.chat_url, *chat_provider.model_urls],
         auth_header,
         auth_scheme,
     )
@@ -1138,26 +1144,9 @@ def config_from_modelsdev_selection(
     if access is None:
         raise ValueError(
             f"provider {provider_id!r} is not available from startup credentials")
-    # A catalog endpoint decides where this provider's static credential is
-    # sent, and the catalog is untrusted input.  Only an endpoint+credential
-    # pair the user has approved may be used: the picker asks in the terminal,
-    # and the ACP front asks with an elicitation before forwarding the change.
-    # A front that cannot ask (headless, subagent) fails closed here.  A
-    # synthetic provider decides neither, so approval does not apply to it.
-    if not modelsdev.provider_is_synthetic(provider_entry):
-        state, approved = endpoint_pins.status(
-            provider_id, access.api_url, access.credential_ref.encode())
-        if state != endpoint_pins.PINNED:
-            detail = (
-                f"differs from the approved endpoint "
-                f"{approved['api']!r} with credential "
-                f"{approved['credential']!r}"
-                if state == endpoint_pins.CHANGED
-                else "has not been approved")
-            raise ValueError(
-                f"provider endpoint {access.api_url!r} with credential "
-                f"{access.credential_ref.encode()!r} {detail}; approve it "
-                "once before using this provider here")
+    # Construction is pure. Approval belongs to the supervisor's lease path,
+    # not a tools-writable file consulted while building an otherwise valid
+    # configuration. Controllers confirm the concrete destinations before use.
     selected_model = model_entry.get("id") or model_entry.get("name")
     if not selected_model:
         raise ValueError(f"provider {provider_id!r} returned a model without an id")
@@ -2072,9 +2061,17 @@ class JobManager:
                 if authority is None:
                     raise RuntimeError(
                         "cannot delegate credentials without an authority")
+                destinations = None
+                if subagent and credential_refs:
+                    # The child uses this captured environment, not whatever
+                    # connection the parent may select after an await. Explore
+                    # only needs inference, never account/discovery authority.
+                    chat_url, _models_url = protocols.endpoint_urls(
+                        env["LOKI_API_BASE"], env["LOKI_PROVIDER"])
+                    destinations = [chat_url]
                 credential_server, credential_child = await (
                     credential_capabilities.CredentialCapabilityServer.create(
-                        authority, credential_refs))
+                        authority, credential_refs, destinations=destinations))
                 spawn_command = [
                     *spawn_command,
                     "--credential-capability-fd",

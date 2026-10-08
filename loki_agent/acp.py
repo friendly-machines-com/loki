@@ -21,7 +21,7 @@ from . import (
     __version__,
     acps,
     credential_supervisors,
-    endpoint_pins,
+    authentications,
     runtime_isolation,
     savefiles,
 )
@@ -869,14 +869,20 @@ class Front:
 
     async def _authorize_saved_connection(
             self, descriptor: ConnectionDescriptor,
-            restore_request_id, working_directory=None, *, owner) -> None:
+            restore_request_id, working_directory=None, *, destinations, owner) -> None:
         if not self._client_supports_form_elicitation:
             raise acps.TransportError(
                 "restoring a saved network connection requires an ACP "
                 "client with form elicitation support",
                 code=acps.INVALID_PARAMS,
             )
+        reference = descriptor.credential_ref
+        if reference is not None:
+            await self.credential_broker.unapproved_destinations(reference, destinations)
+        elif destinations != []:
+            raise acps.TransportError("saved request destinations are invalid")
         display = list(connection_display_fields(descriptor))
+        display.extend(["Request destination", destination] for destination in destinations)
         if working_directory:
             # The workspace is part of what the client approves: it is where
             # every tool reads and writes for this session.
@@ -920,6 +926,9 @@ class Front:
                 "saved connection authorization was not accepted",
                 code=acps.INVALID_PARAMS,
             )
+        if reference is not None:
+            await self.credential_broker.approve_destinations(
+                reference, destinations, before_commit=lambda: self._check_owner(owner))
 
     @staticmethod
     def _working_directory(params: dict) -> str:
@@ -1024,7 +1033,8 @@ class Front:
                         f"worker returned an invalid connection: {error}"
                     ) from error
                 await self._authorize_saved_connection(
-                    descriptor, restore_request_id, cwd, owner=owner)
+                    descriptor, restore_request_id, cwd,
+                    destinations=prepared.get("authorizationDestinations"), owner=owner)
             self._check_owner(owner)
             reply = await channel.request("session/commit_open", {})
             self._check_owner(owner)
@@ -1179,7 +1189,16 @@ class Front:
         """Ask the client to approve a catalog endpoint+credential pair."""
         selection = await channel.request(
             "session/describe_config_selection", params)
-        if not isinstance(selection, dict) or not selection:
+        if not isinstance(selection, dict):
+            raise acps.TransportError("selected request destinations are invalid")
+        if not selection:
+            return
+        reference = authentications.CredentialRef.decode(selection.get("credential"))
+        destinations = selection.get("destinations")
+        missing = await self.credential_broker.unapproved_destinations(
+            reference, destinations)
+        self._check_owner(owner)
+        if not missing:
             return
         if not self._client_supports_form_elicitation:
             raise acps.TransportError(
@@ -1187,14 +1206,8 @@ class Front:
                 "form elicitation support, so its endpoint can be approved",
                 code=acps.INVALID_PARAMS,
             )
-        facts = [("Endpoint", selection.get("endpoint")),
-                 ("Credential", selection.get("credential"))]
-        if selection.get("changed"):
-            facts = [
-                ("Approved endpoint", selection.get("approvedEndpoint")),
-                ("Approved credential", selection.get("approvedCredential")),
-                *facts,
-            ]
+        facts = [["Credential", reference.encode()]]
+        facts.extend(["Request destination", destination] for destination in destinations)
         result = await self._request_client("elicitation/create", {
             "requestId": (
                 request_id if request_id is not None
@@ -1233,11 +1246,7 @@ class Front:
                 "the provider endpoint was not approved",
                 code=acps.INVALID_PARAMS,
             )
-        # Consent belongs to this operation, not any replacement session using
-        # the same ID. No await separates the lifetime check and durable write.
-        self._check_owner(owner)
-        endpoint_pins.record(
-            str(selection.get("providerId")),
-            str(selection.get("endpoint")),
-            str(selection.get("credential")),
-        )
+        # Storage may wait for another supervisor's transaction. Recheck this
+        # owner after that wait, with no yield between the check and publication.
+        await self.credential_broker.approve_destinations(
+            reference, destinations, before_commit=lambda: self._check_owner(owner))

@@ -14,7 +14,7 @@ class _Config:
 
 
 class _Authority:
-    async def lease(self, credential, rejected_generation=None):
+    async def lease(self, credential, destination, rejected_generation=None):
         return auth.CredentialLease(credential, "access-token")
 
     def available(self):

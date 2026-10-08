@@ -198,7 +198,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(durable.load_openai_subscription().tokens.refresh_token,
                              "refresh-rotated-secret")
             restarted = credential_supervisors.CredentialSupervisor(CredentialStore({}), durable)
-            self.assertEqual((await restarted.broker.lease(ref)).value, "access-rotated-secret")
+            self.assertEqual((await restarted.broker.lease(ref, destination=url)).value, "access-rotated-secret")
             revision = durable.load_document()["revision"]
             self.assertEqual(await authentication_commands.run(["status", "openai"], storage=durable), 0)
             self.assertEqual(await authentication_commands.run(["logout", "openai"], storage=durable), 0)
@@ -211,7 +211,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
                 credential_storages.JsonCredentialStorage(self.storage.directory))
             self.assertFalse(logged_out.inventory.has_ref(ref))
             with self.assertRaises(authentications.CredentialUnavailable):
-                await logged_out.broker.lease(ref)
+                await logged_out.broker.lease(ref, destination=url)
         self.assertEqual(errors.getvalue(), "")
         self.assertIn("Logged in: OpenAI ChatGPT subscription", output.getvalue())
         for secret in [access, identity, "refresh-secret", "access-rotated-secret",

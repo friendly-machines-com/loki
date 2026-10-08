@@ -30,7 +30,7 @@ class CredentialSupervisor:
 
     def __init__(self, credentials: CredentialStore, storage=None):
         self.environment = credentials.sanitized_environment()
-        self.broker = CredentialBroker()
+        self.broker = CredentialBroker(storage=storage)
         credentials.install_static_credentials(self.broker)
         self.storage = storage
         if storage is not None:
@@ -52,15 +52,38 @@ class CredentialSupervisor:
             self.broker.available(),
         )
 
-    async def delegate(self, allowed=None) -> "RuntimeDelegation":
-        return await RuntimeDelegation.create(self.broker, allowed)
+        # Use the same pure configuration/route derivation as the runtime.
+        # Only the captured explicit connection is prior consent; saved logs
+        # and catalog selections cannot claim to be launch configuration.
+        from . import loki
+        if loki.explicit_api_base_configured(self.inventory):
+            try:
+                config = loki.build_config_from_env(credentials=self.inventory)
+            except (ValueError, loki.protocols.ProtocolError):
+                # The runtime reports invalid configuration through its usual
+                # UI. It must not create any implicit destination permissions.
+                config = None
+            if config is not None and config.auth_spec is not None:
+                self.broker.allow_startup_destinations(
+                    config.auth_spec.credential, config.credential_destinations())
+
+    async def delegate(self, allowed=None, *, manage_approvals=False) -> "RuntimeDelegation":
+        return await RuntimeDelegation.create(
+            self.broker, allowed, manage_approvals=manage_approvals)
 
     async def run_terminal_runtime(
             self, executable: str, arguments: list[str]) -> int:
         """Run one terminal/headless child while serving its credentials."""
         # The Windows workspace gate runs before any channel is created.
         workspace = runtime_isolation.configured_workspace(arguments)
-        delegation = await self.delegate()
+        import getopt
+        from .terminal_frontend import parse_cli_args
+        try:
+            options, _positional = parse_cli_args(arguments)
+            manage_approvals = not any(name == "--headless" for name, _value in options)
+        except getopt.GetoptError:
+            manage_approvals = False  # The runtime reports its CLI error.
+        delegation = await self.delegate(manage_approvals=manage_approvals)
         process = None
         try:
             process = await runtime_isolation.start_runtime(
@@ -110,14 +133,14 @@ class RuntimeDelegation:
     credential_child: object | None
 
     @classmethod
-    async def create(cls, authority, allowed=None):
+    async def create(cls, authority, allowed=None, *, manage_approvals=False):
         owner_parent, owner_child = host_ipc.owner_channel()
         credential_server = None
         credential_child = None
         try:
             credential_server, credential_child = await (
                 credential_capabilities.CredentialCapabilityServer.create(
-                    authority, allowed))
+                    authority, allowed, manage_approvals=manage_approvals))
             return cls(
                 credential_server,
                 owner_child,

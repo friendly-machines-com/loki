@@ -3,12 +3,10 @@ import unittest
 
 from loki_agent import authentications, loki, models, protocols
 from loki_agent.credentials import CredentialStore
-from loki_endpoints import assume_endpoints_approved
 
 
 class ModelProviderOverrideTests(unittest.TestCase):
     def setUp(self):
-        assume_endpoints_approved(self)
         self.provider = {
             "id": "opencode-go",
             "name": "OpenCode Go",

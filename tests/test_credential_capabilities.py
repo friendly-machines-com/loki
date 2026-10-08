@@ -11,6 +11,9 @@ from loki_agent import credential_supervisors
 from loki_agent import host_ipc
 
 
+DESTINATION = "https://example.test/inference"
+
+
 CHILD_SCRIPT = """
 import asyncio, sys
 from loki_agent import authentications, credential_capabilities
@@ -28,7 +31,7 @@ async def main():
         host_ipc.child_endpoint(argument("--credential-capability-fd")))
     credential = authentications.CredentialRef.decode(
         argument("--credential"))
-    lease = await client.lease(credential)
+    lease = await client.lease(credential, destination="https://example.test/inference")
     print("lease:" + lease.value, flush=True)
     await owner.closed_task
     print("revoked", flush=True)
@@ -48,6 +51,8 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             "SECOND_API_KEY")
         self.broker.install_static(self.first, "first-secret")
         self.broker.install_static(self.second, "second-secret")
+        await self.broker.approve_destinations(self.first, [DESTINATION])
+        await self.broker.approve_destinations(self.second, [DESTINATION])
         self.server = None
         self.client = None
 
@@ -78,12 +83,12 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_delegates_only_allowed_credentials(self):
         await self.connect({self.first})
 
-        lease = await self.client.lease(self.first)
+        lease = await self.client.lease(self.first, destination=DESTINATION)
 
         self.assertEqual(lease.value, "first-secret")
         self.assertEqual(self.client.available(), frozenset({self.first}))
         with self.assertRaises(credential_capabilities.CapabilityError):
-            await self.client.lease(self.second)
+            await self.client.lease(self.second, destination=DESTINATION)
 
     async def test_capability_can_delegate_strict_subset(self):
         await self.connect({self.first, self.second})
@@ -93,11 +98,11 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         grandchild = (
             await credential_capabilities.CredentialClient.from_fd(child_fd))
         try:
-            lease = await grandchild.lease(self.second)
+            lease = await grandchild.lease(self.second, destination=DESTINATION)
             self.assertEqual(lease.value, "second-secret")
             with self.assertRaises(
                     credential_capabilities.CapabilityError):
-                await grandchild.lease(self.first)
+                await grandchild.lease(self.first, destination=DESTINATION)
         finally:
             await grandchild.close()
             await relay.close()
@@ -129,9 +134,9 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.connect({credential})
 
-        first = await self.client.lease(credential)
+        first = await self.client.lease(credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)
         second = await self.client.lease(
-            credential, rejected_generation=first.generation)
+            credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL, rejected_generation=first.generation)
 
         self.assertEqual(first.value, "access-old")
         self.assertEqual(second.value, "access-1")
@@ -140,14 +145,14 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["refresh-old"])
         self.assertFalse(hasattr(second, "refresh_token"))
         third = await self.client.lease(
-            credential, rejected_generation=second.generation)
+            credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL, rejected_generation=second.generation)
         self.assertEqual(third.value, "access-2")
         self.assertEqual(third.generation, 2)
         self.assertEqual(calls, ["refresh-old", "refresh-1"])
         # A late rejection of generation zero adopts generation two; it must
         # not refresh again or roll the client back to an earlier token.
         stale = await self.client.lease(
-            credential, rejected_generation=first.generation)
+            credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL, rejected_generation=first.generation)
         self.assertEqual((stale.credential, stale.value, stale.generation),
                          (credential, "access-2", 2))
         self.assertEqual(calls, ["refresh-old", "refresh-1"])
@@ -158,7 +163,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
 
         leases = await asyncio.gather(*[
             self.client.lease(
-                self.first if index % 2 == 0 else self.second)
+                self.first if index % 2 == 0 else self.second, destination=DESTINATION)
             for index in range(20)
         ])
 
@@ -178,7 +183,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 return frozenset({self.first})
 
             async def lease(
-                    inner_self, credential,
+                    inner_self, credential, destination,
                     rejected_generation=None):
                 nonlocal active, maximum
                 active += 1
@@ -197,7 +202,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             await credential_capabilities.CredentialClient.from_fd(child_fd))
 
         leases = await asyncio.gather(*[
-            self.client.lease(self.first) for _ in range(20)
+            self.client.lease(self.first, destination=DESTINATION) for _ in range(20)
         ])
 
         self.assertEqual(maximum, 1)
@@ -214,7 +219,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 return frozenset({self.first})
 
             async def lease(
-                    inner_self, credential,
+                    inner_self, credential, destination,
                     rejected_generation=None):
                 requests.append(credential)
                 started.set()
@@ -228,7 +233,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 BlockingAuthority(), {self.first}))
         self.client = (
             await credential_capabilities.CredentialClient.from_fd(child_fd))
-        pending = asyncio.create_task(self.client.lease(self.first))
+        pending = asyncio.create_task(self.client.lease(self.first, destination=DESTINATION))
         try:
             await asyncio.wait_for(started.wait(), 2)
             self.assertFalse(pending.done())
@@ -242,7 +247,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             # shutting it down as the cooperative owner-lifetime child does.
             with self.assertRaisesRegex(
                     credential_capabilities.CapabilityError, "closed"):
-                await asyncio.wait_for(self.client.lease(self.first), 2)
+                await asyncio.wait_for(self.client.lease(self.first, destination=DESTINATION), 2)
             self.assertEqual(requests, [self.first])
             self.assertEqual(self.client._pending, {})
         finally:
@@ -297,7 +302,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 return frozenset({self.first})
 
             async def lease(
-                    inner_self, credential,
+                    inner_self, credential, destination,
                     rejected_generation=None):
                 raise RuntimeError(secret)
 
@@ -309,7 +314,7 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
         try:
             with self.assertRaises(
                     credential_capabilities.CapabilityError) as raised:
-                await client.lease(self.first)
+                await client.lease(self.first, destination=DESTINATION)
             self.assertNotIn(secret, str(raised.exception))
             self.assertEqual(
                 str(raised.exception), "credential request failed")
@@ -333,6 +338,7 @@ class DelegatedRuntimeProcessTests(unittest.IsolatedAsyncioTestCase):
         self.credential = authentications.CredentialRef.environment(
             "DELEGATED_API_KEY")
         self.broker.install_static(self.credential, "delegated-secret")
+        await self.broker.approve_destinations(self.credential, [DESTINATION])
         self.delegation = None
 
     async def asyncTearDown(self):

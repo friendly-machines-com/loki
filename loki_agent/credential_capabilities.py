@@ -21,6 +21,7 @@ from .authentications import (
     CredentialLease,
     CredentialRef,
     CredentialUnavailable,
+    validate_destination_url,
     RefreshIndeterminateError,
     RefreshPermanentError,
     RefreshTransientError,
@@ -195,11 +196,25 @@ class CredentialClient:
     def available(self) -> frozenset[CredentialRef]:
         return self._available
 
+    async def unapproved_destinations(self, credential, destinations):
+        result = await self._request("approvals.status", {
+            "credential": credential.encode(), "destinations": destinations})
+        if (not isinstance(result, list)
+                or any(not isinstance(value, str) or value not in destinations
+                       for value in result)):
+            raise CapabilityError("approval response is invalid")
+        return result
+
+    async def approve_destinations(self, credential, destinations):
+        await self._request("approvals.record", {
+            "credential": credential.encode(), "destinations": destinations})
+
     async def lease(
-            self, credential: CredentialRef,
+            self, credential: CredentialRef, destination: str,
             rejected_generation: int | None = None) -> CredentialLease:
         result = await self._request("lease", {
             "credential": credential.encode(),
+            "destination": destination,
             "rejected_generation": rejected_generation,
         })
         try:
@@ -312,12 +327,18 @@ class CredentialCapabilityServer:
             self, authority: CredentialAuthority,
             allowed: frozenset[CredentialRef],
             reader: asyncio.StreamReader,
-            writer: asyncio.StreamWriter):
+            writer: asyncio.StreamWriter, *,
+            destinations=None, manage_approvals=False):
         if not allowed.issubset(authority.available()):
             raise ValueError(
                 "delegated credentials exceed the upstream authority")
         self.authority = authority
         self.allowed = allowed
+        # A relay may narrow URLs as well as references. It never gains access
+        # to approval mutation merely because its upstream has that permission.
+        self.destinations = (
+            frozenset(destinations) if destinations is not None else None)
+        self.manage_approvals = manage_approvals
         self._reader = reader
         self._writer = writer
         self._close_lock = asyncio.Lock()
@@ -329,7 +350,7 @@ class CredentialCapabilityServer:
     @classmethod
     async def create(
             cls, authority: CredentialAuthority,
-            allowed=None
+            allowed=None, *, destinations=None, manage_approvals=False
     ) -> tuple["CredentialCapabilityServer", int]:
         permitted = frozenset(
             authority.available() if allowed is None else allowed)
@@ -342,7 +363,9 @@ class CredentialCapabilityServer:
                 parent_end,
                 limit=CAPABILITY_MAX_MESSAGE_BYTES,
             )
-            server = cls(authority, permitted, reader, writer)
+            server = cls(
+                authority, permitted, reader, writer,
+                destinations=destinations, manage_approvals=manage_approvals)
             return server, host_ipc.prepare_child_socket(child_end)
         except BaseException:
             host_ipc.close_end(parent_end)
@@ -398,12 +421,33 @@ class CredentialCapabilityServer:
                 credential.encode()
                 for credential in sorted(self.allowed)
             ]
-        if method != "lease" or not isinstance(params, dict):
+        if not isinstance(params, dict):
             raise CapabilityError("unsupported credential capability request")
         credential = CredentialRef.decode(params.get("credential"))
         if credential not in self.allowed:
             raise CapabilityError(
                 f"credential {credential.encode()!r} is not delegated")
+        if method in {"approvals.status", "approvals.record"}:
+            if not self.manage_approvals:
+                raise CapabilityError("approval requests are not available")
+            destinations = params.get("destinations")
+            if not isinstance(destinations, list) or not destinations:
+                raise CapabilityError("request destinations are required")
+            for destination in destinations:
+                validate_destination_url(destination)
+            if method == "approvals.status":
+                return await self.authority.unapproved_destinations(
+                    credential, destinations)
+            await self.authority.approve_destinations(
+                credential, destinations, before_commit=self._check_live)
+            return None
+        if method != "lease":
+            raise CapabilityError("unsupported credential capability request")
+        destination = params.get("destination")
+        validate_destination_url(destination)
+        if (self.destinations is not None
+                and destination not in self.destinations):
+            raise CapabilityError("this request destination is not available in this session")
         rejected = params.get("rejected_generation")
         if (rejected is not None
                 and (not isinstance(rejected, int)
@@ -411,8 +455,12 @@ class CredentialCapabilityServer:
             raise CapabilityError(
                 "rejected credential generation must be an integer or null")
         lease = await self.authority.lease(
-            credential, rejected_generation=rejected)
+            credential, destination=destination, rejected_generation=rejected)
         return lease.to_wire()
+
+    def _check_live(self):
+        if self._closed:
+            raise CapabilityError("approval was cancelled")
 
     async def _close_writer(self):
         async with self._close_lock:

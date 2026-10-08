@@ -13,7 +13,6 @@ from . import (
     acp_commands,
     acps,
     acp_events,
-    endpoint_pins,
     formats,
     loki,
     models as modelsdev,
@@ -178,40 +177,26 @@ class Worker:
         )
 
     def describe_config_selection(self, params: dict) -> dict:
-        """Report the endpoint+credential one config value would use.
-
-        Read-only, for the front to turn into an approval request.  An empty
-        object means there is nothing to approve: the value selects no catalog
-        provider (an explicit or saved connection, or the disconnected stub),
-        the provider is synthetic, the provider is unusable, or the pair is
-        already approved.
-        """
+        """Describe effective request destinations; only the front owns consent."""
+        if params.get("configId") != "model":
+            return {}
         leaf = self._option_leaves.get(params.get("value"))
-        if not isinstance(leaf, tuple) or len(leaf) != 3:
+        if leaf is None:
+            raise acps.TransportError("unknown model value", code=acps.INVALID_PARAMS)
+        if leaf is _DISCONNECTED:
             return {}
-        provider_id, provider_entry, model_entry = leaf
-        if modelsdev.provider_is_synthetic(provider_entry):
+        if isinstance(leaf, modelsdev.ExplicitConnectionOption):
+            config = loki.build_config_from_env(credentials=loki.CREDENTIALS)
+        elif isinstance(leaf, ConnectionDescriptor):
+            config = loki.config_from_connection_descriptor(leaf, loki.CREDENTIALS)
+        else:
+            provider_id, provider_entry, model_entry = leaf
+            config = loki.config_from_modelsdev_selection(
+                provider_id, provider_entry, model_entry, loki.CREDENTIALS)
+        if config.auth_spec is None:
             return {}
-        effective = modelsdev.effective_provider(provider_entry, model_entry)
-        access = modelsdev.provider_access(effective, loki.CREDENTIALS)
-        if access is None:
-            return {}
-        credential = access.credential_ref.encode()
-        state, approved = endpoint_pins.status(
-            provider_id, access.api_url, credential)
-        if state == endpoint_pins.PINNED:
-            return {}
-        return {
-            "providerId": provider_id,
-            "endpoint": access.api_url,
-            "credential": credential,
-            "changed": state == endpoint_pins.CHANGED,
-            "approvedEndpoint": (
-                approved.get("api") if isinstance(approved, dict) else None),
-            "approvedCredential": (
-                approved.get("credential")
-                if isinstance(approved, dict) else None),
-        }
+        return {"credential": config.auth_spec.credential.encode(),
+                "destinations": config.credential_destinations()}
 
     # -- session lifecycle and model configuration -----------------------
 
@@ -552,6 +537,7 @@ class Worker:
         if authorization_descriptor is not None:
             result["authorizationConnection"] = (
                 authorization_descriptor.to_dict())
+            result["authorizationDestinations"] = runtime_config.credential_destinations()
         return result
 
     def commit_open(self) -> dict:

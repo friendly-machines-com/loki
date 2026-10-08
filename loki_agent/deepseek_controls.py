@@ -39,7 +39,7 @@ def _spec(credential):
     return provider_controls.credential_spec(
         credential,
         scheme="bearer",
-        authorized_origins=frozenset({DEEPSEEK_API_ORIGIN}),
+        authorized_urls=frozenset({DEEPSEEK_BALANCE_URL}),
     )
 
 
@@ -90,6 +90,7 @@ BALANCE = provider_controls.ControlSpec(
     description="prepaid account balance",
     applies=_applies,
     read=_read_balance,
+    destinations=lambda context: _spec(_credential(context)).authorized_urls,
 )
 
 CONTROLS = (BALANCE,)

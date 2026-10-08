@@ -152,16 +152,21 @@ def _url(context, path: str) -> str:
     return provider_controls.connection_origin(context) + path
 
 
+def _destinations(context):
+    return frozenset(_url(context, path) for path in [
+        _QUOTA_PATH, _RESET_LIST_PATH, _RESET_USE_PATH])
+
+
 def _auth_specs(context):
-    """The styles one request may try, in order, scoped to this origin."""
-    origin = frozenset({provider_controls.connection_origin(context)})
+    """The styles one request may try, scoped to the declared exact routes."""
+    destinations = _destinations(context)
     credential = _credential(context)
     return (
         ("key", authentications.AuthSpec(
             credential, "custom", header_name="Authorization",
-            authorized_origins=origin)),
+            authorized_urls=destinations)),
         ("bearer", authentications.AuthSpec(
-            credential, "bearer", authorized_origins=origin)),
+            credential, "bearer", authorized_urls=destinations)),
     )
 
 
@@ -395,6 +400,7 @@ USAGE = provider_controls.ControlSpec(
     description="current quota windows and reset times",
     applies=_applies,
     read=_read_usage,
+    destinations=_destinations,
 )
 
 RESETS = provider_controls.ControlSpec(
@@ -403,6 +409,7 @@ RESETS = provider_controls.ControlSpec(
     description="quota reset cards, with redemption",
     applies=_applies,
     read=_read_resets,
+    destinations=_destinations,
 )
 
 CONTROLS = (USAGE, RESETS)

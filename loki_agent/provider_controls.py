@@ -69,6 +69,9 @@ class ControlSpec:
     description: str
     applies: Callable[[ControlContext], bool]
     read: Callable[[ControlContext], Awaitable[ControlResult]]
+    # Shared by the controller's approval display and the request recipe;
+    # responses may supply values, never new destinations.
+    destinations: Callable[[ControlContext], frozenset[str]] = lambda context: frozenset()
 
 
 def _registry() -> tuple[ControlSpec, ...]:
@@ -89,6 +92,11 @@ def _registry() -> tuple[ControlSpec, ...]:
 
 def available_controls(context: ControlContext) -> list[ControlSpec]:
     return [spec for spec in _registry() if spec.applies(context)]
+
+
+def account_destinations(context: ControlContext) -> list[str]:
+    return sorted({destination for spec in available_controls(context)
+                   for destination in spec.destinations(context)})
 
 
 def control_names(spec: ControlSpec) -> set[str]:
@@ -192,12 +200,10 @@ def json_document(response) -> object:
         raise OSError(f"provider response is invalid: {error}") from error
 
 
-def credential_spec(credential, *, scheme, authorized_origins=frozenset(),
-                    authorized_urls=frozenset()):
+def credential_spec(credential, *, scheme, authorized_urls=frozenset()):
     """An AuthSpec for one account control's own endpoints."""
     return authentications.AuthSpec(
         credential,
         scheme,
-        authorized_origins=authorized_origins,
         authorized_urls=authorized_urls,
     )

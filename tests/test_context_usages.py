@@ -14,7 +14,6 @@ from loki_agent.authentications import CredentialRef
 from loki_agent.connections import ConnectionDescriptor, ConnectionDescriptorError
 from loki_agent.credentials import CredentialInventory
 from loki_agent.sessions import Session
-from loki_endpoints import assume_endpoints_approved
 
 
 CAPACITY = usages.ContextCapacity(1000, "configured")
@@ -216,7 +215,6 @@ class CapacityConfigurationTests(unittest.TestCase):
         self.assertEqual(capacity, usages.ContextCapacity(1000, "models.dev"))
 
     def test_selected_catalog_leaf_and_environment_override(self):
-        assume_endpoints_approved(self)
         provider = {
             "id": "provider", "name": "Provider", "api": "https://example.test/v1",
             "npm": "@ai-sdk/openai-compatible", "env": ["EXAMPLE_KEY"],

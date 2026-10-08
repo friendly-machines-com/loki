@@ -45,7 +45,10 @@ def open_directory(path: str) -> int:
 
 
 def open_read_at(directory_fd: int, name: str) -> int:
-    return os.open(name, _no_follow(os.O_RDONLY), dir_fd=directory_fd)
+    # A regular file ignores O_NONBLOCK. A substituted FIFO must open without
+    # waiting so the caller can inspect its handle and reject its type.
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    return os.open(name, _no_follow(flags), dir_fd=directory_fd)
 
 
 def create_exclusive_at(directory_fd: int, name: str, mode: int) -> int:

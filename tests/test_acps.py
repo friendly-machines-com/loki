@@ -26,7 +26,6 @@ from loki_agent import (
     models,
 )
 from loki_agent.credentials import CredentialStore, is_credential_name
-from loki_endpoints import assume_endpoints_approved
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -811,8 +810,10 @@ args=(%r + str(__import__('os').getpid()), 'a')
             credential_name)
         self.assertTrue(front.credentials.has_ref(credential))
         self.assertEqual(front.credentials.get(credential_name), "")
-        lease = asyncio.run(front.credential_broker.lease(credential))
-        self.assertEqual(lease.value, credential_value)
+        # Inventory/delegation alone grants no authenticated destination.
+        with self.assertRaises(authentications.CredentialUnavailable):
+            asyncio.run(front.credential_broker.lease(
+                credential, destination="https://example.test/unapproved"))
 
     def test_real_front_scrubs_and_real_worker_never_receives_credential(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2549,9 +2550,6 @@ class ConfigOptionTests(unittest.TestCase):
 
 
 class WorkerReasoningConfigTests(unittest.TestCase):
-    def setUp(self):
-        assume_endpoints_approved(self)
-
     @staticmethod
     def _profile(*values):
         return models.ReasoningEffortProfile(list(values))
@@ -2863,9 +2861,6 @@ class TtyStdinTests(unittest.TestCase):
 
 
 class WorkerSessionContractTests(unittest.TestCase):
-    def setUp(self):
-        assume_endpoints_approved(self)
-
     def test_worker_rejects_unknown_open_method(self):
         from loki_agent import loki
         from loki_agent.acp_worker import Worker
@@ -3562,17 +3557,13 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
     """The ACP front asks before a catalog endpoint receives a credential."""
 
     PAIR = {
-        "providerId": "acme",
-        "endpoint": "https://acme.invalid/v1",
         "credential": "env:ACME_API_KEY",
-        "changed": False,
-        "approvedEndpoint": None,
-        "approvedCredential": None,
+        "destinations": ["https://acme.invalid/v1/chat/completions", "https://acme.invalid/v1/models"],
     }
 
     def _front(self, *, supports_elicitation=True):
         front = acp.Front(
-            lambda: None, lambda message: None, CredentialStore({}))
+            lambda: None, lambda message: None, CredentialStore({"ACME_API_KEY": "sample"}))
         front._client_supports_form_elicitation = supports_elicitation
         return front
 
@@ -3596,7 +3587,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         """
         from types import SimpleNamespace
         from test_http_client import FakeConnector
-        from loki_agent import endpoint_pins, http_client, loki
+        from loki_agent import credential_storages, http_client, loki
         from loki_agent.sessions import Session
 
         async with asyncio.timeout(20):
@@ -3647,7 +3638,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                         f.trace.append('elicitation')
                     f.changed.set()
 
-                f.front = acp.Front(lambda: None, write, credentials)
+                f.storage = credential_storages.JsonCredentialStorage(os.path.join(root, 'config', 'loki', 'credentials'))
+                f.front = acp.Front(lambda: None, write, credentials, f.storage)
                 f.source = _FrontInput(f.front)
                 await f.source.send(acps.request(0, 'initialize', {
                     'clientCapabilities': {'elicitation': {'form': {}}}}))
@@ -3671,21 +3663,22 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     return await real_lease(ref, **kwargs)
 
                 stack.enter_context(mock.patch.object(f.front.credential_broker, 'lease', new=lease))
-                endpoint_pins.record('untouched', 'https://untouched.example/v1', 'env:UNRELATED_API_KEY')
-                f.pins_path = endpoint_pins._path()
-                with open(f.pins_path, 'rb') as stream:
-                    f.original_pins = stream.read()
-                f.expected_pins = {
-                    'untouched': {'api': 'https://untouched.example/v1',
-                                  'credential': 'env:UNRELATED_API_KEY'},
-                    'acme': {'api': endpoint, 'credential': 'env:ACME_API_KEY'}}
-                real_record = endpoint_pins.record
+                await f.front.credential_broker.approve_destinations(
+                    authentications.CredentialRef.environment('UNRELATED_API_KEY'),
+                    ['https://untouched.example/v1'])
+                f.approvals_path = f.storage.file_path
+                with open(f.approvals_path, 'rb') as stream:
+                    f.original_approvals_document = stream.read()
+                f.expected_approvals = {
+                    'env:UNRELATED_API_KEY': ['https://untouched.example/v1'],
+                    'env:ACME_API_KEY': [endpoint + '/chat/completions', endpoint + '/models']}
+                real_record = f.storage.approve_destinations
 
-                def record(*args):
-                    real_record(*args)
-                    f.trace.append('pin')
+                async def record(*args, **kwargs):
+                    await real_record(*args, **kwargs)
+                    f.trace.append('approval')
 
-                stack.enter_context(mock.patch.object(endpoint_pins, 'record', new=record))
+                stack.enter_context(mock.patch.object(f.storage, 'approve_destinations', new=record))
 
                 async def launch(cwd, environment, delegation):
                     session = Session(shell_cwd=cwd)
@@ -3700,8 +3693,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                             f.trace.append('describe')
                         if message['method'] == 'session/set_config_option':
                             f.trace.append('switch')
-                            with open(f.pins_path, encoding='utf-8') as stream:
-                                self.assertEqual(json.load(stream), f.expected_pins)
+                            with open(f.approvals_path, encoding='utf-8') as stream:
+                                self.assertEqual(json.load(stream)["endpoint_approvals"], f.expected_approvals)
 
                     process = _LocalWorkerProcess(session, 'provisional', before_request)
                     f.processes.append(process)
@@ -3773,8 +3766,9 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(elicitation['jsonrpc'], '2.0')
         params = elicitation['params']
         self.assertEqual(params['mode'], 'form')
-        self.assertEqual(params['message'], 'Send this credential to this endpoint?\n'
-                         f'Endpoint: "{f.endpoint}"\nCredential: "env:ACME_API_KEY"')
+        self.assertIn('Credential: "env:ACME_API_KEY"', params['message'])
+        for target in f.expected_approvals['env:ACME_API_KEY']:
+            self.assertIn(target, params['message'])
         self.assertEqual(params['requestedSchema']['type'], 'object')
         self.assertEqual(params['requestedSchema']['required'], ['approve'])
         field = params['requestedSchema']['properties']['approve']
@@ -3787,8 +3781,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(f.session.chat_log_dirty)
         self.assertEqual(f.leases, [])
         self.assertEqual(f.connector.calls, [])
-        with open(f.pins_path, 'rb') as stream:
-            self.assertEqual(stream.read(), f.original_pins)
+        with open(f.approvals_path, 'rb') as stream:
+            self.assertEqual(stream.read(), f.original_approvals_document)
         with open(f.path, 'rb') as stream:
             self.assertEqual(stream.read(), f.original_chat)
         return task, elicitation
@@ -3827,7 +3821,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(asyncio.all_tasks() - f.tasks_before)
         with open(f.path, 'rb') as stream:
             saved = stream.read()
-        with open(f.pins_path, 'rb') as stream:
+        with open(f.approvals_path, 'rb') as stream:
             pins = stream.read()
         for secret in f.secrets:
             self.assertNotIn(secret.encode(), saved + pins + json.dumps(f.messages).encode())
@@ -3841,8 +3835,8 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(descriptor['protocol'], 'openai_chat')
         self.assertIs(descriptor['stream'], False)
 
-    async def test_approval_routes_pins_switches_infers_and_reuses(self):
-        from loki_agent import endpoint_pins, formats
+    async def test_approval_records_switches_infers_and_reuses(self):
+        from loki_agent import formats
 
         async with self._approval_journey() as f:
             task, elicitation = await self._pending_approval(f, 9)
@@ -3856,7 +3850,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, 3)
             reply = await f.wait_message(lambda message: message.get('id') == 9)
             self.assertNotIn('error', reply, reply)
-            self.assertEqual(f.trace, ['describe', 'elicitation', 'pin', 'switch'])
+            self.assertEqual(f.trace, ['describe', 'elicitation', 'approval', 'switch'])
             model_option, = [option for option in reply['result']['configOptions'] if option['id'] == 'model']
             self.assertEqual(model_option['currentValue'], f.value)
             self.assertFalse(f.front._client_requests)
@@ -3866,19 +3860,19 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 switched = json.load(stream)
             self._assert_approved_descriptor(f, switched)
             self.assertEqual(_conversation_pairs(switched), [])
-            self.assertEqual(endpoint_pins.load(), f.expected_pins)
-            self.assertEqual(endpoint_pins.status('acme', f.endpoint, 'env:ACME_API_KEY'),
-                             (endpoint_pins.PINNED, f.expected_pins['acme']))
+            self.assertEqual(f.storage.load_document()['endpoint_approvals'], f.expected_approvals)
+            self.assertEqual(await f.front.credential_broker.unapproved_destinations(
+                authentications.CredentialRef.environment('ACME_API_KEY'), f.expected_approvals['env:ACME_API_KEY']), [])
             expected_pairs = []
             for index, (prompt, answer) in enumerate((('approved prompt', 'approved answer'),
                                                       ('pinned prompt', 'pinned answer'))):
                 if index:
-                    with open(f.pins_path, 'rb') as stream:
+                    with open(f.approvals_path, 'rb') as stream:
                         pinned_bytes = stream.read()
                     await f.request(12, 'session/set_config_option', f.params)
                     self.assertEqual(sum(message.get('method') == 'elicitation/create'
                                          for message in f.messages), 1)
-                    with open(f.pins_path, 'rb') as stream:
+                    with open(f.approvals_path, 'rb') as stream:
                         self.assertEqual(stream.read(), pinned_bytes)
                 start = len(f.messages)
                 result = await f.request(20 + index, 'session/prompt', {
@@ -3913,14 +3907,14 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     (role, [{'type': 'text', 'text': text}])
                     for role, text in expected_pairs])
                 self._assert_approved_descriptor(f, blob)
-                with open(f.pins_path, 'rb') as stream:
+                with open(f.approvals_path, 'rb') as stream:
                     pins = stream.read()
                 for secret in f.secrets:
                     self.assertNotIn(secret.encode(), saved + pins + json.dumps(f.messages).encode())
             self.assertEqual([call['host'] for call in f.connector.calls], ['approved.example'] * 2)
             self.assertEqual(f.leases, ['env:ACME_API_KEY'] * 2)
             self.assertEqual(f.connector.responses, [])
-            self.assertEqual(f.trace, ['describe', 'elicitation', 'pin', 'switch', 'lease', 'http',
+            self.assertEqual(f.trace, ['describe', 'elicitation', 'approval', 'switch', 'lease', 'http',
                                        'describe', 'switch', 'lease', 'http'])
             await self._close_approval_journey(f)
 
@@ -3948,21 +3942,21 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                         self.assertFalse(f.session.chat_log_dirty)
                         with open(f.path, 'rb') as stream:
                             self.assertEqual(stream.read(), f.original_chat)
-                        with open(f.pins_path, 'rb') as stream:
-                            self.assertEqual(stream.read(), f.original_pins)
+                        with open(f.approvals_path, 'rb') as stream:
+                            self.assertEqual(stream.read(), f.original_approvals_document)
                         self.assertEqual(f.leases, [])
                         self.assertEqual(f.connector.calls, [])
                         self.assertFalse(f.front._client_requests)
                         self.assertNotIn('switch', f.trace)
-                        self.assertNotIn('pin', f.trace)
+                        self.assertNotIn('approval', f.trace)
                     await self._close_approval_journey(f)
 
-    def _assert_no_pin_or_inference(self, f):
-        with open(f.pins_path, 'rb') as stream:
-            self.assertEqual(stream.read(), f.original_pins)
+    def _assert_no_approval_or_inference(self, f):
+        with open(f.approvals_path, 'rb') as stream:
+            self.assertEqual(stream.read(), f.original_approvals_document)
         self.assertEqual(f.leases, [])
         self.assertEqual(f.connector.calls, [])
-        self.assertNotIn('pin', f.trace)
+        self.assertNotIn('approval', f.trace)
         self.assertNotIn('switch', f.trace)
 
     async def test_pending_approval_rejects_buffered_work_only_in_its_session(self):
@@ -4004,7 +3998,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             ask = await f.wait_message(lambda m: m.get('method') == 'elicitation/create')
             self.assertEqual(ask['params']['requestId'], 9)
             self.assertEqual(f.processes[0].methods[-1], 'session/describe_config_selection')
-            self._assert_no_pin_or_inference(f)
+            self._assert_no_approval_or_inference(f)
             with open(f.path, 'rb') as stream:
                 self.assertEqual(stream.read(), f.original_chat)
             await f.source.send(acps.response(ask['id'], result={'action': 'decline'}))
@@ -4024,7 +4018,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('error', await asyncio.wait_for(task, 3))
             self.assertEqual(await f.wait_message(lambda m: m.get('id') == 10),
                              acps.response(10, result={}))
-            self._assert_no_pin_or_inference(f)
+            self._assert_no_approval_or_inference(f)
             await f.request(11, 'session/resume', {
                 'sessionId': f.session_id, 'cwd': f.workspace})
             f.channel = f.front.workers[f.session_id]
@@ -4037,7 +4031,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
             await f.source.send(acps.response(ask['id'], result={
                 'action': 'accept', 'content': {'approve': True}}))
             self.assertFalse(f.front._client_requests[new_ask['id']].done())
-            self._assert_no_pin_or_inference(f)
+            self._assert_no_approval_or_inference(f)
             await f.source.send(acps.response(new_ask['id'], result={'action': 'cancel'}))
             self.assertIn('error', await f.wait_message(lambda m: m.get('id') == 12))
             await self._close_approval_journey(f)
@@ -4057,7 +4051,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.gather(task, return_exceptions=True)
                         await f.source.finish()
                         self.assertFalse(any(m.get('id') == 9 for m in f.messages))
-                    self._assert_no_pin_or_inference(f)
+                    self._assert_no_approval_or_inference(f)
                     await self._assert_approval_released(f)
 
     async def test_active_prompt_rejects_model_change_before_asking(self):
@@ -4080,7 +4074,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                 reply = await f.wait_message(lambda m: m.get('id') == 10)
                 self.assertIn('prompt is running', reply['error']['message'])
                 self.assertFalse(any(m.get('method') == 'elicitation/create' for m in f.messages))
-                self._assert_no_pin_or_inference(f)
+                self._assert_no_approval_or_inference(f)
                 await f.source.send(acps.notification('session/cancel', {'sessionId': f.session_id}))
                 reply = await f.wait_message(lambda m: m.get('id') == 9)
                 self.assertEqual(reply['result'], {'stopReason': 'cancelled'})
@@ -4100,38 +4094,29 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                             'action': 'accept', 'content': {'approve': True}}))
                     reply = await asyncio.wait_for(task, 3)
                     self.assertEqual(reply['error'], expected)
-                    self._assert_no_pin_or_inference(f)
+                    self._assert_no_approval_or_inference(f)
                     await self._close_approval_journey(f)
 
-    async def test_changed_pair_shows_the_approved_values(self):
+    async def test_unapproved_exact_urls_are_displayed(self):
         front = self._front()
-        selection = dict(self.PAIR, changed=True,
-                         approvedEndpoint="https://old.invalid/v1",
-                         approvedCredential="env:OLD_KEY")
-        channel = self._channel(front, selection)
+        channel = self._channel(front, dict(self.PAIR))
         front._request_client = mock.AsyncMock(
             return_value={"action": "accept", "content": {"approve": True}})
-
-        with mock.patch.object(acp.endpoint_pins, "record"):
-            await front._approve_config_endpoint(
-                channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
-
+        await front._approve_config_endpoint(
+            channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
         message = front._request_client.await_args.args[1]["message"]
-        self.assertIn("https://old.invalid/v1", message)
-        self.assertIn("env:OLD_KEY", message)
-        self.assertIn("https://acme.invalid/v1", message)
+        for destination in self.PAIR["destinations"]:
+            self.assertIn(destination, message)
+        self.assertEqual(await front.credential_broker.unapproved_destinations(
+            authentications.CredentialRef.environment('ACME_API_KEY'), self.PAIR['destinations']), [])
 
     async def test_nothing_to_approve_asks_nothing(self):
         front = self._front()
         channel = self._channel(front, {})
         front._request_client = mock.AsyncMock()
-
-        with mock.patch.object(acp.endpoint_pins, "record") as record:
-            await front._approve_config_endpoint(
-                channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
-
+        await front._approve_config_endpoint(
+            channel, {"sessionId": "s"}, 9, owner=front._sessions['s'])
         front._request_client.assert_not_awaited()
-        record.assert_not_called()
 
     async def test_client_without_form_elicitation_fails_closed(self):
         front = self._front(supports_elicitation=False)

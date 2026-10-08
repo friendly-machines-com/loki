@@ -29,7 +29,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from . import authentications
-from . import endpoint_pins
 from . import http_client
 from . import openai_models
 from . import protocols
@@ -343,9 +342,9 @@ def normalize_catalog(data):
     models.dev leaves the endpoint out for providers whose native SDK package
     knows it internally; substituting the documented OpenAI platform base
     keeps that provider usable.  Nothing else is decided here: which endpoint
-    receives which credential is confirmed by the user on selection
-    (``endpoint_pins``), for every provider alike, so a changed catalog entry
-    is shown rather than silently trusted or silently refused.
+    receives which credential is confirmed by the user on selection and
+    enforced against exact request URLs by the supervisor at lease time.
+    Repairing a missing endpoint does not create an approval.
 
     This function never mutates the raw downloaded or cached catalog.
     """
@@ -1356,50 +1355,35 @@ def provider_is_synthetic(provider_entry) -> bool:
 
 async def _confirm_catalog_endpoint(
         input_fn, text_writer, credentials, provider_id, provider_entry,
-        model_entry):
-    """Require explicit approval of what a catalog provider would send, and where.
-
-    The endpoint and the credential shown are the ones a request would
-    actually use (``effective_provider``, so a model-level ``api`` override is
-    covered), never the raw provider template.  Returns False when the user
-    declines.
-    """
+        model_entry, credential_authority):
+    """Confirm the effective connection's concrete request destinations."""
     if provider_is_synthetic(provider_entry):
-        # Loki's own endpoint and credential; nothing here is catalog-decided,
-        # so there is nothing to approve.
-        return True
-    effective = effective_provider(provider_entry, model_entry)
-    access = provider_access(effective, credentials)
-    if access is None:
-        # Unusable: no endpoint or no credential present.  Building the
-        # selection rejects it again, so there is nothing to approve here.
-        return True
-    api = access.api_url
-    credential = access.credential_ref.encode()
-    state, approved = endpoint_pins.status(provider_id, api, credential)
-    if state == endpoint_pins.PINNED:
+        return True  # The broker still enforces the canonical subscription URLs.
+    if provider_access(effective_provider(provider_entry, model_entry), credentials) is None:
+        return True  # The pure constructor rejects unusable selections.
+    from . import loki
+    config = loki.config_from_modelsdev_selection(
+        provider_id, provider_entry, model_entry, credentials)
+    reference = config.auth_spec.credential
+    destinations = config.credential_destinations()
+    if credential_authority is None:
+        raise authentications.CredentialUnavailable("no credential authority is installed")
+    missing = await credential_authority.unapproved_destinations(reference, destinations)
+    if not missing:
         return True
     print()
-    print("Do you want to send the credentials to that site?"
-          if state == endpoint_pins.NEW else "Do you want to send your credentials to that CHANGED site?")
-    if state == endpoint_pins.CHANGED:
-        print("  approved endpoint:   ", end="")
-        text_writer(str(approved["api"]))
-        print()
-        print("  approved credential: ", end="")
-        text_writer(str(approved["credential"]))
-        print()
-    print("  endpoint:   ", end="")
-    text_writer(api)
-    print()
+    print("Send this credential to these request destinations?")
     print("  credential: ", end="")
-    text_writer(credential)
+    text_writer(reference.encode())
     print()
-    answer = (await input_fn(
-        "Send this credential to this endpoint? [y/N] ") or "")
+    for destination in destinations:
+        print("  endpoint: ", end="")
+        text_writer(destination)
+        print()
+    answer = (await input_fn("Approve these destinations? [y/N] ") or "")
     if answer.strip().lower() not in ["y", "yes"]:
         return False
-    endpoint_pins.record(provider_id, api, credential)
+    await credential_authority.approve_destinations(reference, destinations)
     return True
 
 
@@ -1463,6 +1447,6 @@ async def run_model_picker_async(
         provider_id, provider_entry, model_entry = picked
         if not await _confirm_catalog_endpoint(
                 input_fn, text_writer, credentials, provider_id,
-                provider_entry, model_entry):
+                provider_entry, model_entry, credential_authority):
             return None
     return picked

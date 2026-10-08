@@ -439,7 +439,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                                tokens.id_token]:
                     self.assertNotIn(secret, repr(terminal.environment))
                     self.assertNotIn(secret, repr(inventory))
-                lease = await broker.lease(credential)
+                lease = await broker.lease(credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)
                 leases.append(lease)
                 self.assertEqual(lease.value, tokens.access_token)
                 self.assertTrue(lease.refreshable)
@@ -451,7 +451,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             for broker, old in zip(
                     (terminal.broker, front.credential_broker), leases):
                 lease = await broker.lease(
-                    credential, rejected_generation=old.generation)
+                    credential, rejected_generation=old.generation, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)
                 self.assertEqual(lease.value, "access-new")
                 self.assertGreater(lease.generation, old.generation)
                 self.assertFalse(hasattr(lease, "refresh_token"))
@@ -471,7 +471,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 CredentialStore({}), reopened)
             for broker in [fresh_terminal.broker,
                            fresh_front.credential_broker]:
-                self.assertEqual((await broker.lease(credential)).value,
+                self.assertEqual((await broker.lease(credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)).value,
                                  "access-new")
             self.assertEqual(calls, ["refresh-secret"])
 
@@ -483,7 +483,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 fedramp=True, expires_at=1, last_refresh=now))
             expired = credential_supervisors.CredentialSupervisor(
                 CredentialStore({}), storage)
-            self.assertEqual((await expired.broker.lease(credential)).value,
+            self.assertEqual((await expired.broker.lease(credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)).value,
                              "access-next")
             self.assertEqual(calls, ["refresh-secret", "refresh-new"])
             self.assertEqual(reopened.load_openai_subscription().tokens,
@@ -503,7 +503,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 credential_storages.JsonCredentialStorage(directory))
             self.assertFalse(logged_out.inventory.has_ref(credential))
             with self.assertRaises(authentications.CredentialUnavailable):
-                await logged_out.broker.lease(credential)
+                await logged_out.broker.lease(credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)
 
     async def test_subscription_redelegates_to_nested_runtime(self):
         credential = (
@@ -547,7 +547,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             inventory = inner_runtime.install(inner_session)
 
             lease = await inner_session.credential_authority.lease(
-                credential)
+                credential, destination=authentications.OPENAI_CHATGPT_RESPONSES_URL)
 
             self.assertTrue(inventory.has_ref(credential))
             self.assertEqual(lease.value, "access-secret")
@@ -594,6 +594,9 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
         value = "supervisor-only-secret"
         supervisor = credential_supervisors.CredentialSupervisor(
             CredentialStore({name: value}))
+        destination = "https://example.test/data"
+        await supervisor.broker.approve_destinations(
+            authentications.CredentialRef.environment(name), [destination])
         delegation = await supervisor.delegate()
         owner_fd = _private_end(delegation.owner_child)
         capability_fd = _private_end(delegation.credential_child)
@@ -613,7 +616,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(inventory.has_ref(credential))
             self.assertEqual(inventory.get(name), "")
-            lease = await session.credential_authority.lease(credential)
+            lease = await session.credential_authority.lease(credential, destination=destination)
             self.assertEqual(lease.value, value)
         finally:
             if runtime is not None:

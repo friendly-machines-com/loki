@@ -53,7 +53,7 @@ def _spec(credential):
     return provider_controls.credential_spec(
         credential,
         scheme="bearer",
-        authorized_origins=frozenset({OPENROUTER_API_ORIGIN}),
+        authorized_urls=frozenset({OPENROUTER_KEY_URL, OPENROUTER_CREDITS_URL}),
     )
 
 
@@ -134,6 +134,7 @@ BALANCE = provider_controls.ControlSpec(
     description="prepaid credit and per-key spend limit",
     applies=_applies,
     read=_read_balance,
+    destinations=lambda context: _spec(_credential(context)).authorized_urls,
 )
 
 CONTROLS = (BALANCE,)

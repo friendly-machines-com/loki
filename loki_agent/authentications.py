@@ -114,14 +114,9 @@ class AuthSpec:
     credential: CredentialRef | None
     scheme: str = "bearer"
     header_name: str | None = None
-    # Static credentials may be used only at origins selected when the
-    # Provider was constructed. This binds authorization policy to provider
-    # configuration without retaining a secret in either object.
-    authorized_origins: frozenset[str] = frozenset()
-    # The subscription scheme authorizes exact request URLs rather than
-    # origins because its private endpoints permit no query or path variation.
-    # An empty set authorizes nothing, so a caller that forgets to supply its
-    # endpoints fails closed.
+    # These are the exact destinations of this connection/operation, not
+    # persisted user approvals. The supervisor independently checks approval
+    # before issuing a value. An empty set permits no authenticated request.
     authorized_urls: frozenset[str] = frozenset()
 
 
@@ -275,11 +270,19 @@ class RefreshIndeterminateError(RefreshPermanentError):
 
 class CredentialAuthority(Protocol):
     async def lease(
-            self, credential: CredentialRef,
+            self, credential: CredentialRef, destination: str,
             rejected_generation: int | None = None) -> CredentialLease:
         ...
 
     def available(self) -> frozenset[CredentialRef]:
+        ...
+
+    async def unapproved_destinations(
+            self, credential: CredentialRef, destinations: list[str]) -> list[str]:
+        ...
+
+    async def approve_destinations(
+            self, credential: CredentialRef, destinations: list[str]) -> None:
         ...
 
 
@@ -444,8 +447,14 @@ class OpenAIChatGPTCredential:
 class CredentialBroker:
     """Root-process credential registry and local authority."""
 
-    def __init__(self):
+    def __init__(self, storage=None):
         self._records: dict[CredentialRef, StaticCredential | OpenAIChatGPTCredential] = {}
+        self._storage = storage
+        # Launch configuration belongs to this supervisor's lifetime. Only
+        # storage-free authorities need in-memory user approvals; production
+        # reads the protected document afresh rather than caching permissions.
+        self._startup_destinations: dict[CredentialRef, frozenset[str]] = {}
+        self._memory_approvals: dict[CredentialRef, set[str]] = {}
 
     def available(self) -> frozenset[CredentialRef]:
         return frozenset(self._records)
@@ -467,14 +476,75 @@ class CredentialBroker:
         self._records[credential] = OpenAIChatGPTCredential(
             tokens, rotate=rotate, clock=clock)
 
-    async def lease(
-            self, credential: CredentialRef,
-            rejected_generation: int | None = None) -> CredentialLease:
-        record = self._records.get(credential)
-        if record is None:
+    def _check_destinations(self, credential, destinations):
+        if credential not in self._records:
             raise CredentialUnavailable(
                 f"credential {credential.encode()!r} is unavailable")
-        return await record.lease(rejected_generation)
+        if not isinstance(destinations, list) or not destinations:
+            raise CredentialUnavailable("request destinations are required")
+        for destination in destinations:
+            validate_destination_url(destination)
+        if credential.kind == "openai-subscription":
+            # Account controls own a separate exact set. It is referenced here,
+            # never widened into a host/origin rule or overridden by disk data.
+            from .openai_controls import OPENAI_CHATGPT_ACCOUNT_URLS
+            canonical = OPENAI_CHATGPT_CODEX_URLS | OPENAI_CHATGPT_ACCOUNT_URLS
+            if any(destination not in canonical for destination in destinations):
+                raise CredentialUnavailable(
+                    "OpenAI subscription destination is not supported")
+
+    def allow_startup_destinations(self, credential, destinations):
+        """Grant only the exact URLs derived from captured launch configuration."""
+        self._check_destinations(credential, destinations)
+        self._startup_destinations[credential] = frozenset(destinations)
+
+    async def unapproved_destinations(self, credential, destinations):
+        self._check_destinations(credential, destinations)
+        if credential.kind == "openai-subscription":
+            return []
+        approved = self._startup_destinations.get(credential, frozenset())
+        if all(destination in approved for destination in destinations):
+            return []
+        if self._storage is not None:
+            approved = approved | self._storage.approved_destinations(credential)
+        else:
+            approved = approved | self._memory_approvals.get(credential, set())
+        return [destination for destination in destinations
+                if destination not in approved]
+
+    async def approve_destinations(
+            self, credential, destinations, *, before_commit=None):
+        self._check_destinations(credential, destinations)
+        # Built-in subscription routes and launch configuration need no
+        # persistent record. A confirmation only adds previously missing URLs.
+        missing = await self.unapproved_destinations(credential, destinations)
+        if not missing:
+            if before_commit is not None:
+                before_commit()
+            return
+        if self._storage is not None:
+            await self._storage.approve_destinations(
+                credential, missing, before_commit=before_commit)
+        else:
+            if before_commit is not None:
+                before_commit()
+            self._memory_approvals.setdefault(credential, set()).update(missing)
+
+    async def _check_approval(self, credential, destination):
+        if await self.unapproved_destinations(credential, [destination]):
+            raise CredentialUnavailable(
+                "approval is required for this credential and destination")
+
+    async def lease(
+            self, credential: CredentialRef, destination: str,
+            rejected_generation: int | None = None) -> CredentialLease:
+        await self._check_approval(credential, destination)
+        lease = await self._records[credential].lease(rejected_generation)
+        # Refresh may have awaited network/storage while an approval changed.
+        # No await follows the final check before returning the value to the
+        # capability writer, which itself checks channel revocation.
+        await self._check_approval(credential, destination)
+        return lease
 
 
 def authorization_headers(
@@ -511,31 +581,28 @@ def validate_authorization_target(
     """Reject use of a credential outside its configured network targets."""
     if spec is None or spec.credential is None:
         return
-    if spec.scheme != "openai-subscription":
-        origin = authorization_origin(request_url)
-        if origin not in spec.authorized_origins:
-            raise CredentialUnavailable(
-                "credential may only be sent to its configured "
-                "provider origin")
-        return
+    validate_destination_url(request_url)
+    if request_url not in spec.authorized_urls:
+        raise CredentialUnavailable(
+            "credential may only be sent to this operation's configured URLs")
+
+
+def validate_destination_url(request_url: str) -> None:
+    """Check URL syntax without changing the approval's exact string identity."""
+    if (not isinstance(request_url, str) or not request_url
+            or any(ord(character) <= 32 or ord(character) == 127
+                   for character in request_url)
+            or "#" in request_url):
+        raise CredentialUnavailable("request destination is not a valid HTTP URL")
     try:
         parsed = urllib.parse.urlsplit(request_url)
-        port = parsed.port
-    except (TypeError, ValueError):
-        parsed = None
-        port = None
-    if (parsed is None
-            or parsed.username is not None
-            or parsed.password is not None
-            or port is not None
-            or parsed.scheme.lower() != "https"
-            or parsed.hostname is None
-            or parsed.hostname.lower() != "chatgpt.com"
-            or parsed.fragment
-            or request_url not in spec.authorized_urls):
+        port = parsed.port  # Validate port syntax, not just hostname syntax.
+    except ValueError as error:
         raise CredentialUnavailable(
-            "OpenAI subscription credentials may only be sent to "
-            "the canonical ChatGPT Codex endpoints")
+            "request destination is not a valid HTTP URL") from error
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or port == 0
+            or parsed.username is not None or parsed.password is not None):
+        raise CredentialUnavailable("request destination is not a valid HTTP URL")
 
 
 def authorization_origin(request_url: str) -> str:
@@ -587,6 +654,7 @@ async def authorized_request_headers(
             "no credential authority is installed")
     lease = await authority.lease(
         spec.credential,
+        destination=request_url,
         rejected_generation=rejected_generation,
     )
     generated = authorization_headers(spec, lease)

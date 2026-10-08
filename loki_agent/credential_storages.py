@@ -97,7 +97,9 @@ def _validate_document(value):
     if not isinstance(value, dict):
         raise CredentialStorageError(
             "credential JSON must contain an object")
-    if value.get("version") != FORMAT_VERSION:
+    if (not isinstance(value.get("version"), int)
+            or isinstance(value.get("version"), bool)
+            or value.get("version") != FORMAT_VERSION):
         raise CredentialStorageError(
             "unsupported credential JSON format version")
     _integer(value.get("revision"), "document revision")
@@ -112,6 +114,20 @@ def _validate_document(value):
         if not isinstance(record, dict):
             raise CredentialStorageError(
                 f"credential record {key!r} must be an object")
+    approvals = value.get("endpoint_approvals", {})
+    if not isinstance(approvals, dict):
+        raise CredentialStorageError("endpoint approvals must be an object")
+    for encoded, destinations in approvals.items():
+        try:
+            authentications.CredentialRef.decode(encoded)
+            if not isinstance(destinations, list):
+                raise ValueError("destinations must be a list")
+            for destination in destinations:
+                authentications.validate_destination_url(destination)
+            if len(set(destinations)) != len(destinations):
+                raise ValueError("duplicate destinations")
+        except (ValueError, authentications.CredentialError) as error:
+            raise CredentialStorageError("endpoint approvals are invalid") from error
     return value
 
 
@@ -251,6 +267,9 @@ class JsonCredentialStorage:
             private_files.close(directory_fd)
             raise CredentialStorageError(
                 f"credential directory is a reparse point: {self.directory}")
+        if not facts.owned_by_current_user or facts.group_or_other_access:
+            private_files.close(directory_fd)
+            raise CredentialStorageError("credential directory is not private")
         return directory_fd
 
     @staticmethod
@@ -302,9 +321,8 @@ class JsonCredentialStorage:
             text = data.decode("utf-8")
             value = json.loads(
                 text, object_pairs_hook=_no_duplicate_object)
-        except (UnicodeDecodeError, ValueError) as error:
-            raise CredentialStorageError(
-                f"credential JSON is invalid: {error}") from error
+        except (UnicodeDecodeError, ValueError, RecursionError) as error:
+            raise CredentialStorageError("credential JSON is invalid") from error
         return _validate_document(value)
 
     def load_document(self):
@@ -415,6 +433,34 @@ class JsonCredentialStorage:
             document["revision"], "document revision") + 1
         document["revision"] = revision
         return revision
+
+    def approved_destinations(self, credential):
+        """Fresh permissions only; the protected document is not cached.
+
+        The existing version-1 credential format permits extra top-level
+        fields. Documents predating this section mean no approvals. Token
+        updates preserve this section, and approval updates preserve tokens.
+        """
+        document = self.load_document()
+        return frozenset(document.get("endpoint_approvals", {}).get(
+            credential.encode(), []))
+
+    async def approve_destinations(
+            self, credential, destinations, *, before_commit=None):
+        for destination in destinations:
+            authentications.validate_destination_url(destination)
+        async with self._locked_document() as [directory_fd, document]:
+            approvals = document.setdefault("endpoint_approvals", {})
+            existing = set(approvals.get(credential.encode(), []))
+            combined = existing | set(destinations)
+            if before_commit is not None:
+                before_commit()
+            # The final lifetime check and bounded file publication do not
+            # yield. Waiting for the shared lock above is async/cancellable.
+            if combined != existing:
+                approvals[credential.encode()] = sorted(combined)
+                self._next_revision(document)
+                self._write_document_at(directory_fd, document)
 
     async def store_openai_login(self, tokens):
         normalized = tokens.normalized()

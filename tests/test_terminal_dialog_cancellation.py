@@ -10,7 +10,7 @@ from unittest import mock
 
 from response_header_fixtures import setUpModule as set_up_response_headers
 from settings_fixtures import setUpModule as set_up_default_settings
-from loki_agent import endpoint_pins, loki, models, protocols, provider_controls
+from loki_agent import authentications, loki, models, protocols, provider_controls
 from loki_agent import terminal_frontend, terminals
 from loki_agent.credentials import CredentialStore
 
@@ -123,6 +123,9 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
         if offline:
             index.side_effect = OSError("offline")
         inputs = KeyboardSession(events, command="/model", interrupt=interrupt)
+        authority = authentications.CredentialBroker()
+        credentials.install_static_credentials(authority)
+        self.agent_session.credential_authority = authority
         with mock.patch.object(loki, "CREDENTIALS", credentials), \
                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.directory.name}), \
                 mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
@@ -133,7 +136,7 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(models, "ensure_index", index), \
                 mock.patch.object(terminal_frontend, "load_models_async",
                                   mock.AsyncMock(return_value=["current-model", "other-model"])), \
-                mock.patch.object(endpoint_pins, "record") as record, \
+                mock.patch.object(authority, "approve_destinations", wraps=authority.approve_destinations) as record, \
                 mock.patch.object(terminal_frontend, "run_terminal_turn_async") as turn:
             if interrupt is asyncio.CancelledError:
                 with self.assertRaises(asyncio.CancelledError):
@@ -146,7 +149,7 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(loki.current_model(), "current-model")
             self.assertEqual(loki.current_config().model, "current-model")
             self.assertEqual(self.agent_session.session_state["connection"]["model"], "current-model")
-            record.assert_not_called()
+            record.assert_not_awaited()
             turn.assert_not_called()
             self.assert_modal_released(inputs)
 

@@ -47,7 +47,9 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
         ref = auth.CredentialRef.environment("EXAMPLE_API_KEY")
         broker.install_static(ref, "secret")
 
-        lease = await broker.lease(ref, rejected_generation=0)
+        url = "https://example.test/v1/responses"
+        await broker.approve_destinations(ref, [url])
+        lease = await broker.lease(ref, destination=url, rejected_generation=0)
 
         self.assertEqual(lease.value, "secret")
         self.assertFalse(lease.refreshable)
@@ -129,14 +131,15 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             clock=lambda: now,
         )
 
-        tasks = [asyncio.create_task(broker.lease(ref)) for _ in range(8)]
+        tasks = [asyncio.create_task(broker.lease(ref, destination=auth.OPENAI_CHATGPT_RESPONSES_URL)) for _ in range(8)]
         await asyncio.sleep(0)
         gate.set()
         leases = await asyncio.gather(*tasks)
 
         self.assertEqual(calls, ["refresh-a"])
         self.assertEqual({lease.generation for lease in leases}, {1})
-        await broker.lease(ref, rejected_generation=1)
+        await broker.lease(ref, destination=auth.OPENAI_CHATGPT_RESPONSES_URL,
+                           rejected_generation=1)
         self.assertEqual(calls, ["refresh-a", "refresh-b"])
 
     async def test_stale_401_does_not_refresh_new_generation(self):
@@ -161,11 +164,13 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             clock=lambda: now,
         )
 
-        first = await broker.lease(ref)
+        first = await broker.lease(ref, destination=auth.OPENAI_CHATGPT_RESPONSES_URL)
         refreshed = await broker.lease(
-            ref, rejected_generation=first.generation)
+            ref, destination=auth.OPENAI_CHATGPT_RESPONSES_URL,
+            rejected_generation=first.generation)
         stale = await broker.lease(
-            ref, rejected_generation=first.generation)
+            ref, destination=auth.OPENAI_CHATGPT_RESPONSES_URL,
+            rejected_generation=first.generation)
 
         self.assertEqual(calls, ["refresh-a"])
         self.assertEqual(refreshed.generation, 1)
@@ -465,6 +470,7 @@ class AuthorizedRequestHeaderTests(unittest.IsolatedAsyncioTestCase):
         broker = auth.CredentialBroker()
         ref = auth.CredentialRef.environment("EXAMPLE_API_KEY")
         broker.install_static(ref, "secret")
+        await broker.approve_destinations(ref, ["https://example.test/v1/responses"])
 
         with self.assertRaisesRegex(
                 auth.CredentialError, "authentication-owned"):
@@ -473,32 +479,29 @@ class AuthorizedRequestHeaderTests(unittest.IsolatedAsyncioTestCase):
                 auth.AuthSpec(
                     ref,
                     "bearer",
-                    authorized_origins=frozenset({
-                        "https://example.test",
+                    authorized_urls=frozenset({
+                        "https://example.test/v1/responses",
                     }),
                 ),
                 "https://example.test/v1/responses",
                 {"authorization": "Bearer stale"},
             )
 
-    async def test_static_credential_is_bound_to_configured_origin(self):
+    async def test_static_credential_is_bound_to_exact_configured_url(self):
         broker = auth.CredentialBroker()
         ref = auth.CredentialRef.environment("EXAMPLE_API_KEY")
         broker.install_static(ref, "secret")
-        spec = auth.AuthSpec(
-            ref,
-            "bearer",
-            authorized_origins=frozenset({
-                auth.authorization_origin(
-                    "https://Example.Test:443/v1/responses"),
-            }),
-        )
+        url = "https://Example.Test:443/v1/responses"
+        await broker.approve_destinations(ref, [url])
+        spec = auth.AuthSpec(ref, "bearer", authorized_urls=frozenset({url}))
 
-        headers, _lease = await auth.authorized_request_headers(
-            broker, spec, "https://example.test/other/path")
+        headers, _lease = await auth.authorized_request_headers(broker, spec, url)
         self.assertEqual(headers["Authorization"], "Bearer secret")
 
         for target in [
+                "https://example.test/v1/responses",
+                "https://Example.Test:443/v1/responses?different=1",
+                "https://Example.Test:443/other/path",
                 "http://example.test/other/path",
                 "https://example.test:444/other/path",
                 "https://other.test/other/path",

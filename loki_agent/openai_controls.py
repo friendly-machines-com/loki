@@ -343,6 +343,7 @@ USAGE = provider_controls.ControlSpec(
     description="current usage windows and banked reset count",
     applies=_applies,
     read=_read_usage,
+    destinations=lambda context: OPENAI_CHATGPT_ACCOUNT_URLS,
 )
 
 RESETS = provider_controls.ControlSpec(
@@ -351,6 +352,7 @@ RESETS = provider_controls.ControlSpec(
     description="banked reset credits, with redemption",
     applies=_applies,
     read=_read_resets,
+    destinations=lambda context: OPENAI_CHATGPT_ACCOUNT_URLS,
 )
 
 CONTROLS = (USAGE, RESETS)

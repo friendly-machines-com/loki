@@ -19,12 +19,12 @@ class _Config:
         self.auth_spec = auth.AuthSpec(
             credential or auth.CredentialRef.environment("EXAMPLE_API_KEY"),
             "bearer",
-            authorized_origins=frozenset({auth.authorization_origin(chat_url)}),
+            authorized_urls=frozenset({chat_url}),
         )
 
 
 class _Authority:
-    async def lease(self, credential, rejected_generation=None):
+    async def lease(self, credential, destination, rejected_generation=None):
         return auth.CredentialLease(credential, "secret-token")
 
     def available(self):
