@@ -3314,6 +3314,58 @@ class WorkerSessionContractTests(unittest.TestCase):
             loki._DEFAULT_SESSION = old_session
             loki.CREDENTIALS = old_credentials
 
+    def test_acp_turn_end_hook_outcomes(self):
+        from loki_agent import loki, protocols
+        from loki_agent.acp_worker import TurnFailure, Worker
+        from loki_agent.sessions import Session
+
+        for outcome in ["completed", "stream_error", "raised", "cancelled"]:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmpdir:
+                session = Session(shell_cwd=tmpdir)
+                worker = Worker(session, lambda message: None, "s")
+
+                async def run_loop(*args, on_event, **kwargs):
+                    if outcome == "stream_error":
+                        on_event({
+                            "type": "stream_error",
+                            "error": protocols.StreamProtocolError("unexpected EOF"),
+                        })
+                        return ""
+                    if outcome == "raised":
+                        raise RuntimeError("turn failed")
+                    if outcome == "cancelled":
+                        worker.cancel_event.set()
+                        raise asyncio.CancelledError()
+                    return "answer"
+
+                pipeline = mock.Mock(turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+                with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                        mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
+                        mock.patch.object(loki, "current_model", return_value="test"), \
+                        mock.patch.object(worker, "_ask_advertised_tools",
+                                          return_value=[[], None]), \
+                        mock.patch.object(loki, "run_tool_loop_async", side_effect=run_loop), \
+                        mock.patch.object(loki, "save_chat_log"):
+                    prompt = worker.prompt({
+                        "sessionId": "s",
+                        "prompt": [{"type": "text", "text": "hello"}],
+                    })
+                    if outcome == "raised":
+                        with self.assertRaisesRegex(RuntimeError, "turn failed"):
+                            asyncio.run(prompt)
+                    elif outcome == "stream_error":
+                        with self.assertRaisesRegex(TurnFailure, "unexpected EOF"):
+                            asyncio.run(prompt)
+                    else:
+                        expected_stop = "cancelled" if outcome == "cancelled" else "end_turn"
+                        self.assertEqual(asyncio.run(prompt)["stopReason"], expected_stop)
+                pipeline.finish_turn.assert_awaited_once()
+                payload = pipeline.finish_turn.await_args.args[0]
+                self.assertEqual(payload["event"], "turn_end")
+                expected = "error" if outcome in ["stream_error", "raised"] else outcome
+                self.assertEqual(payload["reason"], expected)
+                self.assertEqual(payload["text"], "answer" if outcome == "completed" else "")
+
     def test_provider_failure_is_an_acp_request_failure(self):
         from loki_agent import formats, loki, protocols
         from loki_agent.acp_worker import TurnFailure, Worker

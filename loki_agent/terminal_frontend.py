@@ -1855,11 +1855,13 @@ async def async_main(args) -> int:
                 raise
             finally:
                 try:
-                    # Persist the final transcript before notifying external code.
-                    save_chat_log()
-                    if turn_events is not None:
-                        await _core.run_turn_end_hooks_async(
-                            turn_events, turn_text, failed=turn_failed)
+                    try:
+                        # Attempt to persist the transcript before notifying hooks.
+                        save_chat_log()
+                    finally:
+                        if turn_events is not None:
+                            await _core.run_turn_end_hooks_async(
+                                turn_events, turn_text, failed=turn_failed)
                 finally:
                     _terminal_activity.set_turn_running(False)
 

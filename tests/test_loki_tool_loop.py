@@ -149,6 +149,48 @@ class TerminalImageCommandTests(unittest.TestCase):
     def tearDown(self):
         restore_loki_state(self.saved_state)
 
+    def test_terminal_turn_end_hook_outcomes(self):
+        for outcome in ["completed", "stream_error", "raised", "cancelled"]:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmpdir:
+                loki.CREDENTIALS = CredentialStore({
+                    "LOKI_API_BASE": "https://example.test/v1/chat/completions",
+                    "LOKI_MODEL": "test-model",
+                })
+
+                async def run_turn(*args, turn_events, **kwargs):
+                    if outcome == "stream_error":
+                        turn_events.append({"type": "stream_error"})
+                        return ""
+                    if outcome == "raised":
+                        raise RuntimeError("turn failed")
+                    if outcome == "cancelled":
+                        raise KeyboardInterrupt()
+                    return "answer"
+
+                pipeline = mock.Mock(turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+                with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
+                        mock.patch.object(terminal_frontend, "input_session",
+                                          return_value=ScriptedInputSession(["hi", "/quit"])), \
+                        mock.patch.object(terminal_frontend, "new_chat_log_path",
+                                          return_value=os.path.join(tmpdir, "chat.json")), \
+                        mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                        mock.patch.object(terminal_frontend, "run_terminal_turn_async",
+                                          side_effect=run_turn), \
+                        mock.patch.object(terminal_frontend, "save_chat_log"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if outcome == "raised":
+                        with self.assertRaisesRegex(RuntimeError, "turn failed"):
+                            asyncio.run(terminal_frontend.async_main([]))
+                    else:
+                        self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+                pipeline.finish_turn.assert_awaited_once()
+                payload = pipeline.finish_turn.await_args.args[0]
+                self.assertEqual(payload["event"], "turn_end")
+                expected = "error" if outcome in ["stream_error", "raised"] else outcome
+                self.assertEqual(payload["reason"], expected)
+                self.assertEqual(payload["text"], "answer" if outcome == "completed" else "")
+                self.assertFalse(terminal_frontend._terminal_activity.turn_running)
+
     def test_loader_snapshots_relative_png_and_detects_real_type(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data = b"\x89PNG\r\n\x1a\npayload"

@@ -929,8 +929,11 @@ class Worker:
                         "saved": False,
                     })
         finally:
-            await loki.run_turn_end_hooks_async(
-                events, turn_text, failed=turn_failed)
+            try:
+                loki.save_chat_log()
+            finally:
+                await loki.run_turn_end_hooks_async(
+                    events, turn_text, failed=turn_failed)
         failure = self._turn_failure(events)
         if failure:
             raise TurnFailure(failure)
@@ -944,49 +947,46 @@ class Worker:
             self.write(acps.notification("session/update", update))
 
     async def _run_turn(self, on_event, thinking):
-        try:
-            if not loki.current_model():
-                detail = self._configuration_error or (
-                    "No model selected; configure LOKI_* or select a model.")
-                on_event({
-                    "type": "assistant_message",
-                    "content": detail,
-                })
-                return
-            cancel_check = self.cancel_event.is_set
-            advertised, withheld = self._ask_advertised_tools()
+        if not loki.current_model():
+            detail = self._configuration_error or (
+                "No model selected; configure LOKI_* or select a model.")
+            on_event({
+                "type": "assistant_message",
+                "content": detail,
+            })
+            return
+        cancel_check = self.cancel_event.is_set
+        advertised, withheld = self._ask_advertised_tools()
 
-            async def chat_fn(
-                    items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
-                kwargs = {
-                    "on_text_delta": on_text_delta,
-                    "cancel_check": cancel_check,
-                    "codex_turn_state": codex_turn_state,
-                    "thinking": thinking,
-                }
-                if on_reasoning_delta is not None:
-                    kwargs["on_reasoning_delta"] = on_reasoning_delta
-                return await loki.async_chat_completion(
-                    items, advertised, True, False, **kwargs)
+        async def chat_fn(
+                items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
+            kwargs = {
+                "on_text_delta": on_text_delta,
+                "cancel_check": cancel_check,
+                "codex_turn_state": codex_turn_state,
+                "thinking": thinking,
+            }
+            if on_reasoning_delta is not None:
+                kwargs["on_reasoning_delta"] = on_reasoning_delta
+            return await loki.async_chat_completion(
+                items, advertised, True, False, **kwargs)
 
-            def on_response(turn, event):
-                loki.mark_chat_log_dirty()
-                self._publish_context_usage(live=True)
+        def on_response(turn, event):
+            loki.mark_chat_log_dirty()
+            self._publish_context_usage(live=True)
 
-            return await loki.run_tool_loop_async(
-                self.session.transcript_items,
-                chat_fn=chat_fn,
-                on_event=on_event,
-                cancel_check=cancel_check,
-                cancel_event=self.cancel_event,
-                stream_chat=True,
-                on_response=on_response,
-                thinking=thinking,
-                ask_user=(
-                    None if withheld is not None else self._ask_user),
-            )
-        finally:
-            loki.save_chat_log()
+        return await loki.run_tool_loop_async(
+            self.session.transcript_items,
+            chat_fn=chat_fn,
+            on_event=on_event,
+            cancel_check=cancel_check,
+            cancel_event=self.cancel_event,
+            stream_chat=True,
+            on_response=on_response,
+            thinking=thinking,
+            ask_user=(
+                None if withheld is not None else self._ask_user),
+        )
 
     @staticmethod
     def _turn_failure(events: list) -> str | None:
