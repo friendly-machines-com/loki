@@ -310,7 +310,14 @@ Each command receives `{"event":"turn_end","reason":"completed",
 "cwd":"...","text":"..."}` on stdin. `cwd` is the session shell cwd
 at turn end and is also the hook subprocess's working directory. `reason` may
 also be `cancelled`, `error`, or `max_loops`; `text` is the last returned
-assistant text, if any.
+assistant text, if any. For `reason: "error"`, the input also includes
+`error_type` and `error_message`. Event-reported errors use their event type
+(e.g. `stream_error` or `network_error`); unexpected turn exceptions use their
+exception class name (e.g. `RuntimeError`). The message is a string, or `null`
+when the event provides no message. If multiple failures occur, an unexpected
+exception takes precedence; otherwise the first error event supplies the details.
+These fields are absent for non-error outcomes. Transcript-save errors are not
+turn errors.
 Hooks run in order; their JSON stdout is validated but cannot change the
 completed turn. Failures are reported to stderr and do not change the result.
 There is **no default timeout** for turn-end hooks; set a positive `timeout_ms`

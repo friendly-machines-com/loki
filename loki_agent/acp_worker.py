@@ -912,13 +912,13 @@ class Worker:
                 self.write(acps.notification("session/update", update))
 
         turn_text = ""
-        turn_failed = False
+        turn_error = None
         try:
             try:
                 turn_text = await self._run_turn(on_event, thinking) or ""
-            except BaseException:
+            except BaseException as error:
                 if not self.cancel_event.is_set():
-                    turn_failed = True
+                    turn_error = error
                     raise
                 if not any(
                         event.get("type") == "response_cancelled"
@@ -933,7 +933,7 @@ class Worker:
                 loki.save_chat_log()
             finally:
                 await loki.run_turn_end_hooks_async(
-                    events, turn_text, failed=turn_failed)
+                    events, turn_text, error=turn_error)
         failure = self._turn_failure(events)
         if failure:
             raise TurnFailure(failure)

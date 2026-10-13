@@ -830,6 +830,48 @@ class TurnEndHookTests(unittest.TestCase):
                 asyncio.run(loki.run_turn_end_hooks_async([], "hello"))
                 spawn.assert_not_called()
 
+    def test_turn_end_error_details(self):
+        for kind in ["api_error", "network_error", "stream_error",
+                     "transcript_error", "provider_error"]:
+            with self.subTest(kind=kind):
+                pipeline = mock.Mock(turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+                message = "stream interrupted after output began: unexpected EOF in chunked HTTP response"
+                detail = message if kind == "network_error" else RuntimeError(message)
+                with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
+                    asyncio.run(loki.run_turn_end_hooks_async([
+                        {"type": kind, "error": detail},
+                    ]))
+                payload = json.loads(json.dumps(pipeline.finish_turn.await_args.args[0]))
+                self.assertEqual(payload["reason"], "error")
+                self.assertEqual(payload["error_type"], kind)
+                self.assertEqual(payload["error_message"], message)
+
+    def test_turn_end_provider_status_details(self):
+        for kind in ["response_failed", "response_incomplete"]:
+            with self.subTest(kind=kind):
+                pipeline = mock.Mock(turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+                native = ({"error": {"message": "provider failure"}}
+                          if kind == "response_failed"
+                          else {"incomplete_details": {"reason": "max_output_tokens"}})
+                with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
+                    asyncio.run(loki.run_turn_end_hooks_async([{
+                        "type": kind,
+                        "protocol_data": {formats.OPENAI_RESPONSES: native},
+                    }]))
+                payload = pipeline.finish_turn.await_args.args[0]
+                self.assertEqual(payload["error_type"], kind)
+                expected = "provider failure" if kind == "response_failed" else "max_output_tokens"
+                self.assertEqual(payload["error_message"], expected)
+
+    def test_turn_end_unexpected_exception_details(self):
+        pipeline = mock.Mock(turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+        with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
+            asyncio.run(loki.run_turn_end_hooks_async([], error=ValueError("broken turn")))
+        payload = pipeline.finish_turn.await_args.args[0]
+        self.assertEqual(payload["reason"], "error")
+        self.assertEqual(payload["error_type"], "ValueError")
+        self.assertEqual(payload["error_message"], "broken turn")
+
     def test_turn_end_command_has_no_default_timeout(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "hooks.json")

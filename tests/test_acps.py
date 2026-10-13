@@ -3365,6 +3365,14 @@ class WorkerSessionContractTests(unittest.TestCase):
                 expected = "error" if outcome in ["stream_error", "raised"] else outcome
                 self.assertEqual(payload["reason"], expected)
                 self.assertEqual(payload["text"], "answer" if outcome == "completed" else "")
+                if outcome in ["stream_error", "raised"]:
+                    expected_type = "stream_error" if outcome == "stream_error" else "RuntimeError"
+                    expected_message = "unexpected EOF" if outcome == "stream_error" else "turn failed"
+                    self.assertEqual(payload["error_type"], expected_type)
+                    self.assertEqual(payload["error_message"], expected_message)
+                else:
+                    self.assertNotIn("error_type", payload)
+                    self.assertNotIn("error_message", payload)
 
     def test_provider_failure_is_an_acp_request_failure(self):
         from loki_agent import formats, loki, protocols

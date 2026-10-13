@@ -5253,15 +5253,19 @@ PLAN_TOOLS = EXPLORE_TOOLS | {
 TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
 
 
-async def run_turn_end_hooks_async(events, text="", *, failed=False):
+async def run_turn_end_hooks_async(events, text="", *, error=None):
     """Notify user-facing turn hooks after the model/tool loop has stopped."""
     pipeline = TOOL_HOOK_PIPELINE
     if not pipeline.turn_end_hooks:
         return
+    error_kinds = {
+        "api_error", "network_error", "stream_error", "transcript_error",
+        "provider_error", "response_failed", "response_incomplete",
+    }
+    failure = next((event for event in events
+                    if event.get("type") in error_kinds), None)
     kinds = {event.get("type") for event in events}
-    if failed or kinds.intersection({
-            "api_error", "network_error", "stream_error", "transcript_error",
-            "provider_error", "response_failed", "response_incomplete"}):
+    if error is not None or failure is not None:
         reason = "error"
     elif "response_cancelled" in kinds:
         reason = "cancelled"
@@ -5269,12 +5273,28 @@ async def run_turn_end_hooks_async(events, text="", *, failed=False):
         reason = "max_loops"
     else:
         reason = "completed"
-    await pipeline.finish_turn({
+    payload = {
         "event": "turn_end",
         "reason": reason,
         "cwd": current_cwd(),
         "text": text,
-    })
+    }
+    if error is not None:
+        payload["error_type"] = type(error).__name__
+        payload["error_message"] = str(error)
+    elif failure is not None:
+        payload["error_type"] = failure["type"]
+        detail = failure.get("error")
+        if detail is None:
+            protocol_data = failure.get("protocol_data")
+            native = (protocol_data.get(formats.OPENAI_RESPONSES)
+                      if isinstance(protocol_data, dict) else None)
+            if isinstance(native, dict):
+                details = native.get("error") or native.get("incomplete_details")
+                if isinstance(details, dict):
+                    detail = details.get("message") or details.get("reason")
+        payload["error_message"] = str(detail) if detail is not None else None
+    await pipeline.finish_turn(payload)
 
 
 def configure_tool_hook_pipeline(environ=os.environ, stderr_reporter=None):

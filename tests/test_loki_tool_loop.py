@@ -159,7 +159,10 @@ class TerminalImageCommandTests(unittest.TestCase):
 
                 async def run_turn(*args, turn_events, **kwargs):
                     if outcome == "stream_error":
-                        turn_events.append({"type": "stream_error"})
+                        turn_events.append({
+                            "type": "stream_error",
+                            "error": protocols.StreamProtocolError("unexpected EOF"),
+                        })
                         return ""
                     if outcome == "raised":
                         raise RuntimeError("turn failed")
@@ -189,6 +192,14 @@ class TerminalImageCommandTests(unittest.TestCase):
                 expected = "error" if outcome in ["stream_error", "raised"] else outcome
                 self.assertEqual(payload["reason"], expected)
                 self.assertEqual(payload["text"], "answer" if outcome == "completed" else "")
+                if outcome in ["stream_error", "raised"]:
+                    expected_type = "stream_error" if outcome == "stream_error" else "RuntimeError"
+                    expected_message = "unexpected EOF" if outcome == "stream_error" else "turn failed"
+                    self.assertEqual(payload["error_type"], expected_type)
+                    self.assertEqual(payload["error_message"], expected_message)
+                else:
+                    self.assertNotIn("error_type", payload)
+                    self.assertNotIn("error_message", payload)
                 self.assertFalse(terminal_frontend._terminal_activity.turn_running)
 
     def test_loader_snapshots_relative_png_and_detects_real_type(self):

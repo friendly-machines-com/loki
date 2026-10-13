@@ -1820,7 +1820,7 @@ async def async_main(args) -> int:
 
             turn_events = [] if _core.TOOL_HOOK_PIPELINE.turn_end_hooks else None
             turn_text = ""
-            turn_failed = False
+            turn_error = None
             _terminal_activity.set_turn_running(True)
             try:
                 # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
@@ -1850,8 +1850,8 @@ async def async_main(args) -> int:
                     ))
                 mark_chat_log_dirty()
                 continue
-            except BaseException:
-                turn_failed = True
+            except BaseException as error:
+                turn_error = error
                 raise
             finally:
                 try:
@@ -1861,7 +1861,7 @@ async def async_main(args) -> int:
                     finally:
                         if turn_events is not None:
                             await _core.run_turn_end_hooks_async(
-                                turn_events, turn_text, failed=turn_failed)
+                                turn_events, turn_text, error=turn_error)
                 finally:
                     _terminal_activity.set_turn_running(False)
 
