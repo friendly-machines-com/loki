@@ -747,7 +747,10 @@ class AccessMask(enum.IntFlag):
     # denial.
     FILE_WRITE_DATA = 0x00000002
     FILE_APPEND_DATA = 0x00000004
+    FILE_WRITE_EA = 0x00000010
+    FILE_DELETE_CHILD = 0x00000040
     FILE_READ_ATTRIBUTES = 0x00000080
+    FILE_WRITE_ATTRIBUTES = 0x00000100
 
 
 # FILE_SHARE_* (winnt.h): CreateFileW's dwShareMode -- what other opens may do

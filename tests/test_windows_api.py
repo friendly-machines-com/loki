@@ -147,15 +147,14 @@ class StateBaseDirectoryTests(unittest.TestCase):
                 paths.state_base_directory({}),
                 os.path.expanduser("~/.local/state"))
 
-    def test_windows_has_no_config_state_split(self):
-        # Windows has no XDG state directory, so state shares the application
-        # data root with configuration rather than inventing a second tree.
+    def test_windows_state_is_separate_from_readable_configuration(self):
         base = os.path.join(tempfile.gettempdir(), "Local")
         with mock.patch.object(sys, "platform", "win32"), \
-                mock.patch.object(windows_api, "known_folder",
-                                  return_value=base):
-            self.assertEqual(paths.state_base_directory({}), base)
-            self.assertEqual(paths.config_base_directory({}), base)
+                mock.patch.object(windows_api, "known_folder", return_value=base):
+            self.assertEqual(paths.loki_config_dir({}), os.path.join(base, "loki"))
+            self.assertEqual(paths.loki_state_dir({}), os.path.join(base, "loki-state"))
+            self.assertEqual(paths.loki_state_dir({"XDG_STATE_HOME": "/state"}),
+                             os.path.join("/state", "loki"))
 
     def test_loki_state_dir_appends_the_app_directory(self):
         self.assertEqual(

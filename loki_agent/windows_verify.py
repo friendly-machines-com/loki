@@ -19,6 +19,7 @@ import os
 from . import paths
 from . import windows_api
 from .windows_acl import (
+    dacl_parts,
     package_access,
     package_allow,
 )
@@ -27,6 +28,7 @@ from .windows_state import (
     Check,
     Grant,
     access_mask,
+    configuration_path_errors,
     entry_grants,
     grants_access,
     profile_name_for,
@@ -51,6 +53,9 @@ def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
     than asking for access.  The editor's Verify button calls this; the
     runtime's own check is :func:`probe_containment`.
     """
+    errors = configuration_path_errors()
+    if errors:
+        return [Check("configuration layout", "fail", "; ".join(errors))]
     profile = profile_name_for(workspace)
     checks: list[Check] = []
     try:
@@ -69,21 +74,34 @@ def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
             f"grant {grant.path}", "pass" if granted else "fail",
             grant.access.value if granted
             else _grant_failure(sddl, package, grant.access)))
-    for tree, name in ((paths.credential_directory(), "credentials"),
-                       (paths.loki_config_dir(), "config"),
-                       (paths.loki_state_dir(), "state")):
+    try:
+        sddl = windows_api.dacl_sddl(paths.loki_config_dir())
+        read_only = (grants_access(sddl, package, Access.READ)
+                     and not package_allow(sddl, package) & ~access_mask(Access.READ))
+        checks.append(Check(
+            "config", "pass" if read_only else "fail",
+            "configuration is readable without write access" if read_only
+            else "configuration must grant read access only"))
+    except windows_api.WindowsApiError as error:
+        checks.append(Check("config", "fail", str(error)))
+    for tree, name in [[paths.credential_directory(), "credentials"],
+                       [paths.loki_state_dir(), "state"]]:
         try:
             sddl = windows_api.dacl_sddl(tree)
             allowed = package_allow(sddl, package)
+            header, _aces = dacl_parts(sddl)
         except windows_api.WindowsApiError as error:
             checks.append(Check(name, "fail", str(error)))
             continue
         if allowed:
             checks.append(Check(
                 name, "fail", f"package SID is granted {allowed:#x}"))
+        elif "P" not in header:
+            checks.append(Check(
+                name, "fail", "private directory must block inherited grants"))
         else:
             checks.append(Check(
-                name, "pass", "the package SID holds no access"))
+                name, "pass", "the package SID holds no access; inheritance is blocked"))
     return checks
 
 
@@ -117,6 +135,10 @@ def probe_containment(workspace: str, expected_package: str) -> list[Check]:
         windows_api.AccessMask.GENERIC_READ
         | windows_api.AccessMask.GENERIC_WRITE,
         "the workspace opens read-write"))
+    checks.extend(_configuration_checks())
+    checks.append(_denied(
+        "state inaccessible", paths.loki_state_dir(), windows_api.AccessMask.GENERIC_READ,
+        "reading private state is denied"))
     checks.extend(_credential_checks())
     checks.append(_denied(
         "cannot rewrite a DACL", workspace, windows_api.AccessMask.WRITE_DAC,
@@ -146,22 +168,26 @@ _CREDENTIAL_DIRECTORY_PROBES = (
      "the credential directory cannot be opened to change its owner"),
 )
 
-# The directions each credential *file* must refuse, beyond the read that also
-# detects whether it exists.  Opening and closing without using the handle
-# cannot write, truncate, delete or re-own anything: the access check happens
-# at open, so each entry measures permission without performing the act.
-_CREDENTIAL_FILE_PROBES = (
-    ("not writable", windows_api.AccessMask.GENERIC_WRITE,
-     "cannot be opened for write"),
-    ("not appendable", windows_api.AccessMask.FILE_APPEND_DATA,
-     "cannot be opened for append"),
-    ("not deletable", windows_api.AccessMask.DELETE,
-     "cannot be opened to delete it"),
-    ("DACL not rewritable", windows_api.AccessMask.WRITE_DAC,
-     "cannot be opened to rewrite its DACL"),
-    ("owner not rewritable", windows_api.AccessMask.WRITE_OWNER,
-     "cannot be opened to change its owner"),
-)
+# File mutation checks shared by private credentials and readable configuration.
+# Opening and closing without using the handle does not mutate the object.
+_FILE_MUTATION_PROBES = [
+    ["not writable", windows_api.AccessMask.GENERIC_WRITE,
+     "cannot be opened for write"],
+    ["data not writable", windows_api.AccessMask.FILE_WRITE_DATA,
+     "cannot be opened to change its contents"],
+    ["attributes not writable", windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
+     "cannot be opened to change its attributes"],
+    ["extended attributes not writable", windows_api.AccessMask.FILE_WRITE_EA,
+     "cannot be opened to change its extended attributes"],
+    ["not appendable", windows_api.AccessMask.FILE_APPEND_DATA,
+     "cannot be opened for append"],
+    ["not deletable", windows_api.AccessMask.DELETE,
+     "cannot be opened to delete it"],
+    ["DACL not rewritable", windows_api.AccessMask.WRITE_DAC,
+     "cannot be opened to rewrite its DACL"],
+    ["owner not rewritable", windows_api.AccessMask.WRITE_OWNER,
+     "cannot be opened to change its owner"],
+]
 
 # Both files the storage uses, not just the JSON: the lock is a different
 # object with its own DACL, and a container that can write or delete it can
@@ -170,6 +196,38 @@ _CREDENTIAL_FILES = (
     (paths.CREDENTIAL_FILE_NAME, "credential file"),
     (paths.CREDENTIAL_LOCK_FILE_NAME, "credential lock"),
 )
+
+
+def _configuration_checks() -> list[Check]:
+    """Read configuration without gaining persistent mutation rights."""
+    directory = paths.loki_config_dir()
+    checks = [_reachable(
+        "configuration readable", directory, windows_api.AccessMask.GENERIC_READ,
+        "the configuration directory opens for read")]
+    mutations = {
+        "cannot create configuration files": windows_api.AccessMask.FILE_WRITE_DATA,
+        "cannot create configuration directories": windows_api.AccessMask.FILE_APPEND_DATA,
+        "cannot delete configuration children": windows_api.AccessMask.FILE_DELETE_CHILD,
+        "configuration attributes not writable": windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
+        "configuration extended attributes not writable": windows_api.AccessMask.FILE_WRITE_EA,
+        "configuration directory not deletable": windows_api.AccessMask.DELETE,
+        "configuration DACL not rewritable": windows_api.AccessMask.WRITE_DAC,
+        "configuration owner not rewritable": windows_api.AccessMask.WRITE_OWNER,
+    }
+    checks.extend(_denied(name, directory, access, name)
+                  for name, access in mutations.items())
+    # Optional files may be missing or deliberately unreadable. Their consumers
+    # report read errors; here only mutation rights must always be refused.
+    for name in ["SYSTEM.md", "settings.ini", "hooks.json"]:
+        file = os.path.join(directory, name)
+        error = _attempt(file, windows_api.AccessMask.GENERIC_READ)
+        if error is not None and error.status in [
+                windows_api.ERROR_FILE_NOT_FOUND, windows_api.ERROR_PATH_NOT_FOUND]:
+            continue
+        for suffix, access, description in _FILE_MUTATION_PROBES:
+            checks.append(_denied(
+                f"{name} {suffix}", file, access, f"{name} {description}"))
+    return checks
 
 
 def _credential_checks() -> list[Check]:
@@ -204,7 +262,7 @@ def _credential_file_checks(asset: str, label: str) -> list[Check]:
     checks = [_denied_from(
         f"{label} unreadable", error,
         f"the {label} cannot be opened for read")]
-    for suffix, access, description in _CREDENTIAL_FILE_PROBES:
+    for suffix, access, description in _FILE_MUTATION_PROBES:
         checks.append(_denied(
             f"{label} {suffix}", asset, access,
             f"the {label} {description}"))

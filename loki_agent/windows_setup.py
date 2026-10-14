@@ -32,10 +32,10 @@ itself rather than trusting this process' output or its identity.
 
 Two rules this module enforces rather than documents:
 
-* Paths that would invalidate the property are **errors**: anything covering
-  Loki's credential directory, its configuration/state trees, or its own
-  runtime tree.  We are the only ones who can know those, so refusing is our
-  job.
+* Paths that would invalidate the property are **errors**: private credentials
+  and state cannot be granted; configuration and runtime code can be read, not
+  written. Configuration is an automatic grant, with protected credentials
+  beneath it. We are the only ones who can know those, so refusing is our job.
 * Conventional secret locations a grant would cover are **warnings**, and only
   when we can check that they exist.  We are not the user's police, and a
   generic "are you sure?" trains them to click through the ones that matter.
@@ -60,6 +60,7 @@ from .windows_state import (
     Plan,
     add_package_ace,
     build_plan,
+    configuration_path_errors,
     entry_grants,
     handle_path_errors,
     ledger_entry,
@@ -151,8 +152,16 @@ class WindowsBackend:
         checks: list[Check] = []
         try:
             user = windows_api.current_user_sid()
+            # Configuration is user-owned and shared by workspace profiles.
+            # Preserve its DACL so configuring one workspace cannot revoke the
+            # others. New directories start private; only recorded read grants
+            # are added below. Credentials block inheritance before any grant.
+            os.makedirs(paths.loki_config_dir(), mode=0o700, exist_ok=True)
+            os.makedirs(paths.loki_state_dir(), mode=0o700, exist_ok=True)
+            errors = configuration_path_errors()
+            if errors:
+                raise windows_api.WindowsApiError("; ".join(errors))
             self._private_directory(paths.credential_directory(), user)
-            self._private_directory(paths.loki_config_dir(), user)
             self._private_directory(paths.loki_state_dir(), user)
             # Persist recovery coverage BEFORE changing any grant. On a failed
             # or interrupted apply, every old/new path remains recorded, and
@@ -265,10 +274,10 @@ def access_label(access: Access) -> str:
 
 
 def automatic_grants(workspace: str) -> list[Grant]:
-    """Workspace read-write and runtime read access, shown as automatic rows.
+    """Workspace write access, and runtime/config reads, as automatic rows.
 
-    This function does not configure TEMP/TMP. Runtime scratch placement is a
-    separate launcher responsibility; private configuration trees stay denied.
+    TEMP/TMP placement belongs to the launcher. Credentials and state remain
+    private; the credential subtree blocks inherited configuration read grants.
     """
     # The extracted release bundle:
     #
@@ -286,6 +295,7 @@ def automatic_grants(workspace: str) -> list[Grant]:
                 for name in ["loki", "loki-acp"]]
     return [
         Grant(workspace, Access.READ_WRITE, "workspace"),
+        Grant(paths.loki_config_dir(), Access.READ, "config"),
         *(Grant(runtime, Access.READ, "runtime") for runtime in runtimes),
     ]
 
@@ -457,9 +467,9 @@ class Editor:
         self.listing.pack(side="left", fill="both", expand=True)
         tk.Label(self.root, anchor="w", justify="left", fg="#444444", text=(
             "Automatically shared: this workspace (read and write) and the "
-            "Loki runtime bundles (read).\n"
+            "Loki runtime bundles and configuration (read).\n"
             f"Always protected and never grantable: "
-            f"{paths.credential_directory()}")).pack(
+            f"{paths.credential_directory()} and {paths.loki_state_dir()}")).pack(
                 fill="x", padx=8, pady=(4, 8))
         buttons = tk.Frame(self.root)
         buttons.pack(fill="x", padx=8, pady=8)

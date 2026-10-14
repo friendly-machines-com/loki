@@ -109,8 +109,26 @@ def _canonical_or_absolute(path: str) -> str:
         return os.path.normcase(os.path.abspath(path))
 
 
+def configuration_path_errors() -> list[str]:
+    """Readable configuration must not also expose private state or credentials."""
+    config = _canonical_or_absolute(paths.loki_config_dir())
+    state = _canonical_or_absolute(paths.loki_state_dir())
+    credentials = _canonical_or_absolute(paths.credential_directory())
+    errors = []
+    if config == state or _contains(config, state) or _contains(state, config):
+        errors.append("Loki configuration and state directories must not overlap")
+    if config == credentials or _contains(credentials, config):
+        errors.append("Loki configuration must not resolve inside credentials")
+    return errors
+
+
 def _protected_reasons(target: str, path: str, access: Access) -> list[str]:
     """Overlap verdict for an already-canonical ``target`` spelling."""
+    if (access is Access.READ
+            and target == _canonical_or_absolute(paths.loki_config_dir())):
+        # This exact tree is deliberately readable. Its credential child has a
+        # protected DACL; no ancestor or arbitrary private-tree grant is allowed.
+        return configuration_path_errors()
     reasons = []
     for tree in _runtime_trees(include_code=access is Access.READ_WRITE):
         protected = _canonical_or_absolute(tree)
@@ -213,7 +231,7 @@ def profile_name_for(workspace: str) -> str:
 class Grant:
     path: str
     access: Access
-    origin: str  # 'workspace' | 'runtime' | 'temp' | 'user'
+    origin: str  # 'workspace' | 'runtime' | 'config' | 'temp' | 'user'
 
 
 @dataclass
@@ -362,18 +380,26 @@ class Plan:
         return not self.errors
 
 
+def _grant_identity(grant: Grant) -> str:
+    # First setup creates configuration only on Apply. Planning must identify
+    # that absent directory without creating it; the eventual grant is still
+    # checked against the actual handle in WindowsBackend.apply().
+    if grant.path == paths.loki_config_dir() and grant.access is Access.READ:
+        return _canonical_or_absolute(grant.path)
+    return canonical_workspace(grant.path)
+
+
 def build_plan(definition: Definition, previous: dict | None) -> Plan:
     """Diff a definition against the recorded one, with rules applied."""
-    errors: list[str] = []
+    errors = configuration_path_errors()
     warnings: list[str] = []
     for grant in definition.grants:
         errors.extend(protected_path_errors(grant.path, grant.access))
         if grant.origin == "user":
             warnings.extend(covered_secret_warnings(grant.path))
 
-    current = {canonical_workspace(g.path): g for g in definition.grants}
-    recorded = {canonical_workspace(g.path): g
-                for g in entry_grants(previous or {})}
+    current = {_grant_identity(g): g for g in definition.grants}
+    recorded = {_grant_identity(g): g for g in entry_grants(previous or {})}
     changes = []
     for key, grant in sorted(current.items()):
         if key not in recorded:

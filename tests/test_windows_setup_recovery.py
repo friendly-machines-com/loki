@@ -45,6 +45,8 @@ class RecoveryTests(unittest.TestCase):
         self.removed = os.path.join(self.root, 'removed')
         self.new = os.path.join(self.root, 'new')
         self.location = os.path.join(self.root, 'ledger.json')
+        self.config = os.path.join(self.root, 'config')
+        self.state = os.path.join(self.root, 'state')
         self.key = state.workspace_key(self.workspace)
         self.profile = state.profile_name_for(self.workspace)
         self.old = [state.Grant(self.workspace, state.Access.READ_WRITE, 'workspace'),
@@ -56,6 +58,10 @@ class RecoveryTests(unittest.TestCase):
                             for g in self.old}
         self.descriptors[self.new] = 'D:AI(A;OICI;FA;;;SY)'
         patches = [
+            mock.patch.object(setup.paths, 'loki_config_dir', return_value=self.config),
+            mock.patch.object(setup.paths, 'loki_state_dir', return_value=self.state),
+            mock.patch.object(setup.paths, 'credential_directory',
+                              return_value=os.path.join(self.config, 'credentials')),
             mock.patch.object(api, 'current_user_sid', return_value='user'),
             mock.patch.object(self.backend, '_private_directory'),
             mock.patch.object(self.backend, '_ensure_profile', return_value=SID),
@@ -92,6 +98,44 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(all(c.status == 'pass' for c in self.apply()))
         self.assertEqual(before, self.descriptors)
         self.assertFalse(self.ledger['workspaces'][self.key].get('pending'))
+
+    def test_shared_config_reads_survive_another_workspace_reapply_and_removal(self):
+        other_workspace = os.path.join(self.root, 'other-workspace')
+        other_sid = 'S-1-15-2-9-8-7'
+        self.descriptors[self.config] = setup.private_dacl_sddl('user')
+        self.descriptors[other_workspace] = setup.private_dacl_sddl('user')
+        first = state.Definition(self.workspace, [
+            state.Grant(self.workspace, state.Access.READ_WRITE, 'workspace'),
+            state.Grant(self.config, state.Access.READ, 'config')])
+        second = state.Definition(other_workspace, [
+            state.Grant(other_workspace, state.Access.READ_WRITE, 'workspace'),
+            state.Grant(self.config, state.Access.READ, 'config')])
+
+        def apply(definition, sid):
+            previous = self.ledger['workspaces'].get(state.workspace_key(definition.workspace))
+            with mock.patch.object(self.backend, '_ensure_profile', return_value=sid):
+                checks = self.backend.apply(state.build_plan(definition, previous), definition)
+            self.assertTrue(all(check.status == 'pass' for check in checks), checks)
+
+        apply(first, SID)
+        apply(second, other_sid)
+        apply(first, SID)
+        self.assertTrue(state.grants_access(self.descriptors[self.config], SID, state.Access.READ))
+        self.assertTrue(state.grants_access(
+            self.descriptors[self.config], other_sid, state.Access.READ))
+        self.backend._private_directory.assert_any_call(
+            os.path.join(self.config, 'credentials'), 'user')
+        self.assertNotIn(mock.call(self.config, 'user'),
+                         self.backend._private_directory.call_args_list)
+        with mock.patch.object(api, 'derive_app_container_sid', return_value=SID), \
+                mock.patch.object(containers, 'delete_app_container_profile'):
+            checks = self.backend.uninstall({'workspaces': {
+                self.key: self.ledger['workspaces'][self.key]}})
+        self.assertTrue(all(check.status == 'pass' for check in checks), checks)
+        self.assertNotIn(SID, self.descriptors[self.config])
+        self.assertTrue(state.grants_access(
+            self.descriptors[self.config], other_sid, state.Access.READ))
+        self.assertIn(state.workspace_key(other_workspace), self.ledger['workspaces'])
 
     def test_failed_apply_keeps_recovery_paths_and_blocks_startup(self):
         with mock.patch.object(self.backend, '_grant_path', side_effect=api.WindowsApiError('grant failed')):

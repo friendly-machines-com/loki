@@ -264,6 +264,30 @@ class ProtectedPathTests(unittest.TestCase):
         package = os.path.dirname(os.path.abspath(windows_setup.__file__))
         self.assertTrue(windows_state.protected_path_errors(package))
 
+    def test_configuration_is_readable_but_not_writable(self):
+        self.assertEqual(windows_state.protected_path_errors(
+            self.config, windows_state.Access.READ), [])
+        self.assertTrue(windows_state.protected_path_errors(
+            self.config, windows_state.Access.READ_WRITE))
+        for path in [self.root, self.credentials, self.state]:
+            with self.subTest(path=path):
+                self.assertTrue(windows_state.protected_path_errors(
+                    path, windows_state.Access.READ))
+
+    def test_overlapping_config_and_state_are_rejected(self):
+        for state in [self.config, os.path.join(self.config, 'state'), self.root]:
+            with self.subTest(state=state), mock.patch.object(
+                    windows_setup.paths, 'loki_state_dir', return_value=state):
+                self.assertTrue(windows_state.configuration_path_errors())
+                self.assertTrue(windows_state.protected_path_errors(
+                    self.config, windows_state.Access.READ))
+
+    def test_alias_of_state_cannot_be_granted_as_configuration(self):
+        with mock.patch.object(windows_state, '_final_path', side_effect=lambda path:
+                               self.state if path == self.config else path):
+            self.assertTrue(windows_state.protected_path_errors(
+                self.config, windows_state.Access.READ))
+
     def test_allows_an_unrelated_directory(self):
         self.assertEqual(
             windows_state.protected_path_errors(
@@ -297,6 +321,14 @@ class HandlePathTests(unittest.TestCase):
             errors = windows_state.handle_path_errors(
                 object(), self.credentials)
         self.assertTrue(errors)
+
+    def test_config_read_exception_is_bound_to_the_actual_handle(self):
+        with self._named_by_handle(self.config):
+            self.assertEqual(windows_state.handle_path_errors(
+                object(), self.config, windows_state.Access.READ), [])
+        with self._named_by_handle(self.credentials):
+            self.assertTrue(windows_state.handle_path_errors(
+                object(), self.config, windows_state.Access.READ))
 
     def test_allows_an_unrelated_directory_through_the_handle(self):
         elsewhere = os.path.join(self.root, "elsewhere")
@@ -459,6 +491,34 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(
             windows_setup.build_plan(definition, previous).changes, [])
 
+    def test_first_setup_can_plan_missing_config_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = os.path.join(root, "config")
+            state = os.path.join(root, "state")
+            credentials = os.path.join(config, "credentials")
+
+            def existing_object(path):
+                if not os.path.isdir(path):
+                    raise windows_api.WindowsApiError(
+                        "directory is missing", status=windows_api.ERROR_PATH_NOT_FOUND)
+                return os.path.realpath(path)
+
+            definition = windows_state.Definition(root, [
+                windows_state.Grant(root, windows_state.Access.READ_WRITE, "workspace"),
+                windows_state.Grant(config, windows_state.Access.READ, "config")])
+            # Unlike realpath(), the native handle lookup refuses a missing
+            # directory. Model that failure so first setup is actually covered.
+            with mock.patch.object(windows_state, "_final_path", side_effect=existing_object), \
+                    mock.patch.object(windows_state.paths, "loki_config_dir", return_value=config), \
+                    mock.patch.object(windows_state.paths, "loki_state_dir", return_value=state), \
+                    mock.patch.object(windows_state.paths, "credential_directory",
+                                      return_value=credentials):
+                plan = windows_state.build_plan(definition, None)
+            self.assertTrue(plan.applicable, plan.errors)
+            self.assertEqual({change.path for change in plan.changes}, {root, config})
+            self.assertFalse(os.path.exists(config))
+            self.assertFalse(os.path.exists(state))
+
     def test_protected_paths_are_errors_and_block_apply(self):
         with tempfile.TemporaryDirectory() as root:
             credentials = os.path.join(root, "credentials")
@@ -484,20 +544,24 @@ class PlanTests(unittest.TestCase):
 
 
 class AutomaticGrantTests(unittest.TestCase):
-    def test_automatic_grants_are_the_workspace_and_the_runtimes(self):
+    def test_automatic_grants_include_read_only_configuration(self):
         grants = windows_setup.automatic_grants("/work")
 
         by_origin = {}
         for grant in grants:
             by_origin.setdefault(grant.origin, []).append(grant)
-        self.assertEqual(sorted(by_origin), ["runtime", "workspace"])
+        self.assertEqual(sorted(by_origin), ["config", "runtime", "workspace"])
+        self.assertEqual(by_origin["config"], [windows_setup.Grant(
+            windows_setup.paths.loki_config_dir(), windows_setup.Access.READ, "config")])
         self.assertEqual(by_origin["workspace"][0].access,
                          windows_setup.Access.READ_WRITE)
         for grant in by_origin["runtime"]:
             self.assertEqual(grant.access, windows_setup.Access.READ)
-        # No scratch grant: TEMP points inside the workspace, and a directory of
-        # our own under the configuration tree would put a package ACE beside
-        # the credential directory.
+        # No scratch grant: TEMP stays inside the writable workspace, not beside
+        # credentials under configuration. Configuration is shared read-only;
+        # the credential directory's protected DACL must block inheritance from
+        # that readable parent. A writable scratch grant there would introduce
+        # mutation rights into a tree whose integrity the runtime must preserve.
         self.assertEqual(windows_state.protected_path_errors("/work"), [])
 
     def test_definition_is_automatic_plus_recorded_user_grants(self):
@@ -595,7 +659,7 @@ class ConfigureCommandTests(unittest.TestCase):
         _plan, definition = backend.applied[0]
         self.assertEqual(definition.workspace, "/work")
         self.assertEqual([grant.origin for grant in definition.grants],
-                         ["workspace", "runtime", "runtime"])
+                         ["workspace", "config", "runtime", "runtime"])
 
     def test_a_failing_check_is_a_nonzero_exit(self):
         class Failing(FakeBackend):

@@ -1445,6 +1445,10 @@ def runtime_gate(manifest_path):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from loki_agent import windows_verify
     os.environ['XDG_CONFIG_HOME'] = manifest['config_home']
+    os.environ['XDG_STATE_HOME'] = manifest['state_home']
+    instructions = Path(manifest['config_home']) / 'loki' / 'SYSTEM.md'
+    if instructions.read_text(encoding='utf-8') != 'Read-only configuration':
+        raise RuntimeError('contained configuration read returned unexpected text')
     checks = windows_verify.probe_containment(
         manifest['workspace'], manifest['package'])
     for check in checks:
@@ -2755,19 +2759,29 @@ class AppContainerTests(unittest.TestCase):
         native.acl(workspace, private_dacl(owner) +
                    '(A;OICI;0x%X;;;%s)' % (FILE_MODIFY, package))
 
+        state_home = root / 'state'
+        state_directory = state_home / 'loki'
+        state_directory.mkdir(parents=True)
+        native.acl(state_home, private_dacl(owner) +
+                   '(A;;0x%X;;;%s)' % (FILE_TRAVERSE, package))
+        native.acl(state_directory, private_dacl(owner))
+
         def credential_tree(label, tokens=b'FAKE-CREDENTIAL',
                             directory_ace='', file_ace=''):
             home = root / label
             credentials = home / 'loki' / 'credentials'
             credentials.mkdir(parents=True)
-            # Traverse only on the parents, never inherited; the credential
-            # directory and file keep no package ACE. Without traverse a denial
-            # would surface as not-found rather than access-denied.
+            # Only the outer home needs traversal. Configuration grants
+            # inheritable read, but credentials are protected FIRST so that
+            # neither existing nor future credential files inherit that read.
             traverse = private_dacl(owner) + '(A;;0x%X;;;%s)' % (
                 FILE_TRAVERSE, package)
             native.acl(home, traverse)
-            native.acl(home / 'loki', traverse)
             native.acl(credentials, private_dacl(owner) + directory_ace)
+            native.acl(home / 'loki', private_dacl(owner) +
+                       '(A;OICI;FRFX;;;%s)' % package)
+            (home / 'loki' / 'SYSTEM.md').write_text(
+                'Read-only configuration', encoding='utf-8')
             # Record the levels each denial must be read against. The contained
             # process is Low integrity, so a write right on this Medium-integrity
             # directory is refused by mandatory policy whatever the DACL grants
@@ -2802,6 +2816,7 @@ class AppContainerTests(unittest.TestCase):
         def run(config_home):
             manifest.write_text(json.dumps({'workspace': str(workspace),
                                             'config_home': str(config_home),
+                                            'state_home': str(state_home),
                                             'package': package}))
             log = root / (config_home.name + '.log')
             code = native.launch([sys.executable, '-I', '-u', __file__,

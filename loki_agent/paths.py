@@ -98,10 +98,9 @@ def loki_config_dir(environ=None) -> str:
 def state_base_directory(environ=None) -> str:
     """Return the directory that holds Loki's per-user state.
 
-    POSIX separates state from configuration (``XDG_STATE_HOME``, defaulting to
-    ``~/.local/state``), and that override wins when explicitly set.  Windows has
-    no such split -- per-user application data lives under LocalAppData -- so
-    there state resolves to the same base as the configuration directory.
+    ``XDG_STATE_HOME`` wins when explicitly set. POSIX defaults to
+    ``~/.local/state``. Windows uses LocalAppData as the base, but
+    loki_state_dir() chooses a separate directory from configuration.
     """
     values = os.environ if environ is None else environ
     configured = values.get("XDG_STATE_HOME")
@@ -113,8 +112,10 @@ def state_base_directory(environ=None) -> str:
 
 
 def loki_state_dir(environ=None) -> str:
-    return os.path.join(
-        state_base_directory(environ), LOKI_CONFIG_DIR_NAME)
+    values = os.environ if environ is None else environ
+    name = ("loki-state" if sys.platform == "win32" and not values.get("XDG_STATE_HOME")
+            else LOKI_CONFIG_DIR_NAME)
+    return os.path.join(state_base_directory(values), name)
 
 
 def credential_directory(environ=None) -> str:
