@@ -5338,6 +5338,7 @@ class SubagentLaunchTests(unittest.TestCase):
 
         self.assertEqual(result, "done")
         self.assertNotIn("Agent", captured["allowed"])
+        self.assertNotIn("Ask", captured["allowed"])
         self.assertIn(
             "maximum delegation depth",
             formats.item_text(captured["messages"][0]),
@@ -5367,6 +5368,10 @@ class SubagentLaunchTests(unittest.TestCase):
             restore_loki_state(saved)
 
         self.assertIn("Agent", captured["allowed"])
+        self.assertNotIn("Ask", captured["allowed"])
+        self.assertIn("not available in this subagent", loki._tool_access_error(
+            "Ask", allowed=captured["allowed"],
+            extra_context={"inhibit_edits": "answering the user's question"}))
         self.assertIn(
             "delegate another read-only Explore search",
             formats.item_text(captured["messages"][0]),
@@ -7459,17 +7464,15 @@ class QuestionGuardTests(unittest.TestCase):
         # deliberately, as a diff to this expected set.
         self.assertEqual(
             loki.EXPLORE_TOOLS,
-            {"Agent", "Read", "Glob", "Grep", "Jobs", "JobStatus", "TodoRead",
+            {"Agent", "Ask", "Read", "Glob", "Grep", "Jobs", "JobStatus", "TodoRead",
              "WebFetch", "WebSearch"})
 
     def test_plan_tools_registry_shape_is_pinned(self):
         # Plan mode additionally allows TodoWrite (session-scoped plan
-        # state) and Ask (clarifying questions asked of the user before
-        # the plan is final); anything else landing here must be a
-        # deliberate diff.
+        # state); anything else landing here must be a deliberate diff.
         self.assertEqual(
             loki.PLAN_TOOLS,
-            loki.EXPLORE_TOOLS | {"TodoWrite", "Ask"})
+            loki.EXPLORE_TOOLS | {"TodoWrite"})
 
     def test_plan_mode_allows_todowrite_but_blocks_workspace_and_system(self):
         loki.current_session().agent_mode = "plan"
@@ -7504,7 +7507,7 @@ class QuestionGuardTests(unittest.TestCase):
             loki._tool_access_error(
                 "TodoWrite", extra_context=question_context))
 
-    def test_agent_description_matches_explore_tools(self):
+    def test_agent_description_matches_subagent_tools(self):
         description = next(
             spec["function"]["description"] for spec in loki.TOOLS
             if spec["function"]["name"] == "Agent")
@@ -7515,7 +7518,7 @@ class QuestionGuardTests(unittest.TestCase):
         advertised = {
             part.strip()
             for part in description[start + len(marker):end].split(",")}
-        self.assertEqual(advertised, loki.EXPLORE_TOOLS)
+        self.assertEqual(advertised, loki.EXPLORE_TOOLS - {loki.ASK_TOOL_NAME})
 
 
 class ThinkingControlsTests(unittest.TestCase):

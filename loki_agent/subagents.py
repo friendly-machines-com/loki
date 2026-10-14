@@ -166,7 +166,8 @@ async def run_prompt_async(subagent_type: str, prompt: str,
         formats.message_item("user", prompt),
     ]
     _core.current_session().agent_mode = "explore"
-    allowed = _core.EXPLORE_TOOLS
+    # Unlike top-level Explore mode, subagents have no interactive input seam.
+    allowed = _core.EXPLORE_TOOLS - {_core.ASK_TOOL_NAME}
     if not may_delegate:
         allowed = allowed - {"Agent"}
     if thinking is None:

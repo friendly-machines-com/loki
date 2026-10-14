@@ -207,9 +207,9 @@ class TerminalAskUserTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlanModeAdvertisementTests(unittest.TestCase):
-    def test_ask_is_a_plan_tool_and_never_an_explore_tool(self):
+    def test_ask_is_safe_in_plan_and_explore_modes(self):
         self.assertIn("Ask", loki.PLAN_TOOLS)
-        self.assertNotIn("Ask", loki.EXPLORE_TOOLS)
+        self.assertIn("Ask", loki.EXPLORE_TOOLS)
 
 
 class TurnAdvertisementTests(unittest.IsolatedAsyncioTestCase):
@@ -250,6 +250,16 @@ class TurnAdvertisementTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Ask", await self._turn(ask_user=ask_user))
 
+    async def test_read_only_modes_advertise_ask_only_with_a_seam(self):
+        async def ask_user(question, options, *, multi_select=False):
+            return {"action": "cancelled"}
+
+        for mode in ["explore", "plan"]:
+            with self.subTest(mode=mode):
+                self.session.agent_mode = mode
+                self.assertNotIn("Ask", await self._turn())
+                self.assertIn("Ask", await self._turn(ask_user=ask_user))
+
 
 class LoopAdvertisementTests(unittest.IsolatedAsyncioTestCase):
     """run_tool_loop_async strips Ask for seam-less callers (subagents)."""
@@ -285,6 +295,46 @@ class LoopAdvertisementTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Ask", await self._loop(ask_user=ask_user))
 
+    async def test_clarification_preserves_question_guard_in_every_mode(self):
+        args = {
+            "question": "Which storage?",
+            "options": [{"label": "Local"}, {"label": "Remote"}],
+        }
+        for mode in ["normal", "explore", "plan"]:
+            for question in [False, True]:
+                with self.subTest(mode=mode, question=question):
+                    self.session.agent_mode = mode
+                    transcript = [formats.message_item(
+                        "user", "Which storage is best?" if question else "Investigate storage")]
+                    asker = mock.AsyncMock(return_value={
+                        "action": "answered", "answer": "Local; go ahead"})
+                    replies = [
+                        [formats.tool_call_item("ask1", "Ask", args)],
+                        [formats.message_item("assistant", "done")],
+                    ]
+
+                    async def chat(items, *, codex_turn_state):
+                        return replies.pop(0)
+
+                    if question:
+                        replies.insert(1, [
+                            formats.tool_call_item("blocked-bash", "Bash", {"command": "exit 99"}),
+                            formats.tool_call_item("blocked-edit", "Edit", {
+                                "file_path": "unused", "old_string": "x", "new_string": "y"}),
+                            formats.tool_call_item("blocked-write", "Write", {
+                                "file_path": "unused", "content": "x"}),
+                            formats.tool_call_item("blocked-todo", "TodoWrite", {"todos": []}),
+                        ])
+
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        await loki.run_tool_loop_async(
+                            transcript, chat_fn=chat, ask_user=asker)
+                    asker.assert_awaited_once()
+                    self.assertIn("Local; go ahead", str(transcript))
+                    if question:
+                        self.assertGreaterEqual(
+                            str(transcript).count("answering the user's question"), 4)
+
 
 class AskHeaderTests(unittest.TestCase):
     """The tool's public contract is stated once and shared by every owner."""
@@ -299,7 +349,7 @@ class AskHeaderTests(unittest.TestCase):
         self.assertIsInstance(loki.ASK_TOOL_NAME, str)
         self.assertIn(loki.ASK_TOOL_NAME, loki.TOOL_REGISTRY)
         self.assertIn(loki.ASK_TOOL_NAME, loki.PLAN_TOOLS)
-        self.assertNotIn(loki.ASK_TOOL_NAME, loki.EXPLORE_TOOLS)
+        self.assertIn(loki.ASK_TOOL_NAME, loki.EXPLORE_TOOLS)
 
     def test_schema_bounds_come_from_the_shared_constants(self):
         parameters = self._ask_definition()["function"]["parameters"]

@@ -5240,9 +5240,9 @@ TOOL_HANDLERS = {
     "Skill": {"handler": _handle_skill},
     "WebFetch": {"async_handler": _handle_webfetch_async, "explore": True},
     "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
-    # A question has no side effects, and plan mode is exactly where "which
-    # approach?" decisions arise, so Ask joins PLAN_TOOLS (never EXPLORE).
-    ASK_TOOL_NAME: {"async_handler": _handle_ask_async, "plan": True},
+    # Clarification does not modify workspace state, so it is safe in Explore
+    # mode and question-guarded turns. Interactive callers still need a callback.
+    ASK_TOOL_NAME: {"async_handler": _handle_ask_async, "explore": True},
 }
 TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]
