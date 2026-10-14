@@ -658,7 +658,7 @@ class ImmediateQueueTests(unittest.TestCase):
 
         self.run_queue_scenario(script)
         rendered = self.output.getvalue()
-        self.assertIn("No queued texts.", rendered)
+        self.assertIn("No queued texts anymore.", rendered)
         self.assertIn(
             "usage: /queue [texts | images] "
             "[delete ID | move ID before OTHER_ID | move ID end | edit ID TEXT]", rendered)

@@ -253,7 +253,7 @@ def _queue_usage():
 def _print_queued_texts():
     entries = _queued_inputs.pending_entries()
     if not entries:
-        print("No queued texts.")
+        print("No queued texts anymore.")
         return
     print("Queued texts (send order):")
     # Queued text is untrusted; write_text never emits its ANSI.
