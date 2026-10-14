@@ -2788,8 +2788,6 @@ async def run_glob_async(
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
     root = _resolve_path(path) if path else current_cwd()
-    if not os.path.isdir(root):
-        return f"Error: {root} is not a directory"
     args = [rg, '--files', '--color=never']
     if hidden:
         args.append('--hidden')
@@ -2874,8 +2872,6 @@ async def run_grep_async(pattern: str, path: str | None = None, glob: str | None
     if not rg:
         return "Error: ripgrep binary not found. Install rg."
     root = _resolve_path(path) if path else current_cwd()
-    if not os.path.exists(root):
-        return f"Error: {root} does not exist"
 
     head_limit, err = _parse_nonnegative_int(kwargs.get('head_limit'), 'head_limit', GREP_DEFAULT_HEAD_LIMIT)
     if err:

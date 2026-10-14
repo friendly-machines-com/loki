@@ -145,6 +145,25 @@ class GlobTests(unittest.TestCase):
                         if os.name == 'posix':
                             self.assertTrue(job.process._transport.is_closing())
 
+    def test_missing_search_targets_are_checked_by_the_external_program(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = str(Path(directory) / 'missing')
+            manager = loki.JobManager(str(Path(directory) / 'jobs'))
+            session = Session(shell_cwd=directory, job_manager=manager)
+            for name, handler in {'Glob': loki._handle_glob_async,
+                                  'Grep': loki._handle_grep_async}.items():
+                with self.subTest(tool=name):
+                    execute = mock.AsyncMock(return_value=[
+                        mock.Mock(exit_code=2), 'completed', '', 'target unavailable'])
+                    with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                            mock.patch.object(loki.executables, 'RIPGREP', 'test-search-program'), \
+                            mock.patch.object(manager, 'run_exec', execute):
+                        result = asyncio.run(handler({'pattern': 'needle', 'path': target}))
+                    execute.assert_awaited_once()
+                    self.assertEqual(execute.await_args.args[0][-1], target)
+                    self.assertEqual(result,
+                                     'Error: ripgrep failed with exit code 2\ntarget unavailable')
+
     def test_cancel_reaches_a_running_search_and_reaps_its_child(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = loki.JobManager(str(Path(directory) / 'jobs'))
