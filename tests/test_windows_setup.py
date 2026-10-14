@@ -493,6 +493,9 @@ class PlanTests(unittest.TestCase):
 
     def test_first_setup_can_plan_missing_config_without_creating_it(self):
         with tempfile.TemporaryDirectory() as root:
+            # A workspace grant must not cover the protected config/state trees.
+            workspace = os.path.join(root, "workspace")
+            os.mkdir(workspace)
             config = os.path.join(root, "config")
             state = os.path.join(root, "state")
             credentials = os.path.join(config, "credentials")
@@ -503,8 +506,8 @@ class PlanTests(unittest.TestCase):
                         "directory is missing", status=windows_api.ERROR_PATH_NOT_FOUND)
                 return os.path.realpath(path)
 
-            definition = windows_state.Definition(root, [
-                windows_state.Grant(root, windows_state.Access.READ_WRITE, "workspace"),
+            definition = windows_state.Definition(workspace, [
+                windows_state.Grant(workspace, windows_state.Access.READ_WRITE, "workspace"),
                 windows_state.Grant(config, windows_state.Access.READ, "config")])
             # Unlike realpath(), the native handle lookup refuses a missing
             # directory. Model that failure so first setup is actually covered.
@@ -515,7 +518,7 @@ class PlanTests(unittest.TestCase):
                                       return_value=credentials):
                 plan = windows_state.build_plan(definition, None)
             self.assertTrue(plan.applicable, plan.errors)
-            self.assertEqual({change.path for change in plan.changes}, {root, config})
+            self.assertEqual({change.path for change in plan.changes}, {workspace, config})
             self.assertFalse(os.path.exists(config))
             self.assertFalse(os.path.exists(state))
 
