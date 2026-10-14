@@ -9,6 +9,7 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from config_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import acp_events, formats, loki, process_outputs, protocols, savefiles
 from loki_agent import settings, terminal_frontend, tool_runtime

@@ -87,6 +87,14 @@ def main() -> int:
         from .subagents import main as subagent_main
         return subagent_main(sys.argv[2:])
 
+    if sys.argv[1:2] == ["--print-default-system-prompt"]:
+        if len(sys.argv) != 2:
+            print("--print-default-system-prompt must be used alone", file=sys.stderr)
+            return 2
+        from .prompts import DEFAULT_SYSTEM_PROMPT
+        sys.stdout.write(DEFAULT_SYSTEM_PROMPT)
+        return 0
+
     # Public entrypoints alone capture startup credentials. The child runtime
     # is execed with this store's sanitized environment and therefore cannot
     # construct a parallel root authority from environment values.

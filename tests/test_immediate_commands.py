@@ -15,12 +15,18 @@ import types
 import unittest
 from unittest import mock
 
-from settings_fixtures import setUpModule  # noqa: F401 - unittest hook
+from settings_fixtures import setUpModule as set_up_default_settings
+from config_fixtures import setUpModule as set_up_config
 
 from loki_agent import formats, loki, terminal_frontend, terminals
 from loki_agent.provider_controls import ControlAction, ControlResult
 from loki_agent.response_headers import Store
 from loki_agent.sessions import Session
+
+
+def setUpModule():
+    set_up_config()
+    set_up_default_settings()
 
 
 class _FakeReader:

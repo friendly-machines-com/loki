@@ -40,6 +40,7 @@ from . import http_client
 from . import models as modelsdev
 from . import openai_models
 from . import paths
+from . import prompts
 from . import protocols
 from . import process_outputs
 from . import authentications
@@ -6208,15 +6209,13 @@ def cycle_agent_mode() -> str:
 
 
 def initial_transcript_items():
-    return [formats.instruction_item(
-        "You are a helpful system agent running in a terminal. You have these tools: "
-        "Read, Write, Edit, Bash, Jobs, JobStatus, JobStop, Glob, Grep, TodoRead, TodoWrite, Agent, Skill, WebFetch, WebSearch. "
+    instructions = prompts.load_system_prompt()
+    items = [formats.instruction_item(instructions)] if instructions else []
+    items.append(formats.instruction_item(
         f"Current date: {time.strftime('%Y-%m-%d')}. "
         f"Current Loki cwd: {current_cwd()}. Relative tool paths and Bash commands run from this directory. "
-        "Prefer Glob/Grep/Read over Bash equivalents (find/grep/cat). "
-        "Always Read a file before editing or overwriting it. "
-        "Use TodoWrite to plan multi-step work. Keep responses concise."
-    )]
+    ))
+    return items
 
 
 def _remember_session_toolset(tools):

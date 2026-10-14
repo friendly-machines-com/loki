@@ -8,6 +8,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from config_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import loki, savefiles, sessions, terminal_frontend
 

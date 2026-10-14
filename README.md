@@ -162,6 +162,35 @@ exact count of the next prompt. `*` marks an older or incomplete measurement;
 context capacity, set `LOKI_CONTEXT_WINDOW` to a positive token count. This
 changes the display only, not the model's limits.
 
+## System prompt
+
+Create `~/.config/loki/SYSTEM.md` (or `$XDG_CONFIG_HOME/loki/SYSTEM.md`) to
+replace the main conversation's base instructions. The file is optional:
+when absent, Loki uses its built-in instructions. Loading never creates or
+rewrites configuration, so read-only configuration directories work too.
+
+To export the current built-in instructions, run:
+
+```
+./loki.py --print-default-system-prompt
+```
+
+Save that output to a file if you want a starting point for customization.
+The export needs no provider, credentials, or runtime setup. User instructions
+are not automatically updated when Loki is upgraded.
+
+The file is literal UTF-8 text, not a template. An empty file omits the base
+instructions. Loki adds the current date and working directory separately;
+tool definitions and mode restrictions remain independent of this file.
+Changes apply to new conversations, not current or resumed conversations:
+the instructions used are retained in the saved transcript. Delete the file
+to get the current built-in default on the next new conversation.
+
+If an existing file cannot be read or decoded, Loki reports the problem and
+uses the built-in instructions for that conversation, leaving the file alone.
+Explore subagents, headless Explore runs, and WebFetch's analysis helper keep
+their own specialized instructions; they do not load this file.
+
 ## User settings
 
 Terminal preferences are read from the optional `~/.config/loki/settings.ini`

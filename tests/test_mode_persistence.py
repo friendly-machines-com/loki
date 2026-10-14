@@ -5,6 +5,7 @@ import pathlib
 import tempfile
 import unittest
 from unittest import mock
+from config_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import formats, loki
 from loki_agent.sessions import Session

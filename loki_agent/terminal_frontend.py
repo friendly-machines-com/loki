@@ -1335,6 +1335,8 @@ Options:
                           (an explicit value outranks a resumed one)
       --dangerously-skip-permissions
                           skip permission prompts
+      --print-default-system-prompt
+                          print built-in instructions and exit (use alone)
   -h, --help              show this help and exit
 
 Without options, loki starts the interactive TUI.

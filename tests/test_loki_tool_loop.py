@@ -17,6 +17,7 @@ from unittest import mock
 from loki_entrypoints import child_environment, configure_container, entrypoint
 from response_header_fixtures import setUpModule as set_up_response_headers
 from settings_fixtures import setUpModule as set_up_default_settings
+from config_fixtures import setUpModule as set_up_config
 
 
 from loki_agent import formats
@@ -41,6 +42,7 @@ _MISSING = object()
 
 
 def setUpModule():
+    set_up_config()
     set_up_response_headers()
     set_up_default_settings()
 

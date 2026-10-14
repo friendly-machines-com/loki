@@ -10,12 +10,14 @@ from unittest import mock
 
 from response_header_fixtures import setUpModule as set_up_response_headers
 from settings_fixtures import setUpModule as set_up_default_settings
+from config_fixtures import setUpModule as set_up_config
 from loki_agent import authentications, loki, models, protocols, provider_controls
 from loki_agent import terminal_frontend, terminals
 from loki_agent.credentials import CredentialStore
 
 
 def setUpModule():
+    set_up_config()
     set_up_response_headers()
     set_up_default_settings()
 

@@ -15,7 +15,8 @@ import unittest
 from contextlib import ExitStack, asynccontextmanager
 from unittest import mock
 from loki_entrypoints import configure_container, loki_acp_command
-from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
+from response_header_fixtures import setUpModule as set_up_response_headers
+from config_fixtures import setUpModule as set_up_config
 
 from loki_agent import (
     __version__,
@@ -28,6 +29,11 @@ from loki_agent import (
 from loki_agent.credentials import CredentialStore, is_credential_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def setUpModule():
+    set_up_config()
+    set_up_response_headers()
 
 
 def _configured_workspace(tmpdir):

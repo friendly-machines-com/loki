@@ -5,7 +5,8 @@ import tempfile
 import types
 import unittest
 from unittest import mock
-from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
+from response_header_fixtures import setUpModule as set_up_response_headers
+from config_fixtures import setUpModule as set_up_config
 from test_http_client import FakeConnector, PatchedOpenConnection
 
 from loki_agent import formats
@@ -13,6 +14,11 @@ from loki_agent import loki
 from loki_agent import protocols
 from loki_agent.credentials import CredentialStore
 from loki_agent.sessions import Session
+
+
+def setUpModule():
+    set_up_config()
+    set_up_response_headers()
 
 
 class OpenCodeSessionHeaderTests(unittest.TestCase):
