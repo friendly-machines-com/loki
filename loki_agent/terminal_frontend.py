@@ -92,6 +92,7 @@ from .connections import (
     connection_descriptor_from_config,
     explicit_api_base_configured,
     explicit_connection_option,
+    make_runtime_config,
 )
 from .terminals import (
     input_session, restore_output_area_after_input, terminal, terminal_output_mode)
@@ -1463,7 +1464,9 @@ async def async_main(args) -> int:
             else:
                 descriptor = connection_from_session_state(saved_state)
                 if descriptor is None:
-                    config = None
+                    config = make_runtime_config(
+                        "http://dummy.invalid/v1", protocols.DUMMY,
+                        model="dummy")
                 else:
                     try:
                         refreshed_descriptor = (

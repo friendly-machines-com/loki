@@ -1314,6 +1314,35 @@ class ModelLoadingTests(unittest.TestCase):
             protocol=protocols.OPENAI_CHAT,
         ))
 
+    def test_unconfigured_interactive_startup_selects_dummy_model(self):
+        loki.CREDENTIALS = CredentialStore({})
+        loki.runtime_config = None
+        session = ScriptedInputSession([None])
+        stderr = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            loader = mock.AsyncMock()
+            with mock.patch(
+                    "loki_agent.terminal_frontend.input_session",
+                    return_value=session), mock.patch(
+                        "loki_agent.terminal_frontend.new_chat_log_path",
+                        return_value=path), mock.patch(
+                            "loki_agent.terminal_frontend.restore_output_area_after_input"
+                        ), mock.patch(
+                            "loki_agent.terminal_frontend.load_models_async",
+                            new=loader), contextlib.redirect_stderr(stderr):
+                status = asyncio.run(terminal_frontend.async_main([]))
+
+        loader.assert_not_awaited()
+        self.assertEqual(status, 0)
+        self.assertEqual(loki.current_model(), "dummy")
+        self.assertEqual(
+            loki.current_config().chat_provider.kind, protocols.DUMMY)
+        self.assertIsNone(loki.current_config().auth_spec)
+        self.assertNotIn("No model selected", stderr.getvalue())
+        self.assertNotIn("No provider configured", stderr.getvalue())
+
     def test_interactive_startup_does_not_fetch_provider_models(self):
         loki.CREDENTIALS = CredentialStore({
             "LOKI_API_BASE":
