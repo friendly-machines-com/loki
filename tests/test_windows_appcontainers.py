@@ -950,7 +950,9 @@ def state_writer_child(manifest_path):
         probe.compare_launches(current, source, role_sid, manifest_path,
                                'appcontainer', diagnostic_streams)
         for role in ['control', 'filtered']:
-            token = source if role == 'control' else probe.filtered(source, role_sid)
+            # Filter the caller's own primary token for CreateProcessAsUser's
+            # assignment-privilege exemption.
+            token = source if role == 'control' else probe.filtered(current, role_sid)
             try:
                 stdout = cleanup.enter_context(open(Path(manifest['state']) / (role + '.stdout'), 'wb', buffering=0))
                 stderr = cleanup.enter_context(open(Path(manifest['state']) / (role + '.stderr'), 'wb', buffering=0))
@@ -3369,6 +3371,77 @@ class StateTokenProbeTests(unittest.TestCase):
                     self.assertTrue(row['created'])
                 probe.api.close.assert_called_once_with(21)
                 self.assertEqual(probe.launch.call_count, 2)
+
+    def test_writer_restricts_own_primary_and_cleans_up_after_launch_failure(self):
+        for fail_filtered in [False, True]:
+            with self.subTest(fail_filtered=fail_filtered), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workspace, state = root / 'workspace', root / 'state'
+                workspace.mkdir()
+                state.mkdir()
+                (workspace / 'stdin').write_bytes(b'')
+                manifest = workspace / 'manifest.json'
+                manifest.write_text(json.dumps({
+                    'workspace': str(workspace), 'state': str(state),
+                    'role_sid': 'S-1-5-21-1-2-3-4'}))
+                native, probe = mock.Mock(), mock.Mock()
+                native.current_process.return_value = 99
+                native.open.return_value = 19
+                probe.api.token.return_value = 17
+                probe.api.clone.return_value = 18
+                probe.api.snapshot.return_value = {'user': 'owner', 'app': 1,
+                                                   'package': 'package', 'restricting_sids': []}
+
+                def parse_sid(value, result):
+                    C.cast(result, C.POINTER(HANDLE)).contents.value = 25
+                    return True
+
+                def read_memory(process, address, buffer, size, result):
+                    C.memmove(buffer, address, size)
+                    C.cast(result, C.POINTER(C.c_size_t)).contents.value = size
+                    return True
+
+                def restrict(source, role_sid):
+                    self.assertEqual(source, 17)
+                    self.assertNotIn(mock.call(17), probe.api.close.call_args_list)
+                    return 21
+
+                def launch(token, path, role, streams, observe=None):
+                    self.assertEqual(token, 18 if role == 'control' else 21)
+                    if role == 'filtered':
+                        if fail_filtered:
+                            raise OSError('filtered launch failed')
+                        (workspace / 'filtered-ready').write_text('ready')
+                        observe(99)
+                    return {'report': {'role': role}}
+
+                probe.api.parse_sid.side_effect = parse_sid
+                probe.api.read_memory.side_effect = read_memory
+                probe.filtered.side_effect = restrict
+                probe.launch.side_effect = launch
+                with mock.patch.object(sys, 'path', sys.path[:]), \
+                        mock.patch('loki_agent.process_protections.protect_credential_process'), \
+                        mock.patch.dict(state_writer_child.__globals__, {
+                            'AppContainers': mock.Mock(return_value=native),
+                            'StateTokenProbe': mock.Mock(return_value=probe)}):
+                    if fail_filtered:
+                        with self.assertRaisesRegex(OSError, 'filtered launch failed'):
+                            state_writer_child(str(manifest))
+                    else:
+                        state_writer_child(str(manifest))
+                        self.assertEqual((state / 'published-later').read_bytes(), b'owner publication')
+                        report = json.loads((workspace / 'state-owner-report.json').read_text())
+                        self.assertEqual([child['report']['role'] for child in report['children']],
+                                         ['control', 'filtered'])
+                role_sid = probe.filtered.call_args.args[1]
+                probe.filtered.assert_called_once_with(17, role_sid)
+                probe.api.clone.assert_called_once_with(
+                    17, TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY)
+                probe.compare_launches.assert_called_once_with(
+                    17, 18, role_sid, str(manifest), 'appcontainer', mock.ANY)
+                self.assertEqual(probe.api.close.call_args_list,
+                                 [mock.call(handle) for handle in [21, 19, 18, 17]])
+                native.local_free.assert_called_once_with(role_sid)
 
     def test_restricting_sid_and_write_only_flag_reach_native_call(self):
         probe = StateTokenProbe.__new__(StateTokenProbe)
