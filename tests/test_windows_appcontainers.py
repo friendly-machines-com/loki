@@ -87,6 +87,7 @@ PROCESS_VM_WRITE = 0x0020
 PROCESS_DUP_HANDLE = 0x0040
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TOKEN_QUERY = 0x0008
+WRITE_RESTRICTED = 0x00000008
 DACL_SECURITY_INFORMATION = 0x00000004
 PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 
@@ -520,20 +521,53 @@ class StateTokenProbe:
             HANDLE, ULONG, ULONG, HANDLE, ULONG, HANDLE, ULONG,
             C.POINTER(primitives['SidAttributes']), C.POINTER(HANDLE))
 
-    def filtered(self, source, role_sid):
+    def filtered(self, source, role_sid, *, flags=None):
         result = HANDLE()
         restriction = (primitives['SidAttributes'](role_sid, 0)
                        if role_sid is not None else None)
         # WRITE_RESTRICTED makes the second SID check apply to writes only.
         # A second call with no SID/flags tests attempts to discard restrictions.
-        print(json.dumps({'probe': 'state-token', 'phase': 'filter',
-                          'write_only': restriction is not None}), flush=True)
+        if flags is None:
+            flags = WRITE_RESTRICTED if restriction is not None else 0
+        print(json.dumps({'probe': 'state-token', 'phase': 'filter', 'flags': flags,
+                          'restricted_sid_count': 1 if restriction is not None else 0,
+                          'write_only': bool(flags & WRITE_RESTRICTED)}), flush=True)
         self.n.check(self.restrict(
-            source, 0x8 if restriction is not None else 0,
-            0, None, 0, None, 1 if restriction is not None else 0,
+            source, flags, 0, None, 0, None, 1 if restriction is not None else 0,
             C.byref(restriction) if restriction is not None else None,
             C.byref(result)))
         return result.value
+
+    def compare_filters(self, source, role_sid, context):
+        """Record independent calls; none of these tokens ever starts a child."""
+        print(json.dumps({'probe': 'state-token-filter', 'phase': 'source',
+                          'context': context, 'token': self.api.snapshot(source)}), flush=True)
+        role = self.n.sid(role_sid)
+        for variant, restriction, flags in [
+                ['unchanged', None, 0],
+                ['restrict-all', role_sid, 0],
+                ['restrict-writes', role_sid, WRITE_RESTRICTED]]:
+            row = {'probe': 'state-token-filter', 'phase': 'result',
+                   'context': context, 'variant': variant, 'flags': flags,
+                   'restricting_sid': role if restriction is not None else None}
+            try:
+                try:
+                    token = self.filtered(source, restriction, flags=flags)
+                except OSError as error:
+                    # A rejected construction is evidence, not a successful
+                    # access denial. Still collect the remaining comparisons.
+                    row.update({'created': False, 'winerror': getattr(error, 'winerror', None),
+                                'error': str(error)})
+                else:
+                    row.update({'created': True, 'winerror': 0})
+                    try:
+                        row['token'] = self.api.snapshot(token)
+                    finally:
+                        self.api.close(token)
+            finally:
+                # Inspection/cleanup failures must remain failures, but cannot
+                # erase the native call's outcome from the diagnostics.
+                print(json.dumps(row), flush=True)
 
     def launch(self, token, manifest_path, role, streams, observe=None):
         """Use the existing AsUser binding, with an explicit stdio handle list."""
@@ -820,10 +854,11 @@ def state_writer_child(manifest_path):
         current = probe.api.token(native.current_process(), TOKEN_QUERY | 2)
         try:
             source = probe.api.clone(current, TOKEN_QUERY | 2 | 1)
+            cleanup.callback(probe.api.close, source)
         finally:
             probe.api.close(current)
-        cleanup.callback(probe.api.close, source)
         report = {'writer_token': probe.api.snapshot(source), 'children': []}
+        probe.compare_filters(source, role_sid, 'appcontainer')
         memory = C.create_string_buffer(b'SYNTHETIC-STATE-WRITER')
         handle = native.open(Path(manifest['state']) / 'writer-handle', access=GENERIC_WRITE)
         cleanup.callback(probe.api.close, handle)
@@ -3173,6 +3208,83 @@ class StateTokenProbeTests(unittest.TestCase):
         self.assertEqual(calls[1]['count'], 0)
         self.assertEqual(calls[1]['flags'], 0)
         self.assertIsNone(calls[1]['sid'])
+        self.assertEqual(probe.filtered(17, HANDLE(23), flags=0), 77)
+        self.assertEqual(calls[2], {**calls[0], 'flags': 0})
+
+    def test_filter_comparisons_record_rejections_and_close_all_created_tokens(self):
+        for context in ['standard-user', 'appcontainer']:
+            for rejected in [[], [0], [1], [2], [0, 1, 2]]:
+                with self.subTest(context=context, rejected=rejected):
+                    probe = StateTokenProbe.__new__(StateTokenProbe)
+                    probe.n = mock.Mock()
+                    probe.n.sid.return_value = 'tool-role'
+                    probe.api = mock.Mock()
+                    source = {'user': 'owner', 'app': int(context == 'appcontainer'),
+                              'package': 'package' if context == 'appcontainer' else None,
+                              'restricting_sids': []}
+                    probe.api.snapshot.return_value = source
+                    failure = OSError('CreateRestrictedToken rejected its arguments')
+                    failure.winerror = 87
+                    handles = [71, 72, 73]
+                    probe.filtered = mock.Mock(side_effect=[
+                        failure if index in rejected else handle
+                        for index, handle in enumerate(handles)])
+                    role = HANDLE(23)
+                    with mock.patch('builtins.print') as output:
+                        probe.compare_filters(17, role, context)
+                    records = [json.loads(call.args[0]) for call in output.call_args_list]
+                    self.assertEqual(records[0], {
+                        'probe': 'state-token-filter', 'phase': 'source',
+                        'context': context, 'token': source})
+                    results = records[1:]
+                    self.assertEqual([row['variant'] for row in results],
+                                     ['unchanged', 'restrict-all', 'restrict-writes'])
+                    self.assertEqual([row['flags'] for row in results], [0, 0, 0x8])
+                    self.assertEqual([row['restricting_sid'] for row in results],
+                                     [None, 'tool-role', 'tool-role'])
+                    for index, row in enumerate(results):
+                        self.assertEqual(row['context'], context)
+                        self.assertEqual(row['created'], index not in rejected)
+                        self.assertEqual(row['winerror'], 87 if index in rejected else 0)
+                        self.assertNotIn('denied', row)
+                        if index in rejected:
+                            self.assertNotIn('token', row)
+                            self.assertIn('CreateRestrictedToken', row['error'])
+                        else:
+                            self.assertEqual(row['token'], source)
+                    self.assertEqual(probe.filtered.call_args_list, [
+                        mock.call(17, None, flags=0), mock.call(17, role, flags=0),
+                        mock.call(17, role, flags=0x8)])
+                    successful = [handle for index, handle in enumerate(handles)
+                                  if index not in rejected]
+                    self.assertEqual(probe.api.snapshot.call_args_list,
+                                     [mock.call(17), *[mock.call(handle) for handle in successful]])
+                    self.assertEqual(probe.api.close.call_args_list,
+                                     [mock.call(handle) for handle in successful])
+                    probe.api.create_as_user.assert_not_called()
+
+    def test_filter_comparison_inspection_and_cleanup_errors_remain_failures(self):
+        for failure in ['inspection', 'cleanup']:
+            with self.subTest(failure=failure):
+                probe = StateTokenProbe.__new__(StateTokenProbe)
+                probe.n = mock.Mock()
+                probe.n.sid.return_value = 'tool-role'
+                probe.api = mock.Mock()
+                probe.filtered = mock.Mock(return_value=71)
+                error = OSError(failure + ' failed')
+                probe.api.snapshot.side_effect = [{}, error if failure == 'inspection' else {}]
+                if failure == 'cleanup':
+                    probe.api.close.side_effect = error
+                with mock.patch('builtins.print') as output:
+                    with self.assertRaisesRegex(OSError, failure):
+                        probe.compare_filters(17, HANDLE(23), 'appcontainer')
+                result = json.loads(output.call_args.args[0])
+                self.assertTrue(result['created'])
+                self.assertEqual(result['winerror'], 0)
+                if failure == 'inspection':
+                    self.assertNotIn('token', result)
+                probe.api.close.assert_called_once_with(71)
+                probe.filtered.assert_called_once_with(17, None, flags=0)
 
     def test_state_probe_verdict_rejects_bad_controls_and_missing_restrictions(self):
         token = {'app': 1, 'package': 'package', 'user': 'owner', 'restricting_sids': []}
@@ -3220,6 +3332,17 @@ class AppContainerTests(unittest.TestCase):
         native.hresult(native.derive_profile_sid(name + '.tools', C.byref(role_sid)))
         self.addCleanup(lambda: native.free_sid(role_sid))
         package, role = native.sid(sid), native.sid(role_sid)
+        probe = StateTokenProbe(native)
+        with ExitStack() as tokens:
+            current = probe.api.token(native.current_process(), TOKEN_QUERY | 2)
+            try:
+                source = probe.api.clone(current, TOKEN_QUERY | 2 | 1)
+                tokens.callback(probe.api.close, source)
+            finally:
+                probe.api.close(current)
+            # Match the contained writer's primary-token type and handle rights.
+            # These diagnostic tokens are closed here, never passed to a child.
+            probe.compare_filters(source, role_sid, 'standard-user')
         grant = subprocess.run(
             ['icacls.exe', str(stage), '/grant', '*%s:(OI)(CI)RX' % package, '/T', '/Q'],
             capture_output=True, text=True)
