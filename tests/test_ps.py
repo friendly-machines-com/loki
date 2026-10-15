@@ -21,6 +21,7 @@ class PsTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.manager = job_runtime.JobManager(directory.name)
+        self.addCleanup(self.manager.close)
         self.session = Session(job_manager=self.manager)
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
@@ -58,7 +59,7 @@ class PsTests(unittest.TestCase):
             self.manager._refresh_job(job)
         self.assertEqual(job.status, "exited")
         self.assertEqual(job.exit_code, 0)
-        with mock.patch.object(file_operations, 'atomic_write_text', side_effect=OSError("metadata failed")), \
+        with mock.patch.object(file_operations, 'atomic_write_text_at', side_effect=OSError("metadata failed")), \
                 self.assertLogs("loki_agent.jobs", level="ERROR"), \
                 self.assertRaisesRegex(OSError, "metadata failed"):
             self.manager._write_metadata(job)
@@ -285,7 +286,7 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                         while True:
                             job = next(iter(manager.jobs.values()), None)
                             if job is not None and job.process is not None:
-                                if "job-ready" in job_runtime._read_spool_tail(job.stdout_path):
+                                if "job-ready" in manager._spool_tail(job, 'stdout.log'):
                                     break
                             await asyncio.sleep(.01)
                     resources = ProcessResources(job.process)

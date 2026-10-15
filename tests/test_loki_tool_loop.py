@@ -7549,11 +7549,12 @@ class QuestionGuardTests(unittest.TestCase):
                     f"{mode} mode")
 
     def test_question_refuses_changes_to_disposable_reviewed_targets(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as cleanup:
             root = pathlib.Path(directory)
             target = root / 'reviewed.txt'
             target.write_text('preserve these bytes', encoding='utf-8')
-            manager = job_runtime.JobManager(str(root / 'jobs'))
+            manager = cleanup.enter_context(contextlib.closing(job_runtime.JobManager(str(root / 'jobs'))))
+            baseline = set(root.iterdir())
             session = loki.Session(shell_cwd=directory, job_manager=manager)
             quote = (subprocess.list2cmdline([str(target)]) if os.name == 'nt'
                      else shlex.quote(str(target)))
@@ -7581,7 +7582,7 @@ class QuestionGuardTests(unittest.TestCase):
                                       result['content'])
                         self.assertEqual(target.read_text(encoding='utf-8'),
                                          'preserve these bytes')
-                        self.assertEqual(set(root.iterdir()), {target})
+                        self.assertEqual(set(root.iterdir()), baseline)
                         self.assertEqual(manager.jobs, {})
 
     def test_refused_bash_grep_recommends_grep_tool(self):

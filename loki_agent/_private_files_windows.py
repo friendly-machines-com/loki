@@ -6,8 +6,8 @@ the storage investigation measured:
 * **No reparse point is followed.**  Every child is opened with
   ``FILE_OPEN_REPARSE_POINT``, so the object acted on is the link itself; the
   storage then refuses it because :class:`FileFacts` reports ``reparse_point``.
-  ``open_directory`` additionally refuses a reparse-point directory outright,
-  because a handle to one would still traverse an intermediate link.
+  State owners validate the opened root; ``open_directory_at`` refuses a
+  reparse-point directory before it can become an intermediate lookup root.
 * **Every operation is bound to the retained directory handle.**  Children are
   opened with ``NtCreateFile(RootDirectory=...)`` and renamed with
   ``NtSetInformationFile``, not by re-resolving the directory's pathname.  This
@@ -23,6 +23,8 @@ What the privacy check does and does not cover is stated at
 """
 
 from __future__ import annotations
+
+import os
 
 from . import windows_acl, windows_api
 from .credential_errors import CredentialStorageError
@@ -181,6 +183,30 @@ def read(handle, size):
         _raise_oserror(error)
 
 
+def binary_file(handle, mode):
+    """Transfer HANDLE ownership to the CRT, then to the Python file once."""
+    import msvcrt
+
+    try:
+        fd = msvcrt.open_osfhandle(
+            handle, os.O_BINARY | os.O_NOINHERIT | (os.O_RDONLY if mode == 'rb' else os.O_WRONLY))
+    except BaseException:
+        windows_api.close_handle(handle)
+        raise
+    try:
+        return os.fdopen(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def seek(handle, offset, whence):
+    try:
+        return windows_api.set_file_pointer(handle, offset, whence)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+
+
 def write(handle, data):
     try:
         return windows_api.write_file(handle, data)
@@ -271,6 +297,69 @@ def open_lock_file_at(directory, name: str, mode: int):
         windows_api.AccessMask.GENERIC_READ
         | windows_api.AccessMask.GENERIC_WRITE
         | windows_api.AccessMask.FILE_READ_ATTRIBUTES
+        | windows_api.AccessMask.SYNCHRONIZE,
+        windows_api.NtCreateDisposition.FILE_OPEN_IF, _NON_DIRECTORY)
+
+
+def _directory_result(handle):
+    try:
+        try:
+            attributes = windows_api.by_handle_file_information(handle).dwFileAttributes
+        except windows_api.WindowsApiError as error:
+            _raise_oserror(error)
+        if attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("state directory is a reparse point")
+        if not attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY:
+            raise NotADirectoryError("state path is not a directory")
+    except BaseException:
+        windows_api.close_handle(handle)
+        raise
+    return handle
+
+
+def open_directory_at(directory, name: str):
+    _check_name(name)
+    # FILE_OPEN_REPARSE_POINT opens the link itself; reject that handle before
+    # it can become the RootDirectory of another relative operation.
+    return _directory_result(_open_relative(
+        directory, name,
+        windows_api.AccessMask.GENERIC_READ
+        | windows_api.AccessMask.FILE_READ_ATTRIBUTES
+        | windows_api.AccessMask.SYNCHRONIZE,
+        windows_api.NtCreateDisposition.FILE_OPEN,
+        windows_api.NtCreateOptions.FILE_DIRECTORY_FILE
+        | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT
+        | _SYNCHRONOUS))
+
+
+def create_directory_at(directory, name: str, mode: int = 0o700):
+    _check_name(name)
+    # ``mode`` is a POSIX concept; on this platform the new directory's access
+    # comes from the parent's DACL by inheritance, exactly as create_exclusive_at
+    # documents for files.  OPEN_IF makes an existing directory a success, so
+    # every failure reaching the caller is a real one.
+    handle = _open_relative(
+        directory, name,
+        windows_api.AccessMask.FILE_READ_ATTRIBUTES
+        | windows_api.AccessMask.SYNCHRONIZE
+        | windows_api.AccessMask.READ_CONTROL,
+        windows_api.NtCreateDisposition.FILE_OPEN_IF,
+        windows_api.NtCreateOptions.FILE_DIRECTORY_FILE
+        | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT
+        | _SYNCHRONOUS,
+        windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
+    windows_api.close_handle(_directory_result(handle))
+
+
+def open_append_at(directory, name: str):
+    _check_name(name)
+    # FILE_APPEND_DATA without FILE_WRITE_DATA is the handle-scoped append-only
+    # right: seeks write at the end without granting arbitrary overwrite.
+    return _open_relative(
+        directory, name,
+        windows_api.AccessMask.FILE_APPEND_DATA
+        | windows_api.AccessMask.FILE_READ_ATTRIBUTES
+        | windows_api.AccessMask.READ_CONTROL
         | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.NtCreateDisposition.FILE_OPEN_IF, _NON_DIRECTORY)
 

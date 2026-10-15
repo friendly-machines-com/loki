@@ -43,13 +43,15 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
     from .acp_worker import Worker
     from .sessions import Session
 
-    session = Session(shell_cwd=os.getcwd())
+    try:
+        session = Session(shell_cwd=os.getcwd())
+    except BaseException:
+        await runtime.close()
+        raise
     # Single-session process: make it the process default so loki's
     # current_*() helpers (chat-log bookkeeping, job manager, model) all
     # resolve to this conversation.
     loki._DEFAULT_SESSION = session
-    loki.CREDENTIALS = runtime.install(session)
-    worker = Worker(session, write)
 
     async def serve():
         try:
@@ -106,11 +108,13 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
         return 0
 
     try:
+        loki.CREDENTIALS = runtime.install(session)
+        worker = Worker(session, write)
         completed, result = await runtime.run(serve())
         return result if completed else 1
     finally:
         try:
-            await session.response_headers.save_on_exit()
+            await session.close_state()
         finally:
             await runtime.close()
 

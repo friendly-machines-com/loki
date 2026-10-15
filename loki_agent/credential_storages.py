@@ -202,6 +202,19 @@ class JsonCredentialStorage:
     def __init__(self, directory=None):
         self.directory = (
             paths.credential_directory() if directory is None else directory)
+        self._directory_fd = None
+        self._directory_fd = self._acquire_directory()
+
+    def close(self):
+        if self._directory_fd is not None:
+            fd, self._directory_fd = self._directory_fd, None
+            private_files.close(fd)
+
+    def __del__(self):
+        if getattr(self, '_directory_fd', None) is not None:
+            fd, self._directory_fd = self._directory_fd, None
+            with contextlib.suppress(OSError):
+                private_files.close(fd)
 
     @property
     def file_path(self):
@@ -214,19 +227,12 @@ class JsonCredentialStorage:
             self.directory, paths.CREDENTIAL_LOCK_FILE_NAME)
 
     def ensure_directory(self):
-        # Refuse before creating anything: on Windows versions that ignore
-        # os.mkdir(mode) the directory would be created with inherited access,
-        # leaving credentials readable by other users.
-        unsupported = paths.private_directory_support_error()
-        if unsupported is not None:
-            raise CredentialStorageError(unsupported)
-        parent = os.path.dirname(self.directory)
-        os.makedirs(parent, exist_ok=True)
-        try:
-            os.mkdir(self.directory, 0o700)
-        except FileExistsError:
-            pass
-        facts = private_files.describe_path(self.directory)
+        """Recheck the held directory's privacy without reopening its name."""
+        if self._directory_fd is None:
+            raise CredentialStorageError("credential storage is closed")
+        self._validate_directory(private_files.describe(self._directory_fd))
+
+    def _validate_directory(self, facts):
         if not facts.directory:
             raise CredentialStorageError(
                 f"credential path is not a directory: {self.directory}")
@@ -235,41 +241,37 @@ class JsonCredentialStorage:
                 f"credential directory is a reparse point: {self.directory}")
         if not facts.owned_by_current_user:
             raise CredentialStorageError(
-                f"credential directory is not owned by this user: "
-                f"{self.directory}")
+                f"credential directory is not owned by this user: {self.directory}")
         if facts.group_or_other_access:
             raise CredentialStorageError(
                 f"credential directory has group or other permission bits "
                 f"set: {self.directory!r}; adjust its permissions before "
                 "retrying (Loki will not change them)")
 
-    def _open_directory(self):
-        self.ensure_directory()
+    def _acquire_directory(self):
+        # Refuse before creating anything on Windows versions without private
+        # mkdir support. Only construction resolves this configured pathname.
+        unsupported = paths.private_directory_support_error()
+        if unsupported is not None:
+            raise CredentialStorageError(unsupported)
+        os.makedirs(os.path.dirname(self.directory), exist_ok=True)
+        try:
+            os.mkdir(self.directory, 0o700)
+        except FileExistsError:
+            pass
         try:
             directory_fd = private_files.open_directory(self.directory)
+        except NotADirectoryError as error:
+            raise CredentialStorageError(
+                f"credential path is not a directory: {self.directory}") from error
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential directory: {error}") from error
-        # Checked on the retained handle, not the pathname: between
-        # ensure_directory's describe_path and this open the directory could
-        # have been swapped for a link, and every relative open traverses a
-        # handle to one.
         try:
-            facts = private_files.describe(directory_fd)
+            self._validate_directory(private_files.describe(directory_fd))
         except BaseException:
             private_files.close(directory_fd)
             raise
-        if not facts.directory:
-            private_files.close(directory_fd)
-            raise CredentialStorageError(
-                f"credential path is not a directory: {self.directory}")
-        if facts.reparse_point:
-            private_files.close(directory_fd)
-            raise CredentialStorageError(
-                f"credential directory is a reparse point: {self.directory}")
-        if not facts.owned_by_current_user or facts.group_or_other_access:
-            private_files.close(directory_fd)
-            raise CredentialStorageError("credential directory is not private")
         return directory_fd
 
     @staticmethod
@@ -326,11 +328,8 @@ class JsonCredentialStorage:
         return _validate_document(value)
 
     def load_document(self):
-        directory_fd = self._open_directory()
-        try:
-            return self._read_document_at(directory_fd)
-        finally:
-            private_files.close(directory_fd)
+        self.ensure_directory()
+        return self._read_document_at(self._directory_fd)
 
     def load_openai_subscription(self):
         return _openai_record(self.load_document())
@@ -404,28 +403,26 @@ class JsonCredentialStorage:
 
     @asynccontextmanager
     async def _locked_document(self):
-        directory_fd = self._open_directory()
+        self.ensure_directory()
+        directory_fd = self._directory_fd
+        lock_fd = self._open_lock_at(directory_fd)
         try:
-            lock_fd = self._open_lock_at(directory_fd)
+            acquired = False
             try:
-                acquired = False
-                try:
-                    while True:
-                        try:
-                            file_locks.try_lock_exclusive(lock_fd)
-                            acquired = True
-                            break
-                        except BlockingIOError:
-                            await asyncio.sleep(LOCK_RETRY_DELAY_S)
-                    yield directory_fd, self._read_document_at(directory_fd)
-                finally:
-                    if acquired:
-                        with contextlib.suppress(OSError):
-                            file_locks.unlock(lock_fd)
+                while True:
+                    try:
+                        file_locks.try_lock_exclusive(lock_fd)
+                        acquired = True
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(LOCK_RETRY_DELAY_S)
+                yield directory_fd, self._read_document_at(directory_fd)
             finally:
-                private_files.close(lock_fd)
+                if acquired:
+                    with contextlib.suppress(OSError):
+                        file_locks.unlock(lock_fd)
         finally:
-            private_files.close(directory_fd)
+            private_files.close(lock_fd)
 
     @staticmethod
     def _next_revision(document):

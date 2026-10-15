@@ -108,6 +108,17 @@ class Session:
         if not self.previous_shell_cwd:
             self.previous_shell_cwd = self.shell_cwd
 
+    async def close_state(self):
+        """Finish runtime-owned work before releasing its retained directories."""
+        try:
+            if self.job_manager is not None:
+                await self.job_manager.aclose()
+        finally:
+            try:
+                await self.response_headers.save_on_exit()
+            finally:
+                self.response_headers.close()
+
     @property
     def root_conversation_id(self) -> str:
         return self.delegated_root_conversation_id or self.conversation_id

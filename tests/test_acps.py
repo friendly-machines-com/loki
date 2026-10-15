@@ -2204,7 +2204,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         job = next(iter(manager.jobs.values()), None) if manager is not None else None
                         if job is not None and job.process is not None:
                             self.assertIsNone(job.process.returncode)
-                            if "bang-ready" in job_runtime._read_spool_tail(job.stdout_path):
+                            if "bang-ready" in manager._spool_tail(job, 'stdout.log'):
                                 break
                         if asyncio.get_running_loop().time() >= deadline:
                             self.fail("bang command did not become ready")

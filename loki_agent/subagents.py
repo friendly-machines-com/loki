@@ -298,7 +298,7 @@ async def async_main(args) -> int:
         session.subagent_depth = previous_depth
         session.delegated_root_conversation_id = previous_root
         try:
-            await session.response_headers.save_on_exit()
+            await session.close_state()
         finally:
             if runtime is not None:
                 await runtime.close()

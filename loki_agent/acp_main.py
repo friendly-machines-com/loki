@@ -47,10 +47,13 @@ async def amain(credentials: CredentialStore) -> int:
                 continue
             yield message
 
-    front = Front(
-        read, write, credentials, JsonCredentialStorage())
-    await front.run()
-    return 0
+    storage = JsonCredentialStorage()
+    try:
+        front = Front(read, write, credentials, storage)
+        await front.run()
+        return 0
+    finally:
+        storage.close()
 
 
 def main() -> int:

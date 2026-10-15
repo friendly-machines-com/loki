@@ -98,14 +98,29 @@ def _valid_observation(value):
     )
 
 
-def _read(path):
+def _read(directory, name):
     try:
-        with open(path, "r", encoding="utf-8") as source:
-            text = source.read(MAX_SNAPSHOT_BYTES + 1)
+        fd = private_files.open_read_at(directory, name)
     except FileNotFoundError:
         return {}
-    if len(text) > MAX_SNAPSHOT_BYTES:
+    try:
+        facts = private_files.describe(fd)
+        if not facts.regular or facts.reparse_point:
+            raise ValueError("response status snapshot is not a regular file")
+        chunks = []
+        remaining = MAX_SNAPSHOT_BYTES + 1
+        while remaining:
+            chunk = private_files.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b''.join(chunks)
+    finally:
+        private_files.close(fd)
+    if len(raw) > MAX_SNAPSHOT_BYTES:
         raise ValueError("response status snapshot is too large")
+    text = raw.decode('utf-8')
     data = json.loads(text)
     if (not isinstance(data, dict) or data.get("version") != 1
             or not isinstance(data.get("endpoints"), list)):
@@ -146,6 +161,21 @@ def _document(entries):
 class Store:
     def __init__(self, path=None):
         self.path = path or snapshot_path()
+        self._directory_fd = None
+        directory = os.path.dirname(self.path) or '.'
+        self._name = os.path.basename(self.path)
+        if self._name in ['', '.', '..']:
+            raise ValueError("response status path must name a file")
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd = private_files.open_directory(directory)
+        try:
+            facts = private_files.describe(fd)
+            if not facts.directory or facts.reparse_point:
+                raise OSError("response status root is not a plain directory")
+        except BaseException:
+            private_files.close(fd)
+            raise
+        self._directory_fd = fd
         self.observations = {}
         self.dirty = False
         # A high-low observation id: the high half is random and unique to
@@ -154,6 +184,22 @@ class Store:
         # both.
         self._observation_high = secrets.randbits(32)
         self._observation_low = 0
+
+    def close(self):
+        if self._directory_fd is not None:
+            fd, self._directory_fd = self._directory_fd, None
+            private_files.close(fd)
+
+    def __del__(self):
+        if getattr(self, '_directory_fd', None) is not None:
+            fd, self._directory_fd = self._directory_fd, None
+            with contextlib.suppress(OSError):
+                private_files.close(fd)
+
+    def _directory(self):
+        if self._directory_fd is None:
+            raise ValueError("response status storage is closed")
+        return self._directory_fd
 
     def observer(self, endpoint, credential, model, provider_id=None,
                  provider_name=None):
@@ -193,7 +239,7 @@ class Store:
         return observe
 
     def snapshot(self, endpoint=None, *, credential=_ANY_CREDENTIAL):
-        entries = _read(self.path)
+        entries = _read(self._directory(), self._name)
         _merge(entries, self.observations.values())
         if endpoint is not None:
             endpoint = sanitized_endpoint(endpoint)
@@ -207,21 +253,15 @@ class Store:
     async def save(self):
         if not self.dirty:
             return
-        directory = os.path.dirname(self.path)
-        name = os.path.basename(self.path)
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        # Publish through the platform file primitives, as the credential store
-        # does: the open is relative to the retained directory and refuses a
-        # symlink in the final component, the replace is handle-relative, and
-        # the lock is taken on the token the platform can actually lock (a
-        # descriptor on POSIX, a handle on Windows).
-        directory_fd = private_files.open_directory(directory)
+        name = self._name
+        # The directory was acquired at construction. All reads, locks and
+        # publication use that object, even after its ancestors are renamed.
+        directory_fd = self._directory()
         temporary_name = None
         try:
             lock_fd = private_files.open_lock_file_at(
                 directory_fd, name + ".lock", 0o600)
         except OSError as error:
-            private_files.close(directory_fd)
             raise OSError(
                 f"could not open response status lock: {error}") from error
         try:
@@ -240,7 +280,7 @@ class Store:
             # No await between the merge and publish: observations cannot race
             # this runtime's dirty reset. Small local filesystem operations are
             # synchronous; lock contention never blocks the asyncio loop.
-            entries = _read(self.path)
+            entries = _read(self._directory(), self._name)
             _merge(entries, self.observations.values())
             content = json.dumps(_document(entries), indent=2, ensure_ascii=True)
             if len(content) > MAX_SNAPSHOT_BYTES:
@@ -267,7 +307,6 @@ class Store:
                 with contextlib.suppress(OSError):
                     private_files.unlink_at(directory_fd, temporary_name)
             private_files.close(lock_fd)
-            private_files.close(directory_fd)
 
     async def save_on_exit(self):
         try:
@@ -437,7 +476,8 @@ def main(args):
     parser.add_argument("--endpoint", help="filter by inference endpoint URL")
     options = parser.parse_args(args)
     try:
-        document = Store().snapshot(options.endpoint)
+        with contextlib.closing(Store()) as store:
+            document = store.snapshot(options.endpoint)
         print(json.dumps(document, indent=2, ensure_ascii=True)
               if options.json else (
                   "Saved observations only (not live balances); other runtimes' "

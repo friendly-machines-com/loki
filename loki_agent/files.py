@@ -209,6 +209,37 @@ def atomic_write_text(file_path: str, content: str):
         private_files.close(directory_fd)
 
 
+def atomic_write_text_at(directory_fd, name: str, content: str):
+    """Publish private runtime metadata in an already-retained directory.
+
+    Unlike the editor publisher above, these are owned state files: POSIX mode
+    is 0600 and Windows inherits the directory's DACL. No pathname-based mode
+    or DACL copying may redirect an operation after an ancestor is renamed.
+    """
+    if not name or name in ['.', '..'] or any(part in name for part in ['/', '\\', ':']):
+        raise ValueError("state filename must be a single path component")
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    created = False
+    try:
+        descriptor = private_files.create_exclusive_at(directory_fd, temporary, 0o600)
+        created = True
+        try:
+            view = memoryview(content.encode('utf-8'))
+            while view:
+                count = private_files.write(descriptor, view)
+                if count <= 0:
+                    raise OSError("state write made no progress")
+                view = view[count:]
+        finally:
+            private_files.close(descriptor)
+        private_files.replace_at(directory_fd, temporary, name)
+    except BaseException:
+        if created:
+            with contextlib.suppress(OSError):
+                private_files.unlink_at(directory_fd, temporary)
+        raise
+
+
 def _stale_file_error(file_path: str, action: str,
                       file_key=None, *, observations) -> str | None:
     if file_key is None:

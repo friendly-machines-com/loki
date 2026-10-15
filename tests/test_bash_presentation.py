@@ -186,7 +186,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
         self.addCleanup(patch.stop)
-        self.addAsyncCleanup(self.manager.close_session_owned)
+        self.addAsyncCleanup(self.manager.aclose)
 
     async def execute(self, command="test-command", *, pipeline=None, **arguments):
         call = formats.tool_call_item("bash-call", "Bash", {"command": command, **arguments})
@@ -263,14 +263,16 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("stderr-message", hidden)
 
     def completed_job(self, shell):
-        stdout = self.directory / "stdout.log"
-        stderr = self.directory / "stderr.log"
+        directory = pathlib.Path(self.manager.session_dir) / '1'
+        directory.mkdir()
+        stdout = directory / "stdout.log"
+        stderr = directory / "stderr.log"
         stdout.write_text("job-stdout", encoding="utf-8")
         stderr.write_text("job-stderr", encoding="utf-8")
         job = job_runtime.Job(
             id="1", command="test", argv=None, shell=shell, description="", background=True,
-            spool_dir=str(self.directory), stdout_path=str(stdout), stderr_path=str(stderr),
-            metadata_path=str(self.directory / "job.json"), started_at_iso="start",
+            spool_dir=str(directory), stdout_path=str(stdout), stderr_path=str(stderr),
+            metadata_path=str(directory / "job.json"), started_at_iso="start",
             status="exited", exit_code=0)
         self.manager.jobs[job.id] = job
         return job

@@ -23,7 +23,7 @@ from process_lifecycle_fixtures import ProcessResources
 from loki_agent import authentication_commands
 from loki_agent import authentications
 from loki_agent import credential_storages
-from loki_agent import formats, savefiles
+from loki_agent import formats, paths, savefiles
 from loki_agent import credential_supervisors, http_client, oauth_logins
 from loki_agent.credentials import CredentialStore
 from tests.test_oauth_logins import jwt, response
@@ -340,9 +340,10 @@ class AuthenticationEntrypointTests(unittest.TestCase):
         async def exercise(directory):
             workspace = os.path.join(directory, 'workspace')
             os.mkdir(workspace)
-            storage = credential_storages.JsonCredentialStorage(
-                os.path.join(directory, 'config', 'loki', 'credentials'))
-            self.assertFalse(os.path.exists(storage.directory))
+            credential_directory = os.path.join(directory, 'config', 'loki', 'credentials')
+            token_path = os.path.join(credential_directory, paths.CREDENTIAL_FILE_NAME)
+            self.assertFalse(os.path.exists(credential_directory))
+            storage = None
             connected = asyncio.get_running_loop().create_future()
 
             def accept(reader, writer):
@@ -370,14 +371,14 @@ connection.close()
 '''
             command = shlex.join([
                 sys.executable, '-c', 'exec(' + repr(probe) + ')',
-                address, storage.file_path])
+                address, token_path])
             environment = child_environment(
                 PATH=os.environ.get('PATH', ''), HOME=directory,
                 XDG_CONFIG_HOME=os.path.join(directory, 'config'),
                 XDG_STATE_HOME=os.path.join(directory, 'state'),
                 LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
                 LOKI_MODEL='dummy', LOKI_DUMMY_TOOL_CALL=json.dumps({
-                    'name': 'Read', 'arguments': {'file_path': storage.file_path}}))
+                    'name': 'Read', 'arguments': {'file_path': token_path}}))
             process = None
             resources = None
             status_resources = None
@@ -398,8 +399,9 @@ connection.close()
                     self.fail(f'Runtime exited before readiness: {stdout!r} {stderr!r}')
                 reader, writer = await connected
                 self.assertEqual(await reader.readline(), b'ready\n')
-                self.assertTrue(os.path.isdir(storage.directory))
-                self.assertFalse(os.path.exists(storage.file_path))
+                self.assertTrue(os.path.isdir(credential_directory))
+                self.assertFalse(os.path.exists(token_path))
+                storage = credential_storages.JsonCredentialStorage(credential_directory)
                 late_tokens = authentications.OpenAITokenSet(
                     access_token='late-access-secret', refresh_token='late-refresh-secret',
                     id_token='late-id-secret', account_id='account',
@@ -414,6 +416,10 @@ connection.close()
                     cwd=workspace, env=environment)
                 status_resources = ProcessResources(status)
                 status_out, status_err = await status.communicate()
+                # communicate() may observe returncode before the queued
+                # process-exited/connection-lost transport callbacks run.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
                 self.assertEqual(status.returncode, 0, status_err)
                 status_resources.assert_released(self)
                 self.assertIn(b'logged in', status_out)
@@ -421,6 +427,8 @@ connection.close()
                 await writer.drain()
                 self.assertEqual(await reader.readline(), b'hidden\n')
                 stdout, stderr = await output
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
                 self.assertEqual(process.returncode, 0, stderr)
                 resources.assert_released(self)
                 for secret in [late_tokens.access_token, late_tokens.refresh_token, late_tokens.id_token]:
@@ -447,6 +455,8 @@ connection.close()
                     await resources.cleanup()
                 if output is not None:
                     await output
+                if storage is not None:
+                    storage.close()
 
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(exercise(directory))

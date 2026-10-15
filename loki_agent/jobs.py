@@ -15,6 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from . import credential_capabilities, executables, files, host_ipc, host_process
+from . import private_files
 from . import process_outputs, tool_contracts, tool_runtime
 
 
@@ -47,16 +48,31 @@ def _decode_spooled_output(data: bytes) -> str:
         return data.decode('utf-8', errors='replace')
 
 
-def _read_spool_tail(path: str, max_chars: int = tool_contracts.JOB_TAIL_CHARS) -> str:
+def _read_spool_tail(directory_fd, name: str,
+                     max_chars: int = tool_contracts.JOB_TAIL_CHARS) -> str:
+    """Read the last ``max_chars`` of one spool, relative to its directory.
+
+    The read resolves from the retained session handle, never a pathname, and
+    is bounded: it positions at most ``max_chars * 4`` bytes from the end
+    (UTF-8 may use multiple bytes per character; trimmed after decoding so the
+    character cap is stable).
+    """
+    if max_chars <= 0:
+        return ''
     try:
-        size = os.path.getsize(path)
-        with open(path, 'rb') as f:
-            # Read extra bytes because UTF-8 may use multiple bytes per
-            # character; trim after decoding so the character cap is stable.
-            f.seek(max(0, size - max_chars * 4))
-            text = _decode_spooled_output(f.read())
+        fd = private_files.open_read_at(directory_fd, name)
     except FileNotFoundError:
         return ""
+    try:
+        facts = private_files.describe(fd)
+        if not facts.regular or facts.reparse_point:
+            raise OSError("job spool is not a regular file")
+        start = max(0, facts.size - max_chars * 4)
+        if start:
+            private_files.seek(fd, start, os.SEEK_SET)
+        text = _decode_spooled_output(private_files.read(fd, max_chars * 4 + 1))
+    finally:
+        private_files.close(fd)
     if len(text) > max_chars:
         return text[-max_chars:]
     return text
@@ -118,11 +134,123 @@ class JobManager:
         self.base_dir = base_dir
         self.session_id = str(uuid.uuid4())
         self.session_dir = os.path.join(base_dir, self.session_id)
+        # One retained handle to the session directory, opened at construction
+        # and held for the manager's lifetime: every spool and
+        # metadata access resolves from this dentry, never from a pathname, so
+        # a renamed state ancestor cannot redirect job storage.  Path strings
+        # on Job remain for display and job.json only.
+        self._session_fd = None
+        self._closed = False
+        self._monitors = set()
         self.jobs = {}
         self._counter = 0
         self._active_subagents = 0
         # A local synchronous observer, bound only while a frontend owns it.
         self.on_change = None
+        self._session_directory()
+
+    def close(self) -> None:
+        if any(not task.done() for task in self._monitors):
+            raise RuntimeError("job monitors must be joined with aclose()")
+        self._closed = True
+        if self._session_fd is not None:
+            fd, self._session_fd = self._session_fd, None
+            private_files.close(fd)
+
+    def __del__(self):
+        if getattr(self, '_session_fd', None) is not None:
+            fd, self._session_fd = self._session_fd, None
+            with contextlib.suppress(OSError):
+                private_files.close(fd)
+
+    async def aclose(self):
+        if self._closed:
+            return
+        try:
+            await self.close_session_owned()
+        finally:
+            tasks = list(self._monitors)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.close()
+
+    def _session_directory(self):
+        """The retained session-directory handle, creating the tree once."""
+        if self._closed:
+            raise ValueError("job storage is closed")
+        if self._session_fd is None:
+            try:
+                base_fd = private_files.open_directory(self.base_dir)
+            except FileNotFoundError:
+                os.makedirs(self.base_dir, exist_ok=True)
+                base_fd = private_files.open_directory(self.base_dir)
+            try:
+                facts = private_files.describe(base_fd)
+                if not facts.directory or facts.reparse_point:
+                    raise OSError("job root is not a plain directory")
+                try:
+                    private_files.create_directory_at(base_fd, self.session_id)
+                except OSError as error:
+                    raise OSError(
+                        f"could not create job session directory: {error}") from error
+                self._session_fd = private_files.open_directory_at(
+                    base_fd, self.session_id)
+            finally:
+                private_files.close(base_fd)
+        return self._session_fd
+
+    def _job_directory(self, job_id: str, *, create=False):
+        """A transient handle reached only through the retained session."""
+        session_fd = self._session_directory()
+        if create:
+            private_files.create_directory_at(session_fd, job_id)
+        return private_files.open_directory_at(session_fd, job_id)
+
+    @staticmethod
+    def _open_spool_stream(directory, name):
+        return private_files.binary_file(
+            private_files.create_exclusive_at(directory, name, 0o600), 'wb')
+
+    def _append_spool(self, job, name, data):
+        directory = self._job_directory(job.id)
+        try:
+            fd = private_files.open_append_at(directory, name)
+            try:
+                facts = private_files.describe(fd)
+                if not facts.regular or facts.reparse_point:
+                    raise OSError("job spool is not a regular file")
+                view = memoryview(data)
+                while view:
+                    count = private_files.write(fd, view)
+                    if count <= 0:
+                        raise OSError("spool write made no progress")
+                    view = view[count:]
+            finally:
+                private_files.close(fd)
+        finally:
+            private_files.close(directory)
+
+    def _spool_tail(self, job, name, max_chars=tool_contracts.JOB_TAIL_CHARS):
+        try:
+            directory = self._job_directory(job.id)
+        except FileNotFoundError:
+            return ''
+        try:
+            return _read_spool_tail(directory, name, max_chars)
+        finally:
+            private_files.close(directory)
+
+    def _start_monitor(self, job):
+        operation = self._monitor_background_job(job)
+        try:
+            task = asyncio.create_task(operation)
+        except BaseException:
+            operation.close()
+            raise
+        self._monitors.add(task)
+        task.add_done_callback(self._monitors.discard)
 
     def _reserve_subagent_slot(self, job: Job):
         # This check-and-increment contains no await and JobManager belongs to
@@ -177,7 +305,11 @@ class JobManager:
 
     def _write_metadata(self, job: Job):
         try:
-            files.atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
+            directory = self._job_directory(job.id)
+            try:
+                files.atomic_write_text_at(directory, 'job.json', json.dumps(self._job_metadata(job), indent=2) + '\n')
+            finally:
+                private_files.close(directory)
         finally:
             # State has already changed, even if persistence failed. Display
             # errors must neither change the job outcome nor mask an IO error.
@@ -276,10 +408,8 @@ class JobManager:
                 "credential capabilities require a direct executable")
         if subagent and not session_owned:
             raise ValueError("subagents must be session-owned")
-        os.makedirs(self.session_dir, exist_ok=True)
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
-        os.makedirs(spool_dir, exist_ok=True)
         stdout_path = os.path.join(spool_dir, "stdout.log")
         stderr_path = os.path.join(spool_dir, "stderr.log")
         metadata_path = os.path.join(spool_dir, "job.json")
@@ -314,6 +444,7 @@ class JobManager:
         capability_handed_off = False
         spawn_command = command
         proc = None
+        job_dir_fd = None
         try:
             if subagent:
                 # Reserved inside the failure boundary, immediately before the
@@ -345,8 +476,9 @@ class JobManager:
                     str(host_ipc.reference(credential_child)),
                 ]
 
-            with open(stdout_path, 'wb') as stdout_file, \
-                    open(stderr_path, 'wb') as stderr_file:
+            job_dir_fd = self._job_directory(job_id, create=True)
+            with self._open_spool_stream(job_dir_fd, 'stdout.log') as stdout_file, \
+                    self._open_spool_stream(job_dir_fd, 'stderr.log') as stderr_file:
                 # A job gets no input, so its stdin is a pipe with no writer
                 # rather than the null device: the AppContainer that confines
                 # the Windows runtime denies that device, so a DEVNULL stdin
@@ -389,6 +521,11 @@ class JobManager:
                     # this copy is no longer needed either way.
                     release_stdin()
 
+            # Release the transient directory inside the launch failure
+            # boundary, before publishing a live child to its caller.
+            directory, job_dir_fd = job_dir_fd, None
+            private_files.close(directory)
+
             # The session may have revoked this job while it was launching.
             # Publishing it now would leave a live child nobody owns.
             if job.status != "starting":
@@ -425,23 +562,28 @@ class JobManager:
                 pass
             if not revoked:
                 try:
-                    with open(job.stderr_path, 'ab') as stderr_file:
-                        stderr_file.write(
-                            f"\n[launch failed: {type(error).__name__}: "
-                            f"{error}]\n".encode('utf-8'))
+                    self._append_spool(
+                        job, 'stderr.log',
+                        f"\n[launch failed: {type(error).__name__}: "
+                        f"{error}]\n".encode('utf-8'))
                 except OSError:
                     pass
             raise
         finally:
-            if owner_child is not None:
-                host_ipc.close_end(owner_child)
-            if credential_child is not None:
-                host_ipc.close_end(credential_child)
-            # Close each parent-side end only if no job took ownership of it.
-            if owner_parent is not None and not parent_handed_off:
-                host_ipc.close_end(owner_parent)
-            if credential_server is not None and not capability_handed_off:
-                await credential_server.close()
+            # Each independent owner must release its resource even if another
+            # close fails. The session handle is retained; only this job's
+            # transient lookup handle belongs to this launch.
+            async with contextlib.AsyncExitStack() as cleanup:
+                if credential_server is not None and not capability_handed_off:
+                    cleanup.push_async_callback(credential_server.close)
+                if owner_parent is not None and not parent_handed_off:
+                    cleanup.callback(host_ipc.close_end, owner_parent)
+                if credential_child is not None:
+                    cleanup.callback(host_ipc.close_end, credential_child)
+                if owner_child is not None:
+                    cleanup.callback(host_ipc.close_end, owner_child)
+                if job_dir_fd is not None:
+                    cleanup.callback(private_files.close, job_dir_fd)
 
     async def _wait_for_job(self, job: Job) -> int:
         return await job.process.wait()
@@ -460,8 +602,8 @@ class JobManager:
             self._revoke_credential_capability(job)
             # A broken waiter does not prove that the child exited. Retain its
             # slot and fail closed instead of admitting an extra live child.
-            with open(job.stderr_path, 'ab') as stderr_file:
-                stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
+            self._append_spool(job, 'stderr.log',
+                               f'\n[job monitor error: {type(e).__name__}: {e}]\n'.encode('utf-8'))
             self._write_metadata(job)
         finally:
             await self._close_credential_capability(job)
@@ -523,7 +665,7 @@ class JobManager:
             self._write_metadata(job)
             self._record_exit(job, exit_code)
             await self._close_credential_capability(job)
-            return job, "cancelled", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+            return job, "cancelled", self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
 
         cancel_task = (asyncio.create_task(cancel_event.wait())
                        if cancel_event is not None else None)
@@ -564,7 +706,7 @@ class JobManager:
         if not interrupted and exit_task in done:
             self._record_exit(job, exit_task.result())
             await self._close_credential_capability(job)
-            return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+            return job, "completed", self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
 
         # Cancellation wins even if exit was observed in the same loop pass.
         # Otherwise terminate the live job before recording cancellation or
@@ -578,7 +720,7 @@ class JobManager:
         self._record_exit(job, exit_code)
         await self._close_credential_capability(job)
         status = "cancelled" if interrupted else "timed_out"
-        return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
+        return job, status, self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
 
     async def run_shell(self, command: str, timeout: int | None = None, description: str = "",
                         run_in_background: bool = False,
@@ -597,7 +739,7 @@ class JobManager:
         if run_in_background:
             job = await self._spawn(command, command, description, True, None, True, cwd=cwd)
             try:
-                asyncio.get_running_loop().create_task(self._monitor_background_job(job))
+                self._start_monitor(job)
             except RuntimeError:
                 # If no loop can accept the monitor task, the job still exists
                 # with stdout/stderr/metadata paths for manual inspection.
@@ -670,7 +812,7 @@ class JobManager:
                                 credential_authority=credential_authority,
                                 credential_destinations=credential_destinations,
                                 subagent=subagent)
-        asyncio.get_running_loop().create_task(self._monitor_background_job(job))
+        self._start_monitor(job)
         return job
 
     @staticmethod
@@ -776,8 +918,8 @@ class JobManager:
         job = self._get_job(job_id)
         if job is None:
             return f"Error: unknown job id {job_id!r}"
-        stdout = _read_spool_tail(job.stdout_path, tail_chars)
-        stderr = _read_spool_tail(job.stderr_path, tail_chars)
+        stdout = self._spool_tail(job, 'stdout.log', tail_chars)
+        stderr = self._spool_tail(job, 'stderr.log', tail_chars)
         parts = [
             f"job_id: {job.id}",
             f"status: {job.status}",

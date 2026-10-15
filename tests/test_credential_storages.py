@@ -48,20 +48,23 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             self.temporary.name, "loki", "credentials")
         self.storage = credential_storages.JsonCredentialStorage(
             self.directory)
+        self.addCleanup(self.storage.close)
 
     async def test_directory_creation_requests_private_mode_without_chmod(self):
         mkdir = os.mkdir
         with mock.patch.object(os, 'mkdir', wraps=mkdir) as create, \
                 mock.patch.object(os, 'chmod', side_effect=AssertionError(
                     'directory permissions must not be repaired')):
-            self.storage.ensure_directory()
+            created = credential_storages.JsonCredentialStorage(
+                os.path.join(self.temporary.name, 'new-private-directory'))
+            self.addCleanup(created.close)
         # The mode is requested on every platform; on Windows it becomes a
         # private DACL, which os.stat cannot show.  POSIX asserts the resulting
         # bits here, Windows asserts the DACL in WindowsCredentialStorageTests.
-        create.assert_any_call(self.directory, 0o700)
+        create.assert_any_call(created.directory, 0o700)
         if os.name == 'posix':
             self.assertEqual(
-                stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
+                stat.S_IMODE(os.stat(created.directory).st_mode), 0o700)
 
     async def test_existing_private_directory_is_not_changed(self):
         self.storage.ensure_directory()
@@ -152,8 +155,8 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_symlinked_credential_directory(self):
         real = os.path.join(self.temporary.name, "real")
         os.mkdir(real)
-        os.makedirs(os.path.dirname(self.directory))
-        os.symlink(real, self.directory)
+        alias = os.path.join(self.temporary.name, 'linked-credentials')
+        os.symlink(real, alias)
 
         # POSIX lstat sees a link as neither file nor directory; a Windows
         # directory link is a directory that is also a reparse point.  Both
@@ -161,7 +164,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(
                 credential_storages.CredentialStorageError,
                 "not a directory|reparse point"):
-            self.storage.load_document()
+            credential_storages.JsonCredentialStorage(alias)
 
     async def test_rejects_symlinked_json_file(self):
         self.storage.ensure_directory()
@@ -204,19 +207,17 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                 await self.storage.store_openai_login(tokens())
 
     async def test_setup_failure_after_lock_open_propagates(self):
-        directory_fd = self.storage._open_directory()
+        directory_fd = self.storage._directory_fd
         lock_fd = self.storage._open_lock_at(directory_fd)
-        with mock.patch.object(self.storage, '_open_directory',
-                               return_value=directory_fd), \
-                mock.patch.object(self.storage, '_open_lock_at',
-                                  return_value=lock_fd), \
+        with mock.patch.object(self.storage, '_open_lock_at',
+                               return_value=lock_fd), \
                 mock.patch.object(file_locks, 'try_lock_exclusive',
                                   side_effect=RuntimeError('setup failed')):
             with self.assertRaisesRegex(RuntimeError, 'setup failed'):
                 await self.storage.store_openai_login(tokens())
 
     async def test_lock_close_error_propagates(self):
-        directory_fd = self.storage._open_directory()
+        directory_fd = self.storage._directory_fd
         lock_fd = self.storage._open_lock_at(directory_fd)
         # Patch the platform close the storage actually calls: os.close on
         # POSIX, CloseHandle on Windows.  Patching os.close would inject
@@ -228,10 +229,8 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             if token == lock_fd:
                 raise OSError('lock close failed')
 
-        with mock.patch.object(self.storage, '_open_directory',
-                               return_value=directory_fd), \
-                mock.patch.object(self.storage, '_open_lock_at',
-                                  return_value=lock_fd), \
+        with mock.patch.object(self.storage, '_open_lock_at',
+                               return_value=lock_fd), \
                 mock.patch.object(private_files, 'close',
                                   side_effect=close_then_report_error):
             with self.assertRaisesRegex(OSError, 'lock close failed'):
@@ -239,12 +238,10 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
     async def test_cancellation_while_waiting_is_propagated(self):
-        directory_fd = self.storage._open_directory()
+        directory_fd = self.storage._directory_fd
         lock_fd = self.storage._open_lock_at(directory_fd)
-        with mock.patch.object(self.storage, '_open_directory',
-                               return_value=directory_fd), \
-                mock.patch.object(self.storage, '_open_lock_at',
-                                  return_value=lock_fd), \
+        with mock.patch.object(self.storage, '_open_lock_at',
+                               return_value=lock_fd), \
                 mock.patch.object(file_locks, 'try_lock_exclusive',
                                   side_effect=BlockingIOError):
             task = asyncio.create_task(self.storage.store_openai_login(tokens()))
@@ -272,7 +269,7 @@ class JsonCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             owned_by_current_user=False, group_or_other_access=False)
 
         with mock.patch.object(
-                private_files, "describe_path", return_value=facts):
+                private_files, "describe", return_value=facts):
             with self.assertRaisesRegex(
                     credential_storages.CredentialStorageError,
                     "directory is not owned"):
@@ -702,13 +699,11 @@ class PrivateDirectorySupportTests(unittest.TestCase):
     def test_ensure_directory_refuses_before_creating_anything(self):
         with tempfile.TemporaryDirectory() as temporary:
             parent = os.path.join(temporary, "loki")
-            storage = credential_storages.JsonCredentialStorage(
-                os.path.join(parent, "credentials"))
             with mock.patch.object(sys, "platform", "win32"), \
                     mock.patch.object(sys, "version_info", (3, 11, 9)):
                 with self.assertRaises(
                         credential_storages.CredentialStorageError):
-                    storage.ensure_directory()
+                    credential_storages.JsonCredentialStorage(os.path.join(parent, "credentials"))
             # Refusal must precede makedirs/mkdir: nothing may be created.
             self.assertFalse(os.path.exists(parent))
 
@@ -813,7 +808,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
             owned_by_current_user=True, group_or_other_access=True)
         with tempfile.TemporaryDirectory() as directory:
             storage = credential_storages.JsonCredentialStorage(directory)
-            directory_fd = storage._open_directory()
+            directory_fd = storage._directory_fd
             try:
                 with mock.patch.object(private_files, "describe",
                                        return_value=shared):
@@ -823,7 +818,7 @@ class WindowsCredentialFilePrimitiveTests(unittest.TestCase):
                             directory_fd,
                             credential_storages._empty_document())
             finally:
-                private_files.close(directory_fd)
+                storage.close()
             # The refused temporary file is cleaned up, not left behind.
             self.assertEqual(
                 [entry for entry in os.listdir(directory)
@@ -952,6 +947,7 @@ class WindowsCredentialStorageTests(unittest.IsolatedAsyncioTestCase):
             self.temporary.name, "loki", "credentials")
         self.storage = credential_storages.JsonCredentialStorage(
             self.directory)
+        self.addCleanup(self.storage.close)
 
     async def test_login_load_and_logout_round_trip(self):
         stored = await self.storage.store_openai_login(tokens())

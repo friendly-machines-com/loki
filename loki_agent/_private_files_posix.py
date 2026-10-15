@@ -44,6 +44,31 @@ def open_directory(path: str) -> int:
     return os.open(path, _no_follow(flags))
 
 
+def _check_name(name):
+    if not name or name in ['.', '..'] or any(part in name for part in ['/', '\\', ':']):
+        raise ValueError("state filename must be a single path component")
+
+
+def open_directory_at(directory_fd: int, name: str) -> int:
+    _check_name(name)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    return os.open(name, _no_follow(flags), dir_fd=directory_fd)
+
+
+def create_directory_at(directory_fd: int, name: str, mode: int = 0o700) -> None:
+    _check_name(name)
+    try:
+        os.mkdir(name, mode, dir_fd=directory_fd)
+    except FileExistsError:
+        pass
+
+
+def open_append_at(directory_fd: int, name: str) -> int:
+    _check_name(name)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK
+    return os.open(name, _no_follow(flags), 0o600, dir_fd=directory_fd)
+
+
 def open_read_at(directory_fd: int, name: str) -> int:
     # A regular file ignores O_NONBLOCK. A substituted FIFO must open without
     # waiting so the caller can inspect its handle and reject its type.
@@ -78,6 +103,19 @@ def unlink_at(directory_fd: int, name: str) -> None:
 
 def read(fd, size):
     return os.read(fd, size)
+
+
+def binary_file(fd, mode):
+    """Transfer an owned descriptor into a Python subprocess-compatible file."""
+    try:
+        return os.fdopen(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def seek(fd, offset, whence):
+    return os.lseek(fd, offset, whence)
 
 
 def write(fd, data):

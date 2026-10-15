@@ -67,6 +67,34 @@ class CredentialPrimitiveTests(unittest.TestCase):
         # trustee the privacy allowlist does not -- a fact to fix, not hide.
         self.assertFalse(facts.group_or_other_access)
 
+    def test_relative_subdirectory_spool_handles_survive_parent_rename(self):
+        directory = private_files.open_directory(str(self.directory))
+        self.addCleanup(private_files.close, directory)
+        private_files.create_directory_at(directory, 'session')
+        private_files.create_directory_at(directory, 'session')
+        session = private_files.open_directory_at(directory, 'session')
+        self.addCleanup(private_files.close, session)
+        with private_files.binary_file(
+                private_files.create_exclusive_at(session, 'stdout.log', 0o600), 'wb') as stream:
+            self.assertFalse(os.get_inheritable(stream.fileno()))
+            stream.write(b'original')
+        moved = self.root / 'moved'
+        self.directory.rename(moved)
+        self.directory.mkdir(mode=0o700)
+        appended = private_files.open_append_at(session, 'stdout.log')
+        try:
+            private_files.write(appended, b'-tail')
+        finally:
+            private_files.close(appended)
+        reader = private_files.open_read_at(session, 'stdout.log')
+        try:
+            self.assertEqual(private_files.seek(reader, -4, os.SEEK_END), len(b'original-'))
+            self.assertEqual(private_files.read(reader, 4), b'tail')
+        finally:
+            private_files.close(reader)
+        self.assertEqual((moved / 'session' / 'stdout.log').read_bytes(), b'original-tail')
+        self.assertEqual(list(self.directory.iterdir()), [])
+
     def test_create_read_replace_and_unlink_round_trip(self):
         directory = _private_files_windows.open_directory(str(self.directory))
         self.addCleanup(_private_files_windows.close, directory)

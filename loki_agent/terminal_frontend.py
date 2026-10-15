@@ -1981,6 +1981,7 @@ async def _run_frontend(args) -> int:
 async def _run_credential_runtime(
         args, owner_fd: int, capability_fd: int) -> int:
     runtime = None
+    session = None
     try:
         try:
             runtime = await credential_runtimes.CredentialRuntime.connect(
@@ -2003,12 +2004,14 @@ async def _run_credential_runtime(
         # ACP workers and subagents. Root broker installation belongs solely
         # to their supervisor; retaining a local fallback here would recreate
         # the asymmetric in-process credential escape hatch.
-        _core.CREDENTIALS = runtime.install(current_session())
+        session = current_session()
+        _core.CREDENTIALS = runtime.install(session)
         completed, result = await runtime.run(_run_frontend(args))
         return result if completed else 1
     finally:
         try:
-            await current_session().response_headers.save_on_exit()
+            if session is not None:
+                await session.close_state()
         finally:
             if runtime is not None:
                 await runtime.close()

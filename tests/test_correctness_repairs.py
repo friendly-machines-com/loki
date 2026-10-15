@@ -289,7 +289,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 [sys.executable, "-c", script], cwd=tmpdir)
             try:
                 deadline = asyncio.get_running_loop().time() + 3
-                while "ready" not in job_runtime._read_spool_tail(job.stdout_path):
+                while "ready" not in manager._spool_tail(job, 'stdout.log'):
                     if asyncio.get_running_loop().time() >= deadline:
                         self.fail("background process did not become ready")
                     await asyncio.sleep(0.01)
@@ -366,7 +366,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                         job = next(iter(manager.jobs.values()), None)
                         if job is not None and job.process is not None:
                             self.assertIsNone(job.process.returncode)
-                            if "ready" in job_runtime._read_spool_tail(job.stdout_path):
+                            if "ready" in manager._spool_tail(job, 'stdout.log'):
                                 break
                         if asyncio.get_running_loop().time() >= deadline:
                             self.fail("foreground process did not become ready")
@@ -538,7 +538,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 manager._close_owner_signal(job)
                 deadline = asyncio.get_running_loop().time() + 5
                 while True:
-                    reported = job_runtime._read_spool_tail(job.stdout_path)
+                    reported = manager._spool_tail(job, 'stdout.log')
                     if "closed" in reported:
                         return reported
                     if asyncio.get_running_loop().time() >= deadline:
@@ -585,7 +585,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 manager._close_owner_signal(job)
                 deadline = asyncio.get_running_loop().time() + 5
                 while True:
-                    reported = job_runtime._read_spool_tail(job.stdout_path)
+                    reported = manager._spool_tail(job, 'stdout.log')
                     if "closed" in reported:
                         return reported
                     if asyncio.get_running_loop().time() >= deadline:
@@ -676,9 +676,9 @@ class JobOwnershipContractTests(unittest.TestCase):
                     deadline = asyncio.get_running_loop().time() + 5
                     for job, marker in ((owned, 'owned-ready:'),
                                         (ordinary, 'ordinary-ready:')):
-                        while marker + job.cwd not in job_runtime._read_spool_tail(job.stdout_path):
+                        while marker + job.cwd not in manager._spool_tail(job, 'stdout.log'):
                             self.assertIsNone(job.process.returncode,
-                                              job_runtime._read_spool_tail(job.stderr_path))
+                                              manager._spool_tail(job, 'stderr.log'))
                             if asyncio.get_running_loop().time() >= deadline:
                                 self.fail('children did not become ready')
                             await asyncio.sleep(.01)
@@ -709,7 +709,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                     self.assertEqual(owned.process.returncode, 0)
                     self.assertEqual(owned.exit_code, 0)
                     self.assertEqual(owned.status, 'owner_closed')
-                    self.assertIn('owner-eof', job_runtime._read_spool_tail(owned.stdout_path))
+                    self.assertIn('owner-eof', manager._spool_tail(owned, 'stdout.log'))
                     self.assertIsNone(owned.owner_signal_fd)
                     self.assertFalse(owned.subagent_slot)
                     self.assertEqual(manager._active_subagents, 0)

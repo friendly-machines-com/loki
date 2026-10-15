@@ -123,20 +123,23 @@ def _show_openai_status(storage):
 async def run(arguments, *, program="loki", storage=None):
     parsed = _parser(program).parse_args(arguments)
     credential_storage = (
-        storage or credential_storages.JsonCredentialStorage())
-    if parsed.command == "login":
-        return await _login_openai(parsed, credential_storage)
-    if parsed.command == "status":
-        return _show_openai_status(credential_storage)
-    if parsed.command == "logout":
-        removed = (
-            await credential_storage.remove_openai_subscription())
-        if removed:
-            print("Logged out: OpenAI ChatGPT subscription")
-        else:
-            print("OpenAI ChatGPT subscription: not logged in")
-        return 0
-    raise AssertionError("unhandled authentication command")
+        storage if storage is not None else credential_storages.JsonCredentialStorage())
+    try:
+        if parsed.command == "login":
+            return await _login_openai(parsed, credential_storage)
+        if parsed.command == "status":
+            return _show_openai_status(credential_storage)
+        if parsed.command == "logout":
+            removed = await credential_storage.remove_openai_subscription()
+            if removed:
+                print("Logged out: OpenAI ChatGPT subscription")
+            else:
+                print("OpenAI ChatGPT subscription: not logged in")
+            return 0
+        raise AssertionError("unhandled authentication command")
+    finally:
+        if storage is None:
+            credential_storage.close()
 
 
 def main(arguments, *, program="loki") -> int:

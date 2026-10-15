@@ -1330,6 +1330,7 @@ class NtObjectAttributes(enum.IntFlag):
 class NtCreateOptions(enum.IntFlag):
     FILE_NON_DIRECTORY_FILE = 0x00000040
     FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+    FILE_DIRECTORY_FILE = 0x00000001
     FILE_OPEN_REPARSE_POINT = 0x00200000
 
 
@@ -1540,6 +1541,21 @@ def write_file(handle, data):
                  ctypes.byref(count), None):
         raise WindowsApiError("WriteFile failed", status=ctypes.get_last_error())
     return count.value
+
+
+def set_file_pointer(handle, offset, whence) -> int:
+    """Move a synchronous file handle's pointer; returns the new position.
+
+    ``whence`` uses the portable ``os.SEEK_*`` numbering, which matches the
+    Win32 FILE_BEGIN/FILE_CURRENT/FILE_END values.
+    """
+    move = bind("kernel32", "SetFilePointerEx", wintypes.BOOL, ctypes.c_void_p,
+                ctypes.c_int64, ctypes.POINTER(ctypes.c_int64), wintypes.DWORD)
+    position = ctypes.c_int64()
+    if not move(handle, ctypes.c_int64(offset), ctypes.byref(position), whence):
+        raise WindowsApiError("SetFilePointerEx failed",
+                              status=ctypes.get_last_error())
+    return position.value
 
 
 def flush_file(handle) -> None:
