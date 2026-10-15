@@ -248,10 +248,9 @@ def isolate_credential_directory(directory: str | None = None) -> bool:
     """Hide the credential directory in this runtime and its descendants.
 
     Production supervisors create the dedicated directory before spawning
-    every runtime, including before the first login.  The absent-directory
-    case remains useful only for runtimes constructed without persistent
-    storage, such as focused tests. Linux runtimes always set NO_NEW_PRIVS,
-    even when there is no credential directory to hide.
+    every runtime, including before the first login. A missing directory is
+    fatal: continuing uncovered would expose credentials created by a later
+    login. Tests must establish the same boundary as production.
     """
     if not sys.platform.startswith("linux"):
         return False
@@ -259,7 +258,8 @@ def isolate_credential_directory(directory: str | None = None) -> bool:
     _set_no_new_privileges(libc)
     target = credential_directory() if directory is None else directory
     if not os.path.isdir(target):
-        return False
+        raise RuntimeIsolationError(
+            "credential directory is missing or not a directory")
 
     try:
         original_cwd = os.getcwd()

@@ -9,16 +9,21 @@ import urllib.request
 import contextlib
 import io
 import os
+import shlex
+import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from loki_entrypoints import configure_container, entrypoint
+from loki_entrypoints import child_environment, configure_container, entrypoint
+from process_lifecycle_fixtures import ProcessResources
 
 from loki_agent import authentication_commands
 from loki_agent import authentications
 from loki_agent import credential_storages
+from loki_agent import formats, savefiles
 from loki_agent import credential_supervisors, http_client, oauth_logins
 from loki_agent.credentials import CredentialStore
 from tests.test_oauth_logins import jwt, response
@@ -297,6 +302,155 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AuthenticationEntrypointTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
+    def test_missing_credentials_refuse_real_runtime_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner_read, owner_write = os.pipe()
+            capability_parent, capability_child = socket.socketpair()
+            # EOF makes a regression fail rather than hang in the later
+            # capability handshake. Correct startup refuses before reaching it.
+            capability_parent.close()
+            try:
+                process = subprocess.run(
+                    [entrypoint('loki'), '--runtime',
+                     '--session-owner-fd', str(owner_read),
+                     '--credential-capability-fd', str(capability_child.fileno()),
+                     '--', '--headless'],
+                    pass_fds=[owner_read, capability_child.fileno()],
+                    cwd=directory,
+                    env=child_environment(
+                        PATH=os.environ.get('PATH', ''), HOME=directory,
+                        XDG_CONFIG_HOME=os.path.join(directory, 'config'),
+                        XDG_STATE_HOME=os.path.join(directory, 'state')),
+                    capture_output=True, text=True,
+                )
+            finally:
+                os.close(owner_read)
+                os.close(owner_write)
+                capability_child.close()
+            self.assertEqual(process.returncode, 2, process.stderr)
+            self.assertEqual(process.stdout, '')
+            self.assertIn(
+                'Security initialization error: credential directory is missing',
+                process.stderr)
+            self.assertFalse(os.path.exists(os.path.join(directory, '.loki')))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
+    def test_late_login_stays_hidden_from_live_runtime_and_tool(self):
+        async def exercise(directory):
+            workspace = os.path.join(directory, 'workspace')
+            os.mkdir(workspace)
+            storage = credential_storages.JsonCredentialStorage(
+                os.path.join(directory, 'config', 'loki', 'credentials'))
+            self.assertFalse(os.path.exists(storage.directory))
+            connected = asyncio.get_running_loop().create_future()
+
+            def accept(reader, writer):
+                connected.set_result([reader, writer])
+
+            address = os.path.join(workspace, 'control.sock')
+            server = await asyncio.start_unix_server(accept, path=address)
+            # The Bash child cannot proceed until the outside process has
+            # published credentials, so denial cannot pass merely because the
+            # token file did not exist when the tool tried to read it.
+            probe = r'''
+import socket, sys
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(sys.argv[1])
+connection.sendall(b'ready\n')
+assert connection.recv(1) == b'g'
+try:
+    with open(sys.argv[2], 'rb') as stream:
+        stream.read()
+except (FileNotFoundError, PermissionError):
+    connection.sendall(b'hidden\n')
+else:
+    connection.sendall(b'EXPOSED\n')
+connection.close()
+'''
+            command = shlex.join([
+                sys.executable, '-c', 'exec(' + repr(probe) + ')',
+                address, storage.file_path])
+            environment = child_environment(
+                PATH=os.environ.get('PATH', ''), HOME=directory,
+                XDG_CONFIG_HOME=os.path.join(directory, 'config'),
+                XDG_STATE_HOME=os.path.join(directory, 'state'),
+                LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                LOKI_MODEL='dummy', LOKI_DUMMY_TOOL_CALL=json.dumps({
+                    'name': 'Read', 'arguments': {'file_path': storage.file_path}}))
+            process = None
+            resources = None
+            status_resources = None
+            output = None
+            writer = None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    entrypoint('loki'), '--dangerously-skip-permissions',
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, cwd=workspace, env=environment)
+                resources = ProcessResources(process)
+                output = asyncio.create_task(process.communicate(
+                    f'!{command}\n/quit\n'.encode()))
+                done, _pending = await asyncio.wait(
+                    [connected, output], return_when=asyncio.FIRST_COMPLETED)
+                if connected not in done:
+                    stdout, stderr = await output
+                    self.fail(f'Runtime exited before readiness: {stdout!r} {stderr!r}')
+                reader, writer = await connected
+                self.assertEqual(await reader.readline(), b'ready\n')
+                self.assertTrue(os.path.isdir(storage.directory))
+                self.assertFalse(os.path.exists(storage.file_path))
+                late_tokens = authentications.OpenAITokenSet(
+                    access_token='late-access-secret', refresh_token='late-refresh-secret',
+                    id_token='late-id-secret', account_id='account',
+                    expires_at=10**12, last_refresh=100)
+                # This is the durable publication used by auth login, executed
+                # outside the still-running runtime's mount namespace.
+                await storage.store_openai_login(late_tokens)
+                self.assertEqual(storage.load_openai_subscription().tokens, late_tokens)
+                status = await asyncio.create_subprocess_exec(
+                    entrypoint('loki'), 'auth', 'status', 'openai',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    cwd=workspace, env=environment)
+                status_resources = ProcessResources(status)
+                status_out, status_err = await status.communicate()
+                self.assertEqual(status.returncode, 0, status_err)
+                status_resources.assert_released(self)
+                self.assertIn(b'logged in', status_out)
+                writer.write(b'g')
+                await writer.drain()
+                self.assertEqual(await reader.readline(), b'hidden\n')
+                stdout, stderr = await output
+                self.assertEqual(process.returncode, 0, stderr)
+                resources.assert_released(self)
+                for secret in [late_tokens.access_token, late_tokens.refresh_token, late_tokens.id_token]:
+                    self.assertNotIn(secret.encode(), stdout + stderr)
+                logs = os.path.join(workspace, '.loki', 'chats')
+                self.assertEqual(len(os.listdir(logs)), 1)
+                with open(os.path.join(logs, os.listdir(logs)[0]), encoding='utf-8') as stream:
+                    transcript, _todos, _state, _toolsets = savefiles.read_chat_log(stream)
+                results = [item for item in transcript if item.get('type') == 'tool_result']
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]['call_id'], 'dummy-tool-call')
+                self.assertRegex(formats.item_text(results[0]), r'Permission denied|not found')
+                self.assertNotIn(late_tokens.access_token, json.dumps(transcript))
+            finally:
+                if writer is not None:
+                    writer.close()
+                    with contextlib.suppress(ConnectionError):
+                        await writer.wait_closed()
+                server.close()
+                await server.wait_closed()
+                if status_resources is not None:
+                    await status_resources.cleanup()
+                if resources is not None:
+                    await resources.cleanup()
+                if output is not None:
+                    await output
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(exercise(directory))
+
     def test_dummy_frontend_startup_compatibility_not_subscription_consumption(self):
         with tempfile.TemporaryDirectory() as temporary:
             config_home = os.path.join(temporary, "config")

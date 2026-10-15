@@ -142,76 +142,31 @@ class LinuxIsolationTests(unittest.TestCase):
     differ, not because the property does.
     """
 
-    def test_storage_free_runtime_sets_no_new_privileges_from_known_state(self):
-        # A real child can inherit an already-set flag. This native-call seam
-        # starts at zero as well as one, so omitting the setter cannot pass.
+    def test_missing_credentials_are_fatal_from_known_privilege_states(self):
         for initial in [0, 1]:
-            with self.subTest(initial=initial), \
-                    tempfile.TemporaryDirectory() as directory:
+            with self.subTest(initial=initial), tempfile.TemporaryDirectory() as directory:
                 state = initial
-                calls = []
 
                 def prctl(*arguments):
                     nonlocal state
-                    values = list(argument.value for argument in arguments)
-                    calls.append(values)
-                    self.assertEqual(values, [38, 1, 0, 0, 0])
+                    self.assertEqual(
+                        [argument.value for argument in arguments], [38, 1, 0, 0, 0])
                     state = 1
                     return 0
 
                 libc = mock.Mock(prctl=mock.Mock(side_effect=prctl))
-                with mock.patch.object(runtime_isolations.ctypes, "CDLL",
-                                       return_value=libc), \
-                        mock.patch.object(
-                            runtime_isolations,
-                            "_unshare_user_and_mount_namespaces") as unshare:
-                    self.assertFalse(
+                with mock.patch.object(runtime_isolations.ctypes, 'CDLL', return_value=libc):
+                    with self.assertRaisesRegex(
+                            runtime_isolations.RuntimeIsolationError, 'credential directory'):
                         runtime_isolations.isolate_credential_directory(
-                            os.path.join(directory, "missing")))
+                            os.path.join(directory, 'missing'))
                     self.assertEqual(state, 1)
-                    self.assertEqual(calls, [[38, 1, 0, 0, 0]])
-                    # Repeated storage-free initialization is still protected.
-                    self.assertFalse(
-                        runtime_isolations.isolate_credential_directory(
-                            os.path.join(directory, "missing")))
-                    self.assertEqual(state, 1)
-                    self.assertEqual(calls, [[38, 1, 0, 0, 0]] * 2)
-                    unshare.assert_not_called()
-
-    def test_missing_credentials_native_privilege_transition_and_exec(self):
-        with tempfile.TemporaryDirectory() as directory:
-            code = r"""
-import ctypes
-import json
-import subprocess
-import sys
-from loki_agent.runtime_isolations import isolate_credential_directory
-
-libc = ctypes.CDLL(None)
-before = libc.prctl(39, 0, 0, 0, 0)  # PR_GET_NO_NEW_PRIVS
-if before == 1:
-    sys.exit(77)  # Irreversible inherited state cannot witness a transition.
-assert before == 0, before
-assert isolate_credential_directory(sys.argv[1]) is False
-assert libc.prctl(39, 0, 0, 0, 0) == 1
-child = subprocess.run([
-    sys.executable, "-c",
-    "import ctypes; print(ctypes.CDLL(None).prctl(39, 0, 0, 0, 0))",
-], capture_output=True, text=True, check=True, timeout=5)
-print(json.dumps({"before": before, "after": 1,
-                  "exec_child": int(child.stdout)}))
-"""
-            process = subprocess.run(
-                [sys.executable, "-c", code,
-                 os.path.join(directory, "missing")],
-                cwd=ROOT, capture_output=True, text=True, timeout=10,
-            )
-            if process.returncode == 77:
-                self.skipTest("native transition unavailable: NO_NEW_PRIVS "
-                              "was already inherited; stateful seam still runs")
-            self.assertEqual(process.returncode, 0, process.stderr)
-            self.assertEqual(json.loads(process.stdout),
-                             {"before": 0, "after": 1, "exec_child": 1})
+                    not_directory = os.path.join(directory, 'file')
+                    with open(not_directory, 'w'):
+                        pass
+                    with self.assertRaisesRegex(
+                            runtime_isolations.RuntimeIsolationError, 'not a directory'):
+                        runtime_isolations.isolate_credential_directory(not_directory)
 
     def test_no_new_privileges_failure_is_fatal_without_credentials(self):
         libc = mock.Mock()
