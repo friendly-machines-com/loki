@@ -86,6 +86,8 @@ PROCESS_VM_READ = 0x0010
 PROCESS_VM_WRITE = 0x0020
 PROCESS_DUP_HANDLE = 0x0040
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_ASSIGN_PRIMARY = 0x0001
+TOKEN_DUPLICATE = 0x0002
 TOKEN_QUERY = 0x0008
 WRITE_RESTRICTED = 0x00000008
 DACL_SECURITY_INFORMATION = 0x00000004
@@ -586,8 +588,46 @@ class StateTokenProbe:
             for target in allocated:
                 self.n.local_free(target)
 
-    def launch(self, token, manifest_path, role, streams, observe=None):
-        """Use the existing AsUser binding, with an explicit stdio handle list."""
+    def compare_launches(self, primary, duplicate, role_sid, manifest_path, context, streams):
+        """Compare token lineage and filter flags without executing child code."""
+        for origin, source in [['primary', primary], ['duplicate', duplicate]]:
+            print(json.dumps({'probe': 'state-token-launch', 'phase': 'source',
+                              'context': context, 'source': origin,
+                              'token': self.api.snapshot(source)}), flush=True)
+            for variant, flags in [['unchanged', None], ['restrict-all', 0],
+                                   ['restrict-writes', WRITE_RESTRICTED]]:
+                row = {'probe': 'state-token-launch', 'context': context,
+                       'source': origin, 'variant': variant, 'flags': flags,
+                       'phase': 'filter' if flags is not None else 'inspect'}
+                try:
+                    with ExitStack() as tokens:
+                        token = source
+                        if flags is not None:
+                            try:
+                                token = self.filtered(source, role_sid, flags=flags)
+                            except OSError as error:
+                                row.update({'created': False,
+                                            'winerror': getattr(error, 'winerror', None),
+                                            'error': str(error)})
+                                continue
+                            tokens.callback(self.api.close, token)
+                        row['phase'] = 'inspect'
+                        row['token'] = self.api.snapshot(token)
+                        row['phase'] = 'create'
+                        # All inputs except the token are identical. Creation
+                        # errors are returned only at the native call below;
+                        # inspection or cleanup errors must still abort the probe.
+                        row.update(self.launch(token, manifest_path, 'control', streams,
+                                               suspended_only=True))
+                finally:
+                    print(json.dumps(row), flush=True)
+
+    def launch(self, token, manifest_path, role, streams, observe=None, *, suspended_only=False):
+        """Use the same AsUser call for the scenario and suspended diagnostics.
+
+        A diagnostic child is inspected, never resumed, and retired by the
+        same process-handle owner as an ordinary scenario child.
+        """
         import msvcrt
 
         native = self.n
@@ -617,10 +657,16 @@ class StateTokenProbe:
                     attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                     inherited, C.sizeof(inherited), None, None))
                 print(json.dumps({'probe': 'state-token', 'phase': 'create', 'role': role}), flush=True)
-                native.check(self.api.create_as_user(
-                    token, sys.executable, command, None, None, True,
-                    CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, None,
-                    str(Path(manifest_path).parent), C.byref(startup), C.byref(child)))
+                try:
+                    native.check(self.api.create_as_user(
+                        token, sys.executable, command, None, None, True,
+                        CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, None,
+                        str(Path(manifest_path).parent), C.byref(startup), C.byref(child)))
+                except OSError as error:
+                    if not suspended_only:
+                        raise
+                    return {'created': False, 'winerror': getattr(error, 'winerror', None),
+                            'error': str(error)}
                 # retire() both reaps and closes the process handle.
                 cleanup.callback(self.api.retire, child.process)
                 cleanup.callback(lambda: native.check(native.close(child.thread)))
@@ -634,6 +680,12 @@ class StateTokenProbe:
                 self.api.close(actual_token)
             in_job = W.BOOL()
             native.check(native.in_job(child.process, None, C.byref(in_job)))
+            if suspended_only:
+                # The unrestricted standard-user control need not already be
+                # in a job. No diagnostic child ever executes, and retire()
+                # terminates it before this result reaches the caller.
+                return {'created': True, 'winerror': 0, 'kernel_token': snapshot,
+                        'in_job': bool(in_job.value)}
             if not in_job.value:
                 raise RuntimeError('state child escaped the owning kill-on-close job')
             print(json.dumps({'state_child_created': role, 'pid': child.pid,
@@ -868,12 +920,11 @@ def state_writer_child(manifest_path):
     native.check(probe.api.parse_sid(manifest['role_sid'], C.byref(role_sid)))
     with ExitStack() as cleanup:
         cleanup.callback(native.local_free, role_sid)
-        current = probe.api.token(native.current_process(), TOKEN_QUERY | 2)
-        try:
-            source = probe.api.clone(current, TOKEN_QUERY | 2 | 1)
-            cleanup.callback(probe.api.close, source)
-        finally:
-            probe.api.close(current)
+        current = probe.api.token(
+            native.current_process(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY)
+        cleanup.callback(probe.api.close, current)
+        source = probe.api.clone(current, TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY)
+        cleanup.callback(probe.api.close, source)
         report = {'writer_token': probe.api.snapshot(source), 'children': []}
         probe.compare_filters(source, role_sid, 'appcontainer')
         memory = C.create_string_buffer(b'SYNTHETIC-STATE-WRITER')
@@ -893,6 +944,11 @@ def state_writer_child(manifest_path):
             raise RuntimeError('writer memory control failed')
         native.write_all(handle, b'writer control')
         stdin = cleanup.enter_context(open(Path(manifest['workspace']) / 'stdin', 'rb'))
+        diagnostic_streams = [stdin, *[
+            cleanup.enter_context(open(Path(manifest['state']) / name, 'wb', buffering=0))
+            for name in ['launch.stdout', 'launch.stderr']]]
+        probe.compare_launches(current, source, role_sid, manifest_path,
+                               'appcontainer', diagnostic_streams)
         for role in ['control', 'filtered']:
             token = source if role == 'control' else probe.filtered(source, role_sid)
             try:
@@ -3138,67 +3194,181 @@ class AppContainerMarshallingTests(unittest.TestCase):
 
 class StateTokenProbeTests(unittest.TestCase):
     def test_launch_cleanup_has_exactly_one_process_handle_owner(self):
-        native = mock.Mock()
-        closed = []
+        for suspended_only, failure in [[False, None], [True, None], [False, 'create'],
+                                        [True, 'create'], [True, 'inspection'], [True, 'cleanup']]:
+            with self.subTest(suspended_only=suspended_only, failure=failure):
+                native = mock.Mock()
+                closed = []
+                error = OSError(str(failure) + ' failed')
+                error.winerror = 1314 if failure == 'create' else 6
 
-        def close(handle):
-            if handle in closed:
-                return False
-            closed.append(handle)
-            return True
+                def close(handle):
+                    if handle in closed:
+                        return False
+                    closed.append(handle)
+                    return not (failure == 'cleanup' and handle == 88)
 
-        def check(value):
-            if not value:
-                raise OSError('invalid or already closed handle')
-            return value
+                def check(value):
+                    if not value:
+                        raise error
+                    return value
 
-        def initialize(attributes, count, flags, size):
-            C.cast(size, C.POINTER(C.c_size_t)).contents.value = 64
-            return attributes is not None
+                def initialize(attributes, count, flags, size):
+                    C.cast(size, C.POINTER(C.c_size_t)).contents.value = 64
+                    return attributes is not None
 
-        def create(*arguments):
-            child = C.cast(arguments[-1], C.POINTER(ProcessInfos)).contents
-            child.process, child.thread, child.pid = 77, 88, 123
-            return True
+                def create(*arguments):
+                    self.assertEqual(arguments[0], 17)
+                    self.assertEqual(arguments[6], CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT)
+                    if failure == 'create':
+                        return False
+                    child = C.cast(arguments[-1], C.POINTER(ProcessInfos)).contents
+                    child.process, child.thread, child.pid = 77, 88, 123
+                    return True
 
-        def in_job(process, job, result):
-            C.cast(result, C.POINTER(W.BOOL)).contents.value = True
-            return True
+                def in_job(process, job, result):
+                    # The broker control may have no enclosing job, but it
+                    # must still retire its suspended child without running it.
+                    C.cast(result, C.POINTER(W.BOOL)).contents.value = not suspended_only
+                    return True
 
-        native.close.side_effect = close
-        native.check = check
-        native.initialize.side_effect = initialize
-        native.update.return_value = True
-        native.in_job.side_effect = in_job
-        native.resume.return_value = 1
-        native.wait.return_value = 0
-        native.exit_code.return_value = True
-        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
-        api.n = native
-        api.create_as_user = create
-        api.token = mock.Mock(return_value=99)
-        snapshot = {'app': 1, 'package': 'package', 'user': 'owner', 'restricting_sids': []}
-        api.snapshot = mock.Mock(return_value=snapshot)
-        probe = StateTokenProbe.__new__(StateTokenProbe)
-        probe.n, probe.api = native, api
-        streams = [mock.Mock() for _ in range(3)]
-        for index, stream in enumerate(streams):
-            stream.fileno.return_value = index
-        crt = mock.Mock()
-        crt.get_osfhandle.side_effect = lambda descriptor: descriptor + 1000
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.dict(sys.modules, {'msvcrt': crt}), \
-                mock.patch.object(os, 'get_handle_inheritable', return_value=False, create=True), \
-                mock.patch.object(os, 'set_handle_inheritable', create=True):
-            manifest = Path(directory) / 'manifest.json'
-            manifest.write_text(json.dumps({'owner': 'owner', 'package': 'package'}))
-            (Path(directory) / 'control.json').write_text(json.dumps({'role': 'control'}))
-            probe.launch(17, manifest, 'control', streams)
-        # This runs the real Escapes.retire(), including its close. A second
-        # close registration makes the same launch fail, as it did on CI.
-        self.assertEqual(closed, [99, 88, 77])
-        native.delete_attributes.assert_called_once()
-        native.terminate.assert_not_called()
+                native.close.side_effect = close
+                native.check = check
+                native.initialize.side_effect = initialize
+                native.update.return_value = True
+                native.in_job.side_effect = in_job
+                native.resume.return_value = 1
+                native.wait.return_value = 0
+                if suspended_only and failure != 'create':
+                    native.wait.side_effect = [258, 0]
+                native.terminate.return_value = True
+                native.exit_code.return_value = True
+                api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+                api.n = native
+                api.create_as_user = create
+                api.token = mock.Mock(return_value=99)
+                snapshot = {'app': 1, 'package': 'package', 'user': 'owner', 'restricting_sids': []}
+                api.snapshot = mock.Mock(return_value=snapshot)
+                if failure == 'inspection':
+                    api.snapshot.side_effect = error
+                probe = StateTokenProbe.__new__(StateTokenProbe)
+                probe.n, probe.api = native, api
+                streams = [mock.Mock() for _ in range(3)]
+                for index, stream in enumerate(streams):
+                    stream.fileno.return_value = index
+                crt = mock.Mock()
+                crt.get_osfhandle.side_effect = lambda descriptor: descriptor + 1000
+                with tempfile.TemporaryDirectory() as directory, \
+                        mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                        mock.patch.object(os, 'get_handle_inheritable', return_value=False, create=True), \
+                        mock.patch.object(os, 'set_handle_inheritable', create=True) as inheritance:
+                    manifest = Path(directory) / 'manifest.json'
+                    manifest.write_text(json.dumps({'owner': 'owner', 'package': 'package'}))
+                    (Path(directory) / 'control.json').write_text(json.dumps({'role': 'control'}))
+                    if failure in ['inspection', 'cleanup'] or (failure == 'create' and not suspended_only):
+                        with self.assertRaisesRegex(OSError, failure):
+                            probe.launch(17, manifest, 'control', streams, suspended_only=suspended_only)
+                    else:
+                        result = probe.launch(17, manifest, 'control', streams,
+                                              suspended_only=suspended_only)
+                        if failure == 'create':
+                            self.assertEqual(result, {'created': False, 'winerror': 1314,
+                                                      'error': str(error)})
+                        elif suspended_only:
+                            self.assertEqual(result, {'created': True, 'winerror': 0,
+                                                      'kernel_token': snapshot, 'in_job': False})
+                    self.assertEqual(inheritance.call_args_list, [
+                        *[mock.call(handle, True) for handle in [1000, 1001, 1002]],
+                        *[mock.call(handle, False) for handle in [1000, 1001, 1002]]])
+                # Run the real retire(), including its close, on every created
+                # process. Even failed inspection/thread close cannot skip it.
+                self.assertEqual(closed, [] if failure == 'create' else [99, 88, 77])
+                native.delete_attributes.assert_called_once()
+                if suspended_only and failure != 'create':
+                    native.terminate.assert_called_once_with(77, 1)
+                else:
+                    native.terminate.assert_not_called()
+                if suspended_only or failure is not None:
+                    native.resume.assert_not_called()
+                else:
+                    native.resume.assert_called_once_with(88)
+
+    def test_launch_comparisons_preserve_sources_flags_and_native_failures(self):
+        for context in ['standard-user', 'appcontainer']:
+            for failure in [None, 'filter', 'create']:
+                with self.subTest(context=context, failure=failure):
+                    probe = StateTokenProbe.__new__(StateTokenProbe)
+                    probe.api = mock.Mock()
+                    snapshot = {'user': 'owner', 'app': int(context == 'appcontainer'),
+                                'restricting_sids': []}
+                    probe.api.snapshot.return_value = snapshot
+                    error = OSError('filter failed')
+                    error.winerror = 87
+                    probe.filtered = mock.Mock(side_effect=[
+                        error if failure == 'filter' else 21, 22, 23, 24])
+                    success = {'created': True, 'winerror': 0, 'kernel_token': snapshot, 'in_job': True}
+                    rejected = {'created': False, 'winerror': 1314, 'error': 'privilege not held'}
+                    probe.launch = mock.Mock(return_value=rejected if failure == 'create' else success)
+                    streams = [mock.Mock() for _ in range(3)]
+                    role = HANDLE(25)
+                    with mock.patch('builtins.print') as output:
+                        probe.compare_launches(17, 18, role, '/manifest', context, streams)
+                    rows = [json.loads(call.args[0]) for call in output.call_args_list]
+                    results = [row for row in rows if row['phase'] != 'source']
+                    self.assertEqual([row['token'] for row in rows if row['phase'] == 'source'],
+                                     [snapshot, snapshot])
+                    self.assertEqual([row['source'] for row in results],
+                                     ['primary'] * 3 + ['duplicate'] * 3)
+                    self.assertEqual([row['variant'] for row in results],
+                                     ['unchanged', 'restrict-all', 'restrict-writes'] * 2)
+                    self.assertEqual([row['flags'] for row in results], [None, 0, 8] * 2)
+                    self.assertTrue(all(row['context'] == context for row in results))
+                    self.assertEqual(probe.filtered.call_args_list, [
+                        mock.call(17, role, flags=0), mock.call(17, role, flags=8),
+                        mock.call(18, role, flags=0), mock.call(18, role, flags=8)])
+                    inputs = [17, 21, 22, 18, 23, 24]
+                    if failure == 'filter':
+                        inputs.remove(21)
+                        self.assertEqual(results[1]['phase'], 'filter')
+                        self.assertFalse(results[1]['created'])
+                        self.assertEqual(results[1]['winerror'], 87)
+                    self.assertEqual(probe.launch.call_args_list, [
+                        mock.call(token, '/manifest', 'control', streams, suspended_only=True)
+                        for token in inputs])
+                    for row in results:
+                        self.assertNotIn('denied', row)
+                        if row['phase'] == 'create':
+                            self.assertEqual(row['created'], failure != 'create')
+                            self.assertEqual(row['winerror'], 1314 if failure == 'create' else 0)
+                    self.assertEqual(probe.api.close.call_args_list, [
+                        mock.call(token) for token in [21, 22, 23, 24]
+                        if token != 21 or failure != 'filter'])
+
+    def test_launch_comparison_inspection_and_cleanup_errors_are_not_native_rejections(self):
+        for failure in ['inspection', 'cleanup']:
+            with self.subTest(failure=failure):
+                probe = StateTokenProbe.__new__(StateTokenProbe)
+                probe.api = mock.Mock()
+                probe.api.snapshot.return_value = {}
+                probe.filtered = mock.Mock(return_value=21)
+                error = OSError(failure + ' failed')
+                success = {'created': True, 'winerror': 0, 'kernel_token': {}, 'in_job': True}
+                if failure == 'inspection':
+                    probe.launch = mock.Mock(side_effect=[success, error])
+                else:
+                    probe.launch = mock.Mock(return_value=success)
+                    probe.api.close.side_effect = error
+                with mock.patch('builtins.print') as output:
+                    with self.assertRaisesRegex(OSError, failure):
+                        probe.compare_launches(17, 18, HANDLE(25), '/manifest', 'appcontainer', [])
+                row = json.loads(output.call_args.args[0])
+                self.assertEqual(row['phase'], 'create')
+                if failure == 'inspection':
+                    self.assertNotIn('created', row)
+                else:
+                    self.assertTrue(row['created'])
+                probe.api.close.assert_called_once_with(21)
+                self.assertEqual(probe.launch.call_count, 2)
 
     def test_restricting_sid_and_write_only_flag_reach_native_call(self):
         probe = StateTokenProbe.__new__(StateTokenProbe)
@@ -3393,16 +3563,6 @@ class AppContainerTests(unittest.TestCase):
             (identifier >> 32) & 0xFFFFFFFF, identifier & 0xFFFFFFFF)
         native.check(probe.api.parse_sid(role, C.byref(role_sid)))
         self.addCleanup(lambda: native.local_free(role_sid))
-        with ExitStack() as tokens:
-            current = probe.api.token(native.current_process(), TOKEN_QUERY | 2)
-            try:
-                source = probe.api.clone(current, TOKEN_QUERY | 2 | 1)
-                tokens.callback(probe.api.close, source)
-            finally:
-                probe.api.close(current)
-            # Match the contained writer's primary-token type and handle rights.
-            # These diagnostic tokens are closed here, never passed to a child.
-            probe.compare_filters(source, role_sid, 'standard-user')
         grant = subprocess.run(
             ['icacls.exe', str(stage), '/grant', '*%s:(OI)(CI)RX' % package, '/T', '/Q'],
             capture_output=True, text=True)
@@ -3458,6 +3618,19 @@ class AppContainerTests(unittest.TestCase):
             'setup': str(setup / 'ledger'), 'credentials': str(credentials / 'tokens'),
             'configuration': str(configuration / 'SYSTEM.md'),
             'owner': owner, 'package': package, 'role_sid': role}))
+        with ExitStack() as diagnostics:
+            primary = probe.api.token(
+                native.current_process(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY)
+            diagnostics.callback(probe.api.close, primary)
+            duplicate = probe.api.clone(
+                primary, TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY)
+            diagnostics.callback(probe.api.close, duplicate)
+            streams = [diagnostics.enter_context(open(workspace / 'stdin', 'rb')), *[
+                diagnostics.enter_context(open(state / name, 'wb', buffering=0))
+                for name in ['launch.stdout', 'launch.stderr']]]
+            probe.compare_filters(duplicate, role_sid, 'standard-user')
+            probe.compare_launches(primary, duplicate, role_sid, manifest,
+                                   'standard-user', streams)
         log = root / 'state-probe.log'
 
         def live_diagnostics(process, _job):
