@@ -30,6 +30,14 @@ windows_escapes.py probes selected token and ShellExecute/WMI launch routes;
 its documented limits remain distinct from complete escape resistance.
 """
 
+import sys
+
+# Emit before imports so a bootstrap/import stall is not mistaken for a
+# readiness-handshake stall. Keep this record independent of those imports.
+if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-access':
+    print('{"probe": "state-progress", "phase": "python-entry"}',
+          file=sys.stderr, flush=True)
+
 from contextlib import ExitStack
 import ctypes as C
 from ctypes import wintypes as W
@@ -40,18 +48,32 @@ from pathlib import Path
 import runpy
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 import uuid
 
+
+def state_progress(phase, **details):
+    print(json.dumps({'probe': 'state-progress', 'phase': phase,
+                      'pid': os.getpid(), 'at_ns': time.monotonic_ns(), **details}),
+          file=sys.stderr, flush=True)
+
+
+if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-access':
+    state_progress('stdlib-imports-ready', mode=sys.argv[1:2])
+    state_progress('primitives-load-before')
 # Explicit sibling loading also works under isolated (-I) Python. This imports
 # only the existing standalone probe declarations, never the Loki runtime.
 primitives = runpy.run_path(str(Path(__file__).with_name(
     'test_windows_primitives.py')))
+if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-access':
+    state_progress('primitives-load-after')
+    state_progress('escapes-load-before')
 escape_helpers = runpy.run_path(str(Path(__file__).with_name('windows_escapes.py')))
+if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-access':
+    state_progress('escapes-load-after')
 NativeCalls = primitives['NativeCalls']
 Guids = escape_helpers['Guids']
 HANDLE = C.c_void_p
@@ -690,19 +712,31 @@ class StateTokenProbe:
                 raise RuntimeError('state child escaped the owning kill-on-close job')
             print(json.dumps({'state_child_created': role, 'pid': child.pid,
                               'token': snapshot, 'in_job': bool(in_job.value)}), flush=True)
+            state_progress('launch-manifest-read-before', role=role, child_pid=child.pid)
             manifest = json.loads(Path(manifest_path).read_text())
+            state_progress('launch-manifest-read-after', role=role, child_pid=child.pid)
             if (snapshot['app'] != 1 or snapshot['package'] != manifest['package']
                     or snapshot['user'] != manifest['owner']):
                 raise RuntimeError('state child has the wrong suspended identity')
             if role in ['filtered', 'duplicated', 'refiltered'] and not any(
                     sid == manifest['role_sid'] for sid, _flags in snapshot['restricting_sids']):
                 raise RuntimeError('suspended child lost its write restriction')
-            native.check(native.resume(child.thread) != 0xffffffff)
+            state_progress('resume-before', role=role, child_pid=child.pid)
+            previous_suspend_count = native.resume(child.thread)
+            state_progress('resume-after', role=role, child_pid=child.pid,
+                           previous_suspend_count=previous_suspend_count)
+            native.check(previous_suspend_count != 0xffffffff)
             if observe is not None:
+                state_progress('observer-enter', role=role, child_pid=child.pid)
                 observe(child.process)
+                state_progress('observer-return', role=role, child_pid=child.pid)
             # The existing CI supervisor owns the budget; no probe-local
             # execution deadline is added here.
-            if native.wait(child.process, 0xffffffff) != 0:
+            state_progress('child-exit-wait-before', role=role, child_pid=child.pid)
+            wait_result = native.wait(child.process, 0xffffffff)
+            state_progress('child-exit-wait-after', role=role, child_pid=child.pid,
+                           wait_result=wait_result)
+            if wait_result != 0:
                 raise RuntimeError('state probe process wait failed')
             code = ULONG()
             native.check(native.exit_code(child.process, C.byref(code)))
@@ -725,6 +759,7 @@ def state_access_report(probe, manifest, role):
     rows = []
 
     def observe(name, action, expected):
+        state_progress('operation-before', role=role, operation=name)
         row = access_outcome(name, action)
         row['expected'] = expected
         rows.append(row)
@@ -854,30 +889,53 @@ def recover_state_parent_token(probe, manifest):
 
 
 def state_access_child(manifest_path, role):
+    state_progress('child-enter', role=role)
+    state_progress('child-manifest-read-before', role=role)
     manifest = json.loads(Path(manifest_path).read_text())
-    probe = StateTokenProbe(AppContainers())
+    state_progress('child-manifest-read-after', role=role)
+    state_progress('child-native-init-before', role=role)
+    native = AppContainers()
+    state_progress('child-native-init-after', role=role)
+    state_progress('child-probe-init-before', role=role)
+    probe = StateTokenProbe(native)
+    state_progress('child-probe-init-after', role=role)
+    state_progress('child-token-open-before', role=role)
     source = probe.api.token(probe.n.current_process(), TOKEN_QUERY)
     try:
+        state_progress('child-token-open-after', role=role)
+        state_progress('child-token-snapshot-before', role=role)
         snapshot = probe.api.snapshot(source)
+        state_progress('child-token-snapshot-after', role=role)
         if (snapshot['app'] != 1 or snapshot['package'] != manifest['package']
                 or snapshot['user'] != manifest['owner']):
             raise RuntimeError('state witness has an unexpected token identity')
         if role not in ['control', 'recovered'] and not any(
                 sid == manifest['role_sid'] for sid, _flags in snapshot['restricting_sids']):
             raise RuntimeError('state witness has no restricting SID')
+        state_progress('child-identity-verified', role=role)
         if role == 'filtered':
             workspace = Path(manifest['workspace'])
+            state_progress('child-ready-write-before', role=role, path=str(workspace / 'filtered-ready'))
             (workspace / 'filtered-ready').write_text('ready')
+            state_progress('child-ready-write-after', role=role)
+            state_progress('child-publication-wait', role=role, path=str(workspace / 'writer-published'))
             while not (workspace / 'writer-published').exists():
                 time.sleep(0.01)
+            state_progress('child-publication-observed', role=role)
+            state_progress('child-live-state-read-before', role=role)
             if (Path(manifest['state']) / 'published-later').read_bytes() != b'owner publication':
                 raise RuntimeError('filtered child did not see the live owner publication')
+            state_progress('child-live-state-read-after', role=role)
+        state_progress('child-operations-before', role=role)
         report = {'role': role, 'token': snapshot,
                   'operations': state_access_report(probe, manifest, role), 'children': []}
+        state_progress('child-operations-after', role=role)
         if role == 'filtered':
+            state_progress('child-descendant-before', role=role)
             result = subprocess.run(
                 [sys.executable, '-I', '-u', __file__, '--state-access', manifest_path, 'descendant'],
                 stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, close_fds=True)
+            state_progress('child-descendant-after', role=role, returncode=result.returncode)
             if result.returncode:
                 raise RuntimeError('ordinary restricted descendant failed')
             report['children'].append({'report': json.loads(
@@ -902,7 +960,9 @@ def state_access_child(manifest_path, role):
                 attempt = access_outcome(child_role + '-launch', relaunch)
                 attempt['expected'] = 'characterized'
                 report['operations'].append(attempt)
+        state_progress('child-report-write-before', role=role)
         (Path(manifest_path).parent / (role + '.json')).write_text(json.dumps(report))
+        state_progress('child-report-write-after', role=role)
     finally:
         probe.api.close(source)
 
@@ -959,15 +1019,21 @@ def state_writer_child(manifest_path):
 
                 def publish(process):
                     workspace = Path(manifest['workspace'])
+                    state_progress('writer-ready-wait', role=role, path=str(workspace / 'filtered-ready'))
                     while not (workspace / 'filtered-ready').exists():
                         if native.wait(process, 0) != 258:
                             raise RuntimeError('filtered child exited before its workspace control')
                         time.sleep(0.01)
+                    state_progress('writer-ready-observed', role=role)
                     state = Path(manifest['state'])
                     temporary = state / '.owner-publication'
+                    state_progress('writer-publication-before', role=role)
                     temporary.write_bytes(b'owner publication')
                     os.replace(temporary, state / 'published-later')
+                    state_progress('writer-publication-after', role=role)
+                    state_progress('writer-signal-before', role=role, path=str(workspace / 'writer-published'))
                     (workspace / 'writer-published').write_text('ready')
+                    state_progress('writer-signal-after', role=role)
 
                 report['children'].append(probe.launch(
                     token, manifest_path, role, [stdin, stdout, stderr],
@@ -3195,10 +3261,145 @@ class AppContainerMarshallingTests(unittest.TestCase):
 
 
 class StateTokenProbeTests(unittest.TestCase):
+    def test_bootstrap_checkpoints_precede_staged_helper_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(__file__).resolve()
+            incomplete = Path(directory) / original.name
+            shutil.copyfile(original, incomplete)
+            for script in [original, incomplete]:
+                with self.subTest(script=script):
+                    result = subprocess.run(
+                        [sys.executable, '-I', '-u', str(script), '--state-access',
+                         str(Path(directory) / 'missing-manifest.json'), 'filtered'], cwd=directory,
+                        capture_output=True, encoding='utf-8', errors='replace')
+                    rows = [json.loads(line) for line in result.stderr.splitlines()
+                            if line.startswith('{"probe": "state-progress"')]
+                    expected = ['python-entry', 'stdlib-imports-ready', 'primitives-load-before']
+                    if script == original:
+                        expected.extend(['primitives-load-after', 'escapes-load-before', 'escapes-load-after',
+                                         'child-dispatch', 'child-enter', 'child-manifest-read-before'])
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('FileNotFoundError', result.stderr)
+                    self.assertEqual([row['phase'] for row in rows], expected)
+                    self.assertEqual(rows[1]['mode'], ['--state-access'])
+                    self.assertTrue(all(isinstance(row['pid'], int) for row in rows[1:]))
+                    times = [row['at_ns'] for row in rows[1:]]
+                    self.assertEqual(times, sorted(times))
+            help_result = subprocess.run(
+                [sys.executable, '-I', '-u', str(original), '-h'], cwd=directory,
+                capture_output=True, encoding='utf-8', errors='replace')
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+            self.assertNotIn('state-progress', help_result.stderr)
+
+    def test_child_checkpoints_stop_at_the_failing_startup_or_handshake_step(self):
+        expected = [
+            'child-enter', 'child-manifest-read-before', 'child-manifest-read-after',
+            'child-native-init-before', 'child-native-init-after', 'child-probe-init-before',
+            'child-probe-init-after', 'child-token-open-before', 'child-token-open-after',
+            'child-token-snapshot-before', 'child-token-snapshot-after', 'child-identity-verified',
+            'child-ready-write-before', 'child-ready-write-after', 'child-publication-wait',
+            'child-publication-observed', 'child-live-state-read-before', 'child-live-state-read-after',
+            'child-operations-before']
+        for failure, last_phase, owns_token in [
+                ['manifest', 'child-manifest-read-before', False],
+                ['native-init', 'child-native-init-before', False],
+                ['probe-init', 'child-probe-init-before', False],
+                ['token-open', 'child-token-open-before', False],
+                ['snapshot', 'child-token-snapshot-before', True],
+                ['ready-write', 'child-ready-write-before', True],
+                ['live-read', 'child-live-state-read-before', True],
+                ['operations', 'child-operations-before', True]]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workspace, state = root / 'workspace', root / 'state'
+                workspace.mkdir()
+                state.mkdir()
+                manifest = workspace / 'manifest.json'
+                role_sid = 'S-1-5-21-1-2-3-4'
+                if failure != 'manifest':
+                    manifest.write_text(json.dumps({
+                        'workspace': str(workspace), 'state': str(state),
+                        'owner': 'owner', 'package': 'package', 'role_sid': role_sid}))
+                native, probe = mock.Mock(), mock.Mock()
+                probe.n = native
+                native.current_process.return_value = 99
+                probe.api.token.return_value = 17
+                probe.api.snapshot.return_value = {
+                    'user': 'owner', 'app': 1, 'package': 'package', 'restricting_sids': [[role_sid, 7]]}
+                error = RuntimeError('injected ' + failure)
+                constructor = mock.Mock(return_value=native)
+                probe_constructor = mock.Mock(return_value=probe)
+                if failure == 'native-init':
+                    constructor.side_effect = error
+                if failure == 'probe-init':
+                    probe_constructor.side_effect = error
+                if failure == 'token-open':
+                    probe.api.token.side_effect = error
+                if failure == 'snapshot':
+                    probe.api.snapshot.side_effect = error
+                write_text, read_bytes = Path.write_text, Path.read_bytes
+
+                def write(path, *args, **kwargs):
+                    if failure == 'ready-write' and path == workspace / 'filtered-ready':
+                        raise error
+                    return write_text(path, *args, **kwargs)
+
+                def read(path, *args, **kwargs):
+                    if failure == 'live-read' and path == state / 'published-later':
+                        raise error
+                    return read_bytes(path, *args, **kwargs)
+
+                def publish(_seconds):
+                    self.assertEqual(json.loads(output.call_args.args[0])['phase'], 'child-publication-wait')
+                    self.assertEqual((workspace / 'filtered-ready').read_text(), 'ready')
+                    (state / 'published-later').write_bytes(b'owner publication')
+                    (workspace / 'writer-published').write_text('ready')
+
+                with mock.patch.dict(state_access_child.__globals__, {
+                        'AppContainers': constructor, 'StateTokenProbe': probe_constructor,
+                        'state_access_report': mock.Mock(side_effect=error)}), \
+                        mock.patch.object(Path, 'write_text', new=write), \
+                        mock.patch.object(Path, 'read_bytes', new=read), \
+                        mock.patch.object(time, 'sleep', side_effect=publish) as sleep, \
+                        mock.patch('builtins.print') as output:
+                    if failure == 'manifest':
+                        with self.assertRaises(FileNotFoundError):
+                            state_access_child(str(manifest), 'filtered')
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'injected ' + failure):
+                            state_access_child(str(manifest), 'filtered')
+                rows = [json.loads(call.args[0]) for call in output.call_args_list]
+                self.assertEqual([row['phase'] for row in rows], expected[:expected.index(last_phase) + 1])
+                self.assertTrue(all(row['role'] == 'filtered' for row in rows))
+                if owns_token:
+                    probe.api.close.assert_called_once_with(17)
+                else:
+                    probe.api.close.assert_not_called()
+                if failure in ['live-read', 'operations']:
+                    sleep.assert_called_once()
+                else:
+                    sleep.assert_not_called()
+
+    def test_operation_checkpoint_precedes_the_action_and_no_result_is_invented(self):
+        def stop(name, action):
+            row = json.loads(output.call_args.args[0])
+            self.assertEqual(row['phase'], 'operation-before')
+            self.assertEqual(row['operation'], name)
+            raise RuntimeError('blocked operation')
+
+        with mock.patch('builtins.print') as output, \
+                mock.patch.dict(state_access_report.__globals__, {'access_outcome': stop}):
+            with self.assertRaisesRegex(RuntimeError, 'blocked operation'):
+                state_access_report(mock.Mock(), {'workspace': '/workspace', 'state': '/state'}, 'control')
+        self.assertEqual(output.call_count, 1)
+        self.assertEqual(json.loads(output.call_args.args[0])['role'], 'control')
+
     def test_launch_cleanup_has_exactly_one_process_handle_owner(self):
-        for suspended_only, failure in [[False, None], [True, None], [False, 'create'],
-                                        [True, 'create'], [True, 'inspection'], [True, 'cleanup']]:
-            with self.subTest(suspended_only=suspended_only, failure=failure):
+        for suspended_only, failure, resume_count in [
+                [False, None, 1], [False, None, 2], [True, None, 1],
+                [False, 'create', 1], [True, 'create', 1],
+                [True, 'inspection', 1], [True, 'cleanup', 1], [False, 'resume', 0xffffffff]]:
+            with self.subTest(suspended_only=suspended_only, failure=failure, resume_count=resume_count):
                 native = mock.Mock()
                 closed = []
                 error = OSError(str(failure) + ' failed')
@@ -3239,9 +3440,9 @@ class StateTokenProbeTests(unittest.TestCase):
                 native.initialize.side_effect = initialize
                 native.update.return_value = True
                 native.in_job.side_effect = in_job
-                native.resume.return_value = 1
+                native.resume.return_value = resume_count
                 native.wait.return_value = 0
-                if suspended_only and failure != 'create':
+                if (suspended_only and failure != 'create') or failure == 'resume':
                     native.wait.side_effect = [258, 0]
                 native.terminate.return_value = True
                 native.exit_code.return_value = True
@@ -3260,18 +3461,21 @@ class StateTokenProbeTests(unittest.TestCase):
                     stream.fileno.return_value = index
                 crt = mock.Mock()
                 crt.get_osfhandle.side_effect = lambda descriptor: descriptor + 1000
+                observer = mock.Mock()
                 with tempfile.TemporaryDirectory() as directory, \
                         mock.patch.dict(sys.modules, {'msvcrt': crt}), \
                         mock.patch.object(os, 'get_handle_inheritable', return_value=False, create=True), \
-                        mock.patch.object(os, 'set_handle_inheritable', create=True) as inheritance:
+                        mock.patch.object(os, 'set_handle_inheritable', create=True) as inheritance, \
+                        mock.patch('builtins.print') as output:
                     manifest = Path(directory) / 'manifest.json'
                     manifest.write_text(json.dumps({'owner': 'owner', 'package': 'package'}))
                     (Path(directory) / 'control.json').write_text(json.dumps({'role': 'control'}))
-                    if failure in ['inspection', 'cleanup'] or (failure == 'create' and not suspended_only):
+                    if failure in ['inspection', 'cleanup', 'resume'] or (failure == 'create' and not suspended_only):
                         with self.assertRaisesRegex(OSError, failure):
-                            probe.launch(17, manifest, 'control', streams, suspended_only=suspended_only)
+                            probe.launch(17, manifest, 'control', streams, observe=observer,
+                                         suspended_only=suspended_only)
                     else:
-                        result = probe.launch(17, manifest, 'control', streams,
+                        result = probe.launch(17, manifest, 'control', streams, observe=observer,
                                               suspended_only=suspended_only)
                         if failure == 'create':
                             self.assertEqual(result, {'created': False, 'winerror': 1314,
@@ -3286,14 +3490,31 @@ class StateTokenProbeTests(unittest.TestCase):
                 # process. Even failed inspection/thread close cannot skip it.
                 self.assertEqual(closed, [] if failure == 'create' else [99, 88, 77])
                 native.delete_attributes.assert_called_once()
-                if suspended_only and failure != 'create':
+                if (suspended_only and failure != 'create') or failure == 'resume':
                     native.terminate.assert_called_once_with(77, 1)
                 else:
                     native.terminate.assert_not_called()
-                if suspended_only or failure is not None:
+                checkpoints = [json.loads(call.args[0]) for call in output.call_args_list
+                               if json.loads(call.args[0]).get('probe') == 'state-progress']
+                if suspended_only or failure == 'create':
                     native.resume.assert_not_called()
+                    observer.assert_not_called()
+                    self.assertEqual(checkpoints, [])
                 else:
                     native.resume.assert_called_once_with(88)
+                    expected = ['launch-manifest-read-before', 'launch-manifest-read-after',
+                                'resume-before', 'resume-after']
+                    if failure == 'resume':
+                        observer.assert_not_called()
+                    else:
+                        observer.assert_called_once_with(77)
+                        expected.extend(['observer-enter', 'observer-return',
+                                         'child-exit-wait-before', 'child-exit-wait-after'])
+                    self.assertEqual([row['phase'] for row in checkpoints], expected)
+                    self.assertEqual(checkpoints[3]['previous_suspend_count'], resume_count)
+                    self.assertTrue(all(row['role'] == 'control' and row['child_pid'] == 123
+                                        for row in checkpoints))
+                    self.assertTrue(all(isinstance(row['at_ns'], int) for row in checkpoints))
 
     def test_launch_comparisons_preserve_sources_flags_and_native_failures(self):
         for context in ['standard-user', 'appcontainer']:
@@ -3423,7 +3644,8 @@ class StateTokenProbeTests(unittest.TestCase):
                         mock.patch('loki_agent.process_protections.protect_credential_process'), \
                         mock.patch.dict(state_writer_child.__globals__, {
                             'AppContainers': mock.Mock(return_value=native),
-                            'StateTokenProbe': mock.Mock(return_value=probe)}):
+                            'StateTokenProbe': mock.Mock(return_value=probe)}), \
+                        mock.patch('builtins.print') as output:
                     if fail_filtered:
                         with self.assertRaisesRegex(OSError, 'filtered launch failed'):
                             state_writer_child(str(manifest))
@@ -3442,6 +3664,11 @@ class StateTokenProbeTests(unittest.TestCase):
                 self.assertEqual(probe.api.close.call_args_list,
                                  [mock.call(handle) for handle in [21, 19, 18, 17]])
                 native.local_free.assert_called_once_with(role_sid)
+                checkpoints = [json.loads(call.args[0]) for call in output.call_args_list]
+                self.assertEqual([row['phase'] for row in checkpoints], [] if fail_filtered else [
+                    'writer-ready-wait', 'writer-ready-observed', 'writer-publication-before',
+                    'writer-publication-after', 'writer-signal-before', 'writer-signal-after'])
+                self.assertTrue(all(row['role'] == 'filtered' for row in checkpoints))
 
     def test_restricting_sid_and_write_only_flag_reach_native_call(self):
         probe = StateTokenProbe.__new__(StateTokenProbe)
@@ -4497,6 +4724,7 @@ if __name__ == '__main__':
         state_writer_child(sys.argv[2])
         sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] == '--state-access':
+        state_progress('child-dispatch', role=sys.argv[3])
         state_access_child(sys.argv[2], sys.argv[3])
         sys.exit(0)
     if len(sys.argv) == 5 and sys.argv[1] == '--broker-death':
