@@ -542,18 +542,22 @@ class StateTokenProbe:
         """Record independent calls; none of these tokens ever starts a child."""
         print(json.dumps({'probe': 'state-token-filter', 'phase': 'source',
                           'context': context, 'token': self.api.snapshot(source)}), flush=True)
-        everyone = HANDLE()
-        self.n.check(self.api.parse_sid('S-1-1-0', C.byref(everyone)))
+        allocated = []
+        everyone, foreign = HANDLE(), HANDLE()
         try:
-            # Everyone is a documented ordinary SID that the source token also
-            # holds as a group; the tool-role SID is a package-authority SID it
-            # does not hold. Which of them the API accepts isolates the input
-            # Windows rejects, after the AppContainer context and the
-            # WRITE_RESTRICTED flag were both ruled out at cc15c4b.
+            for value, target in [('S-1-1-0', everyone), ('S-1-5-32-547', foreign)]:
+                self.n.check(self.api.parse_sid(value, C.byref(target)))
+                allocated.append(target)
+            # Everyone is an ordinary SID the source token also holds as a
+            # group; the foreign SID (BUILTIN\Power Users) is ordinary but
+            # absent from it; the tool-role SID is the minted ordinary SID the
+            # scenario launches tools under. Windows refused package-authority
+            # SIDs as restricting SIDs in this exact call (measured at
+            # 9fa1886), and WRITE_RESTRICTED is the flag the tool token needs.
             for variant, restriction, flags in [
                     ['unchanged', None, 0],
                     ['restrict-everyone', everyone, 0],
-                    ['restrict-all', role_sid, 0],
+                    ['restrict-foreign', foreign, 0],
                     ['restrict-writes', role_sid, WRITE_RESTRICTED]]:
                 row = {'probe': 'state-token-filter', 'phase': 'result',
                        'context': context, 'variant': variant, 'flags': flags,
@@ -579,7 +583,8 @@ class StateTokenProbe:
                     # erase the native call's outcome from the diagnostics.
                     print(json.dumps(row), flush=True)
         finally:
-            self.n.local_free(everyone)
+            for target in allocated:
+                self.n.local_free(target)
 
     def launch(self, token, manifest_path, role, streams, observe=None):
         """Use the existing AsUser binding, with an explicit stdio handle list."""
@@ -3241,13 +3246,20 @@ class StateTokenProbeTests(unittest.TestCase):
                         failure if index in rejected else handle
                         for index, handle in enumerate(handles)])
                     role = HANDLE(23)
+                    parsed = []
+                    probe.api.parse_sid.side_effect = (
+                        lambda value, pointer: parsed.append(pointer._obj) or True)
                     probe.n.sid.side_effect = (
-                        lambda handle: 'tool-role' if handle is role else 'everyone')
+                        lambda handle: 'tool-role' if handle is role else
+                        ('everyone' if handle is parsed[0] else 'foreign'))
                     with mock.patch('builtins.print') as output:
                         probe.compare_filters(17, role, context)
-                    everyone = probe.api.parse_sid.call_args[0][1]._obj
-                    probe.api.parse_sid.assert_called_once_with('S-1-1-0', mock.ANY)
-                    probe.n.local_free.assert_called_once_with(everyone)
+                    everyone, foreign = parsed
+                    self.assertEqual(probe.api.parse_sid.call_args_list, [
+                        mock.call('S-1-1-0', mock.ANY),
+                        mock.call('S-1-5-32-547', mock.ANY)])
+                    self.assertEqual(probe.n.local_free.call_args_list,
+                                     [mock.call(everyone), mock.call(foreign)])
                     records = [json.loads(call.args[0]) for call in output.call_args_list]
                     self.assertEqual(records[0], {
                         'probe': 'state-token-filter', 'phase': 'source',
@@ -3255,10 +3267,10 @@ class StateTokenProbeTests(unittest.TestCase):
                     results = records[1:]
                     self.assertEqual([row['variant'] for row in results],
                                      ['unchanged', 'restrict-everyone',
-                                      'restrict-all', 'restrict-writes'])
+                                      'restrict-foreign', 'restrict-writes'])
                     self.assertEqual([row['flags'] for row in results], [0, 0, 0, 0x8])
                     self.assertEqual([row['restricting_sid'] for row in results],
-                                     [None, 'everyone', 'tool-role', 'tool-role'])
+                                     [None, 'everyone', 'foreign', 'tool-role'])
                     for index, row in enumerate(results):
                         self.assertEqual(row['context'], context)
                         self.assertEqual(row['created'], index not in rejected)
@@ -3272,7 +3284,7 @@ class StateTokenProbeTests(unittest.TestCase):
                     self.assertEqual(probe.filtered.call_args_list, [
                         mock.call(17, None, flags=0),
                         mock.call(17, everyone, flags=0),
-                        mock.call(17, role, flags=0),
+                        mock.call(17, foreign, flags=0),
                         mock.call(17, role, flags=0x8)])
                     successful = [handle for index, handle in enumerate(handles)
                                   if index not in rejected]
@@ -3368,10 +3380,19 @@ class AppContainerTests(unittest.TestCase):
         native.hresult(native.profile(name, name, name, None, 0, C.byref(sid)))
         self.addCleanup(lambda: native.hresult(native.delete_profile(name)))
         self.addCleanup(lambda: native.free_sid(sid))
-        native.hresult(native.derive_profile_sid(name + '.tools', C.byref(role_sid)))
-        self.addCleanup(lambda: native.free_sid(role_sid))
-        package, role = native.sid(sid), native.sid(role_sid)
+        package = native.sid(sid)
         probe = StateTokenProbe(native)
+        # Windows refuses package-authority SIDs as restricting SIDs (measured
+        # at 9fa1886), so the tool role is a minted ordinary SID. The ACLs
+        # below grant it exactly what a tool may write. Random domain-style
+        # subauthorities keep disposable runs from colliding; production will
+        # need a stable derivation of its own before this leaves the probe.
+        identifier = uuid.uuid4().int
+        role = 'S-1-5-21-%d-%d-%d-%d' % (
+            (identifier >> 96) & 0xFFFFFFFF, (identifier >> 64) & 0xFFFFFFFF,
+            (identifier >> 32) & 0xFFFFFFFF, identifier & 0xFFFFFFFF)
+        native.check(probe.api.parse_sid(role, C.byref(role_sid)))
+        self.addCleanup(lambda: native.local_free(role_sid))
         with ExitStack() as tokens:
             current = probe.api.token(native.current_process(), TOKEN_QUERY | 2)
             try:
