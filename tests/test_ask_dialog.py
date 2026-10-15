@@ -14,6 +14,7 @@ from unittest import mock
 
 from loki_agent import formats, loki, protocols, terminal_frontend
 from loki_agent.sessions import Session
+from loki_agent import connections, tool_contracts
 
 
 class RecordingTerminal:
@@ -216,7 +217,7 @@ class TurnAdvertisementTests(unittest.IsolatedAsyncioTestCase):
     """The turn advertises Ask exactly when it carries a working seam."""
 
     def setUp(self):
-        self.session = Session(runtime_config=loki.make_runtime_config(
+        self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
             model="claude-opus-4-5"))
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
@@ -265,7 +266,7 @@ class LoopAdvertisementTests(unittest.IsolatedAsyncioTestCase):
     """run_tool_loop_async strips Ask for seam-less callers (subagents)."""
 
     def setUp(self):
-        self.session = Session(runtime_config=loki.make_runtime_config(
+        self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
             model="claude-opus-4-5"))
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
@@ -341,33 +342,33 @@ class AskHeaderTests(unittest.TestCase):
 
     def _ask_definition(self):
         for tool in loki.TOOLS:
-            if tool["function"]["name"] == loki.ASK_TOOL_NAME:
+            if tool["function"]["name"] == tool_contracts.ASK_TOOL_NAME:
                 return tool
         self.fail("Ask tool missing from the registry")
 
     def test_name_constant_and_registry_agree(self):
-        self.assertIsInstance(loki.ASK_TOOL_NAME, str)
-        self.assertIn(loki.ASK_TOOL_NAME, loki.TOOL_REGISTRY)
-        self.assertIn(loki.ASK_TOOL_NAME, loki.PLAN_TOOLS)
-        self.assertIn(loki.ASK_TOOL_NAME, loki.EXPLORE_TOOLS)
+        self.assertIsInstance(tool_contracts.ASK_TOOL_NAME, str)
+        self.assertIn(tool_contracts.ASK_TOOL_NAME, loki.TOOL_REGISTRY)
+        self.assertIn(tool_contracts.ASK_TOOL_NAME, loki.PLAN_TOOLS)
+        self.assertIn(tool_contracts.ASK_TOOL_NAME, loki.EXPLORE_TOOLS)
 
     def test_schema_bounds_come_from_the_shared_constants(self):
         parameters = self._ask_definition()["function"]["parameters"]
         properties = parameters["properties"]
         options = properties["options"]
-        self.assertEqual(options["minItems"], loki.ASK_MIN_OPTIONS)
-        self.assertEqual(options["maxItems"], loki.ASK_MAX_OPTIONS)
+        self.assertEqual(options["minItems"], tool_contracts.ASK_MIN_OPTIONS)
+        self.assertEqual(options["maxItems"], tool_contracts.ASK_MAX_OPTIONS)
         self.assertEqual(
-            properties["question"]["maxLength"], loki.ASK_MAX_QUESTION_CHARS)
+            properties["question"]["maxLength"], tool_contracts.ASK_MAX_QUESTION_CHARS)
         item = options["items"]["properties"]
-        self.assertEqual(item["label"]["maxLength"], loki.ASK_MAX_LABEL_CHARS)
+        self.assertEqual(item["label"]["maxLength"], tool_contracts.ASK_MAX_LABEL_CHARS)
         self.assertEqual(
-            item["description"]["maxLength"], loki.ASK_MAX_DESCRIPTION_CHARS)
+            item["description"]["maxLength"], tool_contracts.ASK_MAX_DESCRIPTION_CHARS)
 
     def test_without_ask_tool_removes_only_the_ask_tool(self):
-        rest = loki.without_ask_tool(loki.TOOLS)
+        rest = tool_contracts.without_ask_tool(loki.TOOLS)
         names = [tool["function"]["name"] for tool in rest]
-        self.assertNotIn(loki.ASK_TOOL_NAME, names)
+        self.assertNotIn(tool_contracts.ASK_TOOL_NAME, names)
         self.assertEqual(len(rest), len(loki.TOOLS) - 1)
 
 

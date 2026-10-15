@@ -14,6 +14,8 @@ from config_fixtures import setUpModule as set_up_config
 from loki_agent import authentications, loki, models, protocols, provider_controls
 from loki_agent import terminal_frontend, terminals
 from loki_agent.credentials import CredentialStore
+from loki_agent import connections
+from loki_agent import jobs as job_runtime
 
 
 def setUpModule():
@@ -74,8 +76,8 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.directory.cleanup)
         self.agent_session = loki.Session(
             shell_cwd=self.directory.name,
-            job_manager=loki.JobManager(self.directory.name),
-            runtime_config=loki.make_runtime_config(
+            job_manager=job_runtime.JobManager(self.directory.name),
+            runtime_config=connections.make_runtime_config(
                 "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
                 model="claude-opus-4-5"),
         )

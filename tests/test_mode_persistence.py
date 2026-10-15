@@ -9,6 +9,7 @@ from config_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import formats, loki
 from loki_agent.sessions import Session
+from loki_agent import files as file_operations
 
 
 class ModePersistenceTests(unittest.TestCase):
@@ -107,7 +108,7 @@ class ModePersistenceTests(unittest.TestCase):
         previous = self.path.read_bytes()
         self.session.agent_mode = "plan"
         loki.record_agent_mode_instruction()
-        with mock.patch.object(loki, "_atomic_write_text",
+        with mock.patch.object(file_operations, 'atomic_write_text',
                                side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 loki.save_chat_log()

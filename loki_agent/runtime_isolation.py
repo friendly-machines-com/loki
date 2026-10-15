@@ -9,9 +9,8 @@ entrypoints contain no platform branch; this module contains no policy about
 what to isolate, only how the platform does it.
 
 The seams are deliberately small: a function per capability, each a thin
-delegation to the platform module.  Where the platforms do the same thing
-(the POSIX no-op for a Windows-only preflight, for instance) the seam says so
-locally rather than pushing the condition back into the callers.
+delegation to the platform module.  Shared invocation grammar stays in arguments; this seam adds platform-specific
+launch checks without pushing platform branches into callers.
 """
 
 from __future__ import annotations
@@ -81,22 +80,12 @@ if sys.platform == "win32":
         return windows_runtime.configured_workspace(arguments)
 
     def preflight(arguments: list[str]) -> int | None:
-        """Windows-only entrypoint checks; ``None`` means continue."""
-        import getopt
+        """Validate invocation before the Windows workspace launch gate."""
+        from .arguments import preflight as argument_preflight
 
-        from .terminal_frontend import USAGE, _print_repr_line, parse_cli_args
-
-        try:
-            options, positional = parse_cli_args(arguments)
-            if positional:
-                raise getopt.GetoptError("unexpected positional arguments")
-        except getopt.GetoptError as error:
-            _print_repr_line("loki: ", str(error), file=sys.stderr)
-            print(USAGE, end='', file=sys.stderr)
-            return 2
-        if any(name in ["-h", "--help"] for name, _ in options):
-            print(USAGE, end="")
-            return 0
+        status = argument_preflight(arguments, reject_positionals=True)
+        if status is not None:
+            return status
         windows_runtime.configured_workspace(arguments)
         return None
 
@@ -176,7 +165,9 @@ else:
         return None
 
     def preflight(arguments: list[str]) -> int | None:
-        return None
+        from .arguments import preflight as argument_preflight
+
+        return argument_preflight(arguments)
 
     async def start_runtime(executable, arguments, workspace, environment,
                             delegation):

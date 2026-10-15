@@ -1361,8 +1361,8 @@ async def _confirm_catalog_endpoint(
         return True  # The broker still enforces the canonical subscription URLs.
     if provider_access(effective_provider(provider_entry, model_entry), credentials) is None:
         return True  # The pure constructor rejects unusable selections.
-    from . import loki
-    config = loki.config_from_modelsdev_selection(
+    from . import connections
+    config = connections.config_from_modelsdev_selection(
         provider_id, provider_entry, model_entry, credentials)
     reference = config.auth_spec.credential
     destinations = config.credential_destinations()

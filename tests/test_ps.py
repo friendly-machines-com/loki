@@ -11,13 +11,16 @@ from unittest import mock
 
 from loki_agent import acp_commands, loki
 from loki_agent.sessions import Session
+from loki_agent import tool_contracts
+from loki_agent import files as file_operations
+from loki_agent import jobs as job_runtime
 
 
 class PsTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.manager = loki.JobManager(directory.name)
+        self.manager = job_runtime.JobManager(directory.name)
         self.session = Session(job_manager=self.manager)
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
@@ -26,7 +29,7 @@ class PsTests(unittest.TestCase):
     def add_job(self, job_id, status, started_at="2026-10-04T10:00:00Z"):
         spool = os.path.join(self.manager.session_dir, job_id)
         os.makedirs(spool)
-        job = loki.Job(
+        job = job_runtime.Job(
             id=job_id, command="command", argv=["command"], shell=False,
             description="test", background=True, spool_dir=spool,
             stdout_path=os.path.join(spool, "stdout.log"),
@@ -41,7 +44,7 @@ class PsTests(unittest.TestCase):
         job = self.add_job("1", "running")
         observed = []
         self.manager.on_change = lambda: observed.append(job.status)
-        with mock.patch.object(loki.host_process, "signal_group"):
+        with mock.patch.object(job_runtime.host_process, "signal_group"):
             loki.run_ps("stop 1")
         job.process.returncode = -15
         self.manager._refresh_job(job)
@@ -51,12 +54,12 @@ class PsTests(unittest.TestCase):
         job = self.add_job("1", "running")
         self.manager.on_change = mock.Mock(side_effect=RuntimeError("display failed"))
         job.process.returncode = 0
-        with self.assertLogs("loki_agent.loki", level="ERROR"):
+        with self.assertLogs("loki_agent.jobs", level="ERROR"):
             self.manager._refresh_job(job)
         self.assertEqual(job.status, "exited")
         self.assertEqual(job.exit_code, 0)
-        with mock.patch.object(loki, "_atomic_write_text", side_effect=OSError("metadata failed")), \
-                self.assertLogs("loki_agent.loki", level="ERROR"), \
+        with mock.patch.object(file_operations, 'atomic_write_text', side_effect=OSError("metadata failed")), \
+                self.assertLogs("loki_agent.jobs", level="ERROR"), \
                 self.assertRaisesRegex(OSError, "metadata failed"):
             self.manager._write_metadata(job)
 
@@ -146,7 +149,7 @@ class PsTests(unittest.TestCase):
     def test_tail_includes_both_streams_of_a_finished_job(self):
         job = self.add_job("1", "exited")
         with open(job.stdout_path, "w", encoding="utf-8") as stream:
-            stream.write("old-prefix" + "x" * loki.JOB_TAIL_CHARS + "answer")
+            stream.write("old-prefix" + "x" * tool_contracts.JOB_TAIL_CHARS + "answer")
         with open(job.stderr_path, "w", encoding="utf-8") as stream:
             stream.write("diagnostic")
         text = loki.run_ps("1")
@@ -157,18 +160,18 @@ class PsTests(unittest.TestCase):
 
     def test_stop_and_kill_use_existing_signal_and_state_transitions(self):
         job = self.add_job("1", "running")
-        with mock.patch.object(loki.host_process, "signal_group") as send:
+        with mock.patch.object(job_runtime.host_process, "signal_group") as send:
             loki.run_ps("stop 1")
-            send.assert_called_once_with(job.process, job.pgid, loki.signal.SIGTERM)
+            send.assert_called_once_with(job.process, job.pgid, job_runtime.signal.SIGTERM)
             self.assertEqual(job.status, "stopping")
             send.reset_mock()
             loki.run_ps("kill 1")
-            send.assert_called_once_with(job.process, job.pgid, loki.host_process.FORCE)
+            send.assert_called_once_with(job.process, job.pgid, job_runtime.host_process.FORCE)
             self.assertEqual(job.status, "stopping")
 
     def test_unknown_ids_and_finished_jobs_do_not_signal(self):
         self.add_job("1", "exited")
-        with mock.patch.object(loki.host_process, "signal_group") as send:
+        with mock.patch.object(job_runtime.host_process, "signal_group") as send:
             for argument in ["99", "stop 99", "kill 99"]:
                 self.assertIn("unknown job id", loki.run_ps(argument))
             for argument in ["stop 1", "kill 1"]:
@@ -220,7 +223,7 @@ class ImmediateTerminalPsTests(unittest.TestCase):
         from process_lifecycle_fixtures import ProcessResources
 
         async def scenario(root):
-            manager = loki.JobManager(os.path.join(root, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(root, "jobs"))
             conversation = Session(job_manager=manager, shell_cwd=root,
                                    transcript_items=[formats.message_item("user", "busy")])
             initial = list(conversation.transcript_items)
@@ -282,7 +285,7 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                         while True:
                             job = next(iter(manager.jobs.values()), None)
                             if job is not None and job.process is not None:
-                                if "job-ready" in loki._read_spool_tail(job.stdout_path):
+                                if "job-ready" in job_runtime._read_spool_tail(job.stdout_path):
                                     break
                             await asyncio.sleep(.01)
                     resources = ProcessResources(job.process)
@@ -337,7 +340,7 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     await session._pause()
                     for job in manager.jobs.values():
                         if job.process is not None and job.process.returncode is None:
-                            loki.host_process.signal_group(job.process, job.pgid, loki.host_process.FORCE)
+                            job_runtime.host_process.signal_group(job.process, job.pgid, job_runtime.host_process.FORCE)
                             await asyncio.wait_for(job.process.wait(), 3)
                     if not foreground.done():
                         foreground.cancel()

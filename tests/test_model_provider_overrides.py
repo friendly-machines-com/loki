@@ -1,8 +1,9 @@
 import copy
 import unittest
 
-from loki_agent import authentications, loki, models, protocols
+from loki_agent import authentications, models, protocols
 from loki_agent.credentials import CredentialStore
+from loki_agent import connections
 
 
 class ModelProviderOverrideTests(unittest.TestCase):
@@ -41,7 +42,7 @@ class ModelProviderOverrideTests(unittest.TestCase):
                 self.assertEqual(models.provider_protocol(leaf[1]), protocol)
                 rows = models._provider_rows(groups[name])
                 self.assertIn(f"[{protocol.replace('_', '-')}]", rows[0][1])
-                config = loki.config_from_modelsdev_selection(
+                config = connections.config_from_modelsdev_selection(
                     *leaf, self.credentials)
                 self.assertEqual(config.chat_provider.kind, protocol)
                 self.assertEqual(
@@ -54,11 +55,11 @@ class ModelProviderOverrideTests(unittest.TestCase):
         self.assertEqual(self.provider, original)
 
     def test_direct_selection_and_saved_connection_use_override(self):
-        config = loki.config_from_modelsdev_selection(
+        config = connections.config_from_modelsdev_selection(
             "opencode-go", self.provider,
             self.provider["models"]["grok-4.6"], self.credentials)
-        restored = loki.config_from_connection_descriptor(
-            loki.connection_descriptor_from_config(config), self.credentials)
+        restored = connections.config_from_connection_descriptor(
+            connections.connection_descriptor_from_config(config), self.credentials)
         self.assertEqual(restored.chat_provider.kind, protocols.OPENAI_RESPONSES)
         self.assertEqual(
             restored.chat_provider.chat_url,
@@ -77,7 +78,7 @@ class ModelProviderOverrideTests(unittest.TestCase):
                         "shape": shape,
                     },
                 }
-                config = loki.config_from_modelsdev_selection(
+                config = connections.config_from_modelsdev_selection(
                     "opencode-go", self.provider, model, self.credentials)
                 self.assertEqual(config.chat_provider.kind, protocol)
                 self.assertEqual(
@@ -110,7 +111,7 @@ class ModelProviderOverrideTests(unittest.TestCase):
                     models.filter_supported_groups(groups, self.credentials),
                     {})
                 with self.assertRaises(ValueError):
-                    loki.config_from_modelsdev_selection(
+                    connections.config_from_modelsdev_selection(
                         "opencode-go", provider, model, self.credentials)
 
     def test_overrides_do_not_supply_credentials_or_request_headers(self):
@@ -120,7 +121,7 @@ class ModelProviderOverrideTests(unittest.TestCase):
             "headers": {"Authorization": "untrusted"},
             "body": {"model": "other"},
         }}
-        config = loki.config_from_modelsdev_selection(
+        config = connections.config_from_modelsdev_selection(
             "opencode-go", self.provider, model, self.credentials)
         self.assertEqual(config.model, "test")
         self.assertNotIn("Authorization", config.chat_provider.headers)

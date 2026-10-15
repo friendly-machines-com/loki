@@ -21,7 +21,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from loki_agent import host_ipc, loki
+from loki_agent import host_ipc
+from loki_agent import jobs as job_runtime
 
 
 # Reads stdin to EOF and prints the byte count.  Real child, real reads: the
@@ -61,7 +62,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             try:
                 job, status, stdout, stderr = await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
@@ -90,7 +91,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             # the shell is still Loki's Bash branch doing the spawning.
             script = root / "report_eof.py"
             script.write_text(_REPORTS_EOF, encoding="utf-8")
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             try:
                 # run_shell renders the job result, so read the text it
                 # returns rather than the intermediate tuple run_foreground
@@ -119,7 +120,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             try:
                 job, status, stdout, stderr = await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF,
@@ -144,7 +145,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             try:
                 job, status, stdout, stderr = await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
@@ -168,7 +169,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             try:
                 job = await manager.run_background_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
@@ -206,7 +207,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                 _REPORTS_EOF + _BLOCKS_UNTIL_RELEASED
                 % (str(ready), str(release)),
                 encoding="utf-8")
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             cancel = asyncio.Event()
             try:
                 task = asyncio.create_task(manager.run_exec(
@@ -269,7 +270,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             try:
                 await manager.run_exec(
                     [sys.executable, "-c", _REPORTS_EOF],
@@ -293,7 +294,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             workspace.mkdir()
-            manager = loki.JobManager(str(root / "jobs"))
+            manager = job_runtime.JobManager(str(root / "jobs"))
             try:
                 with self.assertRaises(FileNotFoundError):
                     await manager.run_exec(

@@ -23,6 +23,8 @@ from loki_agent import (
 )
 from loki_agent import __main__ as terminal_entrypoint
 from loki_agent.credentials import CredentialStore
+from loki_agent import jobs as job_runtime, tool_contracts
+from loki_agent import model_requests
 
 
 async def _finish_within(coroutine, seconds, label):
@@ -78,8 +80,8 @@ class ProviderResponseContractTests(unittest.TestCase):
         )
 
         for method, payload, expected_timeout in [
-                ("POST", {"model": "x"}, loki.LLM_REQUEST_TIMEOUT_S),
-                ("GET", None, loki.WEBFETCH_TIMEOUT_S)]:
+                ("POST", {"model": "x"}, model_requests.LLM_REQUEST_TIMEOUT_S),
+                ("GET", None, http_client.HTTP_DEFAULT_TIMEOUT_S)]:
             transport = mock.AsyncMock(return_value=response)
             with self.subTest(method=method), mock.patch.object(
                     http_client, "async_http_request", new=transport):
@@ -172,7 +174,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                     raise AssertionError("cleanup started before revocation")
 
         async def scenario():
-            manager = loki.JobManager("/tmp/loki-job-cleanup-test")
+            manager = job_runtime.JobManager("/tmp/loki-job-cleanup-test")
             capability = Capability()
             job = types.SimpleNamespace(
                 status="running",
@@ -198,7 +200,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_subagent_slots_bound_concurrent_children_and_release_on_exit(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             command = [
                 sys.executable,
                 "-c",
@@ -210,7 +212,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 command, cwd=tmpdir, session_owned=True, subagent=True)
             third = None
             try:
-                with self.assertRaises(loki.SubagentCapacityError):
+                with self.assertRaises(job_runtime.SubagentCapacityError):
                     await manager.run_background_exec(
                         command,
                         cwd=tmpdir,
@@ -248,7 +250,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_failed_subagent_spawn_releases_its_slot(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             with mock.patch.object(
                     loki.asyncio,
                     "create_subprocess_exec",
@@ -271,7 +273,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_force_stop_escalates_a_job_already_stopping(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             script = (
                 "import signal,time\n"
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -287,7 +289,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 [sys.executable, "-c", script], cwd=tmpdir)
             try:
                 deadline = asyncio.get_running_loop().time() + 3
-                while "ready" not in loki._read_spool_tail(job.stdout_path):
+                while "ready" not in job_runtime._read_spool_tail(job.stdout_path):
                     if asyncio.get_running_loop().time() >= deadline:
                         self.fail("background process did not become ready")
                     await asyncio.sleep(0.01)
@@ -330,7 +332,7 @@ class JobOwnershipContractTests(unittest.TestCase):
         from process_lifecycle_fixtures import ProcessResources
 
         async def scenario(tmpdir, cause):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             cancel_event = asyncio.Event()
             release_spawn = asyncio.Event()
             tasks_before = asyncio.all_tasks()
@@ -364,7 +366,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                         job = next(iter(manager.jobs.values()), None)
                         if job is not None and job.process is not None:
                             self.assertIsNone(job.process.returncode)
-                            if "ready" in loki._read_spool_tail(job.stdout_path):
+                            if "ready" in job_runtime._read_spool_tail(job.stdout_path):
                                 break
                         if asyncio.get_running_loop().time() >= deadline:
                             self.fail("foreground process did not become ready")
@@ -426,7 +428,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_foreground_completion_and_simultaneous_cancellation(self):
         async def scenario(tmpdir, simultaneous_cancel):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             cancel_event = asyncio.Event()
             real_wait = manager._wait_for_job
 
@@ -462,39 +464,33 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_failed_credential_relay_setup_closes_its_ends(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
-            session = loki.current_session()
-            old_authority = session.credential_authority
-            session.credential_authority = (
-                authentications.CredentialBroker())
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
+            authority = authentications.CredentialBroker()
             ends = []
-            real_channel = loki.host_ipc.owner_channel
+            real_channel = job_runtime.host_ipc.owner_channel
 
             def recording_channel():
                 pair = real_channel()
                 ends.extend(pair)
                 return pair
 
-            try:
-                with mock.patch.object(
-                        loki.host_ipc, "owner_channel",
-                        side_effect=recording_channel), \
-                        mock.patch.object(
-                            loki.credential_capabilities.
-                            CredentialCapabilityServer,
-                            "create",
-                            new=mock.AsyncMock(
-                                side_effect=RuntimeError("relay failed"))):
-                    with self.assertRaisesRegex(
-                            RuntimeError, "relay failed"):
-                        await manager.run_background_exec(
-                            [sys.executable, "-c", "pass"],
-                            cwd=tmpdir,
-                            session_owned=True,
-                            credential_refs=frozenset(),
-                        )
-            finally:
-                session.credential_authority = old_authority
+            with mock.patch.object(
+                    job_runtime.host_ipc, "owner_channel",
+                    side_effect=recording_channel), \
+                    mock.patch.object(
+                        job_runtime.credential_capabilities.
+                        CredentialCapabilityServer,
+                        "create",
+                        new=mock.AsyncMock(
+                            side_effect=RuntimeError("relay failed"))):
+                with self.assertRaisesRegex(RuntimeError, "relay failed"):
+                    await manager.run_background_exec(
+                        [sys.executable, "-c", "pass"],
+                        cwd=tmpdir,
+                        session_owned=True,
+                        credential_refs=frozenset(),
+                        credential_authority=authority,
+                    )
             return ends
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -505,7 +501,7 @@ class JobOwnershipContractTests(unittest.TestCase):
             if isinstance(end, int):
                 # A POSIX descriptor; nothing here observes its closure.
                 continue
-            if loki.host_ipc.is_endpoint(end):
+            if job_runtime.host_ipc.is_endpoint(end):
                 # A closed Windows pipe endpoint has released its handles.
                 self.assertEqual(end.handles(), [])
             else:
@@ -522,7 +518,7 @@ class JobOwnershipContractTests(unittest.TestCase):
         holding the kept end would keep the pipe open and never be revoked.
         """
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             script = (
                 "import asyncio, sys\n"
                 "from loki_agent import host_ipc\n"
@@ -542,7 +538,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 manager._close_owner_signal(job)
                 deadline = asyncio.get_running_loop().time() + 5
                 while True:
-                    reported = loki._read_spool_tail(job.stdout_path)
+                    reported = job_runtime._read_spool_tail(job.stdout_path)
                     if "closed" in reported:
                         return reported
                     if asyncio.get_running_loop().time() >= deadline:
@@ -565,14 +561,14 @@ class JobOwnershipContractTests(unittest.TestCase):
         the job's read would stay blocked and revocation would never reach it.
         """
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             script = (
                 "import asyncio, sys, tempfile\n"
-                "from loki_agent import host_ipc, loki\n"
+                "from loki_agent import host_ipc, jobs\n"
                 "async def main():\n"
                 "    end = host_ipc.child_endpoint(\n"
                 "        sys.argv[sys.argv.index('--session-owner-fd') + 1])\n"
-                "    manager = loki.JobManager(tempfile.mkdtemp())\n"
+                "    manager = jobs.JobManager(tempfile.mkdtemp())\n"
                 "    command = await manager.run_background_exec(\n"
                 "        [sys.executable, '-c', 'import time; time.sleep(30)'])\n"
                 "    await host_ipc.watch_closed(end)\n"
@@ -589,7 +585,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                 manager._close_owner_signal(job)
                 deadline = asyncio.get_running_loop().time() + 5
                 while True:
-                    reported = loki._read_spool_tail(job.stdout_path)
+                    reported = job_runtime._read_spool_tail(job.stdout_path)
                     if "closed" in reported:
                         return reported
                     if asyncio.get_running_loop().time() >= deadline:
@@ -605,7 +601,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_cancelling_owner_task_reaps_foreground_process(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             task = asyncio.create_task(manager.run_exec(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
                 60_000, cwd=tmpdir))
@@ -640,7 +636,7 @@ class JobOwnershipContractTests(unittest.TestCase):
         from process_lifecycle_fixtures import ProcessResources
 
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             session = Session(shell_cwd=tmpdir)
             session.job_manager = manager
             worker = Worker(session, lambda message: None, "session")
@@ -680,9 +676,9 @@ class JobOwnershipContractTests(unittest.TestCase):
                     deadline = asyncio.get_running_loop().time() + 5
                     for job, marker in ((owned, 'owned-ready:'),
                                         (ordinary, 'ordinary-ready:')):
-                        while marker + job.cwd not in loki._read_spool_tail(job.stdout_path):
+                        while marker + job.cwd not in job_runtime._read_spool_tail(job.stdout_path):
                             self.assertIsNone(job.process.returncode,
-                                              loki._read_spool_tail(job.stderr_path))
+                                              job_runtime._read_spool_tail(job.stderr_path))
                             if asyncio.get_running_loop().time() >= deadline:
                                 self.fail('children did not become ready')
                             await asyncio.sleep(.01)
@@ -713,7 +709,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                     self.assertEqual(owned.process.returncode, 0)
                     self.assertEqual(owned.exit_code, 0)
                     self.assertEqual(owned.status, 'owner_closed')
-                    self.assertIn('owner-eof', loki._read_spool_tail(owned.stdout_path))
+                    self.assertIn('owner-eof', job_runtime._read_spool_tail(owned.stdout_path))
                     self.assertIsNone(owned.owner_signal_fd)
                     self.assertFalse(owned.subagent_slot)
                     self.assertEqual(manager._active_subagents, 0)
@@ -747,7 +743,7 @@ class JobOwnershipContractTests(unittest.TestCase):
     def test_bash_timeout_is_a_failed_tool_result(self):
         async def scenario(tmpdir):
             old_manager = loki.current_session().job_manager
-            loki.current_session().job_manager = loki.JobManager(
+            loki.current_session().job_manager = job_runtime.JobManager(
                 os.path.join(tmpdir, "jobs"))
             try:
                 return await loki.dispatch_tool_async(
@@ -767,25 +763,25 @@ class JobOwnershipContractTests(unittest.TestCase):
         self.assertIn("timed_out", result["content"])
 
     def test_a_signal_failure_is_not_reported_as_a_gone_process(self):
-        manager = loki.JobManager(
+        manager = job_runtime.JobManager(
             os.path.join(tempfile.gettempdir(), "loki-signal-audit"))
         job = types.SimpleNamespace(
             process=types.SimpleNamespace(returncode=None, pid=1), pgid=1)
 
         with mock.patch.object(
-                loki.host_process, "signal_group",
+                job_runtime.host_process, "signal_group",
                 side_effect=PermissionError(errno.EPERM, "denied")):
             with self.assertRaises(PermissionError):
                 manager._signal_process_group(job, signal.SIGTERM)
 
         with mock.patch.object(
-                loki.host_process, "signal_group",
+                job_runtime.host_process, "signal_group",
                 side_effect=ProcessLookupError(errno.ESRCH, "gone")):
             self.assertFalse(manager._signal_process_group(job, signal.SIGTERM))
 
     def test_a_post_spawn_failure_reaps_the_child_and_frees_its_slot(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             with mock.patch.object(manager, "_write_metadata",
                                    side_effect=OSError("metadata unavailable")):
                 with self.assertRaisesRegex(OSError, "metadata unavailable"):
@@ -806,7 +802,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_recording_a_failure_does_not_replace_it(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             with mock.patch.object(
                     asyncio, "create_subprocess_exec",
                     side_effect=FileNotFoundError("no such program")), \
@@ -826,7 +822,7 @@ class JobOwnershipContractTests(unittest.TestCase):
         from process_lifecycle_fixtures import ProcessResources
 
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             session = Session(shell_cwd=tmpdir)
             session.job_manager = manager
             worker = Worker(session, lambda message: None, "session")
@@ -852,9 +848,9 @@ class JobOwnershipContractTests(unittest.TestCase):
                     self.assertEqual(manager._active_subagents, 1)
                     await _finish_within(worker.close(), 5, 'close during launch')
                     release.set()
-                    with self.assertRaises(loki._JobRevokedDuringLaunch) as raised:
+                    with self.assertRaises(job_runtime._JobRevokedDuringLaunch) as raised:
                         await _finish_within(task, 5, 'revoked launch')
-                    self.assertIs(type(raised.exception), loki._JobRevokedDuringLaunch)
+                    self.assertIs(type(raised.exception), job_runtime._JobRevokedDuringLaunch)
                 self.assertEqual(len(resources), 1)
                 # Observe the captured unpublished child before any backstop.
                 self.assertIsNotNone(resources[0].process.returncode)
@@ -884,7 +880,7 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_a_failed_spawn_is_left_as_a_recorded_failed_job(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             with self.assertRaises(OSError):
                 await manager.run_exec(
                     [os.path.join(tmpdir, "not-a-program")], 5_000,
@@ -909,9 +905,9 @@ class JobOwnershipContractTests(unittest.TestCase):
 
     def test_a_refused_subagent_is_recorded_and_frees_its_reservation(self):
         async def scenario(tmpdir):
-            manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
-            manager._active_subagents = loki.MAX_ACTIVE_DIRECT_SUBAGENTS
-            with self.assertRaises(loki.SubagentCapacityError):
+            manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
+            manager._active_subagents = tool_contracts.MAX_ACTIVE_DIRECT_SUBAGENTS
+            with self.assertRaises(job_runtime.SubagentCapacityError):
                 await manager.run_exec(
                     [os.path.join(tmpdir, "not-a-program")], 5_000,
                     cwd=tmpdir, session_owned=True, subagent=True)
@@ -921,7 +917,7 @@ class JobOwnershipContractTests(unittest.TestCase):
             manager = asyncio.run(scenario(tmpdir))
 
         self.assertEqual(manager._active_subagents,
-                         loki.MAX_ACTIVE_DIRECT_SUBAGENTS)
+                         tool_contracts.MAX_ACTIVE_DIRECT_SUBAGENTS)
         job = next(iter(manager.jobs.values()))
         self.assertEqual(job.status, "failed")
         self.assertIn("SubagentCapacityError", job.error)

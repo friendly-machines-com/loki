@@ -276,7 +276,7 @@ async def _cd(argument: str, session) -> Outcome:
 async def _image(argument: str, session) -> Outcome:
     try:
         path = attachments.image_argument_path(argument)
-        image = attachments.load_image_attachment(path)
+        image = attachments.load_image_attachment(path, base_dir=session.shell_cwd)
     except attachments.ImageAttachmentError as error:
         return Outcome(text=f"image: {error}")
     return Outcome(

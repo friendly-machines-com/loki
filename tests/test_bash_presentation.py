@@ -13,6 +13,9 @@ from config_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import acp_events, formats, loki, process_outputs, protocols, savefiles
 from loki_agent import settings, terminal_frontend, tool_runtime
+from loki_agent import connections
+from loki_agent import tool_contracts
+from loki_agent import jobs as job_runtime
 
 
 def preferences(show_stdout):
@@ -79,8 +82,8 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("status: completed", rendered)
 
     def test_stderr_remains_visible_after_model_text_truncation(self):
-        event = process_event("x" * (loki.BASH_MAX_OUTPUT_CHARS + 1), "important-stderr")
-        event["content"] = loki._truncate_text(event["content"], loki.BASH_MAX_OUTPUT_CHARS)
+        event = process_event("x" * (tool_contracts.BASH_MAX_OUTPUT_CHARS + 1), "important-stderr")
+        event["content"] = process_outputs.truncate_text(event["content"], tool_contracts.BASH_MAX_OUTPUT_CHARS)
         self.assertNotIn("important-stderr", event["content"])
         self.assertIn("important-stderr", self.render(event))
 
@@ -175,10 +178,10 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = pathlib.Path(directory.name)
-        self.manager = loki.JobManager(str(self.directory))
+        self.manager = job_runtime.JobManager(str(self.directory))
         self.session = loki.Session(
             shell_cwd=str(self.directory), job_manager=self.manager,
-            runtime_config=loki.make_runtime_config(
+            runtime_config=connections.make_runtime_config(
                 "http://example.invalid/v1", protocols.DUMMY, model="test-model"))
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
@@ -264,7 +267,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         stderr = self.directory / "stderr.log"
         stdout.write_text("job-stdout", encoding="utf-8")
         stderr.write_text("job-stderr", encoding="utf-8")
-        job = loki.Job(
+        job = job_runtime.Job(
             id="1", command="test", argv=None, shell=shell, description="", background=True,
             spool_dir=str(self.directory), stdout_path=str(stdout), stderr_path=str(stderr),
             metadata_path=str(self.directory / "job.json"), started_at_iso="start",

@@ -15,6 +15,8 @@ import sys
 import uuid
 from dataclasses import dataclass
 
+from . import connections, model_requests
+from . import tool_contracts
 from . import credential_capabilities
 from . import credential_runtimes
 from . import formats
@@ -82,10 +84,10 @@ def _subagent_depth(value: str) -> int:
         depth = int(value)
     except ValueError as error:
         raise ValueError("subagent depth must be an integer") from error
-    if not 1 <= depth <= _core.MAX_SUBAGENT_DEPTH:
+    if not 1 <= depth <= tool_contracts.MAX_SUBAGENT_DEPTH:
         raise ValueError(
             "subagent depth must be between 1 and "
-            f"{_core.MAX_SUBAGENT_DEPTH}")
+            f"{tool_contracts.MAX_SUBAGENT_DEPTH}")
     return depth
 
 
@@ -144,7 +146,7 @@ def parse_args(args) -> SubagentOptions:
 
 
 async def run_prompt_async(subagent_type: str, prompt: str,
-                           thinking: _core.TurnThinkingSettings | None = None) -> str:
+                           thinking: model_requests.TurnThinkingSettings | None = None) -> str:
     if subagent_type != "Explore":
         return (
             f"Error: unknown subagent_type {subagent_type!r} "
@@ -153,7 +155,7 @@ async def run_prompt_async(subagent_type: str, prompt: str,
         return ""
     may_delegate = (
         _core.current_session().subagent_depth
-        < _core.MAX_SUBAGENT_DEPTH)
+        < tool_contracts.MAX_SUBAGENT_DEPTH)
     delegation_instruction = (
         "You may use Agent to delegate another read-only Explore search."
         if may_delegate else
@@ -167,7 +169,7 @@ async def run_prompt_async(subagent_type: str, prompt: str,
     ]
     _core.current_session().agent_mode = "explore"
     # Unlike top-level Explore mode, subagents have no interactive input seam.
-    allowed = _core.EXPLORE_TOOLS - {_core.ASK_TOOL_NAME}
+    allowed = _core.EXPLORE_TOOLS - {tool_contracts.ASK_TOOL_NAME}
     if not may_delegate:
         allowed = allowed - {"Agent"}
     if thinking is None:
@@ -181,7 +183,7 @@ async def run_prompt_async(subagent_type: str, prompt: str,
 
 async def run_cli_async(
         subagent_type: str, prompt: str | None = None,
-        thinking: _core.TurnThinkingSettings | None = None) -> None:
+        thinking: model_requests.TurnThinkingSettings | None = None) -> None:
     prompt = prompt if prompt is not None else sys.stdin.read().strip()
     result = await run_prompt_async(subagent_type, prompt, thinking=thinking)
     if result:
@@ -272,7 +274,7 @@ async def async_main(args) -> int:
                 return 2
 
         try:
-            _core.apply_runtime_config(_core.build_config_from_env(
+            _core.apply_runtime_config(connections.build_config_from_env(
                 credentials=_core.CREDENTIALS))
             # Delegated settings cross only in LOKI_TURN_THINKING; with no
             # envelope the child captures its own defaults.

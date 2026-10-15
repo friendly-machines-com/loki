@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 
-from . import credential_capabilities, host_ipc
+from . import connections, credential_capabilities, host_ipc, protocols
 from . import runtime_isolation
 from .authentications import CredentialBroker
 from .credentials import CredentialInventory, CredentialStore
@@ -55,11 +55,10 @@ class CredentialSupervisor:
         # Use the same pure configuration/route derivation as the runtime.
         # Only the captured explicit connection is prior consent; saved logs
         # and catalog selections cannot claim to be launch configuration.
-        from . import loki
-        if loki.explicit_api_base_configured(self.inventory):
+        if connections.explicit_api_base_configured(self.inventory):
             try:
-                config = loki.build_config_from_env(credentials=self.inventory)
-            except (ValueError, loki.protocols.ProtocolError):
+                config = connections.build_config_from_env(credentials=self.inventory)
+            except (ValueError, protocols.ProtocolError):
                 # The runtime reports invalid configuration through its usual
                 # UI. It must not create any implicit destination permissions.
                 config = None
@@ -77,7 +76,7 @@ class CredentialSupervisor:
         # The Windows workspace gate runs before any channel is created.
         workspace = runtime_isolation.configured_workspace(arguments)
         import getopt
-        from .terminal_frontend import parse_cli_args
+        from .arguments import parse_cli_args
         try:
             options, _positional = parse_cli_args(arguments)
             manage_approvals = not any(name == "--headless" for name, _value in options)

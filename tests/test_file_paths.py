@@ -10,7 +10,8 @@ import unittest
 from unittest import mock
 from config_fixtures import setUpModule  # noqa: F401 - unittest hook
 
-from loki_agent import loki, savefiles, sessions, terminal_frontend
+from loki_agent import loki, private_files, savefiles, sessions, terminal_frontend
+from loki_agent import files as file_operations
 
 
 class StatIdentityTests(unittest.TestCase):
@@ -45,9 +46,9 @@ class StatIdentityTests(unittest.TestCase):
                             if platform == 'posix':
                                 with self.assertRaisesRegex(
                                         OSError, 'changed while it was being read'):
-                                    loki._file_observation(str(path), expected)
+                                    file_operations._file_observation(str(path), expected)
                             else:
-                                observed = loki._file_observation(str(path), expected)
+                                observed = file_operations._file_observation(str(path), expected)
                                 self.assertEqual(observed.digest,
                                                  hashlib.sha256(payload).hexdigest())
                                 self.assertEqual(observed.size, len(payload))
@@ -78,7 +79,7 @@ class FilePathTests(unittest.TestCase):
         original = self.project / 'original'
         other = self.project / 'other'
         alias = self.project / 'alias'
-        atomic_write = loki._atomic_write_text
+        atomic_write = file_operations.atomic_write_text
 
         def redirect_before_publication(path, content):
             alias.unlink()
@@ -93,7 +94,7 @@ class FilePathTests(unittest.TestCase):
                     alias.unlink()
                 alias.symlink_to('original')
                 self.assertIn('reviewed', loki.run_read(str(alias)))
-                with mock.patch.object(loki, '_atomic_write_text',
+                with mock.patch.object(file_operations, 'atomic_write_text',
                                        side_effect=redirect_before_publication):
                     if operation == 'Write':
                         result = loki.run_write(str(alias), 'updated')
@@ -110,7 +111,7 @@ class FilePathTests(unittest.TestCase):
         other.write_text('same contents')
         alias = self.project / 'alias'
         alias.symlink_to('original')
-        observe = loki._file_observation
+        observe = file_operations._file_observation
 
         def redirect_after_observation(path, expected_stat=None):
             result = observe(path, expected_stat=expected_stat)
@@ -118,13 +119,13 @@ class FilePathTests(unittest.TestCase):
             alias.symlink_to('other')
             return result
 
-        with mock.patch.object(loki, '_file_observation',
+        with mock.patch.object(file_operations, '_file_observation',
                                side_effect=redirect_after_observation):
             self.assertIn('same contents', loki.run_read(str(alias)))
         # Authorization is per spelling: the record names the alias the caller
         # read, and nothing recorded a read of the other name.
-        self.assertIn(loki._file_key(str(alias)), loki.file_state)
-        self.assertNotIn(loki._file_key(str(other)), loki.file_state)
+        self.assertIn(file_operations.observation_key(str(alias)), loki.file_state)
+        self.assertNotIn(file_operations.observation_key(str(other)), loki.file_state)
         self.assertIn('You must Read', loki.run_write(str(other), 'wrong'))
         self.assertEqual(other.read_text(), 'same contents')
 
@@ -230,8 +231,8 @@ class FilePathTests(unittest.TestCase):
                 self.assertEqual(target.read_text(), 'old')
                 self.assertIn('old', loki.run_read(operand))
                 self.assertIn('old', loki.run_read('alias'))
-                real_open = loki.private_files.open_directory
-                real_create = loki.private_files.create_exclusive_at
+                real_open = private_files.open_directory
+                real_create = private_files.create_exclusive_at
                 opened, created = [], []
 
                 def observe_open(name):
@@ -243,9 +244,9 @@ class FilePathTests(unittest.TestCase):
                     created.append(handle)
                     return real_create(handle, name, mode)
 
-                with mock.patch.object(loki.private_files, 'open_directory',
+                with mock.patch.object(private_files, 'open_directory',
                                        side_effect=observe_open), \
-                        mock.patch.object(loki.private_files,
+                        mock.patch.object(private_files,
                                           'create_exclusive_at',
                                           side_effect=observe_create):
                     self.assertIn('Successfully',
@@ -464,7 +465,7 @@ class FilePathTests(unittest.TestCase):
         loki.new_chat_log(literal)
         self.assertEqual(self.session.chat_log_path, literal)
         base = self.project if os.name != 'posix' else self.elsewhere
-        loki._atomic_write_text(self.session.chat_log_path, 'snapshot')
+        file_operations.atomic_write_text(self.session.chat_log_path, 'snapshot')
         self.assertEqual((base / 'new-session.json').read_text(), 'snapshot')
 
     def test_resume_writes_through_the_path_it_was_given(self):
@@ -486,13 +487,13 @@ class FilePathTests(unittest.TestCase):
         (base / 'actual.json').write_text('old')
         self.session.replace_transcript([], [], {}, {}, resolved)
         self.assertEqual(self.session.chat_log_path, literal)
-        loki._atomic_write_text(self.session.chat_log_path, 'new')
+        file_operations.atomic_write_text(self.session.chat_log_path, 'new')
         self.assertTrue(alias.is_symlink())
         self.assertEqual((base / 'actual.json').read_text(), 'new')
         # Redirecting the link afterwards redirects later writes.
         (base / 'other.json').write_text('unrelated')
         alias.unlink()
         alias.symlink_to('other.json')
-        loki._atomic_write_text(self.session.chat_log_path, 'saved again')
+        file_operations.atomic_write_text(self.session.chat_log_path, 'saved again')
         self.assertEqual((base / 'other.json').read_text(), 'saved again')
         self.assertEqual((base / 'actual.json').read_text(), 'new')

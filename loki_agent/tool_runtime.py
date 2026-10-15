@@ -9,6 +9,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from . import process_outputs
+
 
 class ToolSchemaError(ValueError):
     pass
@@ -1140,3 +1142,10 @@ def invalid_input_message(tool_name, issues):
     lines.extend(f"- {issue.message}" for issue in issues)
     lines.append(f"Retry {tool_name} with corrected arguments.")
     return "\n".join(lines)
+
+
+def tool_result(ok: bool, content, *, process_output=None) -> dict:
+    result = {"ok": ok, "content": str(content)}
+    if process_output is not None:
+        result["process_output"] = process_outputs.ProcessOutput.from_dict(process_output).to_dict()
+    return result

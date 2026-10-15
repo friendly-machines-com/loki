@@ -17,6 +17,7 @@ import socket
 from . import host_ipc
 from .authentications import (
     CredentialAuthority,
+    CredentialBroker,
     CredentialError,
     CredentialLease,
     CredentialRef,
@@ -438,7 +439,14 @@ class CredentialCapabilityServer:
             if method == "approvals.status":
                 return await self.authority.unapproved_destinations(
                     credential, destinations)
-            await self.authority.approve_destinations(
+            authority = self.authority
+            if not isinstance(authority, CredentialBroker):
+                raise CapabilityError(
+                    "approval changes are not available through this connection")
+            # Only the local broker can check this channel's lifetime at the
+            # durable commit. A remote approval RPC cannot carry the callback;
+            # checking before forwarding would leave an upstream lock-wait race.
+            await authority.approve_destinations(
                 credential, destinations, before_commit=self._check_live)
             return None
         if method != "lease":

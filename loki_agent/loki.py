@@ -11,44 +11,33 @@
 # TODO: make this an actual shell; pipeable and so on like always; history search etc
 
 import sys
-import logging
 import os
 import asyncio
 import collections
-import contextlib
 import copy
-import hashlib
 import json
-import random
 import time
 import urllib.parse
-import signal
 import socket
 import stat
-import uuid
-import shutil
-from dataclasses import dataclass, field, replace
-from html.parser import HTMLParser
-from pprint import pformat
+from dataclasses import replace
+from functools import partial
 
-from . import executables
+from . import connections
+from . import model_requests
+from . import files
+from . import jobs
+from . import web_tools
+from . import tool_contracts
 from . import formats
-from . import host_ipc
-from . import private_files
-from . import host_process
-from . import http_client
 from . import models as modelsdev
-from . import openai_models
 from . import paths
 from . import prompts
 from . import protocols
 from . import process_outputs
 from . import authentications
-from . import credential_capabilities
 from . import savefiles
-from . import sse
 from . import tool_runtime
-from . import usages
 from .connections import ConnectionDescriptor
 from .credentials import (
     CredentialInventory,
@@ -189,23 +178,6 @@ def set_reasoning_effort(value: str | None):
 
 # -- thinking controls ------------------------------------------------------
 
-@dataclass(frozen=True)
-class TurnThinkingSettings:
-    """The thinking settings of one logical turn, captured before any
-    inference starts.
-
-    Every request in the turn -- terminal inference, tool continuations,
-    tool-less helpers, delegated inference -- uses this same snapshot, so
-    changes made mid-turn apply to the next turn, never halfway through
-    this one.
-    """
-
-    effort: str | None = None
-    mode: str | None = None
-    budget: int | None = None
-    retention: str = "default"
-    traces: str = "off"
-
 
 def _thinking_connection():
     config = current_config()
@@ -246,7 +218,7 @@ def effective_thinking_settings():
     return mode, budget, retention
 
 
-def capture_turn_settings() -> TurnThinkingSettings:
+def capture_turn_settings() -> model_requests.TurnThinkingSettings:
     """Project the saved thinking controls into this turn's settings.
 
     This is the turn-admission projection and the single point that
@@ -260,10 +232,10 @@ def capture_turn_settings() -> TurnThinkingSettings:
     session = current_session()
     config = current_config()
     if config is None or not config.model:
-        return TurnThinkingSettings(traces=session.reasoning_traces)
+        return model_requests.TurnThinkingSettings(traces=session.reasoning_traces)
     provider = config.chat_provider
     model = config.model
-    settings = TurnThinkingSettings(
+    settings = model_requests.TurnThinkingSettings(
         effort=effective_reasoning_effort(),
         mode=session.thinking_mode,
         budget=session.thinking_budget,
@@ -474,7 +446,7 @@ def reasoning_traces_status_text():
 def current_job_manager():
     session = current_session()
     if session.job_manager is None:
-        session.job_manager = JobManager(LOKI_JOB_STATE_DIR)
+        session.job_manager = jobs.JobManager(LOKI_JOB_STATE_DIR)
     return session.job_manager
 
 
@@ -486,19 +458,6 @@ ERROR_COLOR = 1
 TOOL_CALL_COLOR = 5
 
 MAX_LOOP_LIMIT = 500
-READ_CHAR_CAP = 10 * 1024 * 1024
-READ_PATHS_LIMIT = 1000
-READ_DEFAULT_LINES = 2000
-BASH_DEFAULT_TIMEOUT_MS = 300000
-BASH_MAX_TIMEOUT_MS = 600000
-BASH_MAX_OUTPUT_CHARS = 10_000_000
-GLOB_MAX_RESULTS = 100
-GREP_DEFAULT_HEAD_LIMIT = 250
-# Each process may own two children, and only three descendant generations
-# may exist. Thus one root process can have at most 2 + 4 + 8 active
-# descendants instead of allowing recursive Agent calls to grow without bound.
-MAX_ACTIVE_DIRECT_SUBAGENTS = 2
-MAX_SUBAGENT_DEPTH = 3
 TODO_MAX_TODOS = 100
 SKILL_MAX_BYTES = 100_000
 LOKI_CONFIG_DIR_NAME = paths.LOKI_CONFIG_DIR_NAME
@@ -506,620 +465,18 @@ LOKI_CONFIG_DIR = paths.loki_config_dir()
 LOKI_STATE_DIR = paths.loki_state_dir()
 LOKI_JOB_STATE_DIR = os.path.join(LOKI_STATE_DIR, "jobs")
 STARTUP_CWD = os.getcwd()
-_UMASK = os.umask(0)          # probe: sets umask to 0 momentarily, returns the previous value
-os.umask(_UMASK)             # restore immediately; no concurrent code runs at startup
 
 
-if os.name == "posix":
-    def _apply_destination_permissions(file_path, fd, tmp_path, target_mode):
-        """Set the captured mode through the open descriptor."""
-        fchmod = getattr(os, 'fchmod', None)
-        if fchmod is not None:
-            fchmod(fd, target_mode)
-        else:
-            # This legacy fallback lacks the descriptor branch's protection
-            # against replacement of the temporary directory entry.
-            os.chmod(tmp_path, target_mode)
-else:
-    def _apply_destination_permissions(file_path, fd, tmp_path, target_mode):
-        """Preserve the destination's DACL on the temporary file.
-
-        Windows has no file modes.  The destination's DACL is captured by name
-        (mirroring the POSIX mode capture).  The descriptor from ``mkstemp`` was
-        not opened with ``WRITE_DAC``, so the DACL is applied by pathname -- the
-        same fallback and the same limitation as the POSIX ``os.chmod`` branch:
-        a replaced temporary entry could receive it instead.  A destination that
-        does not exist yet keeps the inherited default DACL, which is what a
-        plain create would have given it.
-        """
-        from . import windows_api
-        try:
-            sddl = windows_api.dacl_sddl(file_path)
-        except windows_api.WindowsApiError as error:
-            if error.status in [windows_api.ERROR_FILE_NOT_FOUND,
-                                windows_api.ERROR_PATH_NOT_FOUND]:
-                # A destination that does not exist yet keeps the inherited
-                # default DACL; any other read failure must not be papered over.
-                return
-            raise
-        if sddl is not None:
-            windows_api.set_named_dacl(tmp_path, sddl)
-
-
-def chat_log_dir_for(workspace: str) -> str:
-    """The chat-log root for a session whose workspace is ``workspace``.
-
-    A transcript lives in its workspace, not in the directory the process
-    happened to start in.  An ACP client names the session's ``cwd`` and the
-    agent must use it regardless of where the subprocess was spawned (Agent
-    Client Protocol, Session Setup) -- which is also the only tree a contained
-    runtime may write on Windows.  The terminal has no protocol cwd, so its
-    workspace is the startup directory and ``CHAT_LOG_DIR`` is that case.
-    """
-    return os.path.join(workspace, ".loki", "chats")
-
-
-CHAT_LOG_DIR = chat_log_dir_for(STARTUP_CWD)
-JOB_TAIL_CHARS = 20_000
-
-WEBFETCH_TIMEOUT_S = 30
-LLM_REQUEST_TIMEOUT_S = 300
-LLM_STREAM_IDLE_TIMEOUT_S = 300
-WEBFETCH_MAX_BYTES = 10_485_760  # 10 MiB
-WEBFETCH_MAX_PROMPT_CHARS = 200_000
-WEBFETCH_CACHE_TTL = 15 * 60    # 15 minutes
-WEBFETCH_CACHE_MAX_ENTRIES = 128
-WEBSEARCH_TIMEOUT_S = 20
-WEBSEARCH_MAX_RESPONSE_BYTES = 2_000_000
-WEBSEARCH_MAX_RESULTS = 8
-DUCKDUCKGO_HTML_SEARCH_URL = 'https://html.duckduckgo.com/html/'
-HTTP_MAX_RESPONSE_BYTES = http_client.HTTP_MAX_RESPONSE_BYTES
-
-# Retry policy for transient transport failures (timeouts, connection resets).
-# Safe in this codebase because every request opens a fresh TCP connection
-# with Connection: close; the kernel drops late packets from the old socket on
-# the new connection's source port. Edit these to tune or disable.
-HTTP_RETRY_MAX_ATTEMPTS = 3         # for GETs and the read-only search POST
-HTTP_RETRY_MAX_ATTEMPTS_LLM = 3     # for chat-completion POSTs (with idempotency key)
-HTTP_RETRY_BASE_DELAY_S = 0.5
-HTTP_RETRY_MAX_JITTER_S = 0.5
-HTTP_RETRY_BACKOFF_FACTOR = 2.0
-# Idempotency-key header injected on every chat-completion POST so the provider
-# can dedup a retry. Anthropic honors this server-side; OpenAI-compat servers
-# may ignore it and bill for each attempt -- set HTTP_RETRY_MAX_ATTEMPTS_LLM=1
-# if your provider does not honor the header.
-LLM_IDEMPOTENCY_HEADER_ANTHROPIC = "anthropic-idempotency-key"
-LLM_IDEMPOTENCY_HEADER_OPENAI = "Idempotency-Key"
-CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
-OPENCODE_SESSION_HEADER = "x-opencode-session"
-
-
-@dataclass
-class CodexTurnState:
-    """Opaque sticky-routing state for one logical Codex turn.
-
-    The ChatGPT backend mints this value on the first successful response.
-    Every later sampling request in the same user turn must echo that exact
-    first value. It is deliberately neither interpreted nor persisted.
-    """
-
-    value: str | None = None
-
-    def capture(self, value):
-        # Match Codex's OnceLock semantics: absence does nothing and the first
-        # actual header value wins, even if a later response supplies another.
-        if self.value is None and isinstance(value, str):
-            self.value = value
-
-
-class ApiError(Exception):
-    def __init__(self, request_url: str, status: int, reason: str, body_text: str):
-        self.request_url = request_url
-        self.status = status
-        self.reason = reason
-        self.body_text = body_text
-        try:
-            self.body = json.loads(body_text) if body_text else None
-        except json.JSONDecodeError:
-            self.body = None
-        super().__init__(self.summary())
-
-    def summary(self) -> str:
-        return f"API Error for <{self.request_url}>: HTTP {self.status} {self.reason}"
-
-    def formatted_body(self) -> str:
-        if self.body is not None:
-            # API error bodies are often JSON dictionaries. Pretty-print them so
-            # terminal errors stay readable. Use the real terminal width instead
-            # of an arbitrary fixed column so wide terminals are not wrapped early.
-            width = shutil.get_terminal_size(fallback=(80, 24)).columns
-            return pformat(self.body, width=width)
-        return self.body_text
-
-    def formatted(self) -> str:
-        body = self.formatted_body()
-        if not body:
-            return self.summary()
-        return f"{self.summary()}:\n{body}"
-
-
-class StreamingApiError(ApiError):
-    def formatted(self) -> str:
-        return (
-            super().formatted()
-            + "\nStreaming was requested. If this server does not support "
-              "streaming, set LOKI_STREAM=0.")
-
-
-class StreamCancelled(Exception):
-    pass
-
-
-@dataclass
-class RuntimeConfig:
-    chat_provider: protocols.Provider
-    model: str
-    # Authentication is intentionally a non-secret request-time recipe.
-    # Neither RuntimeConfig nor Provider retains a credential value.
-    auth_spec: authentications.AuthSpec | None = None
-    model_status: str | None = None
-    stream: bool = False
-    context_capacity: usages.ContextCapacity | None = None
-    reasoning_effort_profile: (
-        modelsdev.ReasoningEffortProfile | None) = None
-    reasoning_capabilities: (
-        modelsdev.ReasoningCapabilities | None) = None
-
-    def credential_destinations(self) -> list[str]:
-        """Concrete request destinations displayed/approved for this connection."""
-        if self.auth_spec is None:
-            return []
-        from . import provider_controls
-        destinations = [self.chat_provider.chat_url,
-                        *self.chat_provider.model_urls]
-        destinations.extend(provider_controls.account_destinations(
-            provider_controls.ControlContext(config=self)))
-        return list(dict.fromkeys(destinations))
+CHAT_LOG_DIR = paths.chat_log_dir_for(STARTUP_CWD)
 
 
 CREDENTIALS: CredentialStore | CredentialInventory | None = None
 
 
-def _int_setting(name, default, credentials):
-    value = credentials.get(name)
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def _bool_setting(name, default, credentials):
-    value = credentials.get(name)
-    if not value:
-        return default
-    normalized = value.strip().lower()
-    if normalized in ["1", "true", "yes", "on"]:
-        return True
-    if normalized in ["0", "false", "no", "off"]:
-        return False
-    raise ValueError(
-        f"{name} must be one of: 1, 0, true, false, yes, no, on, off")
-
-
-def _auth_spec(provider_kind, credential_ref, request_urls,
-               auth_header=None, auth_scheme=None):
-    if credential_ref is None:
-        if auth_scheme is not None:
-            raise ValueError(
-                "authentication scheme requires a credential reference")
-        return None
-    if auth_scheme is not None:
-        scheme = auth_scheme
-    elif credential_ref.kind == "openai-subscription":
-        scheme = "openai-subscription"
-    elif auth_header:
-        scheme = "custom"
-    elif provider_kind == protocols.ANTHROPIC_MESSAGES:
-        scheme = "anthropic"
-    else:
-        scheme = "bearer"
-    if scheme not in {
-            "anthropic", "bearer", "custom", "openai-subscription"}:
-        raise ValueError(f"unknown authentication scheme {scheme!r}")
-    if ((credential_ref.kind == "openai-subscription")
-            != (scheme == "openai-subscription")):
-        raise ValueError(
-            "OpenAI subscription credentials require the "
-            "openai-subscription authentication scheme")
-    if scheme == "custom" and not auth_header:
-        raise ValueError(
-            "custom authentication requires an authentication header")
-    return authentications.AuthSpec(
-        credential=credential_ref,
-        scheme=scheme,
-        header_name=auth_header if scheme == "custom" else None,
-        # The subscription scheme is bound to the canonical Codex URLs here
-        # rather than to whatever endpoints the provider happens to expose, so
-        # a provider-configuration change cannot widen credential authority.
-        authorized_urls=(
-            authentications.OPENAI_CHATGPT_CODEX_URLS
-            if scheme == "openai-subscription"
-            else frozenset(url for url in request_urls if url is not None)
-        ),
-    )
-
-
-def make_runtime_config(
-        url, provider_kind, *, model="", models_url=None,
-        max_tokens=4096, anthropic_version="2023-06-01",
-        auth_header=None, auth_scheme=None, provider_id=None,
-        provider_name=None, credential_ref=None, model_status=None,
-        stream=False, prompt_cache=False, openai_request_profile=None,
-        reasoning_effort_profile=None, context_capacity=None,
-        reasoning_capabilities=None):
-    """Build a RuntimeConfig (and its Provider) from explicit parameters.
-
-    The single place a production Provider is constructed. Startup reads the
-    environment into these parameters; a mid-session /model change calls
-    reinstall_provider() which reuses this to rebuild the Provider from the
-    current config plus per-model overrides.
-    """
-    if (context_capacity is not None
-            and not isinstance(context_capacity, usages.ContextCapacity)):
-        raise ValueError("context_capacity must be ContextCapacity or null")
-    if (reasoning_effort_profile is not None
-            and not isinstance(
-                reasoning_effort_profile,
-                modelsdev.ReasoningEffortProfile)):
-        raise ValueError(
-            "reasoning_effort_profile must be ReasoningEffortProfile or null")
-    if (reasoning_capabilities is not None
-            and not isinstance(
-                reasoning_capabilities,
-                modelsdev.ReasoningCapabilities)):
-        raise ValueError(
-            "reasoning_capabilities must be ReasoningCapabilities or null")
-    chat_provider = protocols.make_provider(
-        url,
-        provider=provider_kind,
-        models_url=models_url,
-        max_tokens=max_tokens,
-        anthropic_version=anthropic_version,
-        provider_id=provider_id,
-        provider_name=provider_name,
-        prompt_cache=prompt_cache,
-        openai_request_profile=openai_request_profile,
-        reasoning_field=(
-            reasoning_capabilities.interleaved_field
-            if reasoning_capabilities is not None else None),
-    )
-    if (reasoning_effort_profile is not None
-            and not protocols.reasoning_effort_supported(
-                provider_id, chat_provider.kind)):
-        raise ValueError(
-            "reasoning effort profile is not valid for this provider "
-            "protocol")
-    auth_spec = _auth_spec(
-        provider_kind,
-        credential_ref,
-        [chat_provider.chat_url, *chat_provider.model_urls],
-        auth_header,
-        auth_scheme,
-    )
-    if (auth_spec is not None
-            and auth_spec.scheme == "openai-subscription"
-            and provider_id
-            != modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID):
-        raise ValueError(
-            "OpenAI subscription authentication requires the "
-            "openai-subscription provider identity")
-    authentications.validate_authorization_target(
-        auth_spec, chat_provider.chat_url)
-    return RuntimeConfig(
-        chat_provider=chat_provider,
-        model=model,
-        auth_spec=auth_spec,
-        model_status=model_status,
-        stream=stream,
-        reasoning_effort_profile=reasoning_effort_profile,
-        context_capacity=context_capacity,
-        reasoning_capabilities=reasoning_capabilities,
-    )
-
-
-def _context_capacity_setting(credentials, fallback=None):
-    value = credentials.get("LOKI_CONTEXT_WINDOW")
-    if not value:
-        return fallback
-    try:
-        return usages.ContextCapacity(int(value), "configured")
-    except ValueError as error:
-        raise ValueError(
-            "LOKI_CONTEXT_WINDOW must be a positive integer") from error
-
-
-def _available_environment_credential(credentials, names):
-    name = credentials.first_available_name(names)
-    return (
-        authentications.CredentialRef.environment(name)
-        if name is not None else None)
-
-
-def _explicit_credential_ref(credentials):
-    encoded = credentials.get("LOKI_CREDENTIAL_REF")
-    if not encoded:
-        return _available_environment_credential(
-            credentials, ["LOKI_API_KEY"])
-    try:
-        credential = authentications.CredentialRef.decode(encoded)
-    except ValueError as error:
-        raise ValueError(f"invalid LOKI_CREDENTIAL_REF: {error}") from error
-    if not credentials.has_ref(credential):
-        raise ValueError(
-            "LOKI_CREDENTIAL_REF names an unavailable credential: "
-            f"{credential.encode()}")
-    return credential
-
-
-def _openai_request_profile_setting(credentials, subscription):
-    encoded = credentials.get("LOKI_OPENAI_REQUEST_PROFILE")
-    if not encoded:
-        if subscription:
-            raise ValueError(
-                "OpenAI subscription configuration requires "
-                "LOKI_OPENAI_REQUEST_PROFILE; select the model with /model")
-        return None
-    if not subscription:
-        raise ValueError(
-            "LOKI_OPENAI_REQUEST_PROFILE requires an OpenAI subscription "
-            "credential")
-    try:
-        value = json.loads(encoded)
-        return openai_models.CodexModelRequestProfile.from_dict(value)
-    except ValueError as error:
-        raise ValueError(
-            f"invalid LOKI_OPENAI_REQUEST_PROFILE: {error}") from error
-
-
-def _reasoning_effort_profile_setting(credentials):
-    encoded = credentials.get("LOKI_REASONING_EFFORT_PROFILE")
-    if not encoded:
-        return None
-    try:
-        value = json.loads(encoded)
-        return modelsdev.ReasoningEffortProfile.from_dict(value)
-    except ValueError as error:
-        raise ValueError(
-            f"invalid LOKI_REASONING_EFFORT_PROFILE: {error}") from error
-
-
-def build_config_from_env(
-        environ=os.environ,
-        credentials: CredentialStore | CredentialInventory | None = None):
-    """Build an explicit/default runtime config from captured startup values."""
-    if credentials is None:
-        credentials = CredentialStore.capture(environ)
-
-    # Only Loki's namespace configures Loki. Generic SDK variables such as
-    # OPENAI_API_BASE and ANTHROPIC_BASE_URL may belong to unrelated programs
-    # sharing this environment and must not silently select Loki's endpoint.
-    config_url = credentials.get("LOKI_API_BASE")
-    if not config_url:
-        raise ValueError(
-            "API endpoint missing; set LOKI_API_BASE or select one with /model")
-    provider_override = credentials.get("LOKI_PROVIDER")
-    config_provider_kind = protocols.resolve_protocol(config_url, provider_override or "auto")
-
-    if config_provider_kind == protocols.DUMMY:
-        # No-op provider for testing: no network, no API key, fake URL.
-        config_model = credentials.get("LOKI_MODEL") or "dummy"
-        return make_runtime_config(
-            config_url,
-            config_provider_kind,
-            model=config_model,
-            max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
-            anthropic_version=credentials.get(
-                "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
-            provider_name="Explicit LOKI_* connection",
-            stream=_bool_setting("LOKI_STREAM", False, credentials),
-            prompt_cache=False,
-            context_capacity=_context_capacity_setting(credentials),
-        )
-
-    # Never infer credential ownership from the wire protocol. An explicitly
-    # configured endpoint uses LOKI_API_KEY when present and otherwise sends
-    # no authentication header.
-    credential_ref = _explicit_credential_ref(credentials)
-    subscription = (
-        credential_ref is not None
-        and credential_ref.kind == "openai-subscription")
-    openai_request_profile = _openai_request_profile_setting(
-        credentials, subscription)
-    reasoning_effort_profile = _reasoning_effort_profile_setting(
-        credentials)
-    delegated_provider_id = credentials.get("LOKI_PROVIDER_ID") or None
-    config_provider_id = (
-        modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
-        if subscription else delegated_provider_id)
-
-    config_model = credentials.get("LOKI_MODEL") or ""
-    return make_runtime_config(
-        config_url,
-        config_provider_kind,
-        model=config_model,
-        models_url=credentials.get("LOKI_MODELS_URL") or None,
-        max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
-        anthropic_version=credentials.get(
-            "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
-        auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
-        auth_scheme=credentials.get("LOKI_AUTH_SCHEME") or None,
-        provider_id=config_provider_id,
-        provider_name=(
-            "OpenAI ChatGPT subscription"
-            if subscription else "Explicit LOKI_* connection"),
-        credential_ref=credential_ref,
-        stream=_bool_setting("LOKI_STREAM", False, credentials),
-        prompt_cache=_bool_setting(
-            "LOKI_PROMPT_CACHE",
-            urllib.parse.urlparse(config_url).hostname
-            == "api.anthropic.com",
-            credentials,
-        ),
-        openai_request_profile=openai_request_profile,
-        reasoning_effort_profile=reasoning_effort_profile,
-        context_capacity=_context_capacity_setting(credentials),
-    )
-
-
-def explicit_api_base_configured(credentials) -> bool:
-    return bool(credentials.get("LOKI_API_BASE"))
-
-
-def explicit_connection_option(
-        credentials
-) -> modelsdev.ExplicitConnectionOption | None:
-    """Return a selectable captured LOKI_* connection when it is complete."""
-    try:
-        config = build_config_from_env(credentials=credentials)
-    except (protocols.ProtocolError, ValueError):
-        return None
-    if not config.model:
-        return None
-    return modelsdev.ExplicitConnectionOption(
-        model=config.model,
-        api_url=config.chat_provider.input_url,
-        protocol=config.chat_provider.kind,
-    )
-
-
-def config_from_connection_descriptor(
-        descriptor: ConnectionDescriptor,
-        credentials) -> RuntimeConfig:
-    credential_ref = descriptor.credential_ref
-    if (credential_ref is not None
-            and not credentials.has_ref(credential_ref)):
-        raise ValueError(
-            "saved connection requires missing "
-            f"{credential_ref.encode()}")
-
-    provider_kind = credentials.get("LOKI_PROVIDER") or descriptor.protocol
-    resolved_provider_kind = protocols.resolve_protocol(
-        descriptor.chat_url, provider_kind)
-    configured_model = credentials.get("LOKI_MODEL")
-    config_model = configured_model or descriptor.model
-    model_status = (
-        descriptor.model_status
-        if not configured_model or configured_model == descriptor.model
-        else None)
-    openai_request_profile = (
-        descriptor.openai_request_profile
-        if not configured_model or configured_model == descriptor.model
-        else None)
-    # Connection-bound metadata travels only with the same connection:
-    # a protocol override builds a different connection, whose facts the
-    # saved descriptor cannot vouch for.
-    reasoning_effort_profile = (
-        descriptor.reasoning_effort_profile
-        if ((not configured_model or configured_model == descriptor.model)
-            and resolved_provider_kind == descriptor.protocol)
-        else None)
-    max_tokens = (
-        _int_setting("LOKI_MAX_TOKENS", descriptor.max_tokens, credentials)
-        if credentials.get("LOKI_MAX_TOKENS") else descriptor.max_tokens)
-    anthropic_version = (
-        credentials.get("LOKI_ANTHROPIC_VERSION")
-        or descriptor.anthropic_version)
-    auth_header = (
-        credentials.get("LOKI_AUTH_HEADER")
-        if credentials.get("LOKI_AUTH_HEADER")
-        else descriptor.auth_header)
-    configured_auth_scheme = credentials.get("LOKI_AUTH_SCHEME") or None
-    auth_scheme = (
-        configured_auth_scheme
-        if configured_auth_scheme is not None
-        else (None
-              if credentials.get("LOKI_AUTH_HEADER")
-              else descriptor.auth_scheme))
-    stream = (
-        _bool_setting("LOKI_STREAM", descriptor.stream, credentials)
-        if credentials.get("LOKI_STREAM") else descriptor.stream)
-    prompt_cache = (
-        _bool_setting(
-            "LOKI_PROMPT_CACHE", descriptor.prompt_cache, credentials)
-        if credentials.get("LOKI_PROMPT_CACHE")
-        else descriptor.prompt_cache)
-    return make_runtime_config(
-        # Restore the concrete endpoint that was actually used, rather than
-        # deriving it again from a catalog base URL.
-        descriptor.chat_url,
-        provider_kind,
-        model=config_model,
-        models_url=descriptor.models_url,
-        max_tokens=max_tokens,
-        anthropic_version=anthropic_version,
-        auth_header=auth_header,
-        auth_scheme=auth_scheme,
-        provider_id=descriptor.provider_id,
-        provider_name=descriptor.provider_name,
-        credential_ref=credential_ref,
-        model_status=model_status,
-        stream=stream,
-        prompt_cache=prompt_cache,
-        openai_request_profile=openai_request_profile,
-        reasoning_effort_profile=reasoning_effort_profile,
-        context_capacity=_context_capacity_setting(
-            credentials,
-            descriptor.context_capacity
-            if config_model == descriptor.model
-            and resolved_provider_kind == descriptor.protocol else None),
-    )
-
-
-def _is_openai_subscription_connection(descriptor):
-    return (
-        descriptor.provider_id
-        == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID
-        and descriptor.protocol == protocols.OPENAI_RESPONSES
-        and descriptor.credential_ref
-        == authentications.CredentialRef.openai_subscription()
-    )
-
-
-def reconcile_connection_descriptor(descriptor, catalog):
-    """Replace saved subscription model data with fresh exact-slug data."""
-    if not _is_openai_subscription_connection(descriptor):
-        return descriptor
-    profile = modelsdev.reconcile_openai_subscription_profile(
-        descriptor.model,
-        descriptor.openai_request_profile,
-        catalog,
-    )
-    reasoning_effort_profile = (
-        modelsdev.reconcile_openai_subscription_reasoning_effort_profile(
-            descriptor.model,
-            descriptor.reasoning_effort_profile,
-            catalog,
-        ))
-    capacity = descriptor.context_capacity
-    provider = catalog.get(modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID)
-    if (provider is not None
-            and (capacity is None or capacity.source != "configured")):
-        capacity = modelsdev.context_capacity(
-            provider, provider["models"][descriptor.model])
-    return replace(
-        descriptor,
-        openai_request_profile=profile,
-        reasoning_effort_profile=reasoning_effort_profile,
-        context_capacity=capacity,
-    )
-
-
 async def refresh_connection_descriptor_async(
         descriptor, credential_authority, diagnostic_writer=None):
     """Refresh a subscription descriptor, retaining it only on fetch failure."""
-    if not _is_openai_subscription_connection(descriptor):
+    if not connections._is_openai_subscription_connection(descriptor):
         return descriptor
     try:
         response = await modelsdev.fetch_openai_subscription_models(
@@ -1132,103 +489,17 @@ async def refresh_connection_descriptor_async(
                 "OpenAI subscription model discovery failed; using saved "
                 f"request profile: {error}")
         catalog = {}
-    return reconcile_connection_descriptor(descriptor, catalog)
-
-
-def config_from_modelsdev_selection(
-        provider_id: str,
-        provider_entry: dict,
-        model_entry: dict,
-        credentials) -> RuntimeConfig:
-    provider_entry = modelsdev.effective_provider(provider_entry, model_entry)
-    access = modelsdev.provider_access(provider_entry, credentials)
-    if access is None:
-        raise ValueError(
-            f"provider {provider_id!r} is not available from startup credentials")
-    # Construction is pure. Approval belongs to the supervisor's lease path,
-    # not a tools-writable file consulted while building an otherwise valid
-    # configuration. Controllers confirm the concrete destinations before use.
-    selected_model = model_entry.get("id") or model_entry.get("name")
-    if not selected_model:
-        raise ValueError(f"provider {provider_id!r} returned a model without an id")
-    model_status = model_entry.get("status")
-    if not isinstance(model_status, str):
-        model_status = None
-    return make_runtime_config(
-        access.api_url,
-        access.protocol,
-        model=selected_model,
-        models_url=access.models_url,
-        max_tokens=_int_setting("LOKI_MAX_TOKENS", 4096, credentials),
-        anthropic_version=credentials.get(
-            "LOKI_ANTHROPIC_VERSION", "2023-06-01"),
-        auth_header=credentials.get("LOKI_AUTH_HEADER") or None,
-        auth_scheme=credentials.get("LOKI_AUTH_SCHEME") or None,
-        provider_id=provider_id,
-        provider_name=modelsdev.provider_display_name(
-            provider_id, provider_entry),
-        credential_ref=access.credential_ref,
-        model_status=model_status,
-        stream=_bool_setting(
-            "LOKI_STREAM",
-            provider_id == modelsdev.OPENAI_SUBSCRIPTION_PROVIDER_ID,
-            credentials,
-        ),
-        prompt_cache=_bool_setting(
-            "LOKI_PROMPT_CACHE",
-            provider_id == "anthropic",
-            credentials,
-        ),
-        openai_request_profile=modelsdev.openai_request_profile(
-            provider_entry, model_entry),
-        reasoning_effort_profile=modelsdev.reasoning_effort_profile(
-            provider_id, provider_entry, model_entry),
-        context_capacity=_context_capacity_setting(
-            credentials, modelsdev.context_capacity(provider_entry, model_entry)),
-    )
-
-
-def connection_descriptor_from_config(
-        config: RuntimeConfig) -> ConnectionDescriptor | None:
-    if config.chat_provider.kind == protocols.DUMMY:
-        return None
-    auth_spec = config.auth_spec
-    credential_ref = (
-        auth_spec.credential if auth_spec is not None else None)
-    provider = config.chat_provider
-    return ConnectionDescriptor(
-        provider_id=provider.provider_id,
-        provider_name=provider.provider_name,
-        model=config.model,
-        chat_url=provider.chat_url,
-        models_url=provider.models_url,
-        protocol=provider.kind,
-        credential_ref=credential_ref,
-        max_tokens=provider.max_tokens,
-        anthropic_version=provider.headers.get(
-            "anthropic-version", "2023-06-01"),
-        auth_header=(
-            auth_spec.header_name
-            if auth_spec is not None
-            and auth_spec.scheme == "custom" else None),
-        auth_scheme=auth_spec.scheme if auth_spec is not None else None,
-        model_status=config.model_status,
-        stream=config.stream,
-        prompt_cache=provider.prompt_cache,
-        openai_request_profile=provider.openai_request_profile,
-        reasoning_effort_profile=config.reasoning_effort_profile,
-        context_capacity=config.context_capacity,
-    )
+    return connections.reconcile_connection_descriptor(descriptor, catalog)
 
 
 def active_connection_descriptor() -> ConnectionDescriptor | None:
     config = current_config()
     if config is None:
         return None
-    return connection_descriptor_from_config(config)
+    return connections.connection_descriptor_from_config(config)
 
 
-def apply_runtime_config(config: RuntimeConfig):
+def apply_runtime_config(config: connections.RuntimeConfig):
     # model is derived from runtime_config (Session.model property); nothing
     # else to publish.
     current_session().runtime_config = config
@@ -1328,7 +599,7 @@ def reinstall_provider(*, model=None, url=None, provider_kind=None,
             if same_catalog_entry else None)
     else:
         new_reasoning_effort_profile = reasoning_effort_profile
-    apply_runtime_config(make_runtime_config(
+    apply_runtime_config(connections.make_runtime_config(
         new_url,
         new_kind,
         model=new_model,
@@ -1394,77 +665,12 @@ class LruCache(object):
         return self.items.pop(key, default)
 
 
-@dataclass(frozen=True)
-class FileObservation:
-    digest: str
-    size: int
-
-
-file_state = LruCache(READ_PATHS_LIMIT)
-_webfetch_cache = LruCache(WEBFETCH_CACHE_MAX_ENTRIES)  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
+file_state = LruCache(files.READ_PATHS_LIMIT)
+_webfetch_cache = LruCache(web_tools.WEBFETCH_CACHE_MAX_ENTRIES)  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
 
 
 def _resolve_path(path: str, base_dir: str | None = None) -> str:
-    if not path:
-        return path
-    # This is an operation pathname, not an identity key. Let the kernel
-    # traverse symlinks, '..', non-directories and missing components.
-    if os.path.isabs(path):
-        return path
-    return os.path.join(base_dir or current_cwd(), path)
-
-
-def _file_key(file_path: str) -> str:
-    """The name a read-before-write record is kept under.
-
-    Loki never normalises or resolves a filesystem operand -- never, for any
-    purpose, including this one.  A name is what the caller wrote, anchored by
-    the caller to the fixed logical cwd; rewriting it substitutes a different
-    name for a possibly different object, which is not what any caller asked
-    for.  ``realpath``, ``abspath`` and ``normpath`` all do that rewriting.
-    Case and separators are folded so one name has one key, and nothing else is
-    done to it.
-
-    Identity by ``(st_dev, st_ino)`` is not used either: on volumes that report
-    no file index (fat, exFAT, some shares and filters) two unrelated files
-    share ``st_ino`` 0 and would share a key.
-
-    What detects a replaced file is the observation recorded under this key,
-    compared in ``_stale_file_error``.
-    """
-    return os.path.normcase(file_path)
-
-
-_MAX_LINK_DEPTH = 8
-
-
-def _follow_final_link(file_path: str) -> str:
-    """The name to replace: an existing final symlink's target, else the name.
-
-    Following a final symlink is the one thing a write must do with a name:
-    editors' atomic saves replace the link's target and leave the link, and
-    replacing the link instead breaks pnpm-style links, shared configuration
-    and git's view of the file (a typechange from symlink to regular file).
-    Loki still never normalises or resolves a *path*: this reads the link
-    itself with ``readlink`` and joins at most ``_MAX_LINK_DEPTH`` of them, so
-    no ancestor of the operand is opened and no other component is rewritten.
-    """
-    target = file_path
-    for _ in range(_MAX_LINK_DEPTH):
-        if not os.path.islink(target):
-            return target
-        link = os.readlink(target)
-        target = (link if os.path.isabs(link)
-                  else os.path.join(os.path.dirname(target), link))
-    raise OSError(f"too many levels of symbolic links: {file_path}")
-
-
-def _existing_target(file_path: str, observed_stat) -> str:
-    """The name to replace, verified against the object the caller observed."""
-    target = _follow_final_link(file_path)
-    if not os.path.samestat(observed_stat, os.stat(target)):
-        raise OSError("path changed during target selection")
-    return target
+    return files.resolve_path(path, base_dir if base_dir is not None else current_cwd())
 
 
 def display_path(path: str) -> str:
@@ -1482,7 +688,7 @@ def change_shell_cwd(path: str | None = None) -> str:
     observed = os.stat(resolved)
     if not stat.S_ISDIR(observed.st_mode):
         raise FileNotFoundError(resolved)
-    resolved = _existing_target(resolved, observed)
+    resolved = files.existing_target(resolved, observed)
     old_cwd = session.shell_cwd
     session.shell_cwd = resolved
     session.previous_shell_cwd = old_cwd
@@ -1581,977 +787,6 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
     return registry
 
 
-def _truncate_text(s: str, max_chars: int) -> str:
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + f"\n... [output truncated: {len(s)} chars total, {max_chars} shown]"
-
-
-def _format_numbered_lines(lines: list[str], first_line_number: int = 1) -> str:
-    return "\n".join(f"{i}\t{line}" for i, line in enumerate(lines, start=first_line_number))
-
-
-def _bash_output(stdout: str, stderr: str, exit_code: int | None,
-                 status: str = "completed", no_output_expected: bool = False):
-    parts = [f"status: {status}"]
-    if exit_code is not None:
-        parts.append(f"exit_code: {exit_code}")
-    if no_output_expected:
-        parts.append("no_output_expected: true")
-    return process_outputs.ProcessOutput("\n".join(parts), stdout, stderr)
-
-
-def _shell_result(output, *, structured, ok=True, content=None):
-    text = (_truncate_text(output.render(), BASH_MAX_OUTPUT_CHARS)
-            if content is None else content)
-    if structured:
-        return _tool_result(ok, text, process_output=output.to_dict())
-    return text if ok else _tool_result(False, text)
-
-
-def _write_destination(file_path: str) -> str:
-    """Select once, without mutation, before the Read-before-overwrite checks.
-
-    Existing operands must pass kernel lookup before target selection. Missing
-    parents may be created later, but a failed traversal of '.' or '..' is not
-    permission to discard components. A dangling link is expanded only so its
-    missing target, including missing parent directories, can be selected.
-    """
-    try:
-        observed = os.stat(file_path)
-    except FileNotFoundError:
-        directory, name = os.path.split(file_path)
-        if name in ['', '.', '..']:
-            raise
-        parent = _write_destination(directory or '.')
-        try:
-            parent_stat = os.stat(parent)
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISDIR(parent_stat.st_mode):
-                raise NotADirectoryError(parent)
-            parent = _existing_target(parent, parent_stat)
-        target = os.path.join(parent, name)
-        try:
-            entry = os.lstat(target)
-        except FileNotFoundError:
-            return target
-        if stat.S_ISLNK(entry.st_mode):
-            return _write_destination(os.path.join(parent, os.readlink(target)))
-        # An entry appeared during selection. Recheck it rather than assume
-        # this is still a new-file write. The caller checks the selected name.
-        return _write_destination(target)
-    return _existing_target(file_path, observed)
-
-
-def _atomic_write_text(file_path: str, content: str):
-    file_path = _follow_final_link(file_path)
-    # A final symlink is followed so its target is replaced and the link stays,
-    # the same rule as the write tools apply; callers that already selected a
-    # target hand one that is not itself a link.
-    directory, name = os.path.split(file_path)
-    directory = directory or '.'
-    if not name or name in ['.', '..']:
-        raise IsADirectoryError(file_path)
-    # Capture the desired final mode BEFORE writing so a write/replace failure
-    # can never leave the public path's mode corrupted. For an existing file we
-    # preserve its current mode (rwx bits, including execute); for a new file
-    # we match what plain open(...,'w') would produce, i.e. 0o666 & ~umask.
-    try:
-        target_mode = os.stat(file_path).st_mode & 0o7777
-    except FileNotFoundError:
-        target_mode = 0o666 & ~_UMASK
-    os.makedirs(directory, exist_ok=True)
-    # The directory is opened once, and both the temporary file and the
-    # replacement happen inside that open directory: the open *is* the kernel's
-    # resolution of it.  Handing the directory's name to the standard allocator
-    # instead lets its internal abspath() collapse '..' or a link lexically, so
-    # the temporary file lands in a different directory from the destination.
-    directory_fd = private_files.open_directory(directory)
-    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
-    try:
-        descriptor = private_files.create_exclusive_at(
-            directory_fd, temporary, 0o600)
-        try:
-            private_files.write(descriptor, content.encode('utf-8'))
-            _apply_destination_permissions(
-                file_path, descriptor,
-                os.path.join(directory, temporary), target_mode)
-        finally:
-            private_files.close(descriptor)
-        private_files.replace_at(directory_fd, temporary, name)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            private_files.unlink_at(directory_fd, temporary)
-        raise
-    finally:
-        private_files.close(directory_fd)
-
-
-def _stale_file_error(file_path: str, action: str,
-                      file_key=None) -> str | None:
-    if file_key is None:
-        file_key = _file_key(file_path)
-    observed = file_state.get(file_key)
-    if file_key not in file_state:
-        return (
-            f"Error: {file_path} has not been read. Read it before "
-            f"{action}.")
-    if observed is None:
-        # Older callers used None for a binary observation. It conveys no
-        # identity and therefore cannot safely authorize an overwrite.
-        return (
-            f"Error: {file_path} has no verifiable read snapshot. "
-            f"Read it again before {action}.")
-    try:
-        if isinstance(observed, FileObservation):
-            current = _file_observation(file_path)
-        else:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                current = f.read()
-    except Exception as e:
-        return f"Error checking current file contents before {action}: {e}"
-    if observed != current:
-        return (f"Error: {file_path} changed on disk since you last read it. "
-                f"Read it again before {action}.")
-    return None
-
-
-def _stat_identity(stat_result) -> tuple:
-    identity = (
-        stat_result.st_dev,
-        stat_result.st_ino,
-        stat_result.st_size,
-        stat_result.st_mtime_ns,
-    )
-    if os.name == "posix":
-        # POSIX ctime is the kernel-maintained metadata-change time: it moves on
-        # changes mtime misses (mode, owner, link count) and cannot be set by
-        # the process, so it is tamper evidence.  On Windows the field is
-        # deprecated and moving from creation time to metadata-change time (or
-        # zero), which makes it unstable rather than evidential, so it is left
-        # out there; st_birthtime is creation time and constant, so it is not a
-        # substitute.  The stored SHA-256 digest remains the content proof.
-        identity = identity + (stat_result.st_ctime_ns,)
-    return identity
-
-
-def _file_observation(
-        file_path: str, expected_stat=None) -> FileObservation:
-    digest = hashlib.sha256()
-    size = 0
-    with open(file_path, "rb") as file_obj:
-        before = os.fstat(file_obj.fileno())
-        if (expected_stat is not None
-                and _stat_identity(before) != _stat_identity(expected_stat)):
-            raise OSError("file changed while it was being read")
-        while True:
-            chunk = file_obj.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            digest.update(chunk)
-        after = os.fstat(file_obj.fileno())
-        if _stat_identity(after) != _stat_identity(before):
-            raise OSError("file changed while it was being read")
-    return FileObservation(digest.hexdigest(), size)
-
-
-def _content_observation(content: str) -> FileObservation:
-    encoded = content.encode("utf-8")
-    return FileObservation(hashlib.sha256(encoded).hexdigest(), len(encoded))
-
-
-def _now_iso() -> str:
-    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-
-
-def _decode_spooled_output(data: bytes) -> str:
-    try:
-        return data.decode('utf-8')
-    except UnicodeDecodeError:
-        return data.decode('utf-8', errors='replace')
-
-
-def _read_spool_tail(path: str, max_chars: int = JOB_TAIL_CHARS) -> str:
-    try:
-        size = os.path.getsize(path)
-        with open(path, 'rb') as f:
-            # Read extra bytes because UTF-8 may use multiple bytes per
-            # character; trim after decoding so the character cap is stable.
-            f.seek(max(0, size - max_chars * 4))
-            text = _decode_spooled_output(f.read())
-    except FileNotFoundError:
-        return ""
-    if len(text) > max_chars:
-        return text[-max_chars:]
-    return text
-
-
-@dataclass
-class Job:
-    id: str
-    command: str
-    argv: list[str] | None
-    shell: bool
-    description: str
-    background: bool
-    spool_dir: str
-    stdout_path: str
-    stderr_path: str
-    metadata_path: str
-    started_at_iso: str
-    cwd: str | None = None
-    process: asyncio.subprocess.Process | None = field(default=None, repr=False)
-    pid: int | None = None
-    pgid: int | None = None
-    status: str = "starting"
-    exit_code: int | None = None
-    signal: int | None = None
-    # Why the job never ran or why Loki ended it, when that is a failure.
-    error: str | None = None
-    finished_at: float | None = None
-    finished_at_iso: str | None = None
-    timeout_ms: int | None = None
-    session_owned: bool = False
-    # A descriptor on POSIX and a socket on Windows; see host_ipc.
-    owner_signal_fd: object | None = field(default=None, repr=False)
-    credential_capability: credential_capabilities.CredentialCapabilityServer | None = field(
-        default=None, repr=False)
-    # Live resource accounting only. This is deliberately absent from
-    # job.json: after process exit it has no user-visible or recovery meaning.
-    subagent_slot: bool = field(default=False, repr=False)
-
-
-class SubagentCapacityError(RuntimeError):
-    """The process already owns its maximum number of live subagents."""
-
-
-class _JobRevokedDuringLaunch(RuntimeError):
-    """The session revoked the job while its process was being created."""
-
-
-class JobManager:
-    """Own subprocess job state on one asyncio event loop.
-
-    Every in-memory state transition in this class is synchronous and contains
-    no ``await``. It therefore completes before another event-loop task can
-    observe or modify the jobs table. Keep await points outside those
-    transitions instead of adding thread locks to event-loop-owned state.
-    """
-
-    def __init__(self, base_dir: str):
-        self.base_dir = base_dir
-        self.session_id = str(uuid.uuid4())
-        self.session_dir = os.path.join(base_dir, self.session_id)
-        self.jobs = {}
-        self._counter = 0
-        self._active_subagents = 0
-        # A local synchronous observer, bound only while a frontend owns it.
-        self.on_change = None
-
-    def _reserve_subagent_slot(self, job: Job):
-        # This check-and-increment contains no await and JobManager belongs to
-        # one event loop, so concurrent tasks cannot overbook the limit.
-        if self._active_subagents >= MAX_ACTIVE_DIRECT_SUBAGENTS:
-            raise SubagentCapacityError(
-                "maximum active direct subagents reached "
-                f"({MAX_ACTIVE_DIRECT_SUBAGENTS})")
-        self._active_subagents += 1
-        # The flag means "this job holds a slot", not "this is a subagent job":
-        # the release path keys off it, and a job is registered before its slot
-        # is reserved, so a refusal must not look like something to release.
-        job.subagent_slot = True
-
-    def _release_subagent_slot(self, job: Job):
-        # More than one observer can notice an exit. Ownership moves off the
-        # job before decrementing so the operation is idempotent.
-        if not getattr(job, "subagent_slot", False):
-            return
-        job.subagent_slot = False
-        self._active_subagents -= 1
-
-    def _next_job_id(self) -> str:
-        self._counter += 1
-        return str(self._counter)
-
-    def _job_dir(self, job_id: str) -> str:
-        return os.path.join(self.session_dir, job_id)
-
-    def _job_metadata(self, job: Job) -> dict:
-        return {
-            "id": job.id,
-            "command": job.command,
-            "cwd": job.cwd,
-            "argv": job.argv,
-            "shell": job.shell,
-            "description": job.description,
-            "background": job.background,
-            "pid": job.pid,
-            "pgid": job.pgid,
-            "status": job.status,
-            "exit_code": job.exit_code,
-            "signal": job.signal,
-            "error": job.error,
-            "started_at": job.started_at_iso,
-            "finished_at": job.finished_at_iso,
-            "timeout_ms": job.timeout_ms,
-            "session_owned": job.session_owned,
-            "stdout_path": job.stdout_path,
-            "stderr_path": job.stderr_path,
-        }
-
-    def _write_metadata(self, job: Job):
-        try:
-            _atomic_write_text(job.metadata_path, json.dumps(self._job_metadata(job), indent=2) + "\n")
-        finally:
-            # State has already changed, even if persistence failed. Display
-            # errors must neither change the job outcome nor mask an IO error.
-            if self.on_change is not None:
-                try:
-                    self.on_change()
-                except Exception:
-                    logging.getLogger(__name__).exception("Job status observer failed")
-
-    @staticmethod
-    def _close_owner_signal(job: Job):
-        end = job.owner_signal_fd
-        job.owner_signal_fd = None
-        if end is None:
-            return
-        try:
-            host_ipc.close_end(end)
-        except OSError:
-            pass
-
-    @staticmethod
-    def _revoke_credential_capability(job: Job):
-        capability = job.credential_capability
-        if capability is not None:
-            capability.close_now()
-
-    @staticmethod
-    async def _close_credential_capability(job: Job):
-        """Revoke a job capability immediately, then finish async cleanup."""
-        capability = job.credential_capability
-        if capability is None:
-            return
-        capability.close_now()
-        try:
-            await capability.close()
-        finally:
-            if job.credential_capability is capability:
-                job.credential_capability = None
-
-    def _finalize_job(self, job: Job, status: str, error: str | None = None):
-        """Bring a job to a recorded state, whichever path it took.
-
-        Every exit from ``_spawn`` after the job exists comes through here, so a
-        launch that never happened is still a job a caller can observe instead
-        of an exception with no trace.  It is the only place that releases the
-        subagent reservation, which is what keeps that release exactly once.
-        """
-        job.status = status
-        if error is not None:
-            job.error = error
-        job.finished_at = time.time()
-        job.finished_at_iso = _now_iso()
-        self._close_owner_signal(job)
-        self._revoke_credential_capability(job)
-        self._release_subagent_slot(job)
-        self._write_metadata(job)
-
-    def _record_exit(self, job: Job, exit_code: int):
-        # Status records why Loki ended the job; exit_code/signal record
-        # how the child process actually terminated.
-        job.signal = -exit_code if exit_code < 0 else None
-        job.exit_code = exit_code
-        if job.status in [
-                "cancelled", "timed_out", "stopped", "owner_closed",
-                "failed"]:
-            # Preserve the user-visible reason even after wait() reports the
-            # eventual process exit code.
-            status = job.status
-        elif job.status == "owner_closing":
-            status = "owner_closed"
-        elif job.status == "stopping":
-            status = "stopped"
-        elif exit_code < 0:
-            status = "signaled"
-        else:
-            status = "exited"
-        self._finalize_job(job, status)
-
-    def _refresh_job(self, job: Job):
-        if job.status not in ["running", "stopping"]:
-            return
-        exit_code = job.process.returncode
-        if exit_code is not None:
-            self._record_exit(job, exit_code)
-
-    async def _spawn(self, command, display_command: str, description: str,
-                     background: bool, timeout_ms: int | None, shell: bool,
-                     env: dict | None = None, cwd: str | None = None,
-                     session_owned: bool = False,
-                     credential_refs=None, subagent: bool = False) -> Job:
-        if session_owned and shell:
-            raise ValueError(
-                "session-owned jobs require a direct executable")
-        if credential_refs is not None and shell:
-            raise ValueError(
-                "credential capabilities require a direct executable")
-        if subagent and not session_owned:
-            raise ValueError("subagents must be session-owned")
-        os.makedirs(self.session_dir, exist_ok=True)
-        job_id = self._next_job_id()
-        spool_dir = self._job_dir(job_id)
-        os.makedirs(spool_dir, exist_ok=True)
-        stdout_path = os.path.join(spool_dir, "stdout.log")
-        stderr_path = os.path.join(spool_dir, "stderr.log")
-        metadata_path = os.path.join(spool_dir, "job.json")
-        job = Job(
-            id=job_id,
-            command=display_command,
-            argv=None if shell else list(command),
-            shell=shell,
-            description=description,
-            background=background,
-            spool_dir=spool_dir,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            metadata_path=metadata_path,
-            started_at_iso=_now_iso(),
-            cwd=cwd or current_cwd(),
-            timeout_ms=timeout_ms,
-            session_owned=session_owned,
-        )
-        # Registered before the first step that can fail.  A job that never
-        # launches is then a recorded failure rather than a missing record, so
-        # anything watching self.jobs sees an outcome instead of waiting for
-        # one; see _finalize_job.  It may be observed in "starting" briefly,
-        # before the launch resolves to "running" or "failed".
-        self.jobs[job.id] = job
-
-        owner_parent = None
-        owner_child = None
-        credential_child = None
-        credential_server = None
-        parent_handed_off = False
-        capability_handed_off = False
-        spawn_command = command
-        proc = None
-        try:
-            if subagent:
-                # Reserved inside the failure boundary, immediately before the
-                # first operation that can yield to another task: a refusal
-                # here is a recorded failed job, not one stuck in "starting".
-                self._reserve_subagent_slot(job)
-            # Channel acquisition belongs inside the same cleanup boundary as
-            # process creation. A failed relay setup must not leave either end
-            # of the already-created owner channel live.
-            if session_owned:
-                owner_parent, owner_child = host_ipc.owner_channel()
-                spawn_command = [
-                    *command,
-                    "--session-owner-fd",
-                    str(host_ipc.reference(owner_child)),
-                ]
-            if credential_refs is not None:
-                authority = current_session().credential_authority
-                if authority is None:
-                    raise RuntimeError(
-                        "cannot delegate credentials without an authority")
-                destinations = None
-                if subagent and credential_refs:
-                    # The child uses this captured environment, not whatever
-                    # connection the parent may select after an await. Explore
-                    # only needs inference, never account/discovery authority.
-                    chat_url, _models_url = protocols.endpoint_urls(
-                        env["LOKI_API_BASE"], env["LOKI_PROVIDER"])
-                    destinations = [chat_url]
-                credential_server, credential_child = await (
-                    credential_capabilities.CredentialCapabilityServer.create(
-                        authority, credential_refs, destinations=destinations))
-                spawn_command = [
-                    *spawn_command,
-                    "--credential-capability-fd",
-                    str(host_ipc.reference(credential_child)),
-                ]
-
-            with open(stdout_path, 'wb') as stdout_file, \
-                    open(stderr_path, 'wb') as stderr_file:
-                # A job gets no input, so its stdin is a pipe with no writer
-                # rather than the null device: the AppContainer that confines
-                # the Windows runtime denies that device, so a DEVNULL stdin
-                # cannot be delivered there at all.  The parent copy is
-                # released as soon as the child owns the end, on the failure
-                # path too.
-                stdin, release_stdin = host_ipc.eof_stdin()
-                try:
-                    if shell:
-                        # shell rejects session_owned/credential_refs above, so
-                        # spawn_command is still the original command string.
-                        proc = await asyncio.create_subprocess_shell(
-                            str(spawn_command),
-                            executable=executables.BASH,
-                            stdin=stdin,
-                            stdout=stdout_file,
-                            stderr=stderr_file,
-                            close_fds=True,
-                            env=env,
-                            cwd=job.cwd,
-                            **host_process.spawn_kwargs(),
-                        )
-                    else:
-                        child_ends = [
-                            end for end in [owner_child, credential_child]
-                            if end is not None]
-                        proc = await asyncio.create_subprocess_exec(
-                            *spawn_command,
-                            stdin=stdin,
-                            stdout=stdout_file,
-                            stderr=stderr_file,
-                            close_fds=True,
-                            env=env,
-                            cwd=job.cwd,
-                            **host_process.spawn_kwargs(),
-                            **host_ipc.spawn_kwargs(child_ends),
-                        )
-                finally:
-                    # The child duplicated or inherited the end at launch, so
-                    # this copy is no longer needed either way.
-                    release_stdin()
-
-            # The session may have revoked this job while it was launching.
-            # Publishing it now would leave a live child nobody owns.
-            if job.status != "starting":
-                raise _JobRevokedDuringLaunch(
-                    f"job was revoked while launching (status={job.status})")
-            job.process = proc
-            job.owner_signal_fd = owner_parent
-            parent_handed_off = True
-            job.credential_capability = credential_server
-            capability_handed_off = True
-            job.pid = proc.pid
-            job.pgid = host_process.process_group(proc, proc.pid)
-            job.status = "running"
-            self._write_metadata(job)
-            return job
-        except BaseException as error:
-            if proc is not None:
-                # A child exists, so end it before recording anything. An
-                # unowned live process is the one outcome this must not leave.
-                with contextlib.suppress(Exception):
-                    host_process.signal_group(
-                        proc, getattr(job, "pgid", None) or proc.pid,
-                        host_process.FORCE)
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-            revoked = isinstance(
-                error, (asyncio.CancelledError, _JobRevokedDuringLaunch))
-            try:
-                self._finalize_job(
-                    job, "cancelled" if revoked else "failed",
-                    None if revoked else f"{type(error).__name__}: {error}")
-            except Exception:
-                # Recording the failure must not replace the failure itself.
-                pass
-            if not revoked:
-                try:
-                    with open(job.stderr_path, 'ab') as stderr_file:
-                        stderr_file.write(
-                            f"\n[launch failed: {type(error).__name__}: "
-                            f"{error}]\n".encode('utf-8'))
-                except OSError:
-                    pass
-            raise
-        finally:
-            if owner_child is not None:
-                host_ipc.close_end(owner_child)
-            if credential_child is not None:
-                host_ipc.close_end(credential_child)
-            # Close each parent-side end only if no job took ownership of it.
-            if owner_parent is not None and not parent_handed_off:
-                host_ipc.close_end(owner_parent)
-            if credential_server is not None and not capability_handed_off:
-                await credential_server.close()
-
-    async def _wait_for_job(self, job: Job) -> int:
-        return await job.process.wait()
-
-    async def _monitor_background_job(self, job: Job):
-        try:
-            exit_code = await self._wait_for_job(job)
-            self._record_exit(job, exit_code)
-        except Exception as e:
-            # Background monitor failures cannot be returned synchronously, so
-            # record them in the same stderr spool the caller already inspects.
-            job.status = "monitor_error"
-            job.finished_at = time.time()
-            job.finished_at_iso = _now_iso()
-            self._close_owner_signal(job)
-            self._revoke_credential_capability(job)
-            # A broken waiter does not prove that the child exited. Retain its
-            # slot and fail closed instead of admitting an extra live child.
-            with open(job.stderr_path, 'ab') as stderr_file:
-                stderr_file.write(f"\n[job monitor error: {type(e).__name__}: {e}]\n".encode('utf-8'))
-            self._write_metadata(job)
-        finally:
-            await self._close_credential_capability(job)
-
-    async def run_foreground(self, command, display_command: str, timeout_ms: int | None,
-                             description: str = "", shell: bool = False,
-                             output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                             env: dict | None = None, cwd: str | None = None,
-                             cancel_event: asyncio.Event | None = None,
-                             session_owned: bool = False,
-                             credential_refs=None,
-                             subagent: bool = False):
-        job = await self._spawn(command, display_command, description, False, timeout_ms, shell,
-                                env=env, cwd=cwd,
-                                session_owned=session_owned,
-                                credential_refs=credential_refs,
-                                subagent=subagent)
-
-        # Define the exit_task and nested signal helpers first so they are
-        # available throughout the entire function.
-        exit_task = asyncio.create_task(self._wait_for_job(job))
-
-        def _signal_job(signum):
-            # Signal the job's whole process group so shell children are not
-            # left behind.  The status check and the signal call contain no
-            # await, so another task cannot reap the job between them.
-            # A user-requested stop is not proof of exit. Cancellation and
-            # timeout cleanup must still signal and escalate a stopping job.
-            if (job.status not in ["running", "stopping"]
-                    or job.process.returncode is not None):
-                return False
-            try:
-                host_process.signal_group(job.process, job.pgid, signum)
-                return True
-            except ProcessLookupError:
-                return False
-
-        async def terminate(signum, grace_s: float):
-            sent = _signal_job(signum)
-            if not sent:
-                return await exit_task
-            try:
-                exit_code = await asyncio.wait_for(
-                    asyncio.shield(exit_task), timeout=grace_s)
-            except asyncio.TimeoutError:
-                _signal_job(host_process.FORCE)
-                exit_code = await exit_task
-            return exit_code
-
-        # 1. Pre-wait cancellation check: Was the event set while self._spawn awaited?
-        # Bypasses asyncio.wait entirely to avoid watcher/selector registration races.
-        if cancel_event is not None and cancel_event.is_set():
-            # Do not record cancellation until the live process has exited;
-            # the termination helper must remain able to escalate signals.
-            exit_code = await terminate(signal.SIGINT, 2.0)
-            job.status = "cancelled"
-            self._write_metadata(job)
-            self._record_exit(job, exit_code)
-            await self._close_credential_capability(job)
-            return job, "cancelled", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
-
-        cancel_task = (asyncio.create_task(cancel_event.wait())
-                       if cancel_event is not None else None)
-        watchers = {exit_task} if cancel_task is None else {
-            exit_task, cancel_task}
-
-        try:
-            done, _pending = await asyncio.wait(
-                watchers,
-                timeout=timeout_ms / 1000 if timeout_ms is not None else None,
-                return_when=asyncio.FIRST_COMPLETED)
-            # Decide the outcome before cancelling the unused watcher below.
-            # Its eventual done() state is not evidence of user cancellation.
-            interrupted = cancel_event is not None and cancel_event.is_set()
-        except BaseException:
-            # Any unwind of the owning Python task must not orphan the process
-            # it owns. Wait for the process group to die before propagating
-            # the original exception.
-            exit_code = await terminate(signal.SIGINT, 2.0)
-            job.status = "cancelled"
-            self._write_metadata(job)
-            self._record_exit(job, exit_code)
-            await self._close_credential_capability(job)
-            raise
-        finally:
-            # Clean up pending cancel task if it is still running to prevent memory leaks
-            if cancel_task is not None and not cancel_task.done():
-                cancel_task.cancel()
-                try:
-                    await cancel_task
-                except asyncio.CancelledError:
-                    pass
-
-        # Cancel wins a simultaneous finish: if the user cancelled and the
-        # job also exited in the same loop pass, the intent outranks the
-        # race. A job that exited on its own (no cancel pending) records
-        # completed.
-        if not interrupted and exit_task in done:
-            self._record_exit(job, exit_task.result())
-            await self._close_credential_capability(job)
-            return job, "completed", _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
-
-        # Cancellation wins even if exit was observed in the same loop pass.
-        # Otherwise terminate the live job before recording cancellation or
-        # timeout, keeping signal escalation available until it exits.
-        exit_code = await terminate(
-            signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
-
-        job.status = "cancelled" if interrupted else "timed_out"
-        self._write_metadata(job)
-
-        self._record_exit(job, exit_code)
-        await self._close_credential_capability(job)
-        status = "cancelled" if interrupted else "timed_out"
-        return job, status, _read_spool_tail(job.stdout_path, output_chars), _read_spool_tail(job.stderr_path, output_chars)
-
-    async def run_shell(self, command: str, timeout: int | None = None, description: str = "",
-                        run_in_background: bool = False,
-                        cancel_event: asyncio.Event | None = None,
-                        cwd: str | None = None, *, structured=False):
-        if command is None:
-            return "Error: command is required"
-        if command.strip() == "":
-            return _shell_result(
-                _bash_output("", "", 0, no_output_expected=True), structured=structured)
-
-        timeout_ms = int(timeout) if timeout else BASH_DEFAULT_TIMEOUT_MS
-        timeout_ms = min(timeout_ms, BASH_MAX_TIMEOUT_MS)
-        cwd = cwd or current_cwd()
-
-        if run_in_background:
-            job = await self._spawn(command, command, description, True, None, True, cwd=cwd)
-            try:
-                asyncio.get_running_loop().create_task(self._monitor_background_job(job))
-            except RuntimeError:
-                # If no loop can accept the monitor task, the job still exists
-                # with stdout/stderr/metadata paths for manual inspection.
-                pass
-            header = "\n".join([
-                f"Started background job {job.id}",
-                f"cwd: {job.cwd}",
-                f"pid: {job.pid}",
-                f"pgid: {job.pgid}",
-                f"status: {job.status}",
-                f"stdout: {job.stdout_path}",
-                f"stderr: {job.stderr_path}",
-            ])
-            return _shell_result(
-                process_outputs.ProcessOutput(header, "", ""),
-                structured=structured, content=header)
-
-        job, status, stdout, stderr = await self.run_foreground(
-            command, command, timeout_ms, description=description, shell=True,
-            cwd=cwd, cancel_event=cancel_event)
-        if status == "cancelled":
-            message = (
-                "Tool call interrupted by user (SIGINT to the job's process group)")
-            return _shell_result(
-                process_outputs.ProcessOutput(message, stdout, stderr),
-                structured=structured, ok=False,
-                content=message + (f"; partial output:\n{stdout}" if stdout else ""))
-        if status == "timed_out":
-            if stderr:
-                stderr += "\n"
-            stderr += f"command timed out after {timeout_ms}ms"
-            return _shell_result(
-                _bash_output(stdout, stderr, job.exit_code, status="timed_out"),
-                structured=structured, ok=False)
-
-        return _shell_result(
-            _bash_output(stdout, stderr, job.exit_code), structured=structured)
-
-    async def run_exec(self, argv: list[str], timeout_ms: int | None = None, description: str = "",
-                       output_chars: int = BASH_MAX_OUTPUT_CHARS,
-                       env: dict | None = None, cwd: str | None = None,
-                       cancel_event: asyncio.Event | None = None,
-                       session_owned: bool = False,
-                       credential_refs=None,
-                       subagent: bool = False):
-        if not argv:
-            raise ValueError("argv must not be empty")
-        return await self.run_foreground(argv, " ".join(argv), timeout_ms,
-                                         description=description, shell=False,
-                                         output_chars=output_chars, env=env,
-                                         cwd=cwd or current_cwd(),
-                                         cancel_event=cancel_event,
-                                         session_owned=session_owned,
-                                         credential_refs=credential_refs,
-                                         subagent=subagent)
-
-    async def run_background_exec(self, argv: list[str], description: str = "",
-                                  env: dict | None = None, cwd: str | None = None,
-                                  session_owned: bool = False,
-                                  credential_refs=None,
-                                  subagent: bool = False) -> Job:
-        if not argv:
-            raise ValueError("argv must not be empty")
-        job = await self._spawn(argv, " ".join(argv), description, True, None, False,
-                                env=env, cwd=cwd or current_cwd(),
-                                session_owned=session_owned,
-                                credential_refs=credential_refs,
-                                subagent=subagent)
-        asyncio.get_running_loop().create_task(self._monitor_background_job(job))
-        return job
-
-    @staticmethod
-    def _signal_process_group(job: Job, signum) -> bool:
-        if job.process is None or job.process.returncode is not None:
-            return False
-        try:
-            host_process.signal_group(job.process, job.pgid, signum)
-            return True
-        except ProcessLookupError:
-            return False
-
-    async def _finish_owned_job(self, job: Job):
-        exit_task = asyncio.create_task(job.process.wait())
-        try:
-            try:
-                exit_code = await asyncio.wait_for(
-                    asyncio.shield(exit_task), timeout=2)
-            except asyncio.TimeoutError:
-                self._signal_process_group(job, signal.SIGTERM)
-                try:
-                    exit_code = await asyncio.wait_for(
-                        asyncio.shield(exit_task), timeout=2)
-                except asyncio.TimeoutError:
-                    self._signal_process_group(job, host_process.FORCE)
-                    exit_code = await exit_task
-        finally:
-            if not exit_task.done():
-                exit_task.cancel()
-                await asyncio.gather(exit_task, return_exceptions=True)
-        if job.finished_at is None:
-            self._record_exit(job, exit_code)
-        await self._close_credential_capability(job)
-
-    async def close_session_owned(self):
-        """End and reap every live process owned by this Loki session."""
-        owned = []
-        cleanup = []
-        for job in list(self.jobs.values()):
-            self._refresh_job(job)
-            if not job.session_owned:
-                continue
-            if job.process is None:
-                if job.status == "starting":
-                    # Launch still in flight: revoke it so it cannot publish a
-                    # live child nobody owns. _spawn re-checks after launching.
-                    job.status = "owner_closed"
-                self._close_owner_signal(job)
-                self._revoke_credential_capability(job)
-                cleanup.append(job)
-                continue
-            if job.process.returncode is not None:
-                self._close_owner_signal(job)
-                self._revoke_credential_capability(job)
-                cleanup.append(job)
-                continue
-            job.status = "owner_closing"
-            self._write_metadata(job)
-            # EOF asks a cooperating Loki child to cancel its current work.
-            # Process-group signals below enforce the ownership boundary if
-            # the child is stuck or does not understand the owner channel.
-            self._close_owner_signal(job)
-            self._revoke_credential_capability(job)
-            owned.append(job)
-        if cleanup:
-            await asyncio.gather(
-                *(self._close_credential_capability(job)
-                  for job in cleanup))
-        if owned:
-            await asyncio.gather(
-                *(self._finish_owned_job(job) for job in owned))
-
-    def _get_job(self, job_id: str) -> Job | None:
-        job = self.jobs.get(str(job_id))
-        if job is not None:
-            self._refresh_job(job)
-        return job
-
-    def list_jobs(self, *, show_all=True) -> str:
-        jobs = list(self.jobs.values())
-        for job in jobs:
-            self._refresh_job(job)
-        if not show_all:
-            jobs = [job for job in jobs
-                    if job.status in ["running", "starting", "failed", "signaled", "timed_out"]]
-        # _now_iso() emits fixed-width UTC timestamps. _next_job_id() stores
-        # decimal counter IDs as text for job keys and paths; int(id) orders
-        # that counter numerically, so "10" follows "2" at equal timestamps.
-        jobs.sort(key=lambda job: (job.started_at_iso, int(job.id)))
-        if not jobs:
-            return ("No jobs." if show_all
-                    else "No running, starting, or failed jobs.")
-        lines = ["Jobs:"]
-        for job in jobs:
-            lines.append(
-                f"{job.id}. status={job.status} pid={job.pid} exit={job.exit_code} "
-                f"started={job.started_at_iso} cwd={job.cwd!r} "
-                f"command={job.command!r}"
-            )
-        return "\n".join(lines)
-
-    def job_status(self, job_id: str, tail_chars: int = JOB_TAIL_CHARS, *, structured=False):
-        job = self._get_job(job_id)
-        if job is None:
-            return f"Error: unknown job id {job_id!r}"
-        stdout = _read_spool_tail(job.stdout_path, tail_chars)
-        stderr = _read_spool_tail(job.stderr_path, tail_chars)
-        parts = [
-            f"job_id: {job.id}",
-            f"status: {job.status}",
-            f"pid: {job.pid}",
-            f"pgid: {job.pgid}",
-            f"exit_code: {job.exit_code}",
-            f"signal: {job.signal}",
-            f"cwd: {job.cwd}",
-            f"started_at: {job.started_at_iso}",
-            f"finished_at: {job.finished_at_iso}",
-            f"stdout_path: {job.stdout_path}",
-            f"stderr_path: {job.stderr_path}",
-        ]
-        output = process_outputs.ProcessOutput(
-            "\n".join(parts), stdout, stderr, shell=job.shell, tail=True)
-        text = output.render()
-        if structured and job.shell:
-            return _tool_result(True, text, process_output=output.to_dict())
-        return text
-
-    def stop_job(self, job_id: str, force: bool = False) -> str:
-        job = self._get_job(job_id)
-        if job is None:
-            return f"Error: unknown job id {job_id!r}"
-        # This whole transition contains no await, so the event-loop reaper
-        # cannot run between signal dispatch and the new state being recorded.
-        if job.status not in ["running", "stopping"]:
-            return f"Job {job.id} is not running (status={job.status})."
-        if job.status == "stopping" and not force:
-            return (
-                f"Job {job.id} is already stopping. "
-                "Use force=true to send SIGKILL.")
-        if job.process.returncode is not None:
-            self._record_exit(job, job.process.returncode)
-            return f"Job {job.id} is no longer running."
-        sig = host_process.FORCE if force else signal.SIGTERM
-        try:
-            host_process.signal_group(job.process, job.pgid, sig)
-        except ProcessLookupError:
-            return f"Job {job.id} is no longer running."
-        job.status = "stopping"
-        self._write_metadata(job)
-        return (f"Sent {host_process.label(sig)} to job {job.id} "
-                f"(pgid={job.pgid}).")
-
-
 async def run_bash_async(command: str, timeout: int | None = None, description: str = "",
                          run_in_background: bool = False,
                          cancel_event: asyncio.Event | None = None,
@@ -2559,7 +794,8 @@ async def run_bash_async(command: str, timeout: int | None = None, description: 
     return await current_job_manager().run_shell(
         command, timeout=timeout, description=description,
         run_in_background=run_in_background,
-        cancel_event=cancel_event, cwd=cwd, structured=structured)
+        cancel_event=cancel_event,
+        cwd=cwd if cwd is not None else current_cwd(), structured=structured)
 
 
 def run_jobs() -> str:
@@ -2585,7 +821,7 @@ def run_ps(argument: str = "") -> str:
     return "usage: /ps [all | ID | stop ID | kill ID]"
 
 
-def run_job_status(job_id: str, tail_chars: int = JOB_TAIL_CHARS, *, structured=False):
+def run_job_status(job_id: str, tail_chars: int = tool_contracts.JOB_TAIL_CHARS, *, structured=False):
     if not job_id:
         return "Error: job_id is required"
     try:
@@ -2603,173 +839,21 @@ def run_job_stop(job_id: str, force: bool = False) -> str:
     return current_job_manager().stop_job(job_id, force=bool(force))
 
 
-def run_read(file_path: str, offset: int | None = None, limit: int | None = None, *, structured=False):
-    if not file_path:
-        return "Error: file_path is required"
-    file_path = _resolve_path(file_path)
-    if os.path.isdir(file_path):
-        return f"Error: {file_path} is a directory, not a file"
-    try:
-        st = os.stat(file_path)
-        file_key = _file_key(file_path)
-    except FileNotFoundError:
-        return f"Error: File not found: {file_path}"
-    except IsADirectoryError:
-        return f"Error: {file_path} is a directory"
-    except Exception as e:
-        return f"Error: {e}"
-
-    def remember(observation):
-        file_state[file_key] = observation
-
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
-        try:
-            remember(_file_observation(
-                file_path, expected_stat=st))
-        except OSError as error:
-            return f"Error reading file: {error}"
-        return f"File {file_path} is an image ({st.st_size} bytes). Visual content rendering not supported in this environment; reading the file is acknowledged."
-
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            if _stat_identity(os.fstat(f.fileno())) != _stat_identity(st):
-                raise OSError("file changed while it was being read")
-            # Read one character past the cap so the response can say whether
-            # the file was actually truncated.
-            content = f.read(READ_CHAR_CAP + 1)
-            if _stat_identity(os.fstat(f.fileno())) != _stat_identity(st):
-                raise OSError("file changed while it was being read")
-        truncated_chars = len(content) > READ_CHAR_CAP
-        if truncated_chars:
-            content = content[:READ_CHAR_CAP]
-    except UnicodeDecodeError:
-        try:
-            remember(_file_observation(
-                file_path, expected_stat=st))
-        except OSError as error:
-            return f"Error reading file: {error}"
-        return f"File {file_path} is binary ({st.st_size} bytes); cannot display as text."
-    except Exception as e:
-        return f"Error reading file: {e}"
-
-    if "\x00" in content:
-        try:
-            remember(_file_observation(
-                file_path, expected_stat=st))
-        except OSError as error:
-            return f"Error reading file: {error}"
-        return (
-            f"File {file_path} is binary ({st.st_size} bytes); "
-            "cannot display as text.")
-
-    if not content:
-        remember(_content_observation(""))
-        return f"File {file_path} is empty."
-
-    if truncated_chars:
-        content += f"\n\n[... file truncated at {READ_CHAR_CAP} characters; file is {st.st_size} bytes on disk -- pass offset/limit to read further]"
-
-    lines = content.splitlines()
-    total_lines = len(lines)
-    start = int(offset) if offset is not None else 0
-    if start < 0 or start >= total_lines:
-        return f"Error: offset {offset} out of range (file has {total_lines} lines)"
-    if limit is not None:
-        lim = int(limit)
-        if lim <= 0:
-            return "Error: limit must be positive"
-    else:
-        lim = READ_DEFAULT_LINES
-    sliced = lines[start:start + lim]
-    rendered = _format_numbered_lines(sliced, first_line_number=start + 1)
-    if start + lim < total_lines:
-        rendered += f"\n... ({total_lines - start - lim} more lines not shown)"
-    try:
-        remember(_file_observation(
-            file_path, expected_stat=st))
-    except OSError as error:
-        return f"Error reading file snapshot: {error}"
-    if structured:
-        output = process_outputs.ProcessOutput("", rendered, "", shell=False, read=True)
-        return _tool_result(True, rendered, process_output=output.to_dict())
-    return rendered
+def run_read(file_path: str, offset: int | None = None, limit: int | None = None,
+             *, structured=False, cwd=None):
+    return files.run_read(file_path, offset, limit, structured=structured,
+                          cwd=cwd if cwd is not None else current_cwd(), observations=file_state)
 
 
-def run_write(file_path: str, content: str) -> str:
-    if not file_path:
-        return "Error: file_path is required"
-    if content is None:
-        return "Error: content is required"
-    operand = _resolve_path(file_path)
-    # Authorization is per spelling: the record is looked up under the name the
-    # caller wrote, not under the target an existing final symlink resolves to.
-    file_key = _file_key(operand)
-    try:
-        file_path = _write_destination(operand)
-    except Exception as error:
-        return f"Error: {error}"
-    if os.path.exists(operand) and file_key not in file_state:
-        return (f"Error: You must Read {file_path} before overwriting it. "
-                "Read it first, then retry the Write.")
-    if file_key in file_state:
-        stale_error = _stale_file_error(file_path, "overwriting it", file_key)
-        if stale_error:
-            return stale_error
-    try:
-        _atomic_write_text(file_path, content)
-        file_state[file_key] = _content_observation(content)
-        return f"Successfully wrote to {file_path}"
-    except Exception as e:
-        return f"Error: {e}"
+def run_write(file_path: str, content: str, *, cwd=None) -> str:
+    return files.run_write(file_path, content,
+                           cwd=cwd if cwd is not None else current_cwd(), observations=file_state)
 
 
-def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-    if not file_path:
-        return "Error: file_path is required"
-    if old_string == new_string:
-        return "Error: new_string must be different from old_string"
-    operand = _resolve_path(file_path)
-    # Authorization is per spelling: looked up under the name the caller wrote.
-    file_key = _file_key(operand)
-    try:
-        file_path = _write_destination(operand)
-    except Exception as error:
-        return f"Error: {error}"
-    if file_key not in file_state:
-        return f"Error: You must Read {file_path} before editing it."
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = f.read()
-    except FileNotFoundError:
-        return f"Error: File not found: {file_path}"
-    except Exception as e:
-        return f"Error: {e}"
-
-    stale_error = _stale_file_error(file_path, "editing it", file_key)
-    if stale_error:
-        return stale_error
-
-    occurrences = data.count(old_string)
-    if occurrences == 0:
-        return f"Error: old_string not found in {file_path}."
-    if occurrences > 1 and not replace_all:
-        return (f"Error: old_string is not unique ({occurrences} occurrences) in {file_path}. "
-                "Provide more context to make it unique, or pass replace_all=true.")
-
-    if replace_all:
-        new_data = data.replace(old_string, new_string)
-        count = occurrences
-    else:
-        new_data = data.replace(old_string, new_string, 1)
-        count = 1
-
-    try:
-        _atomic_write_text(file_path, new_data)
-        file_state[file_key] = _content_observation(new_data)
-        return f"Successfully edited {file_path} ({count} replacement{'s' if count != 1 else ''})."
-    except Exception as e:
-        return f"Error: {e}"
+def run_edit(file_path: str, old_string: str, new_string: str,
+             replace_all: bool = False, *, cwd=None) -> str:
+    return files.run_edit(file_path, old_string, new_string, replace_all,
+                          cwd=cwd if cwd is not None else current_cwd(), observations=file_state)
 
 
 def run_glob(pattern: str, path: str | None = None, *,
@@ -2778,81 +862,13 @@ def run_glob(pattern: str, path: str | None = None, *,
         pattern, path, hidden=hidden, no_ignore=no_ignore))
 
 
-async def run_glob_async(
-        pattern: str, path: str | None = None,
-        cancel_event: asyncio.Event | None = None, *,
-        hidden: bool = False, no_ignore: bool = False) -> str:
-    if not pattern:
-        return "Error: pattern is required"
-    rg = executables.RIPGREP
-    if not rg:
-        return "Error: ripgrep binary not found. Install rg."
-    root = _resolve_path(path) if path else current_cwd()
-    args = [rg, '--files', '--color=never']
-    if hidden:
-        args.append('--hidden')
-    if no_ignore:
-        args.append('--no-ignore')
-    args.extend(['--glob', pattern, root])
-    start = time.perf_counter()
-    job, status, stdout, stderr = await current_job_manager().run_exec(
-        args, description=f"Glob {pattern!r}",
-        cancel_event=cancel_event)
-    if status == "cancelled":
-        return "Error: glob search was cancelled by the user"
-    duration_ms = int((time.perf_counter() - start) * 1000)
-    stderr = stderr.strip()
-    if job.exit_code not in [0, 1]:
-        return f"Error: ripgrep failed with exit code {job.exit_code}" + (f"\n{stderr}" if stderr else "")
-    matches = stdout.splitlines()
-    num_files = len(matches)
-    truncated = len(matches) > GLOB_MAX_RESULTS
-
-    def mtime_or_zero(file_path: str) -> float:
-        try:
-            return os.path.getmtime(file_path)
-        except OSError:
-            return 0
-
-    # Put recently changed files first because coding tasks usually care about
-    # active work more than lexicographic directory order.
-    matches.sort(key=mtime_or_zero, reverse=True)
-    matches = matches[:GLOB_MAX_RESULTS]
-    if not matches:
-        result = f"No files matched pattern {pattern!r} in {root}"
-        hints = []
-        if not hidden:
-            hints.append("hidden paths are excluded by default (set hidden=true to include)")
-        if not no_ignore:
-            hints.append("ignore rules are respected (set no_ignore=true to bypass)")
-        if hints:
-            result += "\nNote: " + "; ".join(hints) + "."
-        return result
-    return "\n".join([
-        f"duration_ms: {duration_ms}",
-        f"num_files: {num_files}",
-        f"truncated: {str(truncated).lower()}",
-        "[filenames]",
-        *matches,
-    ])
-
-
-def _parse_nonnegative_int(value, name: str, default: int | None = None) -> tuple[int | None, str | None]:
-    if value is None:
-        return default, None
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as e:
-        return None, f"Error: invalid {name}: {e}"
-    if number < 0:
-        return None, f"Error: {name} must be non-negative"
-    return number, None
-
-
-def _select_limited(lines: list[str], offset: int, head_limit: int) -> tuple[list[str], bool]:
-    if head_limit == 0:
-        return lines[offset:], False
-    return lines[offset:offset + head_limit], len(lines) > offset + head_limit
+async def run_glob_async(pattern: str, path: str | None = None,
+                         cancel_event: asyncio.Event | None = None, *,
+                         hidden: bool = False, no_ignore: bool = False, cwd=None) -> str:
+    cwd = cwd if cwd is not None else current_cwd()
+    return await files.run_glob_async(
+        pattern, path, cancel_event, hidden=hidden, no_ignore=no_ignore, cwd=cwd,
+        run_exec=partial(current_job_manager().run_exec, cwd=cwd))
 
 
 def run_grep(pattern: str, path: str | None = None, glob: str | None = None,
@@ -2862,93 +878,11 @@ def run_grep(pattern: str, path: str | None = None, glob: str | None = None,
 
 async def run_grep_async(pattern: str, path: str | None = None, glob: str | None = None,
                          output_mode: str = "files_with_matches",
-                         cancel_event: asyncio.Event | None = None,
-                         **kwargs) -> str:
-    if not pattern:
-        return "Error: pattern is required"
-    if output_mode not in ['content', 'files_with_matches', 'count']:
-        return f"Error: invalid output_mode {output_mode!r}"
-    rg = executables.RIPGREP
-    if not rg:
-        return "Error: ripgrep binary not found. Install rg."
-    root = _resolve_path(path) if path else current_cwd()
-
-    head_limit, err = _parse_nonnegative_int(kwargs.get('head_limit'), 'head_limit', GREP_DEFAULT_HEAD_LIMIT)
-    if err:
-        return err
-    offset_n, err = _parse_nonnegative_int(kwargs.get('offset'), 'offset', 0)
-    if err:
-        return err
-
-    args = [rg, '--color=never']
-    if output_mode == 'files_with_matches':
-        args.append('--files-with-matches')
-    elif output_mode == 'count':
-        args.extend(['--count-matches', '--with-filename'])
-    else:
-        args.append('--with-filename')
-        if kwargs.get('-n', True):
-            args.append('--line-number')
-        else:
-            args.append('--no-line-number')
-        if kwargs.get('-o'):
-            args.append('--only-matching')
-        context_value = kwargs.get('-C')
-        if context_value is None:
-            context_value = kwargs.get('context')
-        if context_value is not None:
-            context_value, err = _parse_nonnegative_int(context_value, '-C/context')
-            if err:
-                return err
-            args.extend(['-C', str(context_value)])
-        else:
-            before, err = _parse_nonnegative_int(kwargs.get('-B'), '-B')
-            if err:
-                return err
-            after, err = _parse_nonnegative_int(kwargs.get('-A'), '-A')
-            if err:
-                return err
-            if before is not None:
-                args.extend(['-B', str(before)])
-            if after is not None:
-                args.extend(['-A', str(after)])
-
-    if kwargs.get('-i'):
-        args.append('--ignore-case')
-    if glob:
-        args.extend(['--glob', glob])
-    if kwargs.get('type'):
-        args.extend(['--type', str(kwargs['type'])])
-    if kwargs.get('multiline'):
-        args.extend(['--multiline', '--multiline-dotall'])
-    args.extend(['--', pattern, root])
-
-    start = time.perf_counter()
-    job, status, stdout, stderr = await current_job_manager().run_exec(
-        args, description=f"Grep {pattern!r}",
-        cancel_event=cancel_event)
-    if status == "cancelled":
-        return "Error: grep search was cancelled by the user"
-    duration_ms = int((time.perf_counter() - start) * 1000)
-    stderr = stderr.strip()
-    if job.exit_code not in [0, 1]:
-        return f"Error: ripgrep failed with exit code {job.exit_code}" + (f"\n{stderr}" if stderr else "")
-
-    lines = stdout.splitlines()
-    selected, truncated = _select_limited(lines, offset_n, head_limit)
-    if not selected:
-        return f"No matches for {pattern!r}"
-    result = "\n".join([
-        f"mode: {output_mode}",
-        f"duration_ms: {duration_ms}",
-        f"num_entries: {len(lines)}",
-        f"applied_offset: {offset_n}",
-        f"applied_limit: {head_limit}",
-        f"truncated: {str(truncated).lower()}",
-        "[results]",
-        *selected,
-    ])
-    return _truncate_text(result, BASH_MAX_OUTPUT_CHARS)
+                         cancel_event: asyncio.Event | None = None, *, cwd=None, **kwargs) -> str:
+    cwd = cwd if cwd is not None else current_cwd()
+    return await files.run_grep_async(
+        pattern, path, glob, output_mode, cancel_event, cwd=cwd,
+        run_exec=partial(current_job_manager().run_exec, cwd=cwd), **kwargs)
 
 
 def run_todoread() -> str:
@@ -3058,7 +992,7 @@ def _handle_jobs(args: dict) -> str:
 
 
 def _handle_job_status(args: dict):
-    return run_job_status(args["job_id"], args.get("tail_chars", JOB_TAIL_CHARS), structured=True)
+    return run_job_status(args["job_id"], args.get("tail_chars", tool_contracts.JOB_TAIL_CHARS), structured=True)
 
 
 def _handle_job_stop(args: dict) -> str:
@@ -3106,11 +1040,10 @@ async def _handle_webfetch_async(args: dict, extra_context=None) -> str:
 
 
 async def _handle_websearch_async(args: dict, extra_context=None) -> str:
-    return await run_websearch_async(args["query"],
-                                     allowed_domains=args.get("allowed_domains"),
-                                     blocked_domains=args.get("blocked_domains"),
-                                     cancel_event=(extra_context or {}).get(
-                                         "cancel_event"))
+    return await web_tools.run_websearch_async(
+        args["query"], allowed_domains=args.get("allowed_domains"),
+        blocked_domains=args.get("blocked_domains"),
+        cancel_event=(extra_context or {}).get("cancel_event"))
 
 
 async def _handle_ask_async(args: dict, extra_context=None) -> str:
@@ -3160,13 +1093,6 @@ async def _handle_ask_async(args: dict, extra_context=None) -> str:
     return f'The user answered "{question}" with {rendered}.'
 
 
-def _tool_result(ok: bool, content, *, process_output=None) -> dict:
-    result = {"ok": ok, "content": str(content)}
-    if process_output is not None:
-        result["process_output"] = process_outputs.ProcessOutput.from_dict(process_output).to_dict()
-    return result
-
-
 def _looks_like_tool_error(content: str) -> bool:
     return content.startswith("Error: ") or content.startswith("Failed")
 
@@ -3177,25 +1103,25 @@ async def with_exception_to_tool_result_async(context: str, thunk) -> dict:
     except (KeyboardInterrupt, SystemExit):
         raise
     except FileNotFoundError as e:
-        return _tool_result(False, f"Error while {context}: file not found: {e}")
+        return tool_runtime.tool_result(False, f"Error while {context}: file not found: {e}")
     except PermissionError as e:
-        return _tool_result(False, f"Error while {context}: permission denied: {e}")
+        return tool_runtime.tool_result(False, f"Error while {context}: permission denied: {e}")
     except TimeoutError as e:
-        return _tool_result(False, f"Error while {context}: timed out: {e}")
+        return tool_runtime.tool_result(False, f"Error while {context}: timed out: {e}")
     except OSError as e:
-        return _tool_result(False, f"Error while {context}: OS error: {e}")
+        return tool_runtime.tool_result(False, f"Error while {context}: OS error: {e}")
     except ValueError as e:
-        return _tool_result(False, f"Error while {context}: invalid value: {e}")
+        return tool_runtime.tool_result(False, f"Error while {context}: invalid value: {e}")
     except Exception as e:
-        return _tool_result(False, f"Failed while {context}: {type(e).__name__}: {e}")
+        return tool_runtime.tool_result(False, f"Failed while {context}: {type(e).__name__}: {e}")
 
     if (isinstance(content, dict)
             and {"ok", "content"} <= set(content) <= {"ok", "content", "process_output"}
             and isinstance(content["ok"], bool)):
-        return _tool_result(
+        return tool_runtime.tool_result(
             content["ok"], content["content"], process_output=content.get("process_output"))
     text = str(content)
-    return _tool_result(not _looks_like_tool_error(text), text)
+    return tool_runtime.tool_result(not _looks_like_tool_error(text), text)
 
 
 def _refused_tool_hint(fn_name, args, allowed):
@@ -3236,16 +1162,16 @@ def _tool_access_error(fn_name: str, args=None, allowed=None, extra_context=None
 async def dispatch_tool_async(fn_name: str, args: dict, allowed=None, extra_context=None) -> dict:
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
-        return _tool_result(False, f"Unknown function: {fn_name}")
+        return tool_runtime.tool_result(False, f"Unknown function: {fn_name}")
     access_error = _tool_access_error(
         fn_name, args=args, allowed=allowed, extra_context=extra_context)
     if access_error:
-        return _tool_result(False, access_error)
+        return tool_runtime.tool_result(False, access_error)
     cancel_event = (extra_context or {}).get("cancel_event")
     if (cancel_event is not None
             and isinstance(cancel_event, asyncio.Event)
             and cancel_event.is_set()):
-        return _tool_result(
+        return tool_runtime.tool_result(
             False, "Tool call not executed because the user cancelled "
                    "the turn.")
 
@@ -3335,7 +1261,7 @@ def _invalidate_hook_file_state(invocation):
         file_state.clear()
         return
     for path in invocation.changed_paths:
-        file_state.pop(_file_key(_resolve_path(path, invocation.cwd)), None)
+        file_state.pop(files.observation_key(_resolve_path(path, invocation.cwd)), None)
 
 
 def _read_default_notes(invocation):
@@ -3351,8 +1277,8 @@ def _read_default_notes(invocation):
     if has_offset:
         return (
             ["Note: limit was omitted; Read used the default of "
-             f"{READ_DEFAULT_LINES} lines."],
-            [{"field": "limit", "value": READ_DEFAULT_LINES}],
+             f"{tool_contracts.READ_DEFAULT_LINES} lines."],
+            [{"field": "limit", "value": tool_contracts.READ_DEFAULT_LINES}],
         )
     return (
         ["Note: offset was omitted; Read started at line offset 0."],
@@ -3378,7 +1304,7 @@ async def execute_tool_call_async(
     call_id = formats.tool_call_id(call)
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
-        result = _tool_result(False, f"Unknown function: {fn_name}")
+        result = tool_runtime.tool_result(False, f"Unknown function: {fn_name}")
         on_event({
             "type": "tool_rejected",
             "name": fn_name,
@@ -3389,7 +1315,7 @@ async def execute_tool_call_async(
         return result, None
     call_kind = call.get("tool_kind", "function")
     if call_kind != spec.get("tool_kind", "function"):
-        result = _tool_result(
+        result = tool_runtime.tool_result(
             False,
             f"Tool {fn_name} was called as {call_kind}, but it is "
             f"registered as {spec.get('tool_kind', 'function')}.",
@@ -3536,7 +1462,7 @@ async def execute_tool_call_async(
         output = process_outputs.ProcessOutput.from_dict(outcome.process_output)
         outcome.process_output = replace(
             output, preamble=_prepend_tool_notes(output.preamble, invocation.notes)).to_dict()
-    result = _tool_result(
+    result = tool_runtime.tool_result(
         outcome.ok, outcome.content, process_output=outcome.process_output)
     return result, _execution_metadata(
         invocation, outcome, defaults)
@@ -3639,7 +1565,7 @@ async def run_tool_loop_async(
         cancel_event: asyncio.Event | None = None,
         ask_user=None,
         reasoning_effort=_UNSET,
-        thinking: TurnThinkingSettings | None = None) -> str:
+        thinking: model_requests.TurnThinkingSettings | None = None) -> str:
     """Run the model/tool loop over canonical session events.
 
     Mutates ``transcript_items`` by appending one ``model_response`` for each
@@ -3647,7 +1573,7 @@ async def run_tool_loop_async(
     callback receives ``codex_turn_state`` explicitly because it changes the
     routing semantics of every provider request in this logical user turn.
     """
-    codex_turn_state = CodexTurnState()
+    codex_turn_state = model_requests.CodexTurnState()
     # One snapshot for the whole logical turn: tool continuations use the
     # settings captured before the first request, not mid-turn changes.
     if thinking is None:
@@ -3668,7 +1594,7 @@ async def run_tool_loop_async(
         if ask_user is None:
             # Without an interactive seam there is nobody to answer, so
             # the model is never offered the question tool at all.
-            advertised_tools = without_ask_tool(advertised_tools)
+            advertised_tools = tool_contracts.without_ask_tool(advertised_tools)
 
         def chat_fn(items, on_text_delta=None, *, codex_turn_state, on_reasoning_delta=None):
             kwargs = {
@@ -3782,7 +1708,7 @@ async def run_tool_loop_async(
                 response_items = await chat_fn(
                     transcript_items,
                     codex_turn_state=codex_turn_state)
-        except StreamCancelled:
+        except model_requests.StreamCancelled:
             finish_live_text(False, "cancelled")
             on_event({
                 "type": "response_cancelled",
@@ -3838,7 +1764,7 @@ async def run_tool_loop_async(
             finish_live_text(False, "error")
             on_event({"type": "provider_error", "error": e})
             return ""
-        except ApiError as e:
+        except model_requests.ApiError as e:
             if cancel_check():
                 finish_live_text(False, "cancelled")
                 on_event({
@@ -4044,11 +1970,11 @@ async def run_tool_loop_async(
 async def run_toolless_completion_async(
         transcript_items: list, cancel_check=None,
         reasoning_effort=_UNSET,
-        thinking: TurnThinkingSettings | None = None) -> str:
+        thinking: model_requests.TurnThinkingSettings | None = None) -> str:
     # Tool helpers such as WebFetch may run inside an outer user turn, but
     # this completion is a distinct logical turn and therefore owns a
     # distinct routing token passed explicitly to the request path.
-    codex_turn_state = CodexTurnState()
+    codex_turn_state = model_requests.CodexTurnState()
     if thinking is None:
         thinking = capture_turn_settings()
     thinking = replace(thinking, traces="off")
@@ -4068,7 +1994,7 @@ async def run_toolless_completion_async(
         )
     except (formats.TranscriptFormatError, protocols.ProtocolError) as e:
         return f"Transcript render error: {e}"
-    except ApiError as e:
+    except model_requests.ApiError as e:
         return e.formatted()
     turn = formats.coerce_decoded_turn(response_items)
     if not turn:
@@ -4108,7 +2034,7 @@ def _format_subagent_result(agent_type: str, description: str, status: str,
 
 
 def _subagent_env(reasoning_effort=_UNSET, *, environ=None,
-                  thinking: TurnThinkingSettings | None = None) -> dict:
+                  thinking: model_requests.TurnThinkingSettings | None = None) -> dict:
     source_environ = os.environ if environ is None else environ
     # LOKI_DUMMY_TOOL_CALL makes the DUMMY provider emit a tool call instead of
     # text; a subagent that inherited it would emit the same call and recurse,
@@ -4213,7 +2139,7 @@ def _subagent_env(reasoning_effort=_UNSET, *, environ=None,
     return env
 
 
-def delegated_turn_settings(credentials) -> TurnThinkingSettings:
+def delegated_turn_settings(credentials) -> model_requests.TurnThinkingSettings:
     """Import non-secret delegation data without importing request authority."""
     encoded = credentials.get("LOKI_TURN_THINKING")
     if not encoded:
@@ -4245,7 +2171,7 @@ def delegated_turn_settings(credentials) -> TurnThinkingSettings:
     apply_runtime_config(replace(
         config, reasoning_capabilities=capabilities,
         chat_provider=replace(provider, reasoning_field=capabilities.interleaved_field if capabilities else None)))
-    return TurnThinkingSettings(
+    return model_requests.TurnThinkingSettings(
         effort=effort, mode=values["mode"], budget=values["budget"], retention=values["retention"], traces="off")
 
 
@@ -4256,7 +2182,7 @@ def _subagent_credential_refs():
     return frozenset({config.auth_spec.credential})
 
 
-def _format_started_background_job(job: Job, kind: str = "job") -> str:
+def _format_started_background_job(job: jobs.Job, kind: str = "job") -> str:
     return "\n".join([
         f"Started background {kind} {job.id}",
         f"cwd: {job.cwd}",
@@ -4270,9 +2196,9 @@ def _format_started_background_job(job: Job, kind: str = "job") -> str:
 
 def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
     depth = current_session().subagent_depth
-    if depth >= MAX_SUBAGENT_DEPTH:
+    if depth >= tool_contracts.MAX_SUBAGENT_DEPTH:
         raise ValueError(
-            f"maximum subagent depth reached ({MAX_SUBAGENT_DEPTH})")
+            f"maximum subagent depth reached ({tool_contracts.MAX_SUBAGENT_DEPTH})")
     return [
         sys.argv[0],
         '--subagent',
@@ -4304,7 +2230,7 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
                           subagent_type: str = "Explore",
                           cancel_event: asyncio.Event | None = None,
                           reasoning_effort=_UNSET,
-                          thinking: TurnThinkingSettings | None = None) -> str:
+                          thinking: model_requests.TurnThinkingSettings | None = None) -> str:
     agent_type = subagent_type or "Explore"
     if not prompt:
         return "Error: prompt is required"
@@ -4317,17 +2243,29 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
     if thinking is None:
         thinking = capture_turn_settings()
     manager = current_job_manager()
+    environment = _subagent_env(reasoning_effort, thinking=thinking)
+    references = _subagent_credential_refs()
+    authority = current_session().credential_authority
+    destinations = None
+    if references:
+        # The child uses this captured environment, not whatever
+        # connection the parent may select after an await. Explore
+        # only needs inference, never account/discovery authority.
+        chat_url, _models_url = protocols.endpoint_urls(
+            environment["LOKI_API_BASE"], environment["LOKI_PROVIDER"])
+        destinations = [chat_url]
     if run_in_background:
         try:
             job = await manager.run_background_exec(
                 argv,
                 description=description or "subagent task",
-                env=_subagent_env(reasoning_effort, thinking=thinking),
+                env=environment,
                 cwd=os.getcwd(),
                 session_owned=True,
-                credential_refs=_subagent_credential_refs(),
+                credential_refs=references, credential_authority=authority,
+                credential_destinations=destinations,
                 subagent=True)
-        except SubagentCapacityError as error:
+        except jobs.SubagentCapacityError as error:
             return f"Error: {error}"
         return _format_started_background_job(job, "subagent")
 
@@ -4335,12 +2273,13 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
         job, status, stdout, stderr = await manager.run_exec(
             argv,
             description=description or "subagent task",
-            env=_subagent_env(reasoning_effort, thinking=thinking), cwd=os.getcwd(),
+            env=environment, cwd=os.getcwd(),
             cancel_event=cancel_event,
             session_owned=True,
-            credential_refs=_subagent_credential_refs(),
+            credential_refs=references, credential_authority=authority,
+            credential_destinations=destinations,
             subagent=True)
-    except SubagentCapacityError as error:
+    except jobs.SubagentCapacityError as error:
         return f"Error: {error}"
     if status == "cancelled":
         return "Error: subagent was cancelled by the user"
@@ -4378,814 +2317,22 @@ def run_skill(skill: str, args: str | None = None) -> str:
     return header + body + footer
 
 
-HTML_TEXT_BLOCK_TAGS = {
-    'address', 'article', 'aside', 'blockquote', 'br', 'dd', 'details', 'div',
-    'dl', 'dt', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3',
-    'h4', 'h5', 'h6', 'header', 'hr', 'li', 'main', 'nav', 'ol', 'p', 'pre',
-    'section', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'ul',
-}
-HTML_TEXT_SKIP_TAGS = {'script', 'style', 'template', 'noscript', 'svg'}
-
-
-class HtmlTextExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts = []
-        self.skip_depth = 0
-
-    def _newline(self):
-        if self.parts and self.parts[-1] != '\n':
-            self.parts.append('\n')
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag in HTML_TEXT_SKIP_TAGS:
-            self.skip_depth += 1
-            return
-        if self.skip_depth:
-            return
-        if tag in HTML_TEXT_BLOCK_TAGS:
-            self._newline()
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag in HTML_TEXT_SKIP_TAGS:
-            if self.skip_depth:
-                self.skip_depth -= 1
-            return
-        if self.skip_depth:
-            return
-        if tag in HTML_TEXT_BLOCK_TAGS:
-            self._newline()
-
-    def handle_data(self, data):
-        if self.skip_depth:
-            return
-        text = ' '.join(data.split())
-        if text:
-            self.parts.append(text)
-
-    def text(self) -> str:
-        lines = []
-        current = []
-        for part in self.parts:
-            if part == '\n':
-                if current:
-                    lines.append(' '.join(current))
-                    current = []
-            else:
-                current.append(part)
-        if current:
-            lines.append(' '.join(current))
-        return '\n'.join(lines).strip()
-
-
-def _html_to_text(html: str) -> str:
-    parser = HtmlTextExtractor()
-    parser.feed(html)
-    parser.close()
-    return parser.text()
-
-
-def _decode_http_text(raw: bytes, headers, default_charset: str = 'utf-8') -> str:
-    candidates = []
-    get_content_charset = getattr(headers, 'get_content_charset', None)
-    if callable(get_content_charset):
-        charset = get_content_charset()
-        if charset:
-            candidates.append(charset)
-    elif isinstance(headers, dict):
-        content_type = headers.get('content-type') or headers.get('Content-Type') or ''
-        for part in content_type.split(';')[1:]:
-            name, sep, value = part.strip().partition('=')
-            if sep and name.lower() == 'charset':
-                candidates.append(value.strip('"'))
-    candidates.append(default_charset)
-
-    seen = set()
-    for charset in candidates:
-        charset = charset.strip()
-        if not charset or charset.lower() in seen:
-            continue
-        seen.add(charset.lower())
-        try:
-            return raw.decode(charset)
-        except (LookupError, UnicodeDecodeError):
-            continue
-    return raw.decode(default_charset, errors='replace')
-
-
-def _content_media_type(content_type: str) -> str:
-    return content_type.split(';', 1)[0].strip().lower()
-
-
-def _is_html_content_type(content_type: str) -> bool:
-    return _content_media_type(content_type) in {'text/html', 'application/xhtml+xml'}
-
-
-def _decode_duckduckgo_result_url(raw_href: str) -> str:
-    parsed = urllib.parse.urlparse(raw_href)
-    query = urllib.parse.parse_qs(parsed.query)
-    return query.get('uddg', [raw_href])[0]
-
-
-class DuckDuckGoResultParser(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.results = []
-        self._href = None
-        self._text_parts = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() != 'a' or self._href is not None:
-            return
-        attr_map = {name.lower(): value or '' for name, value in attrs}
-        classes = attr_map.get('class', '').split()
-        href = attr_map.get('href')
-        if href and 'result__a' in classes:
-            self._href = href
-            self._text_parts = []
-
-    def handle_data(self, data):
-        if self._href is not None:
-            self._text_parts.append(data)
-
-    def handle_endtag(self, tag):
-        if tag.lower() != 'a' or self._href is None:
-            return
-        title = ' '.join(''.join(self._text_parts).split())
-        if title:
-            self.results.append({
-                'title': title,
-                'url': _decode_duckduckgo_result_url(self._href),
-            })
-        self._href = None
-        self._text_parts = []
-
-
-def _parse_duckduckgo_results(html: str) -> list[dict]:
-    parser = DuckDuckGoResultParser()
-    parser.feed(html)
-    parser.close()
-    return parser.results
-
-
-async def _fetch_url_async(url: str, cancel_check=None) -> dict:
-    """GET a URL with redirect tracking, return dict with content/contentType/status/finalUrl/redirects.
-    HTTP is upgraded to HTTPS. Cross-host redirects are surfaced, not followed."""
-    if url.startswith('http://'):
-        url = 'https://' + url[len('http://'):]
-    elif not url.startswith('https://'):
-        url = 'https://' + url
-
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return {'error': f'invalid URL: {url}'}
-
-    request_headers = {
-        'Accept': 'text/markdown;q=1.0, text/html;q=0.9, text/plain;q=0.8, application/json;q=0.7, */*;q=0.1',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-    try:
-        response = await http_client.async_http_request_follow_same_host(
-            'GET', url, headers_in=request_headers,
-            timeout=WEBFETCH_TIMEOUT_S, max_bytes=WEBFETCH_MAX_BYTES,
-            retry_max_attempts=HTTP_RETRY_MAX_ATTEMPTS,
-            retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
-            retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
-            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
-            cancel_check=cancel_check)
-        if response.redirect_url:
-            return {'redirectUrl': response.redirect_url, 'status': response.status,
-                    'finalUrl': response.url, 'error': None}
-        content_type = response.header('content-type')
-        body = _decode_http_text(response.body, response.headers)
-        return {'content': body, 'contentType': content_type, 'status': response.status,
-                'finalUrl': response.url, 'truncated': response.truncated, 'error': None}
-    except Exception as e:
-        return {'error': f'fetch failed: {e}', 'finalUrl': url}
-
-
 async def run_webfetch_async(
         url: str, prompt: str,
         cancel_event: asyncio.Event | None = None,
         reasoning_effort=_UNSET,
-        thinking: TurnThinkingSettings | None = None) -> str:
-    if not url:
-        return "Error: url is required"
-    if not prompt:
-        return "Error: prompt is required"
-    now = time.time()
-    cached = _webfetch_cache.get(url)
-    if cached and now - cached[0] < WEBFETCH_CACHE_TTL:
-        content_text, content_type, final_url, status = cached[1], cached[2], cached[3], cached[4]
-        cache_hit = True
-    else:
-        response = await _fetch_url_async(
-            url,
-            cancel_check=(
-                cancel_event.is_set if cancel_event is not None else None))
-        if response.get('error'):
-            return f"Error: {response['error']}"
-        if response.get('redirectUrl'):
-            return "\n".join([
-                f"WebFetch redirect: HTTP {response['status']}",
-                f"requested_url: {response['finalUrl']}",
-                f"redirect_url: {response['redirectUrl']}",
-                "Call WebFetch again with redirect_url if you want to fetch that page.",
-            ])
-        content_type = response['contentType']
-        if _is_html_content_type(content_type):
-            content_text = _html_to_text(response['content'])
-        else:
-            content_text = response['content']
-        if response.get('truncated'):
-            content_text += "\n[... page truncated at fetch limit]"
-        # cap to a sane size before sending to the model
-        if len(content_text) > WEBFETCH_MAX_PROMPT_CHARS:
-            content_text = content_text[:WEBFETCH_MAX_PROMPT_CHARS] + "\n[... content truncated for prompt processing]"
-        final_url = response['finalUrl']
-        status = response['status']
-        _webfetch_cache[url] = (now, content_text, content_type, final_url, status)
-        cache_hit = False
+        thinking: model_requests.TurnThinkingSettings | None = None) -> str:
+    # The web backend owns retrieval/presentation; this adapter supplies only
+    # the distinct tool-less inference turn and the existing process cache.
+    async def complete(messages, cancel_check=None):
+        return await run_toolless_completion_async(
+            messages, cancel_check=cancel_check,
+            reasoning_effort=reasoning_effort, thinking=thinking)
 
-    msgs = [
-        formats.instruction_item(
-            "You are processing content fetched by the WebFetch tool. "
-            "Answer only from the fetched page content. "
-            "If the content does not contain the answer, say so plainly. "
-            "Keep quotes short and do not reproduce large copyrighted passages."),
-        formats.message_item(
-            "user",
-            f"URL: {final_url}\nContent-Type: {content_type}\nPrompt: {prompt}\n\n--- Page content ---\n{content_text}"),
-    ]
-    answer = await run_toolless_completion_async(
-        msgs,
-        cancel_check=(
-            cancel_event.is_set if cancel_event is not None else None),
-        reasoning_effort=reasoning_effort,
-        thinking=thinking,
-    ) or "(no answer returned)"
-    header = f"[WebFetch status={status} cache_hit={cache_hit} bytes~={len(content_text)} url={final_url}]"
-    return f"{header}\n{answer}"
+    return await web_tools.run_webfetch_async(
+        url, prompt, cache=_webfetch_cache, complete=complete,
+        cancel_event=cancel_event)
 
-
-async def run_websearch_async(query: str, allowed_domains: list | None = None,
-                              blocked_domains: list | None = None,
-                              cancel_event: asyncio.Event | None = None) -> str:
-    if not query or len(query) < 2:
-        return "Error: query must be at least 2 characters"
-    if allowed_domains and blocked_domains:
-        return "Error: allowed_domains and blocked_domains cannot both be specified"
-    if allowed_domains and len(allowed_domains) > 20:
-        return "Error: allowed_domains max 20 entries"
-    if blocked_domains and len(blocked_domains) > 20:
-        return "Error: blocked_domains max 20 entries"
-
-    form = urllib.parse.urlencode({'q': query, 'b': '', 'kl': 'us-en'})
-    try:
-        response = await http_client.async_http_request(
-            'POST',
-            DUCKDUCKGO_HTML_SEARCH_URL,
-            body=form.encode('utf-8'),
-            headers_in={'Content-Type': 'application/x-www-form-urlencoded',
-                        'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'},
-            timeout=WEBSEARCH_TIMEOUT_S,
-            max_bytes=WEBSEARCH_MAX_RESPONSE_BYTES,
-            retry_max_attempts=HTTP_RETRY_MAX_ATTEMPTS,
-            retry_base_delay_s=HTTP_RETRY_BASE_DELAY_S,
-            retry_max_jitter_s=HTTP_RETRY_MAX_JITTER_S,
-            retry_backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
-            cancel_check=(
-                cancel_event.is_set if cancel_event is not None else None),
-        )
-        if response.status >= 400:
-            return f"Error: web search request failed: HTTP {response.status} {response.reason}"
-        html = _decode_http_text(response.body, response.headers)
-    except Exception as e:
-        return f"Error: web search request failed: {e}"
-
-    results = []
-    for result in _parse_duckduckgo_results(html):
-        target = result['url']
-        host = urllib.parse.urlparse(target).netloc.lower()
-        if allowed_domains and not any(host == d.lower() or host.endswith('.' + d.lower())
-                                       for d in allowed_domains):
-            continue
-        if blocked_domains and (any(host == d.lower() or host.endswith('.' + d.lower())
-                                    for d in blocked_domains)):
-            continue
-        results.append(result)
-        if len(results) >= WEBSEARCH_MAX_RESULTS:
-            break
-
-    if not results:
-        return f"No search results for query {query!r}"
-
-    out_lines = [f"WebSearch results for {query!r} ({len(results)} results):"]
-    for i, r in enumerate(results, start=1):
-        out_lines.append(f"{i}. {r['title']}\n   {r['url']}")
-
-    return "\n".join(out_lines)
-
-
-# Ask is the one tool whose response comes from a person, not a process or
-# the network. The bounds below are its public contract, stated here once
-# and reused by the tool schema and the ACP front's validation.
-ASK_TOOL_NAME = "Ask"
-ASK_MIN_OPTIONS = 2
-ASK_MAX_OPTIONS = 8
-ASK_MAX_QUESTION_CHARS = 4000
-ASK_MAX_LABEL_CHARS = 200
-ASK_MAX_DESCRIPTION_CHARS = 1000
-
-
-def without_ask_tool(tools):
-    """Tool definitions with the question tool removed.
-
-    The Ask tool is advertised exactly when the caller can put a question
-    to a user; seam-less callers (headless, subagents) must not offer a
-    tool that would always fail.
-    """
-    return [
-        tool for tool in tools
-        if tool["function"]["name"] != ASK_TOOL_NAME]
-
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "Read",
-            "description": "\n".join([
-                "Reads a file from the local filesystem.",
-                "",
-                "- `file_path` may be absolute or relative to the current Loki cwd.",
-                "- Reads up to 2000 lines by default.",
-                "- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters",
-                "- Results are returned using cat -n format, with line numbers starting at 1",
-                "- Reads images (PNG, JPG/JPEG, GIF, WEBP) and presents them visually.",
-                "- Reading a directory, a missing file, or an empty file returns an error or system reminder rather than content.",
-                "- Do NOT re-read a file you just edited to verify -- Edit/Write would have errored if the change failed, and the harness tracks file state for you.",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": (
-                            "Plain absolute or relative filesystem path "
-                            "passed to file APIs. Do not use Markdown links "
-                            "or URLs."),
-                    },
-                    "offset": {"type": "integer", "minimum": 0,
-                               "description": "The line number to start reading from. Only provide if the file is too large to read at once"},
-                    "limit": {"type": "integer", "minimum": 1,
-                              "description": "The number of lines to read. Only provide if the file is too large to read at once."}
-                },
-                "required": ["file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Write",
-            "description": "\n".join([
-                "Writes a file to the local filesystem, overwriting if one exists.",
-                "",
-                "When to use: creating a new file, or fully replacing one you've already Read. Overwriting an existing file you haven't Read will fail. For partial changes, use Edit instead."
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": (
-                            "Plain absolute or relative filesystem path "
-                            "passed to file APIs. Do not use Markdown links "
-                            "or URLs."),
-                    },
-                    "content": {"type": "string", "description": "The content to write to the file"}
-                },
-                "required": ["file_path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Edit",
-            "description": "\n".join([
-                "Performs exact string replacement in a file.",
-                "",
-                "- You must Read the file in this conversation before editing, or the call will fail.",
-                "- `old_string` must match the file exactly, including indentation, and be unique -- the edit fails otherwise. Strip the Read line prefix (line number + tab) before matching.",
-                "- `replace_all: true` replaces every occurrence instead."
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": (
-                            "Plain absolute or relative filesystem path "
-                            "passed to file APIs. Do not use Markdown links "
-                            "or URLs."),
-                    },
-                    "old_string": {"type": "string", "description": "The text to replace"},
-                    "new_string": {"type": "string",
-                                   "description": "The text to replace it with (must be different from old_string)"},
-                    "replace_all": {"type": "boolean", "default": False,
-                                    "description": "Replace all occurrences of old_string (default false)"}
-                },
-                "required": ["file_path", "old_string", "new_string"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Bash",
-            "description": "\n".join([
-                "Executes a bash command and returns its output.",
-                "",
-                "- Commands run in the current Loki cwd. Use /cd DIR to change that cwd; cd inside a Bash command only affects that one command.",
-                "- IMPORTANT: Avoid using this tool to run `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user.",
-                f"- `timeout` is in milliseconds: default {BASH_DEFAULT_TIMEOUT_MS}, max {BASH_MAX_TIMEOUT_MS}.",
-                "- `run_in_background` starts a detached job with stdout/stderr spooled to files. Use Jobs/JobStatus/JobStop to inspect or control it. No `&` needed.",
-                "",
-                "# Git",
-                "- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The command to execute"},
-                    "timeout": {"type": "integer", "minimum": 0, "maximum": BASH_MAX_TIMEOUT_MS,
-                                "description": f"Optional timeout in milliseconds (max {BASH_MAX_TIMEOUT_MS})"},
-                    "description": {"type": "string", "description": "\n".join([
-                        'Clear, concise description of what this command does in active voice. Never use words like "complex" or "risk" in the description - just describe what it does.',
-                        "",
-                        "For simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):",
-                        '- ls -> "List files in current Loki cwd"',
-                        '- git status -> "Show working tree status"',
-                        '- npm install -> "Install package dependencies"',
-                        "",
-                        "For commands that are harder to parse at a glance (piped commands, obscure flags, etc.), add enough context to clarify what it does:",
-                        '- find . -name "*.tmp" -exec rm {} \\; -> "Find and delete all .tmp files recursively"',
-                        '- git reset --hard origin/main -> "Discard all local changes and match remote main"',
-                        "- curl -s url | jq '.data[]' -> \"Fetch JSON from URL and extract data array elements\"",
-                    ])},
-                    "run_in_background": {"type": "boolean",
-                                          "description": "Set to true to run this command in the background."},
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Jobs",
-            "description": "List background jobs with their status, pid, exit code, and command.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "JobStatus",
-            "description": "Inspect one shell job, including status, exit code, spool paths, and stdout/stderr tails.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {"type": "string", "description": "The job id returned by Bash, Agent, or Jobs"},
-                    "tail_chars": {"type": "integer", "minimum": 0,
-                                   "description": f"Maximum characters to show from each spool file. Defaults to {JOB_TAIL_CHARS}."}
-                },
-                "required": ["job_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "JobStop",
-            "description": "Stop a running shell job by sending SIGTERM to its process group, or SIGKILL if force is true.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {"type": "string", "description": "The job id returned by Bash, Agent, or Jobs"},
-                    "force": {"type": "boolean",
-                              "description": "Use SIGKILL instead of SIGTERM. Default false."}
-                },
-                "required": ["job_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Glob",
-            "description": "Fast file pattern matching. Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\". Returns matching file paths sorted by modification time. Hidden paths and paths excluded by ignore rules (such as .gitignore) are skipped by default. Set hidden=true and no_ignore=true independently to override these exclusions; hidden, ignored directories may require both, even when explicitly named in the pattern.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "The glob pattern to match files against"},
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "Plain filesystem directory path. Defaults to "
-                            "the current Loki cwd. Omit it for the default; "
-                            "do not pass null, undefined, Markdown, or a URL."),
-                    },
-                    "hidden": {
-                        "type": "boolean",
-                        "description": "Include hidden files and directories. Does not bypass ignore rules. Defaults to false.",
-                        "default": False,
-                    },
-                    "no_ignore": {
-                        "type": "boolean",
-                        "description": "Bypass ignore rules, including .gitignore and .ignore. Does not include hidden paths by itself. Defaults to false.",
-                        "default": False,
-                    },
-                },
-                "required": ["pattern"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Grep",
-            "description": "\n".join([
-                "Content search built on ripgrep. Prefer this over `grep`/`rg` via Bash -- results integrate with the permission UI and file links.",
-                "",
-                "- Full regex syntax (e.g. \"log.*Error\", \"function\\s+\\w+\"). Ripgrep, not grep -- escape literal braces (`interface\\{\\}`).",
-                "- Filter with `glob` (e.g. \"**/*.tsx\") or `type` (e.g. \"js\", \"py\", \"rust\").",
-                "- `output_mode`: \"content\" (matching lines), \"files_with_matches\" (paths only, default), or \"count\".",
-                "- `multiline: true` for patterns that span lines.",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string",
-                                "description": "The regular expression pattern to search for in file contents"},
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "Plain filesystem file or directory path for "
-                            "rg. Defaults to the current Loki cwd; do not "
-                            "use Markdown links or URLs."),
-                    },
-                    "glob": {"type": "string",
-                             "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob"},
-                    "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"],
-                                    "description": "Output mode: \"content\" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), \"files_with_matches\" shows file paths (supports head_limit), \"count\" shows match counts (supports head_limit). Defaults to \"files_with_matches\"."},
-                    "-B": {"type": "integer",
-                           "description": "Number of lines to show before each match (rg -B). Requires output_mode: \"content\", ignored otherwise."},
-                    "-A": {"type": "integer",
-                           "description": "Number of lines to show after each match (rg -A). Requires output_mode: \"content\", ignored otherwise."},
-                    "-C": {"type": "integer", "description": "Alias for context."},
-                    "context": {"type": "integer",
-                                "description": "Number of lines to show before and after each match (rg -C). Requires output_mode: \"content\", ignored otherwise."},
-                    "-n": {"type": "boolean",
-                           "description": "Show line numbers in output (rg -n). Requires output_mode: \"content\", ignored otherwise. Defaults to true."},
-                    "-i": {"type": "boolean", "description": "Case insensitive search (rg -i)"},
-                    "-o": {"type": "boolean",
-                           "description": "Print only the matched (non-empty) parts of each matching line, one match per output line (rg -o / --only-matching). Requires output_mode: \"content\", ignored otherwise. Defaults to false."},
-                    "type": {"type": "string",
-                             "description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types."},
-                    "head_limit": {"type": "integer",
-                                   "description": "Limit output to first N lines/entries, equivalent to \"| head -N\". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly -- large result sets waste context)."},
-                    "offset": {"type": "integer",
-                               "description": "Skip first N lines/entries before applying head_limit, equivalent to \"| tail -n +N | head -N\". Works across all output modes. Defaults to 0."},
-                    "multiline": {"type": "boolean",
-                                  "description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false."}
-                },
-                "required": ["pattern"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "TodoRead",
-            "description": "Read the current session todo list",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "TodoWrite",
-            "description": "\n".join([
-                "Create and update a task list for the current session. The list is rendered to the user as your working plan.",
-                "",
-                "- Each todo has `content`, `status` (\"pending\" | \"in_progress\" | \"completed\"), and `priority` (\"high\" | \"medium\" | \"low\").",
-                "- Send the full list each call; it replaces the previous one.",
-                "- Keep one item `in_progress` at a time and mark it `completed` when done.",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "todos": {
-                        "type": "array",
-                        "description": "The complete updated todo list. At most one item may be in_progress at a time.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {"type": "string", "description": "Brief description of the task"},
-                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"],
-                                           "description": "Current status of the task"},
-                                "priority": {"type": "string", "enum": ["high", "medium", "low"],
-                                             "description": "Priority level of the task"}
-                            },
-                            "required": ["content", "status", "priority"]
-                        }
-                    }
-                },
-                "required": ["todos"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Agent",
-            "description": "\n".join([
-                "Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.",
-                "",
-                "Available agent types and the tools they have access to:",
-                (
-                    "- Explore: Read-only search agent for broad fan-out "
-                    "searches - when answering means sweeping many files, "
-                    "directories, or naming conventions and you only need "
-                    "the conclusion, not the file dumps. It reads excerpts "
-                    "rather than whole files, so it locates code; it doesn't "
-                    "review or audit it. It may delegate further read-only "
-                    "Explore searches. Specify search breadth: \"medium\" "
-                    "for moderate exploration, \"very thorough\" for "
-                    "multiple locations and naming conventions. (Tools: "
-                    "Agent, Glob, Grep, Read, Jobs, JobStatus, TodoRead, "
-                    "WebFetch, WebSearch)"
-                ),
-                "",
-                "When using the Agent tool, specify a subagent_type parameter to select which agent type to use. If omitted, the \"Explore\" agent is used.",
-                "",
-                "## When to use",
-                "",
-                "Reach for this when the task matches an available agent type, when you have independent work to run in parallel, or when answering would mean reading across several files - delegate it and you keep the conclusion, not the file dumps. For a single-fact lookup where you already know the file, symbol, or value, search directly. Once you've delegated a search, don't also run it yourself - wait for the result.",
-                "",
-                "- The agent's final message is returned to you as the tool result; it is not shown to the user - relay what matters.",
-                "- A new Agent call starts fresh, so the prompt must be self-contained.",
-                "- `run_in_background` starts the subagent as a background job with stdout/stderr spooled to files. Use Jobs/JobStatus/JobStop to inspect or control it.",
-                "- When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "description": {"type": "string", "description": "A short (3-5 word) description of the task"},
-                    "prompt": {"type": "string", "description": "The task for the agent to perform"},
-                    "run_in_background": {"type": "boolean",
-                                          "description": "Set to true to run this agent as a background job. Use Jobs/JobStatus/JobStop to inspect or control it."},
-                    "subagent_type": {"type": "string", "enum": ["Explore"],
-                                      "description": "The type of specialized agent to use for this task"}
-                },
-                "required": ["description", "prompt"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Skill",
-            "description": "\n".join([
-                "Execute a skill within the main conversation",
-                "",
-                "When users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.",
-                "",
-                "When users reference a \"slash command\" or \"/<something>\", they are referring to a skill. Use this tool to invoke it.",
-                "",
-                "How to invoke:",
-                "- Set `skill` to the exact name of an available skill (no leading slash). For plugin-namespaced skills use the fully qualified `plugin:skill` form.",
-                "- Set `args` to pass optional arguments.",
-                "",
-                "Important:",
-                "- Available skills are listed in system-reminder messages in the conversation",
-                "- Only invoke a skill that appears in that list, or one the user explicitly typed as `/<name>` in their message. Never guess or invent a skill name from training data; otherwise do not call this tool",
-                "- When a skill matches the user's request, this is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task",
-                "- NEVER mention a skill without actually calling this tool",
-                "- Do not invoke a skill that is already running",
-                "- Do not use this tool for built-in CLI commands (like /help, /clear, etc.)",
-                "- If you see a <command-name> tag in the current conversation turn, the skill has ALREADY been loaded - follow the instructions directly instead of calling this tool again",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill": {"type": "string",
-                              "description": "The name of a skill from the available-skills list. Do not guess names."},
-                    "args": {"type": "string", "description": "Optional arguments for the skill"}
-                },
-                "required": ["skill"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "WebFetch",
-            "description": "\n".join([
-                "Fetches a URL, converts the page to markdown, and answers `prompt` against it using a small fast model.",
-                "",
-                "- Fails on authenticated/private URLs -- use an authenticated MCP tool or `gh` for those instead.",
-                "- HTTP is upgraded to HTTPS. Cross-host redirects are returned to you rather than followed; call again with the redirect URL.",
-                "- Responses are cached for 15 minutes per URL.",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "format": "uri",
-                            "description": "The URL to fetch content from"},
-                    "prompt": {"type": "string", "description": "The prompt to run on the fetched content"}
-                },
-                "required": ["url", "prompt"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "WebSearch",
-            "description": "\n".join([
-                "Search the web. Returns result blocks with titles and URLs. US-only.",
-                "",
-                "- Use the session's current-date instruction when searching for recent information.",
-                "- `allowed_domains` / `blocked_domains` filter results.",
-                '- After answering from results, end with a "Sources:" list of the URLs you used as markdown links.',
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "minLength": 2, "description": "The search query to use"},
-                    "allowed_domains": {"type": "array", "items": {"type": "string"}, "maxItems": 20,
-                                        "description": "Only include search results from these domains"},
-                    "blocked_domains": {"type": "array", "items": {"type": "string"}, "maxItems": 20,
-                                        "description": "Never include search results from these domains"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": ASK_TOOL_NAME,
-            "description": "\n".join([
-                "Asks the user one multiple-choice question and waits for the answer.",
-                "",
-                "Use this when a decision, preference, or missing detail changes what you do next and you cannot determine it yourself. Do not use it to ask permission for work you can simply do, and do not ask what you can already infer from the conversation.",
-                "",
-                f"- Offer {ASK_MIN_OPTIONS}-{ASK_MAX_OPTIONS} concrete, mutually distinct options. The user can always answer with their own text instead of an option.",
-                "- Set multi_select only when the choices are not mutually exclusive.",
-                "- If you recommend an option, list it first and say why in its description.",
-                "- The user may decline or dismiss the question. Either way the turn continues without an answer; neither response is consent.",
-            ]),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string", "minLength": 1,
-                        "maxLength": ASK_MAX_QUESTION_CHARS,
-                        "description": "The question to ask, phrased so it ends with a question mark"},
-                    "options": {
-                        "type": "array",
-                        "minItems": ASK_MIN_OPTIONS,
-                        "maxItems": ASK_MAX_OPTIONS,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": {
-                                    "type": "string", "minLength": 1, "maxLength": ASK_MAX_LABEL_CHARS,
-                                    "description": "The answer text, shown as the option's name"},
-                                "description": {
-                                    "type": "string", "maxLength": ASK_MAX_DESCRIPTION_CHARS,
-                                    "description": "One line explaining what choosing this option means"}
-                            },
-                            "required": ["label"]
-                        },
-                        "description": "The answer choices; at least two are required."
-                    },
-                    "multi_select": {
-                        "type": "boolean", "default": False,
-                        "description": "Allow the user to pick several options instead of exactly one"}
-                },
-                "required": ["question", "options"]
-            }
-        }
-    },
-]
 
 TOOL_HANDLERS = {
     "Read": {
@@ -5239,9 +2386,9 @@ TOOL_HANDLERS = {
     "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
     # Clarification does not modify workspace state, so it is safe in Explore
     # mode and question-guarded turns. Interactive callers still need a callback.
-    ASK_TOOL_NAME: {"async_handler": _handle_ask_async, "explore": True},
+    tool_contracts.ASK_TOOL_NAME: {"async_handler": _handle_ask_async, "explore": True},
 }
-TOOL_REGISTRY = _build_tool_registry(TOOLS, TOOL_HANDLERS)
+TOOL_REGISTRY = _build_tool_registry(tool_contracts.TOOLS, TOOL_HANDLERS)
 TOOLS = [spec["definition"] for spec in TOOL_REGISTRY.values()]
 EXPLORE_TOOLS = {
     name for name, spec in TOOL_REGISTRY.items() if spec["explore"]}
@@ -5312,594 +2459,51 @@ def configure_tool_hook_pipeline(environ=os.environ, stderr_reporter=None):
     return path
 
 
-def _codex_turn_state_for_request(
-        config, request_url, supplied_state=None):
-    """Return routing state only for the authenticated Codex Responses URL."""
-    if (config is None
-            or config.chat_provider.kind != protocols.OPENAI_RESPONSES
-            or config.auth_spec is None
-            or config.auth_spec.scheme != "openai-subscription"
-            or request_url != config.chat_provider.chat_url):
-        return None
-    if supplied_state is not None:
-        return supplied_state
-    # A direct one-off request still needs stable state across its own
-    # transport retries, even though it has no enclosing tool loop.
-    return CodexTurnState()
-
-
-def _prepare_codex_session_headers(headers, session):
-    # Codex 0.144.1 uses persistent agent-tree identity for session-id, and
-    # individual thread identity for both thread-id and x-client-request-id.
-    # These are not per-request UUIDs or the ephemeral turn-state token.
-    owned = {
-        "session-id": session.root_conversation_id,
-        "thread-id": session.conversation_id,
-        "x-client-request-id": session.conversation_id,
-    }
-    for name in list(headers):
-        if str(name).lower() in owned:
-            del headers[name]
-    headers.update(owned)
-
-
-def _prepare_codex_turn_headers(headers, turn_state):
-    if turn_state is None:
-        return
-    # Do not accept a caller-supplied or differently-cased stale value. The
-    # only valid token is the first value captured in this logical turn.
-    for name in list(headers):
-        if str(name).lower() == CODEX_TURN_STATE_HEADER:
-            del headers[name]
-    if turn_state.value is not None:
-        headers[CODEX_TURN_STATE_HEADER] = turn_state.value
-
-
-def _capture_codex_turn_state(headers, turn_state):
-    if turn_state is None or not isinstance(headers, dict):
-        return
-    for name, value in headers.items():
-        if str(name).lower() == CODEX_TURN_STATE_HEADER:
-            turn_state.capture(value)
-            return
-
-
-_OPENCODE_GO_INFERENCE_PATHS = frozenset({
-    "/zen/go/v1/chat/completions",
-    "/zen/go/v1/messages",
-    "/zen/go/v1/responses",
-})
-
-
-def _opencode_session_id_for_request(
-        config, request_url, supplied_session_id=None):
-    """Return conversation state only for canonical OpenCode Go inference."""
-    if (config is None
-            or request_url != config.chat_provider.chat_url):
-        return None
-    parsed = urllib.parse.urlparse(request_url)
-    try:
-        canonical_target = (
-            parsed.scheme.lower() == "https"
-            and parsed.hostname == "opencode.ai"
-            and parsed.port in [None, 443]
-            and parsed.username is None
-            and parsed.password is None
-            and parsed.path.rstrip("/") in _OPENCODE_GO_INFERENCE_PATHS
-        )
-    except ValueError:
-        canonical_target = False
-    if not canonical_target:
-        return None
-    if (not isinstance(supplied_session_id, str)
-            or not supplied_session_id):
-        raise ValueError(
-            "OpenCode Go requests require a conversation identity")
-    return supplied_session_id
-
-
-def _prepare_opencode_session_headers(headers, session_id):
-    if session_id is None:
-        return
-    # Provider headers and saved connection data are not authority to choose
-    # conversation identity. Remove any casing variant before installing the
-    # value owned by the current Session.
-    for name in list(headers):
-        if str(name).lower() == OPENCODE_SESSION_HEADER:
-            del headers[name]
-    headers[OPENCODE_SESSION_HEADER] = session_id
-
-
-def _chat_response_observer(config, request_url):
-    if config is None or request_url != config.chat_provider.chat_url:
-        return None
-    provider = config.chat_provider
-    credential = config.auth_spec.credential if config.auth_spec else None
-    return current_session().response_headers.observer(
-        request_url, credential.encode() if credential else None,
-        config.model, provider.provider_id, provider.provider_name)
+def _model_request_context():
+    session = current_session()
+    return model_requests.RequestContext(
+        config=session.runtime_config,
+        credential_authority=session.credential_authority,
+        conversation_id=session.conversation_id,
+        root_conversation_id=session.root_conversation_id,
+        response_headers=session.response_headers)
 
 
 async def async_provider_request(
         method: str, request_url: str, payload=None,
         request_headers: dict | None = None, report_errors: bool = False,
         show_timing: bool = False, cancel_check=None,
-        codex_turn_state=None,
-        opencode_session_id=None) -> protocols.ProviderResponse:
-    start = time.perf_counter()
-    config = current_config()
-    method = method.upper()
-    observe = (_chat_response_observer(config, request_url)
-               if method == "POST" else None)
-    if method not in {"GET", "POST"}:
-        raise ValueError("provider request method must be GET or POST")
-    if method == "GET" and payload is not None:
-        raise ValueError("GET provider requests cannot contain a payload")
-    if method == "POST" and payload is None:
-        raise ValueError("POST provider requests require a payload")
-    body = (
-        json.dumps(payload).encode("utf-8")
-        if method == "POST" else b"")
-    turn_state = (
-        _codex_turn_state_for_request(
-            config, request_url, codex_turn_state)
-        if method == 'POST' else None)
-    opencode_session_id = (
-        _opencode_session_id_for_request(
-            config, request_url, opencode_session_id)
-        if method == 'POST' else None)
-
-    base_headers = request_headers
-    if base_headers is None:
-        base_headers = (
-            config.chat_provider.headers if config else {})
-    # Copy so the per-call idempotency key below does not mutate the cached
-    # provider headers shared across requests.
-    base_headers = dict(base_headers)
-    if turn_state is not None:
-        _prepare_codex_session_headers(base_headers, current_session())
-
-    retry_attempts = HTTP_RETRY_MAX_ATTEMPTS
-    request_timeout = WEBFETCH_TIMEOUT_S
-    if method == 'POST':
-        # Best-effort server-side dedup; Anthropic honors this header on
-        # /v1/messages. OpenAI-compat servers may ignore it.
-        kind = config.chat_provider.kind if config else None
-        header = (LLM_IDEMPOTENCY_HEADER_ANTHROPIC
-                  if kind == protocols.ANTHROPIC_MESSAGES
-                  else LLM_IDEMPOTENCY_HEADER_OPENAI)
-        base_headers[header] = uuid.uuid4().hex
-        retry_attempts = HTTP_RETRY_MAX_ATTEMPTS_LLM
-        request_timeout = LLM_REQUEST_TIMEOUT_S
-
-    rejected_generation = None
-    recovered = False
-    while True:
-        headers_to_use, lease = (
-            await authentications.authorized_request_headers(
-                current_session().credential_authority,
-                config.auth_spec if config is not None else None,
-                request_url,
-                base_headers,
-                rejected_generation,
-            ))
-        _prepare_opencode_session_headers(
-            headers_to_use, opencode_session_id)
-        transport_options = {
-            "body": body,
-            "headers_in": headers_to_use,
-            "timeout": request_timeout,
-            "max_bytes": HTTP_MAX_RESPONSE_BYTES,
-            "retry_max_attempts": retry_attempts,
-            "retry_base_delay_s": HTTP_RETRY_BASE_DELAY_S,
-            "retry_max_jitter_s": HTTP_RETRY_MAX_JITTER_S,
-            "retry_backoff_factor": HTTP_RETRY_BACKOFF_FACTOR,
-            "cancel_check": cancel_check,
-        }
-
-        def on_response_headers(status, headers):
-            if observe is not None:
-                observe(status, headers)
-            if 200 <= status < 300:
-                _capture_codex_turn_state(headers, turn_state)
-
-        if observe is not None or turn_state is not None:
-            transport_options["on_response_headers"] = on_response_headers
-        if turn_state is not None:
-            transport_options["prepare_attempt_headers"] = (
-                lambda headers: _prepare_codex_turn_headers(headers, turn_state))
-        response = await http_client.async_http_request(
-            method,
-            request_url,
-            **transport_options,
-        )
-        if (response.status == 401
-                and lease is not None
-                and lease.refreshable
-                and not recovered):
-            # The generation check in the broker ensures concurrent stale
-            # 401s observe an already-refreshed token instead of replaying
-            # the rotating refresh token.
-            rejected_generation = lease.generation
-            recovered = True
-            continue
-        break
-    response_text = _decode_http_text(response.body, response.headers)
-    if response.status >= 400:
-        raise ApiError(request_url, response.status, response.reason, response_text)
-    try:
-        data = json.loads(response_text)
-    except json.JSONDecodeError as error:
-        raise protocols.ProtocolError(
-            f"response from <{request_url}> was not valid JSON: "
-            f"{error.msg}",
-            payload=response_text,
-        ) from error
-
-    elapsed = time.perf_counter() - start
-    if show_timing:
-        logging.getLogger(__name__).debug(
-            "LLM Response Time: %.3fs", elapsed)
-    return protocols.ProviderResponse(
-        data,
-        effective_model=(
-            protocols.openai_response_model_header(response.headers)
-            if turn_state is not None else None),
-    )
-
-
-async def _next_stream_chunk(iterator, cancel_check):
-    if cancel_check():
-        raise StreamCancelled()
-    task = asyncio.ensure_future(anext(iterator))
-    try:
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=0.05)
-            if done:
-                return task.result()
-            if cancel_check():
-                raise StreamCancelled()
-    finally:
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
-
-
-async def _collect_stream_body(iterator, first_chunk, cancel_check):
-    chunks = [first_chunk] if first_chunk else []
-    while True:
-        try:
-            chunk = await _next_stream_chunk(iterator, cancel_check)
-        except StopAsyncIteration:
-            return b"".join(chunks)
-        chunks.append(chunk)
-
-
-def _stream_body_kind(content_type, first_chunk):
-    # Leading whitespace is legal before a JSON document but NOT before an
-    # SSE field (SseDecoder would drop such a line), so strip it only for
-    # the JSON check: "   data:" classifies as JSON and fails loudly, not
-    # as SSE that silently loses its first event.
-    prefix = first_chunk.lstrip()
-    if prefix.startswith((b"{", b"[")):
-        return "json"
-    # A UTF-8 BOM may precede the first SSE line; SseDecoder strips one
-    # per line itself (sse.py), so the sniffer must accept it here too.
-    if first_chunk.startswith(b"\xef\xbb\xbf"):
-        if first_chunk[3:].lstrip().startswith(
-                (b"data:", b"event:", b":")):
-            return "sse"
-    if first_chunk.startswith((b"data:", b"event:", b":")):
-        return "sse"
-    media_type = content_type.partition(";")[0].strip().lower()
-    if media_type == "text/event-stream":
-        return "sse"
-    if media_type in ["application/json", "application/problem+json"]:
-        return "json"
-    return "json"
-
-
-_STREAM_MARKERS = (b"data:", b"event:", b":")
-
-
-def _prefix_ambiguous(prefix):
-    """Whether prefix so far could still become an SSE field marker.
-
-    A first TCP read can end mid-marker ("da", "data") or hold only
-    whitespace; such prefixes must not be classified yet, and one more
-    chunk resolves them. Whitespace alone stays ambiguous even though a
-    leading-whitespace stream cannot be SSE, because the whitespace may be
-    the padding of a JSON document whose "{" arrives in the next chunk.
-    """
-    stripped = prefix.lstrip()
-    if not stripped:
-        return True
-    if stripped.startswith(b"\xef\xbb\xbf"):
-        stripped = stripped[3:]
-        if not stripped:
-            return True
-    return any(marker.startswith(stripped) for marker in _STREAM_MARKERS)
-
-
-async def _first_body_chunk(iterator, cancel_check):
-    """Read body bytes until the SSE-vs-JSON sniff can decide.
-
-    Returns the concatenated bytes (b"" on immediate EOF). Extra reads
-    happen only while the bytes so far are still an ambiguous prefix of an
-    SSE marker, so a normal first line (or JSON body) never blocks on this
-    bounded lookahead.
-    """
-    chunks = []
-    total = 0
-    while True:
-        try:
-            chunk = await _next_stream_chunk(iterator, cancel_check)
-        except StopAsyncIteration:
-            return b"".join(chunks)
-        if chunk:
-            chunks.append(chunk)
-            total += len(chunk)
-        if not _prefix_ambiguous(b"".join(chunks)[-64:]):
-            return b"".join(chunks)
-
-
-async def _async_chat_stream_request_once(
-        request_url, payload, request_headers, on_text_delta, cancel_check,
-        codex_turn_state=None, observe=None, on_reasoning_delta=None) -> protocols.ProviderResponse:
-    body = json.dumps(payload).encode("utf-8")
-    async with http_client.async_http_stream(
-            "POST",
-            request_url,
-            body=body,
-            headers_in=request_headers,
-            timeout=LLM_STREAM_IDLE_TIMEOUT_S,
-            max_bytes=HTTP_MAX_RESPONSE_BYTES,
-            cancel_check=cancel_check) as response:
-        if observe is not None:
-            observe(response.status, response.headers)
-        effective_model = (
-            protocols.openai_response_model_header(response.headers)
-            if codex_turn_state is not None else None)
-        if 200 <= response.status < 300:
-            # Capture as soon as the HTTP headers arrive. If the body then
-            # fails before yielding an SSE event, the transport retry must
-            # already be able to replay the routing token.
-            _capture_codex_turn_state(
-                response.headers, codex_turn_state)
-        iterator = response.body.__aiter__()
-        first_chunk = await _first_body_chunk(iterator, cancel_check)
-
-        if response.status >= 400:
-            try:
-                response_body = await _collect_stream_body(
-                    iterator, first_chunk, cancel_check)
-            except OSError as e:
-                if first_chunk:
-                    raise protocols.StreamProtocolError(
-                        f"stream interrupted after output began: {e}") from e
-                raise
-            response_text = _decode_http_text(
-                response_body, response.headers)
-            raise StreamingApiError(
-                request_url, response.status, response.reason, response_text)
-
-        if _stream_body_kind(
-                response.header("content-type"), first_chunk) == "json":
-            try:
-                response_body = await _collect_stream_body(
-                    iterator, first_chunk, cancel_check)
-            except OSError as e:
-                if first_chunk:
-                    raise protocols.StreamProtocolError(
-                        f"stream interrupted after output began: {e}") from e
-                raise
-            try:
-                return protocols.ProviderResponse(
-                    json.loads(_decode_http_text(
-                        response_body, response.headers)),
-                    effective_model=effective_model,
-                )
-            except json.JSONDecodeError as e:
-                raise protocols.StreamProtocolError(
-                    "streaming response was neither valid SSE nor JSON: "
-                    f"{e}") from e
-
-        accumulator = current_config().chat_provider.stream_accumulator(
-            on_text_delta, on_reasoning_delta)
-
-        def observed_model():
-            return (
-                effective_model
-                or getattr(accumulator, "effective_model", None))
-
-        decoder = sse.SseDecoder()
-        received_body = bool(first_chunk)
-        try:
-            for event in decoder.feed(first_chunk):
-                if accumulator.feed(event):
-                    return protocols.ProviderResponse(
-                        accumulator.finish(),
-                        effective_model=observed_model(),
-                        reasoning_field=getattr(accumulator, "reasoning_field", None),
-                        notice_codes=tuple(
-                            getattr(accumulator, "notice_codes", ())),
-                    )
-            while True:
-                try:
-                    chunk = await _next_stream_chunk(
-                        iterator, cancel_check)
-                except StopAsyncIteration:
-                    break
-                received_body = received_body or bool(chunk)
-                for event in decoder.feed(chunk):
-                    if accumulator.feed(event):
-                        return protocols.ProviderResponse(
-                            accumulator.finish(),
-                            effective_model=observed_model(),
-                            reasoning_field=getattr(accumulator, "reasoning_field", None),
-                            notice_codes=tuple(
-                                getattr(
-                                    accumulator, "notice_codes", ())),
-                        )
-            for event in decoder.finish():
-                if accumulator.feed(event):
-                    return protocols.ProviderResponse(
-                        accumulator.finish(),
-                        effective_model=observed_model(),
-                        reasoning_field=getattr(accumulator, "reasoning_field", None),
-                        notice_codes=tuple(
-                            getattr(accumulator, "notice_codes", ())),
-                    )
-        except StreamCancelled:
-            raise
-        except protocols.ResponseApiError:
-            raise
-        except protocols.StreamProtocolError:
-            raise
-        except ValueError as e:
-            raise protocols.StreamProtocolError(
-                f"invalid SSE stream: {e}") from e
-        except OSError as e:
-            if received_body:
-                raise protocols.StreamProtocolError(
-                    f"stream interrupted after output began: {e}") from e
-            raise
-        return protocols.ProviderResponse(
-            accumulator.finish(),
-            effective_model=observed_model(),
-            reasoning_field=getattr(accumulator, "reasoning_field", None),
-            notice_codes=tuple(
-                getattr(accumulator, "notice_codes", ())),
-        )
+        codex_turn_state=None, opencode_session_id=None) -> protocols.ProviderResponse:
+    return await model_requests.async_provider_request(
+        method, request_url, payload, request_headers=request_headers,
+        report_errors=report_errors, show_timing=show_timing, cancel_check=cancel_check,
+        codex_turn_state=codex_turn_state, opencode_session_id=opencode_session_id,
+        context=_model_request_context())
 
 
 async def async_chat_stream_request(
         request_url: str, payload, request_headers: dict | None = None,
         on_text_delta=None, cancel_check=None,
         report_errors: bool = False, show_timing: bool = False,
-        codex_turn_state=None,
-        opencode_session_id=None, on_reasoning_delta=None) -> protocols.ProviderResponse:
-    start = time.perf_counter()
-    config = current_config()
-    observe = _chat_response_observer(config, request_url)
-    output_started = False
-
-    def callback(text):
-        nonlocal output_started
-        output_started = output_started or bool(text)
-        if on_text_delta is not None:
-            on_text_delta(text)
-
-    def reasoning_callback(key, kind, text):
-        nonlocal output_started
-        output_started = output_started or bool(text)
-        if on_reasoning_delta is not None:
-            on_reasoning_delta(key, kind, text)
-
-    cancel = cancel_check or (lambda: False)
-    turn_state = _codex_turn_state_for_request(
-        config, request_url, codex_turn_state)
-    opencode_session_id = _opencode_session_id_for_request(
-        config, request_url, opencode_session_id)
-    base_headers = dict(
-        request_headers if request_headers is not None
-        else (config.chat_provider.headers if config else {}))
-    if turn_state is not None:
-        _prepare_codex_session_headers(base_headers, current_session())
-    base_headers.setdefault("Accept", "text/event-stream")
-    kind = config.chat_provider.kind if config else None
-    idempotency_header = (
-        LLM_IDEMPOTENCY_HEADER_ANTHROPIC
-        if kind == protocols.ANTHROPIC_MESSAGES
-        else LLM_IDEMPOTENCY_HEADER_OPENAI)
-    base_headers[idempotency_header] = uuid.uuid4().hex
-
-    transport_attempt = 0
-    rejected_generation = None
-    recovered = False
-    while True:
-        headers_to_use, lease = (
-            await authentications.authorized_request_headers(
-                current_session().credential_authority,
-                config.auth_spec if config is not None else None,
-                request_url,
-                base_headers,
-                rejected_generation,
-            ))
-        _prepare_opencode_session_headers(
-            headers_to_use, opencode_session_id)
-        _prepare_codex_turn_headers(headers_to_use, turn_state)
-        transport_attempt += 1
-        try:
-            stream_kwargs = {"codex_turn_state": turn_state, "observe": observe}
-            if on_reasoning_delta is not None:
-                stream_kwargs["on_reasoning_delta"] = reasoning_callback
-            response = await _async_chat_stream_request_once(
-                request_url, payload, headers_to_use, callback, cancel, **stream_kwargs)
-            break
-        except http_client.HttpRequestCancelled:
-            raise StreamCancelled()
-        except Exception as exc:
-            if (isinstance(exc, StreamingApiError)
-                    and exc.status == 401
-                    and lease is not None
-                    and lease.refreshable
-                    and not recovered):
-                rejected_generation = lease.generation
-                recovered = True
-                # Authentication recovery is independent of transport retry
-                # accounting and preserves the same idempotency key.
-                transport_attempt = 0
-                continue
-            retryable_response_error = (
-                isinstance(exc, protocols.ResponseApiError)
-                and exc.retryable)
-            if (output_started or transport_attempt >= HTTP_RETRY_MAX_ATTEMPTS_LLM
-                    or not (
-                        retryable_response_error
-                        or http_client.is_transient_error(exc))):
-                raise
-            delay = (
-                exc.retry_after
-                if (retryable_response_error
-                    and exc.retry_after is not None)
-                else (
-                    HTTP_RETRY_BASE_DELAY_S
-                    * (HTTP_RETRY_BACKOFF_FACTOR
-                       ** (transport_attempt - 1))))
-            if (HTTP_RETRY_MAX_JITTER_S
-                    and not (
-                        retryable_response_error
-                        and exc.retry_after is not None)):
-                delay += random.uniform(0, HTTP_RETRY_MAX_JITTER_S)
-            try:
-                await http_client._wait_with_cancel(
-                    asyncio.sleep(delay), delay + 0.1, cancel)
-            except http_client.HttpRequestCancelled:
-                raise StreamCancelled()
-
-    elapsed = time.perf_counter() - start
-    if show_timing:
-        logging.getLogger(__name__).debug(
-            "LLM Response Time: %.3fs", elapsed)
-    return response
+        codex_turn_state=None, opencode_session_id=None,
+        on_reasoning_delta=None) -> protocols.ProviderResponse:
+    return await model_requests.async_chat_stream_request(
+        request_url, payload, request_headers=request_headers,
+        on_text_delta=on_text_delta, cancel_check=cancel_check,
+        report_errors=report_errors, show_timing=show_timing,
+        codex_turn_state=codex_turn_state, opencode_session_id=opencode_session_id,
+        on_reasoning_delta=on_reasoning_delta, context=_model_request_context())
 
 
-async def async_chat_completion(transcript_items: list, tools=TOOLS, report_errors: bool = False,
-                                show_timing: bool = False,
-                                on_text_delta=None,
-                                on_reasoning_delta=None,
-                                cancel_check=None,
-                                codex_turn_state=None,
-                                reasoning_effort=_UNSET,
-                                thinking: TurnThinkingSettings | None = None,
-                                ) -> formats.DecodedTurn:
+async def async_chat_completion(
+        transcript_items: list, tools=TOOLS, report_errors: bool = False,
+        show_timing: bool = False, on_text_delta=None, on_reasoning_delta=None,
+        cancel_check=None, codex_turn_state=None, reasoning_effort=_UNSET,
+        thinking: model_requests.TurnThinkingSettings | None = None) -> formats.DecodedTurn:
     if cancel_check and cancel_check():
-        raise StreamCancelled()
-    if not current_config():
+        raise model_requests.StreamCancelled()
+    context = _model_request_context()
+    if context.config is None:
         return formats.DecodedTurn([])
     # Innermost default: a caller that owns a logical turn passes its
     # captured snapshot; a direct call captures one here.
@@ -5908,213 +2512,12 @@ async def async_chat_completion(transcript_items: list, tools=TOOLS, report_erro
     if reasoning_effort is _UNSET:
         reasoning_effort = thinking.effort
     elif reasoning_effort is not None:
-        reasoning_effort = modelsdev.validate_reasoning_effort(
-            reasoning_effort)
-    if (reasoning_effort is not None
-            and (current_config().reasoning_effort_profile is None
-                 or not current_config().reasoning_effort_profile.supports(
-                     reasoning_effort))):
-        raise protocols.ProtocolError(
-            "reasoning effort is not supported by the selected model")
-    effective_model = current_model()
-    notice_codes = ()
-    reasoning_source = current_config().chat_provider.reasoning_field
-
-    if current_config().chat_provider.kind == protocols.DUMMY:
-        # No-op LLM for testing: never touches the network.  The reply is a
-        # canned assistant message, so the whole input/turn/render loop runs
-        # deterministically. LOKI_DUMMY_STREAM_CHUNKS optionally supplies a
-        # JSON array of deltas. A test can make the provider pause after its
-        # first delta by setting LOKI_DUMMY_STREAM_GATE to a path that the test
-        # creates after observing the corresponding terminal output.
-        reply = os.environ.get("LOKI_DUMMY_REPLY", "ok")
-        raw_chunks = os.environ.get("LOKI_DUMMY_STREAM_CHUNKS")
-        if current_config().stream and on_text_delta and raw_chunks is not None:
-            try:
-                chunks = json.loads(raw_chunks)
-            except json.JSONDecodeError as error:
-                raise protocols.ProtocolError(
-                    f"LOKI_DUMMY_STREAM_CHUNKS is invalid JSON: {error}"
-                ) from error
-            if (not isinstance(chunks, list)
-                    or any(not isinstance(chunk, str) for chunk in chunks)):
-                raise protocols.ProtocolError(
-                    "LOKI_DUMMY_STREAM_CHUNKS must be a JSON array "
-                    "of strings")
-            gate = os.environ.get("LOKI_DUMMY_STREAM_GATE")
-            for index, chunk in enumerate(chunks):
-                on_text_delta(chunk)
-                if index == 0 and gate:
-                    deadline = time.monotonic() + 10
-                    while not os.path.exists(gate):
-                        if cancel_check and cancel_check():
-                            raise StreamCancelled()
-                        if time.monotonic() >= deadline:
-                            raise protocols.ProtocolError(
-                                "timed out waiting for "
-                                "LOKI_DUMMY_STREAM_GATE")
-                        await asyncio.sleep(0.01)
-        # A test hook that makes the canned reply a tool call instead of text,
-        # so a test can drive the model/tool loop through a real tool execution
-        # with the DUMMY provider.  The value is a JSON object with a ``name``
-        # and an optional ``arguments`` object.  It fires only while the
-        # transcript contains no tool call yet, so the loop's follow-up model
-        # call gets the ordinary text reply instead of the call again.
-        tool_call_spec = os.environ.get("LOKI_DUMMY_TOOL_CALL")
-        if tool_call_spec and not formats.response_tool_calls(transcript_items):
-            try:
-                spec = json.loads(tool_call_spec)
-            except json.JSONDecodeError as error:
-                raise protocols.ProtocolError(
-                    f"LOKI_DUMMY_TOOL_CALL is invalid JSON: {error}"
-                ) from error
-            if (not isinstance(spec, dict)
-                    or not isinstance(spec.get("name"), str)):
-                raise protocols.ProtocolError(
-                    "LOKI_DUMMY_TOOL_CALL must be an object with a "
-                    "string 'name'")
-            arguments = spec.get("arguments", {})
-            if not isinstance(arguments, dict):
-                raise protocols.ProtocolError(
-                    "LOKI_DUMMY_TOOL_CALL 'arguments' must be an object")
-            return formats.DecodedTurn(
-                [formats.tool_call_item(
-                    "dummy-tool-call", spec["name"], arguments)],
-                {
-                    "protocol": "dummy",
-                    "provider_id": "dummy",
-                    "model": current_model(),
-                    "response": {},
-                },
-            )
-        return formats.DecodedTurn(
-            [formats.message_item("assistant", reply)],
-            {
-                "protocol": "dummy",
-                "provider_id": "dummy",
-                "model": current_model(),
-                "response": {},
-            },
-        )
-
-    opencode_session_id = _opencode_session_id_for_request(
-        current_config(),
-        current_config().chat_provider.chat_url,
-        current_session().conversation_id,
-    )
-    if current_config().stream:
-        payload = current_config().chat_provider.streaming_chat_payload(
-            transcript_items,
-            tools,
-            current_model(),
-            prompt_cache_key=current_session().conversation_id,
-            reasoning_effort=reasoning_effort,
-            thinking_mode=thinking.mode,
-            thinking_budget=thinking.budget,
-            reasoning_retention=thinking.retention,
-            reasoning_traces=thinking.traces,
-        )
-        request_kwargs = {
-            "request_headers":
-                current_config().chat_provider.headers,
-            "on_text_delta": on_text_delta,
-            "cancel_check": cancel_check,
-            "report_errors": report_errors,
-            "show_timing": False,
-        }
-        if on_reasoning_delta is not None:
-            request_kwargs["on_reasoning_delta"] = on_reasoning_delta
-        if codex_turn_state is not None:
-            request_kwargs["codex_turn_state"] = codex_turn_state
-        if opencode_session_id is not None:
-            request_kwargs["opencode_session_id"] = opencode_session_id
-        response = await async_chat_stream_request(
-            current_config().chat_provider.chat_url,
-            payload,
-            **request_kwargs,
-        )
-        data = response.payload
-        effective_model = response.effective_model or effective_model
-        notice_codes = response.notice_codes
-        reasoning_source = response.reasoning_field or reasoning_source
-    else:
-        payload = current_config().chat_provider.chat_payload(
-            transcript_items,
-            tools,
-            current_model(),
-            prompt_cache_key=current_session().conversation_id,
-            reasoning_effort=reasoning_effort,
-            thinking_mode=thinking.mode,
-            thinking_budget=thinking.budget,
-            reasoning_retention=thinking.retention,
-            reasoning_traces=thinking.traces,
-        )
-        try:
-            request_kwargs = {
-                "request_headers":
-                    current_config().chat_provider.headers,
-                "report_errors": report_errors,
-                "show_timing": show_timing,
-            }
-            if cancel_check is not None:
-                request_kwargs["cancel_check"] = cancel_check
-            if codex_turn_state is not None:
-                request_kwargs["codex_turn_state"] = codex_turn_state
-            if opencode_session_id is not None:
-                request_kwargs["opencode_session_id"] = opencode_session_id
-            response = await async_provider_request(
-                "POST",
-                current_config().chat_provider.chat_url,
-                payload,
-                **request_kwargs,
-            )
-            data = response.payload
-            effective_model = response.effective_model or effective_model
-            notice_codes = response.notice_codes
-        except http_client.HttpRequestCancelled:
-            raise StreamCancelled()
-    if not isinstance(data, dict):
-        raise protocols.ProtocolError(
-            "chat response must be a JSON object", payload=data)
-    detected = protocols.detect_protocol_from_response(data)
-    if detected and detected != current_config().chat_provider.kind:
-        # A configured adapter should not parse a response that clearly has
-        # another protocol's shape; that usually means endpoint/config mismatch.
-        raise protocols.ProtocolError(
-            f"configured provider {current_config().chat_provider.kind!r} "
-            f"but response looks like {detected!r}",
-            payload=data,
-        )
-    try:
-        turn = formats.coerce_decoded_turn(
-            current_config().chat_provider.parse_chat_response(data))
-    except formats.TranscriptFormatError as e:
-        raise protocols.ProtocolError(
-            f"invalid {current_config().chat_provider.kind} response: {e}",
-            payload=data,
-        ) from e
-    provider = current_config().chat_provider
-    turn.metadata["provider_id"] = provider.provider_id
-    turn.metadata["provider_name"] = provider.provider_name
-    turn.metadata["endpoint"] = (
-        provider.chat_url)
-    turn.metadata["model"] = effective_model
-    turn.metadata["requested_model"] = current_model()
-    turn.metadata["protocol"] = current_config().chat_provider.kind
-    if reasoning_source in ["reasoning", "reasoning_content", "reasoning_details"]:
-        native = copy.deepcopy(turn.metadata.get("protocol_data") or {})
-        if not isinstance(native, dict):
-            native = {}
-        native.setdefault("loki", {})["reasoning_field"] = reasoning_source
-        turn.metadata["protocol_data"] = native
-    if notice_codes:
-        protocol_data = copy.deepcopy(
-            turn.metadata.get("protocol_data") or {})
-        if not isinstance(protocol_data, dict):
-            protocol_data = {}
-        protocol_data.setdefault("loki", {})["provider_notices"] = list(notice_codes)
-        turn.metadata["protocol_data"] = protocol_data
-    return turn
+        reasoning_effort = modelsdev.validate_reasoning_effort(reasoning_effort)
+    return await model_requests.async_chat_completion(
+        transcript_items, tools, report_errors=report_errors, show_timing=show_timing,
+        on_text_delta=on_text_delta, on_reasoning_delta=on_reasoning_delta,
+        cancel_check=cancel_check, codex_turn_state=codex_turn_state,
+        reasoning_effort=reasoning_effort, thinking=thinking, context=context)
 
 
 def _status_api_base() -> str:
@@ -6166,7 +2569,7 @@ async def load_models_async(diagnostic_writer=None):
                 request_headers=current_config().chat_provider.headers,
                 report_errors=True,
             )
-        except ApiError as e:
+        except model_requests.ApiError as e:
             errors.append(e.formatted())
             continue
         except OSError as e:
@@ -6373,7 +2776,7 @@ def save_chat_log():
         state,
         toolsets=session.session_toolsets,
     )
-    _atomic_write_text(session.chat_log_path, content)
+    files.atomic_write_text(session.chat_log_path, content)
     savefiles.report_chat_log_saved(session.chat_log_path)
     session.session_state = state
     session.chat_log_dirty = False

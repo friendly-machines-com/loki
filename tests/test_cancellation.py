@@ -242,7 +242,7 @@ class ForegroundJobCancelTests(unittest.TestCase):
 
     def test_cancel_event_kills_sleep_quickly(self):
         import time as _time
-        from loki_agent.loki import JobManager
+        from loki_agent.jobs import JobManager
 
         async def run():
             manager = JobManager("/tmp/loki-cancel-test-jobs2")
@@ -284,7 +284,7 @@ class ForegroundJobCancelTests(unittest.TestCase):
         self.assertLess(elapsed, 5.0)  # cancellation ends sleep immediately
 
     def test_no_cancel_event_uses_timeout_path(self):
-        from loki_agent.loki import JobManager
+        from loki_agent.jobs import JobManager
 
         async def run():
             manager = JobManager("/tmp/loki-cancel-test-jobs3")

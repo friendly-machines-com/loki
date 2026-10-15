@@ -64,3 +64,9 @@ def presentation_text(content, process_output=None, *, show_bash_stdout=False,
     if legacy_read and not show_read_stdout:
         return "Older combined Read output is hidden; enable show_read_stdout to display it."
     return str(content)
+
+
+def truncate_text(s: str, max_chars: int) -> str:
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"\n... [output truncated: {len(s)} chars total, {max_chars} shown]"

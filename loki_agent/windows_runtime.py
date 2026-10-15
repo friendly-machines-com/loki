@@ -74,7 +74,7 @@ def require_checks(checks):
 def configured_workspace(arguments):
     # Supervisor-side only: use the frontend's parser rather than mistaking a
     # prompt value for a workspace option. The child's gate does not call this.
-    from .terminal_frontend import parse_cli_args
+    from .arguments import parse_cli_args
     workspace = os.getcwd()
     options, _ = parse_cli_args(arguments)
     for option, value in options:

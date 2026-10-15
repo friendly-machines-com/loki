@@ -12,6 +12,18 @@ from . import __version__
 # stack. Every production Internet request uses it. Keep transport policy here
 # explicit because callers depend on exact redirect, truncation, identity, and
 # header-validation behavior.
+# Retry policy for transient transport failures (timeouts, connection resets).
+# Safe in this codebase because every request opens a fresh TCP connection
+# with Connection: close; the kernel drops late packets from the old socket on
+# the new connection's source port. Edit these to tune or disable.
+# Mutation callers explicitly choose their retry budget; transport defaults
+# remain one try. These constants do not authorize replaying mutations.
+HTTP_RETRY_MAX_ATTEMPTS = 3         # for GETs and the read-only search POST
+HTTP_RETRY_BASE_DELAY_S = 0.5
+HTTP_RETRY_MAX_JITTER_S = 0.5
+HTTP_RETRY_BACKOFF_FACTOR = 2.0
+
+HTTP_DEFAULT_TIMEOUT_S = 30
 HTTP_HEADER_MAX_BYTES = 64 * 1024
 HTTP_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 # Application identity is a property of Loki, not of an endpoint or feature.
@@ -383,7 +395,7 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict | None = 
 
 
 async def _async_http_request_once(method: str, request_url: str, *, headers_in: dict | None = None,
-                                   body: bytes = b'', timeout: int = 30,
+                                   body: bytes = b'', timeout: int = HTTP_DEFAULT_TIMEOUT_S,
                                    max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                    cancel_check=None,
                                    on_response_headers=None) -> HttpResponse:
@@ -467,7 +479,7 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
 @contextlib.asynccontextmanager
 async def async_http_stream(method: str, request_url: str, *,
                             headers_in: dict | None = None, body: bytes = b"",
-                            timeout: int = 30,
+                            timeout: int = HTTP_DEFAULT_TIMEOUT_S,
                             max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                             cancel_check=None):
     """Open an HTTP request and expose its response body as an async iterator.
@@ -518,12 +530,12 @@ async def async_http_stream(method: str, request_url: str, *,
 
 
 async def async_http_request(method: str, request_url: str, *, headers_in: dict | None = None,
-                             body: bytes = b'', timeout: int = 30,
+                             body: bytes = b'', timeout: int = HTTP_DEFAULT_TIMEOUT_S,
                              max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                              retry_max_attempts: int = 1,
-                             retry_base_delay_s: float = 0.5,
-                             retry_max_jitter_s: float = 0.5,
-                             retry_backoff_factor: float = 2.0,
+                             retry_base_delay_s: float = HTTP_RETRY_BASE_DELAY_S,
+                             retry_max_jitter_s: float = HTTP_RETRY_MAX_JITTER_S,
+                             retry_backoff_factor: float = HTTP_RETRY_BACKOFF_FACTOR,
                              cancel_check=None,
                              prepare_attempt_headers=None,
                              on_response_headers=None) -> HttpResponse:
@@ -564,13 +576,13 @@ def _redirect_location(response: HttpResponse) -> str | None:
 
 async def async_http_request_follow_same_host(method: str, request_url: str, *,
                                               headers_in: dict | None = None, body: bytes = b'',
-                                              timeout: int = 30,
+                                              timeout: int = HTTP_DEFAULT_TIMEOUT_S,
                                               max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                               max_redirects: int = 5,
                                               retry_max_attempts: int = 1,
-                                              retry_base_delay_s: float = 0.5,
-                                              retry_max_jitter_s: float = 0.5,
-                                              retry_backoff_factor: float = 2.0,
+                                              retry_base_delay_s: float = HTTP_RETRY_BASE_DELAY_S,
+                                              retry_max_jitter_s: float = HTTP_RETRY_MAX_JITTER_S,
+                                              retry_backoff_factor: float = HTTP_RETRY_BACKOFF_FACTOR,
                                               cancel_check=None) -> HttpResponse:
     current_url = request_url
     original_host = urllib.parse.urlparse(request_url).netloc
@@ -601,3 +613,31 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
             return response
         current_url = next_url
     return response
+
+
+def decode_text(raw: bytes, headers, default_charset: str = 'utf-8') -> str:
+    candidates = []
+    get_content_charset = getattr(headers, 'get_content_charset', None)
+    if callable(get_content_charset):
+        charset = get_content_charset()
+        if charset:
+            candidates.append(charset)
+    elif isinstance(headers, dict):
+        content_type = headers.get('content-type') or headers.get('Content-Type') or ''
+        for part in content_type.split(';')[1:]:
+            name, sep, value = part.strip().partition('=')
+            if sep and name.lower() == 'charset':
+                candidates.append(value.strip('"'))
+    candidates.append(default_charset)
+
+    seen = set()
+    for charset in candidates:
+        charset = charset.strip()
+        if not charset or charset.lower() in seen:
+            continue
+        seen.add(charset.lower())
+        try:
+            return raw.decode(charset)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode(default_charset, errors='replace')

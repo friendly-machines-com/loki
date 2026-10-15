@@ -11,11 +11,14 @@ from unittest import mock
 from loki_agent import formats, loki, models, protocols, subagents
 from loki_agent.credentials import CredentialStore
 from loki_agent.sessions import Session
+from loki_agent import connections
+from loki_agent import jobs as job_runtime
+from loki_agent import model_requests
 
 
 class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.session = Session(runtime_config=loki.make_runtime_config(
+        self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES, model="claude-opus-4-5",
             reasoning_capabilities=models.ReasoningCapabilities(True, ["budget_tokens"], 1024, 6000)))
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
@@ -45,22 +48,22 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(recursive["LOKI_TURN_THINKING"])["settings"], payload["settings"])
 
     async def test_profileless_provider_identity_survives_environment_round_trip(self):
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://api.z.ai/api/paas/v4", protocols.OPENAI_CHAT,
             model="glm-5.2", provider_id="zai")
         env = loki._subagent_env(thinking=loki.capture_turn_settings(), environ={})
         self.assertEqual(env["LOKI_PROVIDER_ID"], "zai")
         self.assertNotIn("LOKI_REASONING_EFFORT_PROFILE", env)
-        child = loki.build_config_from_env(credentials=CredentialStore.capture(env))
+        child = connections.build_config_from_env(credentials=CredentialStore.capture(env))
         self.assertEqual(child.chat_provider.provider_id, "zai")
         self.assertIsNone(child.reasoning_effort_profile)
 
     async def test_effort_selection_has_one_channel_and_profile_remains_model_data(self):
         profile = models.ReasoningEffortProfile(["low", "high"])
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
             model="claude-opus-4-5", reasoning_effort_profile=profile)
-        snapshot = loki.TurnThinkingSettings(effort="high")
+        snapshot = model_requests.TurnThinkingSettings(effort="high")
         env = loki._subagent_env(thinking=snapshot, environ={"LOKI_REASONING_EFFORT": "low"})
         self.assertNotIn("LOKI_REASONING_EFFORT", env)
         self.assertEqual(json.loads(env["LOKI_TURN_THINKING"])["settings"]["effort"], "high")
@@ -70,7 +73,7 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.session.reasoning_effort_preference)
 
     async def test_binding_and_connection_are_validated(self):
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://relay.example/v1/messages", protocols.ANTHROPIC_MESSAGES, model="custom")
         loki.thinking_command("mode adaptive")
         snapshot = loki.capture_turn_settings()
@@ -122,7 +125,7 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(fetch.await_args.kwargs["thinking"], snapshot)
 
     async def test_toolless_helper_keeps_settings_and_returns_answer_only(self):
-        snapshot = loki.TurnThinkingSettings(mode="manual", budget=2048, traces="on")
+        snapshot = model_requests.TurnThinkingSettings(mode="manual", budget=2048, traces="on")
         response = formats.DecodedTurn([
             {"type": "anthropic_thinking", "thinking": "hidden", "signature": "opaque"},
             formats.message_item("assistant", "answer")])
@@ -158,7 +161,7 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         server = await asyncio.start_server(server_request, "127.0.0.1", 0)
         try:
             port = server.sockets[0].getsockname()[1]
-            self.session.runtime_config = loki.make_runtime_config(
+            self.session.runtime_config = connections.make_runtime_config(
                 f"http://127.0.0.1:{port}/v1/messages", protocols.ANTHROPIC_MESSAGES, model="custom",
                 reasoning_effort_profile=models.ReasoningEffortProfile(["low", "high"]))
             loki.thinking_command("effort high mode adaptive")
@@ -166,7 +169,7 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
             snapshot = loki.capture_turn_settings()
             self.session.credential_authority = loki.authentications.CredentialBroker()
             with tempfile.TemporaryDirectory() as directory:
-                manager = loki.JobManager(directory)
+                manager = job_runtime.JobManager(directory)
                 self.session.job_manager = manager
                 try:
                     export_environment = loki._subagent_env
@@ -191,7 +194,7 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
 
     async def test_answer_only_explore_captures_once_then_reuses_explicit_settings(self):
-        snapshot = loki.TurnThinkingSettings(mode="manual", budget=2048, traces="on")
+        snapshot = model_requests.TurnThinkingSettings(mode="manual", budget=2048, traces="on")
         loop = mock.AsyncMock(return_value="answer")
         with mock.patch.object(loki, "capture_turn_settings", return_value=snapshot) as capture, mock.patch.object(
                 loki, "run_tool_loop_async", loop):

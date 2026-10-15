@@ -14,6 +14,8 @@ from loki_agent.authentications import CredentialRef
 from loki_agent.connections import ConnectionDescriptor, ConnectionDescriptorError
 from loki_agent.credentials import CredentialInventory
 from loki_agent.sessions import Session
+from loki_agent import connections
+from loki_agent import model_requests
 
 
 CAPACITY = usages.ContextCapacity(1000, "configured")
@@ -22,7 +24,7 @@ CAPACITY = usages.ContextCapacity(1000, "configured")
 def config(**overrides):
     values = dict(model="alias", context_capacity=CAPACITY)
     values.update(overrides)
-    return loki.make_runtime_config(
+    return connections.make_runtime_config(
         "https://example.test/v1", protocols.OPENAI_CHAT, **values)
 
 
@@ -169,7 +171,7 @@ class SessionSnapshotTests(unittest.TestCase):
         self.assertEqual(self.session.context_snapshot().text, "unknown")
         self.session.runtime_config = config()
         self.assertEqual(self.session.context_snapshot().text, "37%*")
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://elsewhere.test/v1", protocols.OPENAI_CHAT,
             model="alias", context_capacity=CAPACITY)
         self.assertEqual(self.session.context_snapshot().text, "unknown")
@@ -221,24 +223,24 @@ class CapacityConfigurationTests(unittest.TestCase):
         }
         model = {"id": "alias", "limit": {"context": 3000, "output": 200}}
         credential = CredentialRef.environment("EXAMPLE_KEY")
-        runtime = loki.config_from_modelsdev_selection(
+        runtime = connections.config_from_modelsdev_selection(
             "provider", provider, model, CredentialInventory({}, [credential]))
         self.assertEqual(runtime.context_capacity,
                          usages.ContextCapacity(3000, "models.dev"))
         self.assertEqual(runtime.chat_provider.max_tokens, 4096)
-        overridden = loki.config_from_modelsdev_selection(
+        overridden = connections.config_from_modelsdev_selection(
             "provider", provider, model,
             CredentialInventory({"LOKI_CONTEXT_WINDOW": "1000"}, [credential]))
         self.assertEqual(overridden.context_capacity, CAPACITY)
 
     def test_configured_override_and_descriptor_round_trip(self):
-        descriptor = loki.connection_descriptor_from_config(config())
+        descriptor = connections.connection_descriptor_from_config(config())
         restored = ConnectionDescriptor.from_dict(descriptor.to_dict())
         self.assertEqual(restored.context_capacity, CAPACITY)
         inventory = CredentialInventory({"LOKI_CONTEXT_WINDOW": "2000"})
-        rebuilt = loki.config_from_connection_descriptor(restored, inventory)
+        rebuilt = connections.config_from_connection_descriptor(restored, inventory)
         self.assertEqual(rebuilt.context_capacity.tokens, 2000)
-        changed = loki.config_from_connection_descriptor(
+        changed = connections.config_from_connection_descriptor(
             restored, CredentialInventory({"LOKI_MODEL": "other"}))
         self.assertIsNone(changed.context_capacity)
         for invalid in [0, True, -1, "1000"]:
@@ -251,11 +253,11 @@ class CapacityConfigurationTests(unittest.TestCase):
         values = {"LOKI_API_BASE": "https://example.test/v1",
                   "LOKI_PROVIDER": protocols.OPENAI_CHAT,
                   "LOKI_MODEL": "alias", "LOKI_CONTEXT_WINDOW": "1000"}
-        runtime = loki.build_config_from_env(credentials=CredentialInventory(values))
+        runtime = connections.build_config_from_env(credentials=CredentialInventory(values))
         self.assertEqual(runtime.context_capacity, CAPACITY)
         for invalid in ["0", "-1", "broken", "1.5"]:
             with self.assertRaisesRegex(ValueError, "LOKI_CONTEXT_WINDOW"):
-                loki.build_config_from_env(credentials=CredentialInventory(
+                connections.build_config_from_env(credentials=CredentialInventory(
                     dict(values, LOKI_CONTEXT_WINDOW=invalid)))
         session = Session(runtime_config=runtime)
         with mock.patch.object(loki, "_DEFAULT_SESSION", session):
@@ -287,16 +289,16 @@ class CapacityConfigurationTests(unittest.TestCase):
             credential_ref=CredentialRef.openai_subscription(),
             openai_request_profile=models.openai_request_profile(provider, model),
             context_capacity=usages.ContextCapacity(500, "openai-subscription"))
-        self.assertEqual(loki.reconcile_connection_descriptor(
+        self.assertEqual(connections.reconcile_connection_descriptor(
             descriptor, catalog).context_capacity, capacity)
-        self.assertEqual(loki.reconcile_connection_descriptor(
+        self.assertEqual(connections.reconcile_connection_descriptor(
             descriptor, {}).context_capacity.tokens, 500)
         explicit = replace(descriptor, context_capacity=CAPACITY)
-        self.assertEqual(loki.reconcile_connection_descriptor(
+        self.assertEqual(connections.reconcile_connection_descriptor(
             explicit, catalog).context_capacity, CAPACITY)
         entry["context_window"] = "invalid"
         catalog = models.add_openai_subscription_catalog({}, {"models": [entry]})
-        self.assertIsNone(loki.reconcile_connection_descriptor(
+        self.assertIsNone(connections.reconcile_connection_descriptor(
             descriptor, catalog).context_capacity)
 
 
@@ -326,7 +328,7 @@ class PresentationTests(unittest.TestCase):
         ]
         with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                 mock.patch.object(loki, "save_chat_log"), \
-                mock.patch.object(loki, "async_provider_request",
+                mock.patch.object(model_requests, 'async_provider_request',
                                   new=mock.AsyncMock(side_effect=responses)):
             asyncio.run(worker._run_turn(lambda event: None, None))
         updates = [m["params"]["update"] for m in messages]
@@ -360,7 +362,7 @@ class PresentationTests(unittest.TestCase):
     def test_cancelled_or_failed_exchange_cannot_publish_new_usage(self):
         from loki_agent.acp_worker import Worker
 
-        for error in (loki.StreamCancelled(), OSError("offline")):
+        for error in (model_requests.StreamCancelled(), OSError("offline")):
             with self.subTest(error=type(error).__name__):
                 session = Session(runtime_config=config())
                 session.transcript_items.append(response(session))

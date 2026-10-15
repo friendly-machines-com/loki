@@ -9,6 +9,7 @@ import os
 import sys
 from dataclasses import dataclass
 
+from . import connections, model_requests, paths, tool_contracts
 from . import (
     acp_commands,
     acps,
@@ -38,7 +39,7 @@ class PendingSessionOpen:
     the client accepted the exact effective connection.
     """
 
-    runtime_config: loki.RuntimeConfig | None
+    runtime_config: connections.RuntimeConfig | None
     connection_update: object
     open_method: str
 
@@ -116,7 +117,7 @@ class Worker:
 
     async def _answer(
             self, message: dict,
-            thinking: loki.TurnThinkingSettings | None = None):
+            thinking: model_requests.TurnThinkingSettings | None = None):
         request_id = message.get("id")
         try:
             result = await self.dispatch(
@@ -140,7 +141,7 @@ class Worker:
 
     async def dispatch(
             self, method: str, params: dict,
-            thinking: loki.TurnThinkingSettings | None = None):
+            thinking: model_requests.TurnThinkingSettings | None = None):
         if method == "session/prompt":
             return await self.prompt(
                 params,
@@ -186,12 +187,12 @@ class Worker:
         if leaf is _DISCONNECTED:
             return {}
         if isinstance(leaf, modelsdev.ExplicitConnectionOption):
-            config = loki.build_config_from_env(credentials=loki.CREDENTIALS)
+            config = connections.build_config_from_env(credentials=loki.CREDENTIALS)
         elif isinstance(leaf, ConnectionDescriptor):
-            config = loki.config_from_connection_descriptor(leaf, loki.CREDENTIALS)
+            config = connections.config_from_connection_descriptor(leaf, loki.CREDENTIALS)
         else:
             provider_id, provider_entry, model_entry = leaf
-            config = loki.config_from_modelsdev_selection(
+            config = connections.config_from_modelsdev_selection(
                 provider_id, provider_entry, model_entry, loki.CREDENTIALS)
         if config.auth_spec is None:
             return {}
@@ -285,7 +286,7 @@ class Worker:
 
     @staticmethod
     def _explicit_choice():
-        explicit = loki.explicit_connection_option(loki.CREDENTIALS)
+        explicit = connections.explicit_connection_option(loki.CREDENTIALS)
         if explicit is None:
             return None
         option = {
@@ -344,7 +345,7 @@ class Worker:
         explicit = self._explicit_choice()
         choices = []
 
-        if explicit is not None and loki.explicit_api_base_configured(
+        if explicit is not None and connections.explicit_api_base_configured(
                 loki.CREDENTIALS):
             choices.append(explicit)
             self._set_choices(choices, "loki-explicit")
@@ -352,7 +353,7 @@ class Worker:
 
         if saved_descriptor is not None:
             try:
-                config = loki.config_from_connection_descriptor(
+                config = connections.config_from_connection_descriptor(
                     saved_descriptor, loki.CREDENTIALS)
                 loki.apply_runtime_config(config)
                 choices.append(self._saved_choice(saved_descriptor))
@@ -373,7 +374,7 @@ class Worker:
             self._set_choices(choices, "loki-explicit")
             return
 
-        if (loki.explicit_api_base_configured(loki.CREDENTIALS)
+        if (connections.explicit_api_base_configured(loki.CREDENTIALS)
                 and not self._configuration_error):
             self._configuration_error = (
                 "The explicit LOKI_* connection is incomplete; set "
@@ -423,7 +424,7 @@ class Worker:
                     code=acps.INVALID_PARAMS,
                 )
             path = os.path.join(
-                loki.chat_log_dir_for(cwd),
+                paths.chat_log_dir_for(cwd),
                 loki.chat_log_filename(session_id))
             if not os.path.isfile(path):
                 raise acps.TransportError(
@@ -462,7 +463,7 @@ class Worker:
             self.session.shell_cwd = cwd
             try:
                 loki.new_chat_log(os.path.join(
-                    loki.chat_log_dir_for(cwd),
+                    paths.chat_log_dir_for(cwd),
                     loki.chat_log_filename(session_id),
                 ))
             except OSError as error:
@@ -480,7 +481,7 @@ class Worker:
 
         # Await discovery so a resumed subscription uses fresh exact-slug
         # request data before any config choice or prompt becomes available.
-        explicit = loki.explicit_connection_option(loki.CREDENTIALS)
+        explicit = connections.explicit_connection_option(loki.CREDENTIALS)
         catalog = {}
         discovered = []
         try:
@@ -503,7 +504,7 @@ class Worker:
         if saved_descriptor is not None:
             original_descriptor = saved_descriptor
             try:
-                saved_descriptor = loki.reconcile_connection_descriptor(
+                saved_descriptor = connections.reconcile_connection_descriptor(
                     saved_descriptor, catalog)
             except ValueError as error:
                 self._configuration_error = (
@@ -522,7 +523,7 @@ class Worker:
         if (self._current_option_value == "loki-saved"
                 and runtime_config is not None):
             authorization_descriptor = (
-                loki.connection_descriptor_from_config(runtime_config))
+                connections.connection_descriptor_from_config(runtime_config))
         # Preparation must not leave a network-capable session reachable.
         # The front holds the only commit authority after user approval.
         self.session.runtime_config = None
@@ -637,16 +638,16 @@ class Worker:
             self.session.session_state.pop("connection", None)
             loki.mark_chat_log_dirty()
         elif isinstance(leaf, modelsdev.ExplicitConnectionOption):
-            loki.apply_runtime_config(loki.build_config_from_env(
+            loki.apply_runtime_config(connections.build_config_from_env(
                 credentials=loki.CREDENTIALS))
         elif isinstance(leaf, ConnectionDescriptor):
             loki.apply_runtime_config(
-                loki.config_from_connection_descriptor(
+                connections.config_from_connection_descriptor(
                     leaf, loki.CREDENTIALS))
         else:
             provider_id, provider_entry, model_entry = leaf
             loki.apply_runtime_config(
-                loki.config_from_modelsdev_selection(
+                connections.config_from_modelsdev_selection(
                     provider_id, provider_entry, model_entry,
                     loki.CREDENTIALS))
 
@@ -747,7 +748,7 @@ class Worker:
         """
         if self.can_ask_user:
             return loki.TOOLS, None
-        return loki.without_ask_tool(loki.TOOLS), loki.ASK_TOOL_NAME
+        return tool_contracts.without_ask_tool(loki.TOOLS), tool_contracts.ASK_TOOL_NAME
 
     async def _ask_user(self, question: str, options: list, *,
                         multi_select: bool = False) -> dict:
@@ -844,7 +845,7 @@ class Worker:
 
     async def prompt(
             self, params: dict,
-            thinking: loki.TurnThinkingSettings | None = None) -> dict:
+            thinking: model_requests.TurnThinkingSettings | None = None) -> dict:
         task = asyncio.current_task()
         scheduled = self._prompt_task is task
         if not scheduled:

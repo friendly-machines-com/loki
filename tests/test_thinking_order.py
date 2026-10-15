@@ -11,13 +11,14 @@ from unittest import mock
 
 from loki_agent import loki, models as modelsdev, protocols
 from loki_agent.sessions import Session
+from loki_agent import connections
 
 
 def fresh_session(model="claude-opus-4-5", url="https://api.anthropic.com/v1",
                   kind=protocols.ANTHROPIC_MESSAGES, provider_id="anthropic",
                   effort=True):
     session = Session()
-    session.runtime_config = loki.make_runtime_config(
+    session.runtime_config = connections.make_runtime_config(
         url, kind, model=model, provider_id=provider_id,
         reasoning_effort_profile=(
             modelsdev.ReasoningEffortProfile(["low", "medium", "high"])

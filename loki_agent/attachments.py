@@ -14,8 +14,6 @@ import shlex
 import stat
 from dataclasses import dataclass
 
-from .loki import current_cwd, display_path
-
 
 IMAGE_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
 
@@ -78,7 +76,9 @@ def load_image_attachment(path_text: str, *,
 
     path = path_text
     if not os.path.isabs(path):
-        path = os.path.join(base_dir or current_cwd(), path)
+        if base_dir is None:
+            raise ImageAttachmentError("a relative image path needs a working directory")
+        path = os.path.join(base_dir, path)
 
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
@@ -89,7 +89,7 @@ def load_image_attachment(path_text: str, *,
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
             raise ImageAttachmentError(
-                f"not a regular file: {display_path(path)}")
+                f"not a regular file: {path}")
         if file_stat.st_size > limit:
             raise ImageAttachmentError(
                 f"image is {file_stat.st_size} bytes; maximum is "
@@ -102,7 +102,7 @@ def load_image_attachment(path_text: str, *,
     except (OSError, ValueError) as error:
         detail = getattr(error, "strerror", None) or str(error)
         raise ImageAttachmentError(
-            f"cannot read {display_path(path)}: {detail}") from error
+            f"cannot read {path}: {detail}") from error
     finally:
         if fd is not None:
             os.close(fd)

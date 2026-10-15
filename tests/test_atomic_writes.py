@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_agent import loki
+from loki_agent import files as file_operations
 
 
 class AtomicWritePermissionTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
                 return sddl.split('D:', 1)[-1].replace('AI', '')
 
             before = windows_api.dacl_sddl(str(self.target))
-            loki._atomic_write_text(str(self.target), 'new contents')
+            file_operations.atomic_write_text(str(self.target), 'new contents')
             self.assertEqual(self.target.read_text(), 'new contents')
             self.assertEqual(aces(windows_api.dacl_sddl(str(self.target))),
                              aces(before))
@@ -50,7 +50,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
         with mock.patch.object(os, 'fchmod', side_effect=set_mode) as fchmod, \
                 mock.patch.object(os, 'chmod', side_effect=AssertionError(
                     'pathname chmod must not run')):
-            loki._atomic_write_text(str(self.target), content)
+            file_operations.atomic_write_text(str(self.target), content)
         fchmod.assert_called_once()
         self.assertEqual(self.target.read_text(), content)
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), self.mode)
@@ -62,7 +62,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
             # one that denies the user.
             from loki_agent import windows_api
             new_file = self.root / 'new-file'
-            loki._atomic_write_text(str(new_file), 'new')
+            file_operations.atomic_write_text(str(new_file), 'new')
             self.assertEqual(new_file.read_text(), 'new')
             self.assertIsNotNone(windows_api.dacl_sddl(str(new_file)))
             self.assertEqual(set(self.root.iterdir()), {self.target, new_file})
@@ -71,11 +71,11 @@ class AtomicWritePermissionTests(unittest.TestCase):
         with mock.patch.object(os, 'fchmod', wraps=os.fchmod) as fchmod, \
                 mock.patch.object(os, 'chmod', side_effect=AssertionError(
                     'pathname chmod must not run')):
-            loki._atomic_write_text(str(new_file), 'new')
+            file_operations.atomic_write_text(str(new_file), 'new')
         fchmod.assert_called_once()
-        self.assertEqual(fchmod.call_args.args[1], 0o666 & ~loki._UMASK)
+        self.assertEqual(fchmod.call_args.args[1], 0o666 & ~file_operations._UMASK)
         self.assertEqual(stat.S_IMODE(new_file.stat().st_mode),
-                         0o666 & ~loki._UMASK)
+                         0o666 & ~file_operations._UMASK)
 
     def test_replaced_temporary_name_cannot_redirect_fchmod(self):
         if os.name != "posix":
@@ -84,7 +84,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
             # is applied through the open handle, so assert that call instead.
             from loki_agent import windows_api
             with mock.patch.object(windows_api, 'set_named_dacl') as apply:
-                loki._atomic_write_text(str(self.target), 'new')
+                file_operations.atomic_write_text(str(self.target), 'new')
             apply.assert_called_once()
             self.assertEqual(self.target.read_text(), 'new')
             self.assertEqual(set(self.root.iterdir()), {self.target})
@@ -131,7 +131,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
                 mock.patch.object(private_files, 'replace_at',
                                   side_effect=OSError('stop before publication')):
             with self.assertRaisesRegex(OSError, 'stop before publication'):
-                loki._atomic_write_text(str(self.target), 'new')
+                file_operations.atomic_write_text(str(self.target), 'new')
 
         self.assertEqual(unrelated.read_text(), 'untouched')
         self.assertEqual(stat.S_IMODE(unrelated.stat().st_mode), 0o600)
@@ -146,7 +146,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
             with mock.patch.object(windows_api, 'set_named_dacl',
                                    side_effect=PermissionError('mode denied')):
                 with self.assertRaisesRegex(PermissionError, 'mode denied'):
-                    loki._atomic_write_text(str(self.target), 'new')
+                    file_operations.atomic_write_text(str(self.target), 'new')
             self.assertEqual(self.target.read_text(), 'old')
             self.assertEqual(set(self.root.iterdir()), {self.target})
             return
@@ -154,7 +154,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
                                side_effect=PermissionError('mode denied')), \
                 mock.patch.object(os, 'chmod') as chmod:
             with self.assertRaisesRegex(PermissionError, 'mode denied'):
-                loki._atomic_write_text(str(self.target), 'new')
+                file_operations.atomic_write_text(str(self.target), 'new')
         chmod.assert_not_called()
         self.assertEqual(self.target.read_text(), 'old')
         self.assertEqual(set(self.root.iterdir()), {self.target})
@@ -165,7 +165,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
             # file carries the inherited default DACL.
             from loki_agent import windows_api
             new_file = self.root / 'new-file'
-            loki._atomic_write_text(str(new_file), 'new')
+            file_operations.atomic_write_text(str(new_file), 'new')
             self.assertEqual(new_file.read_text(), 'new')
             self.assertIsNotNone(windows_api.dacl_sddl(str(new_file)))
             self.assertEqual(set(self.root.iterdir()), {self.target, new_file})
@@ -173,7 +173,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
         real_chmod = os.chmod
         with mock.patch.object(os, 'fchmod', None, create=True), \
                 mock.patch.object(os, 'chmod', wraps=real_chmod) as chmod:
-            loki._atomic_write_text(str(self.target), 'new')
+            file_operations.atomic_write_text(str(self.target), 'new')
         chmod.assert_called_once()
         temporary_path, mode = chmod.call_args.args
         self.assertEqual(Path(temporary_path).parent, self.root)
@@ -192,7 +192,7 @@ class AtomicWritePermissionTests(unittest.TestCase):
             with mock.patch.object(windows_api, 'dacl_sddl',
                                    side_effect=failure):
                 with self.assertRaises(windows_api.WindowsApiError):
-                    loki._atomic_write_text(str(self.target), 'new')
+                    file_operations.atomic_write_text(str(self.target), 'new')
             self.assertEqual(self.target.read_text(), 'old')
             self.assertEqual(set(self.root.iterdir()), {self.target})
             return
@@ -200,6 +200,6 @@ class AtomicWritePermissionTests(unittest.TestCase):
                 mock.patch.object(os, 'chmod',
                                   side_effect=PermissionError('mode denied')):
             with self.assertRaisesRegex(PermissionError, 'mode denied'):
-                loki._atomic_write_text(str(self.target), 'new')
+                file_operations.atomic_write_text(str(self.target), 'new')
         self.assertEqual(self.target.read_text(), 'old')
         self.assertEqual(set(self.root.iterdir()), {self.target})

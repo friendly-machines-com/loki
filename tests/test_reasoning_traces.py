@@ -8,6 +8,8 @@ from unittest import mock
 
 from loki_agent import formats, loki, protocols, replays, savefiles, sse
 from loki_agent.sessions import Session
+from loki_agent import connections
+from loki_agent import model_requests
 
 
 def feed(accumulator, data):
@@ -172,7 +174,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         result = await loki.run_tool_loop_async(
             transcript, chat_fn=chat, stream_chat=True, on_event=events.append,
-            thinking=loki.TurnThinkingSettings(traces="on"))
+            thinking=model_requests.TurnThinkingSettings(traces="on"))
         self.assertEqual(result, "answer")
         self.assertEqual("".join(event["text"] for event in events if event["type"] == "reasoning_delta"), "thought")
         self.assertEqual([event["content"] for event in events if event["type"] == "assistant_delta"], ["answer"])
@@ -189,7 +191,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
             return chat_turn("thought", "ab")
 
         await loki.run_tool_loop_async([], chat_fn=chat, stream_chat=True, on_event=events.append,
-                                       thinking=loki.TurnThinkingSettings(traces="on"))
+                                       thinking=model_requests.TurnThinkingSettings(traces="on"))
         self.assertEqual([event["type"] for event in events], [
             "assistant_start", "assistant_delta", "assistant_end", "reasoning_start", "reasoning_delta",
             "reasoning_end", "assistant_start", "assistant_delta", "assistant_end"])
@@ -207,14 +209,14 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
             events = []
             result = await loki.run_tool_loop_async(
                 [], chat_fn=chat, on_event=events.append,
-                thinking=loki.TurnThinkingSettings(traces=visibility))
+                thinking=model_requests.TurnThinkingSettings(traces=visibility))
             self.assertEqual(result, "before\nafter")
             visible = [event.get("content", event.get("text")) for event in events
                        if event["type"] in ["assistant_message", "reasoning_delta"]]
             self.assertEqual(visible, ["before", "middle", "after"] if visibility == "on" else ["before\nafter"])
 
     async def test_partial_thinking_closes_without_persisting_transport_fragments(self):
-        for exception in (loki.StreamCancelled(), protocols.StreamProtocolError("broken"), asyncio.CancelledError()):
+        for exception in (model_requests.StreamCancelled(), protocols.StreamProtocolError("broken"), asyncio.CancelledError()):
             events, transcript = [], []
 
             async def chat(items, on_text_delta, *, codex_turn_state, on_reasoning_delta):
@@ -223,7 +225,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             operation = loki.run_tool_loop_async(
                 transcript, chat_fn=chat, stream_chat=True, on_event=events.append,
-                thinking=loki.TurnThinkingSettings(traces="on"))
+                thinking=model_requests.TurnThinkingSettings(traces="on"))
             if isinstance(exception, asyncio.CancelledError):
                 with self.assertRaises(asyncio.CancelledError):
                     await operation
@@ -233,7 +235,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(next(event for event in events if event["type"] == "reasoning_end")["complete"])
 
     async def test_late_stream_alias_has_same_saved_replay(self):
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://gateway.example/v1", protocols.OPENAI_CHAT, model="exact", stream=True)
         self.session.reasoning_traces = "on"
 
@@ -245,10 +247,10 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         @contextlib.asynccontextmanager
         async def stream(method, url, **kwargs):
-            yield loki.http_client.HttpStreamResponse(url, 200, "OK", {"content-type": "text/event-stream"}, body())
+            yield model_requests.http_client.HttpStreamResponse(url, 200, "OK", {"content-type": "text/event-stream"}, body())
 
         events = []
-        with mock.patch.object(loki.http_client, "async_http_stream", stream):
+        with mock.patch.object(model_requests.http_client, "async_http_stream", stream):
             await loki.run_tool_loop_async(self.session.transcript_items, stream_chat=True, on_event=events.append)
         self.assertEqual("".join(event["text"] for event in events if event["type"] == "reasoning_delta"), "visible")
         self.assertEqual(formats.reasoning_field(self.session.transcript_items[0]), "reasoning")
@@ -259,7 +261,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(native["reasoning_content"], "alias")
 
     async def test_no_retry_after_thought_output(self):
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://api.openai.com/v1", protocols.OPENAI_RESPONSES, model="gpt-5", stream=True)
 
         async def failed_request(*args, **kwargs):
@@ -267,7 +269,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
             raise protocols.ResponseApiError("retryable", retryable=True)
 
         once = mock.AsyncMock(side_effect=failed_request)
-        with mock.patch.object(loki, "_async_chat_stream_request_once", once):
+        with mock.patch.object(model_requests, '_async_chat_stream_request_once', once):
             with self.assertRaises(protocols.ResponseApiError):
                 await loki.async_chat_stream_request(
                     self.session.runtime_config.chat_provider.chat_url, {}, on_reasoning_delta=lambda *args: None)

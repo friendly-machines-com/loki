@@ -13,6 +13,7 @@ from loki_agent import formats
 from loki_agent import loki
 from loki_agent import terminal_frontend
 from loki_agent import terminals
+from loki_agent import connections
 
 
 BOLD = "\033[1m"
@@ -466,7 +467,7 @@ class TerminalWiringTests(unittest.TestCase):
         self._old_config = loki.current_session().runtime_config
         # The tool loop consults the real provider interface for thinking
         # settings; a fake config object no longer matches it.
-        loki.current_session().runtime_config = loki.make_runtime_config(
+        loki.current_session().runtime_config = connections.make_runtime_config(
             "dummy://local", loki.protocols.DUMMY, model="local-model")
         terminal_frontend.terminal.assistant_markdown.reset()
 
@@ -739,7 +740,7 @@ class ToolLoopWiringTests(unittest.TestCase):
         self._old_config = loki.current_session().runtime_config
         # The tool loop consults the real provider interface for thinking
         # settings; a fake config object no longer matches it.
-        loki.current_session().runtime_config = loki.make_runtime_config(
+        loki.current_session().runtime_config = connections.make_runtime_config(
             "dummy://local", loki.protocols.DUMMY, model="local-model")
         terminal_frontend.terminal.assistant_markdown.reset()
 

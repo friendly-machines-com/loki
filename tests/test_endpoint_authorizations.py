@@ -10,6 +10,7 @@ from loki_agent import authentications as auth
 from loki_agent import credential_capabilities as capabilities
 from loki_agent import credential_storages, file_locks, private_files
 from loki_agent.credential_errors import CredentialStorageError
+from loki_agent import connections
 
 
 URL = "https://example.test/v1/responses?version=1"
@@ -206,6 +207,27 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
             await server.close()
 
+    async def test_approval_commit_guard_cannot_be_forwarded_through_a_relay(self):
+        server, endpoint = await capabilities.CredentialCapabilityServer.create(
+            self.broker, {self.reference}, manage_approvals=True)
+        client = relay = child = None
+        try:
+            client = await capabilities.CredentialClient.from_fd(endpoint)
+            relay, child_endpoint = await capabilities.CredentialCapabilityServer.create(
+                client, {self.reference}, manage_approvals=True)
+            child = await capabilities.CredentialClient.from_fd(child_endpoint)
+            # The upstream channel can record approvals, but a relay cannot
+            # forward the local lifetime check required at the durable commit.
+            with self.assertRaisesRegex(
+                    capabilities.CapabilityError, "approval changes are not available"):
+                await child.approve_destinations(self.reference, [URL])
+            self.assertEqual(await client.unapproved_destinations(self.reference, [URL]), [URL])
+            self.assertEqual(self.storage.approved_destinations(self.reference), frozenset())
+        finally:
+            for peer in [child, relay, client, server]:
+                if peer is not None:
+                    await peer.close()
+
     async def test_cancelled_channel_record_does_not_publish(self):
         held = asyncio.Event()
         release = asyncio.Event()
@@ -254,13 +276,13 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_catalog_confirmation_uses_effective_full_request_urls(self):
         import contextlib
         import io
-        from loki_agent import models, loki
+        from loki_agent import models
         from loki_agent.credentials import CredentialStore
         credentials = CredentialStore({"EXAMPLE_API_KEY": "sample-value"})
         provider = {"id": "example", "api": "https://api.deepseek.com/anthropic",
                     "npm": "@ai-sdk/anthropic", "env": ["EXAMPLE_API_KEY"]}
         model = {"id": "sample"}
-        config = loki.config_from_modelsdev_selection("example", provider, model, credentials)
+        config = connections.config_from_modelsdev_selection("example", provider, model, credentials)
         targets = config.credential_destinations()
         answer = mock.AsyncMock(return_value="yes")
         with contextlib.redirect_stdout(io.StringIO()) as output:

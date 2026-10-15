@@ -27,6 +27,8 @@ from loki_agent import (
     models,
 )
 from loki_agent.credentials import CredentialStore, is_credential_name
+from loki_agent import connections, paths as app_paths
+from loki_agent import jobs as job_runtime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1233,7 +1235,7 @@ def _historical_chunks(messages, session_id):
 class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     async def test_saved_session_list_load_resume_durable_journey(self):
         import datetime
-        from loki_agent import formats, loki
+        from loki_agent import formats
 
         with tempfile.TemporaryDirectory() as root:
             workspace = _configured_workspace(root)
@@ -1256,7 +1258,7 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                 "sessionId": session_id, "prompt": [{"type": "text", "text": "first prompt"}]})
             self.assertEqual(result["stopReason"], "end_turn")
             await self._finish(front, diagnostics, session_id)
-            path = os.path.join(loki.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
 
             def read_saved(turns):
                 with open(path, encoding="utf-8") as stream:
@@ -1313,7 +1315,7 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
 
 class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     async def test_provisional_approval_rejection_close_and_eof_over_real_pipes(self):
-        from loki_agent import loki, protocols
+        from loki_agent import protocols
         from loki_agent.connections import ConnectionDescriptor
 
         with tempfile.TemporaryDirectory() as root:
@@ -1335,7 +1337,7 @@ class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase
                 'sessionId': session_id,
                 'prompt': [{'type': 'text', 'text': 'seed conversation'}]})
             await self._finish(front, diagnostics, session_id)
-            path = os.path.join(loki.chat_log_dir_for(workspace), f'chat-{session_id}.json')
+            path = os.path.join(app_paths.chat_log_dir_for(workspace), f'chat-{session_id}.json')
             with open(path, encoding='utf-8') as stream:
                 saved = json.load(stream)
             saved['session_state']['connection'] = ConnectionDescriptor(
@@ -1490,7 +1492,6 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
         return blob
 
     async def test_shipped_front_real_tool_updates_save_and_close(self):
-        from loki_agent import loki
 
         with tempfile.TemporaryDirectory() as root:
             workspace, payload, command, result = _tool_fixture(root)
@@ -1523,7 +1524,7 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
             with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
                 self.assertEqual(stream.read(), payload)
             await self._finish(front, diagnostics, session_id)
-            path = os.path.join(loki.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
             self._saved_tool_turn(path, session_id, "Run the real file proof",
                                   "dummy-tool-call", args, result, ["Tool complete."])
 
@@ -1552,7 +1553,7 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
             stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
             stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(root, "jobs")))
             stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
-            loki.apply_runtime_config(loki.build_config_from_env(credentials=credentials))
+            loki.apply_runtime_config(connections.build_config_from_env(credentials=credentials))
             messages = []
             session_id = "tool-workflow"
             worker = Worker(session, messages.append, session_id)
@@ -1753,7 +1754,6 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
 
     async def test_shipped_commands_snapshot_bang_two_turns_and_close(self):
         import socket
-        from loki_agent import loki
         with tempfile.TemporaryDirectory() as root:
             workspace, destination, payload, png, command, output, model_text, image, env = _command_fixture(root)
             _store, status_path, status_bytes = await _command_status(env)
@@ -1778,7 +1778,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
             self.assertEqual(advertised["params"]["sessionId"], session_id)
             self.assertEqual(advertised["params"]["update"]["sessionUpdate"], "available_commands_update")
             self._advertisement(advertised["params"]["update"]["availableCommands"])
-            path = os.path.join(loki.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
 
             async def prompt(request_id, text):
                 reply, messages = await self._request(front, request_id, "session/prompt", {
@@ -1832,7 +1832,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
             stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
             stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
             stack.enter_context(mock.patch.object(acp.runtime_isolation, "close_runtime_process", new=lambda process: None))
-            loki.apply_runtime_config(loki.build_config_from_env(credentials=loki.CREDENTIALS))
+            loki.apply_runtime_config(connections.build_config_from_env(credentials=loki.CREDENTIALS))
             messages = []
             requests = []
             session_id = "local-commands"
@@ -2184,7 +2184,6 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bang_cancellation_reaps_command_without_requesting_inference(self):
         import shlex
-        from loki_agent import loki
         from process_lifecycle_fixtures import ProcessResources
         messages = []
         completion = mock.AsyncMock(side_effect=AssertionError("cancelled bang requested inference"))
@@ -2205,7 +2204,7 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         job = next(iter(manager.jobs.values()), None) if manager is not None else None
                         if job is not None and job.process is not None:
                             self.assertIsNone(job.process.returncode)
-                            if "bang-ready" in loki._read_spool_tail(job.stdout_path):
+                            if "bang-ready" in job_runtime._read_spool_tail(job.stdout_path):
                                 break
                         if asyncio.get_running_loop().time() >= deadline:
                             self.fail("bang command did not become ready")
@@ -2229,8 +2228,8 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     if resources is not None:
                         if job.process.returncode is None:
-                            loki.host_process.signal_group(
-                                job.process, job.pgid, loki.host_process.FORCE)
+                            job_runtime.host_process.signal_group(
+                                job.process, job.pgid, job_runtime.host_process.FORCE)
                             await asyncio.wait_for(job.process.wait(), 3)
                         await resources.cleanup()
                     if not active.done():
@@ -2301,8 +2300,8 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                         loki._DEFAULT_SESSION = session
                         # Match the worker entrypoint's explicit startup config;
                         # prepare_open itself deliberately does not invent it.
-                        if loki.explicit_connection_option(loki.CREDENTIALS):
-                            loki.apply_runtime_config(loki.build_config_from_env(
+                        if connections.explicit_connection_option(loki.CREDENTIALS):
+                            loki.apply_runtime_config(connections.build_config_from_env(
                                 credentials=loki.CREDENTIALS))
 
                         def before_request(message):
@@ -2602,7 +2601,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                     "name": "Plain model",
                 }
                 loki.apply_runtime_config(
-                    loki.config_from_modelsdev_selection(
+                    connections.config_from_modelsdev_selection(
                         "openrouter",
                         provider,
                         high_model,
@@ -2715,7 +2714,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
                 stream.write('real tool continuation')
             session = Session(shell_cwd=directory)
             session.chat_log_path = os.path.join(directory, 'chat.json')
-            session.runtime_config = loki.make_runtime_config(
+            session.runtime_config = connections.make_runtime_config(
                 'https://api.openai.com/v1/responses',
                 protocols.OPENAI_RESPONSES, model='gpt-test',
                 provider_id='openai',
@@ -2902,7 +2901,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 saved_cwd = os.path.join(tmpdir, "saved-cwd")
                 requested_cwd = os.path.join(tmpdir, "requested-cwd")
                 # The saved log lives in the workspace the client names.
-                chat_dir = loki.chat_log_dir_for(requested_cwd)
+                chat_dir = app_paths.chat_log_dir_for(requested_cwd)
                 os.mkdir(saved_cwd)
                 os.mkdir(requested_cwd)
                 os.makedirs(chat_dir)
@@ -3213,7 +3212,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 os.symlink(saved_cwd, client_cwd)
                 # The saved log lives in the workspace the client names -- here
                 # a symlink to the saved directory.
-                chat_dir = loki.chat_log_dir_for(client_cwd)
+                chat_dir = app_paths.chat_log_dir_for(client_cwd)
                 os.makedirs(chat_dir)
                 descriptor = ConnectionDescriptor(
                     provider_id="saved-provider",
@@ -3312,7 +3311,7 @@ class WorkerSessionContractTests(unittest.TestCase):
                 # Session paths are stored through os.path.realpath; compare
                 # resolved directories, or a differently-spelled temp path
                 # (Windows short names) fails on spelling alone.
-                log_dir = os.path.realpath(loki.chat_log_dir_for(tmpdir))
+                log_dir = os.path.realpath(app_paths.chat_log_dir_for(tmpdir))
                 self.assertTrue(all(
                     os.path.realpath(os.path.dirname(path)) == log_dir
                     for path in paths))
@@ -3752,7 +3751,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
                     # journey; no worker credential-IPC claim is made here.
                     session.credential_authority = f.front.credential_broker
                     loki._DEFAULT_SESSION = session
-                    loki.apply_runtime_config(loki.build_config_from_env(credentials=loki.CREDENTIALS))
+                    loki.apply_runtime_config(connections.build_config_from_env(credentials=loki.CREDENTIALS))
 
                     def before_request(message):
                         if message['method'] == 'session/describe_config_selection':

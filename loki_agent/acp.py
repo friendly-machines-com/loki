@@ -24,6 +24,7 @@ from . import (
     authentications,
     runtime_isolation,
     savefiles,
+    paths,
 )
 from .connections import (
     ConnectionDescriptor,
@@ -35,18 +36,20 @@ from .credentials import CredentialStore
 # definition; the front validates against the same values instead of
 # restating them. Model-authored questions are rendered by the client,
 # so the caps exist to bound what the front will carry at all.
-from .loki import (
+from .tool_contracts import (
     ASK_MAX_DESCRIPTION_CHARS,
     ASK_MAX_LABEL_CHARS,
     ASK_MAX_OPTIONS,
     ASK_MAX_QUESTION_CHARS,
     ASK_MIN_OPTIONS,
-    CHAT_LOG_DIR,
-    chat_log_dir_for,
 )
+from .paths import chat_log_dir_for
 from .runtime_isolation import RuntimeIsolationError
 
 logger = logging.getLogger(__name__)
+# The front owns the fallback workspace for session discovery; a client-supplied
+# cwd selects a different root without changing this process's startup context.
+CHAT_LOG_DIR = paths.chat_log_dir_for(os.getcwd())
 
 PROTOCOL_VERSION = 1
 AGENT_INFO = {

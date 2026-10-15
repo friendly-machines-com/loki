@@ -39,7 +39,7 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
     if runtime is None:
         return 1
 
-    from . import acps, loki
+    from . import acps, connections, loki
     from .acp_worker import Worker
     from .sessions import Session
 
@@ -53,7 +53,7 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
 
     async def serve():
         try:
-            loki.apply_runtime_config(loki.build_config_from_env(
+            loki.apply_runtime_config(connections.build_config_from_env(
                 credentials=loki.CREDENTIALS))
         except (loki.protocols.ProtocolError, ValueError):
             # No explicit LOKI_* connection. The model is chosen over the

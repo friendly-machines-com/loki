@@ -9,6 +9,7 @@ from unittest import mock
 
 from loki_agent import loki
 from loki_agent.sessions import Session
+from loki_agent import files as file_operations, jobs as job_runtime
 
 
 class GlobTests(unittest.TestCase):
@@ -45,7 +46,7 @@ class GlobTests(unittest.TestCase):
                         # Independent, distinct times make ordering observable.
                         stamp = 1_000_000_000 + index
                         os.utime(path, (stamp, stamp))
-                    manager = loki.JobManager(str(Path(directory) / 'jobs'))
+                    manager = job_runtime.JobManager(str(Path(directory) / 'jobs'))
                     session = Session(shell_cwd=str(workspace),
                                       job_manager=manager)
                     hidden = options.get('hidden', False)
@@ -98,7 +99,7 @@ class GlobTests(unittest.TestCase):
                         return loki._handle_glob(arguments)
 
                     with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
-                            mock.patch.object(loki.executables, 'RIPGREP', 'test-search-program'), \
+                            mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
                             mock.patch.object(manager, 'run_exec', external_search):
                         # Fixture responses exercise option forwarding, ordering
                         # and Read without depending on an installed search tool.
@@ -148,7 +149,7 @@ class GlobTests(unittest.TestCase):
     def test_missing_search_targets_are_checked_by_the_external_program(self):
         with tempfile.TemporaryDirectory() as directory:
             target = str(Path(directory) / 'missing')
-            manager = loki.JobManager(str(Path(directory) / 'jobs'))
+            manager = job_runtime.JobManager(str(Path(directory) / 'jobs'))
             session = Session(shell_cwd=directory, job_manager=manager)
             for name, handler in {'Glob': loki._handle_glob_async,
                                   'Grep': loki._handle_grep_async}.items():
@@ -156,7 +157,7 @@ class GlobTests(unittest.TestCase):
                     execute = mock.AsyncMock(return_value=[
                         mock.Mock(exit_code=2), 'completed', '', 'target unavailable'])
                     with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
-                            mock.patch.object(loki.executables, 'RIPGREP', 'test-search-program'), \
+                            mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
                             mock.patch.object(manager, 'run_exec', execute):
                         result = asyncio.run(handler({'pattern': 'needle', 'path': target}))
                     execute.assert_awaited_once()
@@ -166,7 +167,7 @@ class GlobTests(unittest.TestCase):
 
     def test_cancel_reaches_a_running_search_and_reaps_its_child(self):
         with tempfile.TemporaryDirectory() as directory:
-            manager = loki.JobManager(str(Path(directory) / 'jobs'))
+            manager = job_runtime.JobManager(str(Path(directory) / 'jobs'))
             session = Session(shell_cwd=directory, job_manager=manager)
 
             async def scenario():
@@ -183,7 +184,7 @@ class GlobTests(unittest.TestCase):
                         **kwargs)
 
                 with mock.patch.object(manager, 'run_exec', gated_search), \
-                        mock.patch.object(loki.executables, 'RIPGREP', 'test-search-program'):
+                        mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'):
                     search = asyncio.create_task(loki._handle_glob_async(
                         {'pattern': '*.txt', 'path': directory},
                         {'cancel_event': cancel}))

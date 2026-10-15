@@ -15,6 +15,8 @@ from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 from loki_agent import file_locks
 from loki_agent import http_client, loki, protocols, response_headers
 from loki_agent.sessions import Session
+from loki_agent import connections
+from loki_agent import model_requests
 
 
 class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
@@ -541,7 +543,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.close_server, server)
         port = server.sockets[0].getsockname()[1]
         url = f"http://127.0.0.1:{port}/v1/chat/completions"
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             url, protocols.OPENAI_CHAT, model="test-model"))
         return url
 
@@ -558,8 +560,8 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                     response = (b"HTTP/1.1 200 OK\r\nX-Remaining: 1\r\n"
                                 b"Content-Length: 20\r\n\r\n")
                 url = await self.server([response])
-                with mock.patch.object(loki, "HTTP_RETRY_MAX_ATTEMPTS_LLM", 1):
-                    with self.assertRaises(OSError if stream else loki.ApiError):
+                with mock.patch.object(model_requests, 'HTTP_RETRY_MAX_ATTEMPTS_LLM', 1):
+                    with self.assertRaises(OSError if stream else model_requests.ApiError):
                         if stream:
                             await loki.async_chat_stream_request(url, {})
                         else:
@@ -665,7 +667,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         async def request(method, request_url, **options):
             if method == "POST":
-                loki.apply_runtime_config(loki.make_runtime_config(
+                loki.apply_runtime_config(connections.make_runtime_config(
                     "https://other.example/chat", protocols.OPENAI_CHAT,
                     model="other-model"))
             if options.get("on_response_headers") is not None:

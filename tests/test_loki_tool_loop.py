@@ -36,6 +36,11 @@ from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
 from loki_agent import savefiles
 from loki_agent import terminals
+from loki_agent import connections, tool_contracts
+from loki_agent import files as file_operations
+from loki_agent import jobs as job_runtime
+from loki_agent import model_requests
+from loki_agent import web_tools
 
 
 _MISSING = object()
@@ -516,7 +521,7 @@ class TerminalImageCommandTests(unittest.TestCase):
     def test_job_redraw_observer_is_scoped_to_terminal_input(self):
         for fail in [False, True]:
             with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
-                manager = loki.JobManager(directory)
+                manager = job_runtime.JobManager(directory)
                 previous = mock.Mock()
                 manager.on_change = previous
                 loki.current_session().job_manager = manager
@@ -576,7 +581,7 @@ class ProviderReinstallTests(unittest.TestCase):
     def test_reinstall_does_not_carry_custom_auth_to_new_provider(self):
         saved = save_loki_state(["runtime_config"])
         try:
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://custom.example.test/v1/chat/completions",
                 protocols.OPENAI_CHAT,
                 model="old-model",
@@ -606,7 +611,7 @@ class ProviderReinstallTests(unittest.TestCase):
     def test_reinstall_does_not_invent_credential_for_new_provider(self):
         saved = save_loki_state(["runtime_config"])
         try:
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://old.example.test/v1/responses",
                 protocols.OPENAI_RESPONSES,
                 model="old-model",
@@ -641,7 +646,7 @@ class ProviderReinstallTests(unittest.TestCase):
         old_values = save_loki_state(names)
 
         try:
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://example.test/v1",
                 protocols.OPENAI_CHAT,
                 model="old-model",
@@ -663,7 +668,7 @@ class ProviderReinstallTests(unittest.TestCase):
     def test_reinstall_preserves_request_profile_only_for_same_model(self):
         saved = save_loki_state(["runtime_config"])
         try:
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://chatgpt.com/backend-api/codex/responses",
                 protocols.OPENAI_RESPONSES,
                 model="gpt-5.6-sol",
@@ -695,21 +700,21 @@ class RuntimeConfigTests(unittest.TestCase):
             "chat_log_path",
             "chat_log_dirty",
         ])
-        first = loki.make_runtime_config(
+        first = connections.make_runtime_config(
             "https://api.openai.com/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="first",
             provider_id="openai",
             reasoning_effort_profile=_effort_profile("low", "high"),
         )
-        narrower = loki.make_runtime_config(
+        narrower = connections.make_runtime_config(
             "https://api.openai.com/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="narrower",
             provider_id="openai",
             reasoning_effort_profile=_effort_profile("low", "medium"),
         )
-        unsupported = loki.make_runtime_config(
+        unsupported = connections.make_runtime_config(
             "https://api.openai.com/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="unsupported",
@@ -749,7 +754,7 @@ class RuntimeConfigTests(unittest.TestCase):
             restore_loki_state(saved)
 
     def test_effort_status_shows_only_the_active_value(self):
-        config = loki.make_runtime_config(
+        config = connections.make_runtime_config(
             "https://api.z.ai/api/paas/v4/chat/completions",
             protocols.OPENAI_CHAT, model="model", provider_id="zai",
             reasoning_effort_profile=modelsdev.ReasoningEffortProfile(
@@ -788,7 +793,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 profile.to_dict()),
         })
 
-        config = loki.build_config_from_env(credentials=inventory)
+        config = connections.build_config_from_env(credentials=inventory)
 
         self.assertEqual(config.reasoning_effort_profile, profile)
 
@@ -807,7 +812,7 @@ class RuntimeConfigTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 path = os.path.join(tmpdir, "chat-reasoning.json")
-                loki.apply_runtime_config(loki.make_runtime_config(
+                loki.apply_runtime_config(connections.make_runtime_config(
                     "https://api.openai.com/v1/responses",
                     protocols.OPENAI_RESPONSES,
                     model="gpt-test",
@@ -863,7 +868,7 @@ class RuntimeConfigTests(unittest.TestCase):
         try:
             loki.current_session().session_state = {}
             loki.current_session().chat_log_path = None
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://api.openai.com/v1/responses",
                 protocols.OPENAI_RESPONSES,
                 model="gpt-test",
@@ -908,7 +913,7 @@ class RuntimeConfigTests(unittest.TestCase):
         try:
             loki.current_session().session_state = {}
             loki.current_session().chat_log_path = None
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://api.openai.com/v1/responses",
                 protocols.OPENAI_RESPONSES,
                 model="gpt-test",
@@ -942,7 +947,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 profile.to_dict()),
         }, {credential})
 
-        config = loki.build_config_from_env(credentials=inventory)
+        config = connections.build_config_from_env(credentials=inventory)
 
         self.assertEqual(config.auth_spec.credential, credential)
         self.assertEqual(config.auth_spec.scheme, "openai-subscription")
@@ -963,7 +968,7 @@ class RuntimeConfigTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
                 ValueError, "unavailable credential"):
-            loki.build_config_from_env(credentials=inventory)
+            connections.build_config_from_env(credentials=inventory)
 
     def test_explicit_streaming_is_opt_in_and_validated(self):
         base = {
@@ -972,20 +977,20 @@ class RuntimeConfigTests(unittest.TestCase):
             "LOKI_MODEL": "local-model",
         }
 
-        enabled = loki.build_config_from_env({
+        enabled = connections.build_config_from_env({
             **base, "LOKI_STREAM": "1",
         })
-        disabled = loki.build_config_from_env(base)
+        disabled = connections.build_config_from_env(base)
 
         self.assertTrue(enabled.stream)
         self.assertFalse(disabled.stream)
         with self.assertRaisesRegex(ValueError, "LOKI_STREAM must be"):
-            loki.build_config_from_env({
+            connections.build_config_from_env({
                 **base, "LOKI_STREAM": "sometimes",
             })
 
     def test_dummy_provider_honors_stream_setting(self):
-        config = loki.build_config_from_env({
+        config = connections.build_config_from_env({
             "LOKI_API_BASE": "http://dummy.invalid/v1",
             "LOKI_PROVIDER": "dummy",
             "LOKI_STREAM": "1",
@@ -994,17 +999,17 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(config.stream)
 
     def test_anthropic_prompt_cache_defaults_only_for_anthropic_api(self):
-        direct = loki.build_config_from_env({
+        direct = connections.build_config_from_env({
             "LOKI_API_BASE": "https://api.anthropic.com/v1/messages",
             "LOKI_PROVIDER": "anthropic_messages",
             "LOKI_MODEL": "claude-test",
         })
-        compatible = loki.build_config_from_env({
+        compatible = connections.build_config_from_env({
             "LOKI_API_BASE": "https://compatible.example/v1/messages",
             "LOKI_PROVIDER": "anthropic_messages",
             "LOKI_MODEL": "compatible-test",
         })
-        opted_in = loki.build_config_from_env({
+        opted_in = connections.build_config_from_env({
             "LOKI_API_BASE": "https://compatible.example/v1/messages",
             "LOKI_PROVIDER": "anthropic_messages",
             "LOKI_MODEL": "compatible-test",
@@ -1015,7 +1020,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertFalse(compatible.chat_provider.prompt_cache)
         self.assertTrue(opted_in.chat_provider.prompt_cache)
         with self.assertRaisesRegex(ValueError, "LOKI_PROMPT_CACHE must be"):
-            loki.build_config_from_env({
+            connections.build_config_from_env({
                 "LOKI_API_BASE":
                     "https://compatible.example/v1/messages",
                 "LOKI_PROVIDER": "anthropic_messages",
@@ -1031,7 +1036,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                         ValueError,
                         "API endpoint missing"):
-                    loki.build_config_from_env(env)
+                    connections.build_config_from_env(env)
 
     def test_unrelated_sdk_base_variables_do_not_configure_loki(self):
         for base_name in ["OPENAI_API_BASE", "ANTHROPIC_BASE_URL"]:
@@ -1042,9 +1047,9 @@ class RuntimeConfigTests(unittest.TestCase):
                 }
                 credentials = CredentialStore.capture(env)
                 self.assertFalse(
-                    loki.explicit_api_base_configured(credentials))
+                    connections.explicit_api_base_configured(credentials))
                 with self.assertRaisesRegex(ValueError, "API endpoint missing"):
-                    loki.build_config_from_env(
+                    connections.build_config_from_env(
                         env, credentials=credentials)
 
     def test_custom_connection_does_not_use_generic_credentials(self):
@@ -1056,7 +1061,7 @@ class RuntimeConfigTests(unittest.TestCase):
                         "https://custom.example.test/v1/chat/completions",
                     credential_name: "must-not-be-sent",
                 }
-                config = loki.build_config_from_env(env)
+                config = connections.build_config_from_env(env)
 
                 self.assertIsNone(config.auth_spec)
                 self.assertNotIn(
@@ -1081,12 +1086,12 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
                 ValueError, "missing env:OPENROUTER_API_KEY"):
-            loki.config_from_connection_descriptor(
+            connections.config_from_connection_descriptor(
                 descriptor,
                 CredentialStore({"LOKI_API_KEY": "wrong-provider-key"}),
             )
 
-        config = loki.config_from_connection_descriptor(
+        config = connections.config_from_connection_descriptor(
             descriptor,
             CredentialStore({
                 "OPENROUTER_API_KEY": "right-key",
@@ -1105,7 +1110,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(
             config.chat_provider.provider_id, "openrouter")
 
-        restored = loki.config_from_connection_descriptor(
+        restored = connections.config_from_connection_descriptor(
             descriptor,
             CredentialStore({"OPENROUTER_API_KEY": "right-key"}),
         )
@@ -1114,7 +1119,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(
             restored.reasoning_effort_profile, effort_profile)
 
-        protocol_override = loki.config_from_connection_descriptor(
+        protocol_override = connections.config_from_connection_descriptor(
             descriptor,
             CredentialStore({
                 "OPENROUTER_API_KEY": "right-key",
@@ -1227,7 +1232,7 @@ class RuntimeConfigTests(unittest.TestCase):
 
         with self.assertRaises(
                 authentications.CredentialUnavailable):
-            loki.config_from_connection_descriptor(
+            connections.config_from_connection_descriptor(
                 descriptor,
                 CredentialInventory({}, {credential}),
             )
@@ -1243,9 +1248,9 @@ class RuntimeConfigTests(unittest.TestCase):
             prompt_cache=True,
         )
 
-        restored = loki.config_from_connection_descriptor(
+        restored = connections.config_from_connection_descriptor(
             descriptor, CredentialStore({}))
-        overridden = loki.config_from_connection_descriptor(
+        overridden = connections.config_from_connection_descriptor(
             descriptor, CredentialStore({"LOKI_PROMPT_CACHE": "0"}))
 
         self.assertTrue(restored.chat_provider.prompt_cache)
@@ -1265,7 +1270,7 @@ class ModelLoadingTests(unittest.TestCase):
         restore_loki_state(self.old_values)
 
     def test_provider_model_discovery_does_not_select_a_model(self):
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "https://provider.example.test/v1/chat/completions",
             protocols.OPENAI_CHAT,
             model="",
@@ -1281,7 +1286,7 @@ class ModelLoadingTests(unittest.TestCase):
         }
 
         with mock.patch(
-                "loki_agent.loki.async_provider_request",
+                'loki_agent.model_requests.async_provider_request',
                 new=mock.AsyncMock(
                     return_value=protocols.ProviderResponse(response))):
             loaded_models = asyncio.run(loki.load_models_async())
@@ -1291,13 +1296,13 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(loki.current_config().model, "")
 
     def test_explicit_connection_option_requires_complete_loki_config(self):
-        self.assertIsNone(loki.explicit_connection_option(
+        self.assertIsNone(connections.explicit_connection_option(
             CredentialStore({
                 "LOKI_API_BASE": "http://localhost:8000/v1",
                 "LOKI_PROVIDER": protocols.OPENAI_CHAT,
             })))
 
-        option = loki.explicit_connection_option(CredentialStore({
+        option = connections.explicit_connection_option(CredentialStore({
             "LOKI_API_BASE": "http://localhost:8000/v1",
             "LOKI_PROVIDER": protocols.OPENAI_CHAT,
             "LOKI_MODEL": "private-model",
@@ -1689,7 +1694,7 @@ class ModelLoadingTests(unittest.TestCase):
             catalog_attempts = []
             with tempfile.TemporaryDirectory() as directory:
                 path = os.path.join(directory, "chat-fallback.json")
-                session = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(directory))
+                session = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(directory))
                 session.credential_authority = owner.broker
                 self.addCleanup(lambda: asyncio.run(session.job_manager.close_session_owned()))
 
@@ -1733,7 +1738,7 @@ class ModelLoadingTests(unittest.TestCase):
                 self.assertNotIn("fallback-secret", pathlib.Path(path).read_text())
                 self.assertEqual(catalog_attempts, ["models.dev"])
                 fresh = credential_supervisors.CredentialSupervisor(CredentialStore({"LOKI_API_KEY": "fallback-secret"}))
-                resumed = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(os.path.join(directory, "resumed-jobs")))
+                resumed = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(os.path.join(directory, "resumed-jobs")))
                 resumed.credential_authority = fresh.broker
                 self.addCleanup(lambda: asyncio.run(resumed.job_manager.close_session_owned()))
 
@@ -1901,7 +1906,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
         )
 
     def test_picker_offers_default_then_exact_model_values(self):
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "https://api.openai.com/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="gpt-test",
@@ -1960,7 +1965,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "LOKI_ANTHROPIC_VERSION": "2024-01-01", "LOKI_STREAM": "0"}
         storage = credential_storages.JsonCredentialStorage(str(root / "credentials"))
         owner = credential_supervisors.CredentialSupervisor(CredentialStore(values), storage)
-        session = loki.Session(shell_cwd=str(root), job_manager=loki.JobManager(str(root / "jobs")))
+        session = loki.Session(shell_cwd=str(root), job_manager=job_runtime.JobManager(str(root / "jobs")))
         session.credential_authority = owner.broker
         self.addAsyncCleanup(session.job_manager.close_session_owned)
         requests, prompts, approvals = [], [], []
@@ -2130,7 +2135,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         and modelsdev.provider_access(leaf[1], owner.inventory).api_url == expected_api)}
                     active = loki.current_config()
                     requests_before = len(requests)
-                    proposed = loki.config_from_modelsdev_selection(*worker._option_leaves["chosen"], owner.inventory)
+                    proposed = connections.config_from_modelsdev_selection(*worker._option_leaves["chosen"], owner.inventory)
                     for destination in proposed.credential_destinations():
                         with self.assertRaises(authentications.CredentialUnavailable):
                             await owner.broker.lease(proposed.auth_spec.credential, destination)
@@ -2152,7 +2157,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rendered.count("\nUsable models:\n"), 2 if answers[0].startswith("filter") else 1)
             self.assertEqual(rendered.count("\nUsable providers:\n"), 2 if len(answers) == 5 else 1)
             self.assertEqual(leaf[0], expected_pid)
-            selected = loki.config_from_modelsdev_selection(*leaf, owner.inventory)
+            selected = connections.config_from_modelsdev_selection(*leaf, owner.inventory)
             self.assertEqual(await owner.broker.unapproved_destinations(
                 selected.auth_spec.credential, selected.credential_destinations()), [])
             expected = {**previous, expected_ref: sorted(set(previous.get(expected_ref, []))
@@ -2171,7 +2176,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                    "LOKI_PROVIDER": protocols.ANTHROPIC_MESSAGES, "LOKI_MODEL": "explicit-model"}
             if variant == "custom":
                 env["LOKI_AUTH_HEADER"] = "X-Custom-Key"
-            config = loki.build_config_from_env(env)
+            config = connections.build_config_from_env(env)
             # This component journey authors its launch configuration here;
             # grant those exact targets through the real root authority.
             owner.broker.allow_startup_destinations(
@@ -2210,7 +2215,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             worker = acp_worker.Worker(session, lambda message: None, "selection")
             worker._option_leaves = {"chosen": leaf}
             selection_credentials = CredentialStore({**values, "LOKI_STREAM": "1"}) if variant == "custom" else owner.inventory
-            config = loki.config_from_modelsdev_selection(*leaf, selection_credentials)
+            config = connections.config_from_modelsdev_selection(*leaf, selection_credentials)
             self.assertEqual(await owner.broker.unapproved_destinations(
                 config.auth_spec.credential, config.credential_destinations()), [])
             self.assertEqual(config.model_status, "deprecated")
@@ -2252,7 +2257,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             modelsdev._index_cache = None
             leaf = await pick(["filter openrouter", "1", "1", "yes"], "openrouter",
                               "https://replacement.example/v1", "env:OPENROUTER_API_KEY")
-            loki.apply_runtime_config(loki.config_from_modelsdev_selection(*leaf, owner.inventory))
+            loki.apply_runtime_config(connections.config_from_modelsdev_selection(*leaf, owner.inventory))
             prepare("https://replacement.example/v1/responses", "z-ai/glm-5.2", protocols.OPENAI_RESPONSES,
                     "selected-router-secret", history=True)
             await turn("replace approved endpoint")
@@ -2263,7 +2268,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             # Replace the provider/protocol through another real approved catalog selection.
             leaf = await pick(["filter anthropic", "1", "1", "y"], "anthropic",
                               "https://api.anthropic.com/v1/messages", "env:ANTHROPIC_API_KEY")
-            selected = loki.config_from_modelsdev_selection(*leaf, owner.inventory)
+            selected = connections.config_from_modelsdev_selection(*leaf, owner.inventory)
             loki.reinstall_provider(model=selected.model, url="https://api.anthropic.com",
                                     provider_kind=selected.chat_provider.kind, provider_id="anthropic",
                                     anthropic_version=selected.chat_provider.headers["anthropic-version"],
@@ -2324,7 +2329,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             else:
                 leaf = await pick(["filter GPT Test", "1", "1", "y"], "openai",
                                   "https://api.openai.com/v1", "env:OPENAI_API_KEY")
-                loki.apply_runtime_config(loki.config_from_modelsdev_selection(*leaf, owner.inventory))
+                loki.apply_runtime_config(connections.config_from_modelsdev_selection(*leaf, owner.inventory))
                 self.assertEqual(loki.current_config().chat_provider.provider_name,
                                  "OpenAI Platform API [endpoint supplied by Loki]")
                 self.assertEqual(loki.current_config().chat_provider.models_url, "https://api.openai.com/v1/models")
@@ -2335,7 +2340,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     leaf = await pick(["filter GPT Override", "1", "1", "yes"], "openai",
                                       "https://normalized-effective.example/v1", "env:OPENAI_API_KEY")
                     self.assertEqual(leaf[2]["id"], "gpt-override")
-                    loki.apply_runtime_config(loki.config_from_modelsdev_selection(*leaf, owner.inventory))
+                    loki.apply_runtime_config(connections.config_from_modelsdev_selection(*leaf, owner.inventory))
                     prepare("https://normalized-effective.example/v1/responses", "gpt-override", protocols.OPENAI_RESPONSES,
                             "selected-openai-secret", history=True)
                     await turn("override a normalized provider endpoint")
@@ -2364,7 +2369,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 fresh_values["LOKI_AUTH_HEADER"] = "X-Custom-Key"
             fresh_owner = credential_supervisors.CredentialSupervisor(CredentialStore(fresh_values), storage)
             self.assertIsNot(fresh_owner.broker, owner.broker)
-            resumed = loki.Session(shell_cwd=str(root), job_manager=loki.JobManager(str(root / "resumed-jobs")))
+            resumed = loki.Session(shell_cwd=str(root), job_manager=job_runtime.JobManager(str(root / "resumed-jobs")))
             resumed.credential_authority = fresh_owner.broker
             self.addAsyncCleanup(resumed.job_manager.close_session_owned)
             descriptor = before["session_state"]["connection"]
@@ -2476,7 +2481,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             path = str(root / f"chat-{chat_id}.json")
             requests, catalog_requests = [], []
             output, errors = io.StringIO(), io.StringIO()
-            initial = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / "jobs")))
+            initial = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / "jobs")))
             initial.credential_authority = supervisor.broker
             initial.session_todos = [{"content": "inspect durable workflow", "status": "pending", "priority": "high"}]
 
@@ -2529,7 +2534,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                             "status": "completed", "output": items}
                 if end_turn is not None:
                     response["end_turn"] = end_turn
-                response_headers = {loki.CODEX_TURN_STATE_HEADER: state} if state else {}
+                response_headers = {model_requests.CODEX_TURN_STATE_HEADER: state} if state else {}
                 return response_headers, response
 
             async def request(method, url, **kwargs):
@@ -2564,7 +2569,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 data = await modelsdev.fetch_openai_subscription_models(supervisor.broker)
                 entries = modelsdev.add_openai_subscription_catalog(modelsdev.normalize_catalog({}), data)
                 provider = entries["openai-subscription"]
-                config = loki.config_from_modelsdev_selection(
+                config = connections.config_from_modelsdev_selection(
                     "openai-subscription", provider,
                     provider["models"]["old-model"], supervisor.inventory)
                 self.assertTrue(config.stream)
@@ -2572,7 +2577,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 loki.reinstall_provider(
                     model="gpt-test",
                     models_url=authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL,
-                    openai_request_profile=loki.config_from_modelsdev_selection(
+                    openai_request_profile=connections.config_from_modelsdev_selection(
                         "openai-subscription", provider,
                         provider["models"]["gpt-test"], supervisor.inventory).chat_provider.openai_request_profile)
                 # Buffered is an explicit supported runtime variant; catalog defaults to SSE.
@@ -2616,7 +2621,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
                 reopened_storage = credential_storages.JsonCredentialStorage(storage.directory)
                 reopened_owner = credential_supervisors.CredentialSupervisor(CredentialStore({}), reopened_storage)
-                resumed = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / "resumed-jobs")))
+                resumed = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / "resumed-jobs")))
                 resumed.credential_authority = reopened_owner.broker
 
                 class Input(ScriptedInputSession):
@@ -2649,7 +2654,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(connection["reasoning_effort_profile"]["options"][0]["value"], "high")
                 self.assertEqual(len(catalog_requests), 2)
                 self.assertEqual(responses, [])
-                self.assertEqual([h.get(loki.CODEX_TURN_STATE_HEADER) for h, _ in requests],
+                self.assertEqual([h.get(model_requests.CODEX_TURN_STATE_HEADER) for h, _ in requests],
                                  [None, "first-state-sentinel", "first-state-sentinel", None, None])
                 for _, payload in requests[3:]:
                     self.assertIn("first durable answer", json.dumps(payload))
@@ -2881,7 +2886,7 @@ class StatusTextTests(unittest.TestCase):
                 headers={},
                 max_tokens=4096,
             )
-            loki.current_session().runtime_config = loki.RuntimeConfig(
+            loki.current_session().runtime_config = connections.RuntimeConfig(
                 chat_provider=chat_provider,
                 model="model-x"
             )
@@ -3056,7 +3061,7 @@ class TerminalOverlayLifecycleTests(unittest.TestCase):
 class ApiErrorFormattingTests(unittest.TestCase):
     def test_formatted_error_preserves_full_json_body(self):
         message = "x" * 5000
-        error = loki.ApiError(
+        error = model_requests.ApiError(
             "https://example.test/v1/chat/completions",
             429,
             "Too Many Requests",
@@ -3070,7 +3075,7 @@ class ApiErrorFormattingTests(unittest.TestCase):
 
     def test_formatted_error_preserves_full_raw_body(self):
         body = "not-json:" + ("y" * 5000)
-        error = loki.ApiError(
+        error = model_requests.ApiError(
             "https://example.test/v1/chat/completions",
             500,
             "Internal Server Error",
@@ -3249,7 +3254,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             from loki_agent import credential_storages
             approval_storage = credential_storages.JsonCredentialStorage(str(root / 'credentials'))
             owner = credential_supervisors.CredentialSupervisor(store, approval_storage)
-            session = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / 'jobs')))
+            session = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / 'jobs')))
             session.credential_authority = owner.broker
             self.addAsyncCleanup(session.job_manager.close_session_owned)
             children, dispatched, events, search_queries, captured = [], [], [], [], []
@@ -3258,7 +3263,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             real_dispatch = loki.dispatch_tool_async
             real_spawn = asyncio.create_subprocess_exec
             phase = {}
-            source_key = loki._file_key(str(source))
+            source_key = file_operations.observation_key(str(source))
 
             async def spawn(*args, **kwargs):
                 if args[0] == 'test-search-program':
@@ -3316,7 +3321,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             def provider_config(name, protocol):
                 suffix = {protocols.OPENAI_RESPONSES: 'responses', protocols.OPENAI_CHAT: 'chat/completions',
                           protocols.ANTHROPIC_MESSAGES: 'messages'}[protocol]
-                return loki.make_runtime_config(
+                return connections.make_runtime_config(
                     f'https://{name.lower()}.example/v1/{suffix}', protocol,
                     model=f'model-{name}', provider_id=name, provider_name=name,
                     credential_ref=authentications.CredentialRef.environment(f'{name}_API_KEY'))
@@ -3362,7 +3367,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
             async def request(method, url, **kwargs):
                 self.assertEqual(method, 'POST')
-                if url == loki.DUCKDUCKGO_HTML_SEARCH_URL:
+                if url == web_tools.DUCKDUCKGO_HTML_SEARCH_URL:
                     query = urllib.parse.parse_qs(kwargs['body'].decode())['q'][0]
                     search_queries.append(query)
                     self.assertNotIn('Authorization', kwargs['headers_in'])
@@ -3472,7 +3477,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
             def reopen():
                 new_owner = credential_supervisors.CredentialSupervisor(store, approval_storage)
-                new = loki.Session(shell_cwd=directory, job_manager=loki.JobManager(str(root / 'reopened-jobs')))
+                new = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / 'reopened-jobs')))
                 new.credential_authority = new_owner.broker
                 self.addAsyncCleanup(new.job_manager.close_session_owned)
                 return new
@@ -3483,7 +3488,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(loki, 'file_state', {}), \
                     mock.patch.object(loki, 'dispatch_tool_async', new=dispatch), \
                     mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn), \
-                    mock.patch.object(loki.executables, 'RIPGREP', 'test-search-program'), \
+                    mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
                     mock.patch.object(http_client, 'async_http_request', new=request), \
                     contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
                 loki.apply_runtime_config(provider_config('A', protocols.OPENAI_RESPONSES))
@@ -3524,7 +3529,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(loki.current_toolsets(), first_toolsets)
                     descriptor = loki.connection_from_session_state(loki.current_state())
                     self.assertEqual((descriptor.provider_id, descriptor.model), ('B', 'model-B'))
-                    loki.apply_runtime_config(loki.config_from_connection_descriptor(descriptor, owner.inventory))
+                    loki.apply_runtime_config(connections.config_from_connection_descriptor(descriptor, owner.inventory))
                     await turn('B', protocols.OPENAI_RESPONSES, [
                         ('b-resumed-read', 'Read', {'file_path': str(source)}),
                         ('b-resumed-grep', 'Grep', {'pattern': 'notes', 'path': str(notes), 'output_mode': 'content'})], 'resume B', restored=True)
@@ -3552,7 +3557,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     loki.load_chat_log(path)
                     descriptor = loki.connection_from_session_state(loki.current_state())
                     self.assertEqual(descriptor.provider_id, 'ANTHROPIC')
-                    loki.apply_runtime_config(loki.config_from_connection_descriptor(descriptor, owner.inventory))
+                    loki.apply_runtime_config(connections.config_from_connection_descriptor(descriptor, owner.inventory))
                     hooks_before = hook_records()
                     child_count = len(children)
                     self.assertIsNone(loki.configure_tool_hook_pipeline({'LOKI_HOOKS': 'off'}))
@@ -3694,7 +3699,9 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
         async def request(
                 method, request_url, payload=None, request_headers=None,
                 report_errors=False, show_timing=False,
-                codex_turn_state=None):
+                codex_turn_state=None, *, context):
+            if context.config is None or context.config.chat_provider.chat_url != request_url:
+                raise AssertionError("request context does not match its selected connection")
             if not queued:
                 raise AssertionError("unexpected provider request")
             if method != "POST":
@@ -3881,7 +3888,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
     def test_incomplete_tool_call_and_media_survive_resume_and_switch(self):
         with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-incomplete.json")
-            responses_config = loki.make_runtime_config(
+            responses_config = connections.make_runtime_config(
                 "https://responses.example/v1/responses",
                 protocols.OPENAI_RESPONSES,
                 model="responses-model",
@@ -3930,7 +3937,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                     "incomplete tool call must not be dispatched")
 
             with mock.patch(
-                    "loki_agent.loki.async_provider_request",
+                    'loki_agent.model_requests.async_provider_request',
                     new=incomplete_request), mock.patch(
                         "loki_agent.loki.dispatch_tool_async",
                         new=forbidden_dispatch):
@@ -3977,7 +3984,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             self.assertEqual(
                 formats.pending_tool_calls(loki.current_transcript()), [])
 
-            chat_config = loki.make_runtime_config(
+            chat_config = connections.make_runtime_config(
                 "https://chat.example/v1/chat/completions",
                 protocols.OPENAI_CHAT,
                 model="chat-model",
@@ -4007,7 +4014,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 }],
             }], captured_chat)
             with mock.patch(
-                    "loki_agent.loki.async_provider_request",
+                    'loki_agent.model_requests.async_provider_request',
                     new=chat_request):
                 recovered = asyncio.run(loki.run_tool_loop_async(
                     loki.current_transcript(),
@@ -4048,7 +4055,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             self):
         with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-server-tool.json")
-            provider_a = loki.make_runtime_config(
+            provider_a = connections.make_runtime_config(
                 "https://anthropic-a.example/v1/messages",
                 protocols.ANTHROPIC_MESSAGES,
                 model="claude-a",
@@ -4116,7 +4123,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 },
             ], captured_a)
             with mock.patch(
-                    "loki_agent.loki.async_provider_request",
+                    'loki_agent.model_requests.async_provider_request',
                     new=requests_a):
                 answer_a = asyncio.run(loki.run_tool_loop_async(
                     loki.current_transcript(),
@@ -4149,7 +4156,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
             loki.current_session().transcript_items = []
             with contextlib.redirect_stdout(io.StringIO()):
                 loki.load_chat_log(path)
-            provider_b = loki.make_runtime_config(
+            provider_b = connections.make_runtime_config(
                 "https://anthropic-b.example/v1/messages",
                 protocols.ANTHROPIC_MESSAGES,
                 model="claude-b",
@@ -4177,7 +4184,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
                 "stop_reason": "end_turn",
             }], captured_b)
             with mock.patch(
-                    "loki_agent.loki.async_provider_request",
+                    'loki_agent.model_requests.async_provider_request',
                     new=requests_b):
                 answer_b = asyncio.run(loki.run_tool_loop_async(
                     loki.current_transcript(),
@@ -4289,7 +4296,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     'LOKI_API_BASE': 'https://picker.example/v1/chat/completions',
                     'LOKI_PROVIDER': protocols.OPENAI_CHAT, 'LOKI_MODEL': 'picker-model',
                 })
-                config = loki.build_config_from_env(credentials=store)
+                config = connections.build_config_from_env(credentials=store)
                 paths, saved, mtimes = {}, {}, {'oldest': 1000, 'middle': 2000, 'newest': 3000}
                 selected_label = {2: 'middle', 3: 'newest'}[selected_index]
 
@@ -4312,13 +4319,13 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result['type'], 'tool_result')
                     self.assertEqual(result['call_id'], f'read-{label}')
                     self.assertEqual(formats.item_text(result), f'1\tevidence {label}')
-                    self.assertIn(loki._file_key(str(root / f'{label}.txt')), loki.file_state)
+                    self.assertIn(file_operations.observation_key(str(root / f'{label}.txt')), loki.file_state)
                     return formats.DecodedTurn([
                         formats.message_item('assistant', f'answer {label}')])
 
                 async def fresh_session():
                     session = loki.Session(shell_cwd=directory,
-                                           job_manager=loki.JobManager(str(root / 'jobs')))
+                                           job_manager=job_runtime.JobManager(str(root / 'jobs')))
                     self.addAsyncCleanup(session.job_manager.close_session_owned)
                     return session
 
@@ -4658,7 +4665,7 @@ class ShellCwdTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmpdir:
                 workdir = os.path.join(tmpdir, "work")
                 os.mkdir(workdir)
-                loki.current_session().job_manager = loki.JobManager(os.path.join(tmpdir, "jobs"))
+                loki.current_session().job_manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
                 loki.change_shell_cwd(workdir)
 
                 # Report a native path rather than the shell's rendering: the
@@ -4714,7 +4721,7 @@ class ShellCwdTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 path = os.path.join(tmpdir, "chat-test.json")
-                config = loki.make_runtime_config(
+                config = connections.make_runtime_config(
                     "https://openrouter.ai/api/v1",
                     protocols.OPENAI_CHAT,
                     model="z-ai/glm",
@@ -4873,7 +4880,7 @@ class ShellCwdTests(unittest.TestCase):
                 }
                 pathlib.Path(path).write_text(
                     json.dumps(blob), encoding="utf-8")
-                loki.apply_runtime_config(loki.make_runtime_config(
+                loki.apply_runtime_config(connections.make_runtime_config(
                     "https://override.example/v1",
                     protocols.OPENAI_CHAT,
                     model="override-model",
@@ -4944,7 +4951,7 @@ class ShellCwdTests(unittest.TestCase):
                 # the publish is private_files.replace_at (a handle-relative
                 # rename), so an os.replace patch would never fire there.
                 with mock.patch(
-                        "loki_agent.loki.private_files.replace_at",
+                        "loki_agent.files.private_files.replace_at",
                         side_effect=OSError("publish failed")):
                     with self.assertRaisesRegex(OSError, "publish failed"):
                         loki.save_chat_log()
@@ -5028,7 +5035,7 @@ class ShellCwdTests(unittest.TestCase):
         credentials = CredentialStore({"OPENROUTER_API_KEY": "sample-value"})
         broker = authentications.CredentialBroker()
         credentials.install_static_credentials(broker)
-        config = loki.config_from_connection_descriptor(descriptor, credentials)
+        config = connections.config_from_connection_descriptor(descriptor, credentials)
         with contextlib.redirect_stdout(output), mock.patch.object(
                 loki.current_session(), "credential_authority", broker):
             declined = asyncio.run(
@@ -5082,9 +5089,9 @@ class SubagentLaunchTests(unittest.TestCase):
                         loki.current_session().root_conversation_id]
             return await subagents.async_main([
                 *args,
-                "--session-owner-fd", str(loki.host_ipc.reference(owner_end)),
+                "--session-owner-fd", str(job_runtime.host_ipc.reference(owner_end)),
                 "--credential-capability-fd",
-                str(loki.host_ipc.reference(capability_end)),
+                str(job_runtime.host_ipc.reference(capability_end)),
             ])
         finally:
             await delegation.close()
@@ -5131,9 +5138,9 @@ class SubagentLaunchTests(unittest.TestCase):
             session = loki.current_session()
             session.credential_authority = (
                 authentications.CredentialBroker())
-            session.job_manager = loki.JobManager(
+            session.job_manager = job_runtime.JobManager(
                 os.path.join(tmpdir, "jobs"))
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "http://dummy.invalid/v1",
                 protocols.DUMMY,
                 model="dummy-model",
@@ -5251,7 +5258,7 @@ class SubagentLaunchTests(unittest.TestCase):
             "",
         ))
         try:
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://chatgpt.com/backend-api/codex/responses",
                 protocols.OPENAI_RESPONSES,
                 model="gpt-5-codex",
@@ -5303,11 +5310,11 @@ class SubagentLaunchTests(unittest.TestCase):
             subagents.parse_args([
                 "Explore",
                 "--subagent-depth",
-                str(loki.MAX_SUBAGENT_DEPTH),
+                str(tool_contracts.MAX_SUBAGENT_DEPTH),
             ]).subagent_depth,
-            loki.MAX_SUBAGENT_DEPTH,
+            tool_contracts.MAX_SUBAGENT_DEPTH,
         )
-        for value in ("0", str(loki.MAX_SUBAGENT_DEPTH + 1), "one"):
+        for value in ("0", str(tool_contracts.MAX_SUBAGENT_DEPTH + 1), "one"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 subagents.parse_args([
                     "Explore", "--subagent-depth", value])
@@ -5315,7 +5322,7 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_maximum_depth_neither_advertises_nor_runs_agent(self):
         saved = save_loki_state(["subagent_depth", "agent_mode"])
         session = loki.current_session()
-        session.subagent_depth = loki.MAX_SUBAGENT_DEPTH
+        session.subagent_depth = tool_contracts.MAX_SUBAGENT_DEPTH
         captured = {}
 
         async def fake_loop(messages, allowed, *, thinking):
@@ -5352,7 +5359,7 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_lower_depth_advertises_recursive_agent(self):
         saved = save_loki_state(["subagent_depth", "agent_mode"])
         session = loki.current_session()
-        session.subagent_depth = loki.MAX_SUBAGENT_DEPTH - 1
+        session.subagent_depth = tool_contracts.MAX_SUBAGENT_DEPTH - 1
         captured = {}
 
         async def fake_loop(messages, allowed, *, thinking):
@@ -5476,22 +5483,22 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_owner_close_cancels_pending_credential_handshake(self):
         async def scenario():
             if os.name != "posix":
-                owner_parent, owner_child = loki.host_ipc.owner_channel()
+                owner_parent, owner_child = job_runtime.host_ipc.owner_channel()
                 owner = credential_runtimes.SessionOwner(owner_child)
-                server_end, client_end = loki.host_ipc.socket_pair()
-                capability_fd = loki.host_ipc.prepare_child_socket(client_end)
+                server_end, client_end = job_runtime.host_ipc.socket_pair()
+                capability_fd = job_runtime.host_ipc.prepare_child_socket(client_end)
                 try:
                     task = asyncio.create_task(
                         credential_runtimes._connect_while_owned(
                             capability_fd, owner))
                     await asyncio.sleep(0)
-                    loki.host_ipc.close_end(owner_parent)
+                    job_runtime.host_ipc.close_end(owner_parent)
                     result = await asyncio.wait_for(task, timeout=1)
                     self.assertEqual(capability_fd.handles(), [])
                     return result
                 finally:
                     await owner.close()
-                    loki.host_ipc.close_end(server_end)
+                    job_runtime.host_ipc.close_end(server_end)
             read_fd, write_fd = os.pipe()
             owner = credential_runtimes.SessionOwner(read_fd)
             broker_socket, child_socket = socket.socketpair()
@@ -5516,11 +5523,11 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_operation_is_cancelled_when_broker_closes(self):
         async def scenario():
             if os.name != "posix":
-                owner_parent, owner_child = loki.host_ipc.owner_channel()
+                owner_parent, owner_child = job_runtime.host_ipc.owner_channel()
                 owner = credential_runtimes.SessionOwner(owner_child)
 
                 def release_owner():
-                    loki.host_ipc.close_end(owner_parent)
+                    job_runtime.host_ipc.close_end(owner_parent)
             else:
                 read_fd, write_fd = os.pipe()
                 owner = credential_runtimes.SessionOwner(read_fd)
@@ -5560,19 +5567,19 @@ class SubagentLaunchTests(unittest.TestCase):
 
     def test_subagent_refuses_owner_fd_without_credential_capability(self):
         if os.name != "posix":
-            owner_parent, owner_child = loki.host_ipc.owner_channel()
+            owner_parent, owner_child = job_runtime.host_ipc.owner_channel()
             with contextlib.redirect_stderr(io.StringIO()):
                 status = asyncio.run(subagents.async_main([
                     "Explore",
                     "--session-owner-fd",
-                    str(loki.host_ipc.reference(owner_child)),
+                    str(job_runtime.host_ipc.reference(owner_child)),
                 ]))
             self.assertEqual(status, 2)
             # Closure is not observable here: ``_close_descriptors`` closes the
             # endpoint it parsed out of the argv reference -- a second
             # PipeEndpoint over the same handle numbers -- while the caller's
             # ``owner_child`` keeps recording those numbers.
-            loki.host_ipc.close_end(owner_parent)
+            job_runtime.host_ipc.close_end(owner_parent)
             return
         read_fd, write_fd = os.pipe()
         try:
@@ -5608,7 +5615,7 @@ class SubagentLaunchTests(unittest.TestCase):
             ["credential_authority", "CREDENTIALS"])
         try:
             with mock.patch.object(
-                    subagents._core,
+                    connections,
                     "build_config_from_env",
                     side_effect=ValueError("invalid config")), \
                     contextlib.redirect_stderr(io.StringIO()):
@@ -5624,7 +5631,7 @@ class SubagentLaunchTests(unittest.TestCase):
             ["credential_authority", "CREDENTIALS", "runtime_config"])
         try:
             with mock.patch.object(
-                    subagents._core, "build_config_from_env"), \
+                    connections, "build_config_from_env"), \
                     mock.patch.object(
                         subagents._core, "apply_runtime_config"), \
                     mock.patch.object(
@@ -5659,8 +5666,8 @@ class SubagentLaunchTests(unittest.TestCase):
 
         try:
             with mock.patch.object(
-                    subagents._core, "build_config_from_env",
-                    return_value=loki.make_runtime_config(
+                    connections, "build_config_from_env",
+                    return_value=connections.make_runtime_config(
                         "dummy://local", protocols.DUMMY, model="dummy")), \
                     mock.patch.object(subagents, "run_cli_async", new=run):
                 with self.assertRaisesRegex(RuntimeError, "failed child"):
@@ -5680,7 +5687,7 @@ class SubagentLaunchTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmpdir, \
                     mock.patch.object(
-                        subagents._core, "build_config_from_env"), \
+                        connections, "build_config_from_env"), \
                     mock.patch.object(
                         subagents._core, "apply_runtime_config"), \
                     mock.patch.object(
@@ -5711,7 +5718,7 @@ class SubagentLaunchTests(unittest.TestCase):
         }
         CredentialStore.capture(dict(source_env))
         try:
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://example.test/v1",
                 protocols.OPENAI_CHAT,
                 model="active-model",
@@ -5748,7 +5755,7 @@ class SubagentLaunchTests(unittest.TestCase):
         names = ["runtime_config"]
         old_values = save_loki_state(names)
         try:
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "http://localhost:8000/v1",
                 protocols.OPENAI_CHAT,
                 model="local-model",
@@ -5799,7 +5806,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
             rotate=rotate,
         )
         loki.current_session().credential_authority = broker
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "https://chatgpt.com/backend-api/codex/responses",
             protocols.OPENAI_RESPONSES,
             model="gpt-5-codex",
@@ -5883,11 +5890,11 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         with mock.patch.object(http_client, "async_http_request", new=request), \
                 mock.patch.object(
-                    loki, "_async_chat_stream_request_once", new=streamed):
+                    model_requests, '_async_chat_stream_request_once', new=streamed):
             self._install_subscription()
             asyncio.run(loki.async_provider_request(
                 "GET", authentications.OPENAI_CHATGPT_MODELS_REQUEST_URL))
-            loki.apply_runtime_config(loki.make_runtime_config(
+            loki.apply_runtime_config(connections.make_runtime_config(
                 "https://api.example.test/v1/responses",
                 protocols.OPENAI_RESPONSES, model="public-model"))
             asyncio.run(loki.async_provider_request(
@@ -5906,13 +5913,13 @@ class RequestTimeCredentialTests(unittest.TestCase):
         async def request(method, url, **kwargs):
             calls.append((method, url, kwargs))
             if len(calls) == 1:
-                return loki.http_client.HttpResponse(
+                return model_requests.http_client.HttpResponse(
                     url, 401, "Unauthorized", {}, b"{}")
-            return loki.http_client.HttpResponse(
+            return model_requests.http_client.HttpResponse(
                 url, 200, "OK", {}, b"{}")
 
         with mock.patch.object(
-                loki.http_client, "async_http_request", new=request):
+                model_requests.http_client, "async_http_request", new=request):
             result = asyncio.run(loki.async_provider_request(
                 "POST",
                 loki.current_config().chat_provider.input_url,
@@ -5931,8 +5938,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         self.assertEqual(
             first_headers["ChatGPT-Account-ID"], "account")
         self.assertEqual(
-            first_headers[loki.LLM_IDEMPOTENCY_HEADER_OPENAI],
-            second_headers[loki.LLM_IDEMPOTENCY_HEADER_OPENAI],
+            first_headers[model_requests.LLM_IDEMPOTENCY_HEADER_OPENAI],
+            second_headers[model_requests.LLM_IDEMPOTENCY_HEADER_OPENAI],
         )
 
     def test_buffered_completion_records_only_header_selected_model(self):
@@ -5949,7 +5956,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
         ]:
             with self.subTest(headers=headers):
                 self._install_subscription()
-                response = loki.http_client.HttpResponse(
+                response = model_requests.http_client.HttpResponse(
                     authentications.OPENAI_CHATGPT_RESPONSES_URL,
                     200,
                     "OK",
@@ -5957,7 +5964,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                     response_body,
                 )
                 with mock.patch.object(
-                        loki.http_client,
+                        model_requests.http_client,
                         "async_http_request",
                         new=mock.AsyncMock(return_value=response)):
                     turn = asyncio.run(loki.async_chat_completion(
@@ -5995,7 +6002,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                     }
                     if http_model is not None:
                         headers["OPENAI-MODEL"] = http_model
-                    yield loki.http_client.HttpStreamResponse(
+                    yield model_requests.http_client.HttpStreamResponse(
                         request_url,
                         200,
                         "OK",
@@ -6004,7 +6011,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
                     )
 
                 with mock.patch.object(
-                        loki.http_client,
+                        model_requests.http_client,
                         "async_http_stream",
                         new=stream):
                     turn = asyncio.run(loki.async_chat_completion(
@@ -6019,12 +6026,12 @@ class RequestTimeCredentialTests(unittest.TestCase):
                 )
 
     def test_public_responses_ignore_subscription_model_header(self):
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "https://api.example.test/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="public-model",
         ))
-        response = loki.http_client.HttpResponse(
+        response = model_requests.http_client.HttpResponse(
             "https://api.example.test/v1/responses",
             200,
             "OK",
@@ -6033,7 +6040,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
         )
 
         with mock.patch.object(
-                loki.http_client,
+                model_requests.http_client,
                 "async_http_request",
                 new=mock.AsyncMock(return_value=response)):
             result = asyncio.run(loki.async_provider_request(
@@ -6047,15 +6054,16 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None, observe=None):
+                codex_turn_state=None, observe=None, *, config):
+            self.assertIs(config, loki.current_config())
             calls.append(dict(headers))
             if len(calls) == 1:
-                raise loki.StreamingApiError(
+                raise model_requests.StreamingApiError(
                     url, 401, "Unauthorized", "{}")
             return protocols.ProviderResponse({})
 
         with mock.patch.object(
-                loki, "_async_chat_stream_request_once",
+                model_requests, '_async_chat_stream_request_once',
                 new=request_once):
             result = asyncio.run(loki.async_chat_stream_request(
                 loki.current_config().chat_provider.input_url,
@@ -6069,8 +6077,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
         self.assertEqual(
             calls[1]["Authorization"], "Bearer access-new")
         self.assertEqual(
-            calls[0][loki.LLM_IDEMPOTENCY_HEADER_OPENAI],
-            calls[1][loki.LLM_IDEMPOTENCY_HEADER_OPENAI],
+            calls[0][model_requests.LLM_IDEMPOTENCY_HEADER_OPENAI],
+            calls[1][model_requests.LLM_IDEMPOTENCY_HEADER_OPENAI],
         )
 
     def test_streaming_response_failure_retries_when_classified_retryable(self):
@@ -6079,7 +6087,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None, observe=None):
+                codex_turn_state=None, observe=None, *, config):
+            self.assertIs(config, loki.current_config())
             calls.append(dict(headers))
             if len(calls) < 3:
                 raise protocols.ResponseApiError(
@@ -6090,12 +6099,12 @@ class RequestTimeCredentialTests(unittest.TestCase):
             return protocols.ProviderResponse({"id": "response"})
 
         with mock.patch.object(
-                loki, "_async_chat_stream_request_once",
+                model_requests, '_async_chat_stream_request_once',
                 new=request_once), \
                 mock.patch.object(
-                    loki, "HTTP_RETRY_BASE_DELAY_S", 0), \
+                    http_client, 'HTTP_RETRY_BASE_DELAY_S', 0), \
                 mock.patch.object(
-                    loki, "HTTP_RETRY_MAX_JITTER_S", 0):
+                    http_client, 'HTTP_RETRY_MAX_JITTER_S', 0):
             result = asyncio.run(loki.async_chat_stream_request(
                 loki.current_config().chat_provider.input_url,
                 {"input": []}))
@@ -6104,7 +6113,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual(
             len({
-                headers[loki.LLM_IDEMPOTENCY_HEADER_OPENAI]
+                headers[model_requests.LLM_IDEMPOTENCY_HEADER_OPENAI]
                 for headers in calls
             }),
             1,
@@ -6154,13 +6163,13 @@ class RequestTimeCredentialTests(unittest.TestCase):
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
             calls.append(kwargs)
-            yield loki.http_client.HttpStreamResponse(
+            yield model_requests.http_client.HttpStreamResponse(
                 request_url,
                 200,
                 "OK",
                 {
                     "content-type": "text/event-stream",
-                    loki.CODEX_TURN_STATE_HEADER: (
+                    model_requests.CODEX_TURN_STATE_HEADER: (
                         "first-state"
                         if len(calls) == 1 else "ignored-later-state"),
                 },
@@ -6168,12 +6177,12 @@ class RequestTimeCredentialTests(unittest.TestCase):
             )
 
         with mock.patch.object(
-                loki.http_client, "async_http_stream",
+                model_requests.http_client, "async_http_stream",
                 side_effect=fake_http_stream), \
                 mock.patch.object(
-                    loki, "HTTP_RETRY_BASE_DELAY_S", 0), \
+                    http_client, 'HTTP_RETRY_BASE_DELAY_S', 0), \
                 mock.patch.object(
-                    loki, "HTTP_RETRY_MAX_JITTER_S", 0):
+                    http_client, 'HTTP_RETRY_MAX_JITTER_S', 0):
             with self.assertRaises(
                     protocols.ResponseApiError) as raised:
                 asyncio.run(loki.async_chat_stream_request(
@@ -6183,15 +6192,15 @@ class RequestTimeCredentialTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "server_error")
         self.assertEqual(len(calls), 3)
         self.assertNotIn(
-            loki.CODEX_TURN_STATE_HEADER,
+            model_requests.CODEX_TURN_STATE_HEADER,
             calls[0]["headers_in"],
         )
         self.assertEqual(
-            calls[1]["headers_in"][loki.CODEX_TURN_STATE_HEADER],
+            calls[1]["headers_in"][model_requests.CODEX_TURN_STATE_HEADER],
             "first-state",
         )
         self.assertEqual(
-            calls[2]["headers_in"][loki.CODEX_TURN_STATE_HEADER],
+            calls[2]["headers_in"][model_requests.CODEX_TURN_STATE_HEADER],
             "first-state",
         )
 
@@ -6201,7 +6210,8 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None, observe=None):
+                codex_turn_state=None, observe=None, *, config):
+            self.assertIs(config, loki.current_config())
             observed.append(dict(headers))
             return protocols.ProviderResponse({
                 "object": "response",
@@ -6210,7 +6220,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
             })
 
         with mock.patch.object(
-                loki, "_async_chat_stream_request_once",
+                model_requests, '_async_chat_stream_request_once',
                 new=request_once):
             asyncio.run(loki.async_chat_stream_request(
                 loki.current_config().chat_provider.input_url,
@@ -6222,7 +6232,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         self.assertNotIn("X-Codex-Turn-State", observed[0])
         self.assertNotIn(
-            loki.CODEX_TURN_STATE_HEADER, observed[0])
+            model_requests.CODEX_TURN_STATE_HEADER, observed[0])
 
     def test_static_credential_does_not_retry_a_401(self):
         credential = authentications.CredentialRef.environment(
@@ -6232,7 +6242,7 @@ class RequestTimeCredentialTests(unittest.TestCase):
         asyncio.run(broker.approve_destinations(
             credential, ["https://example.test/v1/responses"]))
         loki.current_session().credential_authority = broker
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "https://example.test/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="model",
@@ -6242,12 +6252,12 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
         async def request(method, url, **kwargs):
             calls.append(kwargs)
-            return loki.http_client.HttpResponse(
+            return model_requests.http_client.HttpResponse(
                 url, 401, "Unauthorized", {}, b"{}")
 
         with mock.patch.object(
-                loki.http_client, "async_http_request", new=request):
-            with self.assertRaises(loki.ApiError):
+                model_requests.http_client, "async_http_request", new=request):
+            with self.assertRaises(model_requests.ApiError):
                 asyncio.run(loki.async_provider_request(
                     "POST",
                     loki.current_config().chat_provider.input_url,
@@ -6264,7 +6274,7 @@ class StreamingCompletionTests(unittest.TestCase):
     def setUp(self):
         self.old_runtime_config = loki.current_config()
         self.old_model = loki.current_model()
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "http://localhost:8000/v1",
             protocols.OPENAI_CHAT,
             model="local-model",
@@ -6297,7 +6307,7 @@ class StreamingCompletionTests(unittest.TestCase):
             @contextlib.asynccontextmanager
             async def fake_http_stream(method, request_url, **kwargs):
                 payloads.append(json.loads(kwargs["body"]))
-                yield loki.http_client.HttpStreamResponse(
+                yield model_requests.http_client.HttpStreamResponse(
                     request_url,
                     200,
                     "OK",
@@ -6310,7 +6320,7 @@ class StreamingCompletionTests(unittest.TestCase):
                 first_seen.set()
 
             with mock.patch(
-                    "loki_agent.loki.http_client.async_http_stream",
+                    'loki_agent.model_requests.http_client.async_http_stream',
                     side_effect=fake_http_stream):
                 task = asyncio.create_task(loki.async_chat_completion(
                     [formats.message_item("user", "hello")],
@@ -6335,7 +6345,7 @@ class StreamingCompletionTests(unittest.TestCase):
         self.assertEqual(formats.item_text(items[0]), "hello")
 
     def test_responses_stream_returns_at_completed_without_waiting_for_eof(self):
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "http://localhost:8000/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="local-model",
@@ -6355,7 +6365,7 @@ class StreamingCompletionTests(unittest.TestCase):
 
             @contextlib.asynccontextmanager
             async def fake_http_stream(method, request_url, **kwargs):
-                yield loki.http_client.HttpStreamResponse(
+                yield model_requests.http_client.HttpStreamResponse(
                     request_url,
                     200,
                     "OK",
@@ -6364,7 +6374,7 @@ class StreamingCompletionTests(unittest.TestCase):
                 )
 
             with mock.patch(
-                    "loki_agent.loki.http_client.async_http_stream",
+                    'loki_agent.model_requests.http_client.async_http_stream',
                     side_effect=fake_http_stream):
                 return await asyncio.wait_for(
                     loki.async_chat_completion(
@@ -6380,7 +6390,7 @@ class StreamingCompletionTests(unittest.TestCase):
         self.assertEqual(turn.items, [])
 
     def test_public_responses_never_receive_codex_turn_state(self):
-        loki.apply_runtime_config(loki.make_runtime_config(
+        loki.apply_runtime_config(connections.make_runtime_config(
             "https://api.openai.com/v1/responses",
             protocols.OPENAI_RESPONSES,
             model="local-model",
@@ -6390,7 +6400,8 @@ class StreamingCompletionTests(unittest.TestCase):
 
         async def request_once(
                 url, payload, headers, on_text_delta, cancel_check,
-                codex_turn_state=None, observe=None):
+                codex_turn_state=None, observe=None, *, config):
+            self.assertIs(config, loki.current_config())
             observed.append((dict(headers), codex_turn_state))
             return protocols.ProviderResponse({
                 "object": "response",
@@ -6399,18 +6410,18 @@ class StreamingCompletionTests(unittest.TestCase):
             })
 
         with mock.patch.object(
-                loki, "_async_chat_stream_request_once",
+                model_requests, '_async_chat_stream_request_once',
                 new=request_once):
             asyncio.run(loki.async_chat_stream_request(
                 loki.current_config().chat_provider.input_url,
                 {"input": []},
-                codex_turn_state=loki.CodexTurnState(
+                codex_turn_state=model_requests.CodexTurnState(
                     "must-not-leave-subscription"),
             ))
 
         self.assertIsNone(observed[0][1])
         self.assertNotIn(
-            loki.CODEX_TURN_STATE_HEADER, observed[0][0])
+            model_requests.CODEX_TURN_STATE_HEADER, observed[0][0])
 
     def test_reasoning_deltas_are_silent_and_replay_only_at_origin(self):
         deltas = []
@@ -6442,7 +6453,7 @@ class StreamingCompletionTests(unittest.TestCase):
 
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
-            yield loki.http_client.HttpStreamResponse(
+            yield model_requests.http_client.HttpStreamResponse(
                 request_url,
                 200,
                 "OK",
@@ -6452,7 +6463,7 @@ class StreamingCompletionTests(unittest.TestCase):
 
         user = formats.message_item("user", "Test")
         with mock.patch(
-                "loki_agent.loki.http_client.async_http_stream",
+                'loki_agent.model_requests.http_client.async_http_stream',
                 side_effect=fake_http_stream), \
                 contextlib.redirect_stderr(diagnostics):
             turn = asyncio.run(loki.async_chat_completion(
@@ -6465,7 +6476,7 @@ class StreamingCompletionTests(unittest.TestCase):
         origin_payload = (
             loki.current_config().chat_provider.chat_payload(
                 [user, event], [], loki.current_model()))
-        foreign = loki.make_runtime_config(
+        foreign = connections.make_runtime_config(
             "http://other-localhost:8000/v1",
             protocols.OPENAI_CHAT,
             model="other-model",
@@ -6506,7 +6517,7 @@ class StreamingCompletionTests(unittest.TestCase):
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
             calls.append(json.loads(kwargs["body"]))
-            yield loki.http_client.HttpStreamResponse(
+            yield model_requests.http_client.HttpStreamResponse(
                 request_url,
                 200,
                 "OK",
@@ -6515,7 +6526,7 @@ class StreamingCompletionTests(unittest.TestCase):
             )
 
         with mock.patch(
-                "loki_agent.loki.http_client.async_http_stream",
+                'loki_agent.model_requests.http_client.async_http_stream',
                 side_effect=fake_http_stream):
             items = asyncio.run(loki.async_chat_completion(
                 [formats.message_item("user", "hello")],
@@ -6534,7 +6545,7 @@ class StreamingCompletionTests(unittest.TestCase):
 
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
-            yield loki.http_client.HttpStreamResponse(
+            yield model_requests.http_client.HttpStreamResponse(
                 request_url,
                 400,
                 "Bad Request",
@@ -6543,9 +6554,9 @@ class StreamingCompletionTests(unittest.TestCase):
             )
 
         with mock.patch(
-                "loki_agent.loki.http_client.async_http_stream",
+                'loki_agent.model_requests.http_client.async_http_stream',
                 side_effect=fake_http_stream):
-            with self.assertRaises(loki.StreamingApiError) as raised:
+            with self.assertRaises(model_requests.StreamingApiError) as raised:
                 asyncio.run(loki.async_chat_completion(
                     [formats.message_item("user", "hello")],
                     tools=[],
@@ -6562,7 +6573,7 @@ class StreamingCompletionTests(unittest.TestCase):
 
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
-            yield loki.http_client.HttpStreamResponse(
+            yield model_requests.http_client.HttpStreamResponse(
                 request_url,
                 200,
                 "OK",
@@ -6571,7 +6582,7 @@ class StreamingCompletionTests(unittest.TestCase):
             )
 
         with mock.patch(
-                "loki_agent.loki.http_client.async_http_stream",
+                'loki_agent.model_requests.http_client.async_http_stream',
                 side_effect=fake_http_stream):
             items = asyncio.run(loki.async_chat_completion(
                 [formats.message_item("user", "hello")],
@@ -6663,7 +6674,7 @@ class StreamingCompletionTests(unittest.TestCase):
         for content_type, chunk, expected in cases:
             with self.subTest(chunk=chunk, content_type=content_type):
                 self.assertEqual(
-                    loki._stream_body_kind(content_type, chunk), expected)
+                    model_requests._stream_body_kind(content_type, chunk), expected)
 
     def test_transport_failure_after_first_event_is_not_retried(self):
         calls = []
@@ -6678,7 +6689,7 @@ class StreamingCompletionTests(unittest.TestCase):
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
             calls.append(request_url)
-            yield loki.http_client.HttpStreamResponse(
+            yield model_requests.http_client.HttpStreamResponse(
                 request_url,
                 200,
                 "OK",
@@ -6687,7 +6698,7 @@ class StreamingCompletionTests(unittest.TestCase):
             )
 
         with mock.patch(
-                "loki_agent.loki.http_client.async_http_stream",
+                'loki_agent.model_requests.http_client.async_http_stream',
                 side_effect=fake_http_stream):
             with self.assertRaisesRegex(
                     protocols.StreamProtocolError,
@@ -6713,7 +6724,7 @@ class StreamingCompletionTests(unittest.TestCase):
 
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
-            yield loki.http_client.HttpStreamResponse(
+            yield model_requests.http_client.HttpStreamResponse(
                 request_url,
                 200,
                 "OK",
@@ -6725,9 +6736,9 @@ class StreamingCompletionTests(unittest.TestCase):
             cancelled["value"] = True
 
         with mock.patch(
-                "loki_agent.loki.http_client.async_http_stream",
+                'loki_agent.model_requests.http_client.async_http_stream',
                 side_effect=fake_http_stream):
-            with self.assertRaises(loki.StreamCancelled):
+            with self.assertRaises(model_requests.StreamCancelled):
                 asyncio.run(loki.async_chat_completion(
                     [formats.message_item("user", "hello")],
                     tools=[],
@@ -6840,7 +6851,7 @@ class StreamingToolLoopTests(unittest.TestCase):
         async def chat_fn(
                 items, on_text_delta, *, codex_turn_state):
             on_text_delta("partial")
-            raise loki.StreamCancelled()
+            raise model_requests.StreamCancelled()
 
         result = asyncio.run(loki.run_tool_loop_async(
             transcript,
@@ -7257,7 +7268,7 @@ class HarnessProjectionTests(unittest.TestCase):
         body = {"error": {"message": "full marker"}}
 
         async def chat_fn(items, *, codex_turn_state):
-            raise loki.ApiError(
+            raise model_requests.ApiError(
                 "https://provider.test/v1/responses",
                 429,
                 "Too Many Requests",
@@ -7372,7 +7383,7 @@ class QuestionGuardTests(unittest.TestCase):
             root = pathlib.Path(directory)
             target = root / 'reviewed.txt'
             target.write_text('preserve these bytes', encoding='utf-8')
-            manager = loki.JobManager(str(root / 'jobs'))
+            manager = job_runtime.JobManager(str(root / 'jobs'))
             session = loki.Session(shell_cwd=directory, job_manager=manager)
             quote = (subprocess.list2cmdline([str(target)]) if os.name == 'nt'
                      else shlex.quote(str(target)))
@@ -7520,7 +7531,7 @@ class QuestionGuardTests(unittest.TestCase):
         advertised = {
             part.strip()
             for part in description[start + len(marker):end].split(",")}
-        self.assertEqual(advertised, loki.EXPLORE_TOOLS - {loki.ASK_TOOL_NAME})
+        self.assertEqual(advertised, loki.EXPLORE_TOOLS - {tool_contracts.ASK_TOOL_NAME})
 
 
 class ThinkingControlsTests(unittest.TestCase):
@@ -7529,7 +7540,7 @@ class ThinkingControlsTests(unittest.TestCase):
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
         self.addCleanup(patch.stop)
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
             model="claude-opus-4-5", provider_id="anthropic",
             reasoning_effort_profile=modelsdev.ReasoningEffortProfile(

@@ -121,3 +121,13 @@ def loki_state_dir(environ=None) -> str:
 def credential_directory(environ=None) -> str:
     """Return the directory hidden from credential-consuming runtimes."""
     return os.path.join(loki_config_dir(environ), "credentials")
+
+
+def chat_log_dir_for(workspace: str) -> str:
+    """Conversation storage belongs to its workspace, not a launcher cwd.
+
+    ACP supplies a session workspace; the terminal captures its startup
+    directory. Callers own that selection and its lifetime. This is also
+    the writable workspace boundary of a contained Windows runtime.
+    """
+    return os.path.join(workspace, ".loki", "chats")

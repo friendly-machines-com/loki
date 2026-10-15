@@ -14,6 +14,8 @@ from loki_agent import loki
 from loki_agent import protocols
 from loki_agent.credentials import CredentialStore
 from loki_agent.sessions import Session
+from loki_agent import connections
+from loki_agent import model_requests
 
 
 def setUpModule():
@@ -31,7 +33,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
 
     @staticmethod
     def _config(url, *, stream=False):
-        config = loki.make_runtime_config(
+        config = connections.make_runtime_config(
             url,
             protocols.OPENAI_CHAT,
             model="test-model",
@@ -98,7 +100,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                 config = types.SimpleNamespace(
                     chat_provider=types.SimpleNamespace(chat_url=url))
                 self.assertEqual(
-                    loki._opencode_session_id_for_request(
+                    model_requests._opencode_session_id_for_request(
                         config, url, session_id),
                     session_id,
                 )
@@ -107,7 +109,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                 config = types.SimpleNamespace(
                     chat_provider=types.SimpleNamespace(chat_url=url))
                 self.assertIsNone(
-                    loki._opencode_session_id_for_request(
+                    model_requests._opencode_session_id_for_request(
                         config, url, session_id))
 
     def test_canonical_target_requires_a_conversation_identity(self):
@@ -119,7 +121,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                         config = self._config(
                             'https://opencode.ai/zen/go/v1/chat/completions', stream=stream)
                         with self.assertRaisesRegex(ValueError, 'require a conversation identity'):
-                            loki._opencode_session_id_for_request(config, config.chat_provider.chat_url)
+                            model_requests._opencode_session_id_for_request(config, config.chat_provider.chat_url)
                         for invalid in [None, '', 0, 1, False, True, [], ['id'], {}, {'id': 'x'}]:
                             with self.subTest(stream=stream, identity=invalid):
                                 loki.current_session().conversation_id = invalid
@@ -172,7 +174,7 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                                 self.assertEqual(resumed.transcript_items, saved_a['events'])
                                 self.assertEqual(resumed.session_state, saved_a['session_state'])
                                 descriptor = loki.connection_from_session_state(resumed.session_state)
-                                loki.apply_runtime_config(loki.config_from_connection_descriptor(
+                                loki.apply_runtime_config(connections.config_from_connection_descriptor(
                                     descriptor, loki.CREDENTIALS))
                                 with open(path_a, 'rb') as saved:
                                     self.assertEqual(saved.read(), first_bytes)

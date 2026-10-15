@@ -8,6 +8,7 @@ from unittest import mock
 
 from loki_agent import acp_events, formats, loki, protocols, savefiles
 from loki_agent import settings, terminal_frontend, tool_runtime
+from loki_agent import connections
 
 
 class ReadPresentationTests(unittest.IsolatedAsyncioTestCase):
@@ -15,7 +16,7 @@ class ReadPresentationTests(unittest.IsolatedAsyncioTestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = pathlib.Path(directory.name)
-        session = loki.Session(shell_cwd=str(self.directory), runtime_config=loki.make_runtime_config(
+        session = loki.Session(shell_cwd=str(self.directory), runtime_config=connections.make_runtime_config(
             "http://example.invalid/v1", protocols.DUMMY, model="test-model"))
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", session)
         patch.start()

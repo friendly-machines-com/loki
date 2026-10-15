@@ -16,6 +16,7 @@ from loki_agent import (
     terminals,
 )
 from loki_agent.credentials import CredentialInventory, CredentialStore
+from loki_agent import connections
 
 # Minimal synthetic models.dev dataset (provider-keyed, like the real API).
 DATA = {
@@ -1232,7 +1233,6 @@ class MenuTests(unittest.TestCase):
 
 class PickerTests(unittest.TestCase):
     def setUp(self):
-        from loki_agent import loki
         credentials = _credentials(PROVIDER_API_KEY="key")
         self.authority = authentications.CredentialBroker()
         credentials.install_static_credentials(self.authority)
@@ -1240,7 +1240,7 @@ class PickerTests(unittest.TestCase):
         async def grant():
             for provider_id, provider in DATA.items():
                 for model in provider["models"].values():
-                    config = loki.config_from_modelsdev_selection(
+                    config = connections.config_from_modelsdev_selection(
                         provider_id, provider, model, credentials)
                     await self.authority.approve_destinations(
                         config.auth_spec.credential, config.credential_destinations())

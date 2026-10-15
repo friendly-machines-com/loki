@@ -7,11 +7,12 @@ from unittest import mock
 
 from loki_agent import acp_commands, acp_events, acp_worker, formats, loki, protocols, terminal_frontend
 from loki_agent.sessions import Session
+from loki_agent import connections
 
 
 class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.session = Session(runtime_config=loki.make_runtime_config(
+        self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES, model="claude-opus-4-5"))
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
@@ -43,7 +44,7 @@ class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.session.thinking_mode, "manual")
 
     async def test_local_commands_do_not_enter_transcript(self):
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://relay.example/v1/messages", protocols.ANTHROPIC_MESSAGES, model="custom")
         loki.thinking_command("mode adaptive")
         messages = []
@@ -101,7 +102,7 @@ class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshots[1].traces, "off")
 
     async def test_trace_controls_and_retention_default_are_separate(self):
-        self.session.runtime_config = loki.make_runtime_config(
+        self.session.runtime_config = connections.make_runtime_config(
             "https://api.z.ai/api/paas/v4", protocols.OPENAI_CHAT, model="glm-5.2")
         loki.thinking_command("retention preserve")
         loki.thinking_command("retention default")

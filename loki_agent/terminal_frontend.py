@@ -18,6 +18,7 @@ import sys
 from dataclasses import dataclass
 
 from . import attachments
+from .arguments import USAGE, parse_cli_args, preflight as argument_preflight
 from .diagnostics import debug_json
 from . import command_deliveries
 from . import formats
@@ -33,12 +34,18 @@ from . import savefiles
 from . import subagents
 from . import terminals
 from . import texts
+from . import tool_contracts
 from . import tool_runtime
 from .connections import (
     ConnectionDescriptorError,
     connection_display_fields,
 )
-from .loki import RuntimeConfig, computer
+from .loki import (
+    computer,
+)
+from .connections import (
+    RuntimeConfig,
+)
 from . import loki as _core
 from .loki import (
     ERROR_COLOR,
@@ -51,11 +58,7 @@ from .loki import (
     active_connection_descriptor,
     apply_runtime_config,
     async_chat_completion,
-    build_config_from_env,
     change_shell_cwd_from_text,
-    config_from_connection_descriptor,
-    config_from_modelsdev_selection,
-    connection_descriptor_from_config,
     configure_tool_hook_pipeline,
     connection_from_session_state,
     current_agent_mode,
@@ -67,8 +70,6 @@ from .loki import (
     current_transcript,
     cycle_agent_mode,
     display_path,
-    explicit_api_base_configured,
-    explicit_connection_option,
     load_chat_log,
     load_models_async,
     mark_chat_log_dirty,
@@ -83,6 +84,14 @@ from .loki import (
     save_chat_log,
     set_session_connection,
     user_prompt_history,
+)
+from .connections import (
+    build_config_from_env,
+    config_from_connection_descriptor,
+    config_from_modelsdev_selection,
+    connection_descriptor_from_config,
+    explicit_api_base_configured,
+    explicit_connection_option,
 )
 from .terminals import (
     input_session, restore_output_area_after_input, terminal, terminal_output_mode)
@@ -777,7 +786,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     if ask_user is None:
         # Same rule as run_tool_loop_async: without somebody to answer, the
         # model is never offered the question tool at all.
-        active_tools = _core.without_ask_tool(active_tools)
+        active_tools = tool_contracts.without_ask_tool(active_tools)
 
     async def chat_fn(
             items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
@@ -1323,45 +1332,6 @@ async def _run_account_controls_async(command_text, session):
         await _confirm_account_action(modal, action, as_json)
 
 
-USAGE = """\
-usage: loki [options]
-
-Options:
-  -r, --resume LOG        resume a saved chat log (bare --resume: picker)
-  -p, --prompt TEXT       one prompt for --headless mode
-      --headless          headless single-prompt mode
-      --toolset NAME      toolset for headless mode
-      --shell-cwd PATH    working directory for tools and Bash
-                          (an explicit value outranks a resumed one)
-      --dangerously-skip-permissions
-                          skip permission prompts
-      --print-default-system-prompt
-                          print built-in instructions and exit (use alone)
-  -h, --help              show this help and exit
-
-Without options, loki starts the interactive TUI.
-Use /status for the current connection, /status all for all known connections.
-Add --json for JSON; /status save saves this runtime's response observations.
-Use loki status [--json] [--endpoint URL] to inspect saved response headers.
-Use /account for live provider usage and limit resets, when supported.
-Use /queue to inspect queued prompts and staged images while a turn runs.
-"""
-
-
-CLI_SHORT_OPTS = 'r:p:h'
-CLI_LONG_OPTS = ['resume=', 'prompt=', 'headless', 'toolset=',
-                 'shell-cwd=',
-                 'dangerously-skip-permissions', 'help']
-
-
-def parse_cli_args(args):
-    """Normalize and getopt-parse CLI args (raises getopt.GetoptError)."""
-    # getopt's "resume=" requires a value; normalize a bare `--resume` to
-    # `--resume=` so it opens the picker instead of erroring out.
-    args = ['--resume=' if a == '--resume' else a for a in args]
-    return getopt.getopt(args, CLI_SHORT_OPTS, CLI_LONG_OPTS)
-
-
 async def async_main(args) -> int:
     try:
         options, args = parse_cli_args(args)
@@ -1757,7 +1727,7 @@ async def async_main(args) -> int:
                                and command_text[len('/image')].isspace())):
                     try:
                         image_path = _image_command_path(command_text)
-                        image = load_image_attachment(image_path)
+                        image = load_image_attachment(image_path, base_dir=current_cwd())
                     except ImageAttachmentError as error:
                         sys.stdout.flush()
                         print("image: ", end="", file=sys.stderr)
@@ -1913,16 +1883,9 @@ async def _run_frontend(args) -> int:
     # --help and argument errors must leave the user's terminal exactly as
     # it was: handle them before initialize_terminal_overlay touches the
     # screen. No cursor hiding, scroll regions, or teardown output.
-    try:
-        options, _positional = parse_cli_args(args)
-    except getopt.GetoptError as error:
-        _print_repr_line("loki: ", str(error), file=sys.stderr)
-        print(USAGE, end='', file=sys.stderr)
-        return 2
-    for option_name, _option_value in options:
-        if option_name in ['-h', '--help']:
-            print(USAGE, end='')
-            return 0
+    status = argument_preflight(args)
+    if status is not None:
+        return status
     try:
         configure_tool_hook_pipeline(
             stderr_reporter=_report_hook_stderr)
