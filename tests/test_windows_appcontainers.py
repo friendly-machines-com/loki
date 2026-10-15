@@ -542,32 +542,44 @@ class StateTokenProbe:
         """Record independent calls; none of these tokens ever starts a child."""
         print(json.dumps({'probe': 'state-token-filter', 'phase': 'source',
                           'context': context, 'token': self.api.snapshot(source)}), flush=True)
-        role = self.n.sid(role_sid)
-        for variant, restriction, flags in [
-                ['unchanged', None, 0],
-                ['restrict-all', role_sid, 0],
-                ['restrict-writes', role_sid, WRITE_RESTRICTED]]:
-            row = {'probe': 'state-token-filter', 'phase': 'result',
-                   'context': context, 'variant': variant, 'flags': flags,
-                   'restricting_sid': role if restriction is not None else None}
-            try:
+        everyone = HANDLE()
+        self.n.check(self.api.parse_sid('S-1-1-0', C.byref(everyone)))
+        try:
+            # Everyone is a documented ordinary SID that the source token also
+            # holds as a group; the tool-role SID is a package-authority SID it
+            # does not hold. Which of them the API accepts isolates the input
+            # Windows rejects, after the AppContainer context and the
+            # WRITE_RESTRICTED flag were both ruled out at cc15c4b.
+            for variant, restriction, flags in [
+                    ['unchanged', None, 0],
+                    ['restrict-everyone', everyone, 0],
+                    ['restrict-all', role_sid, 0],
+                    ['restrict-writes', role_sid, WRITE_RESTRICTED]]:
+                row = {'probe': 'state-token-filter', 'phase': 'result',
+                       'context': context, 'variant': variant, 'flags': flags,
+                       'restricting_sid': (self.n.sid(restriction)
+                                           if restriction is not None else None)}
                 try:
-                    token = self.filtered(source, restriction, flags=flags)
-                except OSError as error:
-                    # A rejected construction is evidence, not a successful
-                    # access denial. Still collect the remaining comparisons.
-                    row.update({'created': False, 'winerror': getattr(error, 'winerror', None),
-                                'error': str(error)})
-                else:
-                    row.update({'created': True, 'winerror': 0})
                     try:
-                        row['token'] = self.api.snapshot(token)
-                    finally:
-                        self.api.close(token)
-            finally:
-                # Inspection/cleanup failures must remain failures, but cannot
-                # erase the native call's outcome from the diagnostics.
-                print(json.dumps(row), flush=True)
+                        token = self.filtered(source, restriction, flags=flags)
+                    except OSError as error:
+                        # A rejected construction is evidence, not a successful
+                        # access denial. Still collect the remaining comparisons.
+                        row.update({'created': False,
+                                    'winerror': getattr(error, 'winerror', None),
+                                    'error': str(error)})
+                    else:
+                        row.update({'created': True, 'winerror': 0})
+                        try:
+                            row['token'] = self.api.snapshot(token)
+                        finally:
+                            self.api.close(token)
+                finally:
+                    # Inspection/cleanup failures must remain failures, but cannot
+                    # erase the native call's outcome from the diagnostics.
+                    print(json.dumps(row), flush=True)
+        finally:
+            self.n.local_free(everyone)
 
     def launch(self, token, manifest_path, role, streams, observe=None):
         """Use the existing AsUser binding, with an explicit stdio handle list."""
@@ -3213,11 +3225,10 @@ class StateTokenProbeTests(unittest.TestCase):
 
     def test_filter_comparisons_record_rejections_and_close_all_created_tokens(self):
         for context in ['standard-user', 'appcontainer']:
-            for rejected in [[], [0], [1], [2], [0, 1, 2]]:
+            for rejected in [[], [0], [1], [2], [3], [0, 1, 2, 3]]:
                 with self.subTest(context=context, rejected=rejected):
                     probe = StateTokenProbe.__new__(StateTokenProbe)
                     probe.n = mock.Mock()
-                    probe.n.sid.return_value = 'tool-role'
                     probe.api = mock.Mock()
                     source = {'user': 'owner', 'app': int(context == 'appcontainer'),
                               'package': 'package' if context == 'appcontainer' else None,
@@ -3225,23 +3236,29 @@ class StateTokenProbeTests(unittest.TestCase):
                     probe.api.snapshot.return_value = source
                     failure = OSError('CreateRestrictedToken rejected its arguments')
                     failure.winerror = 87
-                    handles = [71, 72, 73]
+                    handles = [71, 72, 73, 74]
                     probe.filtered = mock.Mock(side_effect=[
                         failure if index in rejected else handle
                         for index, handle in enumerate(handles)])
                     role = HANDLE(23)
+                    probe.n.sid.side_effect = (
+                        lambda handle: 'tool-role' if handle is role else 'everyone')
                     with mock.patch('builtins.print') as output:
                         probe.compare_filters(17, role, context)
+                    everyone = probe.api.parse_sid.call_args[0][1]._obj
+                    probe.api.parse_sid.assert_called_once_with('S-1-1-0', mock.ANY)
+                    probe.n.local_free.assert_called_once_with(everyone)
                     records = [json.loads(call.args[0]) for call in output.call_args_list]
                     self.assertEqual(records[0], {
                         'probe': 'state-token-filter', 'phase': 'source',
                         'context': context, 'token': source})
                     results = records[1:]
                     self.assertEqual([row['variant'] for row in results],
-                                     ['unchanged', 'restrict-all', 'restrict-writes'])
-                    self.assertEqual([row['flags'] for row in results], [0, 0, 0x8])
+                                     ['unchanged', 'restrict-everyone',
+                                      'restrict-all', 'restrict-writes'])
+                    self.assertEqual([row['flags'] for row in results], [0, 0, 0, 0x8])
                     self.assertEqual([row['restricting_sid'] for row in results],
-                                     [None, 'tool-role', 'tool-role'])
+                                     [None, 'everyone', 'tool-role', 'tool-role'])
                     for index, row in enumerate(results):
                         self.assertEqual(row['context'], context)
                         self.assertEqual(row['created'], index not in rejected)
@@ -3253,7 +3270,9 @@ class StateTokenProbeTests(unittest.TestCase):
                         else:
                             self.assertEqual(row['token'], source)
                     self.assertEqual(probe.filtered.call_args_list, [
-                        mock.call(17, None, flags=0), mock.call(17, role, flags=0),
+                        mock.call(17, None, flags=0),
+                        mock.call(17, everyone, flags=0),
+                        mock.call(17, role, flags=0),
                         mock.call(17, role, flags=0x8)])
                     successful = [handle for index, handle in enumerate(handles)
                                   if index not in rejected]
@@ -3262,6 +3281,26 @@ class StateTokenProbeTests(unittest.TestCase):
                     self.assertEqual(probe.api.close.call_args_list,
                                      [mock.call(handle) for handle in successful])
                     probe.api.create_as_user.assert_not_called()
+
+    def test_filter_comparison_sid_allocation_failure_frees_nothing(self):
+        probe = StateTokenProbe.__new__(StateTokenProbe)
+        probe.n = mock.Mock()
+        probe.api = mock.Mock()
+        source = {'user': 'owner', 'app': 1, 'package': 'package',
+                  'restricting_sids': []}
+        probe.api.snapshot.return_value = source
+        probe.filtered = mock.Mock()
+        probe.n.check.side_effect = OSError('ConvertStringSidToSidW failed')
+        with mock.patch('builtins.print') as output:
+            with self.assertRaisesRegex(OSError, 'ConvertStringSidToSidW'):
+                probe.compare_filters(17, HANDLE(23), 'appcontainer')
+        probe.filtered.assert_not_called()
+        probe.n.local_free.assert_not_called()
+        probe.api.close.assert_not_called()
+        self.assertEqual(
+            [json.loads(call.args[0]) for call in output.call_args_list],
+            [{'probe': 'state-token-filter', 'phase': 'source',
+              'context': 'appcontainer', 'token': source}])
 
     def test_filter_comparison_inspection_and_cleanup_errors_remain_failures(self):
         for failure in ['inspection', 'cleanup']:
