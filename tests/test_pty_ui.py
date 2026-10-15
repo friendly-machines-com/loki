@@ -501,6 +501,8 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"\r\nSHELL_PREFILL_WORKS\r\n", output)
         first_prompt = output.index(b"User: ")
         self.assertTrue(output[first_prompt:].startswith(b"User: !"))
+        self.assertEqual(output.count(
+            b"Hint: delete the leading ! and type /model to select a model."), 1)
 
     def test_status_bar_shows_api_and_mode(self):
         # Regression for the frontend split dropping the status text

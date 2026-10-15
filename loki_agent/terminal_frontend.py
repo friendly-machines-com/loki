@@ -1545,6 +1545,7 @@ async def async_main(args) -> int:
         # The staged-images list is shared with the immediate /queue command
         # (see _QueuedInputs); the loop keeps using this local name.
         pending_images = _queued_inputs.reset(session)
+        dummy_model_hint_shown = False
         # The first normal frame needs the selected provider and loaded history.
         # Startup modals retain the reader without enabling the normal producer.
         await session.start()
@@ -1804,6 +1805,7 @@ async def async_main(args) -> int:
             _terminal_activity.set_queued_images(0)
             mark_chat_log_dirty()
 
+            dummy_turn = current_config().chat_provider.kind == protocols.DUMMY
             turn_events = [] if _core.TOOL_HOOK_PIPELINE.turn_end_hooks else None
             turn_text = ""
             turn_error = None
@@ -1850,6 +1852,11 @@ async def async_main(args) -> int:
                                 turn_events, turn_text, error=turn_error)
                 finally:
                     _terminal_activity.set_turn_running(False)
+
+            if dummy_turn and not dummy_model_hint_shown:
+                print("Hint: delete the leading ! and type /model to select a model.",
+                      flush=True)
+                dummy_model_hint_shown = True
 
         pending_images.clear()
         _terminal_activity.set_queued_images(0)

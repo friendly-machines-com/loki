@@ -1356,6 +1356,65 @@ class ModelLoadingTests(unittest.TestCase):
         session.start.assert_awaited_once()
         self.assertFalse(input_factory.call_args.kwargs['autostart'])
 
+    def test_dummy_model_hint_is_tui_only_once_per_session_and_not_saved(self):
+        hint = 'Hint: delete the leading ! and type /model to select a model.'
+        # Repeating dummy sessions proves the hint is not process-global.
+        for kind, messages, expected in [
+                [protocols.DUMMY, ['first', 'second', '/quit'], 1],
+                [protocols.DUMMY, ['another session', '/quit'], 1],
+                [protocols.OPENAI_CHAT, ['real provider', '/quit'], 0],
+                [protocols.DUMMY, ['/quit'], 0]]:
+            with self.subTest(kind=kind, messages=messages), tempfile.TemporaryDirectory() as tmpdir:
+                loki.CREDENTIALS = CredentialStore({
+                    'LOKI_API_BASE': 'http://provider.invalid/v1',
+                    'LOKI_PROVIDER': kind,
+                    'LOKI_MODEL': 'test-model',
+                })
+                session = ScriptedInputSession(messages)
+                stdout = io.StringIO()
+                path = os.path.join(tmpdir, 'chat.json')
+                with (
+                    mock.patch.object(terminal_frontend, 'input_session', return_value=session),
+                    mock.patch.object(terminal_frontend, 'new_chat_log_path', return_value=path),
+                    mock.patch.object(terminal_frontend, 'restore_output_area_after_input'),
+                    mock.patch.object(terminal_frontend, 'run_terminal_turn_async',
+                                      new=mock.AsyncMock(return_value='ok')),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+                self.assertEqual(stdout.getvalue().count(hint), expected)
+                self.assertNotIn(hint, str(loki.current_transcript()))
+                loki.save_chat_log()
+                with open(path, encoding='utf-8') as stream:
+                    self.assertNotIn(hint, stream.read())
+
+    def test_cancelled_dummy_turn_does_not_consume_the_hint(self):
+        loki.CREDENTIALS = CredentialStore({})
+        session = ScriptedInputSession(['cancelled', 'completed', '/quit'])
+        stdout = io.StringIO()
+        turns = 0
+
+        async def turn(*args, **kwargs):
+            nonlocal turns
+            turns += 1
+            self.assertNotIn('Hint:', stdout.getvalue())
+            if turns == 1:
+                raise KeyboardInterrupt
+            return 'ok'
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(terminal_frontend, 'input_session', return_value=session),
+            mock.patch.object(terminal_frontend, 'new_chat_log_path',
+                              return_value=os.path.join(tmpdir, 'chat.json')),
+            mock.patch.object(terminal_frontend, 'restore_output_area_after_input'),
+            mock.patch.object(terminal_frontend, 'run_terminal_turn_async', new=turn),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+        self.assertEqual(turns, 2)
+        self.assertEqual(stdout.getvalue().count('Hint:'), 1)
+
     def test_normal_input_seed_uses_provider_kind_not_model_name(self):
         for kind, model, expected in [
                 [protocols.DUMMY, 'custom-dummy-name', '!'],
