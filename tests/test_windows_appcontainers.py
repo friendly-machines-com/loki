@@ -22,10 +22,10 @@ Documentation contracts used by these probes:
   WMI/breakaway exceptions. No all-launch-path containment claim is made.
 
 All files are disposable. No network capabilities, real tokens, elevation
-requests, or durability claims. The one deliberate Loki import is the shipped
-read-only gate (``windows_verify`` and the modules it pulls) in the
-``--runtime-gate`` mode, so the probe that ships is exercised natively; it
-imports no agent core, frontend, or ACL/profile mutation. The companion
+requests, or durability claims. Deliberate Loki imports exercise the shipped
+read-only gate (``windows_verify`` and the modules it pulls) in
+``--runtime-gate`` mode and the process-object protection in ``--state-writer``
+mode. Neither imports the agent core, frontend, or setup/profile mutation. The companion
 windows_escapes.py probes selected token and ShellExecute/WMI launch routes;
 its documented limits remain distinct from complete escape resistance.
 """
@@ -502,6 +502,394 @@ class AppContainers(NativeCalls):
                         if handle:
                             cleanup.callback(
                                 lambda handle=handle: self.check(self.close(handle)))
+
+
+class StateTokenProbe:
+    """Native-only experiment: a writer AppContainer and write-restricted tools.
+
+    No production launch path uses this. The probe keeps the existing package
+    identity and tests an extra restricting SID, rather than assuming two
+    identical AppContainer tokens have different filesystem authority.
+    """
+
+    def __init__(self, native):
+        self.n = native
+        self.api = escape_helpers['Escapes'](native, primitives, ExtendedStartups, ProcessInfos)
+        self.restrict = native.bind(
+            native.advapi, 'CreateRestrictedToken', W.BOOL,
+            HANDLE, ULONG, ULONG, HANDLE, ULONG, HANDLE, ULONG,
+            C.POINTER(primitives['SidAttributes']), C.POINTER(HANDLE))
+
+    def filtered(self, source, role_sid):
+        result = HANDLE()
+        restriction = (primitives['SidAttributes'](role_sid, 0)
+                       if role_sid is not None else None)
+        # WRITE_RESTRICTED makes the second SID check apply to writes only.
+        # A second call with no SID/flags tests attempts to discard restrictions.
+        print(json.dumps({'probe': 'state-token', 'phase': 'filter',
+                          'write_only': restriction is not None}), flush=True)
+        self.n.check(self.restrict(
+            source, 0x8 if restriction is not None else 0,
+            0, None, 0, None, 1 if restriction is not None else 0,
+            C.byref(restriction) if restriction is not None else None,
+            C.byref(result)))
+        return result.value
+
+    def launch(self, token, manifest_path, role, streams, observe=None):
+        """Use the existing AsUser binding, with an explicit stdio handle list."""
+        import msvcrt
+
+        native = self.n
+        size = C.c_size_t()
+        native.initialize(None, 1, 0, C.byref(size))
+        if not size.value:
+            raise RuntimeError('state probe attribute-list sizing failed')
+        attributes = C.create_string_buffer(size.value)
+        native.check(native.initialize(attributes, 1, 0, C.byref(size)))
+        cleanup = ExitStack()
+        try:
+            handles = [msvcrt.get_osfhandle(stream.fileno()) for stream in streams]
+            inherited = (HANDLE * len(handles))(*handles)
+            startup = ExtendedStartups()
+            startup.startup.cb = C.sizeof(startup)
+            startup.startup.flags = STARTF_USESTDHANDLES
+            startup.startup.stdin, startup.startup.stdout, startup.startup.stderr = handles
+            startup.attributes = C.cast(attributes, HANDLE)
+            child = ProcessInfos()
+            command = C.create_unicode_buffer(subprocess.list2cmdline([
+                sys.executable, '-I', '-u', __file__, '--state-access', str(manifest_path), role]))
+            old_inheritance = [[handle, os.get_handle_inheritable(handle)] for handle in handles]
+            try:
+                for handle in handles:
+                    os.set_handle_inheritable(handle, True)
+                native.check(native.update(
+                    attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inherited, C.sizeof(inherited), None, None))
+                print(json.dumps({'probe': 'state-token', 'phase': 'create', 'role': role}), flush=True)
+                native.check(self.api.create_as_user(
+                    token, sys.executable, command, None, None, True,
+                    CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, None,
+                    str(Path(manifest_path).parent), C.byref(startup), C.byref(child)))
+                cleanup.callback(lambda: native.check(native.close(child.process)))
+                cleanup.callback(self.api.retire, child.process)
+                cleanup.callback(lambda: native.check(native.close(child.thread)))
+            finally:
+                for handle, previous in old_inheritance:
+                    os.set_handle_inheritable(handle, previous)
+            actual_token = self.api.token(child.process, TOKEN_QUERY)
+            try:
+                snapshot = self.api.snapshot(actual_token)
+            finally:
+                self.api.close(actual_token)
+            in_job = W.BOOL()
+            native.check(native.in_job(child.process, None, C.byref(in_job)))
+            if not in_job.value:
+                raise RuntimeError('state child escaped the owning kill-on-close job')
+            print(json.dumps({'state_child_created': role, 'pid': child.pid,
+                              'token': snapshot, 'in_job': bool(in_job.value)}), flush=True)
+            manifest = json.loads(Path(manifest_path).read_text())
+            if (snapshot['app'] != 1 or snapshot['package'] != manifest['package']
+                    or snapshot['user'] != manifest['owner']):
+                raise RuntimeError('state child has the wrong suspended identity')
+            if role in ['filtered', 'duplicated', 'refiltered'] and not any(
+                    sid == manifest['role_sid'] for sid, _flags in snapshot['restricting_sids']):
+                raise RuntimeError('suspended child lost its write restriction')
+            native.check(native.resume(child.thread) != 0xffffffff)
+            if observe is not None:
+                observe(child.process)
+            # The existing CI supervisor owns the budget; no probe-local
+            # execution deadline is added here.
+            if native.wait(child.process, 0xffffffff) != 0:
+                raise RuntimeError('state probe process wait failed')
+            code = ULONG()
+            native.check(native.exit_code(child.process, C.byref(code)))
+            report_path = Path(manifest_path).parent / (role + '.json')
+            if code.value != 0 or not report_path.exists():
+                raise RuntimeError('state probe %s exited %s without a report'
+                                   % (role, code.value))
+            return {'kernel_token': snapshot, 'report': json.loads(report_path.read_text())}
+        finally:
+            try:
+                cleanup.close()
+            finally:
+                native.delete_attributes(attributes)
+
+
+def state_access_report(probe, manifest, role):
+    native = probe.n
+    workspace = Path(manifest['workspace'])
+    state = Path(manifest['state']) / role
+    rows = []
+
+    def observe(name, action, expected):
+        row = access_outcome(name, action)
+        row['expected'] = expected
+        rows.append(row)
+        print(json.dumps({'state_role': role, **row}), flush=True)
+
+    def open_right(path, right, directory=False):
+        handle = native.open(path, access=right,
+                             flags=FILE_FLAG_BACKUP_SEMANTICS if directory else 0)
+        native.check(native.close(handle))
+
+    def append_file(path):
+        with path.open('ab') as stream:
+            stream.write(b'append')
+
+    def rename_directory(path):
+        moved = path.with_name(path.name + '-moved')
+        path.rename(moved)
+        moved.rename(path)
+
+    writing = 'allowed' if role == 'control' else 'access-denied'
+    reading = 'characterized' if role == 'refiltered' else 'allowed'
+    observe('state-read', lambda: (state / 'read').read_bytes(), reading)
+    observe('configuration-read', lambda: Path(manifest['configuration']).read_bytes(), reading)
+    observe('configuration-write', lambda: Path(manifest['configuration']).write_bytes(b'bad'), 'access-denied')
+    observe('workspace-write', lambda: (workspace / (role + '-workspace')).write_bytes(b'ok'), 'allowed')
+    for name, action in [
+            ['state-create', lambda: (state / 'created').write_bytes(b'bad')],
+            ['state-append', lambda: append_file(state / 'append')],
+            ['state-truncate', lambda: (state / 'truncate').write_bytes(b'bad')],
+            ['state-delete', lambda: (state / 'delete').unlink()],
+            ['state-rename', lambda: (state / 'rename').rename(state / 'renamed')],
+            ['state-replace', lambda: os.replace(state / 'replacement', state / 'replace')],
+            ['state-mkdir', lambda: (state / 'created-directory').mkdir()],
+            ['state-rmdir', lambda: (state / 'empty-directory').rmdir()],
+            ['state-native-write', lambda: open_right(state / 'read', FILE_WRITE_DATA)],
+            ['state-native-append', lambda: open_right(state / 'read', FILE_APPEND_DATA)],
+            ['protected-child-rename', lambda: rename_directory(workspace / ('protected-' + role))],
+    ]:
+        observe(name, action, writing)
+    for name, action in [
+            ['state-write-dacl', lambda: open_right(state, WRITE_DAC, True)],
+            ['state-write-owner', lambda: open_right(state, WRITE_OWNER, True)],
+            ['state-delete-child', lambda: open_right(state, 0x40, True)],
+            ['state-regrant-dacl', lambda: native.acl(
+                state, private_dacl(manifest['owner']) +
+                '(A;OICI;0x%X;;;%s)' % (FILE_MODIFY, manifest['package']))],
+            ['whole-state-rename', lambda: rename_directory(Path(manifest['state']))],
+    ]:
+        observe(name, action, 'characterized' if role == 'control' else 'access-denied')
+    for name, path in [['setup', manifest['setup']], ['credentials', manifest['credentials']]]:
+        observe(name + '-read', lambda path=path: Path(path).read_bytes(), 'access-denied')
+        observe(name + '-write', lambda path=path: Path(path).write_bytes(b'bad'), 'access-denied')
+    if role != 'control':
+        observe('state-junction-write', lambda: (
+            workspace / 'state-junction' / role / 'via-junction').write_bytes(b'bad'), 'access-denied')
+        observe('state-hardlink-write', lambda: (
+            workspace / 'state-hardlink').write_bytes(b'bad'), 'access-denied')
+    for descriptor in [1, 2]:
+        def write_stdio(descriptor=descriptor):
+            os.write(descriptor, b'inherited-state-spool\n')
+            os.lseek(descriptor, 0, os.SEEK_END)
+            os.ftruncate(descriptor, os.fstat(descriptor).st_size)
+        observe('own-fd-%d-write-seek-truncate' % descriptor, write_stdio, 'allowed')
+    if role not in ['control', 'recovered']:
+        observe('parent-memory-read', lambda: read_state_parent_memory(probe, manifest), 'access-denied')
+        observe('parent-handle-duplication', lambda: duplicate_state_parent_handle(probe, manifest), 'access-denied')
+        observe('parent-dacl-write', lambda: open_state_parent(probe, manifest, WRITE_DAC), 'access-denied')
+        observe('parent-token-recovery', lambda: recover_state_parent_token(probe, manifest), 'access-denied')
+    return rows
+
+
+def open_state_parent(probe, manifest, rights):
+    handle = probe.n.check(probe.n.open_process(rights, False, manifest['writer_pid']))
+    probe.api.close(handle)
+
+
+def read_state_parent_memory(probe, manifest):
+    process = probe.n.check(probe.n.open_process(PROCESS_VM_READ, False, manifest['writer_pid']))
+    try:
+        buffer = C.create_string_buffer(manifest['writer_memory_size'])
+        read = C.c_size_t()
+        probe.n.check(probe.api.read_memory(
+            process, manifest['writer_memory'], buffer, len(buffer), C.byref(read)))
+        if read.value != len(buffer) or buffer.raw != b'SYNTHETIC-STATE-WRITER\0':
+            raise RuntimeError('parent-memory probe did not read its controlled witness')
+    finally:
+        probe.api.close(process)
+
+
+def duplicate_state_parent_handle(probe, manifest):
+    process = probe.n.check(probe.n.open_process(PROCESS_DUP_HANDLE, False, manifest['writer_pid']))
+    duplicated = HANDLE()
+    try:
+        probe.n.check(probe.api.duplicate_handle(
+            process, manifest['writer_handle'], probe.n.current_process(),
+            C.byref(duplicated), 0, False, 2))
+        probe.n.write_all(duplicated, b'RECOVERED-WRITER-HANDLE')
+    finally:
+        if duplicated.value:
+            probe.api.close(duplicated)
+        probe.api.close(process)
+
+
+def recover_state_parent_token(probe, manifest):
+    process = probe.n.check(probe.n.open_process(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, manifest['writer_pid']))
+    try:
+        token = probe.api.token(process, TOKEN_QUERY | 2)
+        try:
+            print(json.dumps({'recovered_parent_token': probe.api.snapshot(token)}), flush=True)
+            # Obtaining a duplicable writer token is already a violation. A
+            # later launch refusal must not turn that into a successful denial.
+            try:
+                primary = probe.api.clone(token, TOKEN_QUERY | 2 | 1)
+                try:
+                    probe.launch(primary, manifest['manifest'], 'recovered',
+                                 [sys.stdin, sys.stdout, sys.stderr])
+                finally:
+                    probe.api.close(primary)
+            except OSError as error:
+                print(json.dumps({'recovered_token_launch_error': str(error),
+                                  'winerror': getattr(error, 'winerror', None)}), flush=True)
+        finally:
+            probe.api.close(token)
+    finally:
+        probe.api.close(process)
+
+
+def state_access_child(manifest_path, role):
+    manifest = json.loads(Path(manifest_path).read_text())
+    probe = StateTokenProbe(AppContainers())
+    source = probe.api.token(probe.n.current_process(), TOKEN_QUERY)
+    try:
+        snapshot = probe.api.snapshot(source)
+        if (snapshot['app'] != 1 or snapshot['package'] != manifest['package']
+                or snapshot['user'] != manifest['owner']):
+            raise RuntimeError('state witness has an unexpected token identity')
+        if role not in ['control', 'recovered'] and not any(
+                sid == manifest['role_sid'] for sid, _flags in snapshot['restricting_sids']):
+            raise RuntimeError('state witness has no restricting SID')
+        if role == 'filtered':
+            workspace = Path(manifest['workspace'])
+            (workspace / 'filtered-ready').write_text('ready')
+            while not (workspace / 'writer-published').exists():
+                time.sleep(0.01)
+            if (Path(manifest['state']) / 'published-later').read_bytes() != b'owner publication':
+                raise RuntimeError('filtered child did not see the live owner publication')
+        report = {'role': role, 'token': snapshot,
+                  'operations': state_access_report(probe, manifest, role), 'children': []}
+        if role == 'filtered':
+            result = subprocess.run(
+                [sys.executable, '-I', '-u', __file__, '--state-access', manifest_path, 'descendant'],
+                stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, close_fds=True)
+            if result.returncode:
+                raise RuntimeError('ordinary restricted descendant failed')
+            report['children'].append({'report': json.loads(
+                (Path(manifest_path).parent / 'descendant.json').read_text())})
+            for child_role in ['duplicated', 'refiltered']:
+                def relaunch(child_role=child_role):
+                    own = probe.api.token(probe.n.current_process(), TOKEN_QUERY | 2)
+                    try:
+                        primary = probe.api.clone(own, TOKEN_QUERY | 2 | 1)
+                    finally:
+                        probe.api.close(own)
+                    try:
+                        token = probe.filtered(primary, None) if child_role == 'refiltered' else primary
+                        try:
+                            report['children'].append(probe.launch(
+                                token, manifest_path, child_role, [sys.stdin, sys.stdout, sys.stderr]))
+                        finally:
+                            if token != primary:
+                                probe.api.close(token)
+                    finally:
+                        probe.api.close(primary)
+                attempt = access_outcome(child_role + '-launch', relaunch)
+                attempt['expected'] = 'characterized'
+                report['operations'].append(attempt)
+        (Path(manifest_path).parent / (role + '.json')).write_text(json.dumps(report))
+    finally:
+        probe.api.close(source)
+
+
+def state_writer_child(manifest_path):
+    # Exercise the shipped process-object protection, not a more favorable
+    # test-only process DACL. This leaf is staged by the existing CI harness.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from loki_agent.process_protections import protect_credential_process
+    protect_credential_process()
+    manifest = json.loads(Path(manifest_path).read_text())
+    native = AppContainers()
+    probe = StateTokenProbe(native)
+    role_sid = HANDLE()
+    native.check(probe.api.parse_sid(manifest['role_sid'], C.byref(role_sid)))
+    with ExitStack() as cleanup:
+        cleanup.callback(native.local_free, role_sid)
+        current = probe.api.token(native.current_process(), TOKEN_QUERY | 2)
+        try:
+            source = probe.api.clone(current, TOKEN_QUERY | 2 | 1)
+        finally:
+            probe.api.close(current)
+        cleanup.callback(probe.api.close, source)
+        report = {'writer_token': probe.api.snapshot(source), 'children': []}
+        memory = C.create_string_buffer(b'SYNTHETIC-STATE-WRITER')
+        handle = native.open(Path(manifest['state']) / 'writer-handle', access=GENERIC_WRITE)
+        cleanup.callback(probe.api.close, handle)
+        manifest.update({'writer_pid': os.getpid(), 'writer_handle': handle,
+                         'writer_memory': C.addressof(memory), 'writer_memory_size': C.sizeof(memory)})
+        Path(manifest_path).write_text(json.dumps(manifest))
+        # Both the direct memory and file operations have successful controls
+        # before hostile children try to recover these authorities.
+        memory_control = C.create_string_buffer(C.sizeof(memory))
+        memory_read = C.c_size_t()
+        native.check(probe.api.read_memory(
+            native.current_process(), C.addressof(memory), memory_control,
+            len(memory_control), C.byref(memory_read)))
+        if memory_control.raw != memory.raw or memory_read.value != C.sizeof(memory):
+            raise RuntimeError('writer memory control failed')
+        native.write_all(handle, b'writer control')
+        stdin = cleanup.enter_context(open(Path(manifest['workspace']) / 'stdin', 'rb'))
+        for role in ['control', 'filtered']:
+            token = source if role == 'control' else probe.filtered(source, role_sid)
+            try:
+                stdout = cleanup.enter_context(open(Path(manifest['state']) / (role + '.stdout'), 'wb', buffering=0))
+                stderr = cleanup.enter_context(open(Path(manifest['state']) / (role + '.stderr'), 'wb', buffering=0))
+
+                def publish(process):
+                    workspace = Path(manifest['workspace'])
+                    while not (workspace / 'filtered-ready').exists():
+                        if native.wait(process, 0) != 258:
+                            raise RuntimeError('filtered child exited before its workspace control')
+                        time.sleep(0.01)
+                    state = Path(manifest['state'])
+                    temporary = state / '.owner-publication'
+                    temporary.write_bytes(b'owner publication')
+                    os.replace(temporary, state / 'published-later')
+                    (workspace / 'writer-published').write_text('ready')
+
+                report['children'].append(probe.launch(
+                    token, manifest_path, role, [stdin, stdout, stderr],
+                    observe=publish if role == 'filtered' else None))
+            finally:
+                if token != source:
+                    probe.api.close(token)
+        (Path(manifest_path).parent / 'state-owner-report.json').write_text(json.dumps(report))
+
+
+def state_probe_failures(report, role_sid, package):
+    failures = []
+    owner = report['writer_token']['user']
+
+    def visit(item):
+        body = item.get('report', item)
+        role = body.get('role')
+        for token in [item.get('kernel_token'), body.get('token')]:
+            if token is None:
+                continue
+            if token['app'] != 1 or token['package'] != package or token['user'] != owner:
+                failures.append({'role': role, 'unexpected_identity': token})
+            if role != 'control' and not any(sid == role_sid for sid, _flags in token['restricting_sids']):
+                failures.append({'role': role, 'missing_restricting_sid': token})
+        for row in body.get('operations', []):
+            if probe_failed(row):
+                failures.append({'role': role, **row})
+        for child in body.get('children', []):
+            visit(child)
+
+    visit(report)
+    return failures
 
 
 def cleanup_tree(directory, depth):
@@ -1168,6 +1556,8 @@ def _remaining_milliseconds(deadline, now=None):
     """Wait budget for a monotonic deadline; the classic 90 s when None."""
     if deadline is None:
         return 90000
+    if deadline == float('inf'):
+        return 0xffffffff  # INFINITE: explicitly unbounded native experiment.
     if now is None:
         now = time.monotonic()
     return max(0, int((deadline - now) * 1000))
@@ -2694,8 +3084,181 @@ class AppContainerMarshallingTests(unittest.TestCase):
         native.close.assert_called_once()
 
 
+class StateTokenProbeTests(unittest.TestCase):
+    def test_restricting_sid_and_write_only_flag_reach_native_call(self):
+        probe = StateTokenProbe.__new__(StateTokenProbe)
+        probe.n = mock.Mock()
+        calls = []
+
+        def restrict(*arguments):
+            source, flags, disabled, disabled_sids, removed, privileges, count, sids, result = arguments
+            entry = C.cast(sids, C.POINTER(primitives['SidAttributes'])).contents if count else None
+            calls.append({'source': source, 'flags': flags, 'disabled': disabled,
+                          'disabled_sids': disabled_sids, 'removed': removed,
+                          'privileges': privileges, 'count': count,
+                          'sid': entry.Sid if entry is not None else None,
+                          'attributes': entry.Attributes if entry is not None else None})
+            C.cast(result, C.POINTER(HANDLE)).contents.value = 77
+            return 1
+
+        probe.restrict = restrict
+        self.assertEqual(probe.filtered(17, HANDLE(23)), 77)
+        self.assertEqual(calls[0], {
+            'source': 17, 'flags': 0x8, 'disabled': 0, 'disabled_sids': None,
+            'removed': 0, 'privileges': None, 'count': 1, 'sid': 23, 'attributes': 0})
+        self.assertEqual(probe.filtered(17, None), 77)
+        self.assertEqual(calls[1]['count'], 0)
+        self.assertEqual(calls[1]['flags'], 0)
+        self.assertIsNone(calls[1]['sid'])
+
+    def test_state_probe_verdict_rejects_bad_controls_and_missing_restrictions(self):
+        token = {'app': 1, 'package': 'package', 'user': 'owner', 'restricting_sids': []}
+        operations = [
+            {'operation': 'workspace-write', 'outcome': 'access-denied', 'expected': 'allowed'},
+            {'operation': 'state-write', 'outcome': 'allowed', 'expected': 'access-denied'},
+            {'operation': 'invalid-call', 'outcome': 'unexpected-error', 'expected': 'characterized'},
+        ]
+        report = {'writer_token': token, 'children': [{
+            'kernel_token': token,
+            'report': {'role': 'filtered', 'token': token, 'operations': operations}}]}
+        failures = state_probe_failures(report, 'tool-role', 'package')
+        self.assertTrue(any('missing_restricting_sid' in failure for failure in failures))
+        self.assertEqual({failure['operation'] for failure in failures if 'operation' in failure},
+                         {'workspace-write', 'state-write', 'invalid-call'})
+
+    def test_explicitly_unbounded_probe_uses_infinite_native_wait(self):
+        self.assertEqual(_remaining_milliseconds(float('inf')), 0xffffffff)
+
+
 @unittest.skip('requires explicit --standard-user invocation in disposable CI stage')
 class AppContainerTests(unittest.TestCase):
+    maxDiff = None
+
+    def test_write_restricted_tools_keep_state_read_only(self):
+        native = AppContainers()
+        details = native.token_details(include_groups=True)
+        owner = details['user']
+        primitives['require_standard_user'](details, owner)
+        stage = Path(__file__).resolve().parent
+        if (not stage.name.startswith('LokiStorageProbes-') or
+                Path(sys.base_prefix) != stage / 'runtime'):
+            raise RuntimeError('refusing ACL changes outside disposable CI copies')
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        workspace, state = root / 'workspace', root / 'state'
+        workspace.mkdir()
+        state.mkdir()
+        name = 'Loki.StateProbe.' + uuid.uuid4().hex
+        sid, role_sid = HANDLE(), HANDLE()
+        native.hresult(native.profile(name, name, name, None, 0, C.byref(sid)))
+        self.addCleanup(lambda: native.hresult(native.delete_profile(name)))
+        self.addCleanup(lambda: native.free_sid(sid))
+        native.hresult(native.derive_profile_sid(name + '.tools', C.byref(role_sid)))
+        self.addCleanup(lambda: native.free_sid(role_sid))
+        package, role = native.sid(sid), native.sid(role_sid)
+        grant = subprocess.run(
+            ['icacls.exe', str(stage), '/grant', '*%s:(OI)(CI)RX' % package, '/T', '/Q'],
+            capture_output=True, text=True)
+        self.assertEqual(grant.returncode, 0, grant.stdout + grant.stderr)
+        native.acl(root, private_dacl(owner) + '(A;;0x%X;;;%s)' % (FILE_TRAVERSE, package))
+        native.acl(workspace, private_dacl(owner) +
+                   '(A;OICI;0x%X;;;%s)(A;OICI;0x%X;;;%s)' %
+                   (FILE_MODIFY, package, FILE_MODIFY, role))
+        native.acl(state, private_dacl(owner) +
+                   '(A;OICI;0x%X;;;%s)' % (FILE_MODIFY, package))
+        # Low labels make the writer-positive control real: otherwise MIC can
+        # deny both tokens and conceal a missing restricting-SID boundary.
+        for directory in [workspace, state]:
+            label = subprocess.run(
+                ['icacls.exe', str(directory), '/setintegritylevel', '(OI)(CI)L'],
+                capture_output=True, text=True)
+            self.assertEqual(label.returncode, 0, label.stdout + label.stderr)
+        for role_name in ['control', 'filtered', 'descendant', 'duplicated', 'refiltered', 'recovered']:
+            directory = state / role_name
+            directory.mkdir()
+            for leaf in ['read', 'append', 'truncate', 'delete', 'rename', 'replace', 'replacement']:
+                (directory / leaf).write_bytes(b'original')
+            (directory / 'empty-directory').mkdir()
+            protected = workspace / ('protected-' + role_name)
+            protected.mkdir()
+            native.acl(protected, private_dacl(owner) +
+                       '(A;OICI;0x%X;;;%s)' % (FILE_MODIFY, package))
+        setup = state / 'setup'
+        setup.mkdir()
+        native.acl(setup, private_dacl(owner))
+        (setup / 'ledger').write_bytes(b'SYNTHETIC-SETUP')
+        configuration = root / 'config'
+        configuration.mkdir()
+        credentials = configuration / 'credentials'
+        credentials.mkdir()
+        native.acl(credentials, private_dacl(owner))
+        native.acl(configuration, private_dacl(owner) + '(A;OICI;FRFX;;;%s)' % package)
+        (configuration / 'SYSTEM.md').write_bytes(b'SYNTHETIC-CONFIGURATION')
+        (credentials / 'tokens').write_bytes(b'SYNTHETIC-CREDENTIALS')
+        (state / 'writer-handle').write_bytes(b'writer control')
+        (workspace / 'stdin').write_bytes(b'')
+        os.link(state / 'filtered' / 'append', workspace / 'state-hardlink')
+        junction = workspace / 'state-junction'
+        link = subprocess.run(
+            ['cmd.exe', '/d', '/c', 'mklink', '/J', str(junction), str(state)],
+            capture_output=True, text=True)
+        self.assertEqual(link.returncode, 0, link.stdout + link.stderr)
+        self.addCleanup(lambda: os.rmdir(junction))
+        manifest = workspace / 'state-manifest.json'
+        manifest.write_text(json.dumps({
+            'manifest': str(manifest), 'workspace': str(workspace), 'state': str(state),
+            'setup': str(setup / 'ledger'), 'credentials': str(credentials / 'tokens'),
+            'configuration': str(configuration / 'SYSTEM.md'),
+            'owner': owner, 'package': package, 'role_sid': role}))
+        log = root / 'state-probe.log'
+
+        def live_diagnostics(process, _job):
+            offsets = {}
+            while True:
+                for output in [log, *state.glob('*.stdout'), *state.glob('*.stderr')]:
+                    if not output.exists():
+                        continue
+                    with output.open('rb') as stream:
+                        stream.seek(offsets.get(output, 0))
+                        chunk = stream.read()
+                        offsets[output] = stream.tell()
+                    if chunk:
+                        print(json.dumps({'state_probe_live': output.name,
+                                          'text': chunk.decode(errors='replace')}), flush=True)
+                status = native.wait(process, 0)
+                if status == 0:
+                    return
+                if status != 258:
+                    raise RuntimeError('state probe diagnostic wait failed: %s' % status)
+                time.sleep(0.05)
+
+        code = native.launch(
+            [sys.executable, '-I', '-u', __file__, '--state-writer', str(manifest)],
+            sid, workspace, log, deadline=float('inf'), observe=live_diagnostics)
+        print(log.read_text(errors='replace'), flush=True)
+        # Child stdout/stderr are intentionally the state spools, not the
+        # broker log; retain their complete diagnostics even on setup failure.
+        for output in sorted(state.glob('*.stdout')) + sorted(state.glob('*.stderr')):
+            print(json.dumps({'state_spool': output.name,
+                              'text': output.read_text(errors='replace')}), flush=True)
+        self.assertEqual(code, 0, 'native state/token experiment failed; see complete logs')
+        report = json.loads((workspace / 'state-owner-report.json').read_text())
+        print(json.dumps({'windows_state_probe': report}), flush=True)
+        self.assertEqual(state_probe_failures(report, role, package), [])
+        self.assertEqual((state / 'published-later').read_bytes(), b'owner publication')
+        self.assertEqual((setup / 'ledger').read_bytes(), b'SYNTHETIC-SETUP')
+        self.assertEqual((credentials / 'tokens').read_bytes(), b'SYNTHETIC-CREDENTIALS')
+        self.assertEqual((configuration / 'SYSTEM.md').read_bytes(), b'SYNTHETIC-CONFIGURATION')
+        for directory in ['filtered', 'descendant', 'duplicated', 'refiltered']:
+            for leaf in ['append', 'truncate', 'delete', 'rename', 'replace']:
+                self.assertEqual((state / directory / leaf).read_bytes(), b'original')
+            self.assertFalse((state / directory / 'created').exists())
+            self.assertTrue((state / directory / 'empty-directory').is_dir())
+            self.assertTrue((workspace / ('protected-' + directory)).is_dir())
+        (state / 'outside-user').write_bytes(b'user access remains')
+        self.assertEqual((state / 'outside-user').read_bytes(), b'user access remains')
+
     def test_runtime_gate(self):
         """Native evidence for the shipped in-container containment gate.
 
@@ -3437,6 +4000,12 @@ if __name__ == '__main__':
         # COM appends this flag to local-server command lines; the witness
         # dispatch must not be confused by it.
         sys.argv.remove('-Embedding')
+    if len(sys.argv) == 3 and sys.argv[1] == '--state-writer':
+        state_writer_child(sys.argv[2])
+        sys.exit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == '--state-access':
+        state_access_child(sys.argv[2], sys.argv[3])
+        sys.exit(0)
     if len(sys.argv) == 5 and sys.argv[1] == '--broker-death':
         broker_death(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]))
         sys.exit(0)
