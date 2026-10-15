@@ -692,6 +692,11 @@ class ProcessAccess(enum.IntFlag):
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 
+# https://learn.microsoft.com/en-us/windows/win32/procthread/thread-security-and-access-rights
+class ThreadAccess(enum.IntFlag):
+    THREAD_TERMINATE = 0x0001
+
+
 # Process creation flags, from
 # https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
 class CreateProcessFlags(enum.IntFlag):
@@ -788,8 +793,11 @@ class FileFlags(enum.IntFlag):
 ERROR_FILE_NOT_FOUND = 2
 ERROR_PATH_NOT_FOUND = 3
 ERROR_ACCESS_DENIED = 5
+ERROR_SHARING_VIOLATION = 32
 ERROR_BROKEN_PIPE = 109
+ERROR_NOT_FOUND = 1168
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+FILE_TYPE_PIPE = 3
 
 
 class SecurityCapabilities(ctypes.Structure):

@@ -829,22 +829,23 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
     stderr_task = asyncio.create_task(
         _read_stream_limited(process.stderr, stderr_limit))
 
+    # This waiter owns the protocol's stdin-close future. Cancelling the write
+    # task must not cancel that future before pipe_connection_lost completes it.
+    stdin_closed = asyncio.create_task(process.stdin.wait_closed())
+
     async def write_stdin():
         try:
             process.stdin.write(stdin_data)
             await process.stdin.drain()
         finally:
             process.stdin.close()
-            # Python 3.10 records a broken child stdin on the stream's close
-            # waiter. Await it so timeout cancellation consumes that result
-            # instead of leaking an unretrieved-future warning at loop exit.
-            with contextlib.suppress(
-                    BrokenPipeError, ConnectionError, OSError):
-                await process.stdin.wait_closed()
+            with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+                await asyncio.shield(stdin_closed)
 
     stdin_task = asyncio.create_task(write_stdin())
 
     async def terminate():
+        process.stdin.close()
         if process.returncode is None:
             try:
                 process.kill()
@@ -855,7 +856,7 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
             if not task.done():
                 task.cancel()
         await asyncio.gather(
-            stdin_task, stdout_task, stderr_task, return_exceptions=True)
+            stdin_task, stdout_task, stderr_task, stdin_closed, return_exceptions=True)
 
     try:
         operation = asyncio.gather(

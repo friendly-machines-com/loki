@@ -104,7 +104,7 @@ def _read(directory, name):
     except FileNotFoundError:
         return {}
     try:
-        facts = private_files.describe(fd)
+        facts = private_files.information(fd)
         if not facts.regular or facts.reparse_point:
             raise ValueError("response status snapshot is not a regular file")
         chunks = []
@@ -166,16 +166,7 @@ class Store:
         self._name = os.path.basename(self.path)
         if self._name in ['', '.', '..']:
             raise ValueError("response status path must name a file")
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        fd = private_files.open_directory(directory)
-        try:
-            facts = private_files.describe(fd)
-            if not facts.directory or facts.reparse_point:
-                raise OSError("response status root is not a plain directory")
-        except BaseException:
-            private_files.close(fd)
-            raise
-        self._directory_fd = fd
+        self._directory_fd = private_files.open_directory_tree(directory)
         self.observations = {}
         self.dirty = False
         # A high-low observation id: the high half is random and unique to
@@ -265,7 +256,7 @@ class Store:
             raise OSError(
                 f"could not open response status lock: {error}") from error
         try:
-            facts = private_files.describe(lock_fd)
+            facts = private_files.information(lock_fd)
             if not facts.regular or facts.reparse_point:
                 raise OSError("response status lock is not a regular file")
             deadline = asyncio.get_running_loop().time() + 0.25

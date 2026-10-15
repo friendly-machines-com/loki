@@ -570,7 +570,7 @@ class StateTokenProbe:
                     token, sys.executable, command, None, None, True,
                     CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, None,
                     str(Path(manifest_path).parent), C.byref(startup), C.byref(child)))
-                cleanup.callback(lambda: native.check(native.close(child.process)))
+                # retire() both reaps and closes the process handle.
                 cleanup.callback(self.api.retire, child.process)
                 cleanup.callback(lambda: native.check(native.close(child.thread)))
             finally:
@@ -2897,7 +2897,7 @@ print('RETURNED', flush=True)
                         subprocess.TimeoutExpired(['encoded-command'], 15,
                                                   output=stdout, stderr=stderr))):
                 with self.assertRaisesRegex(RuntimeError, 'timed out after 15'):
-                    run('script', 'wmi')
+                    run('script', 'wmi', timeout=15)
                 diagnostic = json.loads(printed.call_args.args[0])
                 self.assertTrue(diagnostic['timed_out'])
                 self.assertEqual(diagnostic['probe'], 'wmi')
@@ -2922,7 +2922,7 @@ print('RETURNED', flush=True)
                 else:
                     with self.assertRaises(RuntimeError):
                         api.powershell_startup()
-                self.assertEqual(launch.call_args.kwargs['timeout'], 15)
+                self.assertIsNone(launch.call_args.kwargs['timeout'])
                 self.assertNotIn('env', launch.call_args.kwargs)
 
     def test_wmi_wrapper_protocol_failures_remain_errors(self):
@@ -3085,6 +3085,69 @@ class AppContainerMarshallingTests(unittest.TestCase):
 
 
 class StateTokenProbeTests(unittest.TestCase):
+    def test_launch_cleanup_has_exactly_one_process_handle_owner(self):
+        native = mock.Mock()
+        closed = []
+
+        def close(handle):
+            if handle in closed:
+                return False
+            closed.append(handle)
+            return True
+
+        def check(value):
+            if not value:
+                raise OSError('invalid or already closed handle')
+            return value
+
+        def initialize(attributes, count, flags, size):
+            C.cast(size, C.POINTER(C.c_size_t)).contents.value = 64
+            return attributes is not None
+
+        def create(*arguments):
+            child = C.cast(arguments[-1], C.POINTER(ProcessInfos)).contents
+            child.process, child.thread, child.pid = 77, 88, 123
+            return True
+
+        def in_job(process, job, result):
+            C.cast(result, C.POINTER(W.BOOL)).contents.value = True
+            return True
+
+        native.close.side_effect = close
+        native.check = check
+        native.initialize.side_effect = initialize
+        native.update.return_value = True
+        native.in_job.side_effect = in_job
+        native.resume.return_value = 1
+        native.wait.return_value = 0
+        native.exit_code.return_value = True
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = native
+        api.create_as_user = create
+        api.token = mock.Mock(return_value=99)
+        snapshot = {'app': 1, 'package': 'package', 'user': 'owner', 'restricting_sids': []}
+        api.snapshot = mock.Mock(return_value=snapshot)
+        probe = StateTokenProbe.__new__(StateTokenProbe)
+        probe.n, probe.api = native, api
+        streams = [mock.Mock() for _ in range(3)]
+        for index, stream in enumerate(streams):
+            stream.fileno.return_value = index
+        crt = mock.Mock()
+        crt.get_osfhandle.side_effect = lambda descriptor: descriptor + 1000
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                mock.patch.object(os, 'get_handle_inheritable', return_value=False, create=True), \
+                mock.patch.object(os, 'set_handle_inheritable', create=True):
+            manifest = Path(directory) / 'manifest.json'
+            manifest.write_text(json.dumps({'owner': 'owner', 'package': 'package'}))
+            (Path(directory) / 'control.json').write_text(json.dumps({'role': 'control'}))
+            probe.launch(17, manifest, 'control', streams)
+        # This runs the real Escapes.retire(), including its close. A second
+        # close registration makes the same launch fail, as it did on CI.
+        self.assertEqual(closed, [99, 88, 77])
+        native.delete_attributes.assert_called_once()
+        native.terminate.assert_not_called()
+
     def test_restricting_sid_and_write_only_flag_reach_native_call(self):
         probe = StateTokenProbe.__new__(StateTokenProbe)
         probe.n = mock.Mock()
@@ -3201,7 +3264,8 @@ class AppContainerTests(unittest.TestCase):
         os.link(state / 'filtered' / 'append', workspace / 'state-hardlink')
         junction = workspace / 'state-junction'
         link = subprocess.run(
-            ['cmd.exe', '/d', '/c', 'mklink', '/J', str(junction), str(state)],
+            ['cmd.exe', '/d', '/c', 'mklink', '/J',
+             str(junction).replace('/', '\\'), str(state).replace('/', '\\')],
             capture_output=True, text=True)
         self.assertEqual(link.returncode, 0, link.stdout + link.stderr)
         self.addCleanup(lambda: os.rmdir(junction))

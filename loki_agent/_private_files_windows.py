@@ -28,7 +28,7 @@ import os
 
 from . import windows_acl, windows_api
 from .credential_errors import CredentialStorageError
-from .file_facts import FileFacts
+from .file_facts import FileFacts, FileInfo
 
 
 # Trustees that may hold access to a private credential object besides its
@@ -128,32 +128,35 @@ def _is_shared(sddl, owner: str, inheritable: bool = False) -> bool:
     return not trustees <= allowed
 
 
-def _facts_from_handle(handle) -> FileFacts:
-    """Describe an open object the way the storage needs it.
-
-    The object's facts come from the handle, so a rename between the open and
-    the query cannot change which object is described.
-    """
+def information(handle) -> FileInfo:
+    """Read type and size without applying credential-specific ACL policy."""
     try:
-        information = windows_api.by_handle_file_information(handle)
+        result = windows_api.by_handle_file_information(handle)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+    attributes = result.dwFileAttributes
+    directory = bool(attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY)
+    return FileInfo(
+        regular=not directory,
+        directory=directory,
+        reparse_point=bool(attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT),
+        size=(result.nFileSizeHigh << 32) | result.nFileSizeLow,
+    )
+
+
+def _facts_from_handle(handle) -> FileFacts:
+    """The credential store additionally requires owner and DACL validation."""
+    info = information(handle)
+    try:
         owner = windows_api.handle_owner_sid(handle)
         dacl = windows_api.handle_dacl_sddl(handle)
         current_user = windows_api.current_user_sid()
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
-    attributes = information.dwFileAttributes
-    directory = bool(
-        attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY)
     return FileFacts(
-        # Windows has no device/pipe distinction here; a non-directory is the
-        # regular-file equivalent, and a reparse point is refused separately.
-        regular=not directory,
-        directory=directory,
-        reparse_point=bool(
-            attributes & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT),
-        size=(information.nFileSizeHigh << 32) | information.nFileSizeLow,
+        **vars(info),
         owned_by_current_user=(owner == current_user),
-        group_or_other_access=_is_shared(dacl, owner, inheritable=directory),
+        group_or_other_access=_is_shared(dacl, owner, inheritable=info.directory),
     )
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -353,7 +354,7 @@ class ExternalHookTests(unittest.TestCase):
                 timeout=10,
             )
 
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("Hook configuration error:", result.stderr)
         self.assertNotIn("\x1b", result.stdout + result.stderr)
 
@@ -525,25 +526,72 @@ class ExternalHookTests(unittest.TestCase):
         script = "import time; time.sleep(10)"
 
         async def scenario(directory):
-            started = asyncio.get_running_loop().time()
-            with self.assertRaisesRegex(
-                    tool_runtime.HookExecutionError,
-                    "hook timed out after 20ms"):
-                await asyncio.wait_for(
-                    tool_runtime._run_hook_command(
-                        [sys.executable, "-c", script],
-                        {"large": "x" * 2_000_000},
-                        directory,
-                        20,
-                    ),
-                    timeout=1,
-                )
-            return asyncio.get_running_loop().time() - started
+            loop = asyncio.get_running_loop()
+            previous = loop.get_exception_handler()
+            errors = []
+            loop.set_exception_handler(lambda _loop, context: errors.append(context))
+            started = loop.time()
+            try:
+                with self.assertRaisesRegex(
+                        tool_runtime.HookExecutionError,
+                        "hook timed out after 20ms"):
+                    await asyncio.wait_for(
+                        tool_runtime._run_hook_command(
+                            [sys.executable, "-c", script],
+                            {"large": "x" * 2_000_000}, directory, 20),
+                        timeout=1)
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                self.assertEqual(errors, [])
+                return loop.time() - started
+            finally:
+                loop.set_exception_handler(previous)
 
         with tempfile.TemporaryDirectory() as directory:
             elapsed = asyncio.run(scenario(directory))
 
         self.assertLess(elapsed, 0.5)
+
+    def test_cancelled_hook_joins_stdin_close_without_protocol_errors(self):
+        async def scenario(directory):
+            loop = asyncio.get_running_loop()
+            previous = loop.get_exception_handler()
+            errors = []
+            loop.set_exception_handler(lambda _loop, context: errors.append(context))
+            started = asyncio.Event()
+            processes = []
+            spawn = asyncio.create_subprocess_exec
+
+            async def observed(*arguments, **options):
+                process = await spawn(*arguments, **options)
+                processes.append(process)
+                started.set()
+                return process
+
+            operation = None
+            try:
+                with mock.patch.object(asyncio, 'create_subprocess_exec', new=observed):
+                    operation = asyncio.create_task(tool_runtime._run_hook_command(
+                        [sys.executable, '-c', 'import time; time.sleep(60)'],
+                        {'large': 'x' * 2_000_000}, directory, None))
+                    await started.wait()
+                    operation.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await operation
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                self.assertIsNotNone(processes[0].returncode)
+                with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+                    await processes[0].stdin.wait_closed()
+                self.assertEqual(errors, [])
+            finally:
+                if operation is not None and not operation.done():
+                    operation.cancel()
+                    await asyncio.gather(operation, return_exceptions=True)
+                loop.set_exception_handler(previous)
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(directory))
 
     def test_invalid_hook_config_is_rejected_before_use(self):
         with tempfile.TemporaryDirectory() as directory:

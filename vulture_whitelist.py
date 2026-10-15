@@ -20,6 +20,9 @@ _.optionxform
 
 # Windows constants tested against the native API; ctypes reads these fields.
 PROCESS_QUERY_LIMITED_INFORMATION
+# Native retained-directory tests distinguish refused ancestor renames from
+# successful replacement using this shared declaration, never a copy.
+ERROR_SHARING_VIOLATION
 # ConsoleInputMode is complete for the modes Loki deals with; raw_input_mode
 # leaves ENABLE_EXTENDED_FLAGS alone, and the terminal test sets it.
 _.ENABLE_EXTENDED_FLAGS

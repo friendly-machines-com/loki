@@ -64,7 +64,7 @@ def _read_spool_tail(directory_fd, name: str,
     except FileNotFoundError:
         return ""
     try:
-        facts = private_files.describe(fd)
+        facts = private_files.information(fd)
         if not facts.regular or facts.reparse_point:
             raise OSError("job spool is not a regular file")
         start = max(0, facts.size - max_chars * 4)
@@ -181,15 +181,8 @@ class JobManager:
         if self._closed:
             raise ValueError("job storage is closed")
         if self._session_fd is None:
+            base_fd = private_files.open_directory_tree(self.base_dir)
             try:
-                base_fd = private_files.open_directory(self.base_dir)
-            except FileNotFoundError:
-                os.makedirs(self.base_dir, exist_ok=True)
-                base_fd = private_files.open_directory(self.base_dir)
-            try:
-                facts = private_files.describe(base_fd)
-                if not facts.directory or facts.reparse_point:
-                    raise OSError("job root is not a plain directory")
                 try:
                     private_files.create_directory_at(base_fd, self.session_id)
                 except OSError as error:
@@ -218,7 +211,7 @@ class JobManager:
         try:
             fd = private_files.open_append_at(directory, name)
             try:
-                facts = private_files.describe(fd)
+                facts = private_files.information(fd)
                 if not facts.regular or facts.reparse_point:
                     raise OSError("job spool is not a regular file")
                 view = memoryview(data)

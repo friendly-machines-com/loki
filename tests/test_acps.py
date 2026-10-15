@@ -2800,6 +2800,7 @@ class WorkerReasoningConfigTests(unittest.TestCase):
             self.assertIn('answer-3', json.dumps(saved['events']))
 
 
+@unittest.skipUnless(os.name == 'posix', 'requires a POSIX controlling pseudo-terminal')
 class TtyStdinTests(unittest.TestCase):
     """The front must work when stdin is a tty, not just a pipe.
 

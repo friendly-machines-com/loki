@@ -10,17 +10,27 @@ from __future__ import annotations
 import os
 import stat
 
-from .file_facts import FileFacts
+from .file_facts import FileFacts, FileInfo
 
 
-def _facts(result) -> FileFacts:
-    return FileFacts(
+def _information(result) -> FileInfo:
+    return FileInfo(
         regular=stat.S_ISREG(result.st_mode),
         directory=stat.S_ISDIR(result.st_mode),
         # O_NOFOLLOW refused a link at open; a link seen by describe_path is
         # neither a regular file nor a directory, which the store refuses.
         reparse_point=False,
         size=result.st_size,
+    )
+
+
+def information(fd) -> FileInfo:
+    return _information(os.fstat(fd))
+
+
+def _facts(result) -> FileFacts:
+    return FileFacts(
+        **vars(_information(result)),
         owned_by_current_user=result.st_uid == os.geteuid(),
         group_or_other_access=bool(stat.S_IMODE(result.st_mode) & 0o077),
     )

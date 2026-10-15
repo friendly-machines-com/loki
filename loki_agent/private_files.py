@@ -24,10 +24,11 @@ directory before it is opened.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from .credential_errors import CredentialStorageError
-from .file_facts import FileFacts
+from .file_facts import FileFacts, FileInfo
 
 
 if sys.platform == "win32":
@@ -39,6 +40,7 @@ if sys.platform == "win32":
         describe,
         describe_path,
         fsync,
+        information,
         open_append_at,
         open_directory,
         open_directory_at,
@@ -59,6 +61,7 @@ else:
         describe,
         describe_path,
         fsync,
+        information,
         open_append_at,
         open_directory,
         open_directory_at,
@@ -72,9 +75,41 @@ else:
     )
 
 
+def open_directory_tree(path, mode=0o700):
+    """Acquire a state directory, creating missing children from native opens.
+
+    Do not stat each ancestor with os.makedirs: a contained Windows process
+    may traverse an existing path without permission to inspect the drive root.
+    Only the initial acquisition uses names; callers retain the returned handle.
+    """
+    handle = None
+    try:
+        try:
+            handle = open_directory(path)
+        except FileNotFoundError:
+            parent, name = os.path.split(path)
+            if not name or name in ['.', '..']:
+                raise
+            directory = open_directory_tree(parent or '.', mode)
+            try:
+                create_directory_at(directory, name, mode)
+                handle = open_directory_at(directory, name)
+            finally:
+                close(directory)
+        info = information(handle)
+        if not info.directory or info.reparse_point:
+            raise NotADirectoryError("state path is not a plain directory")
+        return handle
+    except BaseException:
+        if handle is not None:
+            close(handle)
+        raise
+
+
 __all__ = [
     "CredentialStorageError",
     "FileFacts",
+    "FileInfo",
     "binary_file",
     "close",
     "create_directory_at",
@@ -82,9 +117,11 @@ __all__ = [
     "describe",
     "describe_path",
     "fsync",
+    "information",
     "open_append_at",
     "open_directory",
     "open_directory_at",
+    "open_directory_tree",
     "open_lock_file_at",
     "open_read_at",
     "read",

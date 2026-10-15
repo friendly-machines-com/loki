@@ -194,14 +194,14 @@ def caller_token_launch(api, executable):
         api.close(primary)
 
 
-def run_powershell(script, probe):
+def run_powershell(script, probe, *, timeout=None):
     shell = Path(os.environ['SystemRoot']) / (
         'System32/WindowsPowerShell/v1.0/powershell.exe')
     command = [str(shell), '-NoLogo', '-NoProfile', '-NonInteractive',
                '-EncodedCommand',
                base64.b64encode(script.encode('utf-16-le')).decode()]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
         # TimeoutExpired can contain bytes even when text=True was requested.
         def text(value):
@@ -209,7 +209,7 @@ def run_powershell(script, probe):
         print(json.dumps({'probe': probe, 'timed_out': True,
                           'stdout': text(error.stdout),
                           'stderr': text(error.stderr)}), flush=True)
-        raise RuntimeError('%s wrapper timed out after 15 seconds' % probe) from error
+        raise RuntimeError('%s wrapper timed out after %s seconds' % (probe, error.timeout)) from error
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError('%s wrapper did not complete: %s' % (probe, error)) from error
     print(json.dumps({'probe': probe, 'wrapper_exit': result.returncode,

@@ -13,12 +13,18 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class FileFacts:
-    """What a caller needs to know about an object, per platform."""
+class FileInfo:
+    """Handle-bound type and size, without interpreting credential privacy."""
 
     regular: bool
     directory: bool
     reparse_point: bool
     size: int
+
+
+@dataclass(frozen=True)
+class FileFacts(FileInfo):
+    """File information plus the strict credential-store privacy checks."""
+
     owned_by_current_user: bool
     group_or_other_access: bool

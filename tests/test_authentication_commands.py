@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import threading
 import time
 import urllib.parse
@@ -29,6 +30,22 @@ from loki_agent.credentials import CredentialStore
 from tests.test_oauth_logins import jwt, response
 
 
+@contextlib.contextmanager
+def separate_asyncio_diagnostics():
+    """Keep reactor diagnostics visible, separate from auth command stderr."""
+    logger = logging.getLogger('asyncio')
+    handler = logging.StreamHandler(sys.__stderr__)
+    previous = logger.propagate
+    logger.addHandler(handler)
+    logger.propagate = False
+    try:
+        yield
+    finally:
+        logger.propagate = previous
+        logger.removeHandler(handler)
+        handler.close()
+
+
 def tokens():
     return authentications.OpenAITokenSet(
         access_token="access-secret",
@@ -48,6 +65,15 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temporary.cleanup)
         self.storage = credential_storages.JsonCredentialStorage(
             os.path.join(self.temporary.name, "credentials"))
+
+    async def test_reactor_diagnostics_stay_visible_outside_command_stderr(self):
+        runner, command = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, '__stderr__', runner), separate_asyncio_diagnostics(), \
+                contextlib.redirect_stderr(command):
+            logging.getLogger('asyncio').warning('synthetic reactor diagnostic')
+            print('command error', file=sys.stderr)
+        self.assertIn('synthetic reactor diagnostic', runner.getvalue())
+        self.assertEqual(command.getvalue(), 'command error\n')
 
     async def test_browser_command_through_durable_subscription_lifecycle(self):
         await self._subscription_workflow(device=False)
@@ -145,6 +171,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(http_client, "async_http_request", new=request), \
                 mock.patch.object(authentication_commands.webbrowser, "open",
                                   side_effect=browser) as launcher, \
+                separate_asyncio_diagnostics(), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             args = ["login", "openai"] + (["--device-code"] if device else [])
             self.assertEqual(await asyncio.wait_for(authentication_commands.run(

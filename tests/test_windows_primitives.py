@@ -1987,7 +1987,8 @@ class WindowsPrimitiveTests(unittest.TestCase):
         real.mkdir()
         alias = self.root / 'alias'
         result = subprocess.run(
-            ['cmd.exe', '/d', '/c', 'mklink', '/J', str(alias), str(real)],
+            ['cmd.exe', '/d', '/c', 'mklink', '/J',
+             str(alias).replace('/', '\\'), str(real).replace('/', '\\')],
             capture_output=True, text=True)
         record = {'probe': 'junction-alias', 'mklink_exit': result.returncode}
         if alias.exists():
@@ -2066,7 +2067,8 @@ class WindowsPrimitiveTests(unittest.TestCase):
         (real / 'child' / 'file').write_text('x')
         alias = self.root / 'alias'
         subprocess.run(
-            ['cmd.exe', '/d', '/c', 'mklink', '/J', str(alias), str(real)],
+            ['cmd.exe', '/d', '/c', 'mklink', '/J',
+             str(alias).replace('/', '\\'), str(real).replace('/', '\\')],
             capture_output=True, text=True)
         record = {'probe': 'path-semantics', 'alias_exists': alias.exists(),
                   'alias_is_dir': os.path.isdir(alias)}

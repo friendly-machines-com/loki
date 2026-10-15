@@ -26,7 +26,7 @@ def load_system_prompt():
     """
     try:
         file = os.path.join(paths.loki_config_dir(), "SYSTEM.md")
-        with open(file, encoding="utf-8") as source:
+        with open(file, encoding="utf-8", newline="") as source:
             return source.read()
     except FileNotFoundError:
         return DEFAULT_SYSTEM_PROMPT

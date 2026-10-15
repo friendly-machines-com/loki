@@ -40,6 +40,13 @@ class SystemPromptTests(unittest.TestCase):
         self.assertEqual(prompts.load_system_prompt(), expected.decode("utf-8"))
         self.assertEqual(self.file.read_bytes(), expected)
 
+    def test_literal_crlf_bytes_are_preserved_on_every_platform(self):
+        self.file.parent.mkdir(parents=True)
+        data = 'Literal caf\u00e9\r\n{cwd}\r\n'.encode('utf-8')
+        self.file.write_bytes(data)
+        self.assertEqual(prompts.load_system_prompt(), data.decode('utf-8'))
+        self.assertEqual(self.file.read_bytes(), data)
+
     @unittest.skipIf(os.name == "nt", "POSIX read-only file and directory modes")
     def test_read_only_config_supports_both_existing_and_missing_prompt(self):
         self.write_prompt("Read-only instructions")

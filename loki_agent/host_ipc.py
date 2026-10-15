@@ -169,15 +169,27 @@ def eof_stdin():
     must release both on every path, including launch failure.
     """
     if os.name == "nt":
-        # A pipe the child inherits and reads; the write end never survives
-        # this call, so the read end cannot block.
-        read, write = windows_api.create_pipe(inherit=True)
-        windows_api.close_handle(write)
+        import msvcrt
+
+        # CPython subprocess takes a CRT descriptor here, not a raw HANDLE.
+        # Ownership transfers exactly once; subprocess duplicates the standard
+        # handle for the child, so this parent copy need not be inheritable.
+        read, write = windows_api.create_pipe(inherit=False)
+        try:
+            windows_api.close_handle(write)
+        except BaseException:
+            windows_api.close_handle(read)
+            raise
+        try:
+            fd = msvcrt.open_osfhandle(read, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+        except BaseException:
+            windows_api.close_handle(read)
+            raise
 
         def close():
-            windows_api.close_handle(read)
+            os.close(fd)
 
-        return read, close
+        return fd, close
     read, write = os.pipe()
     os.close(write)
 

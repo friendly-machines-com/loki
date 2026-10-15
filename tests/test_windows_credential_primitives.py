@@ -79,8 +79,21 @@ class CredentialPrimitiveTests(unittest.TestCase):
             self.assertFalse(os.get_inheritable(stream.fileno()))
             stream.write(b'original')
         moved = self.root / 'moved'
-        self.directory.rename(moved)
-        self.directory.mkdir(mode=0o700)
+        renamed = False
+        try:
+            self.directory.rename(moved)
+        except PermissionError as error:
+            self.assertIn(error.winerror,
+                          [windows_api.ERROR_ACCESS_DENIED, windows_api.ERROR_SHARING_VIOLATION])
+            control = self.root / 'unheld'
+            control.mkdir()
+            control.rename(self.root / 'unheld-renamed')
+            print(json.dumps({'retained_child_ancestor_rename': 'blocked',
+                              'winerror': error.winerror}), flush=True)
+            moved = self.directory
+        else:
+            renamed = True
+            self.directory.mkdir(mode=0o700)
         appended = private_files.open_append_at(session, 'stdout.log')
         try:
             private_files.write(appended, b'-tail')
@@ -93,7 +106,8 @@ class CredentialPrimitiveTests(unittest.TestCase):
         finally:
             private_files.close(reader)
         self.assertEqual((moved / 'session' / 'stdout.log').read_bytes(), b'original-tail')
-        self.assertEqual(list(self.directory.iterdir()), [])
+        if renamed:
+            self.assertEqual(list(self.directory.iterdir()), [])
 
     def test_create_read_replace_and_unlink_round_trip(self):
         directory = _private_files_windows.open_directory(str(self.directory))

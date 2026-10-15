@@ -19,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 
 from loki_agent import host_ipc
@@ -68,7 +70,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                     [sys.executable, "-c", _REPORTS_EOF],
                     description="noninteractive stdin", cwd=str(workspace))
             finally:
-                await manager.close_session_owned()
+                await manager.aclose()
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.status, "exited", stderr)
             self.assertEqual(job.exit_code, 0, stderr)
@@ -101,7 +103,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                     description="shell stdin",
                     cwd=str(workspace))
             finally:
-                await manager.close_session_owned()
+                await manager.aclose()
             job, = manager.jobs.values()
             self.assertEqual(job.status, "exited", rendered)
             self.assertEqual(job.exit_code, 0, rendered)
@@ -127,7 +129,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                      "--color=never", "--", "marker"],
                     description="search child stdin", cwd=str(workspace))
             finally:
-                await manager.close_session_owned()
+                await manager.aclose()
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.exit_code, 0, stderr)
             self.assertEqual(
@@ -152,7 +154,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                     description="subagent stdin", cwd=str(workspace),
                     session_owned=True, subagent=True)
             finally:
-                await manager.close_session_owned()
+                await manager.aclose()
             self.assertEqual(status, "completed", stderr)
             self.assertEqual(job.exit_code, 0, stderr)
             self.assertEqual(
@@ -176,7 +178,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                     description="background stdin", cwd=str(workspace))
                 await manager._monitor_background_job(job)
             finally:
-                await manager.close_session_owned()
+                await manager.aclose()
             self.assertEqual(job.status, "exited")
             self.assertEqual(job.exit_code, 0)
             self.assertEqual(
@@ -228,7 +230,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                 # The child may outlive a failed expectation; releasing the
                 # pipe lets it exit on its own instead of lingering.
                 release.write_text("release", encoding="utf-8")
-                await manager.close_session_owned()
+                await manager.aclose()
             self.assertEqual(status, "cancelled", stderr)
             self.assertEqual(stdout.strip(), "stdin-bytes: 0", stderr)
             self.assertIsNone(
@@ -280,7 +282,7 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(
                     stdin, "a completed job still owns its stdin end")
             finally:
-                await manager.close_session_owned()
+                await manager.aclose()
 
     async def test_a_failed_launch_releases_the_stdin_it_acquired(self):
         """Launch failure must not strand a stdin pipe end.
@@ -305,7 +307,42 @@ class NoninteractiveStdinTests(unittest.IsolatedAsyncioTestCase):
                         getattr(job.process, "stdin", None),
                         "a failed launch retained its stdin end")
             finally:
-                await manager.close_session_owned()
+                await manager.aclose()
+
+
+class WindowsStdinAdapterTests(unittest.TestCase):
+    def test_native_pipe_transfers_to_crt_descriptor_and_closes_the_right_owner(self):
+        # Distinct test flag bits check composition without redeclaring CRT
+        # constants on a non-Windows host.
+        platform = SimpleNamespace(name='nt', O_RDONLY=1, O_BINARY=2, O_NOINHERIT=4,
+                                   close=mock.Mock())
+        crt = SimpleNamespace(open_osfhandle=mock.Mock(return_value=17))
+        with mock.patch.object(host_ipc, 'os', platform), \
+                mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                mock.patch.object(host_ipc.windows_api, 'create_pipe', return_value=[101, 102]) as create, \
+                mock.patch.object(host_ipc.windows_api, 'close_handle') as close:
+            descriptor, release = host_ipc.eof_stdin()
+            self.assertEqual(descriptor, 17)
+            create.assert_called_once_with(inherit=False)
+            crt.open_osfhandle.assert_called_once_with(
+                101, platform.O_RDONLY | platform.O_BINARY | platform.O_NOINHERIT)
+            close.assert_called_once_with(102)
+            release()
+            platform.close.assert_called_once_with(17)
+            close.assert_called_once_with(102)
+
+    def test_crt_conversion_failure_releases_the_native_read_handle(self):
+        platform = SimpleNamespace(name='nt', O_RDONLY=1, O_BINARY=2, O_NOINHERIT=4,
+                                   close=mock.Mock())
+        crt = SimpleNamespace(open_osfhandle=mock.Mock(side_effect=OSError('conversion failed')))
+        with mock.patch.object(host_ipc, 'os', platform), \
+                mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                mock.patch.object(host_ipc.windows_api, 'create_pipe', return_value=[101, 102]), \
+                mock.patch.object(host_ipc.windows_api, 'close_handle') as close:
+            with self.assertRaisesRegex(OSError, 'conversion failed'):
+                host_ipc.eof_stdin()
+            self.assertEqual(close.call_args_list, [mock.call(102), mock.call(101)])
+            platform.close.assert_not_called()
 
 
 if __name__ == "__main__":

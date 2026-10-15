@@ -28,15 +28,32 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         self.moved = self.root / 'moved-state'
 
     def replace_parent(self):
-        self.parent.rename(self.moved)
-        self.parent.mkdir()
+        self.decoy = self.parent
+        try:
+            self.parent.rename(self.moved)
+        except PermissionError as error:
+            if os.name != 'nt' or error.winerror not in [
+                    windows_api.ERROR_ACCESS_DENIED, windows_api.ERROR_SHARING_VIOLATION]:
+                raise
+            # A retained child-directory handle can prevent an ancestor rename
+            # on Windows. Do not close it to manufacture a successful attack.
+            # Prove ordinary rename works, report the blocked setup, and still
+            # exercise all reads/writes against the unchanged original tree.
+            control = self.root / 'unheld-control'
+            control.mkdir()
+            control.rename(self.root / 'renamed-control')
+            print(json.dumps({'ancestor_rename': 'blocked', 'winerror': error.winerror,
+                              'decoy_replacement_exercised': False}), flush=True)
+            self.moved = self.parent
+            self.decoy = self.root / 'separate-decoy'
+        self.decoy.mkdir()
 
     async def test_job_reads_writes_and_new_jobs_ignore_recreated_parent(self):
         manager = jobs.JobManager(str(self.parent / 'jobs'))
         self.addAsyncCleanup(manager.aclose)
         # The manager must already be anchored before the first child launch.
         self.replace_parent()
-        decoy_session = self.parent / 'jobs' / manager.session_id
+        decoy_session = self.decoy / 'jobs' / manager.session_id
         decoy_job = decoy_session / '1'
         decoy_job.mkdir(parents=True)
         (decoy_job / 'stdout.log').write_text('FORGED STDOUT')
@@ -77,7 +94,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         ref = authentications.CredentialRef.environment('API_KEY')
         await storage.approve_destinations(ref, ['https://original.invalid/v1'])
         self.replace_parent()
-        decoy = credential_storages.JsonCredentialStorage(str(self.parent / 'credentials'))
+        decoy = credential_storages.JsonCredentialStorage(str(self.decoy / 'credentials'))
         self.addCleanup(decoy.close)
         await decoy.store_openai_login(token('FORGED'))
         await decoy.approve_destinations(ref, ['https://evil.invalid/v1'])
@@ -108,7 +125,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         observe(200, {'x-original': 'original'})
         await store.save()
         self.replace_parent()
-        decoy = response_headers.Store(str(self.parent / 'headers.json'))
+        decoy = response_headers.Store(str(self.decoy / 'headers.json'))
         self.addCleanup(decoy.close)
         decoy.observer('https://forged.invalid/v1', None, 'forged')(200, {'x-forged': 'FORGED'})
         await decoy.save()
@@ -152,7 +169,20 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
                 files.atomic_write_text_at(directory, 'metadata', 'replacement')
         self.assertEqual((self.moved / 'metadata').read_text(), 'original')
         self.assertEqual([entry.name for entry in self.moved.iterdir()], ['metadata'])
-        self.assertEqual(list(self.parent.iterdir()), [])
+        self.assertEqual(list(self.decoy.iterdir()), [])
+
+    async def test_existing_and_missing_state_directories_need_no_ancestor_stat(self):
+        with mock.patch.object(private_files.os, 'makedirs', side_effect=AssertionError('ancestor mkdir')):
+            existing = private_files.open_directory_tree(self.parent)
+        private_files.close(existing)
+        target = self.parent / 'new' / 'nested'
+        with mock.patch.object(private_files.os, 'stat', side_effect=AssertionError('ancestor stat')):
+            directory = private_files.open_directory_tree(target)
+        try:
+            self.assertTrue(private_files.information(directory).directory)
+            self.assertTrue(target.is_dir())
+        finally:
+            private_files.close(directory)
 
     async def test_atomic_temporary_collision_does_not_delete_another_file(self):
         directory = private_files.open_directory(str(self.parent))
@@ -184,6 +214,22 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WindowsRelativeDirectoryTests(unittest.TestCase):
+    def test_generic_file_information_does_not_interpret_a_credential_dacl(self):
+        from loki_agent import _private_files_windows as backend
+
+        result = windows_api.ByHandleFileInformation()
+        result.dwFileAttributes = windows_api.FileAttribute.FILE_ATTRIBUTE_DIRECTORY
+        result.nFileSizeLow = 7
+        with mock.patch.object(windows_api, 'by_handle_file_information', return_value=result), \
+                mock.patch.object(windows_api, 'handle_dacl_sddl',
+                                  side_effect=AssertionError('credential privacy parser')):
+            info = backend.information(77)
+        self.assertTrue(info.directory)
+        self.assertFalse(info.reparse_point)
+        self.assertEqual(info.size, 7)
+        self.assertIsInstance(info, private_files.FileInfo)
+        self.assertNotIsInstance(info, private_files.FileFacts)
+
     def test_relative_directory_handle_refuses_reparse_points_and_closes_on_error(self):
         from loki_agent import _private_files_windows as backend
 
