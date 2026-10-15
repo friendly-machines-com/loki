@@ -114,11 +114,22 @@ class ProjectionSurfaceTests(unittest.TestCase):
         self.assertNotIn("Unverified model acceptance", text)
         self.assertNotIn("unknown", text)
 
+    def test_selected_effort_is_the_last_status_line(self):
+        for session in [self.session, fresh_session(
+                model='test-model', url='https://api.openai.com/v1',
+                kind=protocols.OPENAI_CHAT, provider_id='openai')]:
+            with self.subTest(model=session.runtime_config.model), mock.patch.object(
+                    loki, '_DEFAULT_SESSION', session):
+                text = loki.thinking_command('effort medium')
+                self.assertIn('Effort choices: default, low, medium, high', text)
+                self.assertEqual(text.splitlines()[-1], 'Effort: medium')
+
     def test_effort_renders_the_model_default_when_unset(self):
         text = loki.thinking_status_text()
         # The profile's own default, as state -- not "unknown".
         self.assertIn("high", text)
         self.assertNotIn("Effort: unknown", text)
+        self.assertTrue(text.splitlines()[-1].startswith('Effort: '))
 
     def test_allowance_is_state_not_a_lecture(self):
         fresh = fresh_session()

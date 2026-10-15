@@ -388,14 +388,6 @@ def thinking_status_text():
     lines = [f"Thinking controls for {model}"]
     profile = current_reasoning_effort_profile()
     if profile is not None:
-        effective = effective_reasoning_effort()
-        if effective is not None:
-            lines.append(f"Effort: {effective}")
-        else:
-            default = reasoning_effort_default()
-            lines.append(
-                f"Effort: not selected (model default: {default})"
-                if default is not None else "Effort: not selected")
         lines.append("Effort choices: default, " + ", ".join(
             value for value in profile.values
             if isinstance(value, str)))
@@ -423,6 +415,15 @@ def thinking_status_text():
             lines.append(f"Inactive {label} preference: {saved}")
     if profile is None and not modes:
         lines.append("No verified computation controls for this connection.")
+    if profile is not None:
+        effective = effective_reasoning_effort()
+        if effective is not None:
+            lines.append(f"Effort: {effective}")
+        else:
+            default = reasoning_effort_default()
+            lines.append(
+                f"Effort: not selected (model default: {default})"
+                if default is not None else "Effort: not selected")
     return "\n".join(lines)
 
 
