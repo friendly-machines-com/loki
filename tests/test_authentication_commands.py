@@ -36,6 +36,8 @@ def tokens():
 
 
 class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
+    maxDiff = None
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
