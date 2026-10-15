@@ -307,25 +307,82 @@ class InputSessionOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     await session.__aexit__(None, None, None)
                     self.assertEqual(actions, previous)
 
-    async def test_body_cancellation_closes_the_input_session(self):
+    async def test_deferred_session_keeps_startup_modals_from_starting_producer(self):
         with ReaderEnvironment(asyncio.get_running_loop()).installed() as environment:
-            session = terminals.InputSession(fd=environment.read_fd)
-            session.interactive = False
-            entered = asyncio.Event()
+            session = terminals.InputSession(fd=environment.read_fd, autostart=False)
+            started = asyncio.Event()
 
-            async def run():
+            async def produce():
+                started.set()
+                await asyncio.Future()
+
+            session._produce = produce
+            with mock.patch.object(
+                    terminals, 'get_input_async', new=mock.AsyncMock(return_value='yes')):
                 async with session:
-                    entered.set()
-                    await asyncio.Future()
-
-            task = asyncio.create_task(run())
-            await asyncio.wait_for(entered.wait(), 1)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 2)
+                    self.assertTrue(session._reader_entered)
+                    self.assertIsNone(session._producer)
+                    for fails in [False, True]:
+                        try:
+                            async with session.modal() as modal:
+                                self.assertEqual(await modal.prompt('Confirm: '), 'yes')
+                                if fails:
+                                    raise ValueError('cancel startup dialog')
+                        except ValueError:
+                            pass
+                        await asyncio.sleep(0)
+                        self.assertFalse(started.is_set())
+                        self.assertIsNone(session._producer)
+                    await session.start()
+                    await started.wait()
+                    producer = session._producer
+                    await session.start()
+                    self.assertIs(session._producer, producer)
+                    started.clear()
+                    async with session.modal():
+                        self.assertIsNone(session._producer)
+                    await started.wait()
+                    self.assertIsNot(session._producer, producer)
             environment.assert_released(self)
             self.assertIsNone(session._producer)
-            await session.__aexit__(None, None, None)
+
+    async def test_deferred_start_failure_closes_rejected_coroutine_and_resources(self):
+        with ReaderEnvironment(asyncio.get_running_loop()).installed() as environment:
+            session = terminals.InputSession(fd=environment.read_fd, autostart=False)
+            rejected = []
+
+            def reject(coroutine):
+                rejected.append(coroutine)
+                raise RuntimeError('producer creation failed')
+
+            with self.assertRaisesRegex(RuntimeError, 'producer creation failed'):
+                async with session:
+                    with mock.patch.object(terminals.asyncio, 'create_task', side_effect=reject):
+                        await session.start()
+            self.assertTrue(all(coro.cr_frame is None for coro in rejected))
+            environment.assert_released(self)
+
+    async def test_body_cancellation_closes_the_input_session(self):
+        for autostart in [False, True]:
+            with self.subTest(autostart=autostart), ReaderEnvironment(
+                    asyncio.get_running_loop()).installed() as environment:
+                session = terminals.InputSession(fd=environment.read_fd, autostart=autostart)
+                session.interactive = False
+                entered = asyncio.Event()
+
+                async def run():
+                    async with session:
+                        entered.set()
+                        await asyncio.Future()
+
+                task = asyncio.create_task(run())
+                await asyncio.wait_for(entered.wait(), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 2)
+                environment.assert_released(self)
+                self.assertIsNone(session._producer)
+                await session.__aexit__(None, None, None)
 
 
 class KeyReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):

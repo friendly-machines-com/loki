@@ -362,6 +362,9 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             async def __aenter__(inner_self):
                 return inner_self
 
+            async def start(inner_self):
+                pass
+
             async def __aexit__(inner_self, *_args):
                 pass
 

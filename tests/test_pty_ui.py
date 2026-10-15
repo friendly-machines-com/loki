@@ -220,7 +220,8 @@ def _read_to_exit(handle, output=None):
 def run_loki_pty_reply(stream: bool, stream_chunks=None,
                        queued_inputs=None, create_image=False,
                        initial_input=b"hi", reply=None,
-                       raw_file_data=None, stream_prefix=None):
+                       raw_file_data=None, stream_prefix=None,
+                       keep_shell_prefill=False):
     """Run one real TUI turn; optionally pause after its first delta.
 
     Returns ``(all_output, before_stream_release)``. The second value is only
@@ -262,14 +263,15 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
         configure_container(env, tmpdir)
         handle = pty_backend.spawn_pty(
             [entrypoint("loki")], env=env, cwd=tmpdir)
-        _read_until(handle, collected, 'User: ')
+        _read_until(handle, collected, 'User: !')
         turn_start = len(collected)
-        handle.write(initial_input + b"\r")
+        # These journeys exercise model turns, not the dummy shell default.
+        handle.write((b"" if keep_shell_prefill else b"\x7f") + initial_input + b"\r")
         if gate:
             _read_until(handle, collected, stream_prefix)
             queued_texts = 0
             for queued_input in queued_inputs or []:
-                handle.write(queued_input.encode() + b"\r")
+                handle.write(b"\x7f" + queued_input.encode() + b"\r")
                 if queued_input == '/ps':
                     _read_until(handle, collected,
                                 'No running, starting, or failed jobs.')
@@ -294,7 +296,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
 
         # /quit uses the same FIFO as prompts and /image. It cannot overtake
         # them, so natural exit is our completion acknowledgment.
-        handle.write(b"/quit\r")
+        handle.write(b"\x7f/quit\r")
         exit_code, output = _read_to_exit(handle, collected)
         if exit_code != 0:
             raise AssertionError(f'loki exited with {exit_code}; output: {output!r}')
@@ -489,6 +491,16 @@ class PtyUiTests(unittest.TestCase):
         self.assertFalse(
             tracker.osc_param_emitted("777"),
             "the bang-command OSC-777 output must be escaped, not executed")
+
+    def test_dummy_prefill_runs_shell_command_without_typing_bang(self):
+        output, _ = run_loki_pty_reply(
+            stream=False, initial_input=b"printf SHELL_PREFILL_WORKS",
+            keep_shell_prefill=True)
+        self.assertIn(
+            b"[Running local command: printf SHELL_PREFILL_WORKS]", output)
+        self.assertIn(b"\r\nSHELL_PREFILL_WORKS\r\n", output)
+        first_prompt = output.index(b"User: ")
+        self.assertTrue(output[first_prompt:].startswith(b"User: !"))
 
     def test_status_bar_shows_api_and_mode(self):
         # Regression for the frontend split dropping the status text

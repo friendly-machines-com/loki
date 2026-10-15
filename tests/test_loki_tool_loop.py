@@ -123,6 +123,9 @@ class ScriptedInputSession:
     async def __aenter__(self):
         return self
 
+    async def start(self):
+        pass
+
     async def __aexit__(self, exc_type, exc, tb):
         return None
 
@@ -1322,10 +1325,18 @@ class ModelLoadingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-test.json")
+
+            async def start():
+                self.assertEqual(loki.current_model(), "dummy")
+                self.assertEqual(loki.current_chat_log_path(), path)
+                self.assertEqual(
+                    input_factory.call_args.kwargs['initial_text_provider'](), '!')
+
+            session.start = mock.AsyncMock(side_effect=start)
             loader = mock.AsyncMock()
             with mock.patch(
                     "loki_agent.terminal_frontend.input_session",
-                    return_value=session), mock.patch(
+                    return_value=session) as input_factory, mock.patch(
                         "loki_agent.terminal_frontend.new_chat_log_path",
                         return_value=path), mock.patch(
                             "loki_agent.terminal_frontend.restore_output_area_after_input"
@@ -1342,6 +1353,76 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertIsNone(loki.current_config().auth_spec)
         self.assertNotIn("No model selected", stderr.getvalue())
         self.assertNotIn("No provider configured", stderr.getvalue())
+        session.start.assert_awaited_once()
+        self.assertFalse(input_factory.call_args.kwargs['autostart'])
+
+    def test_normal_input_seed_uses_provider_kind_not_model_name(self):
+        for kind, model, expected in [
+                [protocols.DUMMY, 'custom-dummy-name', '!'],
+                [protocols.OPENAI_CHAT, 'dummy', '']]:
+            with self.subTest(kind=kind, model=model):
+                loki.apply_runtime_config(connections.make_runtime_config(
+                    'http://provider.invalid/v1', kind, model=model))
+                self.assertEqual(
+                    terminal_frontend._normal_input_initial_text(), expected)
+        loki.runtime_config = None
+        self.assertEqual(terminal_frontend._normal_input_initial_text(), '')
+
+    def test_model_picker_resumes_with_new_provider_seed(self):
+        loki.CREDENTIALS = CredentialStore({})
+        real_config = connections.make_runtime_config(
+            'http://provider.invalid/v1', protocols.OPENAI_CHAT, model='real')
+        dummy_config = connections.make_runtime_config(
+            'http://dummy.invalid/v1', protocols.DUMMY, model='custom-dummy')
+
+        async def scenario(path):
+            submissions = asyncio.Queue()
+            prompts = asyncio.Queue()
+            session = terminals.InputSession(
+                fd=0, autostart=False,
+                initial_text_provider=terminal_frontend._normal_input_initial_text)
+            session.interactive = True
+            session.reader = mock.MagicMock()
+
+            async def read(**kwargs):
+                self.assertIsNone(session._modal)
+                prompts.put_nowait(kwargs['initial_text'])
+                return await submissions.get()
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(terminals, 'TerminalMode'))
+                stack.enter_context(mock.patch.object(terminals, 'get_input_async', new=read))
+                stack.enter_context(mock.patch.object(
+                    terminal_frontend, 'input_session', return_value=session))
+                stack.enter_context(mock.patch.object(
+                    terminal_frontend, 'new_chat_log_path', return_value=path))
+                stack.enter_context(mock.patch.object(
+                    terminal_frontend, 'restore_output_area_after_input'))
+                stack.enter_context(mock.patch.object(
+                    modelsdev, 'run_model_picker_async',
+                    new=mock.AsyncMock(return_value=['provider', {}, {}])))
+                stack.enter_context(mock.patch.object(
+                    terminal_frontend, 'config_from_modelsdev_selection',
+                    side_effect=[real_config, dummy_config]))
+                task = asyncio.create_task(terminal_frontend.async_main([]))
+                try:
+                    self.assertEqual(await prompts.get(), '!')
+                    for old_seed, new_seed in [['!', ''], ['', '!']]:
+                        submissions.put_nowait('/model')
+                        # The producer opens another prompt before the consumer
+                        # takes modal ownership; that prompt is then cancelled.
+                        self.assertEqual(await prompts.get(), old_seed)
+                        self.assertEqual(await prompts.get(), new_seed)
+                    submissions.put_nowait('/quit')
+                    self.assertEqual(await task, 0)
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asyncio.run(scenario(os.path.join(tmpdir, 'chat.json')))
 
     def test_interactive_startup_does_not_fetch_provider_models(self):
         loki.CREDENTIALS = CredentialStore({
@@ -3026,13 +3107,14 @@ class TerminalJobStatusTtyTests(unittest.IsolatedAsyncioTestCase):
                                   + "\n" + captured.decode("utf-8", errors="replace"))
                     return captured
 
-                await read_until(b"User: ")
-                os.write(master, b"run a job\n")
+                first_frame = await read_until(b"User: !")
+                self.assertNotIn(b"User: \033[7m", first_frame)
+                os.write(master, b"\x7frun a job\n")
                 started = await read_until(b"\033[1m/ps\033[22m")
                 self.assertIn(b"turn: \033[1mrunning\033[22m", started)
                 # No keystrokes or tool calls between these two observations.
                 await read_until(b"/cd DIR, /ps, /image PATH")
-                os.write(master, b"/quit\n")
+                os.write(master, b"\x7f/quit\n")
                 self.assertEqual(await asyncio.wait_for(process.wait(), 5), 0)
                 resources.assert_released(self)
             finally:

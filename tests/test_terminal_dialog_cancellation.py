@@ -47,8 +47,13 @@ class KeyboardSession(terminals.InputSession):
     async def __aenter__(self):
         if self.command:
             self.user_messages.put_nowait(self.command)
-        self._producer = asyncio.create_task(self._produce())
+        await self.start()
         return self
+
+    async def start(self):
+        # This fixture replaces resource acquisition, not producer ownership.
+        self._normal_input_enabled = True
+        await self._resume()
 
     async def read_key(self):
         if self._modal is not None:

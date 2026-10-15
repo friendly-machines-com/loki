@@ -984,7 +984,8 @@ class InputBufferTests(unittest.TestCase):
 
 
 class PromptControllerTests(unittest.TestCase):
-    def read_with_events(self, events, history=None, *, initial_text=""):
+    def read_with_events(self, events, history=None, *, initial_text="",
+                         ignore_unchanged_initial_text=False):
         old_stdin = sys.stdin
         old_isatty = terminals.os.isatty
         old_key_reader = terminals.AsyncKeyReader
@@ -1026,7 +1027,8 @@ class PromptControllerTests(unittest.TestCase):
             terminals.AsyncKeyReader = FakeKeyReader
             terminals.TerminalMode = FakeTerminalMode
             controller = terminals.PromptController(
-                RecordingTerminal(), history=history, initial_text=initial_text)
+                RecordingTerminal(), history=history, initial_text=initial_text,
+                ignore_unchanged_initial_text=ignore_unchanged_initial_text)
             return asyncio.run(controller.read_text())
         finally:
             sys.stdin = old_stdin
@@ -1050,6 +1052,30 @@ class PromptControllerTests(unittest.TestCase):
                 self.assertEqual(
                     self.read_with_events(events, initial_text="filter "), expected)
 
+    def test_normal_seed_is_empty_until_the_user_edits_it(self):
+        def read(events):
+            return self.read_with_events(
+                events, initial_text="!", ignore_unchanged_initial_text=True)
+
+        self.assertEqual(read([terminals.KeyEvent("ENTER")]), "")
+        self.assertEqual(read([
+            terminals.KeyEvent("TEXT", "pwd"),
+            terminals.KeyEvent("ENTER")]), "!pwd")
+        self.assertEqual(read([
+            terminals.KeyEvent("BACKSPACE"),
+            terminals.KeyEvent("TEXT", "/model"),
+            terminals.KeyEvent("ENTER")]), "/model")
+        # Deliberately replacing the seed is real input, even with the same text.
+        self.assertEqual(read([
+            terminals.KeyEvent("BACKSPACE"),
+            terminals.KeyEvent("TEXT", "!"),
+            terminals.KeyEvent("ENTER")]), "!")
+        for kind in ["EOF", "CTRL_D"]:
+            with self.subTest(kind=kind), self.assertRaises(EOFError):
+                read([terminals.KeyEvent(kind)])
+        with self.assertRaises(KeyboardInterrupt):
+            read([terminals.KeyEvent("CTRL_C")])
+
     def test_get_input_renders_initial_text_before_reading_keys(self):
         output_at_read = []
 
@@ -1062,19 +1088,23 @@ class PromptControllerTests(unittest.TestCase):
                 output_at_read.append(output.getvalue())
                 return terminals.KeyEvent("ENTER")
 
-        output = TtyOutput()
-        with (
-            mock.patch.object(terminals, "terminal", RecordingTerminal()),
-            mock.patch.object(terminals.os, "isatty", return_value=True),
-            mock.patch.object(terminals, "refresh_terminal_layout"),
-            mock.patch.object(terminals, "update_status_bar"),
-            contextlib.redirect_stdout(output),
-        ):
-            result = asyncio.run(terminals.get_input_async(
-                "Choice: ", session=Reader(), initial_text="filter "))
+        for seed, ignore_seed, expected in [['filter ', False, 'filter '], ['!', True, '']]:
+            with self.subTest(seed=seed):
+                output_at_read.clear()
+                output = TtyOutput()
+                with (
+                    mock.patch.object(terminals, "terminal", RecordingTerminal()),
+                    mock.patch.object(terminals.os, "isatty", return_value=True),
+                    mock.patch.object(terminals, "refresh_terminal_layout"),
+                    mock.patch.object(terminals, "update_status_bar"),
+                    contextlib.redirect_stdout(output),
+                ):
+                    result = asyncio.run(terminals.get_input_async(
+                        "Choice: ", session=Reader(), initial_text=seed,
+                        ignore_unchanged_initial_text=ignore_seed))
 
-        self.assertEqual(result, "filter ")
-        self.assertEqual(output_at_read, ["Choice: filter  "])
+                self.assertEqual(result, expected)
+                self.assertEqual(output_at_read, [f"Choice: {seed} "])
 
     def test_read_text_applies_keyboard_editing(self):
         result = self.read_with_events(
@@ -1327,6 +1357,56 @@ class InputHistoryTests(unittest.TestCase):
             for restore_draft in [False, True]:
                 with self.subTest(restore_draft=restore_draft):
                     asyncio.run(scenario(restore_draft))
+
+
+class NormalInputSeedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_seed_refreshes_without_reinterpreting_queued_submissions(self):
+        seed = '!'
+        observed = []
+        session = terminals.InputSession(
+            fd=0, initial_text_provider=lambda: seed)
+        session.interactive = True
+
+        async def read(**kwargs):
+            nonlocal seed
+            observed.append(kwargs['initial_text'])
+            if len(observed) == 1:
+                seed = ''
+                return '!first'
+            if len(observed) == 2:
+                seed = '!'
+                return 'queued prose'
+            raise EOFError
+
+        with mock.patch.object(terminals, 'get_input_async', new=read):
+            await session._produce()
+        self.assertEqual(observed, ['!', '', '!'])
+        self.assertEqual(await session.user_messages.get(), '!first')
+        self.assertEqual(await session.user_messages.get(), 'queued prose')
+        self.assertIsNone(await session.user_messages.get())
+
+    async def test_noninteractive_input_is_not_seeded(self):
+        provider = mock.Mock(return_value='!')
+        session = terminals.InputSession(fd=0, initial_text_provider=provider)
+        session.interactive = False
+        reader = mock.AsyncMock(side_effect=['plain text', EOFError()])
+        with mock.patch.object(terminals, 'get_input_async', new=reader):
+            await session._produce()
+        provider.assert_not_called()
+        self.assertEqual(await session.user_messages.get(), 'plain text')
+        self.assertTrue(all(
+            call.kwargs['initial_text'] == '' for call in reader.await_args_list))
+
+    async def test_ctrl_c_opens_a_fresh_seeded_prompt(self):
+        session = terminals.InputSession(fd=0, initial_text_provider=lambda: '!')
+        session.interactive = True
+        reader = mock.AsyncMock(side_effect=[KeyboardInterrupt(), '!pwd', EOFError()])
+        with mock.patch.object(terminals, 'get_input_async', new=reader):
+            await session._produce()
+        self.assertEqual(await session.user_messages.get(), '!pwd')
+        self.assertIsNone(await session.user_messages.get())
+        self.assertTrue(all(
+            call.kwargs['initial_text'] == '!' for call in reader.await_args_list))
 
 
 class InputModalTests(unittest.TestCase):

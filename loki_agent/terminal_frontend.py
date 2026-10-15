@@ -101,6 +101,12 @@ from .terminals import (
 logger = logging.getLogger(__name__)
 
 
+def _normal_input_initial_text():
+    config = current_config()
+    return ('!' if config is not None
+            and config.chat_provider.kind == protocols.DUMMY else '')
+
+
 def _redraw_status():
     try:
         terminals.redraw_status_bar()
@@ -1404,6 +1410,8 @@ async def async_main(args) -> int:
     _terminal_activity.reset()
     terminals.open_terminal_stdin()
     async with input_session(
+            autostart=False,
+            initial_text_provider=_normal_input_initial_text,
             on_mode_cycle=lambda: cycle_agent_mode(),
             history_provider=lambda: user_prompt_history(
                 current_transcript()),
@@ -1537,6 +1545,9 @@ async def async_main(args) -> int:
         # The staged-images list is shared with the immediate /queue command
         # (see _QueuedInputs); the loop keeps using this local name.
         pending_images = _queued_inputs.reset(session)
+        # The first normal frame needs the selected provider and loaded history.
+        # Startup modals retain the reader without enabling the normal producer.
+        await session.start()
         while True:
             user_in = await session.user_messages.get()
             restore_output_area_after_input()

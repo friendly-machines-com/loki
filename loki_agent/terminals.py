@@ -1962,10 +1962,12 @@ class PromptRenderer:
 
 class PromptController:
     def __init__(self, terminal, prompt: str = 'User: ', history=None, session=None,
-                 on_mode_cycle=None, history_provider=None, *, initial_text: str = ''):
+                 on_mode_cycle=None, history_provider=None, *, initial_text: str = '',
+                 ignore_unchanged_initial_text=False):
         self.terminal = terminal
         self.prompt = prompt
         self.initial_text = initial_text
+        self.ignore_unchanged_initial_text = ignore_unchanged_initial_text
         self.history = list(history or [])
         self.history_provider = history_provider
         self.session = session  # AsyncKeyReader held for the whole session
@@ -2006,23 +2008,29 @@ class PromptController:
             renderer.render(buffer)
 
         paste_active = False
+        initial_text_untouched = True
         while True:
             event = await reader.read_key()
+            unchanged_seed = (
+                self.ignore_unchanged_initial_text and initial_text_untouched
+                and buffer.text() == self.initial_text)
             if event.kind == "EOF":
-                if buffer.text():
+                if buffer.text() and not unchanged_seed:
                     return buffer.text()
                 raise EOFError
             if event.kind == "CTRL_C":
                 raise KeyboardInterrupt
             if event.kind == "CTRL_D":
-                if buffer.text():
+                if buffer.text() and not unchanged_seed:
                     return buffer.text()
                 raise EOFError
             if event.kind == "ENTER":
                 if interactive:
                     # print() This would unnecessarily scroll
                     self.terminal.flush()
-                return buffer.text()
+                return '' if unchanged_seed else buffer.text()
+            if event.kind not in ["RESIZE", "MODE_CYCLE", "PASTE_START", "PASTE_END"]:
+                initial_text_untouched = False
             if event.kind == "TEXT":
                 buffer.insert(event.text)
             elif event.kind == "BACKSPACE":
@@ -2081,11 +2089,13 @@ class PromptController:
 
 
 async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle=None,
-                          history_provider=None, *, initial_text: str = ''):
+                          history_provider=None, *, initial_text: str = '',
+                          ignore_unchanged_initial_text=False):
     return await PromptController(terminal, prompt or 'User: ', history=history, session=session,
                                   on_mode_cycle=on_mode_cycle,
                                   history_provider=history_provider,
-                                  initial_text=initial_text).read_text()
+                                  initial_text=initial_text,
+                                  ignore_unchanged_initial_text=ignore_unchanged_initial_text).read_text()
 
 
 class InputModal:
@@ -2263,7 +2273,8 @@ class InputSession:
     """
 
     def __init__(self, fd=None, on_mode_cycle=None, history_provider=None,
-                 on_queue_size_change=None, on_submit=None):
+                 on_queue_size_change=None, on_submit=None, *,
+                 autostart=True, initial_text_provider=None):
         self.fd = fd if fd is not None else new_stdin
         self.interactive = os.isatty(self.fd) and os.isatty(sys.stdout.fileno())
         self.reader = AsyncKeyReader(
@@ -2279,6 +2290,10 @@ class InputSession:
         self._reader_entered = False
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
         self.history_provider = history_provider
+        self.initial_text_provider = initial_text_provider
+        # Modal exit may resume normal input only after startup enables it.
+        # A missing producer alone also means temporarily paused modal input.
+        self._normal_input_enabled = autostart
         # The frontend consumes immediate commands (command_deliveries) here,
         # synchronously, before queueing. This callback must not await a turn
         # or take ownership of the input reader.
@@ -2292,12 +2307,7 @@ class InputSession:
             self._mode.__enter__()
             self._reader_entered = True
             await self.reader.__aenter__()
-            producer = self._produce()
-            try:
-                self._producer = asyncio.create_task(producer)
-            except BaseException:
-                producer.close()
-                raise
+            await self._resume()
         except BaseException:
             await self.__aexit__(*sys.exc_info())
             raise
@@ -2332,9 +2342,15 @@ class InputSession:
     async def _produce(self):
         while True:
             try:
-                text = await get_input_async(session=self.reader,
-                                             history_provider=self.history_provider,
-                                             on_mode_cycle=self.on_mode_cycle)
+                initial_text = (
+                    self.initial_text_provider()
+                    if self.interactive and self.initial_text_provider else '')
+                text = await get_input_async(
+                    session=self.reader,
+                    history_provider=self.history_provider,
+                    on_mode_cycle=self.on_mode_cycle,
+                    initial_text=initial_text,
+                    ignore_unchanged_initial_text=bool(initial_text))
                 # Immediate commands (command_deliveries) are deliberately
                 # allowed during a busy turn and must bypass the FIFO,
                 # including past ordinary prompts already queued.
@@ -2384,19 +2400,34 @@ class InputSession:
                 pass
             self._producer = None
 
+    async def start(self):
+        """Enable normal prompting after frontend initialization is complete."""
+        if not self._reader_entered or self._modal is not None:
+            raise RuntimeError("normal input requires an open, non-modal session")
+        self._normal_input_enabled = True
+        await self._resume()
+
     async def _resume(self):
-        if self._producer is None:
-            self._producer = asyncio.create_task(self._produce())
+        if self._normal_input_enabled and self._producer is None:
+            producer = self._produce()
+            try:
+                self._producer = asyncio.create_task(producer)
+            except BaseException:
+                producer.close()
+                raise
 
 
 def input_session(fd=None, on_mode_cycle=None, history_provider=None,
-                  on_queue_size_change=None, on_submit=None) -> InputSession:
+                  on_queue_size_change=None, on_submit=None, *,
+                  autostart=True, initial_text_provider=None) -> InputSession:
     return InputSession(
         fd,
         on_mode_cycle=on_mode_cycle,
         history_provider=history_provider,
         on_queue_size_change=on_queue_size_change,
         on_submit=on_submit,
+        autostart=autostart,
+        initial_text_provider=initial_text_provider,
     )
 
 
