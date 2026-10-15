@@ -38,7 +38,7 @@ if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-acc
     print('{"probe": "state-progress", "phase": "python-entry"}',
           file=sys.stderr, flush=True)
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import ctypes as C
 from ctypes import wintypes as W
 import errno
@@ -529,6 +529,70 @@ class AppContainers(NativeCalls):
                                 lambda handle=handle: self.check(self.close(handle)))
 
 
+def startup_commands(workspace, mode, executable, system_root):
+    """Fixed witnesses whose progress does not depend on the probe script."""
+    cases = []
+    for name, status, options in [
+            ['cmd-exit', 71, None],
+            ['python-no-site-exit', 72, ['-I', '-u', '-S']],
+            ['python-site-exit', 72, ['-I', '-u']],
+            ['python-file', 73, ['-I', '-u']],
+            ['python-stderr-raw', 75, ['-I', '-u']],
+            ['python-stderr-text', 77, ['-I', '-u']]]:
+        payload = ((f'startup-{mode}-{name}-{uuid.uuid4().hex}').encode('ascii')
+                   if name in ['python-file', 'python-stderr-raw', 'python-stderr-text'] else None)
+        marker = None
+        if options is None:
+            arguments = [str(Path(system_root) / 'System32' / 'cmd.exe'),
+                         '/d', '/c', 'exit', str(status)]
+        else:
+            if name == 'python-file':
+                marker = Path(workspace) / ('startup-' + mode + '-file.marker')
+                script = (
+                    'import os, sys\n'
+                    'try:\n'
+                    '    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n'
+                    '    try:\n'
+                    f'        written = os.write(fd, {payload!r})\n'
+                    '    finally:\n'
+                    '        os.close(fd)\n'
+                    f'    ok = written == {len(payload)}\n'
+                    'except Exception:\n'
+                    '    ok = False\n'
+                    f'os._exit({status} if ok else {status + 1})\n')
+            elif name in ['python-stderr-raw', 'python-stderr-text']:
+                action = (f'    written = os.write(2, {payload!r})\n'
+                          if name == 'python-stderr-raw' else
+                          f'    written = sys.stderr.write({payload.decode("ascii")!r})\n'
+                          '    sys.stderr.flush()\n')
+                script = ('import os, sys\ntry:\n' + action +
+                          f'    ok = written == {len(payload)}\n'
+                          'except Exception:\n'
+                          '    ok = False\n' +
+                          f'os._exit({status} if ok else {status + 1})\n')
+            else:
+                script = f'import os; os._exit({status})'
+            arguments = [executable, *options, '-c', script]
+            if marker is not None:
+                arguments.append(str(marker))
+        cases.append({'name': name, 'expected_exit': status, 'arguments': arguments,
+                      'marker': marker, 'payload': payload})
+    return cases
+
+
+def read_startup_artifact(path):
+    """Bound diagnostic output and preserve read errors as unknown evidence."""
+    try:
+        with Path(path).open('rb') as stream:
+            data = stream.read(4097)
+    except FileNotFoundError:
+        return {'missing': True, 'prefix': '', 'truncated': False}
+    except OSError as error:
+        return {'read_error': str(error), 'winerror': getattr(error, 'winerror', None)}
+    return {'missing': False, 'prefix': data[:4096].decode('utf-8', errors='replace'),
+            'truncated': len(data) > 4096}
+
+
 class StateTokenProbe:
     """Native-only experiment: a writer AppContainer and write-restricted tools.
 
@@ -644,11 +708,13 @@ class StateTokenProbe:
                 finally:
                     print(json.dumps(row), flush=True)
 
-    def launch(self, token, manifest_path, role, streams, observe=None, *, suspended_only=False):
-        """Use the same AsUser call for the scenario and suspended diagnostics.
+    @contextmanager
+    def created_process(self, token, arguments, directory, streams, role):
+        """Own one suspended, inspected child through all caller observation.
 
-        A diagnostic child is inspected, never resumed, and retired by the
-        same process-handle owner as an ordinary scenario child.
+        Both scenario launches and startup witnesses use this exact native
+        creation path. The context, not its caller, retires the process and
+        closes its thread/process handles, including on partial failure.
         """
         import msvcrt
 
@@ -669,9 +735,9 @@ class StateTokenProbe:
             startup.startup.stdin, startup.startup.stdout, startup.startup.stderr = handles
             startup.attributes = C.cast(attributes, HANDLE)
             child = ProcessInfos()
-            command = C.create_unicode_buffer(subprocess.list2cmdline([
-                sys.executable, '-I', '-u', __file__, '--state-access', str(manifest_path), role]))
+            command = C.create_unicode_buffer(subprocess.list2cmdline(arguments))
             old_inheritance = [[handle, os.get_handle_inheritable(handle)] for handle in handles]
+            creation_error = None
             try:
                 for handle in handles:
                     os.set_handle_inheritable(handle, True)
@@ -681,20 +747,21 @@ class StateTokenProbe:
                 print(json.dumps({'probe': 'state-token', 'phase': 'create', 'role': role}), flush=True)
                 try:
                     native.check(self.api.create_as_user(
-                        token, sys.executable, command, None, None, True,
+                        token, arguments[0], command, None, None, True,
                         CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, None,
-                        str(Path(manifest_path).parent), C.byref(startup), C.byref(child)))
+                        str(directory), C.byref(startup), C.byref(child)))
                 except OSError as error:
-                    if not suspended_only:
-                        raise
-                    return {'created': False, 'winerror': getattr(error, 'winerror', None),
-                            'error': str(error)}
-                # retire() both reaps and closes the process handle.
-                cleanup.callback(self.api.retire, child.process)
-                cleanup.callback(lambda: native.check(native.close(child.thread)))
+                    creation_error = error
+                else:
+                    # retire() both reaps and closes the process handle.
+                    cleanup.callback(self.api.retire, child.process)
+                    cleanup.callback(lambda: native.check(native.close(child.thread)))
             finally:
                 for handle, previous in old_inheritance:
                     os.set_handle_inheritable(handle, previous)
+            if creation_error is not None:
+                yield {'created': False, 'exception': creation_error}
+                return
             actual_token = self.api.token(child.process, TOKEN_QUERY)
             try:
                 snapshot = self.api.snapshot(actual_token)
@@ -702,16 +769,146 @@ class StateTokenProbe:
                 self.api.close(actual_token)
             in_job = W.BOOL()
             native.check(native.in_job(child.process, None, C.byref(in_job)))
+            yield {'created': True, 'winerror': 0, 'process': child,
+                   'kernel_token': snapshot, 'in_job': bool(in_job.value)}
+        finally:
+            try:
+                cleanup.close()
+            finally:
+                native.delete_attributes(attributes)
+
+    def startup_controls(self, primary, role_sid, manifest_path):
+        """Start all paired witnesses, then observe each without waiting on another."""
+        native = self.n
+        manifest = json.loads(Path(manifest_path).read_text())
+        workspace = Path(manifest['workspace'])
+        state = Path(manifest['state'])
+        role = native.sid(role_sid)
+        pending = []
+
+        def emit(case, phase, **details):
+            if case['child'] is not None:
+                details['child_pid'] = case['child'].pid
+            state_progress('startup-' + phase, mode=case['mode'],
+                           case=case['spec']['name'], **details)
+
+        with ExitStack() as controls:
+            stdin = controls.enter_context(open(workspace / 'stdin', 'rb'))
+            for mode in ['appcontainer', 'write-restricted']:
+                for spec in startup_commands(workspace, mode, sys.executable, os.environ['SystemRoot']):
+                    case = {'mode': mode, 'spec': spec, 'child': None,
+                            'pending_reported': False, 'marker_reported': False}
+                    stem = 'startup-' + mode + '-' + spec['name']
+                    case['stdout'] = state / (stem + '.stdout')
+                    case['stderr'] = state / (stem + '.stderr')
+                    streams = [stdin, *[
+                        controls.enter_context(open(case[name], 'wb', buffering=0))
+                        for name in ['stdout', 'stderr']]]
+                    emit(case, 'create-before', expected_exit=spec['expected_exit'],
+                         arguments=spec['arguments'],
+                         marker=str(spec['marker']) if spec['marker'] is not None else None,
+                         expected_output=spec['payload'].decode('ascii') if spec['payload'] is not None else None)
+                    token = primary
+                    if mode == 'write-restricted':
+                        try:
+                            token = self.filtered(primary, role_sid)
+                        except OSError as error:
+                            emit(case, 'filter-error', winerror=getattr(error, 'winerror', None), error=str(error))
+                            continue
+                        controls.callback(self.api.close, token)
+                    expected = self.api.snapshot(token)
+                    if mode == 'write-restricted' and not any(sid == role for sid, _flags in expected['restricting_sids']):
+                        raise RuntimeError('startup input token lost its write restriction')
+                    info = controls.enter_context(self.created_process(
+                        token, spec['arguments'], Path(manifest_path).parent, streams, stem))
+                    if not info['created']:
+                        error = info['exception']
+                        emit(case, 'create-error', winerror=getattr(error, 'winerror', None), error=str(error))
+                        continue
+                    case['child'] = info['process']
+                    actual = info['kernel_token']
+                    emit(case, 'created', kernel_token=actual, in_job=info['in_job'])
+                    if actual['app'] != 1 or any(actual[key] != expected[key] for key in ['user', 'app', 'package', 'restricting_sids']):
+                        raise RuntimeError('startup control has the wrong suspended identity')
+                    if not info['in_job']:
+                        raise RuntimeError('startup control escaped the owning kill-on-close job')
+                    try:
+                        count = native.resume(case['child'].thread)
+                        emit(case, 'resume-return', previous_suspend_count=count)
+                        native.check(count != 0xffffffff)
+                    except OSError as error:
+                        emit(case, 'resume-error', winerror=getattr(error, 'winerror', None), error=str(error))
+                        continue
+                    pending.append(case)
+
+            # Every creation/resume attempt precedes the first exit poll.
+            # Only the existing external supervisor supplies an execution budget.
+            while pending:
+                for case in pending[:]:
+                    spec = case['spec']
+                    if spec['marker'] is not None and not case['marker_reported']:
+                        marker = read_startup_artifact(spec['marker'])
+                        if ('read_error' in marker or
+                                (not marker.get('truncated') and
+                                 marker.get('prefix') == spec['payload'].decode('ascii'))):
+                            emit(case, 'artifact-error' if 'read_error' in marker else 'marker-observed',
+                                 artifact=marker)
+                            case['marker_reported'] = True
+                    result = native.wait(case['child'].process, 0)
+                    if result == 258:
+                        if not case['pending_reported']:
+                            emit(case, 'pending')
+                            case['pending_reported'] = True
+                        continue
+                    if result != 0:
+                        raise RuntimeError('startup control wait failed: %s' % result)
+                    code = ULONG()
+                    native.check(native.exit_code(case['child'].process, C.byref(code)))
+                    stdout = read_startup_artifact(case['stdout'])
+                    stderr = read_startup_artifact(case['stderr'])
+                    details = {'exit_code': code.value, 'exit_hex': f'0x{code.value:08x}',
+                               'exit_matches': code.value == spec['expected_exit'],
+                               'stdout': stdout, 'stderr': stderr}
+                    if spec['marker'] is not None:
+                        marker = read_startup_artifact(spec['marker'])
+                        details['marker'] = marker
+                        details['marker_matches'] = None
+                        if 'prefix' in marker:
+                            details['marker_matches'] = (not marker['truncated'] and not marker['missing'] and
+                                                         marker['prefix'] == spec['payload'].decode('ascii'))
+                    if spec['name'] in ['python-stderr-raw', 'python-stderr-text']:
+                        details['stderr_prefix_contains_marker'] = None
+                        if 'prefix' in stderr:
+                            details['stderr_prefix_contains_marker'] = spec['payload'].decode('ascii') in stderr['prefix']
+                    # This is sampled before any owner cleanup. A code later
+                    # imposed by retire()/the supervisor is never emitted as exit.
+                    emit(case, 'exit', **details)
+                    pending.remove(case)
+                if pending:
+                    time.sleep(0.01)
+
+    def launch(self, token, manifest_path, role, streams, observe=None, *, suspended_only=False):
+        """Use the shared creation owner for the scenario and suspended controls."""
+        native = self.n
+        arguments = [sys.executable, '-I', '-u', __file__,
+                     '--state-access', str(manifest_path), role]
+        with self.created_process(token, arguments, Path(manifest_path).parent, streams, role) as info:
+            if not info['created']:
+                error = info['exception']
+                if not suspended_only:
+                    raise error
+                return {'created': False, 'winerror': getattr(error, 'winerror', None),
+                        'error': str(error)}
             if suspended_only:
-                # The unrestricted standard-user control need not already be
-                # in a job. No diagnostic child ever executes, and retire()
-                # terminates it before this result reaches the caller.
-                return {'created': True, 'winerror': 0, 'kernel_token': snapshot,
-                        'in_job': bool(in_job.value)}
-            if not in_job.value:
+                # This control is inspected and retired without running code;
+                # unlike the owning scenario, the ordinary broker may lack a job.
+                return {key: info[key] for key in ['created', 'winerror', 'kernel_token', 'in_job']}
+            child = info['process']
+            snapshot = info['kernel_token']
+            if not info['in_job']:
                 raise RuntimeError('state child escaped the owning kill-on-close job')
             print(json.dumps({'state_child_created': role, 'pid': child.pid,
-                              'token': snapshot, 'in_job': bool(in_job.value)}), flush=True)
+                              'token': snapshot, 'in_job': info['in_job']}), flush=True)
             state_progress('launch-manifest-read-before', role=role, child_pid=child.pid)
             manifest = json.loads(Path(manifest_path).read_text())
             state_progress('launch-manifest-read-after', role=role, child_pid=child.pid)
@@ -745,11 +942,6 @@ class StateTokenProbe:
                 raise RuntimeError('state probe %s exited %s without a report'
                                    % (role, code.value))
             return {'kernel_token': snapshot, 'report': json.loads(report_path.read_text())}
-        finally:
-            try:
-                cleanup.close()
-            finally:
-                native.delete_attributes(attributes)
 
 
 def state_access_report(probe, manifest, role):
@@ -1009,6 +1201,7 @@ def state_writer_child(manifest_path):
             for name in ['launch.stdout', 'launch.stderr']]]
         probe.compare_launches(current, source, role_sid, manifest_path,
                                'appcontainer', diagnostic_streams)
+        probe.startup_controls(current, role_sid, manifest_path)
         for role in ['control', 'filtered']:
             # Filter the caller's own primary token for CreateProcessAsUser's
             # assignment-privilege exemption.
@@ -3261,6 +3454,230 @@ class AppContainerMarshallingTests(unittest.TestCase):
 
 
 class StateTokenProbeTests(unittest.TestCase):
+    def test_startup_payloads_report_execution_without_the_probe_script(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            system_root = os.environ['SystemRoot'] if os.name == 'nt' else str(workspace / 'Windows')
+            for mode in ['appcontainer', 'write-restricted']:
+                specs = startup_commands(workspace, mode, sys.executable, system_root)
+                self.assertEqual([spec['name'] for spec in specs], [
+                    'cmd-exit', 'python-no-site-exit', 'python-site-exit',
+                    'python-file', 'python-stderr-raw', 'python-stderr-text'])
+                for spec in specs:
+                    with self.subTest(mode=mode, case=spec['name']):
+                        arguments = spec['arguments']
+                        if spec['name'] == 'cmd-exit':
+                            self.assertEqual(arguments, [str(Path(system_root) / 'System32' / 'cmd.exe'),
+                                                         '/d', '/c', 'exit', str(spec['expected_exit'])])
+                            if os.name != 'nt':
+                                continue
+                        else:
+                            self.assertEqual(arguments[0], sys.executable)
+                            self.assertIn('-I', arguments)
+                            self.assertIn('-u', arguments)
+                            self.assertEqual('-S' in arguments, spec['name'] == 'python-no-site-exit')
+                        result = subprocess.run(arguments, cwd=directory, capture_output=True)
+                        self.assertEqual(result.returncode, spec['expected_exit'], result.stderr)
+                        if spec['marker'] is not None:
+                            self.assertEqual(spec['marker'].read_bytes(), spec['payload'])
+                            repeated = subprocess.run(arguments, cwd=directory, capture_output=True)
+                            self.assertEqual(repeated.returncode, spec['expected_exit'] + 1)
+                        if spec['name'] in ['python-stderr-raw', 'python-stderr-text']:
+                            self.assertIn(spec['payload'], result.stderr)
+                            broken = arguments[:]
+                            script = broken.index('-c') + 1
+                            broken[script] = 'import os; os.close(2)\n' + broken[script]
+                            failed = subprocess.run(broken, cwd=directory, capture_output=True)
+                            self.assertEqual(failed.returncode, spec['expected_exit'] + 1)
+
+    def test_startup_artifacts_distinguish_missing_truncated_and_unreadable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'output'
+            self.assertEqual(read_startup_artifact(path),
+                             {'missing': True, 'prefix': '', 'truncated': False})
+            path.write_bytes(b'prefix\xff\n')
+            artifact = read_startup_artifact(path)
+            self.assertFalse(artifact['missing'])
+            self.assertFalse(artifact['truncated'])
+            self.assertEqual(artifact['prefix'], 'prefix\ufffd\n')
+            path.write_bytes(b'x' * 5000)
+            artifact = read_startup_artifact(path)
+            self.assertTrue(artifact['truncated'])
+            self.assertEqual(artifact['prefix'], 'x' * 4096)
+            error = PermissionError('cannot inspect artifact')
+            error.winerror = 5
+            with mock.patch.object(Path, 'open', side_effect=error):
+                artifact = read_startup_artifact(path)
+            self.assertEqual(artifact, {'read_error': str(error), 'winerror': 5})
+            self.assertNotIn('missing', artifact)
+            self.assertNotIn('prefix', artifact)
+
+    def test_startup_controls_start_every_case_before_polling_and_own_cleanup(self):
+        for fault in [None, 'create', 'resume', 'pending', 'identity', 'job', 'input-restriction']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workspace, state = root / 'workspace', root / 'state'
+                workspace.mkdir()
+                state.mkdir()
+                (workspace / 'stdin').write_bytes(b'')
+                manifest = workspace / 'manifest.json'
+                manifest.write_text(json.dumps({'workspace': str(workspace), 'state': str(state)}))
+                specs = {mode: startup_commands(workspace, mode, sys.executable, str(root / 'Windows'))
+                         for mode in ['appcontainer', 'write-restricted']}
+                by_label = {'startup-' + mode + '-' + spec['name']: spec
+                            for mode, entries in specs.items() for spec in entries}
+                probe = StateTokenProbe.__new__(StateTokenProbe)
+                native, api = mock.Mock(), mock.Mock()
+                probe.n, probe.api = native, api
+                native.sid.return_value = 'tool-role'
+                attempts, resumed, retired, tokens, events, queried = [], [], [], [], [], []
+                pending_index = 10 if fault == 'pending' else None
+
+                def snapshot(token):
+                    return {'user': 'owner', 'app': 1, 'package': 'package',
+                            'restricting_sids': [] if token == 17 or fault == 'input-restriction' else [['tool-role', 7]]}
+
+                def filtered(source, role_sid):
+                    self.assertEqual(source, 17)
+                    handle = 100 + len(tokens)
+                    tokens.append(handle)
+                    return handle
+
+                @contextmanager
+                def created(token, arguments, cwd, streams, role):
+                    index = len(attempts)
+                    spec = by_label[role]
+                    child = ProcessInfos(process=400 + index, thread=500 + index,
+                                         pid=900 + index, tid=1000 + index)
+                    record = {'child': child, 'token': token, 'spec': spec, 'streams': streams,
+                              'index': index, 'forced_code': None}
+                    attempts.append(record)
+                    self.assertEqual(arguments, spec['arguments'])
+                    self.assertEqual(cwd, workspace)
+                    if fault == 'create' and index == 7:
+                        error = OSError('creation rejected')
+                        error.winerror = 1314
+                        yield {'created': False, 'exception': error}
+                        return
+                    actual = snapshot(token)
+                    if fault == 'identity' and index == 0:
+                        actual['user'] = 'other-user'
+                    try:
+                        yield {'created': True, 'process': child, 'kernel_token': actual,
+                               'in_job': not (fault == 'job' and index == 0)}
+                    finally:
+                        # Even imposing the expected code during cleanup must
+                        # not manufacture an execution result for a pending child.
+                        record['forced_code'] = spec['expected_exit']
+                        retired.append(index)
+                        events.append(['retire', token])
+
+                def resume(thread):
+                    record = next(record for record in attempts if record['child'].thread == thread)
+                    resumed.append(record['index'])
+                    if fault == 'resume' and record['index'] == 8:
+                        return 0xffffffff
+                    if record['index'] != pending_index:
+                        spec = record['spec']
+                        if spec['marker'] is not None:
+                            spec['marker'].write_bytes(spec['payload'])
+                        if spec['name'] in ['python-stderr-raw', 'python-stderr-text']:
+                            record['streams'][2].write(b'startup warning\n' + spec['payload'])
+                    return 1
+
+                def wait(process, milliseconds):
+                    self.assertEqual(milliseconds, 0)
+                    self.assertEqual(len(attempts), 12)
+                    self.assertEqual(resumed, [index for index in range(12) if fault != 'create' or index != 7])
+                    record = next(record for record in attempts if record['child'].process == process)
+                    return 258 if record['index'] == pending_index else 0
+
+                def exit_code(process, result):
+                    record = next(record for record in attempts if record['child'].process == process)
+                    self.assertNotEqual(record['index'], pending_index)
+                    if fault == 'resume':
+                        self.assertNotEqual(record['index'], 8)
+                    self.assertIsNone(record['forced_code'])
+                    queried.append(record['index'])
+                    C.cast(result, C.POINTER(ULONG)).contents.value = record['spec']['expected_exit']
+                    return True
+
+                def stop_poll(_seconds):
+                    rows = [json.loads(call.args[0]) for call in output.call_args_list]
+                    exits = [row for row in rows if row['phase'] == 'startup-exit']
+                    self.assertEqual(len(exits), 11)
+                    self.assertEqual(len([row for row in rows if row['phase'] == 'startup-pending']), 1)
+                    raise RuntimeError('stop with pending witness')
+
+                def check(value):
+                    if not value:
+                        error = OSError('native call failed')
+                        error.winerror = 6
+                        raise error
+                    return value
+
+                native.check = check
+                native.resume.side_effect = resume
+                native.wait.side_effect = wait
+                native.exit_code.side_effect = exit_code
+                api.snapshot.side_effect = snapshot
+                api.close.side_effect = lambda token: events.append(['token-close', token])
+                probe.filtered = mock.Mock(side_effect=filtered)
+                probe.created_process = created
+                with mock.patch.dict(os.environ, {'SystemRoot': str(root / 'Windows')}), \
+                        mock.patch.dict(probe.startup_controls.__globals__, {
+                            'startup_commands': lambda _workspace, mode, _exe, _root: specs[mode]}), \
+                        mock.patch.object(time, 'sleep', side_effect=stop_poll), \
+                        mock.patch('builtins.print') as output:
+                    if fault in ['identity', 'job', 'input-restriction']:
+                        with self.assertRaisesRegex(RuntimeError, 'identity|job|restriction'):
+                            probe.startup_controls(17, HANDLE(25), str(manifest))
+                    elif fault == 'pending':
+                        with self.assertRaisesRegex(RuntimeError, 'stop with pending witness'):
+                            probe.startup_controls(17, HANDLE(25), str(manifest))
+                    else:
+                        probe.startup_controls(17, HANDLE(25), str(manifest))
+                rows = [json.loads(call.args[0]) for call in output.call_args_list]
+                self.assertTrue(all(row['probe'] == 'state-progress' for row in rows))
+                if fault in ['identity', 'job', 'input-restriction']:
+                    native.wait.assert_not_called()
+                    if fault == 'input-restriction':
+                        self.assertEqual(resumed, list(range(6)))
+                        self.assertEqual(sorted(retired), list(range(6)))
+                        api.close.assert_called_once_with(100)
+                    else:
+                        native.resume.assert_not_called()
+                        self.assertEqual(retired, [0])
+                    continue
+                self.assertEqual(len(attempts), 12)
+                exits = [row for row in rows if row['phase'] == 'startup-exit']
+                expected_count = 11 if fault in ['create', 'resume', 'pending'] else 12
+                self.assertEqual(len(exits), expected_count)
+                self.assertEqual(len(queried), expected_count)
+                for row in exits:
+                    self.assertTrue(row['exit_matches'])
+                    if row['case'] == 'python-file':
+                        self.assertTrue(row['marker_matches'])
+                    if row['case'] in ['python-stderr-raw', 'python-stderr-text']:
+                        self.assertTrue(row['stderr_prefix_contains_marker'])
+                failures = [row for row in rows if row['phase'] == 'startup-create-error']
+                self.assertEqual(len(failures), int(fault == 'create'))
+                if failures:
+                    self.assertEqual(failures[0]['winerror'], 1314)
+                resume_errors = [row for row in rows if row['phase'] == 'startup-resume-error']
+                self.assertEqual(len(resume_errors), int(fault == 'resume'))
+                if resume_errors:
+                    self.assertEqual(resume_errors[0]['winerror'], 6)
+                self.assertEqual(sorted(retired), [index for index in range(12) if fault != 'create' or index != 7])
+                self.assertEqual(api.close.call_count, 6)
+                self.assertEqual(sorted(call.args[0] for call in api.close.call_args_list), sorted(tokens))
+                for record in attempts:
+                    if record['token'] != 17 and record['index'] in retired:
+                        self.assertLess(events.index(['retire', record['token']]),
+                                        events.index(['token-close', record['token']]))
+                if fault == 'pending':
+                    self.assertNotIn(900 + pending_index, [row['child_pid'] for row in exits])
+
     def test_bootstrap_checkpoints_precede_staged_helper_imports(self):
         with tempfile.TemporaryDirectory() as directory:
             original = Path(__file__).resolve()
@@ -3393,6 +3810,66 @@ class StateTokenProbeTests(unittest.TestCase):
                 state_access_report(mock.Mock(), {'workspace': '/workspace', 'state': '/state'}, 'control')
         self.assertEqual(output.call_count, 1)
         self.assertEqual(json.loads(output.call_args.args[0])['role'], 'control')
+
+    def test_created_process_contexts_keep_ownership_independent(self):
+        native = mock.Mock()
+        closed, alive = [], {}
+
+        def close(handle):
+            self.assertNotIn(handle, closed)
+            closed.append(handle)
+            return True
+
+        def initialize(attributes, count, flags, size):
+            C.cast(size, C.POINTER(C.c_size_t)).contents.value = 64
+            return attributes is not None
+
+        def create(*arguments):
+            index = len(alive)
+            child = C.cast(arguments[-1], C.POINTER(ProcessInfos)).contents
+            child.process, child.thread, child.pid = 70 + index, 80 + index, 1000 + index
+            alive[child.process] = True
+            return True
+
+        def in_job(process, job, result):
+            C.cast(result, C.POINTER(W.BOOL)).contents.value = True
+            return True
+
+        def terminate(process, code):
+            alive[process] = False
+            return True
+
+        native.close.side_effect = close
+        native.initialize.side_effect = initialize
+        native.update.return_value = True
+        native.in_job.side_effect = in_job
+        native.wait.side_effect = lambda process, _milliseconds: 258 if alive[process] else 0
+        native.terminate.side_effect = terminate
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = native
+        api.create_as_user = create
+        api.token = mock.Mock(side_effect=[90, 91])
+        api.snapshot = mock.Mock(return_value={'app': 1, 'user': 'owner', 'restricting_sids': []})
+        probe = StateTokenProbe.__new__(StateTokenProbe)
+        probe.n, probe.api = native, api
+        streams = [mock.Mock() for _ in range(3)]
+        for index, stream in enumerate(streams):
+            stream.fileno.return_value = index
+        crt = mock.Mock()
+        crt.get_osfhandle.side_effect = lambda descriptor: descriptor + 1000
+        with mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                mock.patch.object(os, 'get_handle_inheritable', return_value=False, create=True), \
+                mock.patch.object(os, 'set_handle_inheritable', create=True), \
+                mock.patch('builtins.print'), ExitStack() as owner:
+            first = owner.enter_context(probe.created_process(17, ['python.exe'], '/work', streams, 'first'))
+            second = owner.enter_context(probe.created_process(18, ['python.exe'], '/work', streams, 'second'))
+            self.assertEqual(first['process'].process, 70)
+            self.assertEqual(second['process'].process, 71)
+            self.assertEqual(closed, [90, 91])
+            native.resume.assert_not_called()
+        self.assertEqual(closed, [90, 91, 81, 71, 80, 70])
+        self.assertEqual(native.terminate.call_args_list, [mock.call(71, 1), mock.call(70, 1)])
+        self.assertEqual(native.delete_attributes.call_count, 2)
 
     def test_launch_cleanup_has_exactly_one_process_handle_owner(self):
         for suspended_only, failure, resume_count in [
@@ -3661,6 +4138,7 @@ class StateTokenProbeTests(unittest.TestCase):
                     17, TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY)
                 probe.compare_launches.assert_called_once_with(
                     17, 18, role_sid, str(manifest), 'appcontainer', mock.ANY)
+                probe.startup_controls.assert_called_once_with(17, role_sid, str(manifest))
                 self.assertEqual(probe.api.close.call_args_list,
                                  [mock.call(handle) for handle in [21, 19, 18, 17]])
                 native.local_free.assert_called_once_with(role_sid)
