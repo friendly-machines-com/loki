@@ -2951,16 +2951,18 @@ class StatusTextTests(unittest.TestCase):
 
     def test_ps_bold_tracks_running_jobs_and_stops_at_the_command(self):
         finished = types.SimpleNamespace(
-            status="exited", process=types.SimpleNamespace(returncode=0))
-        for state, returncode, bold in [
-                ["starting", None, False], ["running", None, True],
-                ["running", 0, False], ["running", 42, False],
-                ["stopping", None, False], ["failed", None, False],
-                ["exited", 0, False], ["signaled", -15, False],
-                ["timed_out", -15, False]]:
-            with self.subTest(state=state, returncode=returncode):
+            status="exited", group_active=False,
+            process=types.SimpleNamespace(returncode=0))
+        for state, returncode, group_active, bold in [
+                ["starting", None, False, False], ["running", None, True, True],
+                ["running", 0, True, True], ["running", 0, False, False],
+                ["running", 42, False, False], ["stopping", None, True, False],
+                ["failed", None, False, False], ["exited", 0, False, False],
+                ["signaled", -15, False, False], ["timed_out", -15, False, False]]:
+            with self.subTest(state=state, returncode=returncode, group_active=group_active):
                 job = types.SimpleNamespace(
-                    status=state, process=types.SimpleNamespace(returncode=returncode))
+                    status=state, group_active=group_active,
+                    process=types.SimpleNamespace(returncode=returncode))
                 session = loki.Session(job_manager=types.SimpleNamespace(
                     jobs={"1": finished, "2": job}))
                 activity = terminal_frontend.TerminalActivityStatus()

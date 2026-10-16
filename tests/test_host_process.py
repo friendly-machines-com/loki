@@ -7,12 +7,14 @@ stops it by terminating (``FORCE``) or, where a console is shared, by
 ``CTRL_BREAK_EVENT``.
 """
 
+import errno
 import os
 import signal
 import subprocess
 import sys
 import types
 import unittest
+from unittest import mock
 
 from loki_agent import host_process
 
@@ -49,6 +51,28 @@ class ProcessGroupTests(unittest.TestCase):
         proc = types.SimpleNamespace(pid=missing)
 
         self.assertEqual(host_process.process_group(proc, missing), missing)
+
+
+class GroupExistenceTests(unittest.TestCase):
+    def test_liveness_uses_the_group_not_the_exited_leader(self):
+        proc = types.SimpleNamespace(pid=123, returncode=0)
+        if os.name != 'posix':
+            self.assertFalse(host_process.group_exists(proc, 123))
+            proc.returncode = None
+            self.assertTrue(host_process.group_exists(proc, 123))
+            return
+        with mock.patch.object(os, 'killpg') as probe:
+            self.assertTrue(host_process.group_exists(proc, 123))
+            probe.assert_called_once_with(123, 0)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX group probing')
+    def test_only_a_missing_group_is_reported_as_gone(self):
+        proc = types.SimpleNamespace(pid=123, returncode=0)
+        with mock.patch.object(os, 'killpg', side_effect=ProcessLookupError(errno.ESRCH, 'gone')):
+            self.assertFalse(host_process.group_exists(proc, 123))
+        with mock.patch.object(os, 'killpg', side_effect=PermissionError(errno.EPERM, 'denied')):
+            with self.assertRaises(PermissionError):
+                host_process.group_exists(proc, 123)
 
 
 class SignalTests(unittest.TestCase):

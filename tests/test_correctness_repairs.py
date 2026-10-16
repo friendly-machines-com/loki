@@ -178,6 +178,7 @@ class JobOwnershipContractTests(unittest.TestCase):
             capability = Capability()
             job = types.SimpleNamespace(
                 status="running",
+                group_active=False,
                 signal=None,
                 exit_code=None,
                 finished_at=None,
@@ -766,7 +767,8 @@ class JobOwnershipContractTests(unittest.TestCase):
         manager = job_runtime.JobManager(
             os.path.join(tempfile.gettempdir(), "loki-signal-audit"))
         job = types.SimpleNamespace(
-            process=types.SimpleNamespace(returncode=None, pid=1), pgid=1)
+            process=types.SimpleNamespace(returncode=None, pid=1), pgid=1,
+            group_active=True)
 
         with mock.patch.object(
                 job_runtime.host_process, "signal_group",

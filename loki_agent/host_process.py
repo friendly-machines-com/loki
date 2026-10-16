@@ -55,6 +55,14 @@ if os.name == "posix":
         except (AttributeError, OSError):
             return pid
 
+    def group_exists(proc, pgid):
+        """The group can outlive its leader; only ESRCH proves it is gone."""
+        try:
+            os.killpg(pgid or proc.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
     def signal_group(proc, pgid, signum):
         """Signal the child's whole process group, so its shell children follow."""
         os.killpg(pgid or proc.pid,
@@ -70,6 +78,10 @@ else:
         # by the id of the process that leads it.
         return pid
 
+    def group_exists(proc, pgid):
+        # This seam only owns the direct child on Windows, not a Job Object.
+        return proc.returncode is None
+
     def signal_group(proc, pgid, signum):
         """Stop the child; Windows has no signals.
 
@@ -77,6 +89,8 @@ else:
         stop with ``CTRL_BREAK_EVENT``, falling back to terminating it when the
         child cannot be reached that way.
         """
+        if proc.returncode is not None:
+            raise ProcessLookupError("child has exited")
         if signum == FORCE:
             _terminate(proc)
             return

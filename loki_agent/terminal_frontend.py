@@ -910,10 +910,10 @@ def _write_status_text():
             # End only bold, preserving the status area's background color.
             print(terminals.BOLD_OFF, end="")
     manager = current_session().job_manager
-    # The reaper can lag a process exit. Read returncode without refreshing
-    # job metadata from the renderer.
+    # Use the manager's group snapshot without refreshing metadata from the
+    # renderer: a running group can outlive its leader.
     has_running_jobs = manager is not None and any(
-        job.status == "running" and job.process.returncode is None
+        job.status == "running" and job.group_active
         for job in manager.jobs.values())
     print("), /pwd, /cd DIR, ", end="")
     # /ps is available immediately, including during a turn; this label is

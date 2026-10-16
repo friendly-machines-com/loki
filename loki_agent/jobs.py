@@ -95,6 +95,9 @@ class Job:
     process: asyncio.subprocess.Process | None = field(default=None, repr=False)
     pid: int | None = None
     pgid: int | None = None
+    # A leader's exit does not retire its group. This in-memory ownership ends
+    # on observed absence or a successful forced stop; pgid remains for display.
+    group_active: bool = field(default=False, repr=False)
     status: str = "starting"
     exit_code: int | None = None
     signal: int | None = None
@@ -347,8 +350,8 @@ class JobManager:
 
         Every exit from ``_spawn`` after the job exists comes through here, so a
         launch that never happened is still a job a caller can observe instead
-        of an exception with no trace.  It is the only place that releases the
-        subagent reservation, which is what keeps that release exactly once.
+        of an exception with no trace. Release the live-child reservation here
+        too: a launch failure may never reach _record_exit.
         """
         job.status = status
         if error is not None:
@@ -365,6 +368,17 @@ class JobManager:
         # how the child process actually terminated.
         job.signal = -exit_code if exit_code < 0 else None
         job.exit_code = exit_code
+        self._close_owner_signal(job)
+        self._revoke_credential_capability(job)
+        # The capacity limit counts direct subagent children, not descendants
+        # left in their groups. Leader exit releases that reservation now.
+        self._release_subagent_slot(job)
+        if self._group_exists(job):
+            # Keep a surviving group signalable, including after a soft stop.
+            # Normal foreground completion still returns the leader's result;
+            # it does not implicitly kill or wait for background descendants.
+            self._write_metadata(job)
+            return
         if job.status in [
                 "cancelled", "timed_out", "stopped", "owner_closed",
                 "failed"]:
@@ -531,6 +545,7 @@ class JobManager:
             capability_handed_off = True
             job.pid = proc.pid
             job.pgid = host_process.process_group(proc, proc.pid)
+            job.group_active = True
             job.status = "running"
             self._write_metadata(job)
             return job
@@ -542,6 +557,7 @@ class JobManager:
                     host_process.signal_group(
                         proc, getattr(job, "pgid", None) or proc.pid,
                         host_process.FORCE)
+                    job.group_active = False
                 with contextlib.suppress(Exception):
                     await proc.wait()
             revoked = isinstance(
@@ -617,103 +633,51 @@ class JobManager:
                                 credential_destinations=credential_destinations,
                                 subagent=subagent)
 
-        # Define the exit_task and nested signal helpers first so they are
-        # available throughout the entire function.
         exit_task = asyncio.create_task(self._wait_for_job(job))
+        cancel_task = None
+        try:
+            # Cancellation may already have arrived while _spawn awaited.
+            interrupted = cancel_event is not None and cancel_event.is_set()
+            if not interrupted:
+                if cancel_event is not None:
+                    cancel_task = asyncio.create_task(cancel_event.wait())
+                watchers = {exit_task} if cancel_task is None else {
+                    exit_task, cancel_task}
+                done, _pending = await asyncio.wait(
+                    watchers,
+                    timeout=timeout_ms / 1000 if timeout_ms is not None else None,
+                    return_when=asyncio.FIRST_COMPLETED)
+                # Cancellation wins a simultaneous finish. The watcher's later
+                # cancellation in finally is not evidence of user intent.
+                interrupted = cancel_event is not None and cancel_event.is_set()
+                if not interrupted and exit_task in done:
+                    self._record_exit(job, exit_task.result())
+                    await self._close_credential_capability(job)
+                    return job, "completed", self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
 
-        def _signal_job(signum):
-            # Signal the job's whole process group so shell children are not
-            # left behind.  The status check and the signal call contain no
-            # await, so another task cannot reap the job between them.
-            # A user-requested stop is not proof of exit. Cancellation and
-            # timeout cleanup must still signal and escalate a stopping job.
-            if (job.status not in ["running", "stopping"]
-                    or job.process.returncode is not None):
-                return False
-            try:
-                host_process.signal_group(job.process, job.pgid, signum)
-                return True
-            except ProcessLookupError:
-                return False
-
-        async def terminate(signum, grace_s: float):
-            sent = _signal_job(signum)
-            if not sent:
-                return await exit_task
-            try:
-                exit_code = await asyncio.wait_for(
-                    asyncio.shield(exit_task), timeout=grace_s)
-            except asyncio.TimeoutError:
-                _signal_job(host_process.FORCE)
-                exit_code = await exit_task
-            return exit_code
-
-        # 1. Pre-wait cancellation check: Was the event set while self._spawn awaited?
-        # Bypasses asyncio.wait entirely to avoid watcher/selector registration races.
-        if cancel_event is not None and cancel_event.is_set():
-            # Do not record cancellation until the live process has exited;
-            # the termination helper must remain able to escalate signals.
-            exit_code = await terminate(signal.SIGINT, 2.0)
-            job.status = "cancelled"
-            self._write_metadata(job)
+            exit_code = await self._terminate_process_group(
+                job, signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
+            status = "cancelled" if interrupted else "timed_out"
+            job.status = status
             self._record_exit(job, exit_code)
             await self._close_credential_capability(job)
-            return job, "cancelled", self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
-
-        cancel_task = (asyncio.create_task(cancel_event.wait())
-                       if cancel_event is not None else None)
-        watchers = {exit_task} if cancel_task is None else {
-            exit_task, cancel_task}
-
-        try:
-            done, _pending = await asyncio.wait(
-                watchers,
-                timeout=timeout_ms / 1000 if timeout_ms is not None else None,
-                return_when=asyncio.FIRST_COMPLETED)
-            # Decide the outcome before cancelling the unused watcher below.
-            # Its eventual done() state is not evidence of user cancellation.
-            interrupted = cancel_event is not None and cancel_event.is_set()
+            return job, status, self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
         except BaseException:
-            # Any unwind of the owning Python task must not orphan the process
-            # it owns. Wait for the process group to die before propagating
-            # the original exception.
-            exit_code = await terminate(signal.SIGINT, 2.0)
+            # Cover the entire ownership scope, including cancellation during
+            # pre-wait cleanup or escalation, not just the initial wait.
+            exit_code = await self._terminate_process_group(
+                job, signal.SIGINT, 2.0)
             job.status = "cancelled"
-            self._write_metadata(job)
             self._record_exit(job, exit_code)
             await self._close_credential_capability(job)
             raise
         finally:
-            # Clean up pending cancel task if it is still running to prevent memory leaks
-            if cancel_task is not None and not cancel_task.done():
-                cancel_task.cancel()
-                try:
-                    await cancel_task
-                except asyncio.CancelledError:
-                    pass
-
-        # Cancel wins a simultaneous finish: if the user cancelled and the
-        # job also exited in the same loop pass, the intent outranks the
-        # race. A job that exited on its own (no cancel pending) records
-        # completed.
-        if not interrupted and exit_task in done:
-            self._record_exit(job, exit_task.result())
-            await self._close_credential_capability(job)
-            return job, "completed", self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
-
-        # Cancellation wins even if exit was observed in the same loop pass.
-        # Otherwise terminate the live job before recording cancellation or
-        # timeout, keeping signal escalation available until it exits.
-        exit_code = await terminate(
-            signal.SIGINT if interrupted else signal.SIGTERM, 2.0)
-
-        job.status = "cancelled" if interrupted else "timed_out"
-        self._write_metadata(job)
-
-        self._record_exit(job, exit_code)
-        await self._close_credential_capability(job)
-        status = "cancelled" if interrupted else "timed_out"
-        return job, status, self._spool_tail(job, 'stdout.log', output_chars), self._spool_tail(job, 'stderr.log', output_chars)
+            tasks = [task for task in [cancel_task, exit_task]
+                     if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_shell(self, command: str, timeout: int | None = None, description: str = "",
                         run_in_background: bool = False,
@@ -809,33 +773,72 @@ class JobManager:
         return job
 
     @staticmethod
+    def _group_exists(job: Job) -> bool:
+        if not job.group_active:
+            return False
+        if host_process.group_exists(job.process, job.pgid):
+            return True
+        job.group_active = False
+        return False
+
+    @staticmethod
     def _signal_process_group(job: Job, signum) -> bool:
-        if job.process is None or job.process.returncode is not None:
+        if job.process is None or not job.group_active:
             return False
         try:
             host_process.signal_group(job.process, job.pgid, signum)
-            return True
         except ProcessLookupError:
+            job.group_active = False
             return False
+        if signum == host_process.FORCE:
+            # Non-child zombies may keep a PGID present until their adopter
+            # reaps them. Once SIGKILL is delivered, do not wait forever for
+            # that or later signal a recycled historical PGID.
+            job.group_active = False
+        return True
+
+    async def _wait_for_group(self, job: Job, grace_s: float) -> bool:
+        deadline = asyncio.get_running_loop().time() + grace_s
+        while self._group_exists(job):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.05, remaining))
+        return True
+
+    async def _terminate_process_group(self, job: Job, signum, grace_s: float,
+                                       owner_grace_s: float = 0) -> int:
+        async def finish():
+            if not (owner_grace_s and await self._wait_for_group(job, owner_grace_s)):
+                if self._signal_process_group(job, signum):
+                    if not await self._wait_for_group(job, grace_s):
+                        self._signal_process_group(job, host_process.FORCE)
+            return await job.process.wait()
+
+        # A cancelled caller must join its teardown before relinquishing the
+        # group. Repeated cancellation must not strand the escalation task.
+        task = asyncio.create_task(finish())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    pass
+            task.result()
+            raise
 
     async def _finish_owned_job(self, job: Job):
-        exit_task = asyncio.create_task(job.process.wait())
         try:
-            try:
-                exit_code = await asyncio.wait_for(
-                    asyncio.shield(exit_task), timeout=2)
-            except asyncio.TimeoutError:
-                self._signal_process_group(job, signal.SIGTERM)
-                try:
-                    exit_code = await asyncio.wait_for(
-                        asyncio.shield(exit_task), timeout=2)
-                except asyncio.TimeoutError:
-                    self._signal_process_group(job, host_process.FORCE)
-                    exit_code = await exit_task
-        finally:
-            if not exit_task.done():
-                exit_task.cancel()
-                await asyncio.gather(exit_task, return_exceptions=True)
+            exit_code = await self._terminate_process_group(
+                job, signal.SIGTERM, 2.0, owner_grace_s=2.0)
+        except asyncio.CancelledError:
+            # The termination helper joined teardown before propagating this.
+            if job.finished_at is None:
+                self._record_exit(job, job.process.returncode)
+            await self._close_credential_capability(job)
+            raise
         if job.finished_at is None:
             self._record_exit(job, exit_code)
         await self._close_credential_capability(job)
@@ -857,7 +860,7 @@ class JobManager:
                 self._revoke_credential_capability(job)
                 cleanup.append(job)
                 continue
-            if job.process.returncode is not None:
+            if job.process.returncode is not None and not self._group_exists(job):
                 self._close_owner_signal(job)
                 self._revoke_credential_capability(job)
                 cleanup.append(job)
@@ -945,13 +948,9 @@ class JobManager:
             return (
                 f"Job {job.id} is already stopping. "
                 "Use force=true to send SIGKILL.")
-        if job.process.returncode is not None:
-            self._record_exit(job, job.process.returncode)
-            return f"Job {job.id} is no longer running."
         sig = host_process.FORCE if force else signal.SIGTERM
-        try:
-            host_process.signal_group(job.process, job.pgid, sig)
-        except ProcessLookupError:
+        if not self._signal_process_group(job, sig):
+            self._refresh_job(job)
             return f"Job {job.id} is no longer running."
         job.status = "stopping"
         self._write_metadata(job)

@@ -22,6 +22,11 @@ class PsTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.manager = job_runtime.JobManager(directory.name)
         self.addCleanup(self.manager.close)
+        # These unit-test jobs have no descendant processes. Real surviving
+        # groups are exercised in test_job_process_groups.py.
+        groups = mock.patch.object(job_runtime.host_process, 'group_exists', return_value=False)
+        groups.start()
+        self.addCleanup(groups.stop)
         self.session = Session(job_manager=self.manager)
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
@@ -37,6 +42,7 @@ class PsTests(unittest.TestCase):
             stderr_path=os.path.join(spool, "stderr.log"),
             metadata_path=os.path.join(spool, "job.json"),
             started_at_iso=started_at, status=status,
+            group_active=status in ['running', 'stopping'],
             process=mock.Mock(returncode=None))
         self.manager.jobs[job_id] = job
         return job
@@ -177,6 +183,18 @@ class PsTests(unittest.TestCase):
                 self.assertIn("unknown job id", loki.run_ps(argument))
             for argument in ["stop 1", "kill 1"]:
                 self.assertIn("not running", loki.run_ps(argument))
+            send.assert_not_called()
+
+    def test_a_retired_group_is_not_reactivated_by_a_reused_id(self):
+        job = self.add_job('1', 'stopping')
+        job.process.returncode = -15
+        loki.run_ps('1')
+        self.assertEqual(job.status, 'stopped')
+        self.assertFalse(job.group_active)
+        with mock.patch.object(job_runtime.host_process, 'group_exists', return_value=True) as probe, \
+                mock.patch.object(job_runtime.host_process, 'signal_group') as send:
+            self.assertIn('not running', loki.run_ps('kill 1'))
+            probe.assert_not_called()
             send.assert_not_called()
 
     def test_invalid_arguments_are_local_usage_errors(self):
