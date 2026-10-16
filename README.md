@@ -43,7 +43,8 @@ clean it up automatically; you can remove its contents between runs.
 
 ```
 export LOKI_API_KEY=xxx
-export LOKI_API_BASE="https://opencode.ai/zen/go/v1/chat/completions"
+export LOKI_API_BASE="https://opencode.ai/inference/go/openai/v1/chat/completions"
+# The legacy base "https://opencode.ai/zen/go/v1/chat/completions" remains supported.
 export LOKI_MODEL="glm-5.2"
 ./loki.py
 ```

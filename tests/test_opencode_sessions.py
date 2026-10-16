@@ -87,6 +87,9 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
             "https://opencode.ai/zen/go/v1/chat/completions",
             "https://opencode.ai/zen/go/v1/messages/",
             "https://opencode.ai:443/zen/go/v1/responses",
+            "https://opencode.ai/inference/go/openai/v1/chat/completions",
+            "https://opencode.ai/inference/go/anthropic/v1/messages",
+            "https://opencode.ai:443/inference/go/openai/v1/responses",
         ]
         rejected = [
             "http://opencode.ai/zen/go/v1/chat/completions",
@@ -94,6 +97,11 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
             "https://opencode.ai.evil/zen/go/v1/chat/completions",
             "https://opencode.ai/zen/v1/chat/completions",
             "https://opencode.ai/zen/go/v1/models",
+            "http://opencode.ai/inference/go/openai/v1/chat/completions",
+            "https://opencode.ai:444/inference/go/openai/v1/chat/completions",
+            "https://opencode.ai.inference/go/openai/v1/chat/completions",
+            "https://opencode.ai/inference/go/v1/chat/completions",
+            "https://opencode.ai/inference/go/v1/models",
         ]
         for url in accepted:
             with self.subTest(url=url):
@@ -114,30 +122,31 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
 
     def test_canonical_target_requires_a_conversation_identity(self):
         async def scenario():
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(10):
                 connector = FakeConnector([])
                 with PatchedOpenConnection(connector):
-                    for stream in [False, True]:
-                        config = self._config(
-                            'https://opencode.ai/zen/go/v1/chat/completions', stream=stream)
-                        with self.assertRaisesRegex(ValueError, 'require a conversation identity'):
-                            model_requests._opencode_session_id_for_request(config, config.chat_provider.chat_url)
-                        for invalid in [None, '', 0, 1, False, True, [], ['id'], {}, {'id': 'x'}]:
-                            with self.subTest(stream=stream, identity=invalid):
-                                loki.current_session().conversation_id = invalid
-                                with self.assertRaisesRegex(ValueError, 'require a conversation identity'):
-                                    await loki.async_chat_completion(
-                                        [formats.message_item('user', 'must not send')], tools=[])
-                                self.assertIs(loki.current_session().runtime_config, config)
-                                self.assertEqual(connector.calls, [])
-                                self.assertEqual(connector.writers, [])
+                    for url in ['https://opencode.ai/zen/go/v1/chat/completions',
+                                'https://opencode.ai/inference/go/openai/v1/chat/completions']:
+                        for stream in [False, True]:
+                            config = self._config(url, stream=stream)
+                            with self.assertRaisesRegex(ValueError, 'require a conversation identity'):
+                                model_requests._opencode_session_id_for_request(
+                                    config, config.chat_provider.chat_url)
+                            for invalid in [None, '', 0, 1, False, True, [], ['id'], {}, {'id': 'x'}]:
+                                with self.subTest(url=url, stream=stream, identity=invalid):
+                                    loki.current_session().conversation_id = invalid
+                                    with self.assertRaisesRegex(ValueError, 'require a conversation identity'):
+                                        await loki.async_chat_completion(
+                                            [formats.message_item('user', 'must not send')], tools=[])
+                                    self.assertIs(loki.current_session().runtime_config, config)
+                                    self.assertEqual(connector.calls, [])
+                                    self.assertEqual(connector.writers, [])
         asyncio.run(scenario())
 
     def test_conversation_identity_survives_resume_and_switch_on_both_transports(self):
-        async def scenario(directory, stream):
+        async def scenario(directory, url, stream):
             async with asyncio.timeout(10):
                 tasks_before = asyncio.all_tasks()
-                url = 'https://opencode.ai/zen/go/v1/chat/completions'
                 identity_a = '11111111-1111-4111-8111-111111111111'
                 identity_b = '22222222-2222-4222-8222-222222222222'
                 path_a = os.path.join(directory, f'chat-{identity_a}.json')
@@ -211,7 +220,9 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                             self.assertEqual(len(connector.writers), index + 1)
                             packet = bytes(connector.writers[index].data)
                             headers, body = packet.split(b'\r\n\r\n', 1)
-                            self.assertTrue(headers.startswith(b'POST /zen/go/v1/chat/completions HTTP/1.1\r\n'))
+                            wire_path = url.removeprefix('https://opencode.ai')
+                            self.assertTrue(headers.startswith(
+                                b'POST ' + wire_path.encode() + b' HTTP/1.1\r\n'))
                             identity_headers = [line for line in headers.split(b'\r\n')
                                                 if line.partition(b':')[0].lower() == b'x-opencode-session']
                             self.assertEqual(identity_headers, [b'x-opencode-session: ' + identity.encode()])
@@ -264,20 +275,32 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                                 writer.close()
                                 await writer.wait_closed()
 
-        for stream in [False, True]:
-            with self.subTest(stream=stream), tempfile.TemporaryDirectory() as directory:
-                with mock.patch.object(loki, '_DEFAULT_SESSION', Session(shell_cwd=directory)), \
-                        mock.patch.object(loki, 'CREDENTIALS', CredentialStore({})):
-                    asyncio.run(scenario(directory, stream))
+        for url in ['https://opencode.ai/zen/go/v1/chat/completions',
+                    'https://opencode.ai/inference/go/openai/v1/chat/completions']:
+            for stream in [False, True]:
+                with self.subTest(url=url, stream=stream), tempfile.TemporaryDirectory() as directory:
+                    with mock.patch.object(loki, '_DEFAULT_SESSION', Session(shell_cwd=directory)), \
+                            mock.patch.object(loki, 'CREDENTIALS', CredentialStore({})):
+                        asyncio.run(scenario(directory, url, stream))
 
     def test_non_go_and_model_requests_do_not_receive_session_header(self):
         async def scenario():
             async with asyncio.timeout(10):
-                canonical = 'https://opencode.ai/zen/go/v1/chat/completions'
-                non_go = 'https://opencode.ai/zen/v1/chat/completions'
-                mismatch = 'https://opencode.ai/zen/go/v1/responses'
+                legacy = 'https://opencode.ai/zen/go/v1/chat/completions'
+                canonical = 'https://opencode.ai/inference/go/openai/v1/chat/completions'
+                cases = [
+                    # Non-Go inference path under the canonical host.
+                    ('https://opencode.ai/zen/v1/chat/completions',
+                     'https://opencode.ai/zen/v1/chat/completions'),
+                    # Canonical configured URL, different canonical Go path.
+                    (legacy, 'https://opencode.ai/zen/go/v1/responses'),
+                    (canonical, 'https://opencode.ai/inference/go/openai/v1/responses'),
+                    # New-style path without the protocol segment.
+                    ('https://opencode.ai/inference/go/v1/chat/completions',
+                     'https://opencode.ai/inference/go/v1/chat/completions'),
+                ]
                 for stream in [False, True]:
-                    for configured, requested in ((non_go, non_go), (canonical, mismatch)):
+                    for configured, requested in cases:
                         with self.subTest(stream=stream, configured=configured, requested=requested):
                             self._config(configured, stream=stream)
                             connector = FakeConnector([self._response('boundary answer', stream=stream)])
@@ -298,27 +321,31 @@ class OpenCodeSessionHeaderTests(unittest.TestCase):
                                         if not writer.closed:
                                             writer.close()
                                             await writer.wait_closed()
-                config = self._config(canonical)
-                body = b'{"data": []}'
-                connector = FakeConnector([b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
-                                           + str(len(body)).encode() + b'\r\n\r\n' + body])
-                with PatchedOpenConnection(connector):
-                    try:
-                        response = await loki.async_provider_request(
-                            'GET', config.chat_provider.models_url,
-                            opencode_session_id=loki.current_session().conversation_id)
-                        self.assertEqual(response.payload, {'data': []})
-                        self.assertEqual(len(connector.writers), 1)
-                        headers = bytes(connector.writers[0].data).split(b'\r\n\r\n', 1)[0]
-                        self.assertTrue(headers.startswith(b'GET /zen/go/v1/models HTTP/1.1\r\n'))
-                        self.assertFalse(any(line.partition(b':')[0].lower() == b'x-opencode-session'
-                                             for line in headers.split(b'\r\n')))
-                        self._assert_transport_closed(connector)
-                    finally:
-                        for writer in connector.writers:
-                            if not writer.closed:
-                                writer.close()
-                                await writer.wait_closed()
+                for url in [legacy, canonical]:
+                    config = self._config(url)
+                    body = b'{"data": []}'
+                    connector = FakeConnector([b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
+                                               + str(len(body)).encode() + b'\r\n\r\n' + body])
+                    with PatchedOpenConnection(connector):
+                        try:
+                            response = await loki.async_provider_request(
+                                'GET', config.chat_provider.models_url,
+                                opencode_session_id=loki.current_session().conversation_id)
+                            self.assertEqual(response.payload, {'data': []})
+                            self.assertEqual(len(connector.writers), 1)
+                            headers = bytes(connector.writers[0].data).split(b'\r\n\r\n', 1)[0]
+                            models_path = config.chat_provider.models_url.split(
+                                'opencode.ai', 1)[1].encode()
+                            self.assertTrue(headers.startswith(
+                                b'GET ' + models_path + b' HTTP/1.1\r\n'))
+                            self.assertFalse(any(line.partition(b':')[0].lower() == b'x-opencode-session'
+                                                 for line in headers.split(b'\r\n')))
+                            self._assert_transport_closed(connector)
+                        finally:
+                            for writer in connector.writers:
+                                if not writer.closed:
+                                    writer.close()
+                                    await writer.wait_closed()
         asyncio.run(scenario())
 
 

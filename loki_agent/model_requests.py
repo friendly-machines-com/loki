@@ -178,9 +178,15 @@ def _capture_codex_turn_state(headers, turn_state):
 
 
 _OPENCODE_GO_INFERENCE_PATHS = frozenset({
+    # Legacy Zen Go inference paths; retained so existing configurations
+    # keep receiving a conversation identity.
     "/zen/go/v1/chat/completions",
     "/zen/go/v1/messages",
     "/zen/go/v1/responses",
+    # Current OpenCode Go inference paths (see opencode.ai/docs/go).
+    "/inference/go/openai/v1/chat/completions",
+    "/inference/go/anthropic/v1/messages",
+    "/inference/go/openai/v1/responses",
 })
 
 
