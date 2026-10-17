@@ -51,6 +51,7 @@ class ProbeContainmentTests(unittest.TestCase):
                               return_value=True),
             mock.patch.object(windows_api, "token_app_container_sid",
                               return_value=PACKAGE),
+            mock.patch.object(windows_api, 'token_restricting_sids', return_value=[]),
             mock.patch.object(paths, "credential_directory",
                               return_value=CREDENTIALS),
             mock.patch.object(paths, "loki_config_dir", return_value=CONFIG),
@@ -85,6 +86,8 @@ class ProbeContainmentTests(unittest.TestCase):
         # exists rather than being absent.
         self.allow(WORKSPACE, WORKSPACE_RW)
         self.allow(CONFIG, windows_api.AccessMask.GENERIC_READ)
+        self.allow(STATE, windows_api.AccessMask.GENERIC_READ)
+        self.allow(STATE, windows_api.AccessMask.GENERIC_WRITE)
         for name in ["SYSTEM.md", "settings.ini", "hooks.json"]:
             self.deny(os.path.join(CONFIG, name), windows_api.AccessMask.GENERIC_READ,
                       status=windows_api.ERROR_FILE_NOT_FOUND)
@@ -100,7 +103,11 @@ class ProbeContainmentTests(unittest.TestCase):
 
         self.assertEqual(set(checks), {
             "AppContainer", "package SID", "workspace reachable",
-            "configuration readable", "state inaccessible",
+            "configuration readable", 'state readable', 'owning state writable',
+            'setup metadata unreadable', 'setup metadata not writable',
+            'setup metadata data not writable', 'setup metadata attributes not writable',
+            'setup metadata extended attributes not writable', 'setup metadata not appendable',
+            'setup metadata not deletable', 'setup metadata DACL not rewritable', 'setup metadata owner not rewritable',
             "cannot create configuration files",
             "cannot create configuration directories",
             "cannot delete configuration children",
@@ -146,14 +153,14 @@ class ProbeContainmentTests(unittest.TestCase):
                      windows_api.AccessMask.DELETE,
                      windows_api.AccessMask.WRITE_DAC,
                      windows_api.AccessMask.WRITE_OWNER],
-            STATE: [windows_api.AccessMask.GENERIC_READ],
+            STATE: [windows_api.AccessMask.GENERIC_READ, windows_api.AccessMask.GENERIC_WRITE],
             CREDENTIALS: [windows_api.AccessMask.GENERIC_READ,
                           windows_api.AccessMask.FILE_WRITE_DATA,
                           windows_api.AccessMask.DELETE,
                           windows_api.AccessMask.WRITE_DAC,
                           windows_api.AccessMask.WRITE_OWNER],
         }
-        for asset in [CREDENTIAL_FILE, CREDENTIAL_LOCK]:
+        for asset in [CREDENTIAL_FILE, CREDENTIAL_LOCK, os.path.join(STATE, 'windows-setup.json')]:
             expected[asset] = [
                 windows_api.AccessMask.GENERIC_READ,
                 windows_api.AccessMask.GENERIC_WRITE,
@@ -242,12 +249,37 @@ class ProbeContainmentTests(unittest.TestCase):
                     self.assertEqual(len(failures), 1, failures)
                     self.assertTrue(failures[0].name.startswith(name))
 
-    def test_state_read_access_fails_even_when_configuration_is_readable(self):
+    def test_owning_state_access_is_required_without_exposing_setup(self):
         self.happy()
-        self.allow(STATE, windows_api.AccessMask.GENERIC_READ)
-        checks = self.checks()
-        self.assertEqual(checks["configuration readable"].status, "pass")
-        self.assertEqual(checks["state inaccessible"].status, "fail")
+        self.assertTrue(all(check.status == 'pass' for check in self.checks().values()))
+        self.deny(STATE, windows_api.AccessMask.GENERIC_READ)
+        self.assertEqual(self.checks()['state readable'].status, 'fail')
+        self.happy()
+        self.deny(STATE, windows_api.AccessMask.GENERIC_WRITE)
+        self.assertEqual(self.checks()['owning state writable'].status, 'fail')
+        self.happy()
+        self.allow(os.path.join(STATE, 'windows-setup.json'), windows_api.AccessMask.GENERIC_READ)
+        self.assertEqual(self.checks()['setup metadata unreadable'].status, 'fail')
+
+    def test_tool_state_is_readable_but_every_mutation_direction_is_denied(self):
+        role = windows_state.tool_role_sid(PACKAGE)
+        with mock.patch.object(windows_api, 'token_restricting_sids', return_value=[[role, 7]]):
+            self.happy()
+            self.deny(STATE, windows_api.AccessMask.GENERIC_WRITE)
+            self.assertTrue(all(check.status == 'pass' for check in self.checks().values()))
+            for access in [windows_api.AccessMask.GENERIC_WRITE, windows_api.AccessMask.FILE_WRITE_DATA,
+                           windows_api.AccessMask.FILE_APPEND_DATA, windows_api.AccessMask.FILE_DELETE_CHILD,
+                           windows_api.AccessMask.DELETE, windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
+                           windows_api.AccessMask.FILE_WRITE_EA, windows_api.AccessMask.WRITE_DAC,
+                           windows_api.AccessMask.WRITE_OWNER]:
+                with self.subTest(access=access):
+                    self.outcomes.clear()
+                    self.happy()
+                    self.deny(STATE, windows_api.AccessMask.GENERIC_WRITE)
+                    self.allow(STATE, access)
+                    failed = [check for check in self.checks().values() if check.status != 'pass']
+                    self.assertEqual(len(failed), 1, failed)
+                    self.assertTrue(failed[0].name.startswith('state '))
 
     def test_a_listable_credential_directory_fails(self):
         self.happy()
@@ -436,12 +468,17 @@ class VerifyContainerTests(unittest.TestCase):
     READ_WRITE = windows_state.Access.READ_WRITE
 
     def setUp(self):
-        self.descriptors = {CONFIG: f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"}
+        self.descriptors = {CONFIG: f"D:PAI(A;OICI;FRFX;;;{PACKAGE})",
+                            STATE: f'D:P(A;OICI;FA;;;{OTHER})(A;OICI;0x1301BF;;;{PACKAGE})',
+                            os.path.join(STATE, 'windows-setup.json'): f'D:P(A;;FA;;;{OTHER})'}
         patches = [
             mock.patch.object(windows_verify, "profile_name_for",
                               return_value="profile"),
             mock.patch.object(windows_api, "derive_app_container_sid",
                               return_value=PACKAGE),
+            mock.patch.object(windows_api, 'current_user_sid', return_value=OTHER),
+            mock.patch.object(windows_verify, 'state_objects', return_value=[STATE]),
+            mock.patch.object(windows_verify, 'setup_files', return_value=[os.path.join(STATE, 'windows-setup.json')]),
             mock.patch.object(windows_api, "dacl_sddl",
                               side_effect=lambda path: self.descriptors.get(
                                   path, NO_PACKAGE)),
@@ -461,7 +498,7 @@ class VerifyContainerTests(unittest.TestCase):
 
     def test_read_write_grant_and_clean_trees_pass(self):
         self.descriptors[GRANTED] = (
-            f"D:PAI(A;OICI;0x1301BF;;;{PACKAGE})")
+            f"D:PAI(A;OICI;0x1301BF;;;{PACKAGE})(A;OICI;0x1301BF;;;{windows_state.tool_role_sid(PACKAGE)})")
 
         checks = self.check(GRANTED, self.READ_WRITE)
 
@@ -522,7 +559,7 @@ class VerifyContainerTests(unittest.TestCase):
                 self.assertEqual(self.check(GRANTED, self.READ)["config"].status, "fail")
 
     def test_an_allow_ace_on_a_private_tree_fails(self):
-        for tree, label in [[CREDENTIALS, "credentials"], [STATE, "state"]]:
+        for tree, label in [[CREDENTIALS, "credentials"]]:
             with self.subTest(tree=tree):
                 self.descriptors[tree] = f"D:PAI(A;OICI;FRFX;;;{PACKAGE})"
                 self.assertEqual(self.check(GRANTED, self.READ)[label].status, "fail")

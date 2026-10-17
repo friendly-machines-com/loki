@@ -50,7 +50,7 @@ from . import paths
 from . import windows_api
 from . import windows_containers
 from . import windows_verify
-from .windows_acl import names_package
+from .windows_acl import names_package, dacl_parts
 from .windows_state import (
     Access,
     Backend,
@@ -68,6 +68,12 @@ from .windows_state import (
     load_ledger,
     remove_package_aces,
     save_ledger,
+    setup_files,
+    state_objects,
+    state_writer_sids,
+    state_acl_errors,
+    grants_access,
+    tool_role_sid,
     workspace_key,
 )
 
@@ -109,6 +115,10 @@ class WindowsBackend:
             raise windows_api.WindowsApiError(
                 f"{path} has no DACL to extend")
         updated = add_package_ace(current, package, access)
+        role = tool_role_sid(package)
+        updated = remove_package_aces(updated, role)
+        if access is Access.READ_WRITE:
+            updated = add_package_ace(updated, role, access)
         # Do not rewrite a DACL this edit did not change.  The write is the
         # expensive part (inherited ACEs propagate), and setup is re-runnable:
         # re-applying an existing configuration must not re-touch the runtime
@@ -118,9 +128,10 @@ class WindowsBackend:
 
     def _ungrant_path(self, path: str, package: str) -> None:
         current = windows_api.dacl_sddl(path)
-        if not names_package(current, package):
+        role = tool_role_sid(package)
+        if not names_package(current, package) and not names_package(current, role):
             return
-        updated = remove_package_aces(current, package)
+        updated = remove_package_aces(remove_package_aces(current, package), role)
         # A deny ACE names the package but has no allow to remove; do not rewrite
         # a DACL that this edit did not change.
         if updated != current:
@@ -129,6 +140,75 @@ class WindowsBackend:
     def _private_directory(self, path: str, user: str) -> None:
         os.makedirs(path, exist_ok=True)
         windows_containers.set_dacl_sddl(path, private_dacl_sddl(user))
+
+    def _state_handle(self, path):
+        handle = windows_api.open_with_access(
+            path, windows_api.AccessMask.READ_CONTROL | windows_api.AccessMask.WRITE_DAC |
+            windows_api.AccessMask.FILE_READ_ATTRIBUTES,
+            flags=windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT,
+            share_mode=windows_api.FileShareMode.FILE_SHARE_READ | windows_api.FileShareMode.FILE_SHARE_WRITE)
+        try:
+            if windows_api.by_handle_file_information(handle).dwFileAttributes & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise windows_api.WindowsApiError('managed state contains a reparse entry: ' + path)
+        except BaseException:
+            windows_api.close_handle(handle)
+            raise
+        return handle
+
+    def _prepare_state(self, user):
+        # Protect existing publication remnants before granting runtime access
+        # to their parent. All future replacements are private at creation.
+        for path in setup_files():
+            handle = self._state_handle(path)
+            try:
+                windows_containers.set_handle_dacl_sddl(handle, private_dacl_sddl(user))
+            finally:
+                windows_api.close_handle(handle)
+        handle = self._state_handle(paths.loki_state_dir())
+        try:
+            current = windows_api.handle_dacl_sddl(handle)
+            existing = dacl_parts(current)[1] if current is not None else []
+            if any(ace[1:-1].split(';')[0] not in ['A', 'D'] for ace in existing):
+                raise windows_api.WindowsApiError('unsupported managed-state security entry')
+            header, private = dacl_parts(private_dacl_sddl(user))
+            # This is Loki's managed root, not a user project directory. Preserve
+            # denies and every recorded workspace writer; never carry a broad
+            # compatibility-SID write grant into the tool-readable state tree.
+            denied = [ace for ace in existing if ace[1:-1].split(';')[0] == 'D']
+            updated = header + ''.join([*denied, *private])
+            for package in sorted(state_writer_sids(self.ledger)):
+                updated = add_package_ace(updated, package, Access.READ_WRITE)
+            if updated != current:
+                windows_containers.set_handle_dacl_sddl(handle, updated)
+        finally:
+            windows_api.close_handle(handle)
+
+    def _grant_state(self, package, user, root_handle):
+        writers = state_writer_sids(self.ledger)
+        root = os.path.normcase(windows_api.final_path_from_handle(root_handle))
+        for path in state_objects():
+            handle = self._state_handle(path)
+            try:
+                actual = os.path.normcase(windows_api.final_path_from_handle(handle))
+                if actual != root and not actual.startswith(root.rstrip(os.sep) + os.sep):
+                    raise windows_api.WindowsApiError('state object resolved outside the managed tree: ' + path)
+                current = windows_api.handle_dacl_sddl(handle)
+                errors = state_acl_errors(current, user, writers)
+                if errors:
+                    raise windows_api.WindowsApiError(path + ': ' + '; '.join(errors))
+                if not grants_access(current, package, Access.READ_WRITE):
+                    updated = add_package_ace(current, package, Access.READ_WRITE)
+                    if not grants_access(updated, package, Access.READ_WRITE):
+                        raise windows_api.WindowsApiError('state permissions deny the recorded runtime: ' + path)
+                    windows_containers.set_handle_dacl_sddl(handle, updated)
+            finally:
+                windows_api.close_handle(handle)
+
+    def _ungrant_state(self, root, package):
+        # Parents precede descendants: removing an explicit parent grant first
+        # revokes its inherited copies; protected children have explicit grants.
+        for path in state_objects(root):
+            self._ungrant_path(path, package)
 
     def _record_entry(self, key, entry):
         workspaces = dict(self.ledger.get("workspaces", {}))
@@ -162,7 +242,6 @@ class WindowsBackend:
             if errors:
                 raise windows_api.WindowsApiError("; ".join(errors))
             self._private_directory(paths.credential_directory(), user)
-            self._private_directory(paths.loki_state_dir(), user)
             # Persist recovery coverage BEFORE changing any grant. On a failed
             # or interrupted apply, every old/new path remains recorded, and
             # the startup gate refuses the pending entry. This is not a rollback
@@ -175,9 +254,15 @@ class WindowsBackend:
             self._record_entry(key, pending)
             package = self._ensure_profile(checked_plan.profile)
             checks.append(Check("profile", "pass", package))
+            if any(grant.origin == 'state' for grant in definition.grants):
+                self._prepare_state(user)
             for change in checked_plan.changes:
                 if change.kind == "remove":
-                    self._ungrant_path(change.path, package)
+                    old = next(grant for grant in entry_grants(previous or {}) if grant.path == change.path)
+                    if old.origin == 'state':
+                        self._ungrant_state(change.path, package)
+                    else:
+                        self._ungrant_path(change.path, package)
                     checks.append(Check(f"ungrant {change.path}", "pass"))
             for grant in definition.grants:
                 # One handle names the directory for the containment check, the
@@ -188,10 +273,13 @@ class WindowsBackend:
                 handle = windows_api.open_directory_for_acl(grant.path)
                 try:
                     errors = handle_path_errors(
-                        handle, grant.path, grant.access)
+                        handle, grant.path, grant.access, origin=grant.origin)
                     if errors:
                         raise windows_api.WindowsApiError("; ".join(errors))
-                    self._grant_path(handle, grant.path, grant.access, package)
+                    if grant.origin == 'state':
+                        self._grant_state(package, user, handle)
+                    else:
+                        self._grant_path(handle, grant.path, grant.access, package)
                 finally:
                     windows_api.close_handle(handle)
                 checks.append(
@@ -216,7 +304,10 @@ class WindowsBackend:
                 self._record_entry(key, {**entry, "pending": True})
                 package = windows_api.derive_app_container_sid(profile)
                 for grant in entry_grants(entry):
-                    self._ungrant_path(grant.path, package)
+                    if grant.origin == 'state':
+                        self._ungrant_state(grant.path, package)
+                    else:
+                        self._ungrant_path(grant.path, package)
                     checks.append(Check(f"ungrant {grant.path}", "pass"))
                 windows_containers.delete_app_container_profile(profile)
                 self._record_entry(key, None)
@@ -276,8 +367,9 @@ def access_label(access: Access) -> str:
 def automatic_grants(workspace: str) -> list[Grant]:
     """Workspace write access, and runtime/config reads, as automatic rows.
 
-    TEMP/TMP placement belongs to the launcher. Credentials and state remain
-    private; the credential subtree blocks inherited configuration read grants.
+    TEMP/TMP placement belongs to the launcher. Credentials and setup metadata
+    remain private. Owning packages maintain state, but the tool write role is
+    granted only to writable workspace/user paths, never managed state.
     """
     # The extracted release bundle:
     #
@@ -296,6 +388,7 @@ def automatic_grants(workspace: str) -> list[Grant]:
     return [
         Grant(workspace, Access.READ_WRITE, "workspace"),
         Grant(paths.loki_config_dir(), Access.READ, "config"),
+        Grant(paths.loki_state_dir(), Access.READ_WRITE, 'state'),
         *(Grant(runtime, Access.READ, "runtime") for runtime in runtimes),
     ]
 

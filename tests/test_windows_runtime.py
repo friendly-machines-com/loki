@@ -424,6 +424,9 @@ class LocalLaunchTests(unittest.TestCase):
         original, compatible = b'original-acl', b'compatible-acl'
         info = api.ProcessInformation(101, 102, 103, 104)
         seen = {'sets': [], 'closed': []}
+        role = runtime.state.tool_role_sid('S-1-15-2-1')
+        original_sids = [['S-1-5-21-2', 0]]
+        filtered_sids = [*original_sids, [role, 7]]
         values = {
             'current_process_handle': lambda: 99,
             'open_process_token': mock.Mock(side_effect=[44, 55, 66]),
@@ -431,7 +434,9 @@ class LocalLaunchTests(unittest.TestCase):
             'token_is_app_container': lambda token: not (mismatch and token == 66),
             'token_app_container_sid': lambda token: 'S-1-15-2-1',
             'token_integrity_level': lambda token: 'S-1-16-4096',
-            'token_restricting_sids': lambda token: [['S-1-5-21-2', 0]],
+            'token_restricting_sids': lambda token: original_sids if owning or token == 44 else filtered_sids,
+            'token_logon_sid': lambda token: 'S-1-5-5-0-99',
+            'create_write_restricted_token': mock.Mock(return_value=77),
             'token_default_dacl': lambda token: original if token == 44 or (token == 66 and owning) else compatible,
             'duplicate_primary_token': lambda *args: 77,
             'acl_sddl': lambda acl: 'D:existing-grants',
@@ -445,6 +450,7 @@ class LocalLaunchTests(unittest.TestCase):
             for name, function in values.items():
                 cleanup.enter_context(mock.patch.object(api, name, side_effect=function))
             seen['create'] = api.create_process_suspended
+            seen['filter'] = api.create_write_restricted_token
             seen['resume'] = api.resume_thread
             yield seen
 
@@ -462,7 +468,16 @@ class LocalLaunchTests(unittest.TestCase):
                 self.assertEqual(call.kwargs['primary_token'], 77)
                 self.assertFalse(call.kwargs['search_path'])
                 self.assertEqual(call.kwargs['inherited_handles'], [21, 22, 23, 31])
-                self.assertEqual(seen['sets'][0], [77, 'D:existing-grants(A;;GA;;;S-1-15-2-1)'])
+                compatible = 'D:existing-grants(A;;GA;;;S-1-15-2-1)'
+                if not owning:
+                    role = runtime.state.tool_role_sid('S-1-15-2-1')
+                    compatible += f'(A;;GA;;;{role})'
+                    self.assertEqual(seen['filter'].call_args.args[0], 55)
+                    self.assertEqual(seen['filter'].call_args.args[1],
+                                     [role, *runtime.state.TOOL_COMPATIBILITY_SIDS, 'S-1-5-5-0-99'])
+                else:
+                    seen['filter'].assert_not_called()
+                self.assertEqual(seen['sets'][0], [77, compatible])
                 self.assertEqual(seen['sets'][1:], [[66, b'original-acl']] if owning else [])
                 self.assertNotIn(44, [entry[0] for entry in seen['sets']])
                 self.assertCountEqual(seen['closed'], [44, 55, 66, 77])

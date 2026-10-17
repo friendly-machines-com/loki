@@ -199,8 +199,11 @@ class TokenAccess(enum.IntFlag):
 
 
 TOKEN_USER_CLASS = 1
+TOKEN_GROUPS_CLASS = 2
 TOKEN_DEFAULT_DACL_CLASS = 6
 TOKEN_RESTRICTED_SIDS_CLASS = 11
+SE_GROUP_LOGON_ID = 0xc0000000
+WRITE_RESTRICTED = 0x00000008
 
 
 def current_user_sid() -> str:
@@ -888,7 +891,7 @@ def current_process_handle():
 def open_with_access(path, desired_access,
                      creation=FileCreateDisposition.OPEN_EXISTING,
                      flags=FileFlags.FILE_FLAG_BACKUP_SEMANTICS,
-                     share_mode=FileShareMode.FILE_SHARE_ALL):
+                     share_mode=FileShareMode.FILE_SHARE_ALL, *, security_descriptor=None):
     """Open ``path`` requesting ``desired_access``, returning the handle.
 
     The containment probe uses this to request rights it must not have, so a
@@ -901,12 +904,38 @@ def open_with_access(path, desired_access,
                        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p)
-    handle = create_file(path, desired_access, share_mode, None, creation,
-                         flags, None)
-    if handle is None or handle == INVALID_HANDLE_VALUE:
-        raise WindowsApiError(f"CreateFileW({path!r}) failed",
-                              status=ctypes.get_last_error())
-    return handle
+    descriptor = ctypes.c_void_p()
+    attributes = None
+    free = None
+    if security_descriptor is not None:
+        convert = bind('advapi32', 'ConvertStringSecurityDescriptorToSecurityDescriptorW',
+                       wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+                       ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+        free = bind('kernel32', 'LocalFree', ctypes.c_void_p, ctypes.c_void_p)
+        if not convert(security_descriptor, SDDL_REVISION_1, ctypes.byref(descriptor), None):
+            raise WindowsApiError('ConvertStringSecurityDescriptorToSecurityDescriptorW failed', status=ctypes.get_last_error())
+        if not descriptor.value:
+            raise WindowsApiError('the explicit file descriptor is null')
+        security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        attributes = ctypes.byref(security)
+    handle = None
+    acquired = False
+    try:
+        handle = create_file(path, desired_access, share_mode, attributes, creation, flags, None)
+        if handle is None or handle == INVALID_HANDLE_VALUE:
+            raise WindowsApiError(f"CreateFileW({path!r}) failed", status=ctypes.get_last_error())
+        acquired = True
+        return handle
+    finally:
+        if free is not None and descriptor.value:
+            try:
+                # Setup metadata must be private from its first instant, even
+                # when its parent grants owning runtimes state-writing access.
+                free(descriptor)
+            except BaseException:
+                if acquired:
+                    close_handle(handle)
+                raise
 
 
 def open_process_token(process, rights: int = TokenAccess.TOKEN_QUERY):
@@ -1003,15 +1032,14 @@ class _TokenGroups(ctypes.Structure):
     _fields_ = [('count', ctypes.c_uint32), ('first', _SidAttributes)]
 
 
-def token_restricting_sids(token):
-    """Read the restricting identities/attributes for pre-resume comparison."""
+def _token_groups(token, kind):
     query = _get_token_information()
     size = wintypes.DWORD()
-    query(token, TOKEN_RESTRICTED_SIDS_CLASS, None, 0, ctypes.byref(size))
+    query(token, kind, None, 0, ctypes.byref(size))
     if size.value < ctypes.sizeof(ctypes.c_uint32):
         raise WindowsApiError('GetTokenInformation(TokenRestrictedSids) sizing failed', status=ctypes.get_last_error())
     storage = ctypes.create_string_buffer(size.value)
-    if not query(token, TOKEN_RESTRICTED_SIDS_CLASS, storage, len(storage), ctypes.byref(size)):
+    if not query(token, kind, storage, len(storage), ctypes.byref(size)):
         raise WindowsApiError('GetTokenInformation(TokenRestrictedSids) failed', status=ctypes.get_last_error())
     count = ctypes.c_uint32.from_buffer(storage).value
     if count and _TokenGroups.first.offset + count * ctypes.sizeof(_SidAttributes) > len(storage):
@@ -1019,6 +1047,59 @@ def token_restricting_sids(token):
     entries = [_SidAttributes.from_buffer(storage, _TokenGroups.first.offset + i * ctypes.sizeof(_SidAttributes))
                for i in range(count)]
     return sorted([sid_text(entry.sid), entry.attributes] for entry in entries)
+
+
+def token_restricting_sids(token):
+    """Read the restricting identities/attributes for pre-resume comparison."""
+    return _token_groups(token, TOKEN_RESTRICTED_SIDS_CLASS)
+
+
+def token_logon_sid(token):
+    """The actual token logon identity, never a caller/environment SID."""
+    logons = [sid for sid, attributes in _token_groups(token, TOKEN_GROUPS_CLASS)
+              if attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID]
+    if len(logons) != 1:
+        raise WindowsApiError('the process token has no unique logon SID')
+    return logons[0]
+
+
+def create_write_restricted_token(source, restricting_sids):
+    """Restrict writes from the actual primary token; return a primary handle.
+
+    Filtering a duplicate is not interchangeable with filtering the caller's
+    actual primary token for CreateProcessAsUserW's privilege exemption. The
+    caller chooses the restricting identities and verifies the result before
+    execution. No privilege, group or parent-default changes are made here.
+    """
+    if not restricting_sids:
+        raise ValueError('write restriction requires restricting identities')
+    convert = bind('advapi32', 'ConvertStringSidToSidW', wintypes.BOOL,
+                   wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
+    free = bind('kernel32', 'LocalFree', ctypes.c_void_p, ctypes.c_void_p)
+    restrict = bind('advapi32', 'CreateRestrictedToken', wintypes.BOOL,
+                    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                    wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                    ctypes.POINTER(_SidAttributes), ctypes.POINTER(ctypes.c_void_p))
+    result = ctypes.c_void_p()
+    created = False
+    try:
+        with ExitStack() as cleanup:
+            pointers = []
+            for sid in restricting_sids:
+                pointer = ctypes.c_void_p()
+                if not convert(sid, ctypes.byref(pointer)):
+                    raise WindowsApiError('ConvertStringSidToSidW failed', status=ctypes.get_last_error())
+                cleanup.callback(free, pointer)
+                pointers.append(pointer)
+            entries = (_SidAttributes * len(pointers))(*[_SidAttributes(pointer, 0) for pointer in pointers])
+            if not restrict(source, WRITE_RESTRICTED, 0, None, 0, None, len(entries), entries, ctypes.byref(result)):
+                raise WindowsApiError('CreateRestrictedToken failed', status=ctypes.get_last_error())
+            created = True
+    except BaseException:
+        if created:
+            close_handle(result)
+        raise
+    return result
 
 
 def set_token_default_dacl(token, sddl: str | bytes) -> None:

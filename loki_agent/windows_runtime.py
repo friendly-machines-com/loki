@@ -388,8 +388,10 @@ def prepare_local(process, command, environment, current_directory, handles, sta
 
     Owning children retain the parent's future-object policy exactly. Ordinary
     children need a compatible creation default for their own libraries' pipes.
-    Neither path adds/removes token restrictions or changes the live parent's
-    default. Restricted-tool ACL adoption remains a separate policy change.
+    Tools get a write-restricted token whose role is derived from the actual
+    package. Owning launches never remove an inherited restriction. Neither
+    path changes the live parent's default; only preopened output handles grant
+    a tool writes to state objects that its token cannot reopen for mutation.
     """
     if creationflags & ~int(api.CreateProcessFlags.CREATE_NEW_PROCESS_GROUP):
         raise ValueError('unsupported local process creation flags')
@@ -402,21 +404,37 @@ def prepare_local(process, command, environment, current_directory, handles, sta
         integrity = api.token_integrity_level(source)
         original = api.token_default_dacl(source)
         primary = None
+        expected_restricting = restricting
         expected_default = original
         owner = api.current_user_sid()
         security = f'D:P(A;;GA;;;{owner})(A;;GA;;;SY)(A;;GA;;;BA)'
         if contained:
             if original is None:
                 raise api.WindowsApiError('the parent token has no creation ACL')
-            duplicate_source = api.open_process_token(api.current_process_handle(), api.TokenAccess.TOKEN_DUPLICATE)
-            cleanup.callback(api.close_handle, duplicate_source)
-            primary = api.duplicate_primary_token(
-                duplicate_source, api.TokenAccess.TOKEN_ASSIGN_PRIMARY | api.TokenAccess.TOKEN_DUPLICATE |
-                api.TokenAccess.TOKEN_QUERY | api.TokenAccess.TOKEN_ADJUST_DEFAULT)
+            launch_rights = (api.TokenAccess.TOKEN_ASSIGN_PRIMARY | api.TokenAccess.TOKEN_DUPLICATE |
+                             api.TokenAccess.TOKEN_QUERY | api.TokenAccess.TOKEN_ADJUST_DEFAULT)
+            role = state.tool_role_sid(package)
+            already_tool = role in [sid for sid, attributes in restricting]
+            actual = api.open_process_token(api.current_process_handle(),
+                                            api.TokenAccess.TOKEN_DUPLICATE if owning or already_tool else launch_rights)
+            cleanup.callback(api.close_handle, actual)
+            if owning or already_tool:
+                # Duplicating an already restricted primary preserves its
+                # restrictions. It is not an unfiltered retry of a failed filter.
+                primary = api.duplicate_primary_token(actual, launch_rights)
+            else:
+                primary = api.create_write_restricted_token(
+                    actual, [role, *state.TOOL_COMPATIBILITY_SIDS, api.token_logon_sid(source)])
             cleanup.callback(api.close_handle, primary)
-            # Preserve existing role/logon/deny entries. Only this copy gets a
-            # package grant so the new token object can be opened by its child.
-            api.set_token_default_dacl(primary, api.acl_sddl(original) + f'(A;;GA;;;{package})')
+            expected_restricting = api.token_restricting_sids(primary)
+            if not owning and role not in [sid for sid, attributes in expected_restricting]:
+                raise api.WindowsApiError('the tool token lacks its write restriction')
+            # Preserve existing role/logon/deny entries. Only this launch token
+            # gets compatibility grants for its own future objects and token.
+            compatible = api.acl_sddl(original) + f'(A;;GA;;;{package})'
+            if not owning:
+                compatible += f'(A;;GA;;;{role})'
+            api.set_token_default_dacl(primary, compatible)
             if not owning:
                 expected_default = api.token_default_dacl(primary)
         process.information = api.create_process_suspended(
@@ -435,7 +453,7 @@ def prepare_local(process, command, environment, current_directory, handles, sta
         if (api.token_is_app_container(child) != contained or
                 (contained and api.token_app_container_sid(child) != package) or
                 api.token_integrity_level(child) != integrity or
-                api.token_restricting_sids(child) != restricting):
+                api.token_restricting_sids(child) != expected_restricting):
             raise api.WindowsApiError('suspended child identity mismatch')
         if contained and owning:
             api.set_token_default_dacl(child, original)

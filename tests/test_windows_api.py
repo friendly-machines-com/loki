@@ -363,6 +363,78 @@ class TokenCreationTests(unittest.TestCase):
                 self.assertEqual(events.count('free'), 0 if failure == 'convert' else 1)
 
 
+class WriteRestrictedTokenTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def calls(self, failure=None):
+        converted, freed, closed, filters = [], [], [], []
+
+        def convert(sid, output):
+            if failure == 'convert' and converted:
+                return False
+            pointer = 100 + len(converted)
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = pointer
+            converted.append(sid)
+            return True
+
+        def restrict(source, flags, disabled_count, disabled, deleted_count, deleted,
+                     count, entries, output):
+            filters.append([source, flags, disabled_count, disabled, deleted_count, deleted,
+                            [[entries[i].sid, entries[i].attributes] for i in range(count)]])
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 999
+            return failure != 'filter'
+
+        def free(pointer):
+            freed.append(pointer.value)
+            if failure == 'free':
+                raise RuntimeError('release failed')
+
+        functions = {'ConvertStringSidToSidW': convert, 'LocalFree': free,
+                     'CreateRestrictedToken': restrict}
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: functions[symbol]), \
+                mock.patch.object(windows_api, 'close_handle', side_effect=lambda handle: closed.append(handle.value)), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            yield [converted, freed, closed, filters]
+
+    def test_only_write_restrictions_are_added_to_the_supplied_token(self):
+        with self.calls() as result:
+            token = windows_api.create_write_restricted_token(42, ['role', 'logon'])
+        converted, freed, closed, filters = result
+        self.assertEqual(token.value, 999)
+        self.assertEqual(converted, ['role', 'logon'])
+        self.assertEqual(freed, [101, 100])
+        self.assertEqual(closed, [])
+        self.assertEqual(filters, [[42, windows_api.WRITE_RESTRICTED, 0, None, 0, None, [[100, 0], [101, 0]]]])
+
+    def test_failed_conversion_frees_only_previously_acquired_sids(self):
+        with self.calls('convert') as result:
+            with self.assertRaises(windows_api.WindowsApiError):
+                windows_api.create_write_restricted_token(42, ['role', 'logon'])
+        self.assertEqual(result, [['role'], [100], [], []])
+
+    def test_failed_filter_output_is_not_treated_as_an_acquired_token(self):
+        with self.calls('filter') as result:
+            with self.assertRaises(windows_api.WindowsApiError):
+                windows_api.create_write_restricted_token(42, ['role'])
+        self.assertEqual(result[1:3], [[100], []])
+
+    def test_logon_identity_requires_one_kernel_reported_logon_group(self):
+        flag = windows_api.SE_GROUP_LOGON_ID
+        for groups in [[], [['user', 7]], [['a', flag], ['b', flag]]]:
+            with self.subTest(groups=groups), \
+                    mock.patch.object(windows_api, '_token_groups', return_value=groups):
+                with self.assertRaises(windows_api.WindowsApiError):
+                    windows_api.token_logon_sid(42)
+        with mock.patch.object(windows_api, '_token_groups', return_value=[['user', 7], ['logon', flag | 7]]) as query:
+            self.assertEqual(windows_api.token_logon_sid(42), 'logon')
+        query.assert_called_once_with(42, windows_api.TOKEN_GROUPS_CLASS)
+
+    def test_failed_sid_cleanup_releases_the_created_token(self):
+        with self.calls('free') as result:
+            with self.assertRaisesRegex(RuntimeError, 'release failed'):
+                windows_api.create_write_restricted_token(42, ['role'])
+        self.assertEqual(result[2], [999])
+
+
 class TokenAclHelpersTests(unittest.TestCase):
     def test_raw_default_restore_copies_the_saved_acl_without_a_text_roundtrip(self):
         saved = b'\x02\x00\x08\x00\x00\x00\x00\x00'
@@ -794,6 +866,66 @@ class AppContainerLaunchTests(unittest.TestCase):
 
 
 class FileAccessTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def private_creation(self, failure=None):
+        events = []
+
+        def convert(text, revision, output, size):
+            events.append('convert')
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 100
+            return failure != 'convert'
+
+        def create(path, access, share, attributes, disposition, flags, template):
+            security = ctypes.cast(attributes, ctypes.POINTER(windows_api.SecurityAttributes)).contents
+            self.assertEqual(security.lpSecurityDescriptor, 100)
+            self.assertFalse(security.bInheritHandle)
+            self.assertNotIn('free', events)
+            self.assertEqual(disposition, windows_api.FileCreateDisposition.CREATE_NEW)
+            events.append('create')
+            return windows_api.INVALID_HANDLE_VALUE if failure == 'create' else 77
+
+        def free(pointer):
+            self.assertEqual(pointer.value, 100)
+            events.append('free')
+            if failure == 'free':
+                raise RuntimeError('descriptor release failed')
+
+        functions = {'CreateFileW': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
+                     'LocalFree': free}
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: functions[symbol]), \
+                mock.patch.object(windows_api, 'close_handle', side_effect=lambda handle: events.append(['close', handle])), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            yield events
+
+    def create_private(self):
+        return windows_api.open_with_access(
+            '/setup-temporary', windows_api.AccessMask.GENERIC_WRITE,
+            creation=windows_api.FileCreateDisposition.CREATE_NEW,
+            security_descriptor='D:P(A;;FA;;;SY)')
+
+    def test_private_descriptor_survives_until_exclusive_file_creation(self):
+        with self.private_creation() as events:
+            self.assertEqual(self.create_private(), 77)
+        self.assertEqual(events, ['convert', 'create', 'free'])
+
+    def test_failed_private_descriptor_never_uses_inherited_permissions(self):
+        with self.private_creation('convert') as events:
+            with self.assertRaises(windows_api.WindowsApiError):
+                self.create_private()
+        self.assertEqual(events, ['convert'])
+
+    def test_failed_private_creation_frees_only_acquired_descriptor(self):
+        with self.private_creation('create') as events:
+            with self.assertRaises(windows_api.WindowsApiError):
+                self.create_private()
+        self.assertEqual(events, ['convert', 'create', 'free'])
+
+    def test_descriptor_cleanup_failure_closes_the_created_file(self):
+        with self.private_creation('free') as events:
+            with self.assertRaisesRegex(RuntimeError, 'descriptor release failed'):
+                self.create_private()
+        self.assertEqual(events, ['convert', 'create', 'free', ['close', 77]])
+
     def test_a_successful_open_returns_the_handle(self):
         with mock.patch.object(windows_api, "bind",
                                return_value=lambda *arguments: 77):

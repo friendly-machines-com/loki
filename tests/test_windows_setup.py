@@ -314,7 +314,7 @@ class HandlePathTests(unittest.TestCase):
 
     def _named_by_handle(self, path):
         return mock.patch.object(
-            windows_api, "final_path_from_handle", return_value=path)
+            windows_api, "final_path_from_handle", return_value=os.path.realpath(path))
 
     def test_refuses_the_credential_directory_through_the_handle(self):
         with self._named_by_handle(self.credentials):
@@ -413,7 +413,12 @@ class NamingTests(unittest.TestCase):
             child = os.path.join(root, "project")
             os.makedirs(child)
             link = os.path.join(root, "link")
-            os.symlink(child, link)
+            try:
+                os.symlink(child, link, target_is_directory=True)
+            except OSError as error:
+                if getattr(error, 'winerror', None) != 1314:
+                    raise
+                self.skipTest('this Windows account cannot create symbolic links')
 
             self.assertEqual(
                 windows_state.canonical_workspace(child),
@@ -546,6 +551,71 @@ class PlanTests(unittest.TestCase):
         warning.assert_called_once_with("/user-dir")
 
 
+class ManagedStatePolicyTests(unittest.TestCase):
+    def setUp(self):
+        aliases = {'SY': 'S-1-5-18', 'BA': 'S-1-5-32-544'}
+        patch = mock.patch.object(windows_api, 'canonical_sid',
+                                  side_effect=lambda sid: aliases.get(sid, sid))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def errors(self, ace):
+        return windows_state.state_acl_errors('D:P' + ace, OTHER_SID, {PACKAGE_SID})
+
+    def test_runtime_modify_is_allowed_but_setup_authority_is_not(self):
+        self.assertEqual(self.errors(f'(A;OICI;0x1301BF;;;{PACKAGE_SID})'), [])
+        for rights in ['FA', 'GA', '0x10000000', 'WD', 'WO', '0x40']:
+            with self.subTest(rights=rights):
+                self.assertTrue(self.errors(f'(A;OICI;{rights};;;{PACKAGE_SID})'))
+
+    def test_no_write_restriction_alternative_may_mutate_state(self):
+        for sid in [windows_state.tool_role_sid(PACKAGE_SID),
+                    *windows_state.TOOL_COMPATIBILITY_SIDS, 'S-1-5-5-0-99']:
+            for rights in ['FW', 'GA', '0x40000000', '0x10000000', '0x2', 'SD', 'WD', 'WO']:
+                for flags in ['', 'OICIIO', 'ID']:
+                    with self.subTest(sid=sid, rights=rights, flags=flags):
+                        self.assertTrue(self.errors(f'(A;{flags};{rights};;;{sid})'))
+            self.assertEqual(self.errors(f'(A;OICI;FRFX;;;{sid})'), [])
+
+    def test_inventory_excludes_only_root_setup_publication_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = os.path.join(root, 'job')
+            os.mkdir(job)
+            for path in [os.path.join(root, 'windows-setup.json'),
+                         os.path.join(root, '.setup-pending'),
+                         os.path.join(job, 'windows-setup.json'),
+                         os.path.join(job, 'stdout.log')]:
+                with open(path, 'w'):
+                    pass
+            self.assertEqual(set(windows_state.state_objects(root)),
+                             {root, job, os.path.join(job, 'windows-setup.json'),
+                              os.path.join(job, 'stdout.log')})
+
+    def test_inventory_refuses_a_setup_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.mkdir(os.path.join(root, 'windows-setup.json'))
+            with self.assertRaises(windows_api.WindowsApiError):
+                list(windows_state.state_objects(root))
+
+    def test_revocation_removes_the_tool_grant_even_if_the_package_grant_is_already_gone(self):
+        role = windows_state.tool_role_sid(PACKAGE_SID)
+        backend = windows_setup.WindowsBackend({})
+        with mock.patch.object(windows_api, 'dacl_sddl', return_value=f'D:P(A;OICI;0x1301BF;;;{role})'), \
+                mock.patch.object(windows_containers, 'set_dacl_sddl') as write:
+            backend._ungrant_path('/work', PACKAGE_SID)
+        write.assert_called_once_with('/work', 'D:P')
+
+    def test_writable_workspace_grants_both_package_and_tool_role(self):
+        backend = windows_setup.WindowsBackend({})
+        with mock.patch.object(windows_api, 'handle_dacl_sddl', return_value='D:P'), \
+                mock.patch.object(windows_containers, 'set_handle_dacl_sddl') as write:
+            backend._grant_path(123, '/work', windows_state.Access.READ_WRITE, PACKAGE_SID)
+        sddl = write.call_args.args[1]
+        self.assertTrue(windows_state.grants_access(sddl, PACKAGE_SID, windows_state.Access.READ_WRITE))
+        self.assertTrue(windows_state.grants_access(
+            sddl, windows_state.tool_role_sid(PACKAGE_SID), windows_state.Access.READ_WRITE))
+
+
 class AutomaticGrantTests(unittest.TestCase):
     def test_automatic_grants_include_read_only_configuration(self):
         grants = windows_setup.automatic_grants("/work")
@@ -553,7 +623,7 @@ class AutomaticGrantTests(unittest.TestCase):
         by_origin = {}
         for grant in grants:
             by_origin.setdefault(grant.origin, []).append(grant)
-        self.assertEqual(sorted(by_origin), ["config", "runtime", "workspace"])
+        self.assertEqual(sorted(by_origin), ["config", "runtime", "state", "workspace"])
         self.assertEqual(by_origin["config"], [windows_setup.Grant(
             windows_setup.paths.loki_config_dir(), windows_setup.Access.READ, "config")])
         self.assertEqual(by_origin["workspace"][0].access,
@@ -662,7 +732,7 @@ class ConfigureCommandTests(unittest.TestCase):
         _plan, definition = backend.applied[0]
         self.assertEqual(definition.workspace, "/work")
         self.assertEqual([grant.origin for grant in definition.grants],
-                         ["workspace", "config", "runtime", "runtime"])
+                         ["workspace", "config", "state", "runtime", "runtime"])
 
     def test_a_failing_check_is_a_nonzero_exit(self):
         class Failing(FakeBackend):

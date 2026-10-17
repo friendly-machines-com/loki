@@ -32,6 +32,12 @@ from .windows_state import (
     entry_grants,
     grants_access,
     profile_name_for,
+    ledger_path,
+    setup_files,
+    state_objects,
+    state_writer_sids,
+    state_acl_errors,
+    tool_role_sid,
     workspace_key,
 )
 
@@ -41,12 +47,12 @@ def verify_workspace(ledger: dict, workspace: str) -> list[Check]:
     entry = ledger.get("workspaces", {}).get(workspace_key(workspace))
     if not isinstance(entry, dict):
         return [Check("ledger", "fail", "workspace is not configured")]
-    if entry.get("pending"):
+    if any(item.get('pending') for item in ledger.get('workspaces', {}).values()):
         return [Check("ledger", "fail", "setup or uninstall is incomplete; retry setup")]
-    return verify_container(workspace, entry_grants(entry))
+    return verify_container(workspace, entry_grants(entry), ledger=ledger)
 
 
-def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
+def verify_container(workspace: str, grants: list[Grant], *, ledger=None) -> list[Check]:
     """Check that ``grants`` are in place for ``workspace``'s profile.
 
     Read-only and safe to run uncontained, which is why it reads DACLs rather
@@ -67,7 +73,9 @@ def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
         try:
             sddl = windows_api.dacl_sddl(grant.path)
             granted = grants_access(sddl, package, grant.access)
-        except windows_api.WindowsApiError as error:
+            if grant.access is Access.READ_WRITE and grant.origin != 'state':
+                granted = granted and grants_access(sddl, tool_role_sid(package), Access.READ_WRITE)
+        except (windows_api.WindowsApiError, ValueError) as error:
             checks.append(Check(f"grant {grant.path}", "fail", str(error)))
             continue
         checks.append(Check(
@@ -84,8 +92,7 @@ def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
             else "configuration must grant read access only"))
     except windows_api.WindowsApiError as error:
         checks.append(Check("config", "fail", str(error)))
-    for tree, name in [[paths.credential_directory(), "credentials"],
-                       [paths.loki_state_dir(), "state"]]:
+    for tree, name in [[paths.credential_directory(), "credentials"]]:
         try:
             sddl = windows_api.dacl_sddl(tree)
             allowed = package_allow(sddl, package)
@@ -102,6 +109,36 @@ def verify_container(workspace: str, grants: list[Grant]) -> list[Check]:
         else:
             checks.append(Check(
                 name, "pass", "the package SID holds no access; inheritance is blocked"))
+    try:
+        writers = state_writer_sids(ledger) if ledger is not None else {package}
+        user = windows_api.current_user_sid()
+        for path in state_objects():
+            try:
+                sddl = windows_api.dacl_sddl(path)
+                errors = state_acl_errors(sddl, user, writers)
+                if path == paths.loki_state_dir() and 'P' not in dacl_parts(sddl)[0]:
+                    errors.append('managed state must block ancestor grants')
+                if not grants_access(sddl, package, Access.READ_WRITE):
+                    errors.append('owning runtime cannot maintain this state object')
+                checks.append(Check('state' if path == paths.loki_state_dir() else 'state ' + path, 'fail' if errors else 'pass',
+                                    '; '.join(errors) if errors else 'runtime writable; tools read-only'))
+            except (windows_api.WindowsApiError, ValueError) as error:
+                checks.append(Check('state' if path == paths.loki_state_dir() else 'state ' + path, 'fail', str(error)))
+        assets = list(setup_files())
+        if ledger_path() not in assets:
+            checks.append(Check('setup metadata', 'fail', 'setup metadata is missing'))
+        for path in assets:
+            sddl = windows_api.dacl_sddl(path)
+            header, aces = dacl_parts(sddl)
+            trusted = {windows_api.canonical_sid(sid) for sid in [user, 'SY', 'BA']}
+            private = 'P' in header and all(
+                ace[1:-1].split(';')[0] == 'D' or
+                (ace[1:-1].split(';')[0] == 'A' and windows_api.canonical_sid(ace[1:-1].split(';')[5]) in trusted)
+                for ace in aces)
+            checks.append(Check('setup metadata ' + path, 'pass' if private else 'fail',
+                                'setup metadata remains private' if private else 'setup metadata exposes runtime access'))
+    except (OSError, windows_api.WindowsApiError, ValueError) as error:
+        checks.append(Check('state', 'fail', str(error)))
     return checks
 
 
@@ -136,9 +173,7 @@ def probe_containment(workspace: str, expected_package: str) -> list[Check]:
         | windows_api.AccessMask.GENERIC_WRITE,
         "the workspace opens read-write"))
     checks.extend(_configuration_checks())
-    checks.append(_denied(
-        "state inaccessible", paths.loki_state_dir(), windows_api.AccessMask.GENERIC_READ,
-        "reading private state is denied"))
+    checks.extend(_state_checks())
     checks.extend(_credential_checks())
     checks.append(_denied(
         "cannot rewrite a DACL", workspace, windows_api.AccessMask.WRITE_DAC,
@@ -196,6 +231,48 @@ _CREDENTIAL_FILES = (
     (paths.CREDENTIAL_FILE_NAME, "credential file"),
     (paths.CREDENTIAL_LOCK_FILE_NAME, "credential lock"),
 )
+
+
+def _state_checks() -> list[Check]:
+    """Owning runtimes write state; tool tokens only read it by pathname.
+
+    Preopened stdout/stderr are separate file capabilities. Opening a path here
+    must never manufacture their exception for another job or metadata object.
+    """
+    try:
+        token = windows_api.open_process_token(windows_api.current_process_handle())
+        try:
+            package = windows_api.token_app_container_sid(token)
+            role = tool_role_sid(package)
+            tool = role in [sid for sid, attributes in windows_api.token_restricting_sids(token)]
+        finally:
+            windows_api.close_handle(token)
+    except (windows_api.WindowsApiError, ValueError) as error:
+        return [Check('state role', 'fail', str(error))]
+    directory = paths.loki_state_dir()
+    checks = [_reachable('state readable', directory, windows_api.AccessMask.GENERIC_READ,
+                         'runtime state is readable')]
+    if tool:
+        mutations = {
+            'state not writable': windows_api.AccessMask.GENERIC_WRITE,
+            'state files not creatable': windows_api.AccessMask.FILE_WRITE_DATA,
+            'state directories not creatable': windows_api.AccessMask.FILE_APPEND_DATA,
+            'state children not deletable': windows_api.AccessMask.FILE_DELETE_CHILD,
+            'state directory not deletable': windows_api.AccessMask.DELETE,
+            'state attributes not writable': windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,
+            'state extended attributes not writable': windows_api.AccessMask.FILE_WRITE_EA,
+            'state DACL not rewritable': windows_api.AccessMask.WRITE_DAC,
+            'state owner not rewritable': windows_api.AccessMask.WRITE_OWNER,
+        }
+        checks.extend(_denied(name, directory, access, name) for name, access in mutations.items())
+    else:
+        checks.append(_reachable('owning state writable', directory, windows_api.AccessMask.GENERIC_WRITE,
+                                 'the owning runtime can maintain its state'))
+    checks.append(_denied('setup metadata unreadable', ledger_path(), windows_api.AccessMask.GENERIC_READ,
+                          'setup metadata is private to setup and the supervisor'))
+    for suffix, access, description in _FILE_MUTATION_PROBES:
+        checks.append(_denied('setup metadata ' + suffix, ledger_path(), access, 'setup metadata ' + description))
+    return checks
 
 
 def _configuration_checks() -> list[Check]:

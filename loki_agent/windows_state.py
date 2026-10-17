@@ -15,6 +15,8 @@ import enum
 import hashlib
 import json
 import os
+import secrets
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -29,6 +31,10 @@ from .windows_acl import (
 )
 LEDGER_VERSION = 1
 PROFILE_NAME_PREFIX = "Loki.Workspace."
+# These are compatibility alternatives in the second (write) access check, not
+# an additional private-role conjunct. Managed state must grant none of them
+# mutation rights. The current logon SID is added from the actual token.
+TOOL_COMPATIBILITY_SIDS = ['S-1-1-0', 'S-1-5-32-545', 'S-1-5-12']
 
 
 class Access(enum.Enum):
@@ -122,16 +128,21 @@ def configuration_path_errors() -> list[str]:
     return errors
 
 
-def _protected_reasons(target: str, path: str, access: Access) -> list[str]:
+def _protected_reasons(target: str, path: str, access: Access, origin='user') -> list[str]:
     """Overlap verdict for an already-canonical ``target`` spelling."""
+    managed_state = origin == 'state' and target == _canonical_or_absolute(paths.loki_state_dir())
     if (access is Access.READ
             and target == _canonical_or_absolute(paths.loki_config_dir())):
         # This exact tree is deliberately readable. Its credential child has a
         # protected DACL; no ancestor or arbitrary private-tree grant is allowed.
         return configuration_path_errors()
-    reasons = []
+    reasons = configuration_path_errors() if managed_state else []
     for tree in _runtime_trees(include_code=access is Access.READ_WRITE):
         protected = _canonical_or_absolute(tree)
+        if managed_state and protected == _canonical_or_absolute(paths.loki_state_dir()):
+            # The state exception never permits overlap with credentials,
+            # configuration or executable code, and never grants the tool role.
+            continue
         if target == protected:
             reasons.append(f"{path} is {tree}, which Loki never grants")
         elif _contains(target, protected):
@@ -142,18 +153,18 @@ def _protected_reasons(target: str, path: str, access: Access) -> list[str]:
     return reasons
 
 
-def protected_path_errors(path: str, access: Access = Access.READ_WRITE) -> list[str]:
+def protected_path_errors(path: str, access: Access = Access.READ_WRITE, *, origin='user') -> list[str]:
     """Reject overlap with private data; trusted code may be read, not written.
 
     Both sides are canonicalised from an open handle, so an alias (junction or
     symlink) is seen through.  This decides only; the backend re-asks through
     the same handle it re-ACLs, via ``handle_path_errors``.
     """
-    return _protected_reasons(_canonical_or_absolute(path), path, access)
+    return _protected_reasons(_canonical_or_absolute(path), path, access, origin)
 
 
 def handle_path_errors(handle, path: str,
-                       access: Access = Access.READ_WRITE) -> list[str]:
+                       access: Access = Access.READ_WRITE, *, origin='user') -> list[str]:
     """Overlap verdict for the object ``handle`` already names.
 
     The target's canonical spelling is read from the open handle, so the object
@@ -162,7 +173,7 @@ def handle_path_errors(handle, path: str,
     decision to a different object.
     """
     target = os.path.normcase(windows_api.final_path_from_handle(handle))
-    return _protected_reasons(target, path, access)
+    return _protected_reasons(target, path, access, origin)
 
 
 def _contains(parent: str, child: str) -> bool:
@@ -225,13 +236,26 @@ def profile_name_for(workspace: str) -> str:
     return PROFILE_NAME_PREFIX + digest[:32]
 
 
+def tool_role_sid(package: str) -> str:
+    """One stable ordinary restricting SID for a kernel-reported package.
+
+    Package-authority SIDs cannot be used as restricting SIDs. A domain-separated
+    128-bit identity avoids another stored mapping: setup and launch derive the
+    same trustee, while neither argv nor a readable state file selects it.
+    """
+    if not package.startswith('S-1-15-2-'):
+        raise ValueError('tool role requires an AppContainer package SID')
+    digest = hashlib.sha256(b'Loki.Tool.Role.v1\0' + package.encode('ascii')).digest()
+    return 'S-1-5-21-' + '-'.join(str(int.from_bytes(digest[i:i + 4], 'little')) for i in [0, 4, 8, 12])
+
+
 # -- definitions and the ledger -----------------------------------------
 
 @dataclass(frozen=True)
 class Grant:
     path: str
     access: Access
-    origin: str  # 'workspace' | 'runtime' | 'config' | 'temp' | 'user'
+    origin: str  # 'workspace' | 'runtime' | 'config' | 'state' | 'temp' | 'user'
 
 
 @dataclass
@@ -268,17 +292,45 @@ def save_ledger(blob: dict, path: str | None = None) -> None:
     location = ledger_path() if path is None else path
     directory = os.path.dirname(location) or "."
     os.makedirs(directory, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".setup-")
+    temporary = None
+    created = False
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        if sys.platform == 'win32':
+            import msvcrt
+            temporary = os.path.join(directory, '.setup-' + secrets.token_hex(12))
+            user = windows_api.current_user_sid()
+            raw = windows_api.open_with_access(
+                temporary, windows_api.AccessMask.GENERIC_WRITE,
+                creation=windows_api.FileCreateDisposition.CREATE_NEW,
+                flags=windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL,
+                security_descriptor=f'D:P(A;;FA;;;{user})(A;;FA;;;SY)(A;;FA;;;BA)')
+            created = True
+            try:
+                handle = msvcrt.open_osfhandle(raw, os.O_WRONLY | os.O_BINARY | os.O_NOINHERIT)
+            except BaseException:
+                windows_api.close_handle(raw)
+                raise
+        else:
+            handle, temporary = tempfile.mkstemp(dir=directory, prefix=".setup-")
+            created = True
+        # The replacement inherits the temporary object's private descriptor,
+        # not the state directory's package access. There is no public interval
+        # in which an owning runtime or a tool can acquire a ledger-write handle.
+        try:
+            stream = os.fdopen(handle, "w", encoding="utf-8")
+        except BaseException:
+            os.close(handle)
+            raise
+        with stream:
             json.dump(blob, stream, indent=2, sort_keys=True)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, location)
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
+        if created:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
         raise
 
 
@@ -309,6 +361,102 @@ def entry_grants(entry: dict) -> list[Grant]:
         grants.append(Grant(str(item.get("path", "")), access,
                             str(item.get("origin", "user"))))
     return grants
+
+
+def setup_asset(path: str, root=None) -> bool:
+    """The ledger and its adjacent publication files keep a private contract."""
+    return (os.path.dirname(path) == (paths.loki_state_dir() if root is None else root) and
+            (os.path.basename(path) == 'windows-setup.json' or os.path.basename(path).startswith('.setup-')))
+
+
+def state_objects(root=None):
+    """Inventory the existing managed tree without following reparse entries.
+
+    Setup/verification inspect every existing object, not merely the root ACL.
+    The parent grants' inheritance secures future runtime-created descendants.
+    """
+    root = paths.loki_state_dir() if root is None else root
+
+    def walk(directory):
+        yield directory
+        with os.scandir(directory) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+        for entry in children:
+            facts = entry.stat(follow_symlinks=False)
+            if (stat.S_ISLNK(facts.st_mode) or
+                    getattr(facts, 'st_file_attributes', 0) & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT):
+                raise windows_api.WindowsApiError('managed state contains a reparse entry: ' + entry.path)
+            if setup_asset(entry.path, root):
+                if not stat.S_ISREG(facts.st_mode):
+                    raise windows_api.WindowsApiError('setup metadata is not a regular file: ' + entry.path)
+                continue
+            if stat.S_ISDIR(facts.st_mode):
+                yield from walk(entry.path)
+            elif stat.S_ISREG(facts.st_mode):
+                yield entry.path
+            else:
+                raise windows_api.WindowsApiError('managed state contains a non-regular entry: ' + entry.path)
+    yield from walk(root)
+
+
+def setup_files():
+    """Existing authority files that must not inherit runtime state access."""
+    with os.scandir(paths.loki_state_dir()) as entries:
+        for entry in entries:
+            if not setup_asset(entry.path):
+                continue
+            facts = entry.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(facts.st_mode) or
+                    getattr(facts, 'st_file_attributes', 0) & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT):
+                raise windows_api.WindowsApiError('setup metadata is not a regular file: ' + entry.path)
+            yield entry.path
+
+
+def state_writer_sids(ledger):
+    """Only recorded state-writing packages may retain managed mutation grants."""
+    return {windows_api.derive_app_container_sid(str(entry.get('profile', '')))
+            for entry in ledger.get('workspaces', {}).values()
+            if any(grant.origin == 'state' for grant in entry_grants(entry))}
+
+
+STATE_MUTATION_MASK = int(windows_api.AccessMask.FILE_WRITE_DATA | windows_api.AccessMask.FILE_APPEND_DATA |
+                          windows_api.AccessMask.FILE_WRITE_EA | windows_api.AccessMask.FILE_WRITE_ATTRIBUTES |
+                          windows_api.AccessMask.FILE_DELETE_CHILD | windows_api.AccessMask.DELETE |
+                          windows_api.AccessMask.WRITE_DAC | windows_api.AccessMask.WRITE_OWNER)
+
+
+def state_acl_errors(sddl, user, packages):
+    """Fail closed on every write-restriction alternative, including inherited ACEs.
+
+    Normal owning-package access is deliberately writable. No private tool role,
+    Everyone/Users/logon alternative or other unowned trustee may supply the
+    second access check with mutation rights. Credential privacy is separate.
+    """
+    trusted = {windows_api.canonical_sid(sid) for sid in [user, 'SY', 'BA', *packages]}
+    package_ids = {windows_api.canonical_sid(sid) for sid in packages}
+    header, aces = dacl_parts(sddl)
+    errors = []
+    for ace in aces:
+        kind, flags, rights, object_id, inherited_id, sid = ace[1:-1].split(';')
+        if kind == 'D':
+            continue
+        if kind != 'A' or object_id or inherited_id:
+            errors.append('unsupported state allow entry')
+            continue
+        identity = windows_api.canonical_sid(sid)
+        mask = rights_mask(rights)
+        # Hexadecimal ACE masks can retain generic bits too; they confer the
+        # same file mutations as their textual GA/GW spellings.
+        if mask & 0x10000000:  # GENERIC_ALL
+            mask |= windows_api.AccessMask.FILE_ALL_ACCESS
+        if mask & windows_api.AccessMask.GENERIC_WRITE:
+            mask |= windows_api.AccessMask.FILE_GENERIC_WRITE
+        if identity not in trusted and mask & STATE_MUTATION_MASK:
+            errors.append('state grants mutation to ' + sid)
+        if identity in package_ids and mask & int(windows_api.AccessMask.FILE_DELETE_CHILD |
+                                                  windows_api.AccessMask.WRITE_DAC | windows_api.AccessMask.WRITE_OWNER):
+            errors.append('state package can change protected setup entries')
+    return errors
 
 
 # -- SDDL editing --------------------------------------------------------
@@ -384,7 +532,8 @@ def _grant_identity(grant: Grant) -> str:
     # First setup creates configuration only on Apply. Planning must identify
     # that absent directory without creating it; the eventual grant is still
     # checked against the actual handle in WindowsBackend.apply().
-    if grant.path == paths.loki_config_dir() and grant.access is Access.READ:
+    if ((grant.path == paths.loki_config_dir() and grant.access is Access.READ)
+            or (grant.origin == 'state' and grant.path == paths.loki_state_dir())):
         return _canonical_or_absolute(grant.path)
     return canonical_workspace(grant.path)
 
@@ -394,7 +543,7 @@ def build_plan(definition: Definition, previous: dict | None) -> Plan:
     errors = configuration_path_errors()
     warnings: list[str] = []
     for grant in definition.grants:
-        errors.extend(protected_path_errors(grant.path, grant.access))
+        errors.extend(protected_path_errors(grant.path, grant.access, origin=grant.origin))
         if grant.origin == "user":
             warnings.extend(covered_secret_warnings(grant.path))
 

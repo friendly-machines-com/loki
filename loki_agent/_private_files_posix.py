@@ -86,8 +86,10 @@ def open_read_at(directory_fd: int, name: str) -> int:
     return os.open(name, _no_follow(flags), dir_fd=directory_fd)
 
 
-def create_exclusive_at(directory_fd: int, name: str, mode: int) -> int:
+def create_exclusive_at(directory_fd: int, name: str, mode: int, *, append=False) -> int:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if append:
+        flags |= os.O_APPEND
     return os.open(name, _no_follow(flags), mode, dir_fd=directory_fd)
 
 

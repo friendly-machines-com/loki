@@ -62,8 +62,8 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         first, status, stdout, stderr = await manager.run_exec([
             sys.executable, '-c', "import sys; print('real output'); print('real error', file=sys.stderr)"])
         self.assertEqual(status, 'completed')
-        self.assertEqual(stdout, 'real output\n')
-        self.assertEqual(stderr, 'real error\n')
+        self.assertEqual(stdout, 'real output' + os.linesep)
+        self.assertEqual(stderr, 'real error' + os.linesep)
         self.assertIn('real output', manager.job_status(first.id))
         self.assertNotIn('FORGED', manager.job_status(first.id))
         manager._append_spool(first, 'stderr.log', b'owner diagnostic\n')
@@ -74,7 +74,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads((original / 'job.json').read_text())['description'], 'updated metadata')
         self.assertEqual((decoy_job / 'job.json').read_text(), 'FORGED METADATA')
         second, _, second_out, _ = await manager.run_exec([sys.executable, '-c', "print('second')"])
-        self.assertEqual(second_out, 'second\n')
+        self.assertEqual(second_out, 'second' + os.linesep)
         self.assertTrue((original.parent / second.id / 'stdout.log').exists())
         self.assertFalse((decoy_session / second.id).exists())
         with self.assertRaises(OSError):
@@ -85,6 +85,19 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager._session_fd)
         with self.assertRaisesRegex(ValueError, 'closed'):
             manager.job_status(first.id)
+
+    async def test_job_output_handles_append_after_seek_and_refuse_replacement(self):
+        directory = private_files.open_directory(str(self.parent))
+        self.addCleanup(private_files.close, directory)
+        with jobs.JobManager._open_spool_stream(directory, 'stdout.log') as stream:
+            stream.write(b'first')
+            stream.flush()
+            stream.seek(0)
+            stream.write(b'second')
+        self.assertEqual((self.parent / 'stdout.log').read_bytes(), b'firstsecond')
+        with self.assertRaises(FileExistsError):
+            jobs.JobManager._open_spool_stream(directory, 'stdout.log')
+        self.assertEqual((self.parent / 'stdout.log').read_bytes(), b'firstsecond')
 
     async def test_credential_reads_refresh_approvals_and_logout_ignore_decoy(self):
         storage = credential_storages.JsonCredentialStorage(str(self.parent / 'credentials'))
@@ -173,11 +186,11 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_and_missing_state_directories_need_no_ancestor_stat(self):
         with mock.patch.object(private_files.os, 'makedirs', side_effect=AssertionError('ancestor mkdir')):
-            existing = private_files.open_directory_tree(self.parent)
+            existing = private_files.open_directory_tree(str(self.parent))
         private_files.close(existing)
         target = self.parent / 'new' / 'nested'
         with mock.patch.object(private_files.os, 'stat', side_effect=AssertionError('ancestor stat')):
-            directory = private_files.open_directory_tree(target)
+            directory = private_files.open_directory_tree(str(target))
         try:
             self.assertTrue(private_files.information(directory).directory)
             self.assertTrue(target.is_dir())

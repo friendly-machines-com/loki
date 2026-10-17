@@ -272,7 +272,7 @@ def open_read_at(directory, name: str):
         windows_api.NtCreateDisposition.FILE_OPEN, _NON_DIRECTORY)
 
 
-def create_exclusive_at(directory, name: str, mode: int):
+def create_exclusive_at(directory, name: str, mode: int, *, append=False):
     _check_name(name)
     # ``mode`` is a POSIX concept.  On POSIX the mode makes the new file
     # private regardless of the directory; here the file's access comes from the
@@ -284,10 +284,14 @@ def create_exclusive_at(directory, name: str, mode: int):
     # refuses.
     # The new file's privacy is the caller's decision: it describes the
     # handle it was given before writing anything.
+    # Job output is an inherited file capability, not a pathname grant. Acquire
+    # only APPEND_DATA at the exclusive create itself: a later reopen would let
+    # a replaced directory entry select a different object.
+    access = (windows_api.AccessMask.FILE_APPEND_DATA | windows_api.AccessMask.READ_CONTROL
+              if append else windows_api.AccessMask.GENERIC_WRITE)
     return _open_relative(
         directory, name,
-        windows_api.AccessMask.GENERIC_WRITE
-        | windows_api.AccessMask.FILE_READ_ATTRIBUTES
+        access | windows_api.AccessMask.FILE_READ_ATTRIBUTES
         | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.NtCreateDisposition.FILE_CREATE, _NON_DIRECTORY,
         windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
