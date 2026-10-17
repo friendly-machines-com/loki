@@ -271,6 +271,11 @@ class StagedGateClosureTests(unittest.TestCase):
         self.assertEqual(imported - _staged_gate_modules(), set(),
                          'the native private-pipe probe must import its shipped implementation')
 
+    def test_private_reader_native_probe_and_implementation_are_staged(self):
+        self.assertEqual(_gate_closure('handle_reader') - _staged_gate_modules(), set())
+        self.assertIn("'windows_readers.py'", PROBES.read_text(),
+                      'the real console/private-default actor must accompany the native fixture')
+
 
 TESTS = ROOT / "tests"
 

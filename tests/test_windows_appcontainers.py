@@ -73,6 +73,7 @@ if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-acc
     state_progress('primitives-load-after')
     state_progress('escapes-load-before')
 escape_helpers = runpy.run_path(str(Path(__file__).with_name('windows_escapes.py')))
+reader_checks = runpy.run_path(str(Path(__file__).with_name('windows_readers.py')))
 if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-access':
     state_progress('escapes-load-after')
 NativeCalls = primitives['NativeCalls']
@@ -1645,7 +1646,6 @@ def private_pipe_child(report_path):
     token = windows_api.open_process_token(
         windows_api.current_process_handle(),
         windows_api.TokenAccess.TOKEN_QUERY | windows_api.TokenAccess.TOKEN_ADJUST_DEFAULT)
-    get_info = native.token_info
     set_info = native.bind(native.advapi, 'SetTokenInformation', W.BOOL,
                            HANDLE, C.c_int, HANDLE, ULONG)
 
@@ -1653,19 +1653,7 @@ def private_pipe_child(report_path):
         _fields_ = [('acl', HANDLE)]
 
     def snapshot():
-        size = ULONG()
-        get_info(token, 6, None, 0, C.byref(size))
-        if not size.value:
-            raise C.WinError(C.get_last_error())
-        buffer = C.create_string_buffer(size.value)
-        native.check(get_info(token, 6, buffer, len(buffer), C.byref(size)))
-        acl = DefaultDacl.from_buffer(buffer).acl
-        if not acl:
-            raise RuntimeError('missing token default DACL')
-        # TOKEN_DEFAULT_DACL points inside this buffer; retain it for restore.
-        # Compare ACL bytes, not addresses allocated afresh on each query.
-        # The native ACL header's 16-bit AclSize follows revision/reserved bytes.
-        return {'buffer': buffer, 'bytes': C.string_at(acl, C.c_uint16.from_address(acl + 2).value)}
+        return reader_checks['default_dacl_snapshot'](token)
 
     report = {'status': 'failed', 'threads': []}
     original = snapshot()
@@ -4805,6 +4793,10 @@ class AppContainerTests(unittest.TestCase):
         workspace.mkdir()
         native.acl(workspace, private_dacl(owner) +
                    '(A;OICI;FA;;;%s)' % package)
+        # This directory is the write-positive control. A Medium label would
+        # let no-write-up hide a broken package grant or local IPC regression.
+        subprocess.run(['icacls.exe', str(workspace), '/setintegritylevel',
+                        '(OI)(CI)L', '/Q'], check=True, capture_output=True)
         # Confirm the credential-transport primitive before any of it is
         # wired: can the contained child actually read and write inherited
         # anonymous pipe ends?  Handle access is checked at creation, not use.
@@ -4832,6 +4824,9 @@ class AppContainerTests(unittest.TestCase):
         private_result = private_pipe_probe(
             native, sid, workspace, root / 'private-pipes.log')
         self.assertEqual(private_result['status'], 'passed')
+        reader_result = reader_checks['probe'](
+            native, ExtendedLimits, sid, workspace, root / 'private-reader.log', __file__)
+        self.assertEqual(reader_result['status'], 'passed')
         # Which environment the contained launch actually requires: the pty
         # tests fail 203 there, and the broker works only because its block was
         # restored from the profile.  Recorded, not asserted.
@@ -5349,6 +5344,8 @@ if __name__ == '__main__':
         sys.exit(inherited_nul_child(int(sys.argv[2])))
     if len(sys.argv) == 3 and sys.argv[1] == '--eof-stdin-child':
         sys.exit(eof_stdin_child(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == '--private-reader-child':
+        sys.exit(reader_checks['child'](Path(sys.argv[2])))
     if len(sys.argv) == 3 and sys.argv[1] == '--private-pipe-child':
         sys.exit(private_pipe_child(sys.argv[2]))
     if len(sys.argv) == 3 and sys.argv[1] == '--nul-open-child':
