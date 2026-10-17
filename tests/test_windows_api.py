@@ -246,6 +246,254 @@ class TokenInspectionTests(unittest.TestCase):
                 windows_api.token_app_container_sid(42)
 
 
+class TokenCreationTests(unittest.TestCase):
+    def test_primary_copy_uses_only_the_requested_rights_without_inheritance(self):
+        def duplicate(source, rights, attributes, level, kind, output):
+            self.assertEqual([source, rights, attributes, level, kind], [42, 0x8b, None, 2, 1])
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 73
+            return True
+
+        with mock.patch.object(windows_api, 'bind', return_value=duplicate) as bind:
+            copied = windows_api.duplicate_primary_token(42, 0x8b)
+        self.assertEqual(copied.value, 73)
+        self.assertEqual(bind.call_args.args[:2], ('advapi32', 'DuplicateTokenEx'))
+
+    def test_primary_copy_failure_is_not_a_handle(self):
+        with mock.patch.object(windows_api, 'bind', return_value=lambda *args: False), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            with self.assertRaises(windows_api.WindowsApiError) as raised:
+                windows_api.duplicate_primary_token(42, 0x8b)
+        self.assertEqual(raised.exception.status, 5)
+
+    def test_default_query_copies_the_acl_not_its_pointer_or_query_buffer(self):
+        acl = ctypes.create_string_buffer(b'\x02\x00\x08\x00\x00\x00\x00\x00', 8)
+        calls = []
+
+        def query(token, kind, buffer, size, returned):
+            calls.append(kind)
+            self.assertEqual(token, 42)
+            ctypes.cast(returned, ctypes.POINTER(wintypes.DWORD))[0] = ctypes.sizeof(ctypes.c_void_p)
+            if buffer is not None:
+                ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(acl)
+            return buffer is not None
+
+        with mock.patch.object(windows_api, '_get_token_information', return_value=query):
+            result = windows_api.token_default_dacl(42)
+        self.assertEqual(result, acl.raw)
+        acl[0] = b'\x00'
+        self.assertEqual(result[0], 2)
+        self.assertEqual(calls, [windows_api.TOKEN_DEFAULT_DACL_CLASS] * 2)
+
+    def test_null_default_is_not_an_empty_deny_acl(self):
+        def query(token, kind, buffer, size, returned):
+            ctypes.cast(returned, ctypes.POINTER(wintypes.DWORD))[0] = ctypes.sizeof(ctypes.c_void_p)
+            return buffer is not None
+
+        with mock.patch.object(windows_api, '_get_token_information', return_value=query):
+            self.assertIsNone(windows_api.token_default_dacl(42))
+
+    def test_default_query_failures_propagate(self):
+        for size_result in [0, ctypes.sizeof(ctypes.c_void_p)]:
+            def query(token, kind, buffer, size, returned):
+                ctypes.cast(returned, ctypes.POINTER(wintypes.DWORD))[0] = size_result
+                return False
+
+            with self.subTest(size=size_result), \
+                    mock.patch.object(windows_api, '_get_token_information', return_value=query), \
+                    mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+                with self.assertRaises(windows_api.WindowsApiError) as raised:
+                    windows_api.token_default_dacl(42)
+                self.assertEqual(raised.exception.status, 5)
+
+    @contextlib.contextmanager
+    def default_calls(self, *, fail=None, present=True, acl=0xa00):
+        events = []
+
+        def convert(sddl, revision, output, size):
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0xd00
+            events.append('convert')
+            return fail != 'convert'
+
+        def get(descriptor, present_out, acl_out, defaulted):
+            ctypes.cast(present_out, ctypes.POINTER(wintypes.BOOL))[0] = present
+            ctypes.cast(acl_out, ctypes.POINTER(ctypes.c_void_p))[0] = acl
+            events.append('get')
+            return fail != 'get'
+
+        def set_info(token, kind, value, size):
+            self.assertEqual(token, 42)
+            self.assertEqual(kind, windows_api.TOKEN_DEFAULT_DACL_CLASS)
+            self.assertEqual(size, ctypes.sizeof(ctypes.c_void_p))
+            self.assertEqual(ctypes.cast(value, ctypes.POINTER(ctypes.c_void_p))[0], acl)
+            self.assertNotIn('free', events)
+            events.append('set')
+            if fail == 'interrupt':
+                raise KeyboardInterrupt()
+            return fail != 'set'
+
+        def free(descriptor):
+            self.assertEqual(descriptor.value, 0xd00)
+            events.append('free')
+
+        calls = {'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
+                 'GetSecurityDescriptorDacl': get, 'SetTokenInformation': set_info,
+                 'LocalFree': free}
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: calls[symbol]), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            yield events
+
+    def test_default_setter_keeps_the_acl_alive_through_the_copy(self):
+        with self.default_calls() as events:
+            windows_api.set_token_default_dacl(42, 'D:(A;;GA;;;SY)')
+        self.assertEqual(events, ['convert', 'get', 'set', 'free'])
+
+    def test_default_setter_refuses_absent_or_null_acls(self):
+        for present, acl in [[False, 0xa00], [True, None]]:
+            with self.subTest(present=present, acl=acl), self.default_calls(present=present, acl=acl) as events:
+                with self.assertRaises(windows_api.WindowsApiError):
+                    windows_api.set_token_default_dacl(42, 'D:')
+                self.assertEqual(events, ['convert', 'get', 'free'])
+
+    def test_default_setter_releases_only_acquired_memory_on_failure(self):
+        for failure in ['convert', 'get', 'set', 'interrupt']:
+            with self.subTest(failure=failure), self.default_calls(fail=failure) as events:
+                error = KeyboardInterrupt if failure == 'interrupt' else windows_api.WindowsApiError
+                with self.assertRaises(error):
+                    windows_api.set_token_default_dacl(42, 'D:(A;;GA;;;SY)')
+                self.assertEqual(events.count('free'), 0 if failure == 'convert' else 1)
+
+
+class OwningCreationTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def native_calls(self, *, fail=None):
+        seen = {'attributes': [], 'freed': [], 'created': [], 'counts': []}
+        live = set()
+
+        def convert_sid(text, output):
+            seen['sid'] = text
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0xabc
+            return True
+
+        def convert_sd(text, revision, output, size):
+            seen['sddl'] = text
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = None if fail == 'null-descriptor' else 0xdef
+            if fail == 'null-descriptor':
+                return True
+            if fail == 'descriptor':
+                return False
+            live.add(0xdef)
+            return True
+
+        def initialize(attributes, count, flags, size):
+            seen['counts'].append(count)
+            ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = 256
+            return attributes is not None
+
+        def update(attributes, flags, attribute, *args):
+            seen['attributes'].append(attribute)
+            return fail != 'attribute'
+
+        def free(value):
+            seen['freed'].append(value.value)
+            live.discard(value.value)
+            if fail == 'cleanup' and value.value == 0xdef:
+                raise KeyboardInterrupt()
+
+        def create(*args):
+            seen['created'].append(args)
+            offset = 0 if isinstance(args[0], str) else 1
+            process_sa = ctypes.cast(args[offset + 2], ctypes.POINTER(windows_api.SecurityAttributes)).contents
+            thread_sa = ctypes.cast(args[offset + 3], ctypes.POINTER(windows_api.SecurityAttributes)).contents
+            self.assertEqual(process_sa.lpSecurityDescriptor, 0xdef)
+            self.assertEqual(thread_sa.lpSecurityDescriptor, 0xdef)
+            self.assertEqual(process_sa.bInheritHandle, 0)
+            self.assertEqual(thread_sa.bInheritHandle, 0)
+            self.assertIn(0xdef, live)
+            information = ctypes.cast(args[-1], ctypes.POINTER(windows_api.ProcessInformation)).contents
+            information.hProcess, information.hThread = 11, 22
+            return fail != 'create'
+
+        calls = {'ConvertStringSidToSidW': convert_sid,
+                 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert_sd,
+                 'LocalFree': free, 'InitializeProcThreadAttributeList': initialize,
+                 'UpdateProcThreadAttribute': update,
+                 'DeleteProcThreadAttributeList': lambda *args: seen.update(deleted=True),
+                 'CreateProcessW': create, 'CreateProcessAsUserW': create}
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: calls[symbol]), \
+                mock.patch.object(windows_api, 'token_is_app_container', return_value=True), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            yield seen
+
+    def test_owning_copy_does_not_reapply_lowbox_capabilities(self):
+        with self.native_calls() as seen:
+            information = windows_api.create_process_in_app_container(
+                'chosen-loki.exe', ['--subagent'], None, inherited_handles=[31, 32],
+                primary_token=73, object_security='D:P(A;;GA;;;SY)')
+        self.assertEqual(information.hProcess, 11)
+        self.assertNotIn('sid', seen)
+        self.assertEqual(seen['attributes'], [windows_api.ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_HANDLE_LIST])
+        self.assertEqual(seen['counts'], [1, 1])
+        self.assertEqual(seen['created'][0][:2], (73, 'chosen-loki.exe'))
+        self.assertTrue(seen['created'][0][6] & windows_api.CreateProcessFlags.CREATE_SUSPENDED)
+        self.assertEqual(seen['freed'], [0xdef])
+        self.assertTrue(seen['deleted'])
+
+    def test_bootstrap_objects_can_be_private_at_creation_too(self):
+        with self.native_calls() as seen:
+            windows_api.create_process_in_app_container(
+                'chosen-loki.exe', [], 'package', object_security='private')
+        self.assertEqual(seen['sid'], 'package')
+        self.assertEqual(seen['freed'], [0xdef, 0xabc])
+        self.assertEqual(len(seen['created']), 1)
+
+    def test_existing_token_needs_no_empty_attribute_list(self):
+        with self.native_calls() as seen:
+            windows_api.create_process_in_app_container(
+                'chosen-loki.exe', [], None, primary_token=73, object_security='private')
+        self.assertEqual(seen['counts'], [])
+        self.assertEqual(seen['attributes'], [])
+        self.assertNotIn('deleted', seen)
+
+    def test_an_uncontained_token_cannot_skip_lowbox_creation(self):
+        with mock.patch.object(windows_api, 'token_is_app_container', return_value=False) as inspect, \
+                mock.patch.object(windows_api, 'bind') as bind:
+            with self.assertRaises(windows_api.WindowsApiError):
+                windows_api.create_process_in_app_container('chosen-loki.exe', [], None, primary_token=73)
+        inspect.assert_called_once_with(73)
+        bind.assert_not_called()
+
+    def test_no_token_and_no_package_is_not_an_uncontained_fallback(self):
+        with self.assertRaises(ValueError):
+            windows_api.create_process_in_app_container('chosen-loki.exe', [], None)
+
+    def test_interrupted_buffer_cleanup_retires_the_unreturned_suspended_child(self):
+        for package in [None, 'package']:
+            events = []
+            with self.subTest(package=package), self.native_calls(fail='cleanup') as seen, \
+                    mock.patch.object(windows_api, 'wait_for_single_object', side_effect=[258, 0]) as wait, \
+                    mock.patch.object(windows_api, 'terminate_process', side_effect=lambda p: events.append(['terminate', p])), \
+                    mock.patch.object(windows_api, 'close_handle', side_effect=lambda h: events.append(['close', h])):
+                with self.assertRaises(KeyboardInterrupt):
+                    windows_api.create_process_in_app_container(
+                        'chosen-loki.exe', [], package, inherited_handles=[31],
+                        primary_token=73, object_security='private')
+            self.assertEqual(events, [['terminate', 11], ['close', 22], ['close', 11]])
+            self.assertEqual(wait.call_args_list, [mock.call(11, 0), mock.call(11, windows_api.INFINITE)])
+            self.assertEqual(seen['freed'], [0xdef] if package is None else [0xdef, 0xabc])
+            self.assertTrue(seen['deleted'])
+
+    def test_creation_failures_release_descriptors_and_attributes_without_retry(self):
+        for failure in ['attribute', 'descriptor', 'null-descriptor', 'create']:
+            with self.subTest(failure=failure), self.native_calls(fail=failure) as seen:
+                with self.assertRaises(windows_api.WindowsApiError):
+                    windows_api.create_process_in_app_container(
+                        'chosen-loki.exe', [], None, inherited_handles=[31],
+                        primary_token=73, object_security='private')
+                self.assertTrue(seen['deleted'])
+                self.assertEqual(seen['freed'], [0xdef] if failure == 'create' else [])
+                self.assertEqual(len(seen['created']), 1 if failure == 'create' else 0)
+
+
 class AppContainerLaunchTests(unittest.TestCase):
     def test_launch_carries_security_capabilities_and_leaves_the_child_suspended(self):
         seen = {"attributes": []}

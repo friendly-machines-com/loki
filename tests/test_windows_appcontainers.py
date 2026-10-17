@@ -74,6 +74,7 @@ if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-acc
     state_progress('escapes-load-before')
 escape_helpers = runpy.run_path(str(Path(__file__).with_name('windows_escapes.py')))
 reader_checks = runpy.run_path(str(Path(__file__).with_name('windows_readers.py')))
+owning_checks = runpy.run_path(str(Path(__file__).with_name('windows_owners.py')))
 if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--state-access':
     state_progress('escapes-load-after')
 NativeCalls = primitives['NativeCalls']
@@ -4827,6 +4828,9 @@ class AppContainerTests(unittest.TestCase):
         reader_result = reader_checks['probe'](
             native, ExtendedLimits, sid, workspace, root / 'private-reader.log', __file__)
         self.assertEqual(reader_result['status'], 'passed')
+        owning_result = owning_checks['probe'](
+            native, StateTokenProbe(native).api, ExtendedLimits, sid, workspace, __file__)
+        self.assertEqual(owning_result['actor']['status'], 'passed')
         # Which environment the contained launch actually requires: the pty
         # tests fail 203 there, and the broker works only because its block was
         # restored from the profile.  Recorded, not asserted.
@@ -5344,6 +5348,10 @@ if __name__ == '__main__':
         sys.exit(inherited_nul_child(int(sys.argv[2])))
     if len(sys.argv) == 3 and sys.argv[1] == '--eof-stdin-child':
         sys.exit(eof_stdin_child(sys.argv[2]))
+    if len(sys.argv) == 4 and sys.argv[1] == '--owning-child':
+        native = AppContainers()
+        sys.exit(owning_checks['child'](
+            Path(sys.argv[2]), int(sys.argv[3]), native, StateTokenProbe(native).api, __file__))
     if len(sys.argv) == 3 and sys.argv[1] == '--private-reader-child':
         sys.exit(reader_checks['child'](Path(sys.argv[2])))
     if len(sys.argv) == 3 and sys.argv[1] == '--private-pipe-child':

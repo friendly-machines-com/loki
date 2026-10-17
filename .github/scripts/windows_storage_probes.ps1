@@ -152,7 +152,7 @@ try {
     }
     if ($Probe -eq 'appcontainer') {
         $script = Join-Path $root 'test_windows_appcontainers.py'
-        foreach ($probeFile in @('test_windows_appcontainers.py', 'windows_escapes.py', 'windows_readers.py')) {
+        foreach ($probeFile in @('test_windows_appcontainers.py', 'windows_escapes.py', 'windows_readers.py', 'windows_owners.py')) {
             $copy = Join-Path $root $probeFile
             Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "tests/$probeFile") -Destination $copy
             & "$env:SystemRoot/System32/icacls.exe" $copy /reset /Q

@@ -271,6 +271,15 @@ class StagedGateClosureTests(unittest.TestCase):
         self.assertEqual(imported - _staged_gate_modules(), set(),
                          'the native private-pipe probe must import its shipped implementation')
 
+    def test_owning_child_native_probe_and_implementation_are_staged(self):
+        tree = ast.parse((ROOT / 'tests' / 'windows_owners.py').read_text())
+        imported = {alias.name for node in ast.walk(tree)
+                    if isinstance(node, ast.ImportFrom) and node.module == 'loki_agent'
+                    for alias in node.names}
+        self.assertEqual(imported - _staged_gate_modules(), set())
+        self.assertIn("'windows_owners.py'", PROBES.read_text(),
+                      'the recursive owning-child actor must accompany the native fixture')
+
     def test_private_reader_native_probe_and_implementation_are_staged(self):
         self.assertEqual(_gate_closure('handle_reader') - _staged_gate_modules(), set())
         self.assertIn("'windows_readers.py'", PROBES.read_text(),

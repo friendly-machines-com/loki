@@ -22,6 +22,7 @@ Two rules keep this module safe to share rather than copied around:
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import ctypes
 import enum
 import subprocess
@@ -198,6 +199,7 @@ class TokenAccess(enum.IntFlag):
 
 
 TOKEN_USER_CLASS = 1
+TOKEN_DEFAULT_DACL_CLASS = 6
 
 
 def current_user_sid() -> str:
@@ -920,6 +922,95 @@ def open_process_token(process, rights: int = TokenAccess.TOKEN_QUERY):
     return token
 
 
+def duplicate_primary_token(token, rights: int):
+    """Copy a primary token without filtering it; return a non-inheritable handle.
+
+    The source needs TOKEN_DUPLICATE. The caller chooses the returned handle's
+    rights explicitly: process creation and default-DACL adjustment need their
+    own rights, not merely TOKEN_QUERY. Changing this copy's creation default
+    must not change the live parent's default while other threads can start.
+    """
+    duplicate = bind(
+        "advapi32", "DuplicateTokenEx", wintypes.BOOL,
+        ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_int,
+        ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+    result = ctypes.c_void_p()
+    # SecurityImpersonation=2, TokenPrimary=1. NULL security attributes keep
+    # the returned handle non-inheritable; this does not add restrictions.
+    if not duplicate(token, rights, None, 2, 1, ctypes.byref(result)):
+        raise WindowsApiError("DuplicateTokenEx failed",
+                              status=ctypes.get_last_error())
+    return result
+
+
+def token_default_dacl(token):
+    """Return the future-object ACL's bytes, or None for a NULL default ACL.
+
+    This is not the token object's own DACL. Keep the query buffer alive until
+    its pointed-to ACL has been copied; a NULL ACL grants access, not privacy.
+    TOKEN_QUERY is required, independently of the right to change the default.
+    """
+    query = _get_token_information()
+    size = wintypes.DWORD()
+    query(token, TOKEN_DEFAULT_DACL_CLASS, None, 0, ctypes.byref(size))
+    if size.value < ctypes.sizeof(ctypes.c_void_p):
+        raise WindowsApiError("GetTokenInformation(TokenDefaultDacl) sizing failed",
+                              status=ctypes.get_last_error())
+    buffer = ctypes.create_string_buffer(size.value)
+    if not query(token, TOKEN_DEFAULT_DACL_CLASS, buffer, len(buffer), ctypes.byref(size)):
+        raise WindowsApiError("GetTokenInformation(TokenDefaultDacl) failed",
+                              status=ctypes.get_last_error())
+    # TOKEN_DEFAULT_DACL contains exactly one pointer. ACL.AclSize is the
+    # 16-bit field after its revision and reserved bytes, not the query size.
+    acl = ctypes.c_void_p.from_buffer(buffer).value
+    if acl is None:
+        return None
+    length = ctypes.c_uint16.from_address(acl + 2).value
+    if length < 8:
+        raise WindowsApiError("TokenDefaultDacl returned a short ACL")
+    return ctypes.string_at(acl, length)
+
+
+def set_token_default_dacl(token, sddl: str) -> None:
+    """Set future-object security on the supplied token, not its object DACL.
+
+    The caller owns token selection and must verify the result before a child
+    runs. TOKEN_ADJUST_DEFAULT suffices here; readback separately needs QUERY.
+    """
+    convert = bind(
+        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    get_dacl = bind(
+        "advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
+        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
+    set_info = bind("advapi32", "SetTokenInformation", wintypes.BOOL,
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                    wintypes.DWORD)
+    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                      ctypes.c_void_p)
+    descriptor = ctypes.c_void_p()
+    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise WindowsApiError("ConvertStringSecurityDescriptorToSecurityDescriptorW failed",
+                              status=ctypes.get_last_error())
+    try:
+        present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not get_dacl(descriptor, ctypes.byref(present), ctypes.byref(acl),
+                        ctypes.byref(defaulted)):
+            raise WindowsApiError("GetSecurityDescriptorDacl failed",
+                                  status=ctypes.get_last_error())
+        if not present.value or not acl.value:
+            raise WindowsApiError("the descriptor has no DACL to apply")
+        # TOKEN_DEFAULT_DACL is one pointer into descriptor. SetTokenInformation
+        # copies the ACL; freeing descriptor sooner would leave a dangling ACL.
+        if not set_info(token, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(acl), ctypes.sizeof(acl)):
+            raise WindowsApiError("SetTokenInformation(TokenDefaultDacl) failed",
+                                  status=ctypes.get_last_error())
+    finally:
+        local_free(descriptor)
+
+
 def token_is_app_container(token) -> bool:
     """Whether ``token`` is an AppContainer (lowbox) token.
 
@@ -1186,10 +1277,11 @@ def environment_block(environment: dict, current_directory=None):
 def create_process_in_app_container(executable, arguments, package_sid,
                                     current_directory=None,
                                     inherited_handles=None, environment=None,
-                                    standard_handles=None, pseudoconsole=None):
+                                    standard_handles=None, pseudoconsole=None, *,
+                                    primary_token=None, object_security=None):
     """Create ``executable`` suspended inside the AppContainer ``package_sid``.
 
-    ``package_sid`` is the package SID in string form, as
+    When supplied, ``package_sid`` is the package SID in string form, as
     :func:`derive_app_container_sid` returns; the profile must already exist,
     since this does not create a profile or change a DACL. ``inherited_handles`` are
     the handles the child must receive, passed explicitly through
@@ -1197,10 +1289,28 @@ def create_process_in_app_container(executable, arguments, package_sid,
     ``pseudoconsole`` attaches the child to an existing ``HPCON`` (ConPTY), which
     then supplies its standard handles in place of the caller's console.
 
+    ``primary_token`` selects CreateProcessAsUserW without filtering that token.
+    ``package_sid=None`` is allowed only with a supplied token that already has
+    the intended AppContainer identity: no new lowbox attributes are then added.
+    The caller must verify the actual child, not infer authority from its argv.
+    ``object_security`` is optional SDDL applied to both the process and initial
+    thread at creation. Suspension prevents execution, not foreign handle opens,
+    so tightening those objects only afterwards cannot provide that boundary.
+
     The child is left suspended, so the caller can inspect its token and then
-    resume or terminate it.  The returned :class:`ProcessInformation` owns the
-    process and thread handles; the caller closes them.
+    resume or terminate it. Its token object's DACL and future-object default
+    are separate: a launch copy can have a compatible creation default while
+    the actual child's default is made private and checked before resume.
+    The returned :class:`ProcessInformation` owns the process and thread handles;
+    the caller must terminate/reap on setup failure and close both handles.
     """
+    if package_sid is None:
+        if primary_token is None:
+            raise ValueError("a package SID or an existing AppContainer token is required")
+        # Omitting SECURITY_CAPABILITIES must mean retaining an existing
+        # lowbox identity, never silently creating an uncontained child.
+        if not token_is_app_container(primary_token):
+            raise WindowsApiError("the supplied primary token is not an AppContainer")
     convert_sid = bind("advapi32", "ConvertStringSidToSidW", wintypes.BOOL,
                        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
     local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
@@ -1214,45 +1324,53 @@ def create_process_in_app_container(executable, arguments, package_sid,
                   ctypes.c_void_p)
     delete = bind("kernel32", "DeleteProcThreadAttributeList", None,
                   ctypes.c_void_p)
-    create = bind("kernel32", "CreateProcessW", wintypes.BOOL,
-                  wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
+    parameters = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
                   ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
                   ctypes.c_void_p, wintypes.LPCWSTR,
                   ctypes.POINTER(StartupInfoEx),
-                  ctypes.POINTER(ProcessInformation))
+                  ctypes.POINTER(ProcessInformation)]
+    if primary_token is None:
+        create = bind("kernel32", "CreateProcessW", wintypes.BOOL, *parameters)
+    else:
+        create = bind("advapi32", "CreateProcessAsUserW", wintypes.BOOL,
+                      ctypes.c_void_p, *parameters)
 
     sid = ctypes.c_void_p()
-    if not convert_sid(package_sid, ctypes.byref(sid)):
+    if package_sid is not None and not convert_sid(package_sid, ctypes.byref(sid)):
         raise WindowsApiError(f"ConvertStringSidToSidW({package_sid!r}) failed")
-    # The list must be sized for every attribute it will receive: one for the
-    # package SID, plus one when handles are inherited, plus one when the child
-    # is attached to a pseudoconsole.  Sizing it for fewer and then adding more
+    # The list must be sized for every attribute it will receive: one when a
+    # package SID is supplied, one when handles are inherited, and one when the
+    # child is attached to a pseudoconsole. Sizing it for fewer and adding more
     # makes the extra UpdateProcThreadAttribute fail.
-    attribute_count = 1 + (1 if inherited_handles else 0) + (
-        1 if pseudoconsole is not None else 0)
+    attribute_count = (1 if package_sid is not None else 0) + (
+        1 if inherited_handles else 0) + (1 if pseudoconsole is not None else 0)
     size = ctypes.c_size_t()
     attribute_list = None
     initialized = False
     handle_array = None
+    descriptor = ctypes.c_void_p()
+    created = False
     try:
-        initialize(None, attribute_count, 0, ctypes.byref(size))
-        if not size.value:
-            raise WindowsApiError(
-                "InitializeProcThreadAttributeList reported no size")
-        attribute_storage = ctypes.create_string_buffer(size.value)
-        attribute_list = ctypes.cast(attribute_storage, ctypes.c_void_p)
-        if not initialize(attribute_list, attribute_count, 0,
-                          ctypes.byref(size)):
-            raise WindowsApiError(
-                "InitializeProcThreadAttributeList failed")
-        initialized = True
-        capabilities = SecurityCapabilities(sid, None, 0, 0)
-        if not update(attribute_list, 0,
-                      ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                      ctypes.byref(capabilities),
-                      ctypes.sizeof(capabilities), None, None):
-            raise WindowsApiError(
-                "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed")
+        if attribute_count:
+            initialize(None, attribute_count, 0, ctypes.byref(size))
+            if not size.value:
+                raise WindowsApiError(
+                    "InitializeProcThreadAttributeList reported no size")
+            attribute_storage = ctypes.create_string_buffer(size.value)
+            attribute_list = ctypes.cast(attribute_storage, ctypes.c_void_p)
+            if not initialize(attribute_list, attribute_count, 0,
+                              ctypes.byref(size)):
+                raise WindowsApiError(
+                    "InitializeProcThreadAttributeList failed")
+            initialized = True
+        if package_sid is not None:
+            capabilities = SecurityCapabilities(sid, None, 0, 0)
+            if not update(attribute_list, 0,
+                          ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                          ctypes.byref(capabilities),
+                          ctypes.sizeof(capabilities), None, None):
+                raise WindowsApiError(
+                    "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed")
         if inherited_handles:
             handle_array = (ctypes.c_void_p * len(inherited_handles))(
                 *inherited_handles)
@@ -1296,18 +1414,58 @@ def create_process_in_app_container(executable, arguments, package_sid,
         block = environment_block(environment, current_directory)
         if block is not None:
             flags |= CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT
-        if not create(executable, command_line, None, None,
-                      bool(inherited_handles), flags, block,
-                      current_directory, ctypes.byref(startup),
-                      ctypes.byref(information)):
-            raise WindowsApiError(
-                "CreateProcessW failed: "
-                f"{ctypes.get_last_error()}")
+        security = None
+        if object_security is not None:
+            convert = bind(
+                "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+            converted = ctypes.c_void_p()
+            if not convert(object_security, SDDL_REVISION_1,
+                           ctypes.byref(converted), None):
+                raise WindowsApiError("ConvertStringSecurityDescriptorToSecurityDescriptorW failed",
+                                      status=ctypes.get_last_error())
+            if not converted.value:
+                raise WindowsApiError("the explicit process descriptor is null")
+            descriptor = converted
+            attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+            security = ctypes.byref(attributes)
+        creation = [executable, command_line, security, security,
+                    bool(inherited_handles), flags, block,
+                    current_directory, ctypes.byref(startup),
+                    ctypes.byref(information)]
+        if primary_token is not None:
+            creation.insert(0, primary_token)
+        if not create(*creation):
+            operation = "CreateProcessW" if primary_token is None else "CreateProcessAsUserW"
+            status = ctypes.get_last_error()
+            raise WindowsApiError(f"{operation} failed: {status}", status=status)
+        created = True
         return information
     finally:
-        if initialized:
-            delete(attribute_list)
-        local_free(sid)
+        try:
+            with ExitStack() as cleanup:
+                if sid.value:
+                    cleanup.callback(local_free, sid)
+                # Both initial objects consume this descriptor synchronously.
+                # It must outlive creation; the child never owns its buffer.
+                if descriptor.value:
+                    cleanup.callback(local_free, descriptor)
+                if initialized:
+                    cleanup.callback(delete, attribute_list)
+        except BaseException:
+            if created:
+                # Ownership transfers only when this function returns. If
+                # native-buffer cleanup is interrupted, the caller has no
+                # handles yet: retire the suspended child here, not an orphan.
+                with ExitStack() as cleanup:
+                    cleanup.callback(close_handle, information.hProcess)
+                    cleanup.callback(close_handle, information.hThread)
+                    if wait_for_single_object(information.hProcess, 0) == WAIT_TIMEOUT:
+                        terminate_process(information.hProcess)
+                    if wait_for_single_object(information.hProcess, INFINITE) != WAIT_OBJECT_0:
+                        raise WindowsApiError("suspended child cleanup wait failed")
+            raise
 
 
 # -- handle-relative file operations -------------------------------------
