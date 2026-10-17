@@ -49,6 +49,7 @@ import runpy
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -1633,6 +1634,129 @@ def eof_stdin_child(report_path):
         report['error'] = '%s: %s' % (type(error).__name__, error)
     Path(report_path).write_text(json.dumps(report))
     return 0
+
+
+def private_pipe_child(report_path):
+    """Exercise shipped local IPC creation with a private primary default."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from loki_agent import host_ipc, windows_acl, windows_api
+    native = AppContainers()
+    owner = windows_api.current_user_sid()
+    token = windows_api.open_process_token(
+        windows_api.current_process_handle(),
+        windows_api.TokenAccess.TOKEN_QUERY | windows_api.TokenAccess.TOKEN_ADJUST_DEFAULT)
+    get_info = native.token_info
+    set_info = native.bind(native.advapi, 'SetTokenInformation', W.BOOL,
+                           HANDLE, C.c_int, HANDLE, ULONG)
+
+    class DefaultDacl(C.Structure):
+        _fields_ = [('acl', HANDLE)]
+
+    def snapshot():
+        size = ULONG()
+        get_info(token, 6, None, 0, C.byref(size))
+        if not size.value:
+            raise C.WinError(C.get_last_error())
+        buffer = C.create_string_buffer(size.value)
+        native.check(get_info(token, 6, buffer, len(buffer), C.byref(size)))
+        acl = DefaultDacl.from_buffer(buffer).acl
+        if not acl:
+            raise RuntimeError('missing token default DACL')
+        # TOKEN_DEFAULT_DACL points inside this buffer; retain it for restore.
+        # Compare ACL bytes, not addresses allocated afresh on each query.
+        # The native ACL header's 16-bit AclSize follows revision/reserved bytes.
+        return {'buffer': buffer, 'bytes': C.string_at(acl, C.c_uint16.from_address(acl + 2).value)}
+
+    report = {'status': 'failed', 'threads': []}
+    original = snapshot()
+    descriptor = HANDLE()
+    try:
+        native.check(native.convert_sd(
+            f'D:P(A;;GA;;;{owner})(A;;GA;;;SY)(A;;GA;;;BA)',
+            1, C.byref(descriptor), None))
+        present, defaulted, acl = W.BOOL(), W.BOOL(), HANDLE()
+        native.check(native.get_dacl(descriptor, C.byref(present), C.byref(acl), C.byref(defaulted)))
+        value = DefaultDacl(acl)
+        native.check(set_info(token, 6, C.byref(value), C.sizeof(value)))
+        private = snapshot()
+        # The failed default-security control distinguishes the new creator
+        # from a pipe that worked only because the private default was absent.
+        try:
+            unexpected = native.pipe_pair()
+        except OSError as error:
+            report['default_pipe_error'] = getattr(error, 'winerror', None)
+            if report['default_pipe_error'] != 5:
+                raise
+        else:
+            for handle in unexpected:
+                native.close(handle)
+            raise AssertionError('default-security pipe unexpectedly succeeded')
+        with ExitStack() as cleanup:
+            read, write = host_ipc.private_pipe(inherit=False)
+            for handle in [read, write]:
+                cleanup.callback(windows_api.close_handle, handle)
+            payload = b'SYNTHETIC-PRIVATE-DEFAULT-IPC'
+            native.write_all(write, payload)
+            if native.read_exactly(read, len(payload), float('inf')) != payload:
+                raise AssertionError('private pipe data mismatch')
+            request, response = host_ipc._private_pipe_pair()
+            for pair in [request, response]:
+                for handle in pair:
+                    cleanup.callback(windows_api.close_handle, handle)
+                native.write_all(pair[1], payload)
+                if native.read_exactly(pair[0], len(payload), float('inf')) != payload:
+                    raise AssertionError('private credential pair data mismatch')
+            stdin, release = host_ipc.eof_stdin()
+            cleanup.callback(release)
+            if os.read(stdin, 1) != b'':
+                raise AssertionError('private EOF stdin did not end')
+
+            def inspect_thread():
+                try:
+                    # Read the newborn object's descriptor through its own
+                    # pseudo-handle. A separate OpenThread by TID would itself
+                    # need DACL access, confusing creation with reopen policy.
+                    current = windows_api.bind('kernel32', 'GetCurrentThread', HANDLE)
+                    report['threads'].append({'dacl': windows_api.handle_dacl_sddl(
+                        current(), windows_api.SE_KERNEL_OBJECT)})
+                except Exception as error:
+                    report['threads'].append({'error': str(error)})
+            worker = threading.Thread(target=inspect_thread)
+            worker.start()
+            worker.join()
+            if len(report['threads']) != 1 or 'error' in report['threads'][0]:
+                raise AssertionError('private thread descriptor not measured')
+            allowed = {windows_api.canonical_sid(sid) for sid in [owner, 'SY', 'BA']}
+            actual = {windows_api.canonical_sid(sid) for sid in windows_acl.allow_trustees(
+                report['threads'][0]['dacl'])}
+            if actual != allowed:
+                raise AssertionError('pipe allocation broadened thread creation')
+        report['default_unchanged'] = snapshot()['bytes'] == private['bytes']
+        if not report['default_unchanged']:
+            raise AssertionError('pipe allocation changed the primary default')
+        report['status'] = 'passed'
+    except Exception as error:
+        report['error'] = '%s: %s' % (type(error).__name__, error)
+    finally:
+        value = DefaultDacl(DefaultDacl.from_buffer(original['buffer']).acl)
+        native.check(set_info(token, 6, C.byref(value), C.sizeof(value)))
+        if descriptor.value:
+            native.local_free(descriptor)
+        windows_api.close_handle(token)
+        Path(report_path).write_text(json.dumps(report))
+    return 0 if report['status'] == 'passed' else 1
+
+
+def private_pipe_probe(native, sid, workspace, output):
+    report_path = workspace / 'private-pipe-child.json'
+    code = native.launch(
+        [sys.executable, '-I', '-u', __file__, '--private-pipe-child', str(report_path)],
+        sid, workspace, output, deadline=float('inf'))
+    report = json.loads(report_path.read_text())
+    print(json.dumps({'private_pipe_creation': report}), flush=True)
+    if code != 0 or report['status'] != 'passed':
+        raise AssertionError('private-default local IPC failed: %r' % report)
+    return report
 
 
 def nul_open_child(report_path):
@@ -4705,6 +4829,9 @@ class AppContainerTests(unittest.TestCase):
             native, sid, workspace, root / 'eof-stdin.log')
         print(json.dumps(stdin_result), flush=True)
         self.assertEqual(stdin_result['outcome'], 'pipe-stdin-reached-eof')
+        private_result = private_pipe_probe(
+            native, sid, workspace, root / 'private-pipes.log')
+        self.assertEqual(private_result['status'], 'passed')
         # Which environment the contained launch actually requires: the pty
         # tests fail 203 there, and the broker works only because its block was
         # restored from the profile.  Recorded, not asserted.
@@ -5222,6 +5349,8 @@ if __name__ == '__main__':
         sys.exit(inherited_nul_child(int(sys.argv[2])))
     if len(sys.argv) == 3 and sys.argv[1] == '--eof-stdin-child':
         sys.exit(eof_stdin_child(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == '--private-pipe-child':
+        sys.exit(private_pipe_child(sys.argv[2]))
     if len(sys.argv) == 3 and sys.argv[1] == '--nul-open-child':
         sys.exit(nul_open_child(sys.argv[2]))
     if len(sys.argv) == 4 and sys.argv[1] == '--scratch-child':

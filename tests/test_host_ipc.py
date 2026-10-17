@@ -112,6 +112,63 @@ class PairConfirmationTests(unittest.TestCase):
         self.assertEqual(second.fileno(), -1)
 
 
+class PrivatePipeCreationTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def identity(self, contained):
+        with mock.patch.multiple(
+                host_ipc.windows_api,
+                current_user_sid=mock.DEFAULT,
+                current_process_handle=mock.DEFAULT,
+                open_process_token=mock.DEFAULT,
+                token_is_app_container=mock.DEFAULT,
+                token_app_container_sid=mock.DEFAULT,
+                close_handle=mock.DEFAULT,
+                create_pipe=mock.DEFAULT) as calls:
+            calls['current_user_sid'].return_value = 'S-1-5-21-9'
+            calls['current_process_handle'].return_value = 10
+            calls['open_process_token'].return_value = 11
+            calls['token_is_app_container'].return_value = contained
+            calls['token_app_container_sid'].return_value = 'S-1-15-2-123'
+            calls['create_pipe'].return_value = [21, 22]
+            yield calls
+
+    def test_uncontained_creator_uses_only_private_trustees(self):
+        with self.identity(False) as calls:
+            self.assertEqual(host_ipc.private_pipe(), [21, 22])
+        calls['open_process_token'].assert_called_once_with(10)
+        calls['close_handle'].assert_called_once_with(11)
+        calls['token_app_container_sid'].assert_not_called()
+        calls['create_pipe'].assert_called_once_with(
+            inherit=True,
+            security_descriptor='D:P(A;;GA;;;S-1-5-21-9)(A;;GA;;;SY)(A;;GA;;;BA)')
+
+    def test_package_gets_client_reopen_rights_not_pipe_data_read(self):
+        with self.identity(True) as calls:
+            host_ipc.private_pipe(inherit=False)
+        calls['token_app_container_sid'].assert_called_once_with(11)
+        calls['close_handle'].assert_called_once_with(11)
+        calls['create_pipe'].assert_called_once_with(
+            inherit=False,
+            security_descriptor=('D:P(A;;GA;;;S-1-5-21-9)(A;;GA;;;SY)(A;;GA;;;BA)'
+                                 '(A;;0x120196;;;S-1-15-2-123)'))
+
+    def test_identity_query_failure_closes_token_and_never_allocates_pipe(self):
+        with self.identity(True) as calls:
+            calls['token_app_container_sid'].side_effect = OSError('identity unavailable')
+            with self.assertRaisesRegex(OSError, 'identity unavailable'):
+                host_ipc.private_pipe()
+        calls['close_handle'].assert_called_once_with(11)
+        calls['create_pipe'].assert_not_called()
+
+    def test_pipe_creation_failure_is_not_retried_with_default_security(self):
+        with self.identity(True) as calls:
+            calls['create_pipe'].side_effect = OSError('access denied')
+            with self.assertRaisesRegex(OSError, 'access denied'):
+                host_ipc.private_pipe()
+        calls['close_handle'].assert_called_once_with(11)
+        self.assertEqual(calls['create_pipe'].call_count, 1)
+
+
 class PrivatePipePairTests(unittest.TestCase):
     """Portable contract of the Windows pipe pair, with the calls mocked.
 
@@ -124,7 +181,7 @@ class PrivatePipePairTests(unittest.TestCase):
     def test_only_the_child_ends_stay_inheritable(self):
         created = iter([(0x10, 0x11), (0x12, 0x13)])
         cleared = []
-        with mock.patch.object(host_ipc.windows_api, "create_pipe",
+        with mock.patch.object(host_ipc, "private_pipe",
                                side_effect=lambda: next(created)), \
                 mock.patch.object(host_ipc.windows_api,
                                   "clear_handle_inheritance",
@@ -173,7 +230,7 @@ class PrivatePipePairTests(unittest.TestCase):
     def test_second_pipe_failure_closes_the_first_pipe(self):
         closed = []
         with mock.patch.object(
-                host_ipc.windows_api, "create_pipe",
+                host_ipc, "private_pipe",
                 side_effect=[(0x10, 0x11), OSError("no more handles")]), \
                 mock.patch.object(host_ipc.windows_api,
                                   "clear_handle_inheritance"), \
@@ -197,7 +254,7 @@ class PrivatePipePairTests(unittest.TestCase):
     def test_inheritance_failure_closes_all_four_ends(self):
         closed = []
         with mock.patch.object(
-                host_ipc.windows_api, "create_pipe",
+                host_ipc, "private_pipe",
                 side_effect=[(0x10, 0x11), (0x12, 0x13)]), \
                 mock.patch.object(
                     host_ipc.windows_api, "clear_handle_inheritance",
@@ -217,7 +274,7 @@ class SocketPairTests(unittest.TestCase):
             # the parent ends have inheritance cleared.
             created = iter([(0x10, 0x11), (0x12, 0x13)])
             cleared = []
-            with mock.patch.object(host_ipc.windows_api, "create_pipe",
+            with mock.patch.object(host_ipc, "private_pipe",
                                    side_effect=lambda: next(created)), \
                     mock.patch.object(host_ipc.windows_api,
                                       "clear_handle_inheritance",

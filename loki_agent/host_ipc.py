@@ -9,43 +9,17 @@ Two channels need this: the session-lifetime channel and the credential
 capability channel.  POSIX keeps a pipe for the first and an AF_UNIX socket for
 the second, exactly as before.
 
-**Why Windows does not use ``socket.socketpair()``.**  Winsock has no
-``socketpair``, so CPython falls back to an AF_INET loopback emulation:
-it binds and listens on 127.0.0.1, connects a second socket to it, and accepts.
-That means a real *listening TCP port* exists for the window between ``listen``
-and ``accept``.  Any local process, under any user, can connect to it; CPython
-detects the substitution afterwards by comparing peer addresses and raises
-``ConnectionError``, so a hijack fails rather than succeeds -- but a failure is
-still a local denial, and, worse, loopback traffic is subject to no policy at
-all, so there is no control to reason about.  Reachability by *address* is the
-wrong property for a credential channel.
+Windows uses anonymous pipes: one for owner lifetime, two for the bidirectional
+credential channel. The tested Windows interpreters do not expose AF_UNIX;
+CPython's TCP-emulated socketpair would instead introduce an address-reachable
+listener and a connection-substitution check. Neither is needed for endpoints
+handed directly to a child.
 
-**What Windows uses instead: AF_UNIX.**  Windows 10 1803 (and Server 2019)
-onwards has AF_UNIX: ``bind`` creates a socket file -- an NTFS reparse point --
-and, per Microsoft's documentation, connecting to it requires write permission
-on that file, with ``bind`` requiring write permission on its directory.  So
-reachability is bounded by the filesystem ACL on a directory this module
-creates private (``tempfile.mkdtemp``, i.e. mode 0o700) and removes as soon as
-the pair is connected.  Winsock has no ``socketpair`` for AF_UNIX either, so
-the pair is built by hand with bind/listen/connect/accept; the socket file must
-be unlinked before the path can be reused.  There is no ``SCM_RIGHTS`` or
-``SCM_CREDENTIALS``, so the peer's identity is never learned -- it does not
-need to be, because the child end is handed over as an inherited handle and
-possession of that handle is the authorization.
-
-**AF_UNIX is unreachable through CPython, so this is being replaced by pipes.**
-Measured 2026-09-13: ``socket.AF_UNIX`` is absent on every Windows interpreter
-Loki runs -- native CPython 3.12 and 3.13 and the mingw-w64 UCRT64 build, host
-and staged copy alike.  The cause is CPython's gate, not the OS:
-``Modules/socketmodule.h`` does ``#undef AF_UNIX`` whenever ``HAVE_SYS_UN_H``
-is absent, MSVC's ``pyconfig.h`` never defines it, and ``configure`` cannot
-find ``sys/un.h`` under mingw-w64 either.  The AF_UNIX branch below therefore
-cannot execute on any supported interpreter, and the transport is
-:func:`_private_pipe_pair`: two anonymous pipes, which have no name to
-enumerate, squat or confirm.  Possession of the inherited handle remains the
-authorization, exactly as for the session-lifetime channel.  The swap of
-``socket_pair`` and the transport-neutral endpoint is done; ``socket_pair``
-returns the pipe pair.
+Each Windows pipe has an explicit descriptor, independent of the creator's
+future-thread default. Authorization depends on the endpoint DACL, the exact
+inherited-handle list and protection of processes holding the handles -- not a
+promise that every Windows version implements anonymous pipes without a name.
+No additional allocation or launch protocol is involved.
 
 This module's channels are the credential and owner channels and the job
 channels.  The ACP worker's stdio is not here: it is overlapped named pipes in
@@ -154,6 +128,38 @@ def confirm_pair(first, second) -> None:
                 end.settimeout(timeout)
 
 
+def private_pipe(inherit: bool = True):
+    """Allocate a Windows pipe for explicitly inherited private IPC.
+
+    The caller owns both handles and must hand credential endpoints only to
+    owning runtimes, never ordinary tools.
+    """
+    # Use kernel-reported process identity: a workspace path, environment
+    # value or requested SID must not select who can access a credential pipe.
+    owner = windows_api.current_user_sid()
+    token = windows_api.open_process_token(
+        windows_api.current_process_handle())
+    try:
+        package = (windows_api.token_app_container_sid(token)
+                   if windows_api.token_is_app_container(token) else None)
+    finally:
+        windows_api.close_handle(token)
+    descriptor = f"D:P(A;;GA;;;{owner})(A;;GA;;;SY)(A;;GA;;;BA)"
+    if package is not None:
+        # A user-only DACL denies the contained creator's client-end reopen.
+        # FILE_GENERIC_WRITE includes READ_CONTROL/SYNCHRONIZE, but not the
+        # READ_ATTRIBUTES that open also requests. Do not add GENERIC_READ:
+        # another process in this package must not gain pipe data-read access.
+        # Keep this ACE off the token default, which also secures new threads.
+        # Tool write-open denial still requires its restricting-SID check;
+        # inherited handles bypass a new open and must be selected separately.
+        access = (windows_api.AccessMask.FILE_GENERIC_WRITE
+                  | windows_api.AccessMask.FILE_READ_ATTRIBUTES)
+        descriptor += f"(A;;0x{int(access):x};;;{package})"
+    return windows_api.create_pipe(
+        inherit=inherit, security_descriptor=descriptor)
+
+
 def eof_stdin():
     """A stdin end that is already at end of file, as a child-side object.
 
@@ -174,7 +180,7 @@ def eof_stdin():
         # CPython subprocess takes a CRT descriptor here, not a raw HANDLE.
         # Ownership transfers exactly once; subprocess duplicates the standard
         # handle for the child, so this parent copy need not be inheritable.
-        read, write = windows_api.create_pipe(inherit=False)
+        read, write = private_pipe(inherit=False)
         try:
             windows_api.close_handle(write)
         except BaseException:
@@ -200,7 +206,7 @@ def eof_stdin():
 
 
 def _private_pipe_pair():
-    """Two anonymous pipes: a named-nothing bidirectional byte channel.
+    """Two private one-way pipes forming a bidirectional byte channel.
 
     Returns ``(request, response)``, each a ``(parent, child)`` pair.  The
     request pipe carries child-to-parent bytes (``request`` is
@@ -210,17 +216,17 @@ def _private_pipe_pair():
     handle list, and the two ``parent`` handles stay here with inheritance
     cleared.
 
-    There is no name, so -- unlike the AF_UNIX emulation -- nothing else can
-    connect, squat, or win a bind/connect race, and ``confirm_pair`` is not
-    needed: the only way to hold an end is to have been handed it.
+    No connection by address is part of this handoff, so ``confirm_pair`` is
+    unnecessary. The pipe DACL and protection of handle holders must also deny
+    unauthorized access/recovery; anonymity is not that security proof.
 
     Defined outside the platform branch because it depends only on
     ``windows_api``'s import-safe declarations; calling it off Windows raises
     the same ``WindowsUnavailableError`` any other Windows call does.
     """
-    request_read, request_write = windows_api.create_pipe()
+    request_read, request_write = private_pipe()
     try:
-        response_read, response_write = windows_api.create_pipe()
+        response_read, response_write = private_pipe()
     except BaseException:
         windows_api.close_handle(request_read)
         windows_api.close_handle(request_write)
@@ -531,13 +537,13 @@ else:
         The parent keeps the write end and closes it to signal the child; the
         child reads.  Only the child's read handle stays inheritable.
         """
-        read_handle, write_handle = windows_api.create_pipe()
+        read_handle, write_handle = private_pipe()
         windows_api.clear_handle_inheritance(write_handle)
         return (PipeEndpoint(write=write_handle),
                 PipeEndpoint(read=read_handle))
 
     def socket_pair():
-        """The credential channel: two anonymous pipes, no name to race."""
+        """The credential channel: two explicitly secured one-way pipes."""
         request, response = _private_pipe_pair()
         # request is (parent_read, child_write); response is
         # (child_read, parent_write).  Each side gets one read and one write.

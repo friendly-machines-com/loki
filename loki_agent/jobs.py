@@ -495,11 +495,13 @@ class JobManager:
                 stdin, release_stdin = host_ipc.eof_stdin()
                 try:
                     if shell:
-                        # shell rejects session_owned/credential_refs above, so
-                        # spawn_command is still the original command string.
-                        proc = await asyncio.create_subprocess_shell(
-                            str(spawn_command),
-                            executable=executables.BASH,
+                        # Bash runs arbitrary tool code, so it must not inherit
+                        # owning-runtime channels (rejected above). Use exec:
+                        # Windows shell=True uses cmd.exe's /c protocol even
+                        # with an executable override. Keep the script as one
+                        # Bash -c argument rather than reinterpret its quoting.
+                        proc = await asyncio.create_subprocess_exec(
+                            executables.BASH, '-c', str(spawn_command),
                             stdin=stdin,
                             stdout=stdout_file,
                             stderr=stderr_file,

@@ -7,7 +7,7 @@ import types
 import unittest
 from unittest import mock
 
-from loki_agent import pty_backend, windows_api
+from loki_agent import host_ipc, pty_backend, windows_api
 
 
 @unittest.skipUnless(os.name == 'posix', 'POSIX PTY backend')
@@ -73,7 +73,7 @@ class PosixPtyTests(unittest.TestCase):
 class WindowsPtyTests(unittest.TestCase):
     def setUp(self):
         patcher = mock.patch.multiple(
-            windows_api, create_pipe=mock.DEFAULT, pseudoconsole_create=mock.DEFAULT,
+            windows_api, pseudoconsole_create=mock.DEFAULT,
             create_process_with_pseudoconsole=mock.DEFAULT,
             pseudoconsole_release=mock.DEFAULT, pseudoconsole_close=mock.DEFAULT,
             close_handle=mock.DEFAULT, read_file=mock.DEFAULT,
@@ -82,8 +82,11 @@ class WindowsPtyTests(unittest.TestCase):
         )
         self.api = patcher.start()
         self.addCleanup(patcher.stop)
+        pipe_patcher = mock.patch.object(host_ipc, 'private_pipe')
+        self.api['private_pipe'] = pipe_patcher.start()
+        self.addCleanup(pipe_patcher.stop)
         self.closed = []
-        self.api['create_pipe'].side_effect = [
+        self.api['private_pipe'].side_effect = [
             ['input-read', 'input-write'], ['output-read', 'output-write']]
         self.api['pseudoconsole_create'].return_value = 'conpty'
         self.api['create_process_with_pseudoconsole'].return_value = types.SimpleNamespace(
@@ -158,7 +161,7 @@ class WindowsPtyTests(unittest.TestCase):
                                  'process': 'create_process_with_pseudoconsole',
                                  'release': 'pseudoconsole_release'}[stage]
                     self.api[operation].side_effect = failure
-                self.api['create_pipe'].side_effect = pipes
+                self.api['private_pipe'].side_effect = pipes
                 self.api['wait_for_single_object'].side_effect = [
                     windows_api.WAIT_TIMEOUT, windows_api.WAIT_OBJECT_0]
                 self.api['terminate_process'].reset_mock()

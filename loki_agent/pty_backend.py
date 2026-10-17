@@ -248,16 +248,18 @@ class _WindowsPty(PtyHandle):
 
 
 def _windows_spawn(argv, cols, rows, env, cwd):
-    from . import windows_api
+    from . import host_ipc, windows_api
 
     handle = _WindowsPty(None, None, None, None)
     try:
+        # ConPTY pipes need the same pipe-only policy as inherited IPC; a
+        # thread-private token default may not admit a client-end reopen.
         # The handle owns host ends as soon as they are acquired. This stack
         # owns only the temporary ends ConPTY duplicates during creation.
         with contextlib.ExitStack() as copies:
-            input_read, handle.input_write = windows_api.create_pipe(inherit=False)
+            input_read, handle.input_write = host_ipc.private_pipe(inherit=False)
             copies.callback(windows_api.close_handle, input_read)
-            handle.output_read, output_write = windows_api.create_pipe(inherit=False)
+            handle.output_read, output_write = host_ipc.private_pipe(inherit=False)
             copies.callback(windows_api.close_handle, output_write)
             handle.hpc = windows_api.pseudoconsole_create(
                 cols, rows, input_read, output_write)

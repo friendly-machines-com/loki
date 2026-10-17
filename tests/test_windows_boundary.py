@@ -261,6 +261,16 @@ class StagedGateClosureTests(unittest.TestCase):
             "the staged gate is missing modules it imports: "
             + ", ".join(missing))
 
+    def test_local_pipe_probe_imports_are_staged(self):
+        tree = ast.parse((ROOT / 'tests' / 'test_windows_appcontainers.py').read_text())
+        probe = next(node for node in tree.body
+                     if isinstance(node, ast.FunctionDef) and node.name == 'private_pipe_child')
+        imported = {alias.name for node in ast.walk(probe)
+                    if isinstance(node, ast.ImportFrom) and node.module == 'loki_agent'
+                    for alias in node.names}
+        self.assertEqual(imported - _staged_gate_modules(), set(),
+                         'the native private-pipe probe must import its shipped implementation')
+
 
 TESTS = ROOT / "tests"
 

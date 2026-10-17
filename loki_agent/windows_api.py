@@ -16,8 +16,8 @@ Two rules keep this module safe to share rather than copied around:
   refuses that instead -- the project has already lost a debugging round to a
   symbol that could not carry two signatures.
 * **Declarations only.**  Nothing here decides what a caller should protect,
-  grant or refuse; those are security decisions that belong to the caller and
-  to the review the design document requires.
+  grant or refuse: the caller owns the resource's purpose, authority boundary
+  and lifetime, so it must choose the policy these bindings apply.
 """
 
 from __future__ import annotations
@@ -1654,28 +1654,53 @@ class SecurityAttributes(ctypes.Structure):
     ]
 
 
-def create_pipe(inherit: bool = True, size: int = 0):
+def create_pipe(inherit: bool = True, size: int = 0, *,
+                security_descriptor: str | None = None):
     """Create an anonymous pipe; return ``(read_handle, write_handle)``.
 
-    ``inherit=True`` asks for both ends to be inheritable, which is what makes
-    it possible to name one end in a child's explicit handle list.  The caller
-    clears ``HANDLE_FLAG_INHERIT`` on the end it keeps, so only the child's end
-    remains eligible to be inherited.  ``size`` of 0 lets the system choose the
-    buffer size.
+    ``inherit=True`` makes both ends eligible for the explicit child handle
+    list; the caller clears inheritance on the end it retains. ``size=0`` lets
+    Windows choose the buffer size. An explicit SDDL descriptor applies only
+    to this pipe, without changing the creator's token default. Its storage
+    stays alive until CreatePipe has created and connected both endpoints.
     """
     create = bind("kernel32", "CreatePipe", wintypes.BOOL,
                   ctypes.POINTER(ctypes.c_void_p),
                   ctypes.POINTER(ctypes.c_void_p),
                   ctypes.POINTER(SecurityAttributes), ctypes.c_uint32)
-    attributes = SecurityAttributes(
-        ctypes.sizeof(SecurityAttributes), None, 1 if inherit else 0)
-    read_handle = ctypes.c_void_p()
-    write_handle = ctypes.c_void_p()
-    if not create(ctypes.byref(read_handle), ctypes.byref(write_handle),
-                  ctypes.byref(attributes), size):
-        raise WindowsApiError("CreatePipe failed",
-                              status=ctypes.get_last_error())
-    return read_handle.value, write_handle.value
+    descriptor = ctypes.c_void_p()
+    if security_descriptor is not None:
+        convert = bind(
+            "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+        free = bind("kernel32", "LocalFree", ctypes.c_void_p,
+                    ctypes.c_void_p)
+        if not convert(security_descriptor, SDDL_REVISION_1,
+                       ctypes.byref(descriptor), None):
+            raise WindowsApiError("Cannot build the pipe security descriptor",
+                                  status=ctypes.get_last_error())
+        if not descriptor.value:
+            raise WindowsApiError("Pipe security descriptor is missing")
+    try:
+        # Conversion uses the Windows local heap, not Python-owned storage.
+        # Keep it until the whole endpoint setup returns: lpSecurityDescriptor
+        # is a borrowed pointer while CreatePipe reads these attributes.
+        attributes = SecurityAttributes(
+            ctypes.sizeof(SecurityAttributes), descriptor.value,
+            1 if inherit else 0)
+        read_handle = ctypes.c_void_p()
+        write_handle = ctypes.c_void_p()
+        if not create(ctypes.byref(read_handle), ctypes.byref(write_handle),
+                      ctypes.byref(attributes), size):
+            # The output values are indeterminate on failure, not handles we
+            # own. Capture the error before LocalFree can change last-error.
+            raise WindowsApiError("CreatePipe failed",
+                                  status=ctypes.get_last_error())
+        return read_handle.value, write_handle.value
+    finally:
+        if descriptor.value:
+            free(descriptor)
 
 
 def set_handle_information(handle, mask: int, flags: int) -> None:

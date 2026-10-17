@@ -8,6 +8,7 @@ locations are checked here too, for the same reason: which platform-specific
 location they resolve to is decided by branches that never run on this host.
 """
 
+import contextlib
 import ctypes
 import os
 import sys
@@ -679,6 +680,100 @@ class PipeDeclarationTests(unittest.TestCase):
                 windows_api.set_handle_information(
                     1, windows_api.HandleFlags.HANDLE_FLAG_INHERIT, 0)
         self.assertEqual(caught.exception.status, 6)
+
+
+class PipeSecurityTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def native(self, *, convert=True, pointer=0x5EC, create=True):
+        seen = {"calls": [], "closed": [], "error": 5}
+
+        def convert_descriptor(sddl, revision, output, size):
+            seen["calls"].append("convert")
+            seen["sddl"] = sddl
+            if convert:
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = pointer
+            return convert
+
+        def create_pipe(read, write, attributes, size):
+            seen["calls"].append("create")
+            value = ctypes.cast(
+                attributes, ctypes.POINTER(windows_api.SecurityAttributes)).contents
+            seen["descriptor"] = value.lpSecurityDescriptor
+            seen["inherit"] = value.bInheritHandle
+            seen["size"] = size
+            if isinstance(create, BaseException):
+                raise create
+            # Deliberately non-null even on failure: failed CreatePipe output
+            # slots must not be mistaken for acquired handles and closed.
+            ctypes.cast(read, ctypes.POINTER(ctypes.c_void_p))[0] = 0x11
+            ctypes.cast(write, ctypes.POINTER(ctypes.c_void_p))[0] = 0x22
+            return create
+
+        def free_descriptor(value):
+            self.assertEqual(value.value, pointer)
+            seen["calls"].append("free")
+            seen["error"] = 123  # Cleanup must not replace the operation's error.
+
+        functions = {
+            "CreatePipe": create_pipe,
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW": convert_descriptor,
+            "LocalFree": free_descriptor,
+            "CloseHandle": seen["closed"].append,
+        }
+        with mock.patch.object(windows_api, "bind",
+                               side_effect=lambda library, name, *args: functions[name]), \
+                mock.patch.object(ctypes, "get_last_error",
+                                  side_effect=lambda: seen["error"], create=True):
+            yield seen
+
+    def test_explicit_descriptor_lives_until_both_ends_are_created(self):
+        with self.native() as seen:
+            result = windows_api.create_pipe(
+                inherit=False, size=8192, security_descriptor="D:P(A;;GA;;;SY)")
+        self.assertEqual(result, (0x11, 0x22))
+        self.assertEqual(seen["sddl"], "D:P(A;;GA;;;SY)")
+        self.assertEqual(seen["descriptor"], 0x5EC)
+        self.assertEqual(seen["inherit"], 0)
+        self.assertEqual(seen["size"], 8192)
+        self.assertEqual(seen["calls"], ["convert", "create", "free"])
+        self.assertEqual(seen["closed"], [])
+
+    def test_creation_failure_releases_descriptor_not_indeterminate_outputs(self):
+        with self.native(create=False) as seen:
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                windows_api.create_pipe(security_descriptor="D:P(A;;GA;;;SY)")
+        self.assertEqual(caught.exception.status, 5)
+        self.assertEqual(seen["calls"], ["convert", "create", "free"])
+        self.assertEqual(seen["closed"], [])
+
+    def test_python_call_failure_also_releases_the_explicit_descriptor(self):
+        failure = TypeError('invalid native argument')
+        with self.native(create=failure) as seen:
+            with self.assertRaises(TypeError) as caught:
+                windows_api.create_pipe(security_descriptor="D:P(A;;GA;;;SY)")
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(seen["calls"], ["convert", "create", "free"])
+        self.assertEqual(seen["closed"], [])
+
+    def test_invalid_descriptor_never_falls_back_to_token_default(self):
+        with self.native(convert=False) as seen:
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                windows_api.create_pipe(security_descriptor="invalid")
+        self.assertEqual(caught.exception.status, 5)
+        self.assertEqual(seen["calls"], ["convert"])
+
+    def test_empty_explicit_descriptor_is_not_treated_as_an_omitted_descriptor(self):
+        with self.native(convert=False) as seen:
+            with self.assertRaises(windows_api.WindowsApiError):
+                windows_api.create_pipe(security_descriptor="")
+        self.assertEqual(seen["sddl"], "")
+        self.assertEqual(seen["calls"], ["convert"])
+
+    def test_null_converted_descriptor_is_refused(self):
+        with self.native(pointer=None) as seen:
+            with self.assertRaisesRegex(windows_api.WindowsApiError, "missing"):
+                windows_api.create_pipe(security_descriptor="D:P(A;;GA;;;SY)")
+        self.assertEqual(seen["calls"], ["convert"])
 
 
 class RangeLockDeclarationTests(unittest.TestCase):
