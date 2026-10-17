@@ -1,5 +1,7 @@
 """Portable startup-gate tests; native launch still needs Windows validation."""
 
+import asyncio
+from contextlib import ExitStack, contextmanager
 import ctypes
 import os
 import shutil
@@ -414,6 +416,109 @@ class LaunchTests(unittest.TestCase):
 
     def test_piped_child_receives_caller_handles_and_duplicated_stderr(self):
         self.exercise_stdio()
+
+
+class LocalLaunchTests(unittest.TestCase):
+    @contextmanager
+    def calls(self, owning, mismatch=False):
+        original, compatible = b'original-acl', b'compatible-acl'
+        info = api.ProcessInformation(101, 102, 103, 104)
+        seen = {'sets': [], 'closed': []}
+        values = {
+            'current_process_handle': lambda: 99,
+            'open_process_token': mock.Mock(side_effect=[44, 55, 66]),
+            'current_user_sid': lambda: 'S-1-5-21-1',
+            'token_is_app_container': lambda token: not (mismatch and token == 66),
+            'token_app_container_sid': lambda token: 'S-1-15-2-1',
+            'token_integrity_level': lambda token: 'S-1-16-4096',
+            'token_restricting_sids': lambda token: [['S-1-5-21-2', 0]],
+            'token_default_dacl': lambda token: original if token == 44 or (token == 66 and owning) else compatible,
+            'duplicate_primary_token': lambda *args: 77,
+            'acl_sddl': lambda acl: 'D:existing-grants',
+            'set_token_default_dacl': lambda *args: seen['sets'].append(list(args)),
+            'close_handle': seen['closed'].append,
+            'create_process_suspended': mock.Mock(return_value=info),
+            'resume_thread': mock.Mock(),
+        }
+        with ExitStack() as cleanup:
+            cleanup.enter_context(mock.patch.object(runtime.os, 'getcwd', return_value='/trusted'))
+            for name, function in values.items():
+                cleanup.enter_context(mock.patch.object(api, name, side_effect=function))
+            seen['create'] = api.create_process_suspended
+            seen['resume'] = api.resume_thread
+            yield seen
+
+    def test_roles_preserve_cwd_image_restrictions_and_parent_default(self):
+        for owning in [True, False]:
+            with self.subTest(owning=owning), self.calls(owning) as seen:
+                process = runtime.ContainedProcess(None)
+                cwd = '/trusted' if owning else '/workspace'
+                runtime.prepare_local(process, ['/chosen/image.exe', '--subagent'], {'SAFE': 'yes'},
+                                      cwd, [21, 22, 23, 31], [21, 22, 23], owning=owning)
+                self.assertEqual(process.pid, 103)
+                call = seen['create'].call_args
+                self.assertEqual(list(call.args), ['/chosen/image.exe', ['--subagent']])
+                self.assertEqual(call.kwargs['current_directory'], cwd)
+                self.assertEqual(call.kwargs['primary_token'], 77)
+                self.assertFalse(call.kwargs['search_path'])
+                self.assertEqual(call.kwargs['inherited_handles'], [21, 22, 23, 31])
+                self.assertEqual(seen['sets'][0], [77, 'D:existing-grants(A;;GA;;;S-1-15-2-1)'])
+                self.assertEqual(seen['sets'][1:], [[66, b'original-acl']] if owning else [])
+                self.assertNotIn(44, [entry[0] for entry in seen['sets']])
+                self.assertCountEqual(seen['closed'], [44, 55, 66, 77])
+                seen['resume'].assert_not_called()
+
+    def test_generic_role_policy_does_not_replace_the_callers_explicit_directory(self):
+        # Loki's trusted call site supplies its process cwd. This generic layer
+        # must forward that value, not derive another directory from the role.
+        with self.calls(True) as seen:
+            runtime.prepare_local(runtime.ContainedProcess(None), ['/chosen/loki.exe'], {},
+                                  '/explicit-trusted-directory', [], [1, 2, 3], owning=True)
+            self.assertEqual(seen['create'].call_args.kwargs['current_directory'], '/explicit-trusted-directory')
+
+    def test_identity_failure_retains_the_suspended_child_for_async_retirement(self):
+        with self.calls(True, mismatch=True) as seen:
+            process = runtime.ContainedProcess(None)
+            with self.assertRaises(api.WindowsApiError):
+                runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], [1, 2, 3], owning=True)
+            self.assertEqual(process.information.hProcess, 101)
+            self.assertNotIn(101, seen['closed'])
+            self.assertNotIn(102, seen['closed'])
+            seen['resume'].assert_not_called()
+
+    def test_only_bare_external_commands_use_windows_command_lookup(self):
+        with self.calls(False) as seen:
+            runtime.prepare_local(runtime.ContainedProcess(None), ['cmd.exe', '/c', 'exit'], {},
+                                  '/workspace', [], [1, 2, 3], owning=False)
+            self.assertTrue(seen['create'].call_args.kwargs['search_path'])
+
+
+class LocalRetirementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_cancellation_joins_exit_before_closing_handles(self):
+        entered, exited = asyncio.Event(), asyncio.Event()
+        events = []
+        process = mock.Mock(information=object())
+
+        async def wait():
+            entered.set()
+            await exited.wait()
+            events.append('exit')
+            return 1
+
+        process.wait = wait
+        process.terminate.side_effect = lambda: events.append('terminate')
+        process.close.side_effect = lambda: events.append('close')
+        task = asyncio.create_task(runtime.retire_local(process))
+        await entered.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertEqual(events, ['terminate'])
+        exited.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(events, ['terminate', 'exit', 'close'])
 
 
 @unittest.skipUnless(sys.platform == "win32",

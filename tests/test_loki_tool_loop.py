@@ -3433,7 +3433,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             outcomes, originals, expected_replay, expected_terminal = {}, {}, [], []
             diagnostics = io.StringIO()
             real_dispatch = loki.dispatch_tool_async
-            real_spawn = asyncio.create_subprocess_exec
+            real_spawn = job_runtime.host_process.create_exec
             phase = {}
             source_key = file_operations.observation_key(str(source))
 
@@ -3659,7 +3659,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()), \
                     mock.patch.object(loki, 'file_state', {}), \
                     mock.patch.object(loki, 'dispatch_tool_async', new=dispatch), \
-                    mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn), \
+                    mock.patch.object(job_runtime.host_process, 'create_exec', new=spawn), \
                     mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
                     mock.patch.object(http_client, 'async_http_request', new=request), \
                     contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
@@ -5271,35 +5271,31 @@ class SubagentLaunchTests(unittest.TestCase):
     def test_subagent_launch_reuses_its_own_dispatcher(self):
         saved = save_loki_state(["subagent_depth"])
         old_argv = sys.argv[:]
+        cases = [
+            ['posix', False, './loki.py', ['./loki.py']],
+            ['posix', False, './loki-acp', ['./loki-acp']],
+            ['nt', False, './loki.py', [sys.executable, './loki.py']],
+            ['nt', False, './loki-acp', [sys.executable, './loki-acp']],
+            ['nt', False, 'C:/built/loki-acp.exe', ['C:/built/loki-acp.exe']],
+            ['nt', True, 'C:/built/loki.exe', ['C:/built/loki.exe']],
+        ]
         try:
-            results = []
             for depth in [0, 2]:
                 loki.current_session().subagent_depth = depth
-                for parent_entrypoint in ["./loki.py", "./loki-acp"]:
-                    sys.argv = [parent_entrypoint]
-                    results.append((
-                        depth,
-                        parent_entrypoint,
-                        loki._subagent_argv("Explore", "inspect this"),
-                    ))
+                for platform, frozen, selected, prefix in cases:
+                    sys.argv = [selected]
+                    with self.subTest(depth=depth, platform=platform, frozen=frozen, selected=selected), \
+                            mock.patch.object(os, 'name', platform), \
+                            mock.patch.object(sys, 'frozen', frozen, create=True):
+                        result = loki._subagent_argv('Explore', 'inspect this')
+                    self.assertEqual(result, [
+                        *prefix, '--subagent', 'Explore', '--subagent-depth', str(depth + 1),
+                        '--root-conversation-id', loki.current_session().root_conversation_id,
+                        '--prompt', 'inspect this', '--shell-cwd', loki.current_cwd(),
+                    ])
         finally:
             sys.argv = old_argv
             restore_loki_state(saved)
-
-        for depth, parent_entrypoint, result in results:
-            self.assertEqual(result, [
-                parent_entrypoint,
-                "--subagent",
-                "Explore",
-                "--subagent-depth",
-                str(depth + 1),
-                "--root-conversation-id",
-                loki.current_session().root_conversation_id,
-                "--prompt",
-                "inspect this",
-                "--shell-cwd",
-                loki.current_cwd(),
-            ])
 
     def test_both_entrypoints_can_run_real_subagent(self):
         saved = save_loki_state([
@@ -5350,9 +5346,9 @@ class SubagentLaunchTests(unittest.TestCase):
             )
             configure_container(env, workspace)
             result = subprocess.run(
-                [entrypoint("loki"), "--headless", "--prompt",
-                 "inspect this"],
-                cwd=workspace, env=env, capture_output=True, text=True)
+                [entrypoint("loki"), "--headless", "--shell-cwd", workspace,
+                 "--prompt", "inspect this"],
+                cwd=os.getcwd(), env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("ok", result.stdout)
             self.assertNotIn("Error:", result.stdout)

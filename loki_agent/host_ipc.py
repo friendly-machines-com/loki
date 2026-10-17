@@ -128,11 +128,12 @@ def confirm_pair(first, second) -> None:
                 end.settimeout(timeout)
 
 
-def private_pipe(inherit: bool = True):
-    """Allocate a Windows pipe for explicitly inherited private IPC.
+def pipe_policy(*, duplex=False):
+    """Object-local policy and kernel identity for local pipe allocation.
 
-    The caller owns both handles and must hand credential endpoints only to
-    owning runtimes, never ordinary tools.
+    Duplex subprocess stdin is deliberately tool-facing: its asynchronous
+    writer needs read access to observe peer closure. Confidential credential
+    and owner channels use separate one-way pipes and never request that grant.
     """
     # Use kernel-reported process identity: a workspace path, environment
     # value or requested SID must not select who can access a credential pipe.
@@ -148,16 +149,23 @@ def private_pipe(inherit: bool = True):
     if package is not None:
         # A user-only DACL denies the contained creator's client-end reopen.
         # FILE_GENERIC_WRITE includes READ_CONTROL/SYNCHRONIZE, but not the
-        # READ_ATTRIBUTES that open also requests. Do not add GENERIC_READ:
-        # another process in this package must not gain pipe data-read access.
+        # READ_ATTRIBUTES that open also requests. One-way confidential pipes
+        # must not grant package data reads; only tool-facing duplex stdio does.
         # Keep this ACE off the token default, which also secures new threads.
         # Tool write-open denial still requires its restricting-SID check;
         # inherited handles bypass a new open and must be selected separately.
         access = (windows_api.AccessMask.FILE_GENERIC_WRITE
                   | windows_api.AccessMask.FILE_READ_ATTRIBUTES)
+        if duplex:
+            access |= windows_api.AccessMask.FILE_GENERIC_READ
         descriptor += f"(A;;0x{int(access):x};;;{package})"
+    return {'descriptor': descriptor, 'package': package}
+
+
+def private_pipe(inherit: bool = True):
+    """Allocate one-way private IPC; only owning runtimes get credential ends."""
     return windows_api.create_pipe(
-        inherit=inherit, security_descriptor=descriptor)
+        inherit=inherit, security_descriptor=pipe_policy()['descriptor'])
 
 
 def eof_stdin():

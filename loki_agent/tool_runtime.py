@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import process_outputs
+from . import process_outputs, host_process
 
 
 class ToolSchemaError(ValueError):
@@ -792,9 +792,13 @@ def _hook_environment(environ=None):
         "HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "SHELL",
         "TEMP", "TERM", "TMP", "TMPDIR", "USER",
     }
+    if os.name == 'nt':
+        # Winsock provider loading expands SYSTEMROOT even for an ordinary
+        # Python hook importing asyncio. This OS path is not credential state.
+        allowed.add('SYSTEMROOT')
     return {
         key: value for key, value in source_environ.items()
-        if key in allowed or key.startswith("LC_")
+        if (key.upper() if os.name == 'nt' else key) in allowed or key.startswith("LC_")
     }
 
 
@@ -812,8 +816,9 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
         raise HookExecutionError(
             f"hook input is not JSON-compatible: {error}") from error
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await host_process.create_exec(
             *command,
+            owning=False,
             cwd=cwd,
             env=_hook_environment(),
             stdin=asyncio.subprocess.PIPE,

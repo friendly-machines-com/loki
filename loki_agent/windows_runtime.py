@@ -9,7 +9,7 @@ preconditions, not arbitrary escape routes or future ACL changes.
 
 import asyncio
 import ctypes
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import logging
 import os
 import sys
@@ -301,12 +301,17 @@ def _checked(result, operation):
 
 
 class ContainedProcess:
-    """Own the native process and job handles until the supervisor closes them."""
+    """Own a native child and, for supervised runtimes, its lifetime job.
 
-    def __init__(self, information, job):
+    Local launches retain the existing enclosing job rather than introducing a
+    second descendant lifecycle. Their root handles release after exit; runtime
+    supervisors/worker transports retain job ownership until explicit close.
+    """
+
+    def __init__(self, information, job=None):
         self.information = information
         self.job = job
-        self.pid = information.dwProcessId
+        self.pid = information.dwProcessId if information is not None else None
         self.returncode = None
 
     async def wait(self):
@@ -325,20 +330,143 @@ class ContainedProcess:
                 await asyncio.sleep(0.02)
             else:
                 raise api.WindowsApiError(f"WaitForSingleObject: {result}")
+        if self.job is None:
+            self.close()
         return self.returncode
 
     def terminate(self):
-        terminate = api.bind("kernel32", "TerminateJobObject", wintypes.BOOL,
-                             ctypes.c_void_p, wintypes.UINT)
-        _checked(terminate(self.job, 1), "TerminateJobObject")
+        if self.job is not None:
+            terminate = api.bind("kernel32", "TerminateJobObject", wintypes.BOOL,
+                                 ctypes.c_void_p, wintypes.UINT)
+            _checked(terminate(self.job, 1), "TerminateJobObject")
+        elif self.information is not None and self.information.hProcess:
+            try:
+                api.terminate_process(self.information.hProcess)
+            except api.WindowsApiError as error:
+                status = error.status or ctypes.get_last_error()
+                if api.wait_for_single_object(self.information.hProcess, 0) == 0:
+                    raise ProcessLookupError('child has exited') from error
+                raise OSError(None, str(error), None, status) from error
+        elif self.returncode is not None:
+            raise ProcessLookupError('child has exited')
 
     kill = terminate
 
     def close(self):
-        # Closing the job also kills descendants left after the root exits.
-        api.close_handle(self.job)
-        api.close_handle(self.information.hThread)
-        api.close_handle(self.information.hProcess)
+        # A local job retains the runtime's existing enclosing job. Closing a
+        # root handle must not kill descendants on normal foreground completion.
+        # Supervisor-owned jobs retain their existing kill-on-close lifetime.
+        if self.job is not None:
+            api.close_handle(self.job)
+            self.job = None
+        if self.information is not None:
+            for field in ['hThread', 'hProcess']:
+                handle = getattr(self.information, field)
+                if handle:
+                    api.close_handle(handle)
+                    setattr(self.information, field, None)
+
+
+def duplicate_standard_handle(value, fd):
+    """Lend an inheritable stdio copy without changing a borrowed CRT handle."""
+    import msvcrt
+    source = fd if value is None else value if isinstance(value, int) else value.fileno()
+    duplicate = api.bind('kernel32', 'DuplicateHandle', wintypes.BOOL,
+                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                         ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD,
+                         wintypes.BOOL, wintypes.DWORD)
+    process = api.current_process_handle()
+    result = ctypes.c_void_p()
+    _checked(duplicate(process, msvcrt.get_osfhandle(source), process,
+                       ctypes.byref(result), 0, True, 2), 'DuplicateHandle')
+    return result.value
+
+
+def prepare_local(process, command, environment, current_directory, handles, standard_handles, *,
+                  owning, creationflags=0):
+    """Prepare an existing local child owner; never infer cwd or role from argv.
+
+    Owning children retain the parent's future-object policy exactly. Ordinary
+    children need a compatible creation default for their own libraries' pipes.
+    Neither path adds/removes token restrictions or changes the live parent's
+    default. Restricted-tool ACL adoption remains a separate policy change.
+    """
+    if creationflags & ~int(api.CreateProcessFlags.CREATE_NEW_PROCESS_GROUP):
+        raise ValueError('unsupported local process creation flags')
+    with ExitStack() as cleanup:
+        source = api.open_process_token(api.current_process_handle(), api.TokenAccess.TOKEN_QUERY)
+        cleanup.callback(api.close_handle, source)
+        contained = api.token_is_app_container(source)
+        package = api.token_app_container_sid(source) if contained else None
+        restricting = api.token_restricting_sids(source)
+        integrity = api.token_integrity_level(source)
+        original = api.token_default_dacl(source)
+        primary = None
+        expected_default = original
+        owner = api.current_user_sid()
+        security = f'D:P(A;;GA;;;{owner})(A;;GA;;;SY)(A;;GA;;;BA)'
+        if contained:
+            if original is None:
+                raise api.WindowsApiError('the parent token has no creation ACL')
+            duplicate_source = api.open_process_token(api.current_process_handle(), api.TokenAccess.TOKEN_DUPLICATE)
+            cleanup.callback(api.close_handle, duplicate_source)
+            primary = api.duplicate_primary_token(
+                duplicate_source, api.TokenAccess.TOKEN_ASSIGN_PRIMARY | api.TokenAccess.TOKEN_DUPLICATE |
+                api.TokenAccess.TOKEN_QUERY | api.TokenAccess.TOKEN_ADJUST_DEFAULT)
+            cleanup.callback(api.close_handle, primary)
+            # Preserve existing role/logon/deny entries. Only this copy gets a
+            # package grant so the new token object can be opened by its child.
+            api.set_token_default_dacl(primary, api.acl_sddl(original) + f'(A;;GA;;;{package})')
+            if not owning:
+                expected_default = api.token_default_dacl(primary)
+        process.information = api.create_process_suspended(
+            command[0], command[1:], current_directory=current_directory,
+            inherited_handles=handles, environment=environment, standard_handles=standard_handles,
+            primary_token=primary, object_security=security, creationflags=creationflags,
+            # This is ordinary external-command lookup, from the creator's
+            # actual cwd. Loki entrypoints must keep their selected image.
+            search_path=not owning and not os.path.dirname(command[0]))
+        process.pid = process.information.dwProcessId
+        rights = api.TokenAccess.TOKEN_QUERY
+        if contained and owning:
+            rights |= api.TokenAccess.TOKEN_ADJUST_DEFAULT
+        child = api.open_process_token(process.information.hProcess, rights)
+        cleanup.callback(api.close_handle, child)
+        if (api.token_is_app_container(child) != contained or
+                (contained and api.token_app_container_sid(child) != package) or
+                api.token_integrity_level(child) != integrity or
+                api.token_restricting_sids(child) != restricting):
+            raise api.WindowsApiError('suspended child identity mismatch')
+        if contained and owning:
+            api.set_token_default_dacl(child, original)
+        if api.token_default_dacl(child) != expected_default or api.token_default_dacl(source) != original:
+            raise api.WindowsApiError('suspended child creation ACL mismatch')
+
+
+async def retire_local(process):
+    """Join unpublished-child teardown; JobManager cannot own it before return."""
+    if process.information is None:
+        return
+
+    async def finish():
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        process.close()
+
+    task = asyncio.create_task(finish())
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+        task.result()
+        raise
 
 
 def launch(executable, arguments, environment, workspace, inherited_handles,

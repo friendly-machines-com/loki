@@ -495,6 +495,13 @@ class ExternalHookTests(unittest.TestCase):
         self.assertEqual(outcome.content, "real result")
         self.assertEqual(invocation.notes, ["post note"])
 
+    def test_windows_hook_bootstrap_path_does_not_expand_the_credential_environment(self):
+        environment = {'SystemRoot': 'C:/Windows', 'PATH': 'tools', 'TEMP': 'scratch',
+                       'LOKI_API_KEY': 'secret', 'OPENAI_API_KEY': 'secret', 'LOCALAPPDATA': 'private'}
+        with mock.patch.object(os, 'name', 'nt'):
+            result = tool_runtime._hook_environment(environment)
+        self.assertEqual(result, {'SystemRoot': 'C:/Windows', 'PATH': 'tools', 'TEMP': 'scratch'})
+
     def test_pre_hook_timeout_denies_without_tool_execution(self):
         script = "import time; time.sleep(1)"
         with tempfile.TemporaryDirectory() as directory:
@@ -560,7 +567,7 @@ class ExternalHookTests(unittest.TestCase):
             loop.set_exception_handler(lambda _loop, context: errors.append(context))
             started = asyncio.Event()
             processes = []
-            spawn = asyncio.create_subprocess_exec
+            spawn = tool_runtime.host_process.create_exec
 
             async def observed(*arguments, **options):
                 process = await spawn(*arguments, **options)
@@ -570,7 +577,7 @@ class ExternalHookTests(unittest.TestCase):
 
             operation = None
             try:
-                with mock.patch.object(asyncio, 'create_subprocess_exec', new=observed):
+                with mock.patch.object(tool_runtime.host_process, 'create_exec', new=observed):
                     operation = asyncio.create_task(tool_runtime._run_hook_command(
                         [sys.executable, '-c', 'import time; time.sleep(60)'],
                         {'large': 'x' * 2_000_000}, directory, None))
@@ -873,8 +880,8 @@ class TurnEndHookTests(unittest.TestCase):
     def test_no_hooks_do_not_start_subprocess_or_build_payload(self):
         with mock.patch.object(loki, "TOOL_HOOK_PIPELINE",
                                tool_runtime.ToolHookPipeline()):
-            with mock.patch.object(tool_runtime.asyncio,
-                                   "create_subprocess_exec") as spawn:
+            with mock.patch.object(tool_runtime.host_process,
+                                   "create_exec") as spawn:
                 asyncio.run(loki.run_turn_end_hooks_async([], "hello"))
                 spawn.assert_not_called()
 

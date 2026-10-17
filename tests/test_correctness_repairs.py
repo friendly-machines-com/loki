@@ -253,8 +253,8 @@ class JobOwnershipContractTests(unittest.TestCase):
         async def scenario(tmpdir):
             manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             with mock.patch.object(
-                    loki.asyncio,
-                    "create_subprocess_exec",
+                    job_runtime.host_process,
+                    "create_exec",
                     new=mock.AsyncMock(
                         side_effect=OSError("spawn failed")),
             ):
@@ -463,6 +463,41 @@ class JobOwnershipContractTests(unittest.TestCase):
             with self.subTest(cancel=simultaneous_cancel), tempfile.TemporaryDirectory() as tmpdir:
                 asyncio.run(scenario(tmpdir, simultaneous_cancel))
 
+    def test_launch_role_comes_from_trusted_subagent_kind_not_argv_or_lifetime(self):
+        async def scenario(root):
+            manager = job_runtime.JobManager(os.path.join(root, 'jobs'))
+            calls = []
+
+            class Child:
+                pid = 999999
+                returncode = 0
+
+                async def wait(self):
+                    return 0
+
+            async def create(*command, **kwargs):
+                kwargs['before_resume']()
+                calls.append([list(command), kwargs['owning'], kwargs['cwd']])
+                return Child()
+
+            with mock.patch.object(job_runtime.host_process, 'create_exec', side_effect=create), \
+                    mock.patch.object(job_runtime.host_process, 'process_group', return_value=999999), \
+                    mock.patch.object(job_runtime.host_process, 'group_exists', return_value=False):
+                await manager.run_background_exec(['selected-loki', '--subagent'], cwd=os.getcwd(),
+                                                  session_owned=True, subagent=True)
+                await manager.run_background_exec(['selected-tool', '--subagent'], cwd=root)
+                await manager.run_background_exec(['selected-tool'], cwd=root, session_owned=True)
+                with self.assertRaises(ValueError):
+                    await manager.run_background_exec(['selected-tool'], credential_refs=frozenset(),
+                                                      credential_authority=object())
+                await manager.aclose()
+            return calls
+
+        with tempfile.TemporaryDirectory() as root:
+            calls = asyncio.run(scenario(root))
+            self.assertEqual([call[1] for call in calls], [True, False, False])
+            self.assertEqual([call[2] for call in calls], [os.getcwd(), root, root])
+
     def test_failed_credential_relay_setup_closes_its_ends(self):
         async def scenario(tmpdir):
             manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
@@ -489,6 +524,7 @@ class JobOwnershipContractTests(unittest.TestCase):
                         [sys.executable, "-c", "pass"],
                         cwd=tmpdir,
                         session_owned=True,
+                        subagent=True,
                         credential_refs=frozenset(),
                         credential_authority=authority,
                     )
@@ -806,7 +842,7 @@ class JobOwnershipContractTests(unittest.TestCase):
         async def scenario(tmpdir):
             manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
             with mock.patch.object(
-                    asyncio, "create_subprocess_exec",
+                    job_runtime.host_process, "create_exec",
                     side_effect=FileNotFoundError("no such program")), \
                     mock.patch.object(
                         manager, "_write_metadata",
@@ -829,20 +865,22 @@ class JobOwnershipContractTests(unittest.TestCase):
             session.job_manager = manager
             worker = Worker(session, lambda message: None, "session")
             entered, release = asyncio.Event(), asyncio.Event()
-            real = asyncio.create_subprocess_exec
+            real = job_runtime.host_process.create_exec
             resources = []
             tasks_before = asyncio.all_tasks()
 
             async def delayed(*args, **kwargs):
-                entered.set()
-                await release.wait()
                 process = await real(*args, **kwargs)
                 resources.append(ProcessResources(process))
+                # Hold the successful launch before JobManager can publish it.
+                # Native pre-resume revocation is covered at the lower seam too.
+                entered.set()
+                await release.wait()
                 return process
 
             task = None
             try:
-                with mock.patch.object(asyncio, "create_subprocess_exec", new=delayed):
+                with mock.patch.object(job_runtime.host_process, "create_exec", new=delayed):
                     task = asyncio.create_task(manager.run_background_exec(
                         [sys.executable, "-c", "import time; time.sleep(60)"],
                         cwd=tmpdir, session_owned=True, subagent=True))

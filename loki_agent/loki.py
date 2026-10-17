@@ -2200,8 +2200,16 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
     if depth >= tool_contracts.MAX_SUBAGENT_DEPTH:
         raise ValueError(
             f"maximum subagent depth reached ({tool_contracts.MAX_SUBAGENT_DEPTH})")
+    command = [sys.argv[0]]
+    if (os.name == 'nt' and not getattr(sys, 'frozen', False)
+            and not sys.argv[0].lower().endswith('.exe')):
+        # CreateProcess cannot execute a Python source dispatcher directly.
+        # An explicitly selected built dispatcher remains its own image, even
+        # when its caller is source Python. Source dispatchers use this running
+        # interpreter, never a PATH-selected Python or a different frontend.
+        command.insert(0, sys.executable)
     return [
-        sys.argv[0],
+        *command,
         '--subagent',
         agent_type,
         '--subagent-depth',

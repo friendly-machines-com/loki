@@ -363,6 +363,74 @@ class TokenCreationTests(unittest.TestCase):
                 self.assertEqual(events.count('free'), 0 if failure == 'convert' else 1)
 
 
+class TokenAclHelpersTests(unittest.TestCase):
+    def test_raw_default_restore_copies_the_saved_acl_without_a_text_roundtrip(self):
+        saved = b'\x02\x00\x08\x00\x00\x00\x00\x00'
+        seen = []
+
+        def set_info(token, kind, pointer, size):
+            acl = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0]
+            seen.append([token, kind, ctypes.string_at(acl, len(saved)), size])
+            return True
+
+        with mock.patch.object(windows_api, 'bind', return_value=set_info):
+            windows_api.set_token_default_dacl(42, saved)
+            with self.assertRaises(ValueError):
+                windows_api.set_token_default_dacl(42, b'broken')
+        self.assertEqual(seen, [[42, windows_api.TOKEN_DEFAULT_DACL_CLASS, saved, ctypes.sizeof(ctypes.c_void_p)]])
+
+    def test_acl_conversion_keeps_its_backing_storage_alive(self):
+        saved = b'\x02\x00\x08\x00\x00\x00\x00\x00'
+
+        def set_dacl(descriptor, present, acl, defaulted):
+            self.assertTrue(present)
+            value = ctypes.cast(descriptor, ctypes.POINTER(windows_api._SecurityDescriptor)).contents
+            value.dacl = ctypes.cast(acl, ctypes.c_void_p).value
+            return True
+
+        def render(descriptor, sections):
+            value = ctypes.cast(descriptor, ctypes.POINTER(windows_api._SecurityDescriptor)).contents
+            self.assertEqual(ctypes.string_at(value.dacl, 8), saved)
+            return 'D:preserved'
+
+        calls = {'InitializeSecurityDescriptor': lambda *args: True, 'SetSecurityDescriptorDacl': set_dacl}
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: calls[symbol]), \
+                mock.patch.object(windows_api, '_sddl_from_descriptor', side_effect=render):
+            self.assertEqual(windows_api.acl_sddl(saved), 'D:preserved')
+        self.assertEqual(ctypes.sizeof(windows_api._SecurityDescriptor), 5 * ctypes.sizeof(ctypes.c_void_p))
+
+    def test_restriction_readback_preserves_attributes_and_all_entries(self):
+        size = windows_api._TokenGroups.first.offset + 2 * ctypes.sizeof(windows_api._SidAttributes)
+
+        def query(token, kind, buffer, length, returned):
+            self.assertEqual(kind, windows_api.TOKEN_RESTRICTED_SIDS_CLASS)
+            ctypes.cast(returned, ctypes.POINTER(wintypes.DWORD))[0] = size
+            if buffer is None:
+                return False
+            ctypes.c_uint32.from_buffer(buffer).value = 2
+            for index, sid in enumerate([202, 101]):
+                entry = windows_api._SidAttributes.from_buffer(buffer, windows_api._TokenGroups.first.offset + index * ctypes.sizeof(windows_api._SidAttributes))
+                entry.sid, entry.attributes = sid, index
+            return True
+
+        with mock.patch.object(windows_api, '_get_token_information', return_value=query), \
+                mock.patch.object(windows_api, 'sid_text', side_effect=lambda sid: str(sid)):
+            self.assertEqual(windows_api.token_restricting_sids(42), [['101', 1], ['202', 0]])
+
+    def test_generic_call_keeps_command_cwd_group_and_suspension_separate(self):
+        create = mock.Mock(return_value=True)
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, name, *args: create if name == 'CreateProcessW' else mock.Mock()):
+            windows_api.create_process_suspended(
+                'cmd.exe', ['/c', 'exit'], current_directory='workspace', search_path=True,
+                creationflags=windows_api.CreateProcessFlags.CREATE_NEW_PROCESS_GROUP)
+        call = create.call_args.args
+        self.assertIsNone(call[0])
+        self.assertEqual(call[1].value, 'cmd.exe /c exit')
+        self.assertEqual(call[7], 'workspace')
+        self.assertTrue(call[5] & windows_api.CreateProcessFlags.CREATE_SUSPENDED)
+        self.assertTrue(call[5] & windows_api.CreateProcessFlags.CREATE_NEW_PROCESS_GROUP)
+
+
 class OwningCreationTests(unittest.TestCase):
     @contextlib.contextmanager
     def native_calls(self, *, fail=None):

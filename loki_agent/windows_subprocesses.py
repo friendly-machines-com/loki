@@ -1,5 +1,5 @@
 # pytype: skip-file
-"""Contained worker processes over overlapped named pipes.
+"""Windows worker and local tool processes with native creation and async stdio.
 
 The stream and orchestration layer below is copied from CPython 3.14.7 --
 ``Lib/asyncio/base_subprocess.py``, ``Lib/asyncio/subprocess.py``,
@@ -9,15 +9,16 @@ public asyncio plus its own Win32 bindings instead of private asyncio
 internals.  CPython is distributed under the PSF licence; the copied code
 keeps its structure and comments.  Intentional differences:
 
-* ``pipe`` names the pipe with ``os.urandom`` and retries, passes an explicit
-  security descriptor (SYSTEM and the current user only) and sets
-  ``PIPE_REJECT_REMOTE_CLIENTS``.  The reference implementation passes NULL
-  security attributes, whose default DACL grants Everyone read access.
+* ``pipe`` uses random names, explicit endpoint-specific security and
+  ``PIPE_REJECT_REMOTE_CLIENTS``. Contained creators use the LOCAL namespace;
+  their package receives only the access needed to connect this stdio pair.
+  Confidential owner/credential channels remain separate one-way allocations.
 * The client calls ``ConnectNamedPipe`` expecting ``ERROR_PIPE_CONNECTED``:
   both ends are created and connected here, in this process, so no wait for a
   connection is needed.
-* ``_start`` runs Loki's contained launcher (AppContainer, token check, job)
-  instead of ``windows_utils.Popen``; child ends cross as native handles.
+* ACP startup uses Loki's contained launcher; local jobs/hooks instead use
+  the caller-selected image, cwd and role. Local children remain suspended
+  through stream attachment and the owner's final pre-resume check.
 * Exit is observed by waiting on the process through Loki's own non-blocking
   wait, not by registering the handle with the loop's completion port.
 * ``_process_exited`` wakes ``_wait`` waiters immediately (the 3.13+ behavior),
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+from contextlib import ExitStack
 import ctypes
 import subprocess
 import sys
@@ -36,7 +38,7 @@ import warnings
 from ctypes import wintypes
 
 from . import windows_api as api
-from . import windows_runtime
+from . import windows_runtime, host_ipc
 
 PIPE = subprocess.PIPE
 
@@ -47,7 +49,7 @@ PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
 ERROR_PIPE_BUSY = 231
 ERROR_PIPE_CONNECTED = 535
 ERROR_ACCESS_DENIED = 5
-INVALID_HANDLE_VALUE = -1
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 BUFSIZE = 8192
 _MAX_NAME_ATTEMPTS = 20
 
@@ -89,16 +91,19 @@ def pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
     # child's inherited handle reaches the child.  The DACL nevertheless keeps
     # the default one -- which grants Everyone read -- from applying while the
     # name is briefly visible in the namespace.
-    sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{api.current_user_sid()})"
+    policy = host_ipc.pipe_policy(duplex=duplex)
     descriptor = ctypes.c_void_p()
-    if not convert(sddl, 1, ctypes.byref(descriptor), None):
+    if not convert(policy['descriptor'], 1, ctypes.byref(descriptor), None):
         raise api.WindowsApiError("cannot build the worker pipe descriptor")
     server = client = None
     try:
         attributes = api.SecurityAttributes(
             ctypes.sizeof(api.SecurityAttributes), descriptor.value, 0)
         for attempt in range(_MAX_NAME_ATTEMPTS):
-            address = r"\\.\pipe\loki-worker-" + uuid.uuid4().hex
+            # Contained creators need the LOCAL pipe namespace. The ACP front
+            # remains uncontained; its existing child-handle protocol is intact.
+            prefix = r"\\.\pipe\LOCAL" if policy['package'] is not None else r"\\.\pipe"
+            address = prefix + "\\" + "loki-worker-" + uuid.uuid4().hex
             handle = create_pipe(address, openmode, PIPE_WAIT
                                  | PIPE_REJECT_REMOTE_CLIENTS, 1, obsize,
                                  ibsize, 0, ctypes.byref(attributes))
@@ -290,16 +295,21 @@ class BaseSubprocessTransport(asyncio.SubprocessTransport):
         if stderr == PIPE:
             self._pipes[2] = None
 
+        self._connect_task = None
         try:
             self._start(args=args, shell=shell, stdin=stdin, stdout=stdout,
                         stderr=stderr, bufsize=bufsize, **kwargs)
+            self._pid = self._proc.pid
+            self._extra['subprocess'] = self._proc
+            self._connect_task = self._loop.create_task(self._connect_pipes(waiter))
         except BaseException:
-            self.close()
+            with ExitStack() as cleanup:
+                if self._proc is not None:
+                    for raw in [self._proc.stdin, self._proc.stdout, self._proc.stderr]:
+                        if raw is not None:
+                            cleanup.callback(raw.close)
+                self.close()
             raise
-
-        self._pid = self._proc.pid
-        self._extra['subprocess'] = self._proc
-        self._connect_task = self._loop.create_task(self._connect_pipes(waiter))
 
     def _start(self, args, shell, stdin, stdout, stderr, bufsize, **kwargs):
         raise NotImplementedError
@@ -502,7 +512,7 @@ class SubprocessStreamProtocol(FlowControlMixin, asyncio.SubprocessProtocol):
                                               loop=self._loop)
 
     def pipe_data_received(self, fd, data):
-        reader = self.stdout if fd == 1 else None
+        reader = self.stdout if fd == 1 else self.stderr if fd == 2 else None
         if reader is not None:
             reader.feed_data(data)
 
@@ -520,7 +530,7 @@ class SubprocessStreamProtocol(FlowControlMixin, asyncio.SubprocessProtocol):
                     # the traceback when it is not awaited.
                     self._stdin_closed._log_traceback = False
             return
-        reader = self.stdout if fd == 1 else None
+        reader = self.stdout if fd == 1 else self.stderr if fd == 2 else None
         if reader is not None:
             if exc is None:
                 reader.feed_eof()
@@ -546,7 +556,7 @@ class SubprocessStreamProtocol(FlowControlMixin, asyncio.SubprocessProtocol):
 
 
 class Process:
-    """The ``asyncio.subprocess.Process`` surface the ACP front relies on."""
+    """The subprocess surface used by ACP, file-backed jobs and streamed hooks."""
 
     def __init__(self, transport, protocol, loop):
         self._transport = transport
@@ -700,6 +710,134 @@ class ContainedWorkerTransport(BaseSubprocessTransport):
             self._proc.release()
 
 
+class LocalProcessTransport(ContainedWorkerTransport):
+    """Reuse the pipe/exit machinery, but keep local image and cwd explicit."""
+
+    def __init__(self, loop, protocol, *, native, command, environment, cwd,
+                 stdin, stdout, stderr, inherited_handles, owning, creationflags, waiter):
+        self._exit_task = None
+        BaseSubprocessTransport.__init__(
+            self, loop, protocol, args=command, shell=False, stdin=stdin,
+            stdout=stdout, stderr=stderr, bufsize=0, waiter=waiter,
+            native=native, environment=environment, cwd=cwd,
+            inherited_handles=inherited_handles, owning=owning, creationflags=creationflags)
+
+    def close(self):
+        BaseSubprocessTransport.close(self)
+        # During failed construction there may be no observer yet. The local
+        # factory still owns the native process and must reap it before release.
+        if self._exit_task is not None and self._exit_task.done():
+            self._release()
+
+    def _start(self, args, shell, stdin, stdout, stderr, bufsize, **kwargs):
+        parent_pipes = {}
+        try:
+            with ExitStack() as cleanup:
+                children = []
+                for fd, value in enumerate([stdin, stdout, stderr]):
+                    if value == PIPE:
+                        first, second = pipe(duplex=fd == 0, overlapped=(fd != 0, fd == 0))
+                        child, parent = [first, second] if fd == 0 else [second, first]
+                        parent_pipes[fd] = PipeHandle(parent)
+                        cleanup.callback(api.close_handle, child)
+                        api.set_handle_information(child, api.HandleFlags.HANDLE_FLAG_INHERIT,
+                                                   api.HandleFlags.HANDLE_FLAG_INHERIT)
+                    else:
+                        child = windows_runtime.duplicate_standard_handle(value, fd)
+                        cleanup.callback(api.close_handle, child)
+                    children.append(child)
+                native = kwargs['native']
+                windows_runtime.prepare_local(
+                    native, args, kwargs['environment'], kwargs['cwd'],
+                    [*kwargs['inherited_handles'], *children], children,
+                    owning=kwargs['owning'], creationflags=kwargs['creationflags'])
+            self._proc = ContainedWorkerProcess(native)
+            self._proc.stdin = parent_pipes.get(0)
+            self._proc.stdout = parent_pipes.get(1)
+            self._proc.stderr = parent_pipes.get(2)
+            self._exit_task = self._loop.create_task(self._watch_exit())
+        except BaseException:
+            with ExitStack() as cleanup:
+                for raw in parent_pipes.values():
+                    cleanup.callback(raw.close)
+            raise
+
+
+async def create_local_process(*command, stdin=None, stdout=None, stderr=None,
+                               close_fds=True, env=None, cwd=None, creationflags=0,
+                               startupinfo=None, owning=False, before_resume=None):
+    """Keep the native child suspended through attachment and owner validation."""
+    if not close_fds:
+        raise ValueError('local child handles must be explicit')
+    inherited = []
+    if startupinfo is not None:
+        attributes = startupinfo.lpAttributeList or {}
+        if startupinfo.dwFlags or attributes.keys() - {'handle_list'}:
+            raise ValueError('unsupported local startup attributes')
+        inherited = list(attributes.get('handle_list', []))
+    native = windows_runtime.ContainedProcess(None)
+    transport = None
+    try:
+        loop = asyncio.get_running_loop()
+        protocol = SubprocessStreamProtocol(limit=64 * 1024, loop=loop)
+        waiter = loop.create_future()
+        transport = LocalProcessTransport(
+            loop, protocol, native=native, command=list(command), environment=env,
+            cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr,
+            inherited_handles=inherited, owning=owning, creationflags=creationflags, waiter=waiter)
+
+        def resume():
+            if before_resume is not None:
+                before_resume()
+            api.resume_thread(native.information.hThread)
+
+        return await _complete_creation(transport, protocol, loop, waiter, resume)
+    except BaseException as error:
+        if transport is None:
+            await windows_runtime.retire_local(native)
+        if isinstance(error, api.WindowsApiError):
+            if error.status is not None:
+                raise OSError(None, str(error), None, error.status) from error
+            raise OSError(str(error)) from error
+        raise
+
+
+async def _complete_creation(transport, protocol, loop, waiter, ready=None):
+    try:
+        await waiter
+        process = Process(transport, protocol, loop)
+        if ready is not None:
+            ready()
+        return process
+    except BaseException:
+        async def finish():
+            proc = transport._proc
+            transport._connect_task.cancel()
+            try:
+                await transport._connect_task
+            finally:
+                transport.close()
+                try:
+                    if proc is not None:
+                        for raw in [proc.stdin, proc.stdout, proc.stderr]:
+                            if raw is not None:
+                                raw.close()
+                finally:
+                    await transport._exit_task
+
+        task = asyncio.create_task(finish())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    pass
+            task.result()
+        raise
+
+
 async def create_worker_process(*, workspace, environment, arguments,
                                 inherited_handles, current_directory):
     """Start one contained worker and return the asyncio ``Process``."""
@@ -710,26 +848,4 @@ async def create_worker_process(*, workspace, environment, arguments,
         loop, protocol, workspace=workspace, environment=environment,
         arguments=arguments, inherited_handles=inherited_handles,
         current_directory=current_directory, waiter=waiter)
-    try:
-        await waiter
-    except (SystemExit, KeyboardInterrupt):
-        raise
-    except BaseException:
-        # Cancelling the caller cancels the waiter, not pipe attachment. Join
-        # attachment cleanup before returning so it cannot publish late pipes.
-        proc = transport._proc
-        transport._connect_task.cancel()
-        try:
-            await transport._connect_task
-        finally:
-            transport.close()
-            try:
-                # Attachment may have been cancelled before its coroutine
-                # started, in which case it never took ownership of these.
-                if proc is not None:
-                    for raw_pipe in [proc.stdin, proc.stdout]:
-                        raw_pipe.close()
-            finally:
-                await transport._exit_task
-        raise
-    return Process(transport, protocol, loop)
+    return await _complete_creation(transport, protocol, loop, waiter)

@@ -200,6 +200,7 @@ class TokenAccess(enum.IntFlag):
 
 TOKEN_USER_CLASS = 1
 TOKEN_DEFAULT_DACL_CLASS = 6
+TOKEN_RESTRICTED_SIDS_CLASS = 11
 
 
 def current_user_sid() -> str:
@@ -703,6 +704,7 @@ class ThreadAccess(enum.IntFlag):
 # https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
 class CreateProcessFlags(enum.IntFlag):
     CREATE_SUSPENDED = 0x00000004
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
     CREATE_UNICODE_ENVIRONMENT = 0x00000400
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 
@@ -918,7 +920,7 @@ def open_process_token(process, rights: int = TokenAccess.TOKEN_QUERY):
                       ctypes.POINTER(ctypes.c_void_p))
     token = ctypes.c_void_p()
     if not open_token(process, rights, ctypes.byref(token)):
-        raise WindowsApiError("OpenProcessToken failed")
+        raise WindowsApiError("OpenProcessToken failed", status=ctypes.get_last_error())
     return token
 
 
@@ -971,12 +973,71 @@ def token_default_dacl(token):
     return ctypes.string_at(acl, length)
 
 
-def set_token_default_dacl(token, sddl: str) -> None:
+class _SecurityDescriptor(ctypes.Structure):
+    _fields_ = [('revision', ctypes.c_uint8), ('reserved', ctypes.c_uint8),
+                ('control', ctypes.c_uint16), ('owner', ctypes.c_void_p),
+                ('group', ctypes.c_void_p), ('sacl', ctypes.c_void_p),
+                ('dacl', ctypes.c_void_p)]
+
+
+def acl_sddl(acl: bytes) -> str:
+    """Render an ACL without discarding its existing grants or deny entries."""
+    initialize = bind('advapi32', 'InitializeSecurityDescriptor', wintypes.BOOL,
+                      ctypes.c_void_p, wintypes.DWORD)
+    set_dacl = bind('advapi32', 'SetSecurityDescriptorDacl', wintypes.BOOL,
+                    ctypes.c_void_p, wintypes.BOOL, ctypes.c_void_p, wintypes.BOOL)
+    descriptor = _SecurityDescriptor()
+    storage = ctypes.create_string_buffer(acl)
+    if not initialize(ctypes.byref(descriptor), SDDL_REVISION_1):
+        raise WindowsApiError('InitializeSecurityDescriptor failed', status=ctypes.get_last_error())
+    if not set_dacl(ctypes.byref(descriptor), True, storage, False):
+        raise WindowsApiError('SetSecurityDescriptorDacl failed', status=ctypes.get_last_error())
+    return _sddl_from_descriptor(ctypes.byref(descriptor), SecurityInformation.DACL_SECURITY_INFORMATION)
+
+
+class _SidAttributes(ctypes.Structure):
+    _fields_ = [('sid', ctypes.c_void_p), ('attributes', ctypes.c_uint32)]
+
+
+class _TokenGroups(ctypes.Structure):
+    _fields_ = [('count', ctypes.c_uint32), ('first', _SidAttributes)]
+
+
+def token_restricting_sids(token):
+    """Read the restricting identities/attributes for pre-resume comparison."""
+    query = _get_token_information()
+    size = wintypes.DWORD()
+    query(token, TOKEN_RESTRICTED_SIDS_CLASS, None, 0, ctypes.byref(size))
+    if size.value < ctypes.sizeof(ctypes.c_uint32):
+        raise WindowsApiError('GetTokenInformation(TokenRestrictedSids) sizing failed', status=ctypes.get_last_error())
+    storage = ctypes.create_string_buffer(size.value)
+    if not query(token, TOKEN_RESTRICTED_SIDS_CLASS, storage, len(storage), ctypes.byref(size)):
+        raise WindowsApiError('GetTokenInformation(TokenRestrictedSids) failed', status=ctypes.get_last_error())
+    count = ctypes.c_uint32.from_buffer(storage).value
+    if count and _TokenGroups.first.offset + count * ctypes.sizeof(_SidAttributes) > len(storage):
+        raise WindowsApiError('TokenRestrictedSids returned a short group buffer')
+    entries = [_SidAttributes.from_buffer(storage, _TokenGroups.first.offset + i * ctypes.sizeof(_SidAttributes))
+               for i in range(count)]
+    return sorted([sid_text(entry.sid), entry.attributes] for entry in entries)
+
+
+def set_token_default_dacl(token, sddl: str | bytes) -> None:
     """Set future-object security on the supplied token, not its object DACL.
 
     The caller owns token selection and must verify the result before a child
     runs. TOKEN_ADJUST_DEFAULT suffices here; readback separately needs QUERY.
+    Bytes restore an earlier ACL exactly, without rebuilding its permissions.
     """
+    set_info = bind('advapi32', 'SetTokenInformation', wintypes.BOOL,
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    if isinstance(sddl, bytes):
+        if len(sddl) < 8 or int.from_bytes(sddl[2:4], 'little') != len(sddl):
+            raise ValueError('invalid default ACL bytes')
+        storage = ctypes.create_string_buffer(sddl)
+        acl = ctypes.c_void_p(ctypes.addressof(storage))
+        if not set_info(token, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(acl), ctypes.sizeof(acl)):
+            raise WindowsApiError('SetTokenInformation(TokenDefaultDacl) failed', status=ctypes.get_last_error())
+        return
     convert = bind(
         "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
         wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
@@ -985,9 +1046,6 @@ def set_token_default_dacl(token, sddl: str) -> None:
         "advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
         ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
-    set_info = bind("advapi32", "SetTokenInformation", wintypes.BOOL,
-                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
-                    wintypes.DWORD)
     local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
                       ctypes.c_void_p)
     descriptor = ctypes.c_void_p()
@@ -1311,6 +1369,25 @@ def create_process_in_app_container(executable, arguments, package_sid,
         # lowbox identity, never silently creating an uncontained child.
         if not token_is_app_container(primary_token):
             raise WindowsApiError("the supplied primary token is not an AppContainer")
+    return create_process_suspended(
+        executable, arguments, package_sid, current_directory, inherited_handles,
+        environment, standard_handles, pseudoconsole,
+        primary_token=primary_token, object_security=object_security)
+
+
+def create_process_suspended(executable, arguments, package_sid=None,
+                             current_directory=None, inherited_handles=None,
+                             environment=None, standard_handles=None, pseudoconsole=None, *,
+                             primary_token=None, object_security=None, creationflags=0,
+                             search_path=False):
+    """One native creation path, retaining ownership until it returns.
+
+    No new lowbox attributes means retaining the supplied token/caller context,
+    not retrying a failed contained launch outside containment. ``search_path``
+    uses Windows' command-line image lookup for a caller-selected bare command;
+    sanctioned Loki images are supplied explicitly and do not use that lookup.
+    Every variant stays suspended until its local owner verifies and resumes it.
+    """
     convert_sid = bind("advapi32", "ConvertStringSidToSidW", wintypes.BOOL,
                        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
     local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
@@ -1410,7 +1487,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
         command_line = ctypes.create_unicode_buffer(
             subprocess.list2cmdline([executable, *arguments]))
         flags = (CreateProcessFlags.CREATE_SUSPENDED
-                 | CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT)
+                 | CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT | creationflags)
         block = environment_block(environment, current_directory)
         if block is not None:
             flags |= CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT
@@ -1430,7 +1507,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
             descriptor = converted
             attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
             security = ctypes.byref(attributes)
-        creation = [executable, command_line, security, security,
+        creation = [None if search_path else executable, command_line, security, security,
                     bool(inherited_handles), flags, block,
                     current_directory, ctypes.byref(startup),
                     ctypes.byref(information)]

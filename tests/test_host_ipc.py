@@ -28,7 +28,14 @@ def mocked_named_pipe(server_handle, *, client_handle=0x22, connect_error=None,
     declarations, like the anonymous pair above, so its creation attributes
     and failure paths are exercised on the same host that runs the rest.
     """
-    state = {"created": [], "closed": [], "connected": [], "last_error": 0}
+    state = {"created": [], "closed": [], "connected": [], "last_error": 0, 'token_closed': False}
+    token = object()
+
+    def close(handle):
+        if handle is token:
+            state['token_closed'] = True
+        else:
+            state['closed'].append(handle)
 
     def named_pipe(address, mode, pipe_mode, instances, obsize, ibsize,
                    timeout, attributes):
@@ -67,15 +74,19 @@ def mocked_named_pipe(server_handle, *, client_handle=0x22, connect_error=None,
                            side_effect=bound), \
             mock.patch.object(windows_subprocesses.api, "current_user_sid",
                               return_value="S-1-5-21-9"), \
+            mock.patch.object(windows_subprocesses.api, 'current_process_handle', return_value=10), \
+            mock.patch.object(windows_subprocesses.api, 'open_process_token', return_value=token), \
+            mock.patch.object(windows_subprocesses.api, 'token_is_app_container', return_value=False), \
             mock.patch.object(windows_subprocesses.api, "open_with_access",
                               side_effect=open_client) as opened, \
-            mock.patch.object(windows_subprocesses.api, "close_handle",
-                              side_effect=state["closed"].append), \
+            mock.patch.object(windows_subprocesses.api, "close_handle", side_effect=close), \
             mock.patch.object(ctypes, "get_last_error",
                               side_effect=lambda: state["last_error"],
                               create=True):
         state["opened"] = opened
         yield state
+        if not state['token_closed']:
+            raise AssertionError('pipe identity query retained its token handle')
 
 
 class PairConfirmationTests(unittest.TestCase):
@@ -152,6 +163,15 @@ class PrivatePipeCreationTests(unittest.TestCase):
             security_descriptor=('D:P(A;;GA;;;S-1-5-21-9)(A;;GA;;;SY)(A;;GA;;;BA)'
                                  '(A;;0x120196;;;S-1-15-2-123)'))
 
+    def test_duplex_stdio_read_grant_never_reaches_confidential_one_way_pipes(self):
+        with self.identity(True) as calls, mock.patch.object(host_ipc.windows_api, 'set_token_default_dacl') as default:
+            policy = host_ipc.pipe_policy(duplex=True)
+            host_ipc.private_pipe()
+            self.assertEqual(policy['package'], 'S-1-15-2-123')
+            self.assertIn('(A;;0x12019f;;;S-1-15-2-123)', policy['descriptor'])
+            self.assertIn('(A;;0x120196;;;S-1-15-2-123)', calls['create_pipe'].call_args.kwargs['security_descriptor'])
+            default.assert_not_called()
+
     def test_identity_query_failure_closes_token_and_never_allocates_pipe(self):
         with self.identity(True) as calls:
             calls['token_app_container_sid'].side_effect = OSError('identity unavailable')
@@ -214,7 +234,7 @@ class PrivatePipePairTests(unittest.TestCase):
         self.assertEqual(created_pipe["pipe_mode"] & 0x8, 0x8)
         self.assertEqual(created_pipe["inherit"], 0)
         self.assertEqual(state["sddl"],
-                         "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-9)")
+                         "D:P(A;;GA;;;S-1-5-21-9)(A;;GA;;;SY)(A;;GA;;;BA)")
         self.assertEqual(state["opened"].call_args.kwargs["flags"],
                          0x40000000)
         self.assertEqual(state["connected"], [0x30])

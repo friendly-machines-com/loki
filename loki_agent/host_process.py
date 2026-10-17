@@ -21,6 +21,7 @@ The Windows notes here are not translations of the POSIX calls:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -35,6 +36,15 @@ def label(signum) -> str:
     if signum == FORCE:
         return "SIGKILL" if os.name == "posix" else "terminate"
     return signum.name
+
+
+async def create_exec(*command, owning=False, before_resume=None, **kwargs):
+    """Preserve the caller's image/cwd; only trusted callers select authority."""
+    if os.name == 'nt':
+        from . import windows_subprocesses
+        return await windows_subprocesses.create_local_process(
+            *command, owning=owning, before_resume=before_resume, **kwargs)
+    return await asyncio.create_subprocess_exec(*command, **kwargs)
 
 
 if os.name == "posix":

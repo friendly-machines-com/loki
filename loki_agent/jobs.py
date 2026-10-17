@@ -415,6 +415,8 @@ class JobManager:
                 "credential capabilities require a direct executable")
         if subagent and not session_owned:
             raise ValueError("subagents must be session-owned")
+        if credential_refs is not None and not subagent:
+            raise ValueError("credential capabilities require an owning subagent")
         job_id = self._next_job_id()
         spool_dir = self._job_dir(job_id)
         stdout_path = os.path.join(spool_dir, "stdout.log")
@@ -452,6 +454,14 @@ class JobManager:
         spawn_command = command
         proc = None
         job_dir_fd = None
+
+        def check_starting():
+            # Windows invokes this after stdio attachment but before resume;
+            # publication rechecks it too. Lifetime never selects authority.
+            if job.status != "starting":
+                raise _JobRevokedDuringLaunch(
+                    f"job was revoked while launching (status={job.status})")
+
         try:
             if subagent:
                 # Reserved inside the failure boundary, immediately before the
@@ -500,8 +510,9 @@ class JobManager:
                         # Windows shell=True uses cmd.exe's /c protocol even
                         # with an executable override. Keep the script as one
                         # Bash -c argument rather than reinterpret its quoting.
-                        proc = await asyncio.create_subprocess_exec(
+                        proc = await host_process.create_exec(
                             executables.BASH, '-c', str(spawn_command),
+                            owning=False, before_resume=check_starting,
                             stdin=stdin,
                             stdout=stdout_file,
                             stderr=stderr_file,
@@ -514,8 +525,9 @@ class JobManager:
                         child_ends = [
                             end for end in [owner_child, credential_child]
                             if end is not None]
-                        proc = await asyncio.create_subprocess_exec(
+                        proc = await host_process.create_exec(
                             *spawn_command,
+                            owning=subagent, before_resume=check_starting,
                             stdin=stdin,
                             stdout=stdout_file,
                             stderr=stderr_file,
@@ -537,9 +549,7 @@ class JobManager:
 
             # The session may have revoked this job while it was launching.
             # Publishing it now would leave a live child nobody owns.
-            if job.status != "starting":
-                raise _JobRevokedDuringLaunch(
-                    f"job was revoked while launching (status={job.status})")
+            check_starting()
             job.process = proc
             job.owner_signal_fd = owner_parent
             parent_handed_off = True
