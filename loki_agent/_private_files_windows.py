@@ -1,3 +1,4 @@
+# pytype: skip-file
 """Windows credential-file primitives: handle-relative, reparse-refusing.
 
 The POSIX module's two guarantees are reproduced here with the native calls
