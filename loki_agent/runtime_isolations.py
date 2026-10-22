@@ -33,12 +33,12 @@ capabilities remain separate required layers.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import os
+import stat
 import sys
-
-from .paths import credential_directory
 
 
 class RuntimeIsolationError(RuntimeError):
@@ -244,47 +244,71 @@ def _set_no_new_privileges(libc) -> None:
         _raise_errno("PR_SET_NO_NEW_PRIVS")
 
 
-def isolate_credential_directory(directory: str | None = None) -> bool:
-    """Hide the credential directory in this runtime and its descendants.
+def isolate_credential_directory(directory_fd: int | None) -> bool:
+    """Consume the inherited storage-directory descriptor before agent imports.
 
-    Production supervisors create the dedicated directory before spawning
-    every runtime, including before the first login. A missing directory is
-    fatal: continuing uncovered would expose credentials created by a later
-    login. Tests must establish the same boundary as production.
+    The supervisor retains its own descriptor. This process must cover that
+    same object, not whichever directory now occupies its configured name.
+    Both the inherited copy and the temporary mount-target descriptor close
+    before any runtime/tool code can inherit them, including on failure.
     """
-    if not sys.platform.startswith("linux"):
-        return False
-    libc = ctypes.CDLL(None, use_errno=True)
-    _set_no_new_privileges(libc)
-    target = credential_directory() if directory is None else directory
-    if not os.path.isdir(target):
-        raise RuntimeIsolationError(
-            "credential directory is missing or not a directory")
-
+    target_fd = None
     try:
-        original_cwd = os.getcwd()
-    except OSError as error:
-        raise RuntimeIsolationError(
-            f"could not record the runtime working directory: {error}"
-        ) from error
-    # Once the new user namespace exists, an unmapped caller is reported as
-    # the overflow identity. Preserve the real IDs before unshare so the map
-    # describes the supervisor-visible user rather than that placeholder.
-    uid = os.getuid()
-    gid = os.getgid()
-    _unshare_user_and_mount_namespaces(libc)
-    _map_current_identity(uid, gid)
-    _mount_private_credential_view(libc, target)
-    try:
-        # A process whose cwd was the covered directory still holds a reference
-        # to the underlying pre-mount dentry. Resolve the same pathname again
-        # through the new mount table so relative opens see the empty cover,
-        # not the supervisor's credential files.
-        os.chdir(original_cwd)
-    except OSError as error:
-        raise RuntimeIsolationError(
-            "could not rebind the runtime working directory after hiding "
-            f"credentials: {error}"
-        ) from error
-    _drop_namespace_capabilities(libc)
-    return True
+        if not sys.platform.startswith("linux"):
+            return False
+        libc = ctypes.CDLL(None, use_errno=True)
+        _set_no_new_privileges(libc)
+        if directory_fd is None:
+            raise RuntimeIsolationError("credential protection is unavailable")
+        try:
+            original = os.fstat(directory_fd)
+        except OSError as error:
+            raise RuntimeIsolationError("credential location is unavailable") from error
+        if not stat.S_ISDIR(original.st_mode):
+            raise RuntimeIsolationError("credential location is not a directory")
+        try:
+            original_cwd = os.getcwd()
+        except OSError as error:
+            raise RuntimeIsolationError("working directory is unavailable") from error
+        try:
+            # Read while this fd still belongs to our mount namespace. After
+            # unshare, a descriptor beneath a bind mount can lose that mount's
+            # pathname ancestry and report only a name relative to its root.
+            name = os.readlink(f"/proc/self/fd/{directory_fd}")
+        except OSError as error:
+            raise RuntimeIsolationError("credential location is unavailable") from error
+        # Once the new user namespace exists, an unmapped caller is reported as
+        # the overflow identity. Preserve the real IDs before unshare.
+        uid = os.getuid()
+        gid = os.getgid()
+        _unshare_user_and_mount_namespaces(libc)
+        _map_current_identity(uid, gid)
+        try:
+            # The inherited fd cannot itself be a mount target in the new
+            # namespace. Reopen its kernel-reported name here and verify the
+            # pinned identity. A rename during this interval is a refusal,
+            # never permission to cover a replacement directory.
+            target_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY |
+                                os.O_NOFOLLOW | os.O_CLOEXEC)
+            target = os.fstat(target_fd)
+            if original.st_dev != target.st_dev or original.st_ino != target.st_ino:
+                raise RuntimeIsolationError("credential location changed while starting Loki")
+        except OSError as error:
+            raise RuntimeIsolationError("credential location is unavailable") from error
+        _mount_private_credential_view(libc, f"/proc/self/fd/{target_fd}")
+        try:
+            # Rebind a pre-cover cwd through this namespace, rather than retain
+            # an underlying-directory reference after the cover is installed.
+            os.chdir(original_cwd)
+        except OSError as error:
+            raise RuntimeIsolationError("working directory is unavailable") from error
+        _drop_namespace_capabilities(libc)
+        return True
+    finally:
+        try:
+            if target_fd is not None:
+                os.close(target_fd)
+        finally:
+            if directory_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(directory_fd)

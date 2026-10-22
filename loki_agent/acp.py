@@ -993,8 +993,11 @@ class Front:
                 # The platform seam spawns the worker contained where the
                 # platform has a container (Windows AppContainer) and piped
                 # on stdio everywhere; the front never launches it directly.
+                storage = self.credential_supervisor.storage
                 process = await runtime_isolation.start_worker(
-                    cwd, self.environment, delegation)
+                    cwd, self.environment, delegation,
+                    credential_directory=(storage.directory_handle
+                                          if storage is not None else None))
             except RuntimeIsolationError as error:
                 raise acps.TransportError(
                     f"could not start worker: {error}",

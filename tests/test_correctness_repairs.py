@@ -1030,7 +1030,7 @@ class TerminalEntrypointContractTests(unittest.TestCase):
                 mock.patch.object(
                     terminal_entrypoint,
                     "_terminal_runtime_arguments",
-                    return_value=(11, 12, ["--headless"])) as descriptors, \
+                    return_value=(11, 12, 13 if os.name == 'posix' else None, ["--headless"])) as descriptors, \
                 mock.patch.object(
                     terminal_frontend,
                     "main",
@@ -1047,7 +1047,7 @@ class TerminalEntrypointContractTests(unittest.TestCase):
         descriptors.assert_called_once_with([])
         terminal_main.assert_called_once_with(["--headless"], 11, 12)
         if os.name == "posix":
-            self.isolation.assert_called_once_with()
+            self.isolation.assert_called_once_with(13)
         else:
             self.windows_steps["verify_runtime"].assert_called_once_with()
 

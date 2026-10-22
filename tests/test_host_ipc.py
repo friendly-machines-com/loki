@@ -10,8 +10,12 @@ is EOF, and the reference/spawn/validation contract the child depends on.
 import asyncio
 import contextlib
 import ctypes
+import json
 import os
 import socket
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -335,6 +339,188 @@ class OwnerChannelTests(unittest.TestCase):
         host_ipc.close_end(parent_end)
 
         self.assertEqual(os.read(child_end, 1), b"")
+
+
+@unittest.skipUnless(os.name == 'posix', 'POSIX descriptor inheritance')
+class ChildReferenceTests(unittest.TestCase):
+    def test_borrowed_directory_copy_preserves_closed_standard_streams(self):
+        code = r'''
+import errno,json,os,sys
+from loki_agent import host_ipc
+report = os.dup(1)
+closed = json.loads(sys.argv[1])
+for fd in closed:
+    os.close(fd)
+source = os.open(sys.argv[2], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+assert source == min(closed)
+original = os.fstat(source)
+copy = host_ipc.duplicate_for_child(source)
+assert copy >= 3 and copy != source
+assert not os.get_inheritable(copy)
+assert not os.get_inheritable(source)
+assert os.path.samestat(original, os.fstat(copy))
+os.close(copy)
+assert os.path.samestat(original, os.fstat(source))
+for fd in closed:
+    if fd == source:
+        continue
+    try:
+        os.fstat(fd)
+    except OSError as error:
+        assert error.errno == errno.EBADF
+    else:
+        raise AssertionError('duplication filled a closed standard stream')
+os.close(source)
+os.write(report, b'borrowed object preserved')
+os.close(report)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            for closed in [[0], [1], [2], [0, 1, 2]]:
+                with self.subTest(closed=closed):
+                    process = subprocess.run(
+                        [sys.executable, '-c', code, json.dumps(closed), directory],
+                        stdin=subprocess.DEVNULL, capture_output=True)
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    self.assertEqual(process.stdout, b'borrowed object preserved')
+
+    def test_owned_channel_references_avoid_closed_standard_streams(self):
+        code = r'''
+import os,socket,sys
+from loki_agent import host_ipc
+report = os.dup(1)
+for fd in [0,1,2]:
+    os.close(fd)
+if sys.argv[1] == 'owner':
+    parent,child = host_ipc.owner_channel()
+    try:
+        assert child >= 3 and not os.get_inheritable(child)
+        assert host_ipc.child_endpoint(str(child)) == child
+        os.write(parent, b'x')
+        assert os.read(child, 1) == b'x'
+    finally:
+        os.close(parent)
+        os.close(child)
+else:
+    parent,end = host_ipc.socket_pair()
+    child = host_ipc.prepare_child_socket(end)
+    assert end.fileno() == -1
+    try:
+        assert child >= 3 and not os.get_inheritable(child)
+        assert host_ipc.child_endpoint(str(child)) == child
+        with socket.socket(fileno=child) as client:
+            parent.sendall(b'x')
+            assert client.recv(1) == b'x'
+            client.sendall(b'y')
+            assert parent.recv(1) == b'y'
+    finally:
+        parent.close()
+os.write(report, b'channel usable')
+os.close(report)
+'''
+        for kind in ['owner', 'credential']:
+            with self.subTest(kind=kind):
+                process = subprocess.run(
+                    [sys.executable, '-c', code, kind],
+                    stdin=subprocess.DEVNULL, capture_output=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertEqual(process.stdout, b'channel usable')
+
+    def test_credential_copy_failure_cannot_leave_a_server_task(self):
+        from loki_agent import authentications, credential_capabilities
+
+        async def scenario():
+            tasks = asyncio.all_tasks()
+            ends = []
+            pair = host_ipc.socket_pair
+
+            def allocate():
+                parent, child = pair()
+                ends.extend([parent, child])
+                return parent, child
+
+            with mock.patch.object(host_ipc, 'socket_pair', side_effect=allocate), \
+                    mock.patch.object(host_ipc, 'duplicate_for_child',
+                                      side_effect=OSError('copy refused')):
+                with self.assertRaisesRegex(OSError, 'copy refused'):
+                    await credential_capabilities.CredentialCapabilityServer.create(
+                        authentications.CredentialBroker())
+            self.assertTrue(ends)
+            self.assertTrue(all(end.fileno() == -1 for end in ends))
+            await asyncio.sleep(0)
+            self.assertFalse(asyncio.all_tasks() - tasks)
+
+        asyncio.run(scenario())
+
+    def test_capability_validation_failure_closes_adopted_transport_and_child_copy(self):
+        from loki_agent import credential_capabilities
+
+        async def scenario():
+            tasks = asyncio.all_tasks()
+            authority = mock.Mock()
+            authority.available.side_effect = [frozenset(['revoked']), frozenset()]
+            ends, copies = [], []
+            pair = host_ipc.socket_pair
+            duplicate = host_ipc.duplicate_for_child
+
+            def allocate():
+                parent, child = pair()
+                ends.extend([parent, child])
+                return parent, child
+
+            def copy(fd):
+                result = duplicate(fd)
+                copies.append(result)
+                return result
+
+            with mock.patch.object(host_ipc, 'socket_pair', side_effect=allocate), \
+                    mock.patch.object(host_ipc, 'duplicate_for_child', side_effect=copy):
+                with self.assertRaisesRegex(ValueError, 'exceed the upstream authority'):
+                    await credential_capabilities.CredentialCapabilityServer.create(
+                        authority, allowed={'revoked'})
+            self.assertTrue(ends)
+            self.assertTrue(all(end.fileno() == -1 for end in ends))
+            for fd in copies:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+            await asyncio.sleep(0)
+            self.assertFalse(asyncio.all_tasks() - tasks)
+
+        asyncio.run(scenario())
+
+    def test_copy_failure_releases_owned_ends_but_not_a_borrowed_source(self):
+        created = []
+        pipe = os.pipe
+
+        def allocate():
+            ends = pipe()
+            created.extend(ends)
+            return ends
+
+        with mock.patch.object(host_ipc.os, 'pipe', side_effect=allocate), \
+                mock.patch.object(host_ipc, 'duplicate_for_child',
+                                  side_effect=OSError('copy refused')):
+            with self.assertRaisesRegex(OSError, 'copy refused'):
+                host_ipc.owner_channel()
+        for fd in created:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+        parent, child = socket.socketpair()
+        self.addCleanup(parent.close)
+        with mock.patch.object(host_ipc, 'duplicate_for_child',
+                               side_effect=OSError('copy refused')):
+            with self.assertRaisesRegex(OSError, 'copy refused'):
+                host_ipc.prepare_child_socket(child)
+        self.assertEqual(child.fileno(), -1)
+        self.assertEqual(parent.recv(1), b'')
+
+        import fcntl
+
+        with tempfile.TemporaryFile() as source:
+            with mock.patch.object(fcntl, 'fcntl', side_effect=OSError('copy refused')):
+                with self.assertRaisesRegex(OSError, 'copy refused'):
+                    host_ipc.duplicate_for_child(source.fileno())
+            os.fstat(source.fileno())
 
 
 class ReferenceTests(unittest.TestCase):

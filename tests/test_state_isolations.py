@@ -146,7 +146,8 @@ def credential_cover_probe(manifest_path):
     mount_call(libc, loki, loki, MS_BIND)
     mount_call(libc, None, loki, MS_BIND | MS_REMOUNT |
                retained_mount_flags(loki) | isolation._MS_RDONLY)
-    isolation.isolate_credential_directory(str(cover_target))
+    directory_fd = os.open(cover_target, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    isolation.isolate_credential_directory(directory_fd)
     moved = configuration.with_name('moved-config')
     with socket.socket(socket.AF_UNIX) as control:
         control.connect(manifest['control'])

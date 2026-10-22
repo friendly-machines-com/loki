@@ -87,7 +87,9 @@ class CredentialSupervisor:
         try:
             process = await runtime_isolation.start_runtime(
                 executable, arguments, workspace, self.environment,
-                delegation)
+                delegation, credential_directory=(
+                    self.storage.directory_handle
+                    if self.storage is not None else None))
             delegation.child_spawned()
             return await process.wait()
         finally:
@@ -164,10 +166,15 @@ class RuntimeDelegation:
             str(host_ipc.reference(self.credential_child)),
         ]
 
-    def child_spawn_kwargs(self) -> dict:
+    def child_spawn_kwargs(self, credential_directory=None) -> dict:
         if self.owner_child is None or self.credential_child is None:
             raise RuntimeError("runtime delegation was already handed off")
-        return host_ipc.spawn_kwargs((self.owner_child, self.credential_child))
+        inherited = [self.owner_child, self.credential_child]
+        if credential_directory is not None:
+            # The storage owner keeps this descriptor; only the child's copy
+            # is consumed by its early namespace setup, before agent imports.
+            inherited.append(credential_directory)
+        return host_ipc.spawn_kwargs(inherited)
 
     def child_spawned(self) -> None:
         """Close the supervisor's copies of the ends the child owns."""

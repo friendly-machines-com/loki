@@ -359,7 +359,11 @@ class CredentialCapabilityServer:
             raise ValueError(
                 "delegated credentials exceed the upstream authority")
         parent_end, child_end = host_ipc.socket_pair()
+        writer = None
         try:
+            # Acquire the child's transport reference before publishing a
+            # server task. Duplication failure must leave no active authority.
+            child_end = host_ipc.prepare_child_socket(child_end)
             reader, writer = await host_ipc.open_streams(
                 parent_end,
                 limit=CAPABILITY_MAX_MESSAGE_BYTES,
@@ -367,10 +371,30 @@ class CredentialCapabilityServer:
             server = cls(
                 authority, permitted, reader, writer,
                 destinations=destinations, manage_approvals=manage_approvals)
-            return server, host_ipc.prepare_child_socket(child_end)
+            return server, child_end
         except BaseException:
-            host_ipc.close_end(parent_end)
-            host_ipc.close_end(child_end)
+            try:
+                host_ipc.close_end(child_end)
+            finally:
+                if writer is None:
+                    host_ipc.close_end(parent_end)
+                else:
+                    # The transport, not the borrowed socket/endpoint, owns
+                    # this side after stream adoption. Join its real closer
+                    # even if acquisition is cancelled a second time.
+                    writer.close()
+
+                    async def wait_closed():
+                        with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+                            await writer.wait_closed()
+
+                    cleanup = asyncio.create_task(wait_closed())
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            continue
+                    cleanup.result()
             raise
 
     async def _read_messages(self):

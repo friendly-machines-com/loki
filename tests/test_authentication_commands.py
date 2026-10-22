@@ -330,7 +330,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
 
 class AuthenticationEntrypointTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
-    def test_missing_credentials_refuse_real_runtime_startup(self):
+    def test_missing_credential_directory_descriptor_refuses_real_runtime_startup(self):
         with tempfile.TemporaryDirectory() as directory:
             owner_read, owner_write = os.pipe()
             capability_parent, capability_child = socket.socketpair()
@@ -358,9 +358,95 @@ class AuthenticationEntrypointTests(unittest.TestCase):
             self.assertEqual(process.returncode, 2, process.stderr)
             self.assertEqual(process.stdout, '')
             self.assertIn(
-                'Security initialization error: credential directory is missing',
+                'Security initialization error: credential protection is unavailable',
                 process.stderr)
             self.assertFalse(os.path.exists(os.path.join(directory, '.loki')))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
+    def test_invalid_startup_authority_refuses_both_real_entrypoints(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as regular:
+            owner_read, owner_write = os.pipe()
+            parent, child = socket.socketpair()
+            parent.close()
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                for frontend in ['loki', 'loki-acp']:
+                    for problem in ['missing', 'closed', 'reserved', 'malformed', 'regular', 'duplicate']:
+                        with self.subTest(frontend=frontend, problem=problem):
+                            command = [entrypoint(frontend),
+                                       '--runtime' if frontend == 'loki' else '--worker',
+                                       '--session-owner-fd', str(owner_read),
+                                       '--credential-capability-fd', str(child.fileno())]
+                            inherited = [owner_read, child.fileno()]
+                            expected = 'credential protection is unavailable'
+                            if problem != 'missing':
+                                value = {'closed': str(2**31 - 1), 'reserved': '1',
+                                         'malformed': 'not-a-reference',
+                                         'regular': str(regular.fileno()),
+                                         'duplicate': str(directory_fd)}[problem]
+                                command.extend(['--credential-directory-fd', value])
+                                if problem == 'closed':
+                                    expected = 'credential location is unavailable'
+                                elif problem == 'regular':
+                                    inherited.append(regular.fileno())
+                                    expected = 'credential location is not a directory'
+                                elif problem == 'duplicate':
+                                    inherited.append(directory_fd)
+                                    command.extend(['--credential-directory-fd', value])
+                            if frontend == 'loki':
+                                command.extend(['--', '--headless'])
+                            process = subprocess.run(
+                                command, pass_fds=inherited, cwd=directory,
+                                env=child_environment(PATH=os.environ.get('PATH', ''),
+                                                      HOME=directory, XDG_CONFIG_HOME=directory,
+                                                      XDG_STATE_HOME=directory),
+                                capture_output=True, text=True)
+                            self.assertEqual(process.returncode, 2, process.stderr)
+                            self.assertEqual(process.stdout, '')
+                            self.assertIn(expected, process.stderr)
+                            self.assertNotIn('descriptor', process.stderr)
+                            self.assertEqual(os.listdir(directory), [])
+                            os.fstat(directory_fd)
+            finally:
+                os.close(directory_fd)
+                os.close(owner_read)
+                os.close(owner_write)
+                child.close()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
+    def test_headless_startup_preserves_closed_output_streams(self):
+        wrapper = r'''
+import json,os,sys
+for fd in json.loads(sys.argv[2]):
+    os.close(fd)
+os.execve(sys.argv[1], [sys.argv[1], '--headless', '--prompt', 'startup check'], os.environ)
+'''
+        for closed in [[], [1], [2], [1, 2]]:
+            with self.subTest(closed=closed), \
+                    tempfile.TemporaryDirectory() as home, \
+                    tempfile.TemporaryDirectory() as state, \
+                    tempfile.TemporaryDirectory() as workspace:
+                environment = child_environment(
+                    PATH=os.environ.get('PATH', ''), HOME=home,
+                    XDG_CONFIG_HOME=home, XDG_STATE_HOME=state,
+                    LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                    LOKI_MODEL='dummy', LOKI_DUMMY_REPLY='closed-stream startup completed')
+                storage = credential_storages.JsonCredentialStorage(
+                    paths.credential_directory(environment))
+                try:
+                    original = tokens()
+                    asyncio.run(storage.store_openai_login(original))
+                    process = subprocess.run(
+                        [sys.executable, '-c', wrapper, entrypoint('loki'), json.dumps(closed)],
+                        stdin=subprocess.DEVNULL, capture_output=True,
+                        cwd=workspace, env=environment, text=True)
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    if 1 not in closed:
+                        self.assertIn('closed-stream startup completed', process.stdout)
+                    self.assertEqual(storage.load_openai_subscription().tokens,
+                                     original.normalized())
+                finally:
+                    storage.close()
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
     def test_late_login_stays_hidden_from_live_runtime_and_tool(self):

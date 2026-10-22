@@ -318,6 +318,7 @@ class WindowsStdinAdapterTests(unittest.TestCase):
                                    close=mock.Mock())
         crt = SimpleNamespace(open_osfhandle=mock.Mock(return_value=17))
         with mock.patch.object(host_ipc, 'os', platform), \
+                mock.patch.object(host_ipc, 'sys', SimpleNamespace(platform='win32')), \
                 mock.patch.dict(sys.modules, {'msvcrt': crt}), \
                 mock.patch.object(host_ipc, 'private_pipe', return_value=[101, 102]) as create, \
                 mock.patch.object(host_ipc.windows_api, 'close_handle') as close:
@@ -336,6 +337,7 @@ class WindowsStdinAdapterTests(unittest.TestCase):
                                    close=mock.Mock())
         crt = SimpleNamespace(open_osfhandle=mock.Mock(side_effect=OSError('conversion failed')))
         with mock.patch.object(host_ipc, 'os', platform), \
+                mock.patch.object(host_ipc, 'sys', SimpleNamespace(platform='win32')), \
                 mock.patch.dict(sys.modules, {'msvcrt': crt}), \
                 mock.patch.object(host_ipc, 'private_pipe', return_value=[101, 102]), \
                 mock.patch.object(host_ipc.windows_api, 'close_handle') as close:

@@ -217,6 +217,17 @@ class JsonCredentialStorage:
                 private_files.close(fd)
 
     @property
+    def directory_handle(self):
+        """Borrow the retained object for trusted runtime startup.
+
+        The store keeps ownership. A spawned process receives its own inherited
+        descriptor copy and must close that copy before running model code.
+        """
+        if self._directory_fd is None:
+            raise CredentialStorageError("credential storage is closed")
+        return self._directory_fd
+
+    @property
     def file_path(self):
         return os.path.join(
             self.directory, paths.CREDENTIAL_FILE_NAME)

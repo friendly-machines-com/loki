@@ -64,8 +64,10 @@ if sys.platform == "win32":
     from . import windows_runtime
     from .runtime_isolations import RuntimeIsolationError
 
-    def isolate_runtime() -> None:
+    def isolate_runtime(credential_directory=None) -> None:
         """Confirm this process is the contained runtime, before it loads."""
+        if credential_directory is not None:
+            raise RuntimeIsolationError("credential protection is unavailable")
         windows_runtime.verify_runtime()
 
     def verify_contained_runtime() -> None:
@@ -90,7 +92,7 @@ if sys.platform == "win32":
         return None
 
     async def start_runtime(executable, arguments, workspace, environment,
-                            delegation):
+                            delegation, *, credential_directory=None):
         command = [
             executable, "--runtime", *delegation.child_arguments(),
             "--", *arguments,
@@ -105,7 +107,7 @@ if sys.platform == "win32":
             executable, command[1:], environment, workspace, inherited,
             current_directory=os.getcwd())
 
-    async def start_worker(cwd, environment, delegation):
+    async def start_worker(cwd, environment, delegation, *, credential_directory=None):
         """The ACP worker, contained like the terminal runtime.
 
         The session cwd is the workspace: its container must already be
@@ -148,8 +150,8 @@ else:
     from . import runtime_isolations
     from .runtime_isolations import RuntimeIsolationError
 
-    def isolate_runtime() -> None:
-        runtime_isolations.isolate_credential_directory()
+    def isolate_runtime(credential_directory=None) -> None:
+        runtime_isolations.isolate_credential_directory(credential_directory)
 
     def verify_contained_runtime() -> None:
         # A subagent inherits the runtime's covered mount; re-unsharing would
@@ -169,20 +171,60 @@ else:
 
         return argument_preflight(arguments)
 
-    async def start_runtime(executable, arguments, workspace, environment,
-                            delegation):
+    async def _create_posix_process(delegation, *command, **options):
+        """Join unpublished creation even when the caller is cancelled again."""
         import asyncio
 
-        command = [
-            executable, "--runtime", *delegation.child_arguments(),
-            "--", *arguments,
-        ]
-        logger.debug("runtime command: %r", command)
-        return await asyncio.create_subprocess_exec(
-            *command, close_fds=True, env=environment,
-            **delegation.child_spawn_kwargs())
+        creation = asyncio.create_task(asyncio.create_subprocess_exec(*command, **options))
+        try:
+            return await asyncio.shield(creation)
+        except asyncio.CancelledError:
+            delegation.revoke_now()
+            creation.cancel()
 
-    async def start_worker(cwd, environment, delegation):
+            async def retire():
+                try:
+                    process = await creation
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    return  # Creation failed without publishing a process.
+                # Creation may have finished immediately before cancellation.
+                # Closing its transport retires the child and pipes, including
+                # output ends another descendant might otherwise keep open.
+                process._transport.close()
+                await process.wait()
+
+            cleanup = asyncio.create_task(retire())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+            raise
+
+    async def start_runtime(executable, arguments, workspace, environment,
+                            delegation, *, credential_directory=None):
+        if credential_directory is None:
+            raise RuntimeIsolationError("credential protection is unavailable")
+        directory_fd = host_ipc.duplicate_for_child(credential_directory)
+        try:
+            command = [
+                executable, "--runtime", *delegation.child_arguments(),
+                "--credential-directory-fd", str(directory_fd),
+                "--", *arguments,
+            ]
+            logger.debug("runtime command: %r", command)
+            return await _create_posix_process(
+                delegation, *command, close_fds=True, env=environment,
+                **delegation.child_spawn_kwargs(directory_fd))
+        finally:
+            # Creation and cancellation cleanup have settled before this
+            # launch copy closes. Storage still owns its original handle.
+            os.close(directory_fd)
+
+    async def start_worker(cwd, environment, delegation, *, credential_directory=None):
         """The ACP worker on POSIX: piped stdio, delegated descriptors.
 
         ``cwd`` is unused here -- the worker learns the session directory
@@ -191,21 +233,28 @@ else:
         """
         import asyncio
 
-        command = [*worker_command(), *delegation.child_arguments()]
-        logger.debug("worker command: %r", command)
-        return await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=None,
-            close_fds=True,
-            env=environment,
-            **delegation.child_spawn_kwargs(),
-            # ACP uses pipes, not a terminal. A new session prevents
-            # an inherited controlling terminal from becoming an
-            # escape channel through TIOCSTI or terminal signals.
-            start_new_session=True,
-        )
+        if credential_directory is None:
+            raise RuntimeIsolationError("credential protection is unavailable")
+        directory_fd = host_ipc.duplicate_for_child(credential_directory)
+        try:
+            command = [*worker_command(), *delegation.child_arguments(),
+                       "--credential-directory-fd", str(directory_fd)]
+            logger.debug("worker command: %r", command)
+            return await _create_posix_process(
+                delegation, *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=None,
+                close_fds=True,
+                env=environment,
+                **delegation.child_spawn_kwargs(directory_fd),
+                # ACP uses pipes, not a terminal. A new session prevents
+                # an inherited controlling terminal from becoming an
+                # escape channel through TIOCSTI or terminal signals.
+                start_new_session=True,
+            )
+        finally:
+            os.close(directory_fd)
 
     def close_runtime_process(process) -> None:
         # An asyncio subprocess owns its transport; waiting has closed it.

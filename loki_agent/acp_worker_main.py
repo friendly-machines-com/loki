@@ -119,40 +119,41 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
             await runtime.close()
 
 
-def _descriptor(value: str, description: str):
+def _descriptor(value: str):
     try:
         return host_ipc.child_endpoint(value)
     except (OSError, ValueError) as error:
-        raise ValueError(
-            f"invalid ACP worker {description} descriptor") from error
+        raise ValueError("credential protection is unavailable") from error
 
 
 def _runtime_descriptors(args):
     required = {"--session-owner-fd", "--credential-capability-fd"}
     if sys.platform == "win32":
         required.add("--stdout-null-handle")
+    else:
+        required.add("--credential-directory-fd")
     options, positional = getopt.getopt(
         args, "", [name[2:] + "=" for name in sorted(required)])
     if positional:
-        raise ValueError("invalid ACP worker arguments")
+        raise ValueError("credential protection is unavailable")
     values = {}
     for name, value in options:
         if name in values:
-            raise ValueError(f"duplicate ACP worker option {name}")
+            raise ValueError("credential protection is unavailable")
         values[name] = value
     if set(values) != required:
-        raise ValueError("ACP workers require " + ", ".join(sorted(required)))
+        raise ValueError("credential protection is unavailable")
     null_handle = None
     if "--stdout-null-handle" in values:
         null_handle = int(values["--stdout-null-handle"])
         if null_handle <= 0:
-            raise ValueError("invalid ACP worker stdout NUL handle")
+            raise ValueError("credential protection is unavailable")
     return (
-        _descriptor(values["--session-owner-fd"], "session owner"),
-        _descriptor(
-            values["--credential-capability-fd"],
-            "credential capability"),
+        _descriptor(values["--session-owner-fd"]),
+        _descriptor(values["--credential-capability-fd"]),
         null_handle,
+        (_descriptor(values["--credential-directory-fd"])
+         if "--credential-directory-fd" in values else None),
     )
 
 
@@ -173,7 +174,7 @@ def main() -> int:
 
     args = sys.argv[2:] if sys.argv[1:2] == ["--worker"] else sys.argv[1:]
     try:
-        owner_fd, capability_fd, null_handle = _runtime_descriptors(args)
+        owner_fd, capability_fd, null_handle, directory_fd = _runtime_descriptors(args)
         with ExitStack() as cleanup:
             null_fd = None
             if null_handle is not None:
@@ -182,7 +183,7 @@ def main() -> int:
                     windows_runtime.inherited_stdout_null(null_handle))
             # Adopt the handle before gates/logging can fail; no inherited
             # temporary copy may escape into later tool children.
-            runtime_isolation.isolate_runtime()
+            runtime_isolation.isolate_runtime(directory_fd)
             runtime_isolation.prepare_runtime_scratch()
             protect_credential_process()
             if not configure_logging(contained=True):

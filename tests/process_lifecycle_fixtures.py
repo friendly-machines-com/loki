@@ -66,7 +66,7 @@ class ProcessResources:
         process = self.process
         if process.returncode is None:
             process.kill()
-            await asyncio.wait_for(self.wait(), 5)
+            await self.wait()
         if self.transport is not None:
             self.transport.close()
 
@@ -123,7 +123,8 @@ async def process_lifecycle(name):
         os.mkdir(workspace)
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith('LOKI_')
-                       and not key.endswith(('_KEY', '_TOKEN', '_PAT'))}
+                       and not any(key.endswith(suffix)
+                                   for suffix in ['_KEY', '_TOKEN', '_PAT'])}
         environment.update({
             'HOME': root,
             'XDG_CONFIG_HOME': os.path.join(root, 'config'),
@@ -173,5 +174,8 @@ async def process_lifecycle(name):
                 for delegation in observations.delegations:
                     await delegation.close()
             finally:
-                for resources in observations.processes:
-                    await resources.cleanup()
+                try:
+                    for resources in observations.processes:
+                        await resources.cleanup()
+                finally:
+                    supervisor.storage.close()

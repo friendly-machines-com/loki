@@ -5,6 +5,7 @@ import contextlib
 import errno
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -157,16 +158,18 @@ class LinuxIsolationTests(unittest.TestCase):
                 libc = mock.Mock(prctl=mock.Mock(side_effect=prctl))
                 with mock.patch.object(runtime_isolations.ctypes, 'CDLL', return_value=libc):
                     with self.assertRaisesRegex(
-                            runtime_isolations.RuntimeIsolationError, 'credential directory'):
-                        runtime_isolations.isolate_credential_directory(
-                            os.path.join(directory, 'missing'))
+                            runtime_isolations.RuntimeIsolationError, 'credential protection'):
+                        runtime_isolations.isolate_credential_directory(None)
                     self.assertEqual(state, 1)
                     not_directory = os.path.join(directory, 'file')
                     with open(not_directory, 'w'):
                         pass
+                    fd = os.open(not_directory, os.O_RDONLY)
                     with self.assertRaisesRegex(
                             runtime_isolations.RuntimeIsolationError, 'not a directory'):
-                        runtime_isolations.isolate_credential_directory(not_directory)
+                        runtime_isolations.isolate_credential_directory(fd)
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
 
     def test_no_new_privileges_failure_is_fatal_without_credentials(self):
         libc = mock.Mock()
@@ -174,17 +177,75 @@ class LinuxIsolationTests(unittest.TestCase):
         with mock.patch.object(runtime_isolations.ctypes, "CDLL",
                                return_value=libc), \
                 mock.patch.object(runtime_isolations.ctypes, "get_errno",
-                                  return_value=errno.EPERM), \
-                mock.patch.object(runtime_isolations.os.path, "isdir",
-                                  return_value=False):
+                                  return_value=errno.EPERM):
             with self.assertRaisesRegex(
                     runtime_isolations.RuntimeIsolationError,
                     "PR_SET_NO_NEW_PRIVS"):
-                runtime_isolations.isolate_credential_directory("/missing")
+                runtime_isolations.isolate_credential_directory(None)
         self.assertEqual(
             [argument.value for argument in libc.prctl.call_args.args],
             [runtime_isolations._PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0],
         )
+
+    @contextlib.contextmanager
+    def directory_startup(self, failure=None):
+        original = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=2)
+        target = types.SimpleNamespace(st_mode=original.st_mode, st_dev=1,
+                                       st_ino=3 if failure == 'identity' else 2)
+        closed = []
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runtime_isolations.ctypes, 'CDLL'))
+            stack.enter_context(mock.patch.object(runtime_isolations, '_set_no_new_privileges'))
+            unshare = stack.enter_context(mock.patch.object(
+                runtime_isolations, '_unshare_user_and_mount_namespaces',
+                side_effect=runtime_isolations.RuntimeIsolationError('namespace') if failure == 'namespace' else None))
+            stack.enter_context(mock.patch.object(runtime_isolations, '_map_current_identity'))
+            stack.enter_context(mock.patch.object(runtime_isolations.os, 'getcwd', return_value='/trusted/source'))
+
+            def kernel_name(path):
+                unshare.assert_not_called()
+                self.assertEqual(path, '/proc/self/fd/80')
+                if failure == 'name':
+                    raise FileNotFoundError()
+                return '/moved/credentials'
+
+            stack.enter_context(mock.patch.object(runtime_isolations.os, 'readlink', side_effect=kernel_name))
+            stack.enter_context(mock.patch.object(runtime_isolations.os, 'fstat', side_effect=[original, target]))
+
+            def reopen(*args):
+                unshare.assert_called_once()
+                self.assertEqual(args[0], '/moved/credentials')
+                if failure == 'reopen':
+                    raise FileNotFoundError()
+                return 81
+
+            stack.enter_context(mock.patch.object(runtime_isolations.os, 'open', side_effect=reopen))
+            mount = stack.enter_context(mock.patch.object(
+                runtime_isolations, '_mount_private_credential_view',
+                side_effect=runtime_isolations.RuntimeIsolationError('mount') if failure == 'mount' else None))
+            stack.enter_context(mock.patch.object(
+                runtime_isolations.os, 'chdir',
+                side_effect=OSError('cwd') if failure == 'cwd' else None))
+            stack.enter_context(mock.patch.object(
+                runtime_isolations, '_drop_namespace_capabilities',
+                side_effect=runtime_isolations.RuntimeIsolationError('capabilities') if failure == 'capabilities' else None))
+            stack.enter_context(mock.patch.object(runtime_isolations.os, 'close', side_effect=closed.append))
+            yield [mount, closed]
+
+    def test_mount_target_is_bound_to_the_checked_directory_handle(self):
+        with self.directory_startup() as [mount, closed]:
+            self.assertTrue(runtime_isolations.isolate_credential_directory(80))
+            self.assertEqual(mount.call_args.args[1], '/proc/self/fd/81')
+            self.assertCountEqual(closed, [80, 81])
+
+    def test_startup_directory_handles_close_on_every_failure(self):
+        for failure in ['name', 'namespace', 'reopen', 'identity', 'mount', 'cwd', 'capabilities']:
+            with self.subTest(failure=failure), self.directory_startup(failure) as [mount, closed]:
+                with self.assertRaises(runtime_isolations.RuntimeIsolationError):
+                    runtime_isolations.isolate_credential_directory(80)
+                self.assertCountEqual(closed, [80] if failure in ['name', 'namespace', 'reopen'] else [80, 81])
+                if failure in ['name', 'namespace', 'reopen', 'identity']:
+                    mount.assert_not_called()
 
     def test_credential_cover_allows_workspace_but_denies_runtime_and_exec_child(self):
         # Windows side:
@@ -218,7 +279,23 @@ with open(secret, encoding="ascii") as stream:
 with open(control, encoding="ascii") as stream:
     assert stream.read() == "workspace-visible"
 os.chdir(starting_cwd)
-isolated = isolate_credential_directory(target)
+directory_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+pinned_directory = os.fstat(directory_fd)
+isolated = isolate_credential_directory(directory_fd)
+try:
+    os.fstat(directory_fd)
+except OSError:
+    pass
+else:
+    raise AssertionError("startup directory descriptor remains open")
+with os.scandir('/proc/self/fd') as entries:
+    for entry in entries:
+        try:
+            held = os.fstat(int(entry.name))
+        except OSError:
+            continue
+        assert (held.st_dev != pinned_directory.st_dev or
+                held.st_ino != pinned_directory.st_ino), 'underlying directory reference remains open'
 assert os.getcwd() == starting_cwd
 if starting_cwd == target:
     try:
@@ -314,6 +391,221 @@ print(json.dumps({
                     with open(os.path.join(workspace, "runtime-created"),
                               encoding="ascii") as stream:
                         self.assertEqual(stream.read(), "allowed write")
+
+    def test_native_reopen_identity_bind_ancestry_and_cwd_failure(self):
+        # Real syscalls select both objects. Only the interval at which this
+        # disposable fixture renames a name is controlled; stat/open/mount are
+        # not substituted. A bind-path test is not coverage of every alias.
+        code = r'''
+import ctypes,json,os,sys
+from loki_agent import paths
+from loki_agent import runtime_isolations as isolation
+mode,base,view,moved,workspace,inherited = sys.argv[1:]
+fd = int(inherited)
+pinned = os.fstat(fd)
+libc = ctypes.CDLL(None, use_errno=True)
+target = paths.credential_directory({'XDG_CONFIG_HOME': base})
+if mode.startswith('bind-'):
+    isolation._set_no_new_privileges(libc)
+    uid,gid = os.getuid(),os.getgid()
+    isolation._unshare_user_and_mount_namespaces(libc)
+    isolation._map_current_identity(uid,gid)
+    mount = libc.mount
+    mount.argtypes = [ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,
+                      ctypes.c_ulong,ctypes.c_void_p]
+    mount.restype = ctypes.c_int
+    for source,destination,flags in [
+            [None,b'/',isolation._MS_REC | isolation._MS_PRIVATE],
+            [os.fsencode(base),os.fsencode(view),4096]]:
+        if mount(source,destination,None,flags,None) != 0:
+            raise OSError(ctypes.get_errno(), 'fixture bind mount failed')
+    target = paths.credential_directory({'XDG_CONFIG_HOME': view})
+    selected = os.open(target,os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    assert os.path.samestat(pinned,os.fstat(selected))
+    os.close(fd)
+    fd = selected
+with os.scandir(target) as entries:
+    secret = next(entry.path for entry in entries if entry.name == paths.CREDENTIAL_FILE_NAME)
+with open(secret) as stream:
+    assert 'native-retained-access' in stream.read()
+original_unshare = isolation._unshare_user_and_mount_namespaces
+def unshare(native):
+    original_unshare(native)
+    if mode in ['replacement','renamed-back']:
+        os.rename(target,moved)
+        if mode == 'replacement':
+            os.mkdir(target,0o700)
+        else:
+            os.rename(moved,target)
+isolation._unshare_user_and_mount_namespaces = unshare
+original_mount = isolation._mount_private_credential_view
+def cover(native,name):
+    original_mount(native,name)
+    if mode == 'cwd-removed':
+        os.rmdir(workspace)
+isolation._mount_private_credential_view = cover
+os.chdir(target if mode == 'bind-credentials' else workspace)
+refused = False
+try:
+    assert isolation.isolate_credential_directory(fd)
+except isolation.RuntimeIsolationError as error:
+    if mode == 'replacement':
+        assert 'credential location changed' in str(error),repr(error)
+    elif mode == 'cwd-removed':
+        assert isinstance(error.__cause__,FileNotFoundError),repr(error)
+        assert 'working directory' in str(error),repr(error)
+    else:
+        raise
+    refused = True
+assert refused == (mode in ['replacement','cwd-removed'])
+with os.scandir('/proc/self/fd') as entries:
+    for entry in entries:
+        try:
+            held = os.fstat(int(entry.name))
+        except OSError:
+            continue
+        assert not os.path.samestat(pinned,held),'startup directory reference survived'
+if not refused:
+    try:
+        with open(secret) as stream:
+            stream.read()
+    except (PermissionError,FileNotFoundError):
+        pass
+    else:
+        raise AssertionError('selected credential view is readable')
+    if mode == 'bind-credentials':
+        try:
+            os.open(paths.CREDENTIAL_FILE_NAME,os.O_RDONLY)
+        except (PermissionError,FileNotFoundError):
+            pass
+        else:
+            raise AssertionError('cwd retained the pre-cover directory')
+print(json.dumps({'mode':mode,'refused':refused,'startup_references_closed':True}))
+'''
+        for mode in ['replacement', 'renamed-back', 'bind-workspace',
+                     'bind-credentials', 'cwd-removed']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as base, \
+                    tempfile.TemporaryDirectory() as view, \
+                    tempfile.TemporaryDirectory() as moved, \
+                    tempfile.TemporaryDirectory() as workspace:
+                storage = credential_storages.JsonCredentialStorage(
+                    paths.credential_directory({'XDG_CONFIG_HOME': base}))
+                try:
+                    tokens = authentications.OpenAITokenSet(
+                        access_token='native-retained-access', refresh_token='native-retained-refresh',
+                        expires_at=10**12, last_refresh=100)
+                    asyncio.run(storage.store_openai_login(tokens))
+                    os.rmdir(moved)
+                    process = subprocess.run(
+                        [sys.executable, '-c', code, mode, base, view, moved, workspace,
+                         str(storage.directory_handle)], pass_fds=[storage.directory_handle],
+                        cwd=ROOT, capture_output=True, text=True)
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    self.assertTrue(json.loads(process.stdout)['startup_references_closed'])
+                    self.assertEqual(storage.load_openai_subscription().tokens, tokens.normalized())
+                    # The failed or completed child must not consume the
+                    # parent's retained store or redirect its next publication.
+                    asyncio.run(storage.remove_openai_subscription())
+                    self.assertIsNone(storage.load_openai_subscription())
+                finally:
+                    storage.close()
+
+    def test_isolated_peer_cannot_recover_another_startup_directory(self):
+        target_code = r'''
+import ctypes,json,os,sys
+from loki_agent import runtime_isolations as isolation
+fd,stage = int(sys.argv[1]),sys.argv[2]
+libc = ctypes.CDLL(None,use_errno=True)
+if stage == 'after-unshare':
+    isolation._set_no_new_privileges(libc)
+    uid,gid = os.getuid(),os.getgid()
+    isolation._unshare_user_and_mount_namespaces(libc)
+    isolation._map_current_identity(uid,gid)
+print(json.dumps({'pid':os.getpid(),'dumpable':libc.prctl(3,0,0,0,0)}),flush=True)
+sys.stdin.read(1)
+'''
+        observer_code = r'''
+import json,os,sys
+from loki_agent import paths,runtime_isolations as isolation
+root,pid,reference = sys.argv[1:]
+def read_at(directory):
+    fd = os.open(directory,os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        token = os.open(paths.CREDENTIAL_FILE_NAME,os.O_RDONLY,dir_fd=fd)
+        with os.fdopen(token) as stream:
+            return stream.read()
+    finally:
+        os.close(fd)
+def attempt(directory):
+    try:
+        read_at(directory)
+    except OSError as error:
+        return error.errno
+    raise AssertionError('isolated observer recovered synthetic credentials')
+isolation.isolate_credential_directory(os.open(root,os.O_RDONLY | os.O_DIRECTORY))
+# This is the actual kernel reference route, not a rewritten configured path.
+foreign = f'/proc/{pid}/fd/{reference}'
+print(json.dumps([attempt(root),attempt(foreign)]),flush=True)
+'''
+        parent_code = r'''
+import json,os,subprocess,sys
+from loki_agent import paths,process_protections
+fd,root = int(sys.argv[1]),sys.argv[2]
+target_code,observer_code = sys.argv[3:]
+process_protections.protect_credential_process()
+os.set_inheritable(fd,False)
+try:
+    for stage in ['before-unshare','after-unshare']:
+        target = subprocess.Popen(
+            [sys.executable,'-c',target_code,str(fd),stage],pass_fds=[fd],close_fds=True,
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        try:
+            line = target.stdout.readline()
+            if not line:
+                raise AssertionError('startup witness failed: '+target.stderr.read())
+            ready = json.loads(line)
+            assert ready['dumpable'] == 1
+            foreign = f'/proc/{ready["pid"]}/fd/{fd}'
+            directory = os.open(foreign,os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                token = os.open(paths.CREDENTIAL_FILE_NAME,os.O_RDONLY,dir_fd=directory)
+                with os.fdopen(token) as stream:
+                    assert 'proc-reference-access' in stream.read()
+            finally:
+                os.close(directory)
+            observer = subprocess.run(
+                [sys.executable,'-c',observer_code,root,str(ready['pid']),str(fd)],
+                capture_output=True,text=True,close_fds=True)
+            assert observer.returncode == 0,observer.stderr
+            errors = json.loads(observer.stdout)
+            assert all(error in [1,13] for error in errors),errors
+        finally:
+            if target.poll() is None:
+                target.stdin.write('x')
+                target.stdin.flush()
+            output,errors = target.communicate()
+            assert target.returncode == 0,errors
+finally:
+    os.close(fd)
+print('matched startup-reference controls passed')
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            storage = credential_storages.JsonCredentialStorage(directory)
+            try:
+                tokens = authentications.OpenAITokenSet(
+                    access_token='proc-reference-access', refresh_token='proc-reference-refresh',
+                    expires_at=10**12, last_refresh=100)
+                asyncio.run(storage.store_openai_login(tokens))
+                process = subprocess.run(
+                    [sys.executable, '-c', parent_code, str(storage.directory_handle),
+                     directory, target_code, observer_code],
+                    pass_fds=[storage.directory_handle], cwd=ROOT,
+                    capture_output=True, text=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertIn('matched startup-reference controls passed', process.stdout)
+                self.assertEqual(storage.load_openai_subscription().tokens, tokens.normalized())
+            finally:
+                storage.close()
 
 
 def launch_patches(spawn):
@@ -578,13 +870,15 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 await runtime.close()
             await delegation.close()
 
-    async def test_terminal_runtime_receives_only_delegated_descriptors(self):
+    async def test_terminal_runtime_receives_channels_and_startup_directory(self):
         store = CredentialStore({
             "LOKI_API_KEY": "must-not-enter-runtime-environment",
             "LOKI_MODEL": "model",
         })
-        supervisor = credential_supervisors.CredentialSupervisor(
-            store)
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        storage = credential_storages.JsonCredentialStorage(directory)
+        self.addCleanup(storage.close)
+        supervisor = credential_supervisors.CredentialSupervisor(store, storage)
         spawned = {}
 
         class Process:
@@ -596,6 +890,14 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
         async def spawn(*args, **kwargs):
             spawned["args"] = args
             spawned["kwargs"] = kwargs
+            if os.name == 'posix':
+                directory_fd = int(args[args.index('--credential-directory-fd') + 1])
+                spawned['directory_fd'] = directory_fd
+                self.assertGreaterEqual(directory_fd, 3)
+                self.assertNotEqual(directory_fd, storage.directory_handle)
+                self.assertTrue(os.path.samestat(
+                    os.fstat(directory_fd), os.fstat(storage.directory_handle)))
+                self.assertFalse(os.get_inheritable(directory_fd))
             return Process()
 
         with contextlib.ExitStack() as stack:
@@ -615,7 +917,12 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "--credential-capability-fd", spawned["args"])
             self.assertEqual(
                 spawned["args"][-2:], ("--", "--headless"))
-            self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 2)
+            self.assertIn("--credential-directory-fd", spawned["args"])
+            self.assertIn(spawned['directory_fd'], spawned["kwargs"]["pass_fds"])
+            self.assertEqual(len(spawned["kwargs"]["pass_fds"]), 3)
+            with self.assertRaises(OSError):
+                os.fstat(spawned['directory_fd'])
+            self.assertIsNone(storage.load_openai_subscription())
             self.assertTrue(spawned["kwargs"]["close_fds"])
             environment = spawned["kwargs"]["env"]
         else:
@@ -630,16 +937,19 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_supervisor_revokes_then_allows_clean_runtime_exit(self):
         store = CredentialStore({})
-        supervisor = credential_supervisors.CredentialSupervisor(
-            store)
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        storage = credential_storages.JsonCredentialStorage(directory)
+        self.addCleanup(storage.close)
+        supervisor = credential_supervisors.CredentialSupervisor(store, storage)
         revoked = asyncio.Event()
         closed = asyncio.Event()
+        waiting = asyncio.Event()
 
         class Delegation:
             def child_arguments(self):
                 return []
 
-            def child_spawn_kwargs(self):
+            def child_spawn_kwargs(self, credential_directory=None):
                 return {}
 
             def child_spawned(self):
@@ -657,6 +967,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
             killed = False
 
             async def wait(self):
+                waiting.set()
                 await revoked.wait()
                 self.returncode = 23
                 return self.returncode
@@ -680,7 +991,7 @@ class CredentialSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patch)
             task = asyncio.create_task(
                 supervisor.run_terminal_runtime("/loki", []))
-            await asyncio.sleep(0)
+            await waiting.wait()
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
@@ -782,52 +1093,279 @@ class CredentialRuntimeCleanupTests(unittest.IsolatedAsyncioTestCase):
                      "by test_windows_runtime")
 class StartWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_spawn_is_piped_delegated_and_sessioned(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        storage = credential_storages.JsonCredentialStorage(directory)
+        self.addCleanup(storage.close)
+        delegation = await credential_supervisors.RuntimeDelegation.create(
+            authentications.CredentialBroker())
+        self.addAsyncCleanup(delegation.close)
         spawned = {}
 
-        class Endpoint:
-            def __init__(self, *handles):
-                self._handles = handles
-
-            def handles(self):
-                return self._handles
-
-        class Delegation:
-            owner_child = Endpoint(7)
-            credential_child = Endpoint(9)
-
-            def child_arguments(self):
-                return ["--session-owner-fd", "7",
-                        "--credential-capability-fd", "9"]
-
-            def child_spawn_kwargs(self):
-                return {"pass_fds": [7, 9]}
-
         async def spawn(*args, **kwargs):
-            spawned["args"] = args
-            spawned["kwargs"] = kwargs
+            spawned['args'] = args
+            spawned['kwargs'] = kwargs
+            fd = int(args[args.index('--credential-directory-fd') + 1])
+            spawned['directory_fd'] = fd
+            self.assertGreaterEqual(fd, 3)
+            self.assertNotEqual(fd, storage.directory_handle)
+            self.assertTrue(os.path.samestat(
+                os.fstat(fd), os.fstat(storage.directory_handle)))
+            self.assertFalse(os.get_inheritable(fd))
             return object()
 
         with mock.patch.object(
-                runtime_isolation, "worker_command",
-                return_value=["/installed/bin/loki", "--worker"]), \
-                mock.patch.object(asyncio, "create_subprocess_exec",
-                                  new=spawn):
+                runtime_isolation, 'worker_command',
+                return_value=['/installed/bin/loki', '--worker']), \
+                mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn):
             await runtime_isolation.start_worker(
-                "/work", {"SAFE": "value"}, Delegation())
+                '/work', {'SAFE': 'value'}, delegation,
+                credential_directory=storage.directory_handle)
 
-        self.assertEqual(spawned["args"], (
-            "/installed/bin/loki", "--worker",
-            "--session-owner-fd", "7",
-            "--credential-capability-fd", "9",
-        ))
-        kwargs = spawned["kwargs"]
-        self.assertIs(kwargs["stdin"], asyncio.subprocess.PIPE)
-        self.assertIs(kwargs["stdout"], asyncio.subprocess.PIPE)
-        self.assertIsNone(kwargs["stderr"])
-        self.assertTrue(kwargs["close_fds"])
-        self.assertEqual(kwargs["env"], {"SAFE": "value"})
-        self.assertEqual(kwargs["pass_fds"], [7, 9])
-        self.assertTrue(kwargs["start_new_session"])
+        self.assertEqual(list(spawned['args']), [
+            '/installed/bin/loki', '--worker', *delegation.child_arguments(),
+            '--credential-directory-fd', str(spawned['directory_fd'])])
+        kwargs = spawned['kwargs']
+        self.assertIs(kwargs['stdin'], asyncio.subprocess.PIPE)
+        self.assertIs(kwargs['stdout'], asyncio.subprocess.PIPE)
+        self.assertIsNone(kwargs['stderr'])
+        self.assertTrue(kwargs['close_fds'])
+        self.assertEqual(kwargs['env'], {'SAFE': 'value'})
+        self.assertEqual(kwargs['pass_fds'], [
+            delegation.owner_child, delegation.credential_child, spawned['directory_fd']])
+        self.assertTrue(kwargs['start_new_session'])
+        with self.assertRaises(OSError):
+            os.fstat(spawned['directory_fd'])
+        reused = os.dup2(storage.directory_handle, spawned['directory_fd'], inheritable=False)
+        try:
+            delegation.child_spawned()
+            await delegation.close()
+            self.assertTrue(os.path.samestat(
+                os.fstat(reused), os.fstat(storage.directory_handle)))
+            self.assertIsNone(storage.load_openai_subscription())
+        finally:
+            os.close(reused)
+
+    async def test_directory_copy_lives_until_creation_settles_and_closes_on_each_outcome(self):
+        for kind in ['terminal', 'worker']:
+            for outcome in ['success', 'failure', 'cancel']:
+                with self.subTest(kind=kind, outcome=outcome), \
+                        tempfile.TemporaryDirectory() as directory:
+                    storage = credential_storages.JsonCredentialStorage(directory)
+                    delegation = await credential_supervisors.RuntimeDelegation.create(
+                        authentications.CredentialBroker())
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    inherited = []
+
+                    async def spawn(*args, **kwargs):
+                        fd = int(args[args.index('--credential-directory-fd') + 1])
+                        inherited.append(fd)
+                        self.assertIn(fd, kwargs['pass_fds'])
+                        entered.set()
+                        await release.wait()
+                        if outcome == 'failure':
+                            raise OSError('creation refused')
+                        return object()
+
+                    try:
+                        with mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn), \
+                                mock.patch.object(runtime_isolation, 'worker_command',
+                                                  return_value=['/selected/loki-acp', '--worker']):
+                            if kind == 'terminal':
+                                operation = runtime_isolation.start_runtime(
+                                    '/selected/loki', [], None, {}, delegation,
+                                    credential_directory=storage.directory_handle)
+                            else:
+                                operation = runtime_isolation.start_worker(
+                                    directory, {}, delegation,
+                                    credential_directory=storage.directory_handle)
+                            task = asyncio.create_task(operation)
+                            try:
+                                await entered.wait()
+                                self.assertTrue(os.path.samestat(
+                                    os.fstat(inherited[0]), os.fstat(storage.directory_handle)))
+                                if outcome == 'cancel':
+                                    task.cancel()
+                                    with self.assertRaises(asyncio.CancelledError):
+                                        await task
+                                else:
+                                    release.set()
+                                    if outcome == 'failure':
+                                        with self.assertRaisesRegex(OSError, 'creation refused'):
+                                            await task
+                                    else:
+                                        await task
+                            finally:
+                                release.set()
+                                if not task.done() and not task.cancelling():
+                                    task.cancel()
+                                await asyncio.gather(task, return_exceptions=True)
+                        with self.assertRaises(OSError):
+                            os.fstat(inherited[0])
+                        self.assertIsNone(storage.load_openai_subscription())
+                    finally:
+                        await delegation.close()
+                        storage.close()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'real Linux runtime creation')
+    async def test_cancelled_native_creation_reaps_unpublished_child_before_releasing_copy(self):
+        from asyncio.base_subprocess import BaseSubprocessTransport
+        from process_lifecycle_fixtures import process_lifecycle
+        from loki_agent import host_ipc
+
+        for kind, repeat in [['terminal', False], ['worker', False],
+                             ['terminal', True], ['worker', True]]:
+            with self.subTest(kind=kind, repeated_cancellation=repeat):
+                async with process_lifecycle('loki' if kind == 'terminal' else 'loki-acp') as fixture:
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    transports, copies = [], []
+                    connect = BaseSubprocessTransport._connect_pipes
+                    duplicate = host_ipc.duplicate_for_child
+                    storage = fixture.supervisor.storage
+                    original = os.fstat(storage.directory_handle)
+
+                    def copy(fd):
+                        result = duplicate(fd)
+                        if os.path.samestat(original, os.fstat(fd)):
+                            copies.append(result)
+                        return result
+
+                    async def connect_pipes(transport, waiter):
+                        # The real OS child already exists, but the public
+                        # creation coroutine has not published its Process.
+                        transports.append(transport)
+                        entered.set()
+                        await release.wait()
+                        await connect(transport, waiter)
+
+                    front = None
+                    with mock.patch.object(BaseSubprocessTransport, '_connect_pipes', new=connect_pipes), \
+                            mock.patch.object(host_ipc, 'duplicate_for_child', side_effect=copy):
+                        if kind == 'terminal':
+                            operation = fixture.supervisor.run_terminal_runtime(
+                                fixture.launcher, ['--headless', '--prompt', 'creation check'])
+                        else:
+                            front = acp.Front(
+                                lambda: None, lambda message: None,
+                                CredentialStore(fixture.supervisor.environment), storage)
+                            operation = front._open_worker(
+                                cwd=fixture.workspace, open_method='session/new')
+                        task = asyncio.create_task(operation)
+                        try:
+                            await entered.wait()
+                            self.assertEqual(len(copies), 1)
+                            self.assertIsNone(transports[0].get_returncode())
+                            task.cancel()
+                            await asyncio.sleep(0)
+                            if repeat:
+                                task.cancel()
+                                await asyncio.sleep(0)
+                            self.assertFalse(task.done())
+                            self.assertTrue(os.path.samestat(original, os.fstat(copies[0])))
+                            release.set()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+                        finally:
+                            release.set()
+                            if not task.done() and not task.cancelling():
+                                task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    self.assertTrue(transports[0].is_closing())
+                    self.assertIsNotNone(transports[0].get_returncode())
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(transports[0].get_pid(), os.WNOHANG)
+                    if front is not None:
+                        self.assertFalse(front.workers)
+                        self.assertFalse(front._sessions)
+                    held = []
+                    with os.scandir('/proc/self/fd') as entries:
+                        for entry in entries:
+                            try:
+                                candidate = os.fstat(int(entry.name))
+                            except OSError:
+                                continue
+                            if os.path.samestat(original, candidate):
+                                held.append(entry.name)
+                    # Only storage owns the original object now; a recycled
+                    # numeric fd is not mistaken for a surviving launch copy.
+                    self.assertEqual(len(held), 1)
+                    self.assertIsNone(storage.load_openai_subscription())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'real Linux runtime creation')
+    async def test_cancelled_completed_creation_retires_the_unpublished_result(self):
+        from process_lifecycle_fixtures import process_lifecycle
+
+        for kind in ['terminal', 'worker']:
+            with self.subTest(kind=kind):
+                async with process_lifecycle('loki' if kind == 'terminal' else 'loki-acp') as fixture:
+                    if kind == 'terminal':
+                        # This absent workspace file holds the real dummy turn
+                        # live; a leaf alone would refer to the runner's cwd.
+                        fixture.supervisor.environment.update({
+                            'LOKI_STREAM': '1',
+                            'LOKI_DUMMY_STREAM_CHUNKS': '["alive", "done"]',
+                            'LOKI_DUMMY_STREAM_GATE': os.path.join(fixture.workspace, 'release'),
+                        })
+                    create = asyncio.create_subprocess_exec
+                    created = []
+
+                    async def spawn(*args, **kwargs):
+                        process = await create(*args, **kwargs)
+                        created.append(fixture.record_process(process))
+                        self.assertIsNone(process.returncode)
+                        # Creation returns a real Process just as cancellation
+                        # reaches its caller: no result has been published yet.
+                        task.cancel()
+                        return process
+
+                    front = None
+                    with mock.patch.object(asyncio, 'create_subprocess_exec', new=spawn):
+                        if kind == 'terminal':
+                            operation = fixture.supervisor.run_terminal_runtime(
+                                fixture.launcher, ['--headless', '--prompt', 'creation check'])
+                        else:
+                            front = acp.Front(
+                                lambda: None, lambda message: None,
+                                CredentialStore(fixture.supervisor.environment), fixture.supervisor.storage)
+                            operation = front._open_worker(
+                                cwd=fixture.workspace, open_method='session/new')
+                        task = asyncio.create_task(operation)
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    self.assertEqual(len(created), 1)
+                    await fixture.assert_released(self)
+                    if front is not None:
+                        self.assertFalse(front.workers)
+                        self.assertFalse(front._sessions)
+                    self.assertIsNone(fixture.supervisor.storage.load_openai_subscription())
+
+    async def test_copy_acquisition_failure_leaves_storage_and_delegation_usable(self):
+        from loki_agent import host_ipc
+
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        storage = credential_storages.JsonCredentialStorage(directory)
+        self.addCleanup(storage.close)
+        delegation = await credential_supervisors.RuntimeDelegation.create(
+            authentications.CredentialBroker())
+        self.addAsyncCleanup(delegation.close)
+        for kind in ['terminal', 'worker']:
+            with self.subTest(kind=kind), mock.patch.object(
+                    host_ipc, 'duplicate_for_child', side_effect=OSError('copy refused')), \
+                    mock.patch.object(asyncio, 'create_subprocess_exec') as spawn:
+                with self.assertRaisesRegex(OSError, 'copy refused'):
+                    if kind == 'terminal':
+                        await runtime_isolation.start_runtime(
+                            '/selected/loki', [], None, {}, delegation,
+                            credential_directory=storage.directory_handle)
+                    else:
+                        await runtime_isolation.start_worker(
+                            directory, {}, delegation,
+                            credential_directory=storage.directory_handle)
+                spawn.assert_not_called()
+            self.assertIsNone(storage.load_openai_subscription())
+            os.fstat(delegation.owner_child)
+            os.fstat(delegation.credential_child)
 
 
 class WindowsWorkerStdioTests(unittest.IsolatedAsyncioTestCase):

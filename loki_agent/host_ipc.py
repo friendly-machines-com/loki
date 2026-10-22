@@ -468,6 +468,17 @@ class _PipeStreamWriter:
 
 
 if os.name == "posix":
+    def duplicate_for_child(fd: int) -> int:
+        """Own a non-inheritable copy outside the child's standard streams.
+
+        Only explicit pass_fds makes this copy inheritable at exec. The source
+        remains borrowed and unchanged, including when it occupies a closed
+        standard-stream slot in the parent.
+        """
+        import fcntl
+
+        return fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+
     def owner_channel():
         """(parent end, child end) for the session-lifetime channel.
 
@@ -475,8 +486,16 @@ if os.name == "posix":
         to race; ``confirm_pair`` does not apply to its two unidirectional ends
         and is not needed.
         """
-        read_fd, write_fd = os.pipe()
-        return write_fd, read_fd
+        with contextlib.ExitStack() as cleanup:
+            read_fd, write_fd = os.pipe()
+            cleanup.callback(os.close, write_fd)
+            try:
+                child_fd = duplicate_for_child(read_fd)
+                cleanup.callback(os.close, child_fd)
+            finally:
+                os.close(read_fd)
+            cleanup.pop_all()
+            return write_fd, child_fd
 
     def socket_pair():
         """A connected AF_UNIX pair, confirmed as our own; ``socketpair``."""
@@ -485,9 +504,16 @@ if os.name == "posix":
         return pair
 
     def prepare_child_socket(end):
-        """Detach ``end`` so only the child's copy of the descriptor remains."""
-        end.set_inheritable(False)
-        return end.detach()
+        """Transfer an owned child copy without occupying a standard stream."""
+        with contextlib.ExitStack() as cleanup:
+            try:
+                end.set_inheritable(False)
+                fd = duplicate_for_child(end.fileno())
+                cleanup.callback(os.close, fd)
+            finally:
+                end.close()
+            cleanup.pop_all()
+            return fd
 
     def reference(child_end) -> int:
         """The argv value that names ``child_end`` in the child."""

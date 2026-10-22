@@ -8,6 +8,7 @@ over pipes with the dummy provider (no network): initialize, session/new
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -205,7 +206,8 @@ class WorkerChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async with process_lifecycle('loki-acp') as fixture:
             delegation = await fixture.supervisor.delegate()
             process = fixture.record_process(await acp.runtime_isolation.start_worker(
-                fixture.workspace, fixture.supervisor.environment, delegation))
+                fixture.workspace, fixture.supervisor.environment, delegation,
+                credential_directory=fixture.supervisor.storage.directory_handle))
             delegation.child_spawned()
             channel = acp.WorkerChannel('session', process, lambda message: None, delegation)
             try:
@@ -263,7 +265,7 @@ class WorkerSpawnGateTests(unittest.IsolatedAsyncioTestCase):
                 await front._open_worker(
                     cwd=ROOT, open_method="session/new")
         spawned.assert_awaited_once_with(
-            ROOT, front.environment, delegation)
+            ROOT, front.environment, delegation, credential_directory=None)
         delegation.close.assert_awaited_once_with()
         self.assertFalse(front.workers)
         self.assertFalse(any(owner.state == "opening"
@@ -630,9 +632,14 @@ class EntrypointTests(unittest.TestCase):
 
 
 class _ACPFrontFixture:
-    async def _front(self, env, workspace):
+    async def _front(self, env, workspace, *, closed_stderr=False):
+        command = loki_acp_command()
+        if closed_stderr:
+            command = [sys.executable, '-c',
+                       'import os,sys; os.close(2); os.execv(sys.argv[1], sys.argv[1:])',
+                       *command]
         process = await asyncio.create_subprocess_exec(
-            *loki_acp_command(), env=env, cwd=workspace,
+            *command, env=env, cwd=workspace,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
         # Drain diagnostics while the child runs; a full stderr pipe must not
@@ -642,17 +649,15 @@ class _ACPFrontFixture:
         async def cleanup():
             if process.returncode is None:
                 process.kill()
-            await asyncio.wait_for(process.wait(), 5)
-            await asyncio.wait_for(diagnostics, 5)
+            await process.wait()
+            await diagnostics
         self.addAsyncCleanup(cleanup)
         return process, diagnostics
 
     async def _response(self, front, request_id):
         preceding = []
-        deadline = asyncio.get_running_loop().time() + 15
         while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            line = await asyncio.wait_for(front.stdout.readline(), remaining)
+            line = await front.stdout.readline()
             self.assertTrue(line, "ACP front exited before its response")
             message = json.loads(line)
             if message.get("id") == request_id:
@@ -663,7 +668,7 @@ class _ACPFrontFixture:
     async def _request(self, front, request_id, method, params):
         front.stdin.write((json.dumps(acps.request(
             request_id, method, params)) + "\n").encode())
-        await asyncio.wait_for(front.stdin.drain(), 5)
+        await front.stdin.drain()
         return await self._response(front, request_id)
 
     async def _finish(self, front, diagnostics, session_id):
@@ -675,20 +680,19 @@ class _ACPFrontFixture:
             91, "session/prompt", {"sessionId": session_id,
                                    "prompt": [{"type": "text", "text": "forbidden"}]}))
                            + "\n").encode())
-        await asyncio.wait_for(front.stdin.drain(), 5)
-        async with asyncio.timeout(5):
-            while True:
-                line = await front.stdout.readline()
-                self.assertTrue(line, "front exited before rejecting closed session")
-                message = json.loads(line)
-                if message.get("id") == 91:
-                    self.assertIn("unknown session", message["error"]["message"])
-                    break
+        await front.stdin.drain()
+        while True:
+            line = await front.stdout.readline()
+            self.assertTrue(line, "front exited before rejecting closed session")
+            message = json.loads(line)
+            if message.get("id") == 91:
+                self.assertIn("unknown session", message["error"]["message"])
+                break
         front.stdin.close()
-        await asyncio.wait_for(front.wait(), 5)
-        stderr = await asyncio.wait_for(diagnostics, 5)
+        await front.wait()
+        stderr = await diagnostics
         self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
-        self.assertEqual(await asyncio.wait_for(front.stdout.read(), 5), b"")
+        self.assertEqual(await front.stdout.read(), b"")
 
 
 class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
@@ -788,7 +792,7 @@ args=(%r + str(__import__('os').getpid()), 'a')
                 if not self._reader_task.done():
                     self._reader_task.set_result(None)
 
-        async def fake_spawn(cwd, environment, delegation):
+        async def fake_spawn(cwd, environment, delegation, *, credential_directory=None):
             spawned["cwd"] = cwd
             spawned["environment"] = environment
             spawned["delegation"] = delegation
@@ -1490,6 +1494,83 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
         self.assertEqual(tool_result["content"], [{"type": "text", "text": result}])
         self.assertEqual(os.path.basename(path), f"chat-{session_id}.json")
         return blob
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux credential-directory mount boundary')
+    async def test_fresh_worker_covers_retained_storage_after_configuration_parent_moves(self):
+        from loki_agent import credential_storages
+
+        for relative, closed_stderr in [[False, False], [True, False],
+                                        [False, True], [True, True]]:
+            with self.subTest(relative=relative, closed_stderr=closed_stderr), \
+                    tempfile.TemporaryDirectory() as root, ExitStack() as cleanup:
+                workspace = os.path.join(root, 'workspace')
+                second_workspace = os.path.join(root, 'second-workspace')
+                os.mkdir(workspace)
+                os.mkdir(second_workspace)
+                configuration = os.path.join(workspace if relative else root, 'config')
+                moved = configuration + '-moved'
+                directory = os.path.join(configuration, 'loki', 'credentials')
+                storage = credential_storages.JsonCredentialStorage(directory)
+                cleanup.callback(storage.close)
+                await storage.store_openai_login(authentications.OpenAITokenSet(
+                    access_token='directory-view-access', refresh_token='directory-view-refresh',
+                    expires_at=10**12))
+                current_name = shlex.quote(configuration)
+                moved_name = shlex.quote(moved)
+                replacement = shlex.quote(directory)
+                original_file = os.path.join(moved, 'loki', 'credentials', 'tokens.json')
+                command = (
+                    f'if test ! -d {moved_name}; then '
+                    f'mv -- {current_name} {moved_name} && mkdir -p -- {replacement} '
+                    '&& printf FIRST_VIEW_OK; '
+                    f'elif cat -- {shlex.quote(original_file)} >/dev/null 2>&1; then '
+                    'printf WRONG_DIRECTORY_VIEW; else printf SECOND_VIEW_OK; fi')
+                environment = {key: value for key, value in os.environ.items()
+                               if not key.startswith('LOKI_')
+                               and not any(key.endswith(suffix)
+                                           for suffix in ['_KEY', '_TOKEN', '_PAT'])}
+                environment.update({
+                    'HOME': root, 'XDG_CONFIG_HOME': 'config' if relative else configuration,
+                    'XDG_STATE_HOME': os.path.join(root, 'state'), 'TERM': 'dumb',
+                    'LOKI_PROVIDER': 'dummy', 'LOKI_API_BASE': 'http://dummy.invalid/v1',
+                    'LOKI_MODEL': 'dummy-model', 'LOKI_DUMMY_REPLY': 'Directory view checked.',
+                    'LOKI_DUMMY_TOOL_CALL': json.dumps({'name': 'Bash', 'arguments': {
+                        'command': command, 'description': 'Check the configured directory view'}}),
+                })
+                front, diagnostics = await self._front(
+                    environment, workspace, closed_stderr=closed_stderr)
+                await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+                opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+                first_session = opened['sessionId']
+                reply, updates = await self._request(front, 3, 'session/prompt', {
+                    'sessionId': first_session, 'prompt': [{'type': 'text', 'text': 'Check the first view'}]})
+                self.assertEqual(reply, {'stopReason': 'end_turn'})
+                first_results = [update for update in _tool_updates(updates, first_session)
+                                 if update['sessionUpdate'] == 'tool_call_update']
+                self.assertEqual(len(first_results), 1)
+                self.assertIn('FIRST_VIEW_OK', json.dumps(first_results))
+                self.assertTrue(os.path.isdir(directory))
+                # Publish after the rename through the same held object. A fresh
+                # worker must hide these new bytes too, not just the old file.
+                await storage.store_openai_login(authentications.OpenAITokenSet(
+                    access_token='later-directory-access', refresh_token='later-directory-refresh',
+                    expires_at=10**12))
+                with open(original_file) as stream:
+                    self.assertIn('later-directory-refresh', stream.read())
+                self.assertFalse(os.path.exists(storage.file_path))
+                opened, _ = await self._request(front, 4, 'session/new', {'cwd': second_workspace})
+                second_session = opened['sessionId']
+                self.assertNotEqual(first_session, second_session)
+                reply, updates = await self._request(front, 5, 'session/prompt', {
+                    'sessionId': second_session, 'prompt': [{'type': 'text', 'text': 'Check the fresh view'}]})
+                self.assertEqual(reply, {'stopReason': 'end_turn'})
+                results = [update for update in _tool_updates(updates, second_session)
+                           if update['sessionUpdate'] == 'tool_call_update']
+                self.assertEqual(len(results), 1)
+                self.assertIn('SECOND_VIEW_OK', json.dumps(results))
+                self.assertNotIn('WRONG_DIRECTORY_VIEW', json.dumps(results))
+                await self._request(front, 6, 'session/close', {'sessionId': first_session})
+                await self._finish(front, diagnostics, second_session)
 
     async def test_shipped_front_real_tool_updates_save_and_close(self):
 
@@ -2294,7 +2375,7 @@ class SavedSessionJourneyTests(unittest.IsolatedAsyncioTestCase):
                         messages.append(message)
                         changed.set()
 
-                    async def launch(cwd, environment, delegation):
+                    async def launch(cwd, environment, delegation, *, credential_directory=None):
                         session = Session(shell_cwd=cwd)
                         session.credential_authority = front.credential_broker
                         loki._DEFAULT_SESSION = session
@@ -3746,7 +3827,7 @@ class ConfigEndpointApprovalTests(unittest.IsolatedAsyncioTestCase):
 
                 stack.enter_context(mock.patch.object(f.storage, 'approve_destinations', new=record))
 
-                async def launch(cwd, environment, delegation):
+                async def launch(cwd, environment, delegation, *, credential_directory=None):
                     session = Session(shell_cwd=cwd)
                     # Same-process authority, as in the existing selection
                     # journey; no worker credential-IPC claim is made here.

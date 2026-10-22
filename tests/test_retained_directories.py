@@ -130,6 +130,8 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         storage.close()
         with self.assertRaisesRegex(credential_storages.CredentialStorageError, 'closed'):
             storage.load_document()
+        with self.assertRaisesRegex(credential_storages.CredentialStorageError, 'closed'):
+            storage.directory_handle
 
     async def test_response_reads_merges_and_publication_ignore_decoy(self):
         store = response_headers.Store(str(self.parent / 'headers.json'))

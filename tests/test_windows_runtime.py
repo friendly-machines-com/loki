@@ -159,14 +159,14 @@ class EntrypointTests(unittest.TestCase):
                 mock.patch.object(entry, 'protect_credential_process') as protect:
             with self.assertRaises(RuntimeIsolationError):
                 entry._protect_runtime()
-        isolate.assert_called_once_with()
+        isolate.assert_called_once_with(None)
         protect.assert_not_called()
 
     def test_isolation_precedes_process_protection(self):
         from loki_agent import __main__ as entry
         calls = []
 
-        def isolate():
+        def isolate(directory=None):
             calls.append('isolate')
 
         def scratch():

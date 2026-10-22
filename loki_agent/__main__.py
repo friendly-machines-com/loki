@@ -21,12 +21,11 @@ from .process_protections import (
 )
 
 
-def _descriptor(value: str, description: str):
+def _descriptor(value: str):
     try:
         return host_ipc.child_endpoint(value)
     except (OSError, ValueError) as error:
-        raise ValueError(
-            f"invalid {description} descriptor") from error
+        raise ValueError("credential protection is unavailable") from error
 
 
 def _terminal_runtime_arguments(args):
@@ -34,20 +33,29 @@ def _terminal_runtime_arguments(args):
             len(args) < 5
             or args[0] != "--session-owner-fd"
             or args[2] != "--credential-capability-fd"
-            or args[4] != "--"
     ):
-        raise ValueError("invalid internal terminal runtime arguments")
+        raise ValueError("credential protection is unavailable")
+    directory_fd = None
+    separator = 4
+    if args[separator] == "--credential-directory-fd":
+        if len(args) < 7:
+            raise ValueError("credential protection is unavailable")
+        directory_fd = _descriptor(args[separator + 1])
+        separator += 2
+    if args[separator] != "--":
+        raise ValueError("credential protection is unavailable")
     return (
-        _descriptor(args[1], "session owner"),
-        _descriptor(args[3], "credential capability"),
-        args[5:],
+        _descriptor(args[1]),
+        _descriptor(args[3]),
+        directory_fd,
+        args[separator + 1:],
     )
 
 
-def _protect_runtime() -> bool:
+def _protect_runtime(directory_fd=None) -> bool:
     # Isolation happens before the large runtime import and while this newly
     # execed Python process is still single-threaded.
-    runtime_isolation.isolate_runtime()
+    runtime_isolation.isolate_runtime(directory_fd)
     runtime_isolation.prepare_runtime_scratch()
     return protect_credential_process()
 
@@ -60,9 +68,9 @@ def _report_security_error(error) -> int:
 def main() -> int:
     if sys.argv[1:2] == ["--runtime"]:
         try:
-            owner_fd, capability_fd, args = (
+            owner_fd, capability_fd, directory_fd, args = (
                 _terminal_runtime_arguments(sys.argv[2:]))
-            _protect_runtime()
+            _protect_runtime(directory_fd)
         except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError,
                 ValueError) as error:
             return _report_security_error(error)
