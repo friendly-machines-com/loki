@@ -61,6 +61,7 @@ import contextlib
 import os
 import secrets
 import socket
+import sys
 import threading
 
 from . import windows_api
@@ -182,7 +183,7 @@ def eof_stdin():
     copy.  The caller owns the returned end until it has been handed over, and
     must release both on every path, including launch failure.
     """
-    if os.name == "nt":
+    if sys.platform == "win32":
         import msvcrt
 
         # CPython subprocess takes a CRT descriptor here, not a raw HANDLE.
