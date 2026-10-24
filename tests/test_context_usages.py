@@ -416,7 +416,8 @@ class PresentationTests(unittest.TestCase):
                 session.transcript_items))
         self.assertEqual(displays, ["unknown", "37%", "37%*", "48%"])
 
-    def test_terminal_redraws_todos_after_todowrite_before_the_next_response(self):
+    def test_terminal_redraws_todos_before_post_hooks_and_the_next_response(self):
+        from loki_agent import tool_runtime
         session = Session(runtime_config=config())
         self.addCleanup(session.response_headers.close)
         todos = [{"content": "Done", "status": "completed", "priority": "high"},
@@ -427,6 +428,13 @@ class PresentationTests(unittest.TestCase):
             [formats.tool_call_item("c", "TodoWrite", {"todos": todos})], metadata),
             formats.DecodedTurn([formats.message_item("assistant", "Done")], dict(metadata))]
         displays = []
+        pipeline = tool_runtime.ToolHookPipeline()
+        post_displays = []
+
+        def after_write(invocation, outcome):
+            post_displays.append(displays[-1])
+
+        pipeline.add_post("check-todo-display", after_write)
 
         async def chat(*args, **kwargs):
             if len(turns) == 1:
@@ -437,6 +445,7 @@ class PresentationTests(unittest.TestCase):
             return turns.pop(0)
 
         with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
                 mock.patch.object(terminal_frontend, "_terminal_activity",
                                   terminal_frontend.TerminalActivityStatus(turn_running=True)), \
                 mock.patch.object(terminal_frontend, "async_chat_completion", new=chat), \
@@ -445,6 +454,8 @@ class PresentationTests(unittest.TestCase):
                                   side_effect=lambda: displays.append(terminal_frontend.status_text())):
             asyncio.run(terminal_frontend.run_terminal_turn_async(session.transcript_items))
         self.assertEqual(session.session_todos, todos)
+        self.assertEqual(len(post_displays), 1)
+        self.assertIn("/todo:1/2, /queue", post_displays[0])
         self.assertFalse(turns)
 
     def test_terminal_response_callback_updates_snapshot_and_redraws(self):

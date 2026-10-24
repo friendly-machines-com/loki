@@ -107,6 +107,8 @@ _COMMANDS: dict[str, _CommandSpec] = {
     # /ps is job control: sync, await-free, immediate in any form.
     "ps": _CommandSpec(
         Delivery(terminal=IMMEDIATE), _any_argument("ps")),
+    "todo": _CommandSpec(
+        Delivery(terminal=IMMEDIATE), _any_argument("todo")),
     # The six inspected/saved forms; other arguments stay unrecognized input.
     "status": _CommandSpec(
         Delivery(terminal=IMMEDIATE),

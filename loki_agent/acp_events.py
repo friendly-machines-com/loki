@@ -42,6 +42,27 @@ def agent_message_chunk(session_id: str, text: str) -> dict:
     }
 
 
+def plan(session_id: str, todos: list) -> dict:
+    # Saved logs validate the list, not its entries. Project only valid ACP
+    # fields so malformed restored data cannot break the client's plan view.
+    entries = []
+    for todo in todos:
+        if not isinstance(todo, dict):
+            continue
+        content = todo.get("content")
+        status = todo.get("status")
+        priority = todo.get("priority")
+        if (not isinstance(content, str) or not content.strip()
+                or status not in ["pending", "in_progress", "completed"]
+                or priority not in ["high", "medium", "low"]):
+            continue
+        entries.append({"content": content, "status": status, "priority": priority})
+    return {
+        "sessionId": session_id,
+        "update": {"sessionUpdate": "plan", "entries": entries},
+    }
+
+
 def context_usage(session_id, snapshot):
     """ACP carries counts; presentation and integer rounding belong to clients.
 
@@ -128,6 +149,8 @@ def map_event(session_id: str, event: dict, state: dict) -> list:
         return [tool_call(
             session_id, call_id, title,
             TOOL_KINDS.get(name, "other"))]
+    if kind == "todos_updated":
+        return [plan(session_id, event["todos"])]
     if kind == "tool_result":
         call_id = _event_call_id(event, state)
         text = event.get("content")

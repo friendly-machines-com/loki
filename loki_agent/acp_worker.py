@@ -565,9 +565,13 @@ class Worker:
             self._publish_context_usage()
         return {
             "configOptions": self.config_options(),
-            # The front emits these as available_commands_update after the
-            # session reply, so the client knows the session first.
-            "lokiCommands": acp_commands.advertised_commands(),
+            # Fresh monitor state follows the session reply, including on
+            # resume, which must not replay conversation history.
+            "lokiUpdates": [
+                {"sessionUpdate": "available_commands_update",
+                 "availableCommands": acp_commands.advertised_commands()},
+                acp_events.plan(self.session_id, self.session.session_todos)["update"],
+            ],
         }
 
     def _install_catalog_choices(self, discovered):

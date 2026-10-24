@@ -542,25 +542,23 @@ class Front:
                 forwarded.set()
         if not self._connected or request_id is None:
             return
-        commands = None
+        updates = None
         if isinstance(result, dict):
-            commands = result.pop("lokiCommands", None)
+            updates = result.pop("lokiUpdates", None)
         self.write(acps.response(request_id, result=result))
-        if commands:
-            # Ordering is the point: the client learns the session from the
-            # reply above, then receives the commands advertised for it.
+        if updates:
+            # The client learns the session before commands and current plan.
+            # These are fresh state, not conversation replay on resume.
             session_id = (
                 result.get("sessionId") if isinstance(result, dict) else None)
             if not isinstance(session_id, str) or not session_id:
                 session_id = (message.get("params") or {}).get("sessionId")
             if isinstance(session_id, str) and session_id:
-                self.write(acps.notification("session/update", {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "available_commands_update",
-                        "availableCommands": commands,
-                    },
-                }))
+                for update in updates:
+                    self.write(acps.notification("session/update", {
+                        "sessionId": session_id,
+                        "update": update,
+                    }))
 
     async def dispatch(
             self, method: str, params: dict, request_id=None,
@@ -1072,9 +1070,9 @@ class Front:
         config_options = worker_reply.get("configOptions")
         if config_options:
             result["configOptions"] = config_options
-        commands = worker_reply.get("lokiCommands")
-        if commands:
-            result["lokiCommands"] = commands
+        updates = worker_reply.get("lokiUpdates")
+        if updates:
+            result["lokiUpdates"] = updates
         return result
 
     async def restore_session(
@@ -1098,9 +1096,9 @@ class Front:
         config_options = worker_reply.get("configOptions")
         if config_options:
             result["configOptions"] = config_options
-        commands = worker_reply.get("lokiCommands")
-        if commands:
-            result["lokiCommands"] = commands
+        updates = worker_reply.get("lokiUpdates")
+        if updates:
+            result["lokiUpdates"] = updates
         return result
 
     def list_sessions(self, params: dict) -> dict:

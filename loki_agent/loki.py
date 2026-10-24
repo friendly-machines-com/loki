@@ -1418,6 +1418,10 @@ async def execute_tool_call_async(
                 allowed=allowed,
                 extra_context=execution_context,
             )
+            if fn_name == "TodoWrite" and result["ok"]:
+                # TodoWrite has committed. Post-hooks may await or be cancelled,
+                # so publish the snapshot before waiting for their completion.
+                on_event({"type": "todos_updated", "todos": copy.deepcopy(current_todos())})
             outcome = tool_runtime.ToolOutcome(
                 "success" if result["ok"] else "tool_error",
                 True,

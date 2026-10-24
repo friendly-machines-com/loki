@@ -238,6 +238,9 @@ These commands execute immediately, without queueing behind a running turn,
 and are also available during terminal pickers and confirmations. `/ps` is
 not an ACP command.
 
+Use `/todo` to view the current session's todo list, even while the agent is
+working.
+
 The same immediate delivery covers `/status` (with `--json`, `all`, and
 `save` forms), the read-only `/account CONTROL` form, and `/queue`: they
 answer while a turn is running and their output never becomes conversation.

@@ -28,6 +28,16 @@ class ClassifyTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(command_deliveries.terminal_immediate(text))
 
+    def test_todo_is_immediate_including_invalid_arguments(self):
+        for text in ["/todo", "  /todo  ", "/todo clear", "/todo --json"]:
+            with self.subTest(text=text):
+                parsed = command_deliveries.terminal_immediate(text)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.name, "todo")
+        for text in ["/todos", "/todo/file", "/todo-extra", "/TODO"]:
+            with self.subTest(text=text):
+                self.assertIsNone(command_deliveries.terminal_immediate(text))
+
     def test_status_covers_exactly_the_inspect_and_save_forms(self):
         immediate = [
             "/status", "/status --json", "/status all",

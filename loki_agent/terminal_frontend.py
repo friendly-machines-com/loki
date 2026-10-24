@@ -179,6 +179,18 @@ def _immediate_ps(argument: str):
     sys.stdout.flush()
 
 
+def _immediate_todo(argument: str):
+    if argument:
+        result = "usage: /todo"
+    else:
+        try:
+            result = _core.run_todoread()
+        except Exception:
+            logger.debug("Could not read session todos", exc_info=True)
+            result = "Could not read the todos saved for this session."
+    _emit_immediate_output("/todo", result)
+
+
 def _immediate_status(argument: str):
     # The connection context is captured at admission, not when the
     # scheduled task first runs: config, session, and the response-header
@@ -442,6 +454,7 @@ _IMMEDIATE_HANDLERS = {
     # They never own the reader, await a turn, or touch transcript state --
     # monitor-plane only, per the contract in command_deliveries.
     "ps": _immediate_ps,
+    "todo": _immediate_todo,
     "status": _immediate_status,
     "account": _immediate_account_read,
     "queue": _immediate_queue,
@@ -819,7 +832,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     def on_event(event):
         if turn_events is not None:
             turn_events.append(event)
-        if event.get("type") in ["tool_result", "response_cancelled", "max_loops"]:
+        if event.get("type") in ["todos_updated", "tool_result", "response_cancelled", "max_loops"]:
             _redraw_status()
         _terminal_agent_event(event, ui_settings=ui_settings)
 

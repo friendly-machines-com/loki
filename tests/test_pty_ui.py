@@ -275,6 +275,8 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
                 if queued_input == '/ps':
                     _read_until(handle, collected,
                                 'No running, starting, or failed jobs.')
+                elif queued_input == '/todo':
+                    _read_until(handle, collected, 'No todos for this session.')
                 else:
                     queued_texts += 1
                     _read_until(
@@ -622,6 +624,22 @@ class PtyUiTests(unittest.TestCase):
         # An echoed /ps is not proof of execution: its actual local result
         # must appear while the real frontend's provider is still blocked.
         self.assertIn(b"No running, starting, or failed jobs.", before_release)
+        self.assertNotIn(b"codeword", before_release)
+        plain = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
+        self.assertIn(b"/queue{txt:1,img:0}", plain)
+        self.assertNotIn(b"/queue{txt:2", plain)
+        self._assert_styled_output(output)
+        tracker = _SgrStreamTracker()
+        tracker.feed(output)
+        self.assertEqual(tracker.unterminated, 0)
+        self.assertFalse(tracker.bold)
+        self.assertEqual(tracker.fg, "default")
+
+    def test_todo_result_is_visible_during_stream_without_joining_prompt_queue(self):
+        output, before_release = run_loki_pty_reply(
+            stream=True, stream_chunks=["partial **bold", "word** and `codeword` done"],
+            stream_prefix="partial ", queued_inputs=["second", "/todo"])
+        self.assertIn(b"No todos for this session.", before_release)
         self.assertNotIn(b"codeword", before_release)
         plain = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         self.assertIn(b"/queue{txt:1,img:0}", plain)

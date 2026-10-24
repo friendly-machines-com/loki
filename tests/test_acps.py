@@ -1070,6 +1070,38 @@ if "--worker" in sys.argv:
 
 
 class EventMapperTests(unittest.TestCase):
+    def test_plan_is_a_full_detached_snapshot_including_empty_clears(self):
+        from loki_agent import acp_events
+        todos = [
+            {"content": "Inspect", "status": "completed", "priority": "high"},
+            {"content": "Implement", "status": "in_progress", "priority": "medium"},
+            {"content": "Verify", "status": "pending", "priority": "low"},
+        ]
+        projected = acp_events.plan("session-A", todos)
+        self.assertEqual(projected, {
+            "sessionId": "session-A", "update": {"sessionUpdate": "plan", "entries": todos}})
+        todos[0]["content"] = "Changed later"
+        todos.clear()
+        self.assertEqual(projected["update"]["entries"][0]["content"], "Inspect")
+        self.assertEqual(acp_events.plan("session-B", []), {
+            "sessionId": "session-B", "update": {"sessionUpdate": "plan", "entries": []}})
+
+    def test_plan_does_not_send_malformed_saved_entries_or_extra_fields(self):
+        import copy
+        from loki_agent import acp_events
+        valid = {"content": "Restored", "status": "pending", "priority": "high"}
+        todos = [
+            None, "not a todo", {},
+            {**valid, "content": None}, {**valid, "content": "  "},
+            {**valid, "status": "unknown"}, {**valid, "status": []},
+            {**valid, "priority": "critical"}, {**valid, "priority": {}},
+            {**valid, "_meta": {"untrusted": True}},
+        ]
+        original = copy.deepcopy(todos)
+        self.assertEqual(acp_events.plan("restored", todos), {
+            "sessionId": "restored", "update": {"sessionUpdate": "plan", "entries": [valid]}})
+        self.assertEqual(todos, original)
+
     def test_rejected_tool_uses_its_real_call_id(self):
         from loki_agent import acp_events
         updates = acp_events.map_event(
@@ -1315,6 +1347,83 @@ class SessionRestoreTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                 await self._finish(front, diagnostics, session_id)
                 turns.append((prompt, answer))
                 read_saved(turns)
+
+    async def test_todo_plans_stream_and_restore_after_new_load_and_resume_replies(self):
+        tasks = [
+            {"content": "Inspect", "status": "completed", "priority": "high"},
+            {"content": "Implement", "status": "in_progress", "priority": "medium"},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            workspace = _configured_workspace(root)
+            os.mkdir(workspace)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("LOKI_")
+                   and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+            env.update({
+                "HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+                "XDG_STATE_HOME": os.path.join(root, "state"), "TERM": "dumb",
+                "LOKI_PROVIDER": "dummy", "LOKI_API_BASE": "http://dummy.invalid/v1",
+                "LOKI_MODEL": "dummy-model", "LOKI_DUMMY_REPLY": "Plan recorded.",
+                "LOKI_DUMMY_TOOL_CALL": json.dumps({"name": "TodoWrite", "arguments": {"todos": tasks}}),
+            })
+            configure_container(env, workspace)
+
+            async def opened_plan(front, session_id):
+                # These reads happen after _request returned the session reply.
+                for kind in ["available_commands_update", "plan"]:
+                    message = json.loads(await asyncio.wait_for(front.stdout.readline(), 5))
+                    self.assertEqual(message["method"], "session/update")
+                    self.assertEqual(message["params"]["sessionId"], session_id)
+                    self.assertEqual(message["params"]["update"]["sessionUpdate"], kind)
+                return message["params"]["update"]["entries"]
+
+            front, diagnostics = await self._front(env, workspace)
+            await self._request(front, 1, "initialize", {"protocolVersion": 1})
+            opened, preceding = await self._request(front, 2, "session/new", {"cwd": workspace})
+            session_id = opened["sessionId"]
+            self.assertNotIn("lokiUpdates", opened)
+            self.assertEqual(preceding, [])
+            self.assertEqual(await opened_plan(front, session_id), [])
+            result, updates = await self._request(front, 3, "session/prompt", {
+                "sessionId": session_id, "prompt": [{"type": "text", "text": "Track this work"}]})
+            self.assertEqual(result, {"stopReason": "end_turn"})
+            plans = [message["params"] for message in updates
+                     if message.get("method") == "session/update"
+                     and message["params"]["update"]["sessionUpdate"] == "plan"]
+            self.assertEqual(plans, [{
+                "sessionId": session_id, "update": {"sessionUpdate": "plan", "entries": tasks}}])
+            # A second worker's empty snapshot must not inherit the first plan.
+            second, _ = await self._request(front, 4, "session/new", {"cwd": workspace})
+            self.assertNotEqual(second["sessionId"], session_id)
+            self.assertEqual(await opened_plan(front, second["sessionId"]), [])
+            await self._request(front, 5, "session/close", {"sessionId": second["sessionId"]})
+            await self._finish(front, diagnostics, session_id)
+            path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["session_todos"], tasks)
+            del env["LOKI_DUMMY_TOOL_CALL"]
+
+            for method in ["session/load", "session/resume"]:
+                with self.subTest(method=method):
+                    front, diagnostics = await self._front(env, workspace)
+                    await self._request(front, 1, "initialize", {"protocolVersion": 1})
+                    restored, preceding = await self._request(front, 2, method, {
+                        "sessionId": session_id, "cwd": workspace, "mcpServers": []})
+                    self.assertNotIn("lokiUpdates", restored)
+                    self.assertFalse(any(message.get("method") == "session/update"
+                                         and message["params"]["update"]["sessionUpdate"] == "plan"
+                                         for message in preceding))
+                    if method == "session/load":
+                        self.assertEqual(_historical_chunks(preceding, session_id), [
+                            ("user_message_chunk", {"type": "text", "text": "Track this work"}),
+                            ("agent_message_chunk", {"type": "text", "text": "Plan recorded."}),
+                        ])
+                    else:
+                        self.assertEqual(preceding, [])
+                    self.assertEqual(await opened_plan(front, session_id), tasks)
+                    await self._finish(front, diagnostics, session_id)
+                    with open(path, encoding="utf-8") as stream:
+                        self.assertEqual(json.load(stream)["session_todos"], tasks)
 
 
 class SavedApprovalStdioTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
@@ -1799,6 +1908,7 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
         self.assertEqual(set(names), {"status", "account", "pwd", "cd", "image", "thinking", "trace"})
         self.assertEqual(len(names), 7)
         self.assertNotIn("ps", names)
+        self.assertNotIn("todo", names)
         self.assertTrue(all(command["description"] for command in commands))
         self.assertNotIn("model", names)
         self.assertNotIn("effort", names)
@@ -1859,6 +1969,12 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
             self.assertEqual(advertised["params"]["sessionId"], session_id)
             self.assertEqual(advertised["params"]["update"]["sessionUpdate"], "available_commands_update")
             self._advertisement(advertised["params"]["update"]["availableCommands"])
+            plan = json.loads(await asyncio.wait_for(front.stdout.readline(), 5))
+            self.assertEqual(plan, acps.notification("session/update", {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "plan", "entries": []},
+            }))
+            self.assertNotIn("lokiUpdates", opened)
             path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
 
             async def prompt(request_id, text):
@@ -1945,7 +2061,9 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                     "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"}), 3)
                 opened = await asyncio.wait_for(channel.request("session/commit_open", {}), 3)
                 self.assertEqual(session.shell_cwd, workspace)
-                self._advertisement(opened["lokiCommands"])
+                self._advertisement(opened["lokiUpdates"][0]["availableCommands"])
+                self.assertEqual(opened["lokiUpdates"][1], {
+                    "sessionUpdate": "plan", "entries": []})
                 initial = copy.deepcopy(session.transcript_items)
                 for text, expected in (
                         ("/pwd", f"cwd: {workspace}"),
@@ -2097,6 +2215,182 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
     def _params(self, text):
         return {"sessionId": "prompt-owner", "prompt": [{"type": "text", "text": text}]}
+
+    async def test_todo_plan_is_visible_before_turn_end_and_survives_cancellation(self):
+        from loki_agent import formats, protocols
+        proposed = [{"content": "  Inspect the code  ", "status": "in_progress", "priority": "high"}]
+        committed = [{"content": "Inspect the code", "status": "in_progress", "priority": "high"}]
+        for cancel in [False, True]:
+            with self.subTest(cancel=cancel), tempfile.TemporaryDirectory() as root:
+                messages = []
+                continuation = asyncio.Event()
+                release = asyncio.Event()
+                calls = 0
+
+                async def completion(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return formats.DecodedTurn([
+                            formats.tool_call_item("write-plan", "TodoWrite", {"todos": proposed}),
+                        ], {"protocol": protocols.OPENAI_CHAT})
+                    continuation.set()
+                    await release.wait()
+                    return formats.DecodedTurn([
+                        formats.message_item("assistant", "Continued."),
+                    ], {"protocol": protocols.OPENAI_CHAT})
+
+                async with self._channel(root, messages, completion) as channel:
+                    worker = channel.process.worker
+                    pending = asyncio.create_task(channel.request(
+                        "session/prompt", self._params("Plan the work")))
+                    try:
+                        await asyncio.wait_for(continuation.wait(), 3)
+                        # Also flushes preceding notifications through the byte
+                        # channel, without relaxing ACP's active-prompt guard.
+                        with self.assertRaisesRegex(acps.TransportError, "a prompt is already running"):
+                            await channel.request("session/prompt", self._params("/pwd"))
+                        self.assertFalse(pending.done())
+                        plans = [message["params"] for message in messages
+                                 if message.get("method") == "session/update"
+                                 and message["params"]["update"]["sessionUpdate"] == "plan"]
+                        self.assertEqual(plans, [{
+                            "sessionId": "prompt-owner",
+                            "update": {"sessionUpdate": "plan", "entries": committed},
+                        }])
+                        self.assertEqual(worker.session.session_todos, committed)
+                        if cancel:
+                            await channel.request("session/cancel", {})
+                        release.set()
+                        result = await asyncio.wait_for(pending, 3)
+                        self.assertEqual(result, {"stopReason": "cancelled" if cancel else "end_turn"})
+                        self.assertEqual(worker.session.session_todos, committed)
+                        with open(worker.session.chat_log_path, encoding="utf-8") as stream:
+                            saved = json.load(stream)
+                        self.assertEqual(saved["session_todos"], committed)
+                        self.assertFalse(any(event["type"] == "plan" for event in saved["events"]))
+                    finally:
+                        release.set()
+                        await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_todo_plan_precedes_post_hook_failure_or_task_cancellation(self):
+        from loki_agent import formats, loki, protocols, tool_runtime
+        tasks = [{"content": "Committed before the hook", "status": "pending", "priority": "medium"}]
+        for outcome in ["failure", "cancellation"]:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as root:
+                messages = []
+                started = asyncio.Event()
+                release = asyncio.Event()
+                pipeline = tool_runtime.ToolHookPipeline()
+
+                async def post_hook(invocation, result):
+                    started.set()
+                    await release.wait()
+                    raise RuntimeError("post hook failed")
+
+                pipeline.add_post("blocking-post", post_hook)
+                completion = mock.AsyncMock(side_effect=[
+                    formats.DecodedTurn([
+                        formats.tool_call_item("write-plan", "TodoWrite", {"todos": tasks}),
+                    ], {"protocol": protocols.OPENAI_CHAT}),
+                    formats.DecodedTurn([formats.message_item("assistant", "Continued.")],
+                                        {"protocol": protocols.OPENAI_CHAT}),
+                ])
+                with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
+                    async with self._channel(root, messages, completion) as channel:
+                        worker = channel.process.worker
+                        pending = asyncio.create_task(channel.request(
+                            "session/prompt", self._params("Track the work")))
+                        try:
+                            await asyncio.wait_for(started.wait(), 3)
+                            with self.assertRaisesRegex(acps.TransportError, "a prompt is already running"):
+                                await channel.request("session/prompt", self._params("/pwd"))
+                            plans = [message["params"] for message in messages
+                                     if message.get("method") == "session/update"
+                                     and message["params"]["update"]["sessionUpdate"] == "plan"]
+                            self.assertEqual(plans, [{
+                                "sessionId": "prompt-owner",
+                                "update": {"sessionUpdate": "plan", "entries": tasks},
+                            }])
+                            self.assertFalse(pending.done())
+                            self.assertFalse(any(update["sessionUpdate"] == "tool_call_update"
+                                                 for update in _tool_updates(messages, "prompt-owner")))
+                            if outcome == "cancellation":
+                                await channel.request("session/cancel", {})
+                                worker._prompt_task.cancel()
+                            else:
+                                release.set()
+                            result = await asyncio.wait_for(pending, 3)
+                            self.assertEqual(result, {
+                                "stopReason": "cancelled" if outcome == "cancellation" else "end_turn"})
+                            self.assertEqual(worker.session.session_todos, tasks)
+                            self.assertEqual(sum(message.get("method") == "session/update"
+                                                 and message["params"]["update"]["sessionUpdate"] == "plan"
+                                                 for message in messages), 1)
+                        finally:
+                            release.set()
+                            await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_todo_plan_survives_a_failed_provider_continuation(self):
+        from loki_agent import formats, protocols
+        tasks = [{"content": "Retain this task", "status": "pending", "priority": "low"}]
+        completion = mock.AsyncMock(side_effect=[
+            formats.DecodedTurn([
+                formats.tool_call_item("write-plan", "TodoWrite", {"todos": tasks}),
+            ], {"protocol": protocols.OPENAI_CHAT}),
+            RuntimeError("continuation failed"),
+        ])
+        messages = []
+        with tempfile.TemporaryDirectory() as root:
+            async with self._channel(root, messages, completion) as channel:
+                with self.assertRaisesRegex(acps.TransportError, "continuation failed"):
+                    await channel.request("session/prompt", self._params("Track this task"))
+                plans = [message["params"] for message in messages
+                         if message.get("method") == "session/update"
+                         and message["params"]["update"]["sessionUpdate"] == "plan"]
+                self.assertEqual(plans, [{
+                    "sessionId": "prompt-owner", "update": {"sessionUpdate": "plan", "entries": tasks}}])
+                worker = channel.process.worker
+                self.assertEqual(worker.session.session_todos, tasks)
+                with open(worker.session.chat_log_path, encoding="utf-8") as stream:
+                    self.assertEqual(json.load(stream)["session_todos"], tasks)
+
+    async def test_todo_reads_and_rejected_writes_do_not_publish_plans_but_clear_does(self):
+        from loki_agent import formats, protocols
+        original = [{"content": "Existing task", "status": "pending", "priority": "low"}]
+        invalid = [
+            {"content": "First", "status": "in_progress", "priority": "high"},
+            {"content": "Second", "status": "in_progress", "priority": "low"},
+        ]
+        completion = mock.AsyncMock(side_effect=[
+            formats.DecodedTurn([
+                formats.tool_call_item("read-plan", "TodoRead", {}),
+                formats.tool_call_item("rejected-plan", "TodoWrite", {
+                    "todos": [{"content": "Missing priority", "status": "pending"}]}),
+                formats.tool_call_item("invalid-plan", "TodoWrite", {"todos": invalid}),
+                formats.tool_call_item("clear-plan", "TodoWrite", {"todos": []}),
+            ], {"protocol": protocols.OPENAI_CHAT}),
+            formats.DecodedTurn([formats.message_item("assistant", "Cleared.")],
+                                {"protocol": protocols.OPENAI_CHAT}),
+        ])
+        messages = []
+        with tempfile.TemporaryDirectory() as root:
+            async with self._channel(root, messages, completion) as channel:
+                worker = channel.process.worker
+                worker.session.session_todos = original
+                result = await channel.request("session/prompt", self._params("Inspect and clear the plan"))
+                self.assertEqual(result, {"stopReason": "end_turn"})
+                plans = [message["params"] for message in messages
+                         if message.get("method") == "session/update"
+                         and message["params"]["update"]["sessionUpdate"] == "plan"]
+                self.assertEqual(plans, [{
+                    "sessionId": "prompt-owner", "update": {"sessionUpdate": "plan", "entries": []}}])
+                self.assertEqual(worker.session.session_todos, [])
+                failed = [update["toolCallId"] for update in _tool_updates(messages, "prompt-owner")
+                          if update["sessionUpdate"] == "tool_call_update" and update.get("status") == "failed"]
+                self.assertEqual(failed, ["rejected-plan", "invalid-plan"])
+                self.assertIn("Existing task", json.dumps(_tool_updates(messages, "prompt-owner")))
+                completion.assert_awaited()
 
     async def test_wire_cancellation_before_prompt_task_starts_and_next_turn(self):
         from loki_agent import formats, protocols

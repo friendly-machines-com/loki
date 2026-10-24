@@ -105,6 +105,103 @@ class ImmediateCommandTests(unittest.TestCase):
         self.assertEqual(session.user_messages.message_count, 0)
         self.assertEqual(self.session.transcript_items, self.initial)
 
+    def test_todo_is_a_synchronous_snapshot_during_a_running_turn(self):
+        async def scenario():
+            self.session.session_todos = [
+                {"content": "Inspect\x1b]777;ATTACK\x07", "status": "completed",
+                 "priority": "high"},
+                {"content": "Implement", "status": "in_progress",
+                 "priority": "medium"},
+                {"content": "Verify", "status": "pending", "priority": "low"},
+            ]
+            original_todos = [dict(todo) for todo in self.session.session_todos]
+            release = asyncio.Event()
+            turn = asyncio.create_task(release.wait())
+            terminal_frontend._terminal_activity.set_turn_running(True)
+            with mock.patch.object(terminals.os, "isatty", return_value=False), \
+                    mock.patch.object(terminal_frontend, "current_model",
+                                      return_value="model"), \
+                    mock.patch.object(terminal_frontend.terminal,
+                                      "markdown_style", True), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    mock.patch.object(loki, "async_chat_completion",
+                                      side_effect=AssertionError("turn started")), \
+                    contextlib.redirect_stdout(self.output):
+                session = self.make_session()
+                session._producer = asyncio.create_task(session._produce())
+                try:
+                    terminal_frontend._terminal_agent_event({"type": "assistant_start"})
+                    terminal_frontend._terminal_agent_event({
+                        "type": "assistant_delta", "content": "before **pen"})
+                    await self.command(session, "/todo")
+                    rendered = self.output.getvalue()
+                    self.assertIn("/todo:\nTodos:\n", rendered)
+                    self.assertIn("1. [completed] (high) Inspect^[]777;ATTACK^G", rendered)
+                    self.assertIn("2. [in_progress] (medium) Implement", rendered)
+                    self.assertIn("3. [pending] (low) Verify", rendered)
+                    self.assertNotIn("\x1b]777", rendered)
+                    self.assertEqual(terminal_frontend._immediate_tasks, set())
+                    self.assertFalse(turn.done())
+                    self.assertTrue(terminal_frontend._terminal_activity.turn_running)
+                    self.assertFalse(session.reader.cancel_event.is_set())
+                    self.assertEqual(self.session.session_todos, original_todos)
+                    self.assertFalse(self.session.chat_log_dirty)
+                    terminal_frontend._terminal_agent_event({
+                        "type": "assistant_delta", "content": "ding** after"})
+                    terminal_frontend._terminal_agent_event({"type": "assistant_end"})
+                finally:
+                    release.set()
+                    await turn
+                    await session._pause()
+            self.assertIn(terminals.BOLD + "pending" + terminals.RESET,
+                          self.output.getvalue())
+
+        asyncio.run(scenario())
+
+    def test_todo_reads_current_session_without_caching_or_starting_a_turn(self):
+        later = Session(session_todos=[
+            {"content": "Restored task", "status": "pending", "priority": "low"}])
+        self.addCleanup(later.response_headers.close)
+        with mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                mock.patch.object(loki, "async_chat_completion",
+                                  side_effect=AssertionError("turn started")), \
+                contextlib.redirect_stdout(self.output):
+            self.assertTrue(terminal_frontend._submit_immediate("/todo"))
+            self.assertIn("No todos for this session.", self.output.getvalue())
+            with mock.patch.object(loki, "_DEFAULT_SESSION", later):
+                self.assertTrue(terminal_frontend._submit_immediate("/todo"))
+            self.assertIn("[pending] (low) Restored task", self.output.getvalue())
+        self.assertEqual(self.session.transcript_items, self.initial)
+        self.assertEqual(later.transcript_items, [])
+        self.assertFalse(self.session.chat_log_dirty)
+        self.assertFalse(later.chat_log_dirty)
+
+    def test_todo_arguments_and_invalid_restored_entries_do_not_kill_input(self):
+        async def scenario():
+            self.session.session_todos = [None]
+            with mock.patch.object(terminals.os, "isatty", return_value=False), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output):
+                session = self.make_session()
+                session._producer = asyncio.create_task(session._produce())
+                try:
+                    await self.command(session, "/todo clear")
+                    self.assertIn("usage: /todo", self.output.getvalue())
+                    self.assertEqual(self.session.session_todos, [None])
+                    await self.command(session, "/todo")
+                    self.assertIn("Could not read the todos saved for this session.", self.output.getvalue())
+                    self.session.session_todos = []
+                    await self.command(session, "/todo")
+                    self.assertIn("No todos for this session.", self.output.getvalue())
+                    self.assertFalse(session._producer.done())
+                finally:
+                    await session._pause()
+            self.assertFalse(self.session.chat_log_dirty)
+
+        asyncio.run(scenario())
+
     def test_status_answers_without_queueing_or_touching_the_turn(self):
         async def scenario():
             store = Store(os.path.join(self.root, "status.json"))
