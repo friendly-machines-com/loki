@@ -1457,8 +1457,8 @@ async def async_main(args) -> int:
         discard_saved_connection = False
         if resolved_log_filename:
             try:
-                with open(resolved_log_filename, "r", encoding="utf-8") as f:
-                    loaded_chat = savefiles.read_chat_log(f)
+                with savefiles.open_chat_log(resolved_log_filename) as (stream, _facts):
+                    loaded_chat = savefiles.read_chat_log(stream)
                     _, _, saved_state, _ = loaded_chat
                     _core.reasoning_effort_from_session_state(saved_state)
             except (OSError, ValueError, json.JSONDecodeError,
