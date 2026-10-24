@@ -942,7 +942,7 @@ def _write_status_text_lines():
     for label, value, active in [
             ["", fields["turn"], fields["turn"] != "idle"],
             [", mode: ", fields["mode"], False],
-            ["; ", f"/todo:{fields['todos_completed']}/{fields['todos_total']}", fields["todos_total"] != 0],
+            ["; ", f"/todo:{fields['todos_completed']}/{fields['todos_total']}", fields["todos_completed"] != fields["todos_total"]],
             [", /queue{txt:", fields["queued_prompts"], fields["queued_prompts"] != 0],
             [",img:", fields["queued_images"], fields["queued_images"] != 0]]:
         print(label, end="")

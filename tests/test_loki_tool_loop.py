@@ -3077,9 +3077,14 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("queued prompts:", local)
         self.assertNotIn("queued images:", local)
 
-    def test_todo_progress_bolds_the_label_and_counts_but_not_the_comma(self):
-        for statuses in [[], ["pending"], ["completed", "in_progress", "pending"],
-                         ["completed", "completed"]]:
+    def test_todo_progress_bolds_only_unfinished_lists_and_not_the_comma(self):
+        for statuses, bold in [
+                [[], False],
+                [["pending"], True],
+                [["in_progress"], True],
+                [["completed"], False],
+                [["completed", "in_progress", "pending"], True],
+                [["completed", "completed"], False]]:
             with self.subTest(statuses=statuses):
                 todos = [{"content": f"Task {index}", "status": status, "priority": "high"}
                          for index, status in enumerate(statuses)]
@@ -3090,7 +3095,7 @@ class StatusTextTests(unittest.TestCase):
                     terminal_frontend._write_status_text()
                     plain = terminal_frontend.status_text()
                 value = f"/todo:{statuses.count('completed')}/{len(statuses)}"
-                styled = f"\033[1m{value}\033[22m" if statuses else value
+                styled = f"\033[1m{value}\033[22m" if bold else value
                 self.assertIn(f"; {value}, /queue", plain)
                 self.assertIn(f"; {styled}, /queue", output.getvalue())
                 self.assertEqual(output.getvalue().replace("\033[1m", "").replace("\033[22m", ""), plain)
