@@ -7,7 +7,7 @@ No production save hooks are disabled, and the process environment is untouched.
 """
 
 import contextlib
-from pathlib import Path
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -19,10 +19,14 @@ from loki_agent.sessions import Session
 @contextlib.contextmanager
 def isolated_response_headers():
     with tempfile.TemporaryDirectory(prefix="loki-test-status-") as directory:
-        path = str(Path(directory) / "response-headers.json")
+        path = os.path.join(directory, "response-headers.json")
         with mock.patch.object(response_headers, "snapshot_path", return_value=path):
-            with mock.patch.object(loki, "_DEFAULT_SESSION", Session()):
-                yield path
+            session = Session()
+            try:
+                with mock.patch.object(loki, "_DEFAULT_SESSION", session):
+                    yield path
+            finally:
+                session.response_headers.close()
 
 
 def setUpModule():
