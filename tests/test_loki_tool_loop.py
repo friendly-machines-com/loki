@@ -437,21 +437,23 @@ class TerminalImageCommandTests(unittest.TestCase):
             ",img:0}" in text for text in status_updates[staged[0] + 1:]), status_updates)
 
     def test_stale_image_delete_after_real_consumption_preserves_new_image(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pathlib.Path(tmpdir, "same.png").write_bytes(b"\x89PNG\r\n\x1a\npayload")
-            with mock.patch.object(
-                    terminal_frontend, "_queued_inputs",
-                    terminal_frontend._QueuedInputs()):
-                status, captured, stdout, _stderr = self._run_terminal(
-                    ["/image same.png", "/queue images", "first prompt",
-                     "/image same.png", "/queue images delete 1",
-                     "second prompt", "/quit"], tmpdir)
-        self.assertEqual(status, 0)
-        self.assertEqual(len(captured), 2)
-        for items in captured:
-            self.assertEqual([block["type"] for block in items[-1]["content"]],
-                             ["text", "image"])
-        self.assertIn("Staged image ID 1 is no longer pending.", stdout)
+        for collection in ["images", "img"]:
+            with self.subTest(collection=collection):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    pathlib.Path(tmpdir, "same.png").write_bytes(b"\x89PNG\r\n\x1a\npayload")
+                    with mock.patch.object(
+                            terminal_frontend, "_queued_inputs",
+                            terminal_frontend._QueuedInputs()):
+                        status, captured, stdout, _stderr = self._run_terminal(
+                            ["/image same.png", f"/queue {collection}", "first prompt",
+                             "/image same.png", f"/queue {collection} delete 1",
+                             "second prompt", "/quit"], tmpdir)
+                self.assertEqual(status, 0)
+                self.assertEqual(len(captured), 2)
+                for items in captured:
+                    self.assertEqual([block["type"] for block in items[-1]["content"]],
+                                     ["text", "image"])
+                self.assertIn("Staged image ID 1 is no longer pending.", stdout)
 
     def test_empty_prompt_submits_all_staged_images_without_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -248,7 +248,8 @@ Delayed answers display immediately on completion as separate, labelled
 blocks, without waiting for the running turn. `/queue` inspects and edits
 what is waiting: bare `/queue` lists its
 subcommands, `/queue texts` lists queued prompts in send order, and
-`/queue images` lists images staged for the next prompt. Each entry has a
+`/queue images` lists images staged for the next prompt. `txt` and `img`
+are aliases for `texts` and `images` in every `/queue` form. Each entry has a
 stable ID, not a position: IDs survive edits and moves and are not reused
 when entries are consumed or deleted. Identical submissions have different
 IDs. Use `/queue texts delete ID`, `/queue texts edit ID TEXT`,

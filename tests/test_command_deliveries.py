@@ -75,11 +75,14 @@ class ClassifyTests(unittest.TestCase):
 
     def test_queue_is_immediate_in_any_form(self):
         for text in ["/queue", "/queue texts", "/queue images",
+                     "/queue txt", "/queue img", "/queue txt delete 1",
+                     "/queue img move 1 end", "/queue txt edit 1 txt  img",
                      "/queue bogus future-subcommand"]:
             with self.subTest(text=text):
                 parsed = command_deliveries.terminal_immediate(text)
                 self.assertIsNotNone(parsed)
                 self.assertEqual(parsed.name, "queue")
+                self.assertEqual(parsed.argument, text.removeprefix("/queue").strip())
         for text in ["/queuex", "/queue/file", "/QUEUE"]:
             with self.subTest(text=text):
                 self.assertIsNone(command_deliveries.terminal_immediate(text))

@@ -275,7 +275,7 @@ def _immediate_account_read(argument: str):
 
 
 def _queue_usage():
-    print("usage: /queue [texts | images] "
+    print("usage: /queue [texts | txt | images | img] "
           "[delete ID | move ID before OTHER_ID | move ID end | edit ID TEXT]")
 
 
@@ -334,8 +334,9 @@ def _immediate_queue(argument: str):
     if not words:
         print(f"Queued texts: {len(_queued_inputs.pending_entries())}; "
               f"staged images: {len(_queued_inputs.staged_images)}.")
-        print("Subcommands: /queue texts, /queue images.")
+        print("Subcommands: /queue texts (or txt), /queue images (or img).")
         return
+    words[0] = {"txt": "texts", "img": "images"}.get(words[0], words[0])
     if words == ["texts"]:
         _print_queued_texts()
         return
