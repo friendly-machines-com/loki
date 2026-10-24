@@ -1,20 +1,39 @@
 """Path lookup regressions and the existing atomic-write/symlink contract."""
 
+import asyncio
 import base64
 import hashlib
+import io
 import os
 from pathlib import Path
+import stat
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
-from config_fixtures import setUpModule  # noqa: F401 - unittest hook
+from config_fixtures import setUpModule as set_up_config
+from response_header_fixtures import setUpModule as set_up_response_headers
 
 from loki_agent import loki, private_files, savefiles, sessions, terminal_frontend
 from loki_agent import files as file_operations
 
 
+def setUpModule():
+    set_up_config()
+    set_up_response_headers()
+
+
 class StatIdentityTests(unittest.TestCase):
+
+    def test_read_history_key_keeps_case_separators_and_raw_components(self):
+        # Model a platform helper that rewrites names, without using that
+        # helper as the oracle or pretending to model filesystem identity.
+        platform = SimpleNamespace(path=SimpleNamespace(normcase=lambda value: 'folded'))
+        with mock.patch.object(file_operations, 'os', platform):
+            for name in ['C:\\Work\\File', 'c:/work/file', 'dir/./file',
+                         'dir//file/', 'link/../file', '~/file']:
+                with self.subTest(name=name):
+                    self.assertEqual(file_operations.observation_key(name), name)
 
     def test_observation_handles_ctime_changes_by_platform(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -32,6 +51,7 @@ class StatIdentityTests(unittest.TestCase):
                             nonlocal calls
                             calls += 1
                             return SimpleNamespace(
+                                st_mode=original.st_mode,
                                 st_dev=original.st_dev,
                                 st_ino=original.st_ino,
                                 st_size=original.st_size,
@@ -68,6 +88,7 @@ class FilePathTests(unittest.TestCase):
         (self.project / 'link').symlink_to(
             self.elsewhere / 'child', target_is_directory=True)
         self.session = sessions.Session(shell_cwd=str(self.project))
+        self.addCleanup(self.session.response_headers.close)
         session_patch = mock.patch.object(loki, '_DEFAULT_SESSION', self.session)
         session_patch.start()
         self.addCleanup(session_patch.stop)
@@ -104,24 +125,165 @@ class FilePathTests(unittest.TestCase):
                 self.assertEqual(original.read_text(), 'updated')
                 self.assertEqual(other.read_text(), 'unrelated')
 
-    def test_snapshot_key_is_not_recomputed_after_observation(self):
+    @unittest.skipUnless(os.name == 'posix', 'controlled same-inode write with restored timestamps')
+    def test_read_snapshot_covers_displayed_bytes_not_a_later_path_read(self):
+        target = os.path.join(self.project, 'read-selection')
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write('value-a')
+        original = os.stat(target)
+        fstat = os.fstat
+        calls = 0
+        changed = False
+
+        def replace_after_text_read(descriptor):
+            nonlocal calls, changed
+            calls += 1
+            if calls == 2:
+                with open(target, 'w', encoding='utf-8') as stream:
+                    stream.write('value-b')
+                os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+                changed = True
+            return fstat(descriptor)
+
+        # Real bytes and timestamps, with the existing Windows comparison
+        # policy: ctime is not treated as a stable change indicator there.
+        with mock.patch.object(file_operations.os, 'name', 'nt'), \
+                mock.patch.object(file_operations.os, 'fstat', side_effect=replace_after_text_read):
+            result = loki.run_read(target)
+        self.assertTrue(changed)
+        self.assertIn('value-a', result)
+        self.assertNotIn('value-b', result)
+        self.assertIn('changed on disk', loki.run_write(target, 'not authorized'))
+        with open(target, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), 'value-b')
+
+    def test_edit_validates_the_buffer_it_will_change(self):
+        target = os.path.join(self.project, 'edit-selection')
+        reviewed = 'old reviewed contents'
+        unread = 'old unread contents'
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write(reviewed)
+        self.assertIn(reviewed, loki.run_read(target))
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write(unread)
+        real_open = open
+        real_text_wrapper = io.TextIOWrapper
+        interleaved = False
+
+        class InterleavedRead:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *arguments):
+                return self.stream.__exit__(*arguments)
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def detach(self):
+                return self.stream.detach()
+
+            def read(self, *arguments):
+                nonlocal interleaved
+                data = self.stream.read(*arguments)
+                interleaved = True
+                with real_open(target, 'w', encoding='utf-8') as replacement:
+                    replacement.write(reviewed)
+                return data
+
+        def opening(path, mode='r', **kwargs):
+            stream = real_open(path, mode, **kwargs)
+            if path == target and mode in ['r', 'rb'] and not interleaved:
+                return InterleavedRead(stream)
+            return stream
+
+        def decoding(buffer, **kwargs):
+            stream = real_text_wrapper(buffer, **kwargs)
+            return stream if interleaved else InterleavedRead(stream)
+
+        with mock.patch.object(file_operations, 'open', side_effect=opening, create=True), \
+                mock.patch.object(io, 'TextIOWrapper', side_effect=decoding):
+            result = loki.run_edit(target, 'old', 'new')
+        self.assertTrue(interleaved)
+        self.assertTrue(result.startswith('Error:'), result)
+        with open(target, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), reviewed)
+
+    @unittest.skipUnless(os.name == 'posix', 'native FIFO replacement')
+    def test_special_file_replacement_is_not_read_or_overwritten(self):
+        target = os.path.join(self.project, 'special-operation')
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write('reviewed')
+        self.assertIn('reviewed', loki.run_read(target))
+        os.unlink(target)
+        os.mkfifo(target)
+        for operation in [lambda: loki.run_read(target),
+                          lambda: loki.run_write(target, 'wrong'),
+                          lambda: loki.run_edit(target, 'reviewed', 'wrong')]:
+            result = operation()
+            self.assertIn('file is not a regular file', result)
+            self.assertTrue(stat.S_ISFIFO(os.stat(target).st_mode))
+        calls = [
+            ['Read', {'file_path': target}],
+            ['Write', {'file_path': target, 'content': 'wrong'}],
+            ['Edit', {'file_path': target, 'old_string': 'reviewed', 'new_string': 'wrong'}],
+        ]
+        for name, arguments in calls:
+            with self.subTest(tool=name):
+                result = asyncio.run(loki.dispatch_tool_async(name, arguments))
+                self.assertFalse(result['ok'], result)
+                self.assertIn('file is not a regular file', result['content'])
+                self.assertTrue(stat.S_ISFIFO(os.stat(target).st_mode))
+
+    @unittest.skipUnless(os.path.isdir('/proc/self/fd'), 'native open-resource accounting')
+    def test_observation_scope_closes_on_binary_success_and_metadata_failure(self):
+        target = os.path.join(self.project, 'observation-resources')
+        with open(target, 'wb') as stream:
+            stream.write(b'\xffbinary')
+        before = len(os.listdir('/proc/self/fd'))
+        self.assertIn('binary', loki.run_read(target))
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+        with mock.patch.object(file_operations.os, 'fstat', side_effect=OSError('metadata unavailable')):
+            self.assertIn('metadata unavailable', loki.run_read(target))
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
+    def test_edit_keeps_existing_universal_newline_behavior(self):
+        target = os.path.join(self.project, 'edit-newlines')
+        for newline in ['\r\n', '\r', '\n']:
+            for legacy_text_snapshot in [False, True]:
+                with self.subTest(newline=newline, legacy_text_snapshot=legacy_text_snapshot):
+                    with open(target, 'wb') as stream:
+                        stream.write(f'old{newline}reviewed{newline}'.encode('utf-8'))
+                    self.assertIn('old', loki.run_read(target))
+                    if legacy_text_snapshot:
+                        loki.file_state[target] = 'old\nreviewed\n'
+                    self.assertIn('Successfully', loki.run_edit(target, 'old', 'new'))
+                    with open(target, 'rb') as stream:
+                        self.assertEqual(stream.read(), b'new\nreviewed\n')
+
+    def test_alias_retarget_during_read_does_not_authorize_other_name(self):
         original = self.project / 'original'
         other = self.project / 'other'
         original.write_text('same contents')
         other.write_text('same contents')
         alias = self.project / 'alias'
         alias.symlink_to('original')
-        observe = file_operations._file_observation
+        observe = file_operations._read_observed_file
 
-        def redirect_after_observation(path, expected_stat=None):
-            result = observe(path, expected_stat=expected_stat)
+        def redirect_after_observation(path, expected_stat=None, **options):
+            result = observe(path, expected_stat=expected_stat, **options)
             alias.unlink()
             alias.symlink_to('other')
             return result
 
-        with mock.patch.object(file_operations, '_file_observation',
+        with mock.patch.object(file_operations, '_read_observed_file',
                                side_effect=redirect_after_observation):
             self.assertIn('same contents', loki.run_read(str(alias)))
+        self.assertEqual(os.readlink(alias), 'other')
         # Authorization is per spelling: the record names the alias the caller
         # read, and nothing recorded a read of the other name.
         self.assertIn(file_operations.observation_key(str(alias)), loki.file_state)
@@ -398,16 +560,33 @@ class FilePathTests(unittest.TestCase):
         self.assertEqual(set(self.project.iterdir()), original_names)
 
     def test_file_operands_do_not_expand_tilde(self):
-        (self.project / '~').mkdir()
-        (self.project / '~' / 'target').write_text('literal')
-        home = self.root / 'home'
-        home.mkdir()
-        (home / 'target').write_text('home target')
-        with mock.patch.dict(os.environ, {'HOME': str(home)}):
+        literal = os.path.join(self.project, '~')
+        literal_target = os.path.join(literal, 'target')
+        home = os.path.join(self.root, 'home')
+        home_target = os.path.join(home, 'target')
+        os.mkdir(literal)
+        os.mkdir(home)
+        with open(literal_target, 'w', encoding='utf-8') as stream:
+            stream.write('literal')
+        with open(home_target, 'w', encoding='utf-8') as stream:
+            stream.write('home target')
+        process_cwd = os.getcwd()
+        with mock.patch.dict(os.environ, {'HOME': home}):
             self.assertIn('literal', loki.run_read('~/target'))
             self.assertIn('Successfully', loki.run_write('~/target', 'updated'))
-        self.assertEqual((home / 'target').read_text(), 'home target')
-        self.assertEqual((self.project / '~' / 'target').read_text(), 'updated')
+            self.assertTrue(os.path.samefile(loki.change_shell_cwd('~'), literal))
+        with open(home_target, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), 'home target')
+        with open(literal_target, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), 'updated')
+        self.assertEqual(os.getcwd(), process_cwd)
+
+    def test_cd_preserves_quoted_edge_spaces_in_the_operand(self):
+        target = os.path.join(self.project, ' edge spaces ')
+        os.mkdir(target)
+        operand = f'"{target}"'
+        self.assertTrue(loki.change_shell_cwd_from_text(operand))
+        self.assertTrue(os.path.samefile(loki.current_cwd(), target))
 
     def test_unlinked_fd_read_does_not_authorize_a_different_named_file(self):
         if os.name != 'posix':
@@ -455,6 +634,45 @@ class FilePathTests(unittest.TestCase):
                 with self.assertRaises(terminal_frontend.ImageAttachmentError):
                     terminal_frontend.load_image_attachment(
                         path, base_dir=str(self.project))
+
+    @unittest.skipUnless(os.name == 'posix', 'native FIFO and regular-file symlink lookup')
+    def test_saved_log_readers_validate_the_opened_file_and_keep_alias_names(self):
+        target = os.path.join(self.project, 'chat-target.json')
+        alias = os.path.join(self.project, 'chat-alias.json')
+        document = savefiles.serialize_chat_log([], [], {'shell_cwd': str(self.project)})
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write(document)
+        os.symlink('chat-target.json', alias)
+        loki.load_chat_log(alias)
+        self.assertEqual(self.session.chat_log_path, alias)
+        self.assertTrue(os.path.islink(alias))
+        entries = {entry.name: entry.path for entry in savefiles.chat_log_entries(str(self.project))}
+        self.assertEqual(entries, {'chat-target.json': target, 'chat-alias.json': alias})
+        self.assertEqual(savefiles.text_for(alias), document)
+        os.unlink(target)
+        os.mkfifo(target)
+        for path in [target, alias]:
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(OSError, 'not a regular file'):
+                    loki.load_chat_log(path)
+                self.assertEqual(savefiles.text_for(path), '')
+                self.assertEqual(self.session.chat_log_path, alias)
+        self.assertEqual(savefiles.filtered_chat_log_entries('not present', str(self.project)), [])
+        os.unlink(target)
+        os.mkdir(target)
+        with self.assertRaisesRegex(OSError, 'not a regular file'):
+            loki.load_chat_log(alias)
+        self.assertEqual(savefiles.text_for(alias), '')
+
+    def test_new_chat_name_selection_does_not_create_directories_before_save(self):
+        parent = os.path.join(self.project, 'new-parent')
+        filename = os.path.join(parent, 'session.json')
+        loki.new_chat_log(filename)
+        self.assertEqual(self.session.chat_log_path, filename)
+        self.assertFalse(os.path.exists(parent))
+        loki.save_chat_log()
+        self.assertTrue(os.path.isdir(parent))
+        self.assertTrue(os.path.isfile(filename))
 
     def test_new_chat_uses_the_path_it_was_given(self):
         # The path handed to a new chat is composed by the runtime, not taken
