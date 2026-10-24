@@ -1561,8 +1561,8 @@ async def async_main(args) -> int:
         # Startup modals retain the reader without enabling the normal producer.
         await session.start()
         while True:
-            # Commands can change status after the input owner has painted
-            # its next prompt. Refresh before waiting for more input.
+            # Show completed dispatch effects before admitting the next queued input.
+            # Busy turns and modals redraw through the out-of-band callbacks.
             _redraw_status()
             user_in = await session.user_messages.get()
             restore_output_area_after_input()

@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -56,6 +57,49 @@ class PsTests(unittest.TestCase):
         job.process.returncode = -15
         self.manager._refresh_job(job)
         self.assertEqual(observed, ["stopping", "stopped"])
+
+    def test_monitor_io_failures_notify_without_retiring_a_live_child(self):
+        for index, failures in enumerate([["spool"], ["metadata"], ["spool", "metadata"]], 1):
+            with self.subTest(failures=failures):
+                job = self.add_job(str(index), "running")
+                job.process.wait = mock.AsyncMock(side_effect=RuntimeError("wait failed"))
+                job.subagent_slot = True
+                self.manager._active_subagents += 1
+                reserved = self.manager._active_subagents
+                capability = mock.Mock(close=mock.AsyncMock())
+                job.credential_capability = capability
+                observed = []
+                self.manager.on_change = lambda: observed.append(job.status)
+                with contextlib.ExitStack() as stack:
+                    if "spool" in failures:
+                        stack.enter_context(mock.patch.object(
+                            self.manager, "_append_spool", side_effect=OSError("spool failed")))
+                    if "metadata" in failures:
+                        stack.enter_context(mock.patch.object(
+                            file_operations, "atomic_write_text_at", side_effect=OSError("metadata failed")))
+                    with self.assertRaises(OSError) as caught:
+                        asyncio.run(self.manager._monitor_background_job(job))
+                self.assertIn("monitor_error", observed)
+                self.assertEqual(job.status, "monitor_error")
+                self.assertIsNone(job.exit_code)
+                self.assertIsNone(job.process.returncode)
+                self.assertTrue(job.group_active)
+                self.assertTrue(job.subagent_slot)
+                self.assertEqual(self.manager._active_subagents, reserved)
+                capability.close_now.assert_called()
+                capability.close.assert_awaited_once()
+                self.assertIsNone(job.credential_capability)
+                errors = []
+                error = caught.exception
+                while error is not None:
+                    errors.append(str(error))
+                    error = error.__context__
+                self.assertIn("wait failed", errors)
+                for failure in failures:
+                    self.assertIn(f"{failure} failed", errors)
+                if "metadata" not in failures:
+                    with open(job.metadata_path, encoding="utf-8") as stream:
+                        self.assertEqual(json.load(stream)["status"], "monitor_error")
 
     def test_display_failure_does_not_replace_job_or_metadata_outcomes(self):
         job = self.add_job("1", "running")

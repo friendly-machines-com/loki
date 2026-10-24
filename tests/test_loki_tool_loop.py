@@ -429,8 +429,12 @@ class TerminalImageCommandTests(unittest.TestCase):
             }],
         })
         self.assertIn("Attached image for next prompt:", stderr)
-        self.assertIn("images: 1)", status_updates[0])
-        self.assertIn("images: 0)", status_updates[1])
+        # Ready-state frames may precede staging; require the visible
+        # staged-to-consumed transition, not fixed redraw indices.
+        staged = [index for index, text in enumerate(status_updates) if "images: 1)" in text]
+        self.assertTrue(staged, status_updates)
+        self.assertTrue(any(
+            "images: 0)" in text for text in status_updates[staged[0] + 1:]), status_updates)
 
     def test_stale_image_delete_after_real_consumption_preserves_new_image(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -551,6 +551,61 @@ class PtyUiTests(unittest.TestCase):
         )
         self.assertIn(b"/queue(texts: 0, images: 0)", output)
 
+    def test_completed_queued_command_repaints_before_next_dispatch(self):
+        with tempfile.TemporaryDirectory(prefix="loki-dispatch-status-") as root:
+            workspace = os.path.join(root, "workspace")
+            os.makedirs(os.path.join(workspace, "after-cd"))
+            gate = os.path.join(workspace, "release-stream")
+            env = child_environment(
+                HOME=root, XDG_CONFIG_HOME=os.path.join(root, "config"),
+                XDG_STATE_HOME=os.path.join(root, "state"),
+                PATH=os.environ.get("PATH", ""), TERM="xterm",
+                LOKI_PROVIDER="dummy", LOKI_API_BASE="http://dummy.invalid/v1",
+                LOKI_STREAM="1", LOKI_DUMMY_REPLY="blocked prefix completed",
+                LOKI_DUMMY_STREAM_CHUNKS=json.dumps(["blocked prefix", " completed"]),
+                LOKI_DUMMY_STREAM_GATE=gate)
+            configure_container(env, workspace)
+            handle = pty_backend.spawn_pty(
+                [entrypoint("loki")], cols=240, rows=24, env=env, cwd=workspace)
+            output = bytearray()
+            try:
+                _read_until(handle, output, "User: !")
+                handle.write(b"\x7ffirst prompt\r")
+                _read_until(handle, output, "blocked prefix")
+                for command, expected in [
+                        ["/cd after-cd", "/queue(texts: 1, images: 0)"],
+                        ["/quit", "/queue(texts: 2, images: 0)"],
+                        ["/ps", "No running, starting, or failed jobs."],
+                        ["/queue texts", "[id 3] /quit"]]:
+                    start = len(output)
+                    handle.write(b"\x7f" + command.encode() + b"\r")
+                    _read_until(handle, output, expected, start=start)
+                before = _SgrStreamTracker()
+                before.feed(bytes(output))
+                self.assertIn("[id 2] /cd after-cd", "".join(before.text))
+                self.assertNotIn("blocked prefix completed", "".join(before.text))
+                # Every key, including /quit, precedes the state change.
+                # Draining to exit makes a missing frame fail, not hang.
+                pathlib.Path(gate).touch()
+                code, captured = _read_to_exit(handle, output)
+                self.assertEqual(code, 0, captured)
+            finally:
+                try:
+                    handle.terminate()
+                finally:
+                    handle.close()
+
+        tracker = _SgrStreamTracker()
+        tracker.feed(captured)
+        after = "".join(tracker.text[len(before.text):])
+        ready = (f"{os.sep}after-cd, turn: idle, mode: normal; "
+                 "/queue(texts: 1, images: 0)")
+        # Dequeuing /quit can itself paint the new cwd with zero pending
+        # texts. Require the completed /cd view while /quit is still pending.
+        self.assertIn(ready, after)
+        self.assertLess(after.index(ready), after.index("User: /quit"))
+        self.assertEqual(tracker.unterminated, 0)
+
     def test_ps_result_is_visible_during_stream_without_joining_prompt_queue(self):
         output, before_release = run_loki_pty_reply(
             stream=True, stream_chunks=["partial **bold", "word** and `codeword` done"],

@@ -626,9 +626,12 @@ class JobManager:
             self._revoke_credential_capability(job)
             # A broken waiter does not prove that the child exited. Retain its
             # slot and fail closed instead of admitting an extra live child.
-            self._append_spool(job, 'stderr.log',
-                               f'\n[job monitor error: {type(e).__name__}: {e}]\n'.encode('utf-8'))
-            self._write_metadata(job)
+            try:
+                self._append_spool(job, 'stderr.log',
+                                   f'\n[job monitor error: {type(e).__name__}: {e}]\n'.encode('utf-8'))
+            finally:
+                # The changed state must reach observers even if spooling fails.
+                self._write_metadata(job)
         finally:
             await self._close_credential_capability(job)
 

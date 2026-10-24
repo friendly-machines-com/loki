@@ -17,8 +17,9 @@ from unittest import mock
 
 from settings_fixtures import setUpModule as set_up_default_settings
 from config_fixtures import setUpModule as set_up_config
+from test_terminals import RecordingTerminal
 
-from loki_agent import formats, loki, terminal_frontend, terminals
+from loki_agent import connections, formats, loki, models, protocols, terminal_frontend, terminals
 from loki_agent.provider_controls import ControlAction, ControlResult
 from loki_agent.response_headers import Store
 from loki_agent.sessions import Session
@@ -346,38 +347,113 @@ class ImmediateCommandTests(unittest.TestCase):
                               output.getvalue())
                 lookup.assert_not_called()
 
-    def test_account_read_captures_connection_and_authority_before_scheduling(self):
+    def test_account_read_keeps_admitted_context_while_status_uses_current_session(self):
         from loki_agent import provider_controls
-        admitted, later = object(), object()
+        profile = models.ReasoningEffortProfile(["low", "max"], default="low")
+        admitted = connections.make_runtime_config(
+            "https://admitted.example/v1/responses", protocols.OPENAI_RESPONSES,
+            model="admitted-A", reasoning_effort_profile=profile)
+        current = connections.make_runtime_config(
+            "https://current.example/v1/responses", protocols.OPENAI_RESPONSES,
+            model="current-B", reasoning_effort_profile=profile)
         authority_a, authority_b = object(), object()
-        holder = {"config": admitted}
+        later = Session(
+            shell_cwd=self.root, runtime_config=current,
+            credential_authority=authority_b, reasoning_effort_preference="max",
+            response_headers=Store(os.path.join(self.root, "later-headers.json")))
+        self.addCleanup(later.response_headers.close)
         seen = {}
 
-        async def read(context):
-            seen["config"] = context.config
-            seen["authority"] = context.credential_authority
-            return ControlResult(lines=["ACCOUNT-A"])
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def read(context):
+                seen["config"] = context.config
+                seen["authority"] = context.credential_authority
+                started.set()
+                await release.wait()
+                return ControlResult(lines=["ACCOUNT-A"])
+
+            loki.apply_runtime_config(admitted)
+            self.session.credential_authority = authority_a
+            input_owner = types.SimpleNamespace(on_submit=terminal_frontend._submit_immediate)
+            with mock.patch.object(provider_controls, "find_control", return_value=mock.Mock(read=read)), \
+                    mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output):
+                try:
+                    self.assertTrue(input_owner.on_submit("/account usage"))
+                    # Replace the current session before the task can start.
+                    with mock.patch.object(loki, "_DEFAULT_SESSION", later):
+                        await asyncio.sleep(0)
+                        self.assertTrue(started.is_set())
+                        self.assertIs(seen["config"], admitted)
+                        self.assertIs(seen["authority"], authority_a)
+                        self.assertNotIn("ACCOUNT-A", self.output.getvalue())
+                        with contextlib.redirect_stdout(io.StringIO()) as before:
+                            terminal_frontend._write_status_text()
+                        self.assertIn("API: current.example", before.getvalue())
+                        self.assertIn("Model: current-B, Effort: max, Context:", before.getvalue())
+                        release.set()
+                        await asyncio.gather(*list(terminal_frontend._immediate_tasks))
+                        self.assertIn("ACCOUNT-A", self.output.getvalue())
+                        with contextlib.redirect_stdout(io.StringIO()) as after:
+                            terminal_frontend._write_status_text()
+                        self.assertEqual(after.getvalue(), before.getvalue())
+                finally:
+                    release.set()
+                    await terminal_frontend._cancel_immediate_tasks(input_owner)
+
+        asyncio.run(scenario())
+
+    def test_status_callback_paints_during_modal_gap_without_consuming_input(self):
+        class Output(io.StringIO):
+            def fileno(self):
+                return 1
 
         async def scenario():
-            self.session.credential_authority = authority_a
-            spec = mock.Mock(read=read)
-            with mock.patch.object(terminal_frontend, "current_config",
-                                   lambda: holder["config"]), \
-                    mock.patch.object(provider_controls, "find_control",
-                                      return_value=spec), \
-                    mock.patch.object(terminal_frontend,
-                                      "restore_output_area_after_input"), \
-                    contextlib.redirect_stdout(self.output):
-                self.assertTrue(terminal_frontend._submit_immediate("/account usage"))
-                # Change both before yielding: the submitted task cannot
-                # have started yet.
-                holder["config"] = later
-                self.session.credential_authority = authority_b
-                async with asyncio.timeout(3):
-                    while "ACCOUNT-A" not in self.output.getvalue():
-                        await asyncio.sleep(0)
-            self.assertIs(seen["config"], admitted)
-            self.assertIs(seen["authority"], authority_a)
+            read_fd, write_fd = os.pipe()
+            output = Output()
+            recorder = RecordingTerminal()
+            try:
+                with mock.patch.object(loki, "run_ps", return_value="PS-IN-MODAL") as ps, \
+                        contextlib.redirect_stdout(output):
+                    owner = terminals.InputSession(fd=read_fd, on_submit=terminal_frontend._submit_immediate)
+                    async with owner:
+                        async with owner.modal() as modal:
+                            os.write(write_fd, b"/ps\ranswer\r")
+                            self.assertEqual(await modal.prompt("Choice: "), "answer")
+                            ps.assert_called_once_with("")
+                            self.assertIn("PS-IN-MODAL", output.getvalue())
+                            self.assertIsNone(owner._producer)
+                            self.assertFalse(modal.reading)
+                            loki.apply_runtime_config(connections.make_runtime_config(
+                                "https://current.example/v1/responses", protocols.OPENAI_RESPONSES,
+                                model="current-B", reasoning_effort_profile=models.ReasoningEffortProfile(
+                                    ["low", "max"], default="low")))
+                            loki.set_thinking_controls({"effort": "max"}, persist=False)
+
+                            async def background_change():
+                                terminal_frontend._redraw_status()
+
+                            # Model/account workflows await provider data here:
+                            # the normal producer is paused and no modal prompt
+                            # is reading. Rendering must not need either one.
+                            with mock.patch.object(terminals, "terminal", recorder), \
+                                    mock.patch.object(terminals.os, "isatty", return_value=True):
+                                await asyncio.create_task(background_change())
+                            self.assertIn("Model: current-B, Effort: max, Context:", output.getvalue())
+                            self.assertIn(("set_clipping_region", *terminals.status_area), recorder.calls)
+                            self.assertIn(("restore_cursor_position",), recorder.calls)
+                            self.assertEqual(recorder.calls[-3:], [
+                                ("reset_colors_and_flags",), ("end_synchronized_update",), ("flush",)])
+                            self.assertIsNone(owner._producer)
+                            self.assertFalse(modal.reading)
+                            self.assertEqual(owner.user_messages.message_count, 0)
+                            self.assertEqual(self.session.transcript_items, self.initial)
+            finally:
+                os.close(read_fd)
+                os.close(write_fd)
 
         asyncio.run(scenario())
 
