@@ -22,7 +22,7 @@ Supports Anthropic and OpenAI protocols.
 * Web Fetch
 * Background jobs
 * Task planning
-* Skills
+* [Skills](#skills-advanced)
 
 ## How to run
 
@@ -497,6 +497,128 @@ control makes a live provider request:
 
 Redeeming a reset is irreversible and never automatic. Account results are not
 saved to the response-header file.
+
+## Skills (advanced)
+
+Skills are reusable instructions stored in Markdown files. Loki advertises their
+names and descriptions to the agent through the `Skill` tool; the full
+instructions enter the conversation only when that tool is called. Skills are
+not executable plugins, and loading one does not grant additional tools or
+permissions.
+
+### Set up a skill
+
+Create a skill directory under your user configuration directory:
+
+- POSIX: `~/.config/loki/skills`, or `$XDG_CONFIG_HOME/loki/skills` when
+  `XDG_CONFIG_HOME` is nonempty.
+- Windows: the LocalAppData known folder's `loki\skills` directory, normally
+  `%LOCALAPPDATA%\loki\skills`. A nonempty `XDG_CONFIG_HOME` overrides the
+  configuration base on Windows too.
+
+Set configuration-location overrides before starting Loki. There is no separate
+skills-path variable; project-local `.loki/skills` directories are not searched.
+
+To install an existing skill, copy its directory, including `SKILL.md` and any
+supporting files, into that skills directory. No registration step is needed.
+To write your own, add `review-changes/SKILL.md` there:
+
+```text
+skills/
++-- review-changes/
+    +-- SKILL.md
+```
+
+Save the following UTF-8 text as `SKILL.md`:
+
+```markdown
+---
+description: Review the current diff for correctness and missing tests.
+---
+Review the current diff without changing files.
+Prioritize correctness bugs, edge cases, and missing workflow coverage.
+If an Args line is supplied, use it to narrow the review.
+Report findings with file and line references; say when none are found.
+```
+
+The directory name supplies the identifier: `review-changes`. Frontmatter is
+optional; Loki extracts a single-line `description:` for its listings, not
+general YAML metadata. A `name:` field does not rename the skill.
+
+One grouping level is also supported:
+`skills/team/review-changes/SKILL.md` registers `team:review-changes`. If
+`skills/team/SKILL.md` exists, it registers `team` instead and its children are
+not scanned. Deeper directory trees are not recursively discovered. Ambiguous
+identifiers are omitted. Avoid identifiers that collide with built-in commands,
+such as `help` or `model`, whose local command handling takes precedence.
+
+### Use a skill
+
+**Agent invocation:** ask the agent to use `review-changes`, or let it select a
+matching skill from the advertised catalogue. It loads the instructions by
+calling `Skill` with arguments such as:
+
+```json
+{"skill": "review-changes", "args": "focus on error handling"}
+```
+
+`skill` is the exact identifier without a leading slash; `args` is optional.
+Arguments appear as an `Args: ...` line before the instructions. They are not
+shell arguments, and Loki does not substitute argument placeholders in the file.
+
+**Terminal/TUI:** the startup `Available skills:` list shows identifiers and
+descriptions. Enter a request such as:
+
+```text
+/review-changes focus on error handling
+```
+
+For a grouped skill, use `/team:review-changes ...`.
+
+**ACP/editor:** Loki advertises the same catalogue in
+`session/update` notifications with `sessionUpdate: "available_commands_update"`.
+An editor can expose these entries in its command menu. Select the entry, or
+send the same `/review-changes ...` text as a normal prompt. There is no separate
+skill RPC; an ACP client with an open session sends, for example:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 17,
+  "method": "session/prompt",
+  "params": {
+    "sessionId": "YOUR_SESSION_ID",
+    "prompt": [
+      {"type": "text", "text": "/review-changes focus on error handling"}
+    ]
+  }
+}
+```
+
+**In both TUI and ACP, skill slash requests are model-mediated.** Loki forwards
+the request text unchanged and instructs the model to call `Skill`; the frontend
+does not preload the file or separately parse the trailing arguments. This needs
+a working model connection and follows the normal model-turn flow, unlike a
+local command such as `/status`. Skill selection and use of its instructions
+depend on the model.
+
+### Supporting files and updates
+
+A skill may refer to supporting files such as `references/checklist.md`. The
+load result tells the agent the skill's base directory, so those references are
+relative to the directory containing `SKILL.md`, not the session cwd. Supporting
+files are not automatically loaded, scripts are not automatically executed, and
+loading a skill does not change the cwd. Access to resources uses normal tools
+and their existing permissions. Keep the main instructions concise: loading
+reads at most 100,000 characters and reports truncation at that limit.
+
+The agent's catalogue refreshes on the next model turn; each `Skill` invocation
+rescans and reads the current file. The terminal's visible list is a startup
+snapshot, and ACP command lists are announced when opening or restoring a
+session, not continuously watched. Reopening an ACP session refreshes its menu
+advertisement. Loaded instructions remain ordinary conversation history, not a
+separately activated mode with an unload command; use a new conversation for
+context without previously loaded skill instructions.
 
 ## Running tests
 
