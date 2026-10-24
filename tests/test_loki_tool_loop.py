@@ -2074,6 +2074,69 @@ class TerminalReasoningEffortTests(unittest.TestCase):
             terminal_frontend.status_text(),
         )
 
+    def test_effort_status_is_repainted_before_waiting_for_more_input(self):
+        config = connections.make_runtime_config(
+            "https://chatgpt.com/backend-api/codex/responses",
+            protocols.OPENAI_RESPONSES,
+            model="gpt-6.1-sol",
+            provider_id="openai-subscription",
+            credential_ref=authentications.CredentialRef.openai_subscription(),
+            openai_request_profile=_codex_model(
+                "gpt-6.1-sol", use_responses_lite=True,
+                supports_reasoning_summaries=True,
+                default_reasoning_level="low", default_reasoning_summary="none"),
+            reasoning_effort_profile=modelsdev.ReasoningEffortProfile(
+                ["low", "medium", "high", "xhigh", "max", "ultra"], default="low"),
+        )
+        loki.CREDENTIALS = CredentialStore({"LOKI_API_BASE": config.chat_provider.chat_url})
+        painted = []
+        idle_status = []
+        payloads = []
+        choices = iter(["1", "4"])
+
+        def paint():
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                terminal_frontend._write_status_text()
+            painted.append(output.getvalue())
+
+        class ObservedInput(ScriptedInputSession):
+            async def start(inner_self):
+                paint()
+
+            async def get(inner_self):
+                # Observe the last frame before another key or queue event
+                # can redraw it and hide a missed command-completion update.
+                idle_status.append(painted[-1])
+                payloads.append(config.chat_provider.streaming_chat_payload(
+                    [formats.message_item("user", "hi")], [], config.model,
+                    reasoning_effort=loki.capture_turn_settings().effort))
+                paint()  # Queue activity redraws before the command runs.
+                return await super().get()
+
+            async def prompt(inner_self, prompt=None, history=None):
+                return next(choices)
+
+        session = ObservedInput([
+            "/thinking effort max", "/thinking effort default", "/thinking",
+            "/thinking effort invalid", "/quit",
+        ])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                    mock.patch.object(terminal_frontend, "input_session", return_value=session),
+                    mock.patch.object(terminal_frontend, "new_chat_log_path",
+                                      return_value=os.path.join(tmpdir, "chat.json")),
+                    mock.patch.object(terminal_frontend, "build_config_from_env", return_value=config),
+                    mock.patch.object(terminal_frontend, "restore_output_area_after_input"),
+                    mock.patch.object(terminals, "redraw_status_bar", side_effect=paint),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO())):
+                self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+
+        expected = ["low", "max", "low", "high", "high"]
+        self.assertEqual([payload["reasoning"]["effort"] for payload in payloads], expected)
+        for status, effort in zip(idle_status, expected):
+            self.assertIn(f"Effort: {effort}, Context:", status)
+
     def test_picker_offers_default_then_exact_model_values(self):
         loki.apply_runtime_config(connections.make_runtime_config(
             "https://api.openai.com/v1/responses",
