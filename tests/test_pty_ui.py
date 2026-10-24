@@ -279,7 +279,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
                     queued_texts += 1
                     _read_until(
                         handle, collected,
-                        'turn: running, mode: normal; '
+                        'turn: running, mode: normal; /todo:0/0, '
                         f'/queue(texts: {queued_texts}, images: 0)')
             before_stream_release = bytes(collected[turn_start:])
             release_start = len(collected)
@@ -291,7 +291,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
             if not queued_inputs:
                 _read_until(
                     handle, collected,
-                    'turn: idle, mode: normal; /queue(texts: 0, images: 0)',
+                    'turn: idle, mode: normal; /todo:0/0, /queue(texts: 0, images: 0)',
                     start=release_start)
 
         # /quit uses the same FIFO as prompts and /image. It cannot overtake
@@ -512,7 +512,7 @@ class PtyUiTests(unittest.TestCase):
         self.assertRegex(
             output,
             rb"Local: CWD: [^\r\n]*, turn: idle, mode: normal; "
-            rb"/queue\(texts: 0, images: 0\), /pwd",
+            rb"/todo:0/0, /queue\(texts: 0, images: 0\), /pwd",
         )
 
     def test_streamed_plain_prefix_is_visible_before_completion(self):
@@ -542,11 +542,11 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"/queue(texts: 1, images: 0)", before_release)
         self.assertIn(b"/queue(texts: 2, images: 0)", before_release)
         self.assertIn(
-            b"turn: running, mode: normal; /queue(texts: 2, images: 0)",
+            b"turn: running, mode: normal; /todo:0/0, /queue(texts: 2, images: 0)",
             before_release,
         )
         self.assertIn(
-            b"turn: idle, mode: normal; /queue(texts: 0, images: 0)",
+            b"turn: idle, mode: normal; /todo:0/0, /queue(texts: 0, images: 0)",
             output,
         )
         self.assertIn(b"/queue(texts: 0, images: 0)", output)
@@ -598,7 +598,7 @@ class PtyUiTests(unittest.TestCase):
         tracker = _SgrStreamTracker()
         tracker.feed(captured)
         after = "".join(tracker.text[len(before.text):])
-        ready = (f"{os.sep}after-cd, turn: idle, mode: normal; "
+        ready = (f"{os.sep}after-cd, turn: idle, mode: normal; /todo:0/0, "
                  "/queue(texts: 1, images: 0)")
         # Dequeuing /quit can itself paint the new cwd with zero pending
         # texts. Require the completed /cd view while /quit is still pending.

@@ -416,6 +416,37 @@ class PresentationTests(unittest.TestCase):
                 session.transcript_items))
         self.assertEqual(displays, ["unknown", "37%", "37%*", "48%"])
 
+    def test_terminal_redraws_todos_after_todowrite_before_the_next_response(self):
+        session = Session(runtime_config=config())
+        self.addCleanup(session.response_headers.close)
+        todos = [{"content": "Done", "status": "completed", "priority": "high"},
+                 {"content": "Next", "status": "pending", "priority": "medium"}]
+        metadata = {key: value for key, value in response(session).items()
+                    if key != "items"}
+        turns = [formats.DecodedTurn(
+            [formats.tool_call_item("c", "TodoWrite", {"todos": todos})], metadata),
+            formats.DecodedTurn([formats.message_item("assistant", "Done")], dict(metadata))]
+        displays = []
+
+        async def chat(*args, **kwargs):
+            if len(turns) == 1:
+                # A final-response-only repaint would leave the running turn's
+                # display stale here, even though it eventually looked right.
+                self.assertIn("turn: running", displays[-1])
+                self.assertIn("/todo:1/2, /queue", displays[-1])
+            return turns.pop(0)
+
+        with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                mock.patch.object(terminal_frontend, "_terminal_activity",
+                                  terminal_frontend.TerminalActivityStatus(turn_running=True)), \
+                mock.patch.object(terminal_frontend, "async_chat_completion", new=chat), \
+                mock.patch.object(terminal_frontend, "_terminal_agent_event"), \
+                mock.patch.object(terminal_frontend.terminals, "redraw_status_bar",
+                                  side_effect=lambda: displays.append(terminal_frontend.status_text())):
+            asyncio.run(terminal_frontend.run_terminal_turn_async(session.transcript_items))
+        self.assertEqual(session.session_todos, todos)
+        self.assertFalse(turns)
+
     def test_terminal_response_callback_updates_snapshot_and_redraws(self):
         session = Session(runtime_config=config())
         event = response(session)

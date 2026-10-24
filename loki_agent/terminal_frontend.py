@@ -850,12 +850,18 @@ def _status_fields(activity):
     elif (current_config() is not None
             and current_config().model_status == "deprecated"):
         displayed_model += " (deprecated)"
+    # Derive progress from the session so restores/clears cannot stale a second
+    # counter. Saved logs validate the list container, not each todo entry.
+    todos = current_session().session_todos
     return {
         "api": _status_api_base(),
         "model": displayed_model,
         "effort": _core.reasoning_effort_status_text(),
         "context": current_session().context_snapshot().text,
         "turn": "running" if activity.turn_running else "idle",
+        "todos_completed": sum(isinstance(todo, dict) and todo.get("status") == "completed"
+                               for todo in todos),
+        "todos_total": len(todos),
         "queued_prompts": activity.queued_prompts,
         "queued_images": activity.queued_images,
         "mode": current_agent_mode(),
@@ -874,12 +880,14 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
     return (
         remote + '\n'
         'Local: CWD: {}, turn: {}, mode: {}; '
-        '/queue(texts: {}, images: {}), '
+        '/todo:{}/{}, /queue(texts: {}, images: {}), '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         fields["cwd"],
         fields["turn"],
         fields["mode"],
+        fields["todos_completed"],
+        fields["todos_total"],
         fields["queued_prompts"],
         fields["queued_images"])
 
@@ -899,10 +907,13 @@ def _write_status_text():
     print(", /thinking, /trace thinking, /status, /account\nLocal: CWD: ", end="")
     terminal.write_text(fields["cwd"])
     print(", turn: ", end="")
+    # Keep the todo label in its value span; the next field owns the comma so
+    # bold ends before punctuation and the independently styled queue counts.
     for label, value, active in [
             ["", fields["turn"], fields["turn"] != "idle"],
             [", mode: ", fields["mode"], False],
-            ["; /queue(texts: ", fields["queued_prompts"], fields["queued_prompts"] != 0],
+            ["; ", f"/todo:{fields['todos_completed']}/{fields['todos_total']}", fields["todos_total"] != 0],
+            [", /queue(texts: ", fields["queued_prompts"], fields["queued_prompts"] != 0],
             [", images: ", fields["queued_images"], fields["queued_images"] != 0]]:
         print(label, end="")
         if active:

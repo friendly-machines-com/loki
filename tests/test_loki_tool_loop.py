@@ -2973,6 +2973,12 @@ class ExitStatusTests(unittest.TestCase):
 
 
 class StatusTextTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.multiple(
+            loki.current_session(), session_todos=[], chat_log_dirty=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_local_status_groups_queue_counts_with_the_queue_command(self):
         activity = terminal_frontend.TerminalActivityStatus()
         with mock.patch.object(terminal_frontend, "current_cwd",
@@ -2983,9 +2989,51 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             local,
             "Local: CWD: /home/dannym/src/loki, turn: idle, mode: normal; "
-            "/queue(texts: 0, images: 0), /pwd, /cd DIR, /ps, /image PATH, !foo, /quit")
+            "/todo:0/0, /queue(texts: 0, images: 0), /pwd, /cd DIR, /ps, /image PATH, !foo, /quit")
         self.assertNotIn("queued prompts:", local)
         self.assertNotIn("queued images:", local)
+
+    def test_todo_progress_bolds_the_label_and_counts_but_not_the_comma(self):
+        for statuses in [[], ["pending"], ["completed", "in_progress", "pending"],
+                         ["completed", "completed"]]:
+            with self.subTest(statuses=statuses):
+                todos = [{"content": f"Task {index}", "status": status, "priority": "high"}
+                         for index, status in enumerate(statuses)]
+                self.assertIn("Updated todos:", loki.run_todowrite(todos))
+                with mock.patch.object(terminal_frontend, "_terminal_activity",
+                                       terminal_frontend.TerminalActivityStatus()), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    terminal_frontend._write_status_text()
+                    plain = terminal_frontend.status_text()
+                value = f"/todo:{statuses.count('completed')}/{len(statuses)}"
+                styled = f"\033[1m{value}\033[22m" if statuses else value
+                self.assertIn(f"; {value}, /queue", plain)
+                self.assertIn(f"; {styled}, /queue", output.getvalue())
+                self.assertEqual(output.getvalue().replace("\033[1m", "").replace("\033[22m", ""), plain)
+                self.assertNotIn("\033[0m", output.getvalue())
+
+    def test_todo_progress_keeps_rejected_writes_and_tracks_clearing(self):
+        todo = {"content": "Done", "status": "completed", "priority": "high"}
+        loki.run_todowrite([todo])
+        self.assertIn("/todo:1/1, /queue", terminal_frontend.status_text())
+        self.assertIn("Error:", loki.run_todowrite([{**todo, "status": "invalid"}]))
+        self.assertIn("/todo:1/1, /queue", terminal_frontend.status_text())
+        loki.run_todowrite([])
+        self.assertIn("/todo:0/0, /queue", terminal_frontend.status_text())
+
+    def test_todo_progress_uses_restored_session_records_without_trusting_their_shape(self):
+        session = loki.Session()
+        self.addCleanup(session.response_headers.close)
+        # Saved logs admit a list without validating each todo record.
+        records = [None, "not a record", {}, {"status": "completed"}]
+        with mock.patch.object(loki, "_DEFAULT_SESSION", session):
+            session.replace_transcript([], records, [], {}, "restored.json")
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                terminal_frontend._write_status_text()
+            self.assertIn("/todo:1/4, /queue", terminal_frontend.status_text())
+            self.assertIn("\033[1m/todo:1/4\033[22m, /queue", output.getvalue())
+            session.replace_transcript([], [], [], {}, "new.json")
+            self.assertIn("/todo:0/0, /queue", terminal_frontend.status_text())
 
     def test_status_bar_bolds_only_nonidle_and_nonzero_activity_values(self):
         for running, messages, images in (
@@ -3145,7 +3193,7 @@ class StatusTextTests(unittest.TestCase):
             "Context: unknown; "
             "/model, /thinking, /trace thinking, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
-            f"mode: {loki.current_agent_mode()}; /queue(texts: 2, images: 1), "
+            f"mode: {loki.current_agent_mode()}; /todo:0/0, /queue(texts: 2, images: 1), "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)
