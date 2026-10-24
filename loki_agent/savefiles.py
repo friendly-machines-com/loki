@@ -5,15 +5,18 @@ written through an injected text writer, and resume presentation is returned
 as typed text segments for a front-end to render.
 """
 
+from contextlib import contextmanager
 import json
 import os
 import re
+import stat
 # import sys
 import time
 import uuid
 from pprint import pformat
 
 from . import formats
+from . import paths
 from . import process_outputs
 from . import texts
 
@@ -30,12 +33,7 @@ def chat_log_filename(chat_id: str) -> str:
     return "chat-{}.json".format(chat_id)
 
 
-def ensure_chat_log_dir(chat_log_dir: str) -> None:
-    os.makedirs(chat_log_dir, exist_ok=True)
-
-
 def new_chat_log_path(chat_log_dir: str) -> str:
-    ensure_chat_log_dir(chat_log_dir)
     return os.path.join(chat_log_dir, chat_log_filename(str(uuid.uuid4())))
 
 
@@ -46,31 +44,51 @@ def resolve_chat_log_path(resume_arg: str, startup_cwd: str,
     # path; a bare name is resolved inside the chat log directory.
     if os.path.isabs(resume_arg):
         return resume_arg
-    if os.path.dirname(resume_arg):
+    if paths.has_directory_component(resume_arg):
         return resolve_path_fn(resume_arg, startup_cwd)
-    ensure_chat_log_dir(chat_log_dir)
     return os.path.join(chat_log_dir, chat_log_filename(resume_arg))
 
 
-def chat_log_paths(chat_log_dir: str) -> list[str]:
-    ensure_chat_log_dir(chat_log_dir)
+def chat_log_entries(chat_log_dir: str) -> list[os.DirEntry]:
     try:
-        names = os.listdir(chat_log_dir)
+        with os.scandir(chat_log_dir) as directory:
+            return [entry for entry in directory
+                    if entry.name.startswith("chat-") and entry.name.endswith(".json")]
     except FileNotFoundError:
         return []
-    return [os.path.join(chat_log_dir, n) for n in names
-            if n.startswith("chat-") and n.endswith(".json")]
+
+
+@contextmanager
+def open_chat_log(path: str, *, errors='strict'):
+    """Validate the opened saved conversation, without a pathname recheck.
+
+    A regular-file symlink remains usable. POSIX special files must not block
+    a frontend before its regular-file check can run.
+    """
+    flags = os.O_RDONLY
+    if os.name == 'posix':
+        flags |= os.O_NONBLOCK
+    descriptor = os.open(path, flags)
+    try:
+        facts = os.fstat(descriptor)
+        if not stat.S_ISREG(facts.st_mode):
+            raise OSError('saved conversation is not a regular file')
+        stream = os.fdopen(descriptor, 'r', encoding='utf-8', errors=errors)
+        descriptor = None
+        with stream:
+            yield stream, facts
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def text_for(path: str) -> str:
-    # Re-read each call; the kernel page cache keeps the bytes in RAM after
-    # the first read, so repeated calls during a picker session are cheap.
+    # Re-read each call rather than retaining a second copy of a saved log.
     try:
-        with open(path, 'rb') as f:
-            data = f.read()
+        with open_chat_log(path, errors='replace') as (stream, _facts):
+            return stream.read()
     except OSError:
         return ""
-    return data.decode('utf-8', 'replace')
 
 
 def preview(text: str) -> str:
@@ -87,31 +105,31 @@ def preview(text: str) -> str:
     return snippet
 
 
-def format_picker_row(idx: int, path: str) -> str:
+def format_picker_row(idx: int, entry: os.DirEntry) -> str:
     try:
-        mtime = os.path.getmtime(path)
+        mtime = os.path.getmtime(entry.path)
     except OSError:
         mtime = 0
     when = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
-    chat_id = os.path.basename(path)[len("chat-"):-len(".json")]
-    return f"  {idx}. {when}  {chat_id[:8]}  {preview(text_for(path))}"
+    chat_id = entry.name[len("chat-"):-len(".json")]
+    return f"  {idx}. {when}  {chat_id[:8]}  {preview(text_for(entry.path))}"
 
 
-def filtered_chat_log_paths(query: str, chat_log_dir: str) -> list[str]:
+def filtered_chat_log_entries(query: str, chat_log_dir: str) -> list[os.DirEntry]:
     # Match by whole-file substring, not parsed JSON -- fast, tolerant of
     # partially-written logs. mtime ordering puts the most recently touched
     # conversation at the bottom of the list.
     words = query.lower().split()
-    paths = chat_log_paths(chat_log_dir)
+    entries = chat_log_entries(chat_log_dir)
     if not words:
-        matches = list(paths)
+        matches = entries
     else:
         matches = []
-        for path in paths:
-            blob = text_for(path).lower()
+        for entry in entries:
+            blob = text_for(entry.path).lower()
             if all(w in blob for w in words):
-                matches.append(path)
-    matches.sort(key=os.path.getmtime)
+                matches.append(entry)
+    matches.sort(key=lambda entry: os.path.getmtime(entry.path))
     return matches
 
 
@@ -122,14 +140,14 @@ async def run_session_picker_async(
     # a fresh chat).
     query = ""
     while True:
-        matches = filtered_chat_log_paths(query, chat_log_dir)
+        matches = filtered_chat_log_entries(query, chat_log_dir)
         print()
         print("Saved sessions:")
         print("Resume a chat. \"filter <words>\" searches the logs (words in any order);")
         print("bare \"filter\" clears it; a number selects that row; empty cancels.")
         if matches:
-            for i, path in enumerate(matches, 1):
-                text_writer(format_picker_row(i, path))
+            for i, entry in enumerate(matches, 1):
+                text_writer(format_picker_row(i, entry))
                 print()
         else:
             print("  (no chats match -- broaden your filter, or type \"filter\" to clear)")
@@ -148,7 +166,7 @@ async def run_session_picker_async(
             n = None
         if n is not None:
             if 1 <= n <= len(matches):
-                return matches[n - 1]
+                return matches[n - 1].path
             continue  # out of range, re-render, keep current filter
 
         # Branch 3: empty -- cancel the picker.

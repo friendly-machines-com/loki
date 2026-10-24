@@ -1105,7 +1105,6 @@ class Front:
 
     def list_sessions(self, params: dict) -> dict:
         requested = params.get("cwd")
-        cwd_filter = None
         if requested is not None:
             if (not isinstance(requested, str)
                     or not os.path.isabs(requested)):
@@ -1113,36 +1112,36 @@ class Front:
                     "session/list cwd must be an absolute path",
                     code=acps.INVALID_PARAMS,
                 )
-            # Case-folded names are compared, nothing is asked of the
-            # filesystem: Loki never resolves or normalises an operand.
-            cwd_filter = os.path.normcase(requested)
-        # Sessions live in the workspace the client names; with no filter, in
-        # this process's own workspace, the directory it was started in.
+        # The workspace selects the log directory. Saved shell_cwd is mutable
+        # conversation metadata.
         root = (chat_log_dir_for(requested) if requested is not None
                 else CHAT_LOG_DIR)
         entries = []
-        for path in savefiles.filtered_chat_log_paths("", root):
+        for entry in savefiles.chat_log_entries(root):
+            session_id = entry.name[len('chat-'):-len('.json')]
+            if not session_id:
+                continue
             try:
-                with open(path, "r", encoding="utf-8") as file_obj:
+                with savefiles.open_chat_log(entry.path) as (file_obj, facts):
                     blob = json.load(file_obj)
-                modified = os.path.getmtime(path)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
                 continue
-            state = blob.get("session_state") if isinstance(blob, dict) else {}
-            cwd = (state or {}).get("cwd") or (state or {}).get("shell_cwd")
-            if not cwd:
+            state = blob.get('session_state') if isinstance(blob, dict) else None
+            if not isinstance(state, dict):
                 continue
-            if (cwd_filter is not None
-                    and os.path.normcase(cwd) != cwd_filter):
+            cwd = state.get('cwd') or state.get('shell_cwd')
+            if not isinstance(cwd, str) or not cwd:
                 continue
-            entries.append({
-                "sessionId": (
-                    os.path.basename(path)[len("chat-"):-len(".json")]),
+            # A fixed record keeps the opened file's ordering observation out
+            # of the protocol payload; no later pathname lookup changes it.
+            entries.append((facts.st_mtime, {
+                "sessionId": session_id,
                 "cwd": cwd,
                 "updatedAt": datetime.datetime.fromtimestamp(
-                    modified, datetime.timezone.utc).isoformat(),
-            })
-        return {"sessions": entries}
+                    facts.st_mtime, datetime.timezone.utc).isoformat(),
+            }))
+        entries.sort(key=lambda item: item[0])
+        return {"sessions": [session for _modified, session in entries]}
 
     async def close_session(self, params: dict, owner=None) -> dict:
         session_id = params.get("sessionId")
