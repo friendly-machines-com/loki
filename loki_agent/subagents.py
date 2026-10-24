@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import getopt
-import os
 import sys
 import uuid
 from dataclasses import dataclass
@@ -44,7 +43,7 @@ Options:
 
 def usage() -> str:
     return (
-        f"usage: {os.path.basename(sys.argv[0])} "
+        f"usage: {texts.escape_terminal_text(sys.argv[0], multiline=False)} "
         f"--subagent TYPE [options]\n"
         f"{USAGE_OPTIONS}")
 
