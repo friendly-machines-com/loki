@@ -148,6 +148,15 @@ else:
         def disable_origin_mode(self):
             print('\033[?6l', end='')
 
+        def disable_autowrap(self):
+            print('\033[?7l', end='')
+
+        def enable_autowrap(self):
+            print('\033[?7h', end='')
+
+        def carriage_return(self):
+            print('\r', end='')
+
         def set_foreground_color(self, index):
             print('\033[{}m'.format(30 + index), end='')
 

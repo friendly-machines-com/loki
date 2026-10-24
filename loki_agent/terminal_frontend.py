@@ -880,7 +880,7 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
     return (
         remote + '\n'
         'Local: CWD: {}, turn: {}, mode: {}; '
-        '/todo:{}/{}, /queue(texts: {}, images: {}), '
+        '/todo:{}/{}, /queue{{txt:{},img:{}}}, '
         '/pwd, /cd DIR, /ps, /image PATH, !foo, /quit'
     ).format(
         fields["cwd"],
@@ -893,6 +893,16 @@ def status_text(activity: TerminalActivityStatus | None = None) -> str:
 
 
 def _write_status_text():
+    # Autowrap is terminal-global, so scope it strictly to status painting and
+    # restore it even if formatting or output fails.
+    terminal.disable_autowrap()
+    try:
+        _write_status_text_lines()
+    finally:
+        terminal.enable_autowrap()
+
+
+def _write_status_text_lines():
     fields = _status_fields(None)
     print("Remote: API: ", end="")
     terminal.write_text(fields["api"])
@@ -904,7 +914,14 @@ def _write_status_text():
     print(", Context: ", end="")
     terminal.write_text(fields["context"])
     print("; /model", end="")
-    print(", /thinking, /trace thinking, /status, /account\nLocal: CWD: ", end="")
+    print(", /thinking, /trace thinking, /status, /account", end="")
+    terminal.enable_autowrap()
+    # CR makes the next line start at column one even when LNM is reset;
+    # LF advances exactly once because autowrap was disabled for the full row.
+    terminal.carriage_return()
+    print("\n", end="")
+    terminal.disable_autowrap()
+    print("Local: CWD: ", end="")
     terminal.write_text(fields["cwd"])
     print(", turn: ", end="")
     # Keep the todo label in its value span; the next field owns the comma so
@@ -913,8 +930,8 @@ def _write_status_text():
             ["", fields["turn"], fields["turn"] != "idle"],
             [", mode: ", fields["mode"], False],
             ["; ", f"/todo:{fields['todos_completed']}/{fields['todos_total']}", fields["todos_total"] != 0],
-            [", /queue(texts: ", fields["queued_prompts"], fields["queued_prompts"] != 0],
-            [", images: ", fields["queued_images"], fields["queued_images"] != 0]]:
+            [", /queue{txt:", fields["queued_prompts"], fields["queued_prompts"] != 0],
+            [",img:", fields["queued_images"], fields["queued_images"] != 0]]:
         print(label, end="")
         if active:
             print(terminals.BOLD, end="")
@@ -928,7 +945,7 @@ def _write_status_text():
     has_running_jobs = manager is not None and any(
         job.status == "running" and job.group_active
         for job in manager.jobs.values())
-    print("), /pwd, /cd DIR, ", end="")
+    print("}, /pwd, /cd DIR, ", end="")
     # /ps is available immediately, including during a turn; this label is
     # only a job-state snapshot, never an instruction to queue the command.
     if has_running_jobs:

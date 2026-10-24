@@ -280,7 +280,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
                     _read_until(
                         handle, collected,
                         'turn: running, mode: normal; /todo:0/0, '
-                        f'/queue(texts: {queued_texts}, images: 0)')
+                        f'/queue{{txt:{queued_texts},img:0}}')
             before_stream_release = bytes(collected[turn_start:])
             release_start = len(collected)
             pathlib.Path(gate).touch()
@@ -291,7 +291,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
             if not queued_inputs:
                 _read_until(
                     handle, collected,
-                    'turn: idle, mode: normal; /todo:0/0, /queue(texts: 0, images: 0)',
+                    'turn: idle, mode: normal; /todo:0/0, /queue{txt:0,img:0}',
                     start=release_start)
 
         # /quit uses the same FIFO as prompts and /image. It cannot overtake
@@ -512,8 +512,17 @@ class PtyUiTests(unittest.TestCase):
         self.assertRegex(
             output,
             rb"Local: CWD: [^\r\n]*, turn: idle, mode: normal; "
-            rb"/todo:0/0, /queue\(texts: 0, images: 0\), /pwd",
+            rb"/todo:0/0, /queue\{txt:0,img:0\}, /pwd",
         )
+        if sys.platform == "win32":
+            # ConPTY consumes mode controls rather than preserving raw bytes.
+            return
+        # ONLCR may add another CR, but each row must stay wholly guarded.
+        self.assertEqual(output.count(b"\x1b[?7l"), output.count(b"\x1b[?7h"))
+        self.assertRegex(
+            output,
+            rb"\x1b\[\?7lRemote: API: [^\x1b\r\n]*/account\x1b\[\?7h\r+\n"
+            rb"\x1b\[\?7lLocal: CWD: [^\r\n]*?/quit\x1b\[\?7h")
 
     def test_streamed_plain_prefix_is_visible_before_completion(self):
         chunks = [
@@ -539,17 +548,17 @@ class PtyUiTests(unittest.TestCase):
         # These assertions concern queue transitions, independently of styling.
         before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
-        self.assertIn(b"/queue(texts: 1, images: 0)", before_release)
-        self.assertIn(b"/queue(texts: 2, images: 0)", before_release)
+        self.assertIn(b"/queue{txt:1,img:0}", before_release)
+        self.assertIn(b"/queue{txt:2,img:0}", before_release)
         self.assertIn(
-            b"turn: running, mode: normal; /todo:0/0, /queue(texts: 2, images: 0)",
+            b"turn: running, mode: normal; /todo:0/0, /queue{txt:2,img:0}",
             before_release,
         )
         self.assertIn(
-            b"turn: idle, mode: normal; /todo:0/0, /queue(texts: 0, images: 0)",
+            b"turn: idle, mode: normal; /todo:0/0, /queue{txt:0,img:0}",
             output,
         )
-        self.assertIn(b"/queue(texts: 0, images: 0)", output)
+        self.assertIn(b"/queue{txt:0,img:0}", output)
 
     def test_completed_queued_command_repaints_before_next_dispatch(self):
         with tempfile.TemporaryDirectory(prefix="loki-dispatch-status-") as root:
@@ -573,8 +582,8 @@ class PtyUiTests(unittest.TestCase):
                 handle.write(b"\x7ffirst prompt\r")
                 _read_until(handle, output, "blocked prefix")
                 for command, expected in [
-                        ["/cd after-cd", "/queue(texts: 1, images: 0)"],
-                        ["/quit", "/queue(texts: 2, images: 0)"],
+                        ["/cd after-cd", "/queue{txt:1,img:0}"],
+                        ["/quit", "/queue{txt:2,img:0}"],
                         ["/ps", "No running, starting, or failed jobs."],
                         ["/queue texts", "[id 3] /quit"]]:
                     start = len(output)
@@ -599,7 +608,7 @@ class PtyUiTests(unittest.TestCase):
         tracker.feed(captured)
         after = "".join(tracker.text[len(before.text):])
         ready = (f"{os.sep}after-cd, turn: idle, mode: normal; /todo:0/0, "
-                 "/queue(texts: 1, images: 0)")
+                 "/queue{txt:1,img:0}")
         # Dequeuing /quit can itself paint the new cwd with zero pending
         # texts. Require the completed /cd view while /quit is still pending.
         self.assertIn(ready, after)
@@ -615,8 +624,8 @@ class PtyUiTests(unittest.TestCase):
         self.assertIn(b"No running, starting, or failed jobs.", before_release)
         self.assertNotIn(b"codeword", before_release)
         plain = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
-        self.assertIn(b"/queue(texts: 1, images: 0)", plain)
-        self.assertNotIn(b"/queue(texts: 2", plain)
+        self.assertIn(b"/queue{txt:1,img:0}", plain)
+        self.assertNotIn(b"/queue{txt:2", plain)
         self._assert_styled_output(output)
         tracker = _SgrStreamTracker()
         tracker.feed(output)
@@ -636,8 +645,8 @@ class PtyUiTests(unittest.TestCase):
         # These assertions concern queue transitions, independently of styling.
         before_release = re.sub(rb"\x1b\[[0-9;]*m", b"", before_release)
         output = re.sub(rb"\x1b\[[0-9;]*m", b"", output)
-        self.assertIn(b"/queue(texts: 1, images: 0)", before_release)
-        self.assertIn(b"/queue(texts: 0, images: 1)", output)
+        self.assertIn(b"/queue{txt:1,img:0}", before_release)
+        self.assertIn(b"/queue{txt:0,img:1}", output)
 
     def test_full_stream_parses_and_styles_land(self):
         # Whole-stream validation of the tty byte output: every escape

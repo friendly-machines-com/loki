@@ -431,10 +431,10 @@ class TerminalImageCommandTests(unittest.TestCase):
         self.assertIn("Attached image for next prompt:", stderr)
         # Ready-state frames may precede staging; require the visible
         # staged-to-consumed transition, not fixed redraw indices.
-        staged = [index for index, text in enumerate(status_updates) if "images: 1)" in text]
+        staged = [index for index, text in enumerate(status_updates) if ",img:1}" in text]
         self.assertTrue(staged, status_updates)
         self.assertTrue(any(
-            "images: 0)" in text for text in status_updates[staged[0] + 1:]), status_updates)
+            ",img:0}" in text for text in status_updates[staged[0] + 1:]), status_updates)
 
     def test_stale_image_delete_after_real_consumption_preserves_new_image(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2979,6 +2979,90 @@ class StatusTextTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_full_status_rows_stay_on_two_rows_and_other_output_wraps(self):
+        # Model only ASCII graphic output, DECAWM, CR and LF. The PTY test
+        # separately checks the native terminal's emitted control sequences.
+        class Screen(io.StringIO):
+            def __init__(self, width, newline_mode):
+                super().__init__()
+                self.width = width
+                self.newline_mode = newline_mode
+                self.autowrap = True
+                self.pending_wrap = False
+                self.row = 0
+                self.column = 0
+                self.rows = {}
+                self.graphic_modes = []
+
+            def write(self, text):
+                for char in text:
+                    if char == "\r":
+                        self.column = 0
+                        self.pending_wrap = False
+                    elif char == "\n":
+                        self.row += 1
+                        self.pending_wrap = False
+                        if self.newline_mode:
+                            self.column = 0
+                    else:
+                        self.graphic_modes.append(self.autowrap)
+                        if self.autowrap and self.pending_wrap:
+                            self.row += 1
+                            self.column = 0
+                        row = self.rows.setdefault(self.row, [" "] * self.width)
+                        row[self.column] = char
+                        self.pending_wrap = self.autowrap and self.column == self.width - 1
+                        self.column = min(self.column + 1, self.width - 1)
+                return super().write(text)
+
+        fields = terminal_frontend._status_fields(terminal_frontend.TerminalActivityStatus())
+        fields.update(api="a" * 100, model="model", effort=None, cwd="/" + "d" * 100)
+        with mock.patch.object(terminal_frontend, "_status_fields", return_value=fields), \
+                mock.patch.object(loki.current_session(), "job_manager", None):
+            lines = terminal_frontend.status_text().splitlines()
+            for width in [20, len(lines[0]), len(lines[0]) + 1]:
+                for newline_mode in [False, True]:
+                    with self.subTest(width=width, newline_mode=newline_mode):
+                        screen = Screen(width, newline_mode)
+                        with mock.patch.object(terminal_frontend.terminal, "disable_autowrap",
+                                               side_effect=lambda: setattr(screen, "autowrap", False)), \
+                                mock.patch.object(terminal_frontend.terminal, "enable_autowrap",
+                                                  side_effect=lambda: setattr(screen, "autowrap", True)), \
+                                mock.patch.object(terminal_frontend.terminal, "carriage_return",
+                                                  side_effect=lambda: print("\r", end="")), \
+                                contextlib.redirect_stdout(screen):
+                            terminal_frontend._write_status_text()
+                            self.assertFalse(any(screen.graphic_modes))
+                            self.assertEqual(sorted(screen.rows), [0, 1])
+                            for row, line in enumerate(lines):
+                                expected = line if len(line) <= width else line[:width - 1] + line[-1]
+                                self.assertEqual("".join(screen.rows[row]).rstrip(), expected)
+                            self.assertTrue(screen.autowrap)
+                            print("\r\n" + "x" * (width + 1), end="")
+                            self.assertEqual("".join(screen.rows[2]), "x" * width)
+                            self.assertEqual("".join(screen.rows[3]).rstrip(), "x")
+
+    def test_status_restores_autowrap_if_either_row_fails(self):
+        fields = terminal_frontend._status_fields(terminal_frontend.TerminalActivityStatus())
+        for field in ["api", "cwd"]:
+            with self.subTest(field=field):
+                transitions = []
+
+                def write_text(text):
+                    if text == fields[field]:
+                        raise OSError("write failed")
+
+                with mock.patch.object(terminal_frontend, "_status_fields", return_value=fields), \
+                        mock.patch.object(terminal_frontend.terminal, "disable_autowrap",
+                                          side_effect=lambda: transitions.append("off")), \
+                        mock.patch.object(terminal_frontend.terminal, "enable_autowrap",
+                                          side_effect=lambda: transitions.append("on")), \
+                        mock.patch.object(terminal_frontend.terminal, "write_text", side_effect=write_text), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(OSError, "write failed"):
+                        terminal_frontend._write_status_text()
+                self.assertEqual(transitions[-1], "on")
+
     def test_local_status_groups_queue_counts_with_the_queue_command(self):
         activity = terminal_frontend.TerminalActivityStatus()
         with mock.patch.object(terminal_frontend, "current_cwd",
@@ -2989,7 +3073,7 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(
             local,
             "Local: CWD: /home/dannym/src/loki, turn: idle, mode: normal; "
-            "/todo:0/0, /queue(texts: 0, images: 0), /pwd, /cd DIR, /ps, /image PATH, !foo, /quit")
+            "/todo:0/0, /queue{txt:0,img:0}, /pwd, /cd DIR, /ps, /image PATH, !foo, /quit")
         self.assertNotIn("queued prompts:", local)
         self.assertNotIn("queued images:", local)
 
@@ -3054,11 +3138,11 @@ class StatusTextTests(unittest.TestCase):
                 self.assertEqual(
                     rendered.replace("\033[1m", "").replace("\033[22m", ""), plain)
                 for label, value, bold, suffix in [
-                        ["turn", "running" if running else "idle", running, ","],
-                        ["texts", str(messages), messages != 0, ","],
-                        ["images", str(images), images != 0, ")"]]:
+                        ["turn: ", "running" if running else "idle", running, ","],
+                        ["/queue{txt:", str(messages), messages != 0, ","],
+                        [",img:", str(images), images != 0, "}"]]:
                     expected = f"\033[1m{value}\033[22m" if bold else value
-                    self.assertIn(f"{label}: {expected}{suffix}", rendered)
+                    self.assertIn(f"{label}{expected}{suffix}", rendered)
                 self.assertEqual(rendered.count("\033[1m"),
                                  sum((running, messages != 0, images != 0)))
                 self.assertNotIn("\033[0m", rendered)
@@ -3193,7 +3277,7 @@ class StatusTextTests(unittest.TestCase):
             "Context: unknown; "
             "/model, /thinking, /trace thinking, /status, /account\n"
             f"Local: CWD: {loki.STARTUP_CWD}, turn: running, "
-            f"mode: {loki.current_agent_mode()}; /todo:0/0, /queue(texts: 2, images: 1), "
+            f"mode: {loki.current_agent_mode()}; /todo:0/0, /queue{{txt:2,img:1}}, "
             "/pwd, /cd DIR, /ps, /image PATH, !foo, /quit",
         )
         self.assertNotIn("user", text)
