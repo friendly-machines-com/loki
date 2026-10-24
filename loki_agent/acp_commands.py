@@ -20,9 +20,8 @@ in command_deliveries does not change this gate.
 from __future__ import annotations
 
 import json
-import os
 
-from . import attachments, loki, provider_controls
+from . import attachments, loki, provider_controls, skills
 
 
 class Outcome:
@@ -53,57 +52,6 @@ LOCAL_COMMANDS = [
     ("trace", "Show or hide thinking: /trace thinking on|off"),
 ]
 
-_SKILL_MARKER = "SKILL.md"
-_SKILL_READ_BYTES = 32 * 1024
-
-
-def _skill_description(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as stream:
-            head = stream.read(_SKILL_READ_BYTES)
-    except OSError:
-        return ""
-    lines = head.splitlines()
-    if lines and lines[0].strip() == "---":
-        for line in lines[1:]:
-            stripped = line.strip()
-            if stripped == "---":
-                break
-            key, separator, value = stripped.partition(":")
-            if separator and key.strip() == "description":
-                return value.strip().strip('"\'')
-    for line in lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and stripped != "---":
-            return stripped
-    return ""
-
-
-def _skill_names(root: str):
-    try:
-        entries = sorted(os.listdir(root))
-    except OSError:
-        return []
-    found = []
-    for entry in entries:
-        directory = os.path.join(root, entry)
-        if not os.path.isdir(directory):
-            continue
-        skill_file = os.path.join(directory, _SKILL_MARKER)
-        if os.path.isfile(skill_file):
-            found.append((entry, skill_file))
-            continue
-        # A plugin namespaces its skills as "<plugin>:<skill>".
-        try:
-            nested = sorted(os.listdir(directory))
-        except OSError:
-            continue
-        for child in nested:
-            child_file = os.path.join(directory, child, _SKILL_MARKER)
-            if os.path.isfile(child_file):
-                found.append((f"{entry}:{child}", child_file))
-    return found
-
 
 def advertised_commands() -> list:
     """The availableCommands list for available_commands_update."""
@@ -111,10 +59,7 @@ def advertised_commands() -> list:
         {"name": name, "description": description}
         for name, description in LOCAL_COMMANDS
     ]
-    root = os.path.join(loki.LOKI_CONFIG_DIR, "skills")
-    for name, path in _skill_names(root):
-        description = _skill_description(path) or f"Skill: {name}"
-        commands.append({"name": name, "description": description})
+    commands.extend(skills.available(loki.LOKI_CONFIG_DIR))
     return commands
 
 

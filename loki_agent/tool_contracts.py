@@ -351,7 +351,7 @@ TOOLS = [
                     "Explore searches. Specify search breadth: \"medium\" "
                     "for moderate exploration, \"very thorough\" for "
                     "multiple locations and naming conventions. (Tools: "
-                    "Agent, Glob, Grep, Read, Jobs, JobStatus, TodoRead, "
+                    "Agent, Glob, Grep, Read, Skill, Jobs, JobStatus, TodoRead, "
                     "WebFetch, WebSearch)"
                 ),
                 "",
@@ -396,7 +396,7 @@ TOOLS = [
                 "- Set `args` to pass optional arguments.",
                 "",
                 "Important:",
-                "- Available skills are listed in system-reminder messages in the conversation",
+                "- Available skills are listed below in this tool's description",
                 "- Only invoke a skill that appears in that list, or one the user explicitly typed as `/<name>` in their message. Never guess or invent a skill name from training data; otherwise do not call this tool",
                 "- When a skill matches the user's request, this is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task",
                 "- NEVER mention a skill without actually calling this tool",

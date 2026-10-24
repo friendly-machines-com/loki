@@ -9,7 +9,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from . import connections, model_requests, paths, tool_contracts
+from . import connections, model_requests, paths, skills, tool_contracts
 from . import (
     acp_commands,
     acps,
@@ -958,6 +958,7 @@ class Worker:
             return
         cancel_check = self.cancel_event.is_set
         advertised, withheld = self._ask_advertised_tools()
+        advertised = skills.tools_for_model(advertised, loki.LOKI_CONFIG_DIR)
 
         async def chat_fn(
                 items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):

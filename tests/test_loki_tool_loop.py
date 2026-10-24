@@ -7646,7 +7646,7 @@ class QuestionGuardTests(unittest.TestCase):
         # deliberately, as a diff to this expected set.
         self.assertEqual(
             loki.EXPLORE_TOOLS,
-            {"Agent", "Ask", "Read", "Glob", "Grep", "Jobs", "JobStatus", "TodoRead",
+            {"Agent", "Ask", "Read", "Skill", "Glob", "Grep", "Jobs", "JobStatus", "TodoRead",
              "WebFetch", "WebSearch"})
 
     def test_plan_tools_registry_shape_is_pinned(self):
@@ -7660,11 +7660,11 @@ class QuestionGuardTests(unittest.TestCase):
         loki.current_session().agent_mode = "plan"
         context = loki.get_tool_loop_extra_context(
             [formats.message_item("user", "plan the refactor")])
-        for name in ["TodoWrite", "Read", "Grep"]:
+        for name in ["TodoWrite", "Read", "Skill", "Grep"]:
             with self.subTest(tool=name):
                 self.assertIsNone(
                     loki._tool_access_error(name, extra_context=context))
-        for name in ["Edit", "Write", "Bash", "Skill", "JobStop"]:
+        for name in ["Edit", "Write", "Bash", "JobStop"]:
             with self.subTest(tool=name):
                 self.assertIsNotNone(
                     loki._tool_access_error(name, extra_context=context))

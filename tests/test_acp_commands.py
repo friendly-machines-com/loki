@@ -5,7 +5,7 @@ from unittest import mock
 
 from loki_agent import acp_commands
 from loki_agent import loki
-from loki_agent import provider_controls
+from loki_agent import provider_controls, skills
 from loki_agent.sessions import Session
 
 
@@ -44,8 +44,64 @@ class AdvertisementTests(unittest.TestCase):
                 commands = {
                     command["name"]: command["description"]
                     for command in acp_commands.advertised_commands()}
+                demo = loki.run_skill('demo')
+                inner = loki.run_skill('pack:inner')
         self.assertEqual(commands["demo"], "Does demo things")
         self.assertEqual(commands["pack:inner"], "First line fallback")
+        self.assertIn('# Demo', demo)
+        self.assertIn(f'Base directory for this skill: {skill}', demo)
+        self.assertIn('# Inner', inner)
+        self.assertIn(f'Base directory for this skill: {plugin}', inner)
+
+    def test_skill_name_does_not_become_an_arbitrary_filename(self):
+        with tempfile.TemporaryDirectory() as config, tempfile.TemporaryDirectory() as outside:
+            path = os.path.join(outside, 'SKILL.md')
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write('not a registered skill')
+            with mock.patch.object(loki, 'LOKI_CONFIG_DIR', config), \
+                    mock.patch.object(skills, 'read_text') as read:
+                for name in [outside, 'missing', '../outside']:
+                    with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'unavailable'):
+                        loki.run_skill(name)
+                read.assert_not_called()
+
+    @unittest.skipUnless(os.name == 'posix', 'literal colon directory names')
+    def test_ambiguous_catalog_identifier_is_neither_advertised_nor_loaded(self):
+        with tempfile.TemporaryDirectory() as config:
+            direct = os.path.join(config, 'skills', 'pack:inner')
+            nested = os.path.join(config, 'skills', 'pack', 'inner')
+            kept = os.path.join(config, 'skills', 'kept')
+            for directory, body in [[direct, 'direct'], [nested, 'nested'], [kept, 'kept body']]:
+                os.makedirs(directory)
+                with open(os.path.join(directory, 'SKILL.md'), 'w', encoding='utf-8') as stream:
+                    stream.write(body)
+            with mock.patch.object(loki, 'LOKI_CONFIG_DIR', config):
+                names = [command['name'] for command in acp_commands.advertised_commands()]
+                self.assertNotIn('pack:inner', names)
+                self.assertIn('kept', names)
+                with self.assertRaisesRegex(ValueError, 'unavailable'):
+                    loki.run_skill('pack:inner')
+                self.assertIn('kept body', loki.run_skill('kept'))
+
+    @unittest.skipUnless(os.name == 'posix', 'native POSIX FIFO replacement')
+    def test_skill_reader_checks_the_opened_object_after_catalog_lookup(self):
+        with tempfile.TemporaryDirectory() as config:
+            directory = os.path.join(config, 'skills', 'demo')
+            os.makedirs(directory)
+            path = os.path.join(directory, 'SKILL.md')
+            with open(path, 'w', encoding='utf-8') as stream:
+                stream.write('original regular file')
+            read = skills.read_text
+
+            def replace(selected, limit, **kwargs):
+                os.unlink(selected)
+                os.mkfifo(selected)
+                return read(selected, limit, **kwargs)
+
+            with mock.patch.object(loki, 'LOKI_CONFIG_DIR', config), \
+                    mock.patch.object(skills, 'read_text', side_effect=replace):
+                with self.assertRaisesRegex(OSError, 'not a regular file'):
+                    loki.run_skill('demo')
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):

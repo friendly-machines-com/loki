@@ -31,6 +31,7 @@ from . import protocols
 from . import process_outputs
 from . import settings
 from . import savefiles
+from . import skills
 from . import subagents
 from . import terminals
 from . import texts
@@ -794,6 +795,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         # Same rule as run_tool_loop_async: without somebody to answer, the
         # model is never offered the question tool at all.
         active_tools = tool_contracts.without_ask_tool(active_tools)
+    active_tools = skills.tools_for_model(active_tools, _core.LOKI_CONFIG_DIR)
 
     async def chat_fn(
             items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
@@ -1520,6 +1522,15 @@ async def async_main(args) -> int:
             print("No provider configured; use /model to select one.",
                   file=sys.stderr)
             sys.stderr.flush()
+
+        # Show the catalogue without requiring a guessed identifier or model
+        # request, before presenting any resumed conversation.
+        available_skills = skills.available(_core.LOKI_CONFIG_DIR)
+        if available_skills:
+            print('Available skills:')
+            for skill in available_skills:
+                terminal.write_text('/' + skill['name'] + ': ' + skill['description'])
+                print()
 
         if resolved_log_filename:
             # --shell-cwd is an explicit instruction; a value saved in the log

@@ -37,6 +37,7 @@ from . import protocols
 from . import process_outputs
 from . import authentications
 from . import savefiles
+from . import skills
 from . import tool_runtime
 from .connections import ConnectionDescriptor
 from .credentials import (
@@ -460,7 +461,6 @@ TOOL_CALL_COLOR = 5
 
 MAX_LOOP_LIMIT = 500
 TODO_MAX_TODOS = 100
-SKILL_MAX_BYTES = 100_000
 LOKI_CONFIG_DIR_NAME = paths.LOKI_CONFIG_DIR_NAME
 LOKI_CONFIG_DIR = paths.loki_config_dir()
 LOKI_STATE_DIR = paths.loki_state_dir()
@@ -1596,6 +1596,7 @@ async def run_tool_loop_async(
             # Without an interactive seam there is nobody to answer, so
             # the model is never offered the question tool at all.
             advertised_tools = tool_contracts.without_ask_tool(advertised_tools)
+        advertised_tools = skills.tools_for_model(advertised_tools, LOKI_CONFIG_DIR)
 
         def chat_fn(items, on_text_delta=None, *, codex_turn_state, on_reasoning_delta=None):
             kwargs = {
@@ -2300,30 +2301,7 @@ async def run_agent_async(description: str, prompt: str, run_in_background: bool
 
 
 def run_skill(skill: str, args: str | None = None) -> str:
-    if not skill:
-        return "Error: skill is required"
-    skill_root = os.path.join(LOKI_CONFIG_DIR, "skills")
-    skill_path = os.path.join(skill_root, skill, "SKILL.md")
-    if not os.path.isfile(skill_path):
-        return (f"Error: skill {skill!r} not found. Available skills can be discovered by listing "
-                f"{skill_root}.")
-    try:
-        with open(skill_path, 'r', encoding='utf-8') as f:
-            content = f.read(SKILL_MAX_BYTES)
-    except Exception as e:
-        return f"Error loading skill: {e}"
-    truncated = len(content) >= SKILL_MAX_BYTES
-    base_dir = os.path.dirname(skill_path)
-    header = f"<skill_content name=\"{skill}\">\n# Skill: {skill}\n\n"
-    body = content
-    if args:
-        body = f"Args: {args}\n\n{body}"
-    footer = (
-        ("\n\n[Skill content truncated]" if truncated else "")
-        + f"\n\nBase directory for this skill: {base_dir}\n"
-        + "Relative paths in this skill are relative to this base directory.\n</skill_content>"
-    )
-    return header + body + footer
+    return skills.load(LOKI_CONFIG_DIR, skill, args)
 
 
 async def run_webfetch_async(
@@ -2390,7 +2368,7 @@ TOOL_HANDLERS = {
         "async_handler": _handle_agent_async,
         "explore": True,
     },
-    "Skill": {"handler": _handle_skill},
+    "Skill": {"handler": _handle_skill, "explore": True},
     "WebFetch": {"async_handler": _handle_webfetch_async, "explore": True},
     "WebSearch": {"async_handler": _handle_websearch_async, "explore": True},
     # Clarification does not modify workspace state, so it is safe in Explore
