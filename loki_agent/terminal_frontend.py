@@ -937,12 +937,12 @@ def _write_status_text_lines():
     print("Local: CWD: ", end="")
     terminal.write_text(fields["cwd"])
     print(", turn: ", end="")
-    # Keep the todo label in its value span; the next field owns the comma so
-    # bold ends before punctuation and the independently styled queue counts.
+    # Keep the todo label outside its value span; the next field owns the comma
+    # so bold ends before punctuation and the independently styled queue counts.
     for label, value, active in [
             ["", fields["turn"], fields["turn"] != "idle"],
             [", mode: ", fields["mode"], False],
-            ["; ", f"/todo:{fields['todos_completed']}/{fields['todos_total']}", fields["todos_completed"] != fields["todos_total"]],
+            ["; /todo:", f"{fields['todos_completed']}/{fields['todos_total']}", fields["todos_completed"] != fields["todos_total"]],
             [", /queue{txt:", fields["queued_prompts"], fields["queued_prompts"] != 0],
             [",img:", fields["queued_images"], fields["queued_images"] != 0]]:
         print(label, end="")
