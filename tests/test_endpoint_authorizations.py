@@ -22,6 +22,7 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.storage = credential_storages.JsonCredentialStorage(self.directory.name)
+        self.addCleanup(self.storage.close)
         self.reference = auth.CredentialRef.environment("EXAMPLE_API_KEY")
         self.broker = auth.CredentialBroker(storage=self.storage)
         self.broker.install_static(self.reference, "sample-value")
@@ -50,12 +51,13 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_old_state_file_is_not_authority(self):
         import json
-        from pathlib import Path
-        state = Path(self.directory.name, "state", "loki")
-        state.mkdir(parents=True)
-        (state / "provider-endpoints.json").write_text(json.dumps({
-            "example": {"api": URL, "credential": self.reference.encode()}}))
-        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state.parent)}):
+
+        state_home = os.path.join(self.directory.name, 'state')
+        state = os.path.join(state_home, 'loki')
+        os.makedirs(state)
+        with open(os.path.join(state, 'provider-endpoints.json'), 'w', encoding='utf-8') as stream:
+            json.dump({'example': {'api': URL, 'credential': self.reference.encode()}}, stream)
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state_home}):
             with self.assertRaises(auth.CredentialUnavailable):
                 await self.broker.lease(self.reference, URL)
 
