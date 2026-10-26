@@ -126,6 +126,17 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn('/' + _NAME + ': ' + _DESCRIPTION, stdout)
         self.assertNotIn('Available skills:', stderr)
         self.assertIn('Skill journey complete.', stdout)
+        self.assertIn('Loaded skill: ' + _NAME, stdout)
+        self.assertNotIn('<skill_content', stdout)
+        self.assertNotIn(_BODY, stdout)
+        self.assert_loaded(self.saved_result(_NAME))
+
+    async def test_terminal_setting_shows_loaded_skill_instructions(self):
+        with open(os.path.join(self.config, 'settings.ini'), 'w', encoding='utf-8') as stream:
+            stream.write('[terminal]\nshow_skill_stdout = true\n')
+        stdout, _stderr = await self.terminal(_NAME)
+        self.assertIn('<skill_content', stdout)
+        self.assertIn(_BODY, stdout)
         self.assert_loaded(self.saved_result(_NAME))
 
     def test_terminal_pty_announces_and_invokes_skill_before_natural_exit(self):
@@ -152,14 +163,17 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_acp_announces_same_catalogue_and_loads_namespaced_skill(self):
         """ACP advertisement and actual loading must identify the same file as terminal."""
-        advertised, _messages = await self.acp(_NAME)
+        advertised, messages = await self.acp(_NAME)
         entries = [entry for entry in advertised if entry['name'] == _NAME]
         self.assertEqual(entries, [{'name': _NAME, 'description': _DESCRIPTION}])
+        self.assertIn('<skill_content', json.dumps(messages))
+        self.assertIn('Use the selected project as read-only context.', json.dumps(messages))
         self.assert_loaded(self.saved_result(_NAME))
 
     async def test_terminal_records_unknown_skill_as_failed_tool_result(self):
         """An unregistered identifier must not become a filename or a successful load."""
-        await self.terminal('../outside')
+        stdout, _stderr = await self.terminal('../outside')
+        self.assertIn('unavailable', stdout)
         result = self.saved_result('../outside')
         self.assertTrue(result['is_error'], result)
         self.assertIn('unavailable', formats.item_text(result))

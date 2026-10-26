@@ -198,13 +198,15 @@ Terminal preferences are read from the optional `~/.config/loki/settings.ini`
 (or `$XDG_CONFIG_HOME/loki/settings.ini`). No file is needed: every preference
 has a built-in default, and startup never creates or rewrites the file.
 
-Bash stdout and Read file contents are hidden from automatic terminal tool-result
-display by default. To show either, add its setting:
+Bash stdout, Read file contents, and successful Skill instruction dumps are
+hidden from automatic terminal tool-result display by default. To show any of
+these, add its setting:
 
 ```ini
 [terminal]
 show_bash_stdout = true
 show_read_stdout = true
+show_skill_stdout = true
 ```
 
 Restart the terminal session after editing the file. Stderr, status, and tool

@@ -1027,8 +1027,11 @@ async def _handle_agent_async(args: dict, extra_context=None) -> str:
                                  thinking=context.get("thinking"))
 
 
-def _handle_skill(args: dict) -> str:
-    return run_skill(args["skill"], args.get("args"))
+def _handle_skill(args: dict) -> dict:
+    content = run_skill(args["skill"], args.get("args"))
+    output = process_outputs.ProcessOutput(
+        f"Loaded skill: {args['skill']}", content, "", shell=False, skill=True)
+    return tool_runtime.tool_result(True, content, process_output=output.to_dict())
 
 
 async def _handle_webfetch_async(args: dict, extra_context=None) -> str:

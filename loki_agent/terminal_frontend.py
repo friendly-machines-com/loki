@@ -574,7 +574,8 @@ class _ResumeTranscriptPresenter:
             assistant_label=assistant_label,
             show_reasoning=current_session().reasoning_traces == "on",
             show_bash_stdout=preferences.terminal.show_bash_stdout,
-            show_read_stdout=preferences.terminal.show_read_stdout)
+            show_read_stdout=preferences.terminal.show_read_stdout,
+            show_skill_stdout=preferences.terminal.show_skill_stdout)
 
     def write(self, events):
         blocks = self.renderer.presentation(events)
@@ -781,7 +782,8 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         text = process_outputs.presentation_text(
             event["content"], event.get("process_output"),
             show_bash_stdout=preferences.terminal.show_bash_stdout,
-            show_read_stdout=preferences.terminal.show_read_stdout)
+            show_read_stdout=preferences.terminal.show_read_stdout,
+            show_skill_stdout=preferences.terminal.show_skill_stdout)
         terminal.write_text(text, multiline=True)
         if event.get("is_error"):
             # Reset precedes the newline so terminal scroll-fill stays neutral.

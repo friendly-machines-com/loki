@@ -21,6 +21,7 @@ class ProcessOutput:
     tail: bool = False
     preamble: str = ""
     read: bool = False
+    skill: bool = False
 
     def to_dict(self):
         return asdict(self)
@@ -35,7 +36,7 @@ class ProcessOutput:
         for name in ["header", "stdout", "stderr", "preamble"]:
             if name in value and not isinstance(value[name], str):
                 raise ValueError(f"process output {name} must be text")
-        for name in ["shell", "tail", "read"]:
+        for name in ["shell", "tail", "read", "skill"]:
             if name in value and type(value[name]) is not bool:
                 raise ValueError(f"process output {name} must be boolean")
         return cls(**value)
@@ -44,19 +45,22 @@ class ProcessOutput:
         parts = [self.header] if self.header else []
         suffix = "_tail" if self.tail else ""
         if show_stdout and self.stdout:
-            parts.extend([self.stdout] if self.read else [f"[stdout{suffix}]", self.stdout])
+            parts.extend([self.stdout] if self.read or self.skill else [f"[stdout{suffix}]", self.stdout])
         if self.stderr:
             parts.extend([f"[stderr{suffix}]", self.stderr])
         return self.preamble + "\n".join(parts)
 
 
 def presentation_text(content, process_output=None, *, show_bash_stdout=False,
-                      legacy_bash=False, show_read_stdout=False, legacy_read=False):
+                      legacy_bash=False, show_read_stdout=False, legacy_read=False,
+                      show_skill_stdout=False):
     """Select a view without mutating canonical content or guessing boundaries."""
     if process_output is not None:
         output = ProcessOutput.from_dict(process_output)
         if output.read:
             return output.render(show_stdout=show_read_stdout)
+        if output.skill:
+            return output.render(show_stdout=show_skill_stdout)
         if output.shell:
             return output.render(show_stdout=show_bash_stdout)
     if legacy_bash and not show_bash_stdout:
