@@ -57,7 +57,7 @@ def spawn_pty(argv, *, cols=80, rows=24, env=None, cwd=None) -> PtyHandle:
     take it.  ``env`` is a full environment mapping or ``None`` to inherit.
     ``cwd`` is the child's working directory or ``None`` to inherit.
     """
-    if os.name == "posix":
+    if sys.platform != "win32":
         return _posix_spawn(argv, cols, rows, env, cwd)
     return _windows_spawn(argv, cols, rows, env, cwd)
 
