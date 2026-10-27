@@ -467,7 +467,7 @@ class _PipeStreamWriter:
         self._endpoint.close()
 
 
-if os.name == "posix":
+if sys.platform != "win32":
     def duplicate_for_child(fd: int) -> int:
         """Own a non-inheritable copy outside the child's standard streams.
 

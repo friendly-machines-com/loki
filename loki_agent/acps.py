@@ -67,7 +67,7 @@ class AsyncFdLineReader:
             if line is not None:
                 return line
 
-            if os.name == "nt":
+            if sys.platform == "win32":
                 return await self._readline_threaded()
 
             loop = asyncio.get_running_loop()
