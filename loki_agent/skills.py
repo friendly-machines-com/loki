@@ -8,6 +8,7 @@ reconstruct a path from a namespaced identifier or recover its parent.
 import json
 import os
 import stat
+import sys
 
 
 _MARKER = "SKILL.md"
@@ -95,7 +96,7 @@ def load(config_directory: str, name: str, args: str | None = None) -> str:
 
 def read_text(path: str, limit: int, *, errors="strict") -> str:
     flags = os.O_RDONLY
-    if os.name == "posix":
+    if sys.platform != "win32":
         flags |= os.O_NONBLOCK
     descriptor = os.open(path, flags)
     try:
