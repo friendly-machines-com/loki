@@ -1936,23 +1936,35 @@ class PromptRenderer:
                 buffer.before_cursor(), multiline=True)
 
             # Draw the fake (reverse-video) caret at the insertion point,
-            # then the text after it.
+            # then the text after it.  The caret is drawn under the
+            # terminal's normal wrap semantics; only the tail below is
+            # flattened with autowrap off.
             after = buffer.after_cursor()
             self.terminal.set_reverse_video(True)
             if after:
                 if after[0] == "\n":
                     # The newline is layout, not caret content. Show the
-                    # logical insertion point before generating that layout.
+                    # logical insertion point before that layout.
                     print(' ', end='')
+                    tail = after
                 else:
                     self.terminal.write_text(after[0])
+                    tail = after[1:]
             else:
                 print(' ', end='')
+                tail = after
             self.terminal.set_reverse_video(False)
-            if after:
-                if after[0] == "\n":
-                    print()
-                self.terminal.write_text(after[1:], multiline=True)
+
+            # Render the rest as one escaped line: LF becomes the literal
+            # marker ^J (multiline=False), and autowrap off keeps it from
+            # wrapping or scrolling the two-row input region.
+            self.terminal.disable_autowrap()
+            try:
+                self.terminal.write_text(tail)
+            finally:
+                # Autowrap is terminal-global: restore it even if a write
+                # fails, or the whole session would render without wrapping.
+                self.terminal.enable_autowrap()
         finally:
             try:
                 # Restore the output scroll region and the cursor position.

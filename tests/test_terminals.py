@@ -156,6 +156,12 @@ class RecordingTerminal:
     def set_reverse_video(self, enabled):
         self.calls.append(("set_reverse_video", enabled))
 
+    def disable_autowrap(self):
+        self.calls.append(("disable_autowrap",))
+
+    def enable_autowrap(self):
+        self.calls.append(("enable_autowrap",))
+
     def begin_synchronized_update(self):
         self.calls.append(("begin_synchronized_update",))
 
@@ -1588,6 +1594,8 @@ class PromptRendererTests(unittest.TestCase):
                 ("set_background_color", terminals.INPUT_COLOR),
                 ("set_reverse_video", True),
                 ("set_reverse_video", False),
+                ("disable_autowrap",),
+                ("enable_autowrap",),
                 ("set_clipping_region", *terminals.output_area),
                 ("restore_cursor_position",),
                 ("reset_colors_and_flags",),
@@ -1624,6 +1632,101 @@ class PromptRendererTests(unittest.TestCase):
             "User: first^[[2J^I\nsecond^M^@\\x9b ",
         )
         self.assertNotIn("\x1b", out.getvalue())
+
+    def _render_without_layout(self, recorder, buffer):
+        old_refresh = terminals.refresh_terminal_layout
+        old_update_status_bar = terminals.update_status_bar
+        old_input_area = terminals.input_area
+        try:
+            terminals.refresh_terminal_layout = lambda: None
+            terminals.update_status_bar = lambda: None
+            terminals.input_area = (10, 13)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                terminals.PromptRenderer(
+                    recorder, "User: ").render(buffer)
+        finally:
+            terminals.refresh_terminal_layout = old_refresh
+            terminals.update_status_bar = old_update_status_bar
+            terminals.input_area = old_input_area
+        return out.getvalue()
+
+    def test_render_flattens_post_caret_newlines_without_scrolling(self):
+        recorder = RecordingTerminal()
+        buffer = terminals.InputBuffer()
+        buffer.insert("one\ntwo\nthree\nfour")
+        buffer.cursor = len("one")
+
+        output = self._render_without_layout(recorder, buffer)
+
+        self.assertEqual(output, "User: one ^Jtwo^Jthree^Jfour")
+        self.assertNotIn("\n", output)
+        self.assertEqual(buffer.text(), "one\ntwo\nthree\nfour")
+
+    def test_render_draws_caret_with_autowrap_enabled(self):
+        class TrackingTerminal(RecordingTerminal):
+            def __init__(self):
+                super().__init__()
+                self.autowrap = True
+                self.writes = []
+
+            def disable_autowrap(self):
+                self.autowrap = False
+                super().disable_autowrap()
+
+            def enable_autowrap(self):
+                self.autowrap = True
+                super().enable_autowrap()
+
+            def write_text(self, text, *, multiline=False, file=None):
+                self.writes.append((text, multiline, self.autowrap))
+                super().write_text(text, multiline=multiline, file=file)
+
+        recorder = TrackingTerminal()
+        buffer = terminals.InputBuffer()
+        buffer.insert("one\ntwo")
+        buffer.cursor = len("one\n")
+
+        self._render_without_layout(recorder, buffer)
+
+        # The caret cell must be painted under normal wrap semantics; the
+        # whole flattened tail is written with autowrap disabled.
+        caret = recorder.writes.index(("t", False, True))
+        tail = recorder.writes.index(("wo", False, False))
+        self.assertLess(caret, tail)
+
+    def test_render_leaves_caret_line_layout_but_flattens_tail(self):
+        recorder = RecordingTerminal()
+        buffer = terminals.InputBuffer()
+        buffer.insert("one\ntwo\nthree")
+        buffer.cursor = len("one\n")
+
+        output = self._render_without_layout(recorder, buffer)
+
+        # The text before the caret keeps its real layout; only the tail is
+        # flattened, so the caret stays on the line the terminal laid out.
+        self.assertEqual(output, "User: one\ntwo^Jthree")
+
+    def test_render_restores_autowrap_when_the_tail_write_fails(self):
+        class FailingTailTerminal(RecordingTerminal):
+            def write_text(self, text, *, multiline=False, file=None):
+                if text == "wo\nthree" and not multiline:
+                    raise OSError("write failed")
+                super().write_text(text, multiline=multiline, file=file)
+
+        recorder = FailingTailTerminal()
+        buffer = terminals.InputBuffer()
+        buffer.insert("one\ntwo\nthree")
+        buffer.cursor = len("one\n")
+
+        with self.assertRaisesRegex(OSError, "write failed"):
+            self._render_without_layout(recorder, buffer)
+
+        self.assertIn(("enable_autowrap",), recorder.calls)
+        self.assertLess(
+            recorder.calls.index(("disable_autowrap",)),
+            recorder.calls.index(("enable_autowrap",)))
+        self.assertEqual(recorder.calls[-1], ("flush",))
 
 
 if __name__ == "__main__":
