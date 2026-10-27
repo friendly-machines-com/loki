@@ -1,10 +1,28 @@
 import unittest
+import uuid
+from unittest import mock
 
 from loki_agent import subagents
 from loki_agent.sessions import Session, conversation_id_for_path
 
 
 class CodexSessionIdentityTests(unittest.TestCase):
+    def test_name_grammar_does_not_rewrite_the_saved_operation_operand(self):
+        identity = '35b2d314-fdfb-466f-bbd6-4f479fc82eb4'
+        for filename in [f'chat-{identity}.json', f'chat-loki-{identity}.json']:
+            raw = 'root/link/../' + filename
+            with self.subTest(raw=raw):
+                self.assertEqual(conversation_id_for_path(raw), identity)
+                session = Session(response_headers=mock.Mock())
+                session.replace_transcript([], [], [], {'conversation_id': 'untrusted'}, raw)
+                self.assertEqual(session.chat_log_path, raw)
+                self.assertEqual(session.conversation_id, identity)
+        for raw in ['root/link/../custom.json', 'root/custom.json', 'root//./custom.json', 'custom.json/']:
+            with self.subTest(raw=raw):
+                self.assertEqual(conversation_id_for_path(raw), str(uuid.uuid5(uuid.NAMESPACE_URL, raw)))
+        self.assertNotEqual(conversation_id_for_path('root/link/../custom.json'),
+                            conversation_id_for_path('root/custom.json'))
+
     def test_roots_follow_persistent_conversation_not_runtime_or_saved_fields(self):
         first = Session()
         resumed = Session()
