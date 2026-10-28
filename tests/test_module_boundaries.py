@@ -55,6 +55,26 @@ class ModuleBoundaryTests(unittest.TestCase):
     def setUpClass(cls):
         cls.graph = dependencies()
 
+    def test_platform_selection_does_not_use_os_name(self):
+        violations = []
+        with os.scandir(PACKAGE) as directory:
+            for entry in directory:
+                if not entry.name.endswith('.py'):
+                    continue
+                with open(entry.path, encoding='utf-8') as source:
+                    tree = ast.parse(source.read())
+                os_names = {alias.asname or 'os' for node in ast.walk(tree)
+                            if isinstance(node, ast.Import) for alias in node.names
+                            if alias.name == 'os'}
+                for node in ast.walk(tree):
+                    if (isinstance(node, ast.Attribute) and node.attr == 'name'
+                            and isinstance(node.value, ast.Name) and node.value.id in os_names):
+                        violations.append(f'{entry.name}:{node.lineno}')
+                    if (isinstance(node, ast.ImportFrom) and node.module == 'os'
+                            and any(alias.name == 'name' for alias in node.names)):
+                        violations.append(f'{entry.name}:{node.lineno}')
+        self.assertEqual(violations, [], 'Use direct sys.platform guards for platform selection')
+
     def test_help_needs_no_credential_storage_or_configured_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             blocked = Path(directory) / 'not-a-directory'
