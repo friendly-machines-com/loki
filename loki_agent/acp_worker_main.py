@@ -39,19 +39,18 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
     if runtime is None:
         return 1
 
+    try:
+        return await _serve_connected_runtime(runtime, write)
+    finally:
+        # Connection transfers ownership before deferred imports or Session
+        # construction. Every later exit must therefore close this runtime.
+        await runtime.close()
+
+
+async def _serve_connected_runtime(runtime, write):
     from . import acps, connections, loki
     from .acp_worker import Worker
     from .sessions import Session
-
-    try:
-        session = Session(shell_cwd=os.getcwd())
-    except BaseException:
-        await runtime.close()
-        raise
-    # Single-session process: make it the process default so loki's
-    # current_*() helpers (chat-log bookkeeping, job manager, model) all
-    # resolve to this conversation.
-    loki._DEFAULT_SESSION = session
 
     async def serve():
         try:
@@ -107,16 +106,17 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
             await worker.close()
         return 0
 
+    session = Session(shell_cwd=os.getcwd())
     try:
+        # One worker serves one conversation; install its default only inside
+        # the acquired Session lifetime so installation failures close it too.
+        loki._DEFAULT_SESSION = session
         loki.CREDENTIALS = runtime.install(session)
         worker = Worker(session, write)
         completed, result = await runtime.run(serve())
         return result if completed else 1
     finally:
-        try:
-            await session.close_state()
-        finally:
-            await runtime.close()
+        await session.close_state()
 
 
 def _descriptor(value: str):
