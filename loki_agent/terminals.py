@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 
-if os.name == "posix":
+if sys.platform != "win32":
     import fcntl
     import termios
 else:
@@ -88,7 +88,7 @@ def open_terminal_stdin() -> int:
     Without a controlling tty this is a no-op returning fd 0.
     """
     global new_stdin
-    if os.name != "posix" or not os.isatty(0):
+    if sys.platform == "win32" or not os.isatty(0):
         new_stdin = 0
         return new_stdin
     sys.stdin.close()
@@ -787,7 +787,7 @@ class AsyncByteReader:
         self.loop = asyncio.get_running_loop()
         self._stopping = False
         try:
-            if os.name != "posix":
+            if sys.platform == "win32":
                 # The existing handle reader owns its thread/event, not the
                 # borrowed input handle. All delivery happens on this loop.
                 self._windows_reader = handle_reader.HandleReader(
@@ -840,7 +840,7 @@ class AsyncByteReader:
 
 def terminal_output_mode():
     """Own output settings across overlay setup, input, and overlay teardown."""
-    if os.name == "posix":
+    if sys.platform != "win32":
         return contextlib.nullcontext()
     return host_terminal_windows.OutputMode()
 
@@ -856,7 +856,7 @@ class TerminalMode:
         if self.old_attrs is not None or self._windows_mode is not None:
             raise RuntimeError("terminal mode still owns settings")
         if self.enabled:
-            if os.name != "posix":
+            if sys.platform == "win32":
                 self._windows_mode = host_terminal_windows.RawMode(self.fd)
                 try:
                     self._windows_mode.__enter__()
@@ -927,7 +927,7 @@ def interrupt_processing_enabled(fd: int) -> bool:
     cannot fire between tool calls.  ``TerminalMode`` clears it on both
     platforms.
     """
-    if os.name != "posix":
+    if sys.platform == "win32":
         return host_terminal_windows.processed_input_enabled(fd)
     try:
         attrs = termios.tcgetattr(fd)
@@ -938,7 +938,7 @@ def interrupt_processing_enabled(fd: int) -> bool:
 
 def terminal_control_bytes(fd: int):
     """Return configured character-erase, word-erase, and interrupt bytes."""
-    if os.name != "posix":
+    if sys.platform == "win32":
         return host_terminal_windows.control_bytes(
             (FALLBACK_BACKSPACE_BYTES, FALLBACK_BACKSPACE_WORD_BYTES,
              FALLBACK_INTERRUPT_BYTES))
@@ -1580,7 +1580,7 @@ class AsyncKeyReader:
             self.byte_reader.queue.put_nowait(KEY_READER_WAKE)
 
     def _start_resize_watch(self):
-        if os.name == "posix":
+        if sys.platform != "win32":
             self._resize_registered = True
             try:
                 self.loop.add_signal_handler(signal.SIGWINCH, self._on_resize)
