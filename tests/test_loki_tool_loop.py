@@ -4743,9 +4743,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                             path = loki.new_chat_log_path()
                             self.assertEqual(pathlib.Path(path).parent, chat_dir)
                             uuid.UUID(pathlib.Path(path).stem.removeprefix('chat-'))
-                            self.assertTrue(chat_dir.is_dir())
                             if not paths:
-                                chat_dir.rmdir()
                                 self.assertFalse(chat_dir.exists())
                             loki.new_chat_log(path)
                             self.assertTrue(chat_dir.is_dir())

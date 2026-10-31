@@ -16,7 +16,6 @@ import uuid
 from pprint import pformat
 
 from . import formats
-from . import paths
 from . import process_outputs
 from . import texts
 
@@ -39,12 +38,11 @@ def new_chat_log_path(chat_log_dir: str) -> str:
 
 def resolve_chat_log_path(resume_arg: str, startup_cwd: str,
                           chat_log_dir: str, resolve_path_fn) -> str:
-    # Bare resume names are chat ids in the local Loki chat directory. An
-    # absolute path or a path with a directory part is treated as a literal
-    # path; a bare name is resolved inside the chat log directory.
-    if os.path.isabs(resume_arg):
-        return resume_arg
-    if paths.has_directory_component(resume_arg):
+    # This CLI argument admits two namespaces: bare saved names and explicit
+    # filenames. Only this grammar decision needs the native directory/drive
+    # view. The original operand, including every dot component, is forwarded.
+    directory, _name = os.path.split(resume_arg)
+    if directory:
         return resolve_path_fn(resume_arg, startup_cwd)
     return os.path.join(chat_log_dir, chat_log_filename(resume_arg))
 
