@@ -192,21 +192,21 @@ def _immediate_todo(argument: str):
 
 
 def _immediate_status(argument: str):
-    # The connection context is captured at admission, not when the
-    # scheduled task first runs: config, session, and the response-header
-    # store are all bound here, synchronously. The handler RETURNS its
-    # rendering instead of printing: _run_immediate emits it as one block,
-    # never spliced into streaming assistant text.
-    config = current_config()
-    session = current_session()
-    store = session.response_headers
-
-    async def report():
-        from . import response_headers
-        try:
-            if argument == "save":
-                await store.save()
-                return "Response status saved (this runtime only)."
+    # Unlike an async account read, the entire status command finishes in
+    # the input owner's call. Snapshot/save, rendering and output never yield
+    # or schedule work: configuration changes and new observations cannot
+    # interleave with this monitor operation or its dirty-state reset.
+    from . import response_headers
+    command = f"/status {argument}".rstrip()
+    file = None
+    try:
+        config = current_config()
+        store = current_session().response_headers
+        if argument == "save":
+            if not store.try_save():
+                raise OSError("response status snapshot is busy")
+            text = "Response status saved (this runtime only)."
+        else:
             tokens = argument.split()
             show_all = "all" in tokens
             as_json = "--json" in tokens
@@ -238,18 +238,24 @@ def _immediate_status(argument: str):
                     text += "No observations for the current connection."
                 else:
                     text += response_headers.render(document)
-            # /status stays offline; this only points at live provider data
-            # when the connection supports it.
+            # This is a static hint, never a live account request.
             from . import provider_controls
             hint = provider_controls.live_hint(
                 provider_controls.ControlContext(config=config))
             if hint is not None:
                 text += "\n" + hint
-            return text
-        except (OSError, ValueError, OverflowError) as error:
-            return f"Could not read response status: {error}"
-
-    return report()
+    except (OSError, ValueError, OverflowError) as error:
+        action = "save" if argument == "save" else "read"
+        text = f"Could not {action} response status: {error}"
+    except Exception as error:  # noqa: BLE001 - reported, not fatal
+        text = f"Command failed: {error}"
+        file = sys.stderr
+    # There is no task completion callback to contain display failures here;
+    # a failed diagnostic must not terminate the input owner or the live turn.
+    try:
+        _emit_immediate_output(command, text, file=file)
+    except Exception as error:  # noqa: BLE001 - reported, not fatal
+        logger.error("Could not display %s output: %s", command, error)
 
 
 def _immediate_account_read(argument: str):

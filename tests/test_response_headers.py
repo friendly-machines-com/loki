@@ -380,6 +380,119 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((after.st_ino, after.st_mtime_ns),
                          (before.st_ino, before.st_mtime_ns))
 
+    def test_try_save_merges_without_a_running_event_loop(self):
+        with self.assertRaises(RuntimeError):
+            asyncio.get_running_loop()
+        with mock.patch.object(response_headers.time, "time_ns", return_value=1):
+            self.observe(headers={"x-remaining": "10", "x-reset": "soon"})
+        with contextlib.closing(response_headers.Store(self.path)) as other:
+            with mock.patch.object(response_headers.time, "time_ns", return_value=2):
+                self.observe(other, {"x-remaining": "9"})
+            self.assertTrue(other.try_save())
+        self.assertTrue(self.store.try_save())
+        self.assertFalse(self.store.dirty)
+        with contextlib.closing(response_headers.Store(self.path)) as saved:
+            headers = saved.snapshot()["endpoints"][0]["headers"]
+            self.assertEqual(headers["x-remaining"]["value"], "9")
+            self.assertEqual(headers["x-reset"]["value"], "soon")
+        before = Path(self.path).read_bytes()
+        with mock.patch.object(response_headers.private_files, "open_lock_file_at") as lock:
+            self.assertTrue(self.store.try_save())
+            lock.assert_not_called()
+        self.assertEqual(Path(self.path).read_bytes(), before)
+
+    def test_try_save_busy_does_not_read_or_change_the_snapshot(self):
+        self.observe()
+        self.assertTrue(self.store.try_save())
+        original = Path(self.path).read_bytes()
+        self.observe(headers={"x-remaining": "5"})
+        # A separately opened handle represents an independent runtime. The
+        # reader/merge must not run until this writer's real lock is released.
+        lock_fd = response_headers.private_files.open_lock_file_at(
+            self.store._directory(), "headers.json.lock", 0o600)
+        try:
+            file_locks.try_lock_exclusive(lock_fd)
+            with mock.patch.object(response_headers, "_read",
+                                   side_effect=AssertionError("read without lock")):
+                self.assertFalse(self.store.try_save())
+            self.assertTrue(self.store.dirty)
+            self.assertEqual(Path(self.path).read_bytes(), original)
+        finally:
+            response_headers.private_files.close(lock_fd)
+        self.assertTrue(self.store.try_save())
+        self.assertFalse(self.store.dirty)
+        with contextlib.closing(response_headers.Store(self.path)) as saved:
+            self.assertEqual(saved.snapshot()["endpoints"][0]["headers"]
+                             ["x-remaining"]["value"], "5")
+
+    def test_try_save_publication_failures_keep_dirty_and_release_the_lock(self):
+        self.observe()
+        self.assertTrue(self.store.try_save())
+        sync = response_headers.private_files.fsync
+
+        def fail_directory_sync(fd):
+            if fd == self.store._directory():
+                raise OSError("directory sync failed")
+            sync(fd)
+
+        for failure in ["replace", "directory_sync"]:
+            with self.subTest(failure=failure):
+                original = Path(self.path).read_bytes()
+                self.observe(headers={"x-remaining": failure})
+                patch = (mock.patch.object(response_headers.private_files, "replace_at",
+                                           side_effect=OSError("replace failed"))
+                         if failure == "replace" else
+                         mock.patch.object(response_headers.private_files, "fsync",
+                                           side_effect=fail_directory_sync))
+                with patch, self.assertRaises(OSError):
+                    self.store.try_save()
+                self.assertTrue(self.store.dirty)
+                if failure == "replace":
+                    self.assertEqual(Path(self.path).read_bytes(), original)
+                else:
+                    with contextlib.closing(response_headers.Store(self.path)) as saved:
+                        self.assertEqual(saved.snapshot()["endpoints"][0]["headers"]
+                                         ["x-remaining"]["value"], failure)
+                self.assertFalse(any(name.startswith(".headers.json.")
+                                     for name in os.listdir(self.directory.name)))
+                # A leaked lock would make the retry fail, not merely leak a
+                # descriptor. Both failure stages must leave retry ownership.
+                self.assertTrue(self.store.try_save())
+                self.assertFalse(self.store.dirty)
+
+    async def test_async_save_retries_contention_and_includes_new_observations(self):
+        with mock.patch.object(response_headers.time, "time_ns", return_value=1):
+            self.observe(headers={"x-remaining": "10", "x-reset": "soon"})
+
+        async def observe_while_waiting(delay):
+            self.assertEqual(delay, 0.01)
+            with mock.patch.object(response_headers.time, "time_ns", return_value=2):
+                self.observe(headers={"x-remaining": "5"})
+
+        with mock.patch.object(file_locks, "try_lock_exclusive",
+                               side_effect=[BlockingIOError, None]) as lock, \
+                mock.patch.object(asyncio, "sleep", side_effect=observe_while_waiting) as sleep:
+            await self.store.save()
+            self.assertEqual(lock.call_count, 2)
+            sleep.assert_awaited_once_with(0.01)
+        self.assertFalse(self.store.dirty)
+        with contextlib.closing(response_headers.Store(self.path)) as saved:
+            headers = saved.snapshot()["endpoints"][0]["headers"]
+            self.assertEqual(headers["x-remaining"]["value"], "5")
+            self.assertEqual(headers["x-reset"]["value"], "soon")
+
+    async def test_async_save_does_not_retry_publication_errors(self):
+        self.observe()
+        with mock.patch.object(response_headers.private_files, "write",
+                               side_effect=BlockingIOError("write unavailable")), \
+                mock.patch.object(asyncio, "sleep") as sleep:
+            with self.assertRaisesRegex(BlockingIOError, "write unavailable"):
+                await self.store.save()
+            sleep.assert_not_called()
+        self.assertTrue(self.store.dirty)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertTrue(self.store.try_save())
+
     async def test_busy_snapshot_survives_failed_save_and_retry_keeps_observations(self):
         self.observe()
         await self.store.save()

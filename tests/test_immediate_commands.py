@@ -9,6 +9,7 @@ turn is busy.
 import asyncio
 import contextlib
 import io
+import json
 import os
 import tempfile
 import types
@@ -19,7 +20,10 @@ from settings_fixtures import setUpModule as set_up_default_settings
 from config_fixtures import setUpModule as set_up_config
 from test_terminals import RecordingTerminal
 
-from loki_agent import connections, formats, loki, models, protocols, terminal_frontend, terminals
+from loki_agent import (
+    connections, file_locks, formats, loki, models, protocols,
+    terminal_frontend, terminals,
+)
 from loki_agent.provider_controls import ControlAction, ControlResult
 from loki_agent.response_headers import Store
 from loki_agent.sessions import Session
@@ -202,58 +206,212 @@ class ImmediateCommandTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_status_answers_without_queueing_or_touching_the_turn(self):
+    def test_every_status_form_finishes_without_an_event_loop_or_scheduling(self):
+        store = Store(os.path.join(self.root, "status.json"))
+        self.addCleanup(store.close)
+        self.session.response_headers = store
+        self.session.runtime_config = connections.make_runtime_config(
+            "https://example.test/chat", protocols.OPENAI_RESPONSES,
+            model="model")
+        store.observer(self.session.runtime_config.chat_provider.chat_url,
+                       None, "model")(200, {"x-remaining": "8"})
+        document = store.snapshot()
+        session = self.make_session()
+        session.user_messages.put_nowait("already queued")
+        with mock.patch.object(terminal_frontend,
+                               "restore_output_area_after_input"), \
+                mock.patch.object(asyncio, "get_running_loop",
+                                  side_effect=AssertionError("loop consulted")) as loop, \
+                mock.patch.object(asyncio, "create_task",
+                                  side_effect=AssertionError("task scheduled")) as schedule, \
+                mock.patch("threading.Thread.start",
+                           side_effect=AssertionError("thread started")) as thread, \
+                mock.patch.object(store, "save", new=mock.Mock(
+                    side_effect=AssertionError("async save used"))) as async_save, \
+                mock.patch.object(loki, "async_chat_completion",
+                                  side_effect=AssertionError("turn started")) as chat:
+            for argument in ["", "--json", "all", "all --json", "--json all", "save"]:
+                command = f"/status {argument}".rstrip()
+                with self.subTest(command=command), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertTrue(session.on_submit(command))
+                    answer = output.getvalue().split(command + ":\n", 1)[1]
+                    if argument == "save":
+                        self.assertIn("Response status saved", answer)
+                        with contextlib.closing(Store(store.path)) as saved:
+                            self.assertEqual(saved.snapshot(), document)
+                        self.assertFalse(store.dirty)
+                    else:
+                        if "--json" in argument:
+                            self.assertEqual(json.loads(answer), document)
+                        else:
+                            self.assertIn("'x-remaining': '8'", answer)
+                        self.assertTrue(store.dirty)
+                        self.assertFalse(os.path.exists(store.path))
+                    self.assertFalse(terminal_frontend._immediate_tasks)
+                    self.assertEqual(session.user_messages.message_count, 1)
+                    self.assertEqual(self.session.transcript_items, self.initial)
+                    self.assertFalse(self.session.chat_log_dirty)
+            loop.assert_not_called()
+            schedule.assert_not_called()
+            thread.assert_not_called()
+            async_save.assert_not_called()
+            chat.assert_not_called()
+
+    def test_status_finishes_inline_during_a_running_turn(self):
         async def scenario():
             store = Store(os.path.join(self.root, "status.json"))
-            store.observer("https://example.test/chat", None, "model")(
-                200, {"x-remaining": "8"})
+            self.addCleanup(store.close)
+            observe = store.observer("https://example.test/chat", None, "model")
+            observe(200, {"x-remaining": "8"})
             self.session.response_headers = store
-            with mock.patch.object(terminals.os, "isatty",
-                                   return_value=False), \
-                    mock.patch.object(
-                        terminal_frontend,
-                        "restore_output_area_after_input"), \
-                    mock.patch.object(
-                        loki, "async_chat_completion",
-                        side_effect=AssertionError("turn started")), \
+            release = asyncio.Event()
+            turn = asyncio.create_task(release.wait())
+            terminal_frontend._terminal_activity.set_turn_running(True)
+            with mock.patch.object(terminal_frontend.terminal,
+                                   "markdown_style", True), \
+                    mock.patch.object(terminal_frontend, "current_model",
+                                      return_value="model"), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    mock.patch.object(loki, "async_chat_completion",
+                                      side_effect=AssertionError("turn started")), \
                     contextlib.redirect_stdout(self.output):
                 session = self.make_session()
-                session._producer = asyncio.create_task(session._produce())
+                session.user_messages.put_nowait("already queued")
+                session.reader.cancel_requested = True
+                session.reader.cancel_event.set()
                 try:
-                    await self.command(session, "/status")
-                    await self.command(session, "/status all")
-                    await self.command(session, "/status --json")
+                    terminal_frontend._terminal_agent_event({"type": "assistant_start"})
+                    terminal_frontend._terminal_agent_event({
+                        "type": "assistant_delta", "content": "before **pen"})
+                    # This response must not run between the monitor snapshot,
+                    # publication and dirty reset. It belongs to the next tick.
+                    asyncio.get_running_loop().call_soon(
+                        observe, 200, {"x-remaining": "9"})
+                    self.assertTrue(session.on_submit("/status all"))
+                    self.assertIn("'x-remaining': '8'", self.output.getvalue())
+                    self.assertTrue(session.on_submit("/status save"))
+                    self.assertIn("Response status saved", self.output.getvalue())
+                    self.assertFalse(store.dirty)
+                    self.assertFalse(terminal_frontend._immediate_tasks)
+                    self.assertFalse(turn.done())
+                    self.assertTrue(terminal_frontend._terminal_activity.turn_running)
+                    self.assertEqual(session.user_messages.pending_entries()[0].text,
+                                     "already queued")
+                    self.assertTrue(session.reader.cancel_requested)
+                    self.assertTrue(session.reader.cancel_event.is_set())
+                    self.assertEqual(self.session.transcript_items, self.initial)
+                    self.assertFalse(self.session.chat_log_dirty)
+                    await asyncio.sleep(0)
+                    self.assertTrue(store.dirty)
+                    self.assertEqual(store.snapshot()["endpoints"][0]["headers"]
+                                     ["x-remaining"]["value"], "9")
+                    with contextlib.closing(Store(store.path)) as saved:
+                        self.assertEqual(saved.snapshot()["endpoints"][0]["headers"]
+                                         ["x-remaining"]["value"], "8")
+                    terminal_frontend._terminal_agent_event({
+                        "type": "assistant_delta", "content": "ding** after"})
+                    terminal_frontend._terminal_agent_event({"type": "assistant_end"})
                 finally:
-                    await session._pause()
-            rendered = self.output.getvalue()
-            self.assertIn("User: /status", rendered)
-            self.assertIn("x-remaining", rendered)
-            self.assertIn("All known connections", rendered)
-            self.assertIn('"endpoints": []', rendered)
+                    release.set()
+                    await turn
+                    await terminal_frontend._cancel_immediate_tasks(session)
+            self.assertIn(terminals.BOLD + "pending" + terminals.RESET,
+                          self.output.getvalue())
 
         asyncio.run(scenario())
 
-    def test_status_save_runs_as_a_scheduled_task(self):
+    def test_status_save_reports_busy_inline_and_keeps_observations_for_retry(self):
+        store = Store(os.path.join(self.root, "status.json"))
+        self.addCleanup(store.close)
+        observe = store.observer("https://example.test/chat", None, "model")
+        observe(200, {"x-remaining": "8"})
+        self.assertTrue(store.try_save())
+        self.session.response_headers = store
+        observe(200, {"x-remaining": "5"})
+        with mock.patch.object(terminal_frontend,
+                               "restore_output_area_after_input"), \
+                contextlib.redirect_stdout(self.output):
+            with mock.patch.object(file_locks, "try_lock_exclusive",
+                                   side_effect=BlockingIOError) as lock:
+                self.assertTrue(terminal_frontend._submit_immediate("/status save"))
+                lock.assert_called_once()
+            self.assertIn("Could not save response status: response status snapshot is busy",
+                          self.output.getvalue())
+            self.assertNotIn("Response status saved", self.output.getvalue())
+            self.assertTrue(store.dirty)
+            with contextlib.closing(Store(store.path)) as saved:
+                self.assertEqual(saved.snapshot()["endpoints"][0]["headers"]
+                                 ["x-remaining"]["value"], "8")
+            self.assertFalse(terminal_frontend._immediate_tasks)
+            self.assertTrue(terminal_frontend._submit_immediate("/status save"))
+            self.assertFalse(store.dirty)
+            with contextlib.closing(Store(store.path)) as saved:
+                self.assertEqual(saved.snapshot()["endpoints"][0]["headers"]
+                                 ["x-remaining"]["value"], "5")
+
+    def test_status_failures_do_not_kill_the_input_owner(self):
         async def scenario():
             store = Store(os.path.join(self.root, "status.json"))
+            self.addCleanup(store.close)
             store.observer("https://example.test/chat", None, "model")(
                 200, {"x-remaining": "8"})
             self.session.response_headers = store
-            with mock.patch.object(terminals.os, "isatty",
-                                   return_value=False), \
-                    mock.patch.object(
-                        terminal_frontend,
-                        "restore_output_area_after_input"), \
-                    contextlib.redirect_stdout(self.output):
+            with mock.patch.object(terminals.os, "isatty", return_value=False), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output), \
+                    contextlib.redirect_stderr(self.output):
                 session = self.make_session()
                 session._producer = asyncio.create_task(session._produce())
                 try:
-                    await self.command(session, "/status save")
+                    for error in [OSError("unavailable\x1b]777;ATTACK\x07"),
+                                  RuntimeError("unexpected failure")]:
+                        with mock.patch.object(store, "snapshot", side_effect=error):
+                            await self.command(session, "/status all")
+                        self.assertFalse(session._producer.done())
+                        self.assertFalse(terminal_frontend._immediate_tasks)
+                    with mock.patch.object(terminal_frontend, "_emit_immediate_output",
+                                           side_effect=OSError("display closed")), \
+                            self.assertLogs("loki_agent.terminal_frontend", level="ERROR") as logs:
+                        await self.command(session, "/status all")
+                    self.assertIn("display closed", logs.output[0])
+                    await self.command(session, "/status all")
+                    self.assertFalse(session._producer.done())
                 finally:
                     await session._pause()
-            self.assertIn("Response status saved", self.output.getvalue())
-            saved = Store(store.path).snapshot()["endpoints"]
-            self.assertEqual(saved[0]["headers"]["x-remaining"]["value"], "8")
+            rendered = self.output.getvalue()
+            self.assertIn("Could not read response status: unavailable^[]777;ATTACK^G", rendered)
+            self.assertNotIn("\x1b]777", rendered)
+            self.assertIn("Command failed: unexpected failure", rendered)
+            self.assertIn("'x-remaining': '8'", rendered)
+            self.assertTrue(store.dirty)
+            self.assertFalse(os.path.exists(store.path))
+            self.assertFalse(self.session.chat_log_dirty)
+
+        asyncio.run(scenario())
+
+    def test_status_is_not_consumed_as_a_modal_answer(self):
+        async def scenario():
+            with mock.patch.object(terminals.os, "isatty", return_value=False), \
+                    mock.patch.object(terminal_frontend,
+                                      "restore_output_area_after_input"), \
+                    contextlib.redirect_stdout(self.output):
+                session = self.make_session()
+                session.user_messages.put_nowait("already queued")
+                try:
+                    async with session.modal() as modal:
+                        self.feed(session, "/status all")
+                        self.feed(session, "chosen answer")
+                        self.assertEqual(await modal.prompt("Choice: "), "chosen answer")
+                        self.assertEqual(self.handled, ["/status all"])
+                        self.assertIn("/status all:\nAll known connections", self.output.getvalue())
+                        self.assertFalse(terminal_frontend._immediate_tasks)
+                        self.assertEqual(session.user_messages.message_count, 1)
+                        self.assertEqual(self.session.transcript_items, self.initial)
+                finally:
+                    await session._pause()
 
         asyncio.run(scenario())
 
@@ -554,23 +712,22 @@ class ImmediateCommandTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_status_save_captures_store_before_scheduling(self):
-        async def scenario():
-            first = types.SimpleNamespace(save=mock.AsyncMock())
-            later = types.SimpleNamespace(save=mock.AsyncMock())
-            self.session.response_headers = first
-            with mock.patch.object(terminal_frontend,
-                                   "restore_output_area_after_input"), \
-                    contextlib.redirect_stdout(self.output):
-                self.assertTrue(terminal_frontend._submit_immediate("/status save"))
-                self.session.response_headers = later
-                async with asyncio.timeout(3):
-                    while "Response status saved" not in self.output.getvalue():
-                        await asyncio.sleep(0)
-            first.save.assert_awaited_once()
-            later.save.assert_not_awaited()
-
-        asyncio.run(scenario())
+    def test_status_save_finishes_on_the_current_store_before_returning(self):
+        first = types.SimpleNamespace(try_save=mock.Mock(return_value=True))
+        later = types.SimpleNamespace(try_save=mock.Mock(return_value=True))
+        self.session.response_headers = first
+        with mock.patch.object(terminal_frontend,
+                               "restore_output_area_after_input"), \
+                contextlib.redirect_stdout(self.output):
+            self.assertTrue(terminal_frontend._submit_immediate("/status save"))
+            first.try_save.assert_called_once_with()
+            later.try_save.assert_not_called()
+            self.assertIn("Response status saved", self.output.getvalue())
+            self.session.response_headers = later
+            self.assertTrue(terminal_frontend._submit_immediate("/status save"))
+            first.try_save.assert_called_once_with()
+            later.try_save.assert_called_once_with()
+            self.assertFalse(terminal_frontend._immediate_tasks)
 
     def test_pending_reads_are_cancelled_and_joined_before_every_frontend_exit(self):
         from loki_agent import provider_controls

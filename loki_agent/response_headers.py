@@ -241,9 +241,17 @@ class Store:
                        if key[1] == credential}
         return _document(entries)
 
-    async def save(self):
+    def try_save(self) -> bool:
+        """Save without yielding; False means another runtime holds the lock.
+
+        Terminal /status save must finish in its input owner's synchronous
+        call: save()'s contention retry would let other event-loop work run.
+        Both paths share this one merge/publication operation. This call owns
+        its lock handle until return, and clears dirty only after publication
+        and synchronization succeed; failures leave observations retryable.
+        """
         if not self.dirty:
-            return
+            return True
         name = self._name
         # The directory was acquired at construction. All reads, locks and
         # publication use that object, even after its ancestors are renamed.
@@ -259,18 +267,13 @@ class Store:
             facts = private_files.information(lock_fd)
             if not facts.regular or facts.reparse_point:
                 raise OSError("response status lock is not a regular file")
-            deadline = asyncio.get_running_loop().time() + 0.25
-            while True:
-                try:
-                    file_locks.try_lock_exclusive(lock_fd)
-                    break
-                except BlockingIOError:
-                    if asyncio.get_running_loop().time() >= deadline:
-                        raise OSError("response status snapshot is busy")
-                    await asyncio.sleep(0.01)
-            # No await between the merge and publish: observations cannot race
-            # this runtime's dirty reset. Small local filesystem operations are
-            # synchronous; lock contention never blocks the asyncio loop.
+            try:
+                file_locks.try_lock_exclusive(lock_fd)
+            except BlockingIOError:
+                return False
+            # No yield anywhere in this operation: observations cannot race
+            # the merge/publication or this runtime's dirty reset. The file
+            # lock separately serializes writers in independent runtimes.
             entries = _read(self._directory(), self._name)
             _merge(entries, self.observations.values())
             content = json.dumps(_document(entries), indent=2, ensure_ascii=True)
@@ -293,11 +296,26 @@ class Store:
             private_files.fsync(directory_fd)
             temporary_name = None
             self.dirty = False
+            return True
         finally:
             if temporary_name is not None:
                 with contextlib.suppress(OSError):
                     private_files.unlink_at(directory_fd, temporary_name)
             private_files.close(lock_fd)
+
+    async def save(self):
+        # ACP and orderly shutdown may yield only between complete attempts,
+        # never while holding a publication lock or resetting dirty state.
+        if self.try_save():
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 0.25
+        while True:
+            if loop.time() >= deadline:
+                raise OSError("response status snapshot is busy")
+            await asyncio.sleep(0.01)
+            if self.try_save():
+                return
 
     async def save_on_exit(self):
         try:
