@@ -25,6 +25,7 @@ from functools import partial
 
 from . import connections
 from . import model_requests
+from . import recoveries
 from . import files
 from . import jobs
 from . import web_tools
@@ -1570,6 +1571,7 @@ async def run_tool_loop_async(
         chat_fn=None, on_event=None, cancel_check=None,
         stream_chat=False, report_timing=False,
         on_response=None, hook_pipeline=None,
+        recovery: recoveries.TurnRecovery | None = None,
         cancel_event: asyncio.Event | None = None,
         ask_user=None,
         reasoning_effort=_UNSET,
@@ -1580,6 +1582,9 @@ async def run_tool_loop_async(
     actual provider response and one event for each local tool result. The
     callback receives ``codex_turn_state`` explicitly because it changes the
     routing semantics of every provider request in this logical user turn.
+    recovery is borrowed from the terminal/ACP owner and is also supplied to
+    that owner's chat_fn request path. It owns one policy/counter across replay
+    and continuation; this loop retains canonical history and response limits.
     """
     codex_turn_state = model_requests.CodexTurnState()
     # One snapshot for the whole logical turn: tool continuations use the
@@ -1591,6 +1596,16 @@ async def run_tool_loop_async(
     elif reasoning_effort is not None:
         reasoning_effort = modelsdev.validate_reasoning_effort(
             reasoning_effort)
+    # User turns have one event: callback APIs see its is_set view, and tools
+    # and recovery waits observe the same object. A caller without an event may
+    # supply its predicate; that creates no second cancellation state here.
+    # Never choose the signal's meaning according to recovery configuration.
+    if cancel_event is not None:
+        if not isinstance(cancel_event, asyncio.Event):
+            raise TypeError("cancel_event must be an asyncio.Event")
+        cancel_check = cancel_event.is_set
+    if recovery is not None and recovery.cancel_event is not cancel_event:
+        raise ValueError("recovery and inference must share the owning turn event")
     completion_cancel_check = cancel_check
     if chat_fn is None:
         advertised_tools = (
@@ -1618,6 +1633,8 @@ async def run_tool_loop_async(
                 kwargs["on_reasoning_delta"] = on_reasoning_delta
             if completion_cancel_check is not None:
                 kwargs["cancel_check"] = completion_cancel_check
+            if recovery is not None:
+                kwargs["recovery"] = recovery
             return async_chat_completion(items, **kwargs)
     if on_event is None:
         on_event = lambda event: None
@@ -1648,6 +1665,30 @@ async def run_tool_loop_async(
         for call in tool_calls:
             transcript_items.append(formats.tool_result_for_call(
                 call, reason, is_error=True))
+
+    async def recover_failure(failure, *, saved=False):
+        # The same object was already available to prepared-request replay.
+        # A terminal request decision is latched there; do not create/reset a
+        # second budget here. Only this loop may continue canonical history.
+        if not saved:
+            finish_live_text(False, "cancelled" if cancel_check() else "error")
+        if recovery is not None and loop_count < max_loops:
+            try:
+                if await recovery.retry(failure):
+                    return True
+            except recoveries.Cancelled:
+                pass
+        if cancel_check():
+            on_event({
+                "type": "response_cancelled",
+                "partial": bool(live_text_parts or live_reasoning) or saved,
+                "saved": saved,
+            })
+        else:
+            # Final classifiers must not retain an earlier recovered failure;
+            # ACP and turn_end consume only the final outcome, not retry history.
+            on_event(failure)
+        return False
 
     loop_count = 0
     while True:
@@ -1717,37 +1758,13 @@ async def run_tool_loop_async(
                 response_items = await chat_fn(
                     transcript_items,
                     codex_turn_state=codex_turn_state)
-        except model_requests.StreamCancelled:
+        except recoveries.Cancelled:
             finish_live_text(False, "cancelled")
             on_event({
                 "type": "response_cancelled",
                 "partial": bool(live_text_parts or live_reasoning),
                 "saved": False,
             })
-            return ""
-        except protocols.ResponseApiError as e:
-            if cancel_check():
-                finish_live_text(False, "cancelled")
-                on_event({
-                    "type": "response_cancelled",
-                    "partial": bool(live_text_parts or live_reasoning),
-                    "saved": False,
-                })
-                return ""
-            finish_live_text(False, "error")
-            on_event({"type": "api_error", "error": e})
-            return ""
-        except protocols.StreamProtocolError as e:
-            if cancel_check():
-                finish_live_text(False, "cancelled")
-                on_event({
-                    "type": "response_cancelled",
-                    "partial": bool(live_text_parts or live_reasoning),
-                    "saved": False,
-                })
-                return ""
-            finish_live_text(False, "error")
-            on_event({"type": "stream_error", "error": e})
             return ""
         except formats.TranscriptFormatError as e:
             if cancel_check():
@@ -1761,42 +1778,25 @@ async def run_tool_loop_async(
             finish_live_text(False, "error")
             on_event({"type": "transcript_error", "error": e})
             return ""
-        except protocols.ProtocolError as e:
-            if cancel_check():
-                finish_live_text(False, "cancelled")
-                on_event({
-                    "type": "response_cancelled",
-                    "partial": bool(live_text_parts or live_reasoning),
-                    "saved": False,
-                })
-                return ""
-            finish_live_text(False, "error")
-            on_event({"type": "provider_error", "error": e})
+        except protocols.ResponseApiError as error:
+            if await recover_failure(model_requests.failure_event(error)):
+                continue
             return ""
-        except model_requests.ApiError as e:
-            if cancel_check():
-                finish_live_text(False, "cancelled")
-                on_event({
-                    "type": "response_cancelled",
-                    "partial": bool(live_text_parts or live_reasoning),
-                    "saved": False,
-                })
-                return ""
-            finish_live_text(False, "error")
-            on_event({"type": "api_error", "error": e})
+        except protocols.StreamProtocolError as error:
+            if await recover_failure(model_requests.failure_event(error)):
+                continue
             return ""
-        except OSError as e:
-            if cancel_check():
-                finish_live_text(False, "cancelled")
-                on_event({
-                    "type": "response_cancelled",
-                    "partial": bool(live_text_parts or live_reasoning),
-                    "saved": False,
-                })
-                return ""
-            finish_live_text(False, "error")
-            msg = str(e) or f"{type(e).__name__}() (errno={e.errno!r}, no OS message)"
-            on_event({"type": "network_error", "error": msg})
+        except protocols.ProtocolError as error:
+            if await recover_failure(model_requests.failure_event(error)):
+                continue
+            return ""
+        except model_requests.ApiError as error:
+            if await recover_failure(model_requests.failure_event(error)):
+                continue
+            return ""
+        except OSError as error:
+            if await recover_failure(model_requests.failure_event(error)):
+                continue
             return ""
         except BaseException:
             finish_live_text(False, "cancelled" if cancel_check() else "error")
@@ -1872,16 +1872,9 @@ async def run_tool_loop_async(
                     "Tool call not executed because the provider response "
                     "was incomplete.",
                 )
-            event_type = (
-                "response_failed"
-                if turn.metadata.get("status") == "failed"
-                else "response_incomplete")
-            on_event({
-                "type": event_type,
-                "status": turn.metadata.get("status"),
-                "protocol_data": copy.deepcopy(
-                    turn.metadata.get("protocol_data")),
-            })
+            failure = model_requests.failure_event(turn)
+            if await recover_failure(failure, saved=True):
+                continue
             return assistant_text
 
         if (turn.metadata.get("stop_reason") == "pause_turn"
@@ -2391,15 +2384,31 @@ PLAN_TOOLS = EXPLORE_TOOLS | {
 TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
 
 
+def make_turn_recovery(cancel_event):
+    """Select policy once for a terminal/ACP turn, not inside each retry.
+
+    The bound pipeline supplies external commands; TurnRecovery supplies the
+    shared state lent to model_requests and the tool loop. Headless/subagent
+    callers do not opt in. This factory supplies the turn's shell context to
+    the existing hook runner without changing its command or cwd policy.
+    """
+    pipeline = TOOL_HOOK_PIPELINE
+    if not pipeline.turn_error_hooks:
+        return None
+
+    async def policy(payload, *, cancel_event):
+        return await pipeline.recover_turn(
+            {**payload, "cwd": current_cwd()}, cancel_event=cancel_event)
+
+    return recoveries.TurnRecovery(policy, cancel_event)
+
+
 async def run_turn_end_hooks_async(events, text="", *, error=None):
     """Notify user-facing turn hooks after the model/tool loop has stopped."""
     pipeline = TOOL_HOOK_PIPELINE
     if not pipeline.turn_end_hooks:
         return
-    error_kinds = {
-        "api_error", "network_error", "stream_error", "transcript_error",
-        "provider_error", "response_failed", "response_incomplete",
-    }
+    error_kinds = recoveries.MODEL_FAILURE_TYPES | {"transcript_error"}
     failure = next((event for event in events
                     if event.get("type") in error_kinds), None)
     kinds = {event.get("type") for event in events}
@@ -2421,17 +2430,7 @@ async def run_turn_end_hooks_async(events, text="", *, error=None):
         payload["error_type"] = type(error).__name__
         payload["error_message"] = str(error)
     elif failure is not None:
-        payload["error_type"] = failure["type"]
-        detail = failure.get("error")
-        if detail is None:
-            protocol_data = failure.get("protocol_data")
-            native = (protocol_data.get(formats.OPENAI_RESPONSES)
-                      if isinstance(protocol_data, dict) else None)
-            if isinstance(native, dict):
-                details = native.get("error") or native.get("incomplete_details")
-                if isinstance(details, dict):
-                    detail = details.get("message") or details.get("reason")
-        payload["error_message"] = str(detail) if detail is not None else None
+        payload.update(recoveries.failure_fields(failure))
     await pipeline.finish_turn(payload)
 
 
@@ -2493,9 +2492,13 @@ async def async_chat_completion(
         transcript_items: list, tools=TOOLS, report_errors: bool = False,
         show_timing: bool = False, on_text_delta=None, on_reasoning_delta=None,
         cancel_check=None, codex_turn_state=None, reasoning_effort=_UNSET,
-        thinking: model_requests.TurnThinkingSettings | None = None) -> formats.DecodedTurn:
+        thinking: model_requests.TurnThinkingSettings | None = None,
+        recovery: recoveries.TurnRecovery | None = None) -> formats.DecodedTurn:
+    # This facade supplies session authority/settings, not another retry owner.
+    # Preserve the frontend's TurnRecovery identity through model_requests;
+    # it must remain the object also borrowed by run_tool_loop_async.
     if cancel_check and cancel_check():
-        raise model_requests.StreamCancelled()
+        raise recoveries.Cancelled()
     context = _model_request_context()
     if context.config is None:
         return formats.DecodedTurn([])
@@ -2511,7 +2514,8 @@ async def async_chat_completion(
         transcript_items, tools, report_errors=report_errors, show_timing=show_timing,
         on_text_delta=on_text_delta, on_reasoning_delta=on_reasoning_delta,
         cancel_check=cancel_check, codex_turn_state=codex_turn_state,
-        reasoning_effort=reasoning_effort, thinking=thinking, context=context)
+        reasoning_effort=reasoning_effort, thinking=thinking, context=context,
+        recovery=recovery)
 
 
 def _status_api_base() -> str:

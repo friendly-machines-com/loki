@@ -148,12 +148,16 @@ class StreamProtocolError(ProtocolError):
 
 
 class ResponseApiError(ProtocolError):
-    """A terminal error reported inside a Responses protocol stream.
+    """A provider's terminal response.failed, not malformed/interrupted SSE.
 
-    This is distinct from malformed SSE or an interrupted transport: the
-    server completed the protocol exchange with ``response.failed``.  Keeping
-    the classification on the exception lets the request layer retry only
-    failures for which replaying the same idempotent request is appropriate.
+    response_failed_error is the one classifier for stream accumulators and
+    decoded-response handling. code is the provider string; category describes
+    it for diagnostics. retryable governs the EXISTING fixed request replay
+    policy before output, not eligibility for a user-selected recovery policy.
+    retry_after is an optional relative minimum in seconds from that failed
+    response: fixed request backoff and TurnRecovery both consume it. Keeping
+    those semantics here prevents buffered/streaming recovery from inventing
+    different classifications or silently dropping the provider's wait hint.
     """
 
     def __init__(
@@ -435,7 +439,14 @@ def _response_retry_after(code, message):
     return delay
 
 
-def _response_failed_error(event):
+def response_failed_error(event):
+    """Classify native failure data for SSE and decoded-response consumers.
+
+    A stream accumulator raises this error; model_requests.failure_event retains
+    it alongside a saved failed response. Both need one code/category/wait-hint
+    interpretation, not another buffered-only table. This creates diagnostic
+    data with ResponseApiError's documented semantics, not a retry authorization.
+    """
     response = event.get("response")
     error = response.get("error") if isinstance(response, dict) else None
     code = error.get("code") if isinstance(error, dict) else None
@@ -1602,7 +1613,7 @@ class OpenAIResponsesStreamAccumulator:
             self.incomplete_response.setdefault("object", "response")
             self.incomplete_response.setdefault("status", "incomplete")
         elif event_type == "response.failed":
-            raise _response_failed_error(data)
+            raise response_failed_error(data)
         elif event_type == "response.cancelled":
             response = data.get("response")
             if isinstance(response, dict):

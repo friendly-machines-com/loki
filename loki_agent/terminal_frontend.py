@@ -28,6 +28,7 @@ from . import credential_capabilities
 from . import credential_runtimes
 from . import models as modelsdev
 from . import protocols
+from . import recoveries
 from . import process_outputs
 from . import settings
 from . import savefiles
@@ -715,16 +716,9 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         print(f"[model response {status}; provider output saved]",
               file=sys.stderr)
         detail = event.get("protocol_data")
-        if isinstance(detail, dict):
-            response = detail.get(formats.OPENAI_RESPONSES)
-            if isinstance(response, dict):
-                reason = (response.get("incomplete_details")
-                          or response.get("error"))
-                if isinstance(reason, dict):
-                    text = reason.get("reason") or reason.get("message")
-                    if isinstance(text, str) and text:
-                        _print_text_line(
-                            "Reason: ", text, file=sys.stderr, multiline=True)
+        text = recoveries.failure_fields(event)["error_message"]
+        if text:
+            _print_text_line("Reason: ", text, file=sys.stderr, multiline=True)
         sys.stderr.flush()
         if detail:
             debug_json(logger, "Provider response details:", detail)
@@ -801,6 +795,12 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
                                   cancel_event: asyncio.Event | None = None,
                                   turn_events=None, ui_settings=None,
                                   ask_user=None) -> str:
+    # The reader's event is the state; callback-based requests see a view of
+    # that same event, with or without recovery. Capture policy once, then lend
+    # one scoped recovery object to both request replay and history continuation.
+    if cancel_event is not None:
+        cancel_check = cancel_event.is_set
+    recovery = _core.make_turn_recovery(cancel_event)
     thinking = _core.capture_turn_settings()
     reasoning_effort = thinking.effort
     read_only = current_agent_mode() in ["explore", "plan"]
@@ -830,6 +830,8 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         }
         if on_reasoning_delta is not None:
             kwargs["on_reasoning_delta"] = on_reasoning_delta
+        if recovery is not None:
+            kwargs["recovery"] = recovery
         return await async_chat_completion(
             items, active_tools, True, False, **kwargs)
 
@@ -857,6 +859,7 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
         stream_chat=True,
         report_timing=True,
         cancel_event=cancel_event,
+        recovery=recovery,
         reasoning_effort=reasoning_effort,
         thinking=thinking,
         ask_user=ask_user,
@@ -1877,11 +1880,10 @@ async def async_main(args) -> int:
             try:
                 # Ctrl+C is a per-turn request. A Ctrl+C used to cancel an
                 # earlier prompt or turn must not poison the next model call.
-                session.reader.cancel_requested = False
                 session.reader.cancel_event.clear()
                 turn_text = await run_terminal_turn_async(
                     current_transcript(),
-                    cancel_check=lambda: session.reader.cancel_requested,
+                    cancel_check=session.reader.cancel_event.is_set,
                     cancel_event=session.reader.cancel_event,
                     turn_events=turn_events, ui_settings=ui_settings,
                     ask_user=terminal_ask_user(session))

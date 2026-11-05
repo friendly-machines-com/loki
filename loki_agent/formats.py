@@ -1034,16 +1034,22 @@ def openai_chat_response_to_items(response):
     _put_optional(protocol_data, "choice_index", first.get("index"))
     _put_optional(protocol_data, "logprobs", first.get("logprobs"))
     _put_optional(protocol_data, "cost", response.get("cost"))
+    # A token cap terminates this response, not the requested work. Classify
+    # it once in its owning adapter so recovery, ACP and final notification
+    # agree; the hook must not reinterpret assistant text to discover it.
+    stop_reason = first.get("finish_reason")
+    status = "incomplete" if stop_reason == "length" else "completed"
     return DecodedTurn(
         openai_chat_message_to_items(first["message"]),
         {
             "protocol": OPENAI_CHAT,
-            "status": "completed",
-            "stop_reason": first.get("finish_reason"),
+            "status": status,
+            "stop_reason": stop_reason,
             "usage": _copy(response.get("usage")),
             "protocol_data": (
                 {OPENAI_CHAT: protocol_data} if protocol_data else None),
         },
+        complete=status == "completed",
     )
 
 
@@ -1207,17 +1213,23 @@ def anthropic_response_to_items(response):
             ANTHROPIC_MESSAGES, "response fields", unknown_envelope)
     protocol_data = {}
     _put_optional(protocol_data, "stop_sequence", response.get("stop_sequence"))
+    # Like Chat length and Responses incomplete, max_tokens is partial output.
+    # pause_turn stays complete: its existing server-tool continuation is a
+    # different protocol obligation, not an error-policy retry.
+    stop_reason = response.get("stop_reason")
+    status = "incomplete" if stop_reason == "max_tokens" else "completed"
     return DecodedTurn(
         items,
         {
             "protocol": ANTHROPIC_MESSAGES,
-            "status": "completed",
-            "stop_reason": response.get("stop_reason"),
+            "status": status,
+            "stop_reason": stop_reason,
             "usage": _copy(response.get("usage")),
             "protocol_data": (
                 {ANTHROPIC_MESSAGES: protocol_data}
                 if protocol_data else None),
         },
+        complete=status == "completed",
     )
 
 

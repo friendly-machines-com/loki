@@ -9,7 +9,7 @@ from unittest import mock
 from loki_agent import formats, loki, protocols, replays, savefiles, sse
 from loki_agent.sessions import Session
 from loki_agent import connections
-from loki_agent import model_requests
+from loki_agent import model_requests, recoveries
 
 
 def feed(accumulator, data):
@@ -216,7 +216,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(visible, ["before", "middle", "after"] if visibility == "on" else ["before\nafter"])
 
     async def test_partial_thinking_closes_without_persisting_transport_fragments(self):
-        for exception in (model_requests.StreamCancelled(), protocols.StreamProtocolError("broken"), asyncio.CancelledError()):
+        for exception in [recoveries.Cancelled(), protocols.StreamProtocolError("broken"), asyncio.CancelledError()]:
             events, transcript = [], []
 
             async def chat(items, on_text_delta, *, codex_turn_state, on_reasoning_delta):

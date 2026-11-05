@@ -366,6 +366,62 @@ minimal environment without Loki API credentials. A hook configured with
 `workspace_side_effects: true` must return `changed_paths` listing the files it
 changed.
 
+### Retrying failed model requests
+
+For long-running terminal and ACP conversations, the example retry hook tells
+Loki to wait and try again after a model-service failure. The same prompt stays
+active while Loki waits.
+
+Add this entry to your hook configuration (`hooks.json`, or the file selected
+by `LOKI_HOOKS`). Replace the placeholders with your Python executable and the
+filename of `contrib/hooks/retries.py`. The script uses only Python's standard
+library and can be copied elsewhere.
+
+```json
+{
+    "turn_error": [{
+        "id": "retry",
+        "command": ["<python-executable>", "<retry-script-filename>"]
+    }]
+}
+```
+
+The example's defaults are:
+
+- Ordinary failures: start with a **5-second** delay.
+- Errors whose reported message contains `overload`: start with **10 minutes**.
+- Double the delay with each retry, up to **30 minutes**, then keep that delay.
+- **No retry-count limit.** Press Ctrl+C in the terminal or cancel the ACP
+  prompt to stop recovery.
+
+Both schedules use the number of retries already made in the current turn;
+intermediate successful requests do not reset it. A provider's minimum retry
+wait, when available, takes precedence even if longer than 30 minutes. Run the
+script with `--help` to see its optional arguments.
+
+The example retries reported API, connection, DNS, stream and provider errors,
+and failed or incomplete answers, including token-limit stops. It does not
+distinguish temporary failures from persistent ones: invalid credentials or
+an oversized conversation can keep failing until you cancel. Tool errors,
+model refusals, cancellation, local conversation-format errors and unexpected
+programming errors do not trigger the hook. Assistant text is not searched for
+error messages. Headless and Explore subagent runs do not use this hook.
+
+Without a recovery hook, Loki retries only some temporary failures, such as
+connection resets or refusals, normally making up to three attempts. Automatic
+retries stop once answer or reasoning text has arrived. With the hook enabled,
+Loki asks it after each eligible failure rather than making three attempts
+first. Refreshing an expired login can add requests.
+
+Retries may be billed again and can repeat displayed text or server-side work.
+Completed local tools are not deliberately rerun, and incomplete tool calls are
+not executed. Retrying does not reset the turn's model-response limit. A broken
+hook or invalid decision ends recovery with the original failure. There is no
+default hook timeout; `timeout_ms` can set one.
+
+A configured `turn_end` hook runs once after the final outcome, not after each
+retry.
+
 ## Saved sessions
 
 Chat logs save the conversation, selected model, connection settings, and other

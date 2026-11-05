@@ -870,7 +870,7 @@ class TerminalMode:
             new_attrs[6] = self.old_attrs[6].copy()
             # ISIG too: with it set, the tty driver turns Ctrl+C into SIGINT
             # for the foreground process group before the byte reaches the
-            # reader, so AsyncKeyReader.cancel_requested can never fire and
+            # reader, so AsyncKeyReader.cancel_event is never set and
             # between-tool-call cancellation never triggers.  Clearing ISIG
             # makes Ctrl+C the byte (0x03) the reader already handles.
             # Tool subprocesses are unaffected either way: they run in their
@@ -923,8 +923,8 @@ def interrupt_processing_enabled(fd: int) -> bool:
     """Whether the terminal converts Ctrl+C into a signal before the reader.
 
     POSIX calls it ``ISIG``; Windows calls it ``ENABLE_PROCESSED_INPUT``.  With
-    it set, a Ctrl+C never reaches the byte reader, so ``cancel_requested``
-    cannot fire between tool calls.  ``TerminalMode`` clears it on both
+    it set, a Ctrl+C never reaches the byte reader, so ``cancel_event``
+    cannot be set between tool calls. ``TerminalMode`` clears it on both
     platforms.
     """
     if sys.platform == "win32":
@@ -1562,16 +1562,14 @@ class AsyncKeyReader:
         self._resize_timer = None
         self._resize_size = None
         self._watching_resize = False
-        self.cancel_requested = False
-        # Event-driven counterpart of cancel_requested.  Set in _feed_byte,
-        # which runs inside read_key(), which runs as a task on the same
-        # asyncio loop as everything that waits on this event -- so a plain
-        # .set() is sufficient (no call_soon_threadsafe needed: the setter
-        # is loop context, not a foreign thread).
+        # One cancellation state for the active user turn. The key reader sets
+        # it on Ctrl+C; terminal_frontend clears it only at turn admission.
+        # Requests query is_set; tools, Ask, and recovery wait on this same event.
+        # A second boolean could disagree with those async consumers, so it is
+        # deliberately absent. Setter and waiters run on the same asyncio loop.
         self.cancel_event = asyncio.Event()
-        # Shift-Tab: requests cycling the agent mode (explore/plan/edit) for the
-        # next turn. Same mechanism as cancel_requested (a flag the main loop
-        # reads), but it must NOT cancel -- the current turn keeps running.
+        # Shift-Tab requests a mode change for the NEXT turn. This separate
+        # preference flag must not cancel any operation in the current turn.
         self.mode_cycle_requested = False
 
     def _on_resize(self):
@@ -1672,7 +1670,6 @@ class AsyncKeyReader:
         elif event.kind == "MODE_CYCLE":
             self.mode_cycle_requested = True
         elif event.kind == "CTRL_C":
-            self.cancel_requested = True
             self.cancel_event.set()
         self.pending.append(event)
 
@@ -2289,8 +2286,8 @@ class InputSession:
     Raw mode and the reader are held from enter to exit, so keys typed while
     the agent works are drained into the queue instead of being lost to the
     kernel's line buffer.  Ctrl+C in raw mode is a CTRL_C key event; the
-    reader sets ``cancel_requested`` and the turn loop checks it between
-    awaits (the old SIGINT emergency stop no longer exists).
+    reader sets ``cancel_event``; requests query it and asynchronous waits
+    observe it directly (the old SIGINT emergency stop no longer exists).
     """
 
     def __init__(self, fd=None, on_mode_cycle=None, history_provider=None,
@@ -2382,7 +2379,7 @@ class InputSession:
                 return
             except KeyboardInterrupt:
                 # Ctrl+C at the prompt cancels the current prompt; keep looping
-                # so the user can keep typing. cancel_requested is set by the
+                # so the user can keep typing. cancel_event is set by the
                 # reader.
                 continue
             except Exception as e:

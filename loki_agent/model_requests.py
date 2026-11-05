@@ -17,13 +17,25 @@ import uuid
 from dataclasses import dataclass
 from pprint import pformat
 
-from . import authentications, connections, formats, http_client, protocols, sse
+from . import authentications, connections, formats, http_client, protocols, recoveries, sse
 from . import response_headers as header_observations
 
 
 @dataclass(frozen=True)
 class RequestContext:
-    """Authority, connection and identity selected for one sampling operation."""
+    """Borrowed authority/identity selected before awaiting one operation.
+
+    Buffered and streaming executors read config's selected provider/auth spec;
+    credential_authority supplies their request leases and bounded 401 refresh,
+    never hook JSON or provider response data. conversation_id partitions cache
+    and provider sessions; root_conversation_id supplies delegated-tree identity
+    headers. response_headers is the inference process's diagnostic Store: both
+    executors observe into it, but neither closes or replaces that shared owner.
+
+    These references are not a turn retry budget or cancellation state. The
+    separate TurnRecovery spans multiple sampling contexts and is passed intact
+    by its frontend owner; putting its counter here would reset it per request.
+    """
 
     config: connections.RuntimeConfig | None
     credential_authority: authentications.CredentialAuthority | None
@@ -121,8 +133,45 @@ class StreamingApiError(ApiError):
               "streaming, set LOKI_STREAM=0.")
 
 
-class StreamCancelled(Exception):
-    pass
+def failure_event(error):
+    """Preserve one request failure in the existing model/tool event vocabulary.
+
+    Prepared-request replay and the tool loop have explicit exception boundaries.
+    This helper translates their already-selected failures to shared event data;
+    it does not select arbitrary exceptions intercepted by a catch-all.
+    The original exception stays in error for final terminal/ACP formatting;
+    only recoveries.failure_fields converts its safe diagnostic facts to JSON.
+    A DecodedTurn comes from the tool loop after saving its canonical response;
+    its native failure uses the same Responses classifier as streamed failures,
+    including retry-delay hints. Unexpected local exceptions are not candidates.
+    """
+    if isinstance(error, formats.DecodedTurn):
+        if error.complete:
+            return None
+        status = error.metadata.get("status")
+        failure = {
+            "type": "response_failed" if status == "failed" else "response_incomplete",
+            "status": status,
+            "stop_reason": error.metadata.get("stop_reason"),
+            "protocol_data": copy.deepcopy(error.metadata.get("protocol_data")),
+        }
+        native = failure["protocol_data"]
+        native = native.get(formats.OPENAI_RESPONSES) if isinstance(native, dict) else None
+        if status == "failed" and isinstance(native, dict):
+            failure["error"] = protocols.response_failed_error({"response": native})
+        return failure
+    if isinstance(error, ApiError | protocols.ResponseApiError):
+        kind = "api_error"
+    elif isinstance(error, protocols.StreamProtocolError):
+        kind = "stream_error"
+    elif isinstance(error, protocols.ProtocolError):
+        kind = "provider_error"
+    elif isinstance(error, OSError):
+        kind = "network_error"
+        error = str(error) or f"{type(error).__name__}() (errno={error.errno!r}, no OS message)"
+    else:
+        return None
+    return {"type": kind, "error": error}
 
 
 def _codex_turn_state_for_request(
@@ -244,10 +293,21 @@ async def async_provider_request(
         request_headers: dict | None = None, report_errors: bool = False,
         show_timing: bool = False, cancel_check=None,
         codex_turn_state=None,
-        opencode_session_id=None, *, context: RequestContext) -> protocols.ProviderResponse:
+        opencode_session_id=None, *, context: RequestContext,
+        recovery: recoveries.TurnRecovery | None = None) -> protocols.ProviderResponse:
+    """Execute a prepared provider request without transferring its identity.
+
+    recovery is borrowed only for inference POSTs from the terminal/ACP turn.
+    Its decisions also cover the caller's history continuation; this executor
+    must not reset that accounting or generate a new idempotency key on replay.
+    Read-only GET callers and tool-less/subagent calls retain their existing
+    request policy when no user-turn recovery object is supplied.
+    """
     start = time.perf_counter()
     config = context.config
     method = method.upper()
+    if recovery is not None and method != "POST":
+        raise ValueError("turn recovery applies only to inference POSTs")
     observe = (_chat_response_observer(config, request_url, context=context)
                if method == "POST" else None)
     if method not in {"GET", "POST"}:
@@ -288,7 +348,10 @@ async def async_provider_request(
                   if kind == protocols.ANTHROPIC_MESSAGES
                   else LLM_IDEMPOTENCY_HEADER_OPENAI)
         base_headers[header] = uuid.uuid4().hex
-        retry_attempts = HTTP_RETRY_MAX_ATTEMPTS_LLM
+        # A user turn's shared recovery object replaces the fixed retry policy,
+        # rather than stacking another budget outside HTTP's automatic retries.
+        # This function still owns body/key replay and its bounded 401 refresh.
+        retry_attempts = 1 if recovery is not None else HTTP_RETRY_MAX_ATTEMPTS_LLM
         request_timeout = LLM_REQUEST_TIMEOUT_S
 
     rejected_generation = None
@@ -327,11 +390,19 @@ async def async_provider_request(
         if turn_state is not None:
             transport_options["prepare_attempt_headers"] = (
                 lambda headers: _prepare_codex_turn_headers(headers, turn_state))
-        response = await http_client.async_http_request(
-            method,
-            request_url,
-            **transport_options,
-        )
+        # The HTTP transport exposes delivery/network failures as OSError;
+        # HttpRequestDeliveryError also derives from it. API status and JSON
+        # failures are handled below, not selected by a catch-all classifier.
+        try:
+            response = await http_client.async_http_request(
+                method,
+                request_url,
+                **transport_options,
+            )
+        except OSError as error:
+            if recovery is not None and await recovery.retry(failure_event(error)):
+                continue
+            raise
         if (response.status == 401
                 and lease is not None
                 and lease.refreshable
@@ -342,18 +413,26 @@ async def async_provider_request(
             rejected_generation = lease.generation
             recovered = True
             continue
+        response_text = http_client.decode_text(response.body, response.headers)
+        if response.status >= 400:
+            error = ApiError(request_url, response.status, response.reason, response_text)
+            if recovery is not None and await recovery.retry(failure_event(error)):
+                continue
+            raise error
+        # JSON decoding belongs to this prepared request too: no response has
+        # been published, so a retry must keep the same body/idempotency key.
+        try:
+            data = json.loads(response_text)
+        except json.JSONDecodeError as cause:
+            error = protocols.ProtocolError(
+                f"response from <{request_url}> was not valid JSON: "
+                f"{cause.msg}",
+                payload=response_text,
+            )
+            if recovery is not None and await recovery.retry(failure_event(error)):
+                continue
+            raise error from cause
         break
-    response_text = http_client.decode_text(response.body, response.headers)
-    if response.status >= 400:
-        raise ApiError(request_url, response.status, response.reason, response_text)
-    try:
-        data = json.loads(response_text)
-    except json.JSONDecodeError as error:
-        raise protocols.ProtocolError(
-            f"response from <{request_url}> was not valid JSON: "
-            f"{error.msg}",
-            payload=response_text,
-        ) from error
 
     elapsed = time.perf_counter() - start
     if show_timing:
@@ -369,7 +448,7 @@ async def async_provider_request(
 
 async def _next_stream_chunk(iterator, cancel_check):
     if cancel_check():
-        raise StreamCancelled()
+        raise recoveries.Cancelled()
     task = asyncio.ensure_future(anext(iterator))
     try:
         while True:
@@ -377,7 +456,7 @@ async def _next_stream_chunk(iterator, cancel_check):
             if done:
                 return task.result()
             if cancel_check():
-                raise StreamCancelled()
+                raise recoveries.Cancelled()
     finally:
         if not task.done():
             task.cancel()
@@ -573,7 +652,7 @@ async def _async_chat_stream_request_once(
                         notice_codes=tuple(
                             getattr(accumulator, "notice_codes", ())),
                     )
-        except StreamCancelled:
+        except recoveries.Cancelled:
             raise
         except protocols.ResponseApiError:
             raise
@@ -602,7 +681,12 @@ async def async_chat_stream_request(
         report_errors: bool = False, show_timing: bool = False,
         codex_turn_state=None,
         opencode_session_id=None, on_reasoning_delta=None,
-        *, context: RequestContext) -> protocols.ProviderResponse:
+        *, context: RequestContext,
+        recovery: recoveries.TurnRecovery | None = None) -> protocols.ProviderResponse:
+    # The shared user-turn policy may authorize a prepared replay only before
+    # output. After output, the model/tool loop must decide continuation from
+    # its valid history instead. Both sites borrow one object/counter; this loop
+    # retains the original body and idempotency key, including 401 recovery.
     start = time.perf_counter()
     config = context.config
     observe = _chat_response_observer(config, request_url, context=context)
@@ -662,8 +746,9 @@ async def async_chat_stream_request(
                 request_url, payload, headers_to_use, callback, cancel, **stream_kwargs)
             break
         except http_client.HttpRequestCancelled:
-            raise StreamCancelled()
-        except Exception as exc:
+            raise recoveries.Cancelled()
+        except (ApiError, protocols.ResponseApiError, protocols.StreamProtocolError,
+                protocols.ProtocolError, OSError) as exc:
             if (isinstance(exc, StreamingApiError)
                     and exc.status == 401
                     and lease is not None
@@ -675,6 +760,13 @@ async def async_chat_stream_request(
                 # accounting and preserves the same idempotency key.
                 transport_attempt = 0
                 continue
+            if recovery is not None:
+                failure = failure_event(exc)
+                if output_started or failure is None:
+                    raise
+                if await recovery.retry(failure):
+                    continue
+                raise
             retryable_response_error = (
                 isinstance(exc, protocols.ResponseApiError)
                 and exc.retryable)
@@ -700,7 +792,7 @@ async def async_chat_stream_request(
                 await http_client._wait_with_cancel(
                     asyncio.sleep(delay), delay + 0.1, cancel)
             except http_client.HttpRequestCancelled:
-                raise StreamCancelled()
+                raise recoveries.Cancelled()
 
     elapsed = time.perf_counter() - start
     if show_timing:
@@ -714,7 +806,14 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
                                 on_text_delta=None, on_reasoning_delta=None,
                                 cancel_check=None, codex_turn_state=None,
                                 reasoning_effort=None, *, context: RequestContext,
-                                thinking: TurnThinkingSettings) -> formats.DecodedTurn:
+                                thinking: TurnThinkingSettings,
+                                recovery: recoveries.TurnRecovery | None = None) -> formats.DecodedTurn:
+    """Project one sampling operation and borrow its user's recovery policy.
+
+    Pass the same TurnRecovery to the selected request executor, never into a
+    provider payload or a new per-request policy/counter. Decoded incomplete
+    output returns to the tool loop, which owns canonical-history continuation.
+    """
     if (reasoning_effort is not None
             and (context.config.reasoning_effort_profile is None
                  or not context.config.reasoning_effort_profile.supports(
@@ -753,7 +852,7 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
                     deadline = time.monotonic() + 10
                     while not os.path.exists(gate):
                         if cancel_check and cancel_check():
-                            raise StreamCancelled()
+                            raise recoveries.Cancelled()
                         if time.monotonic() >= deadline:
                             raise protocols.ProtocolError(
                                 "timed out waiting for "
@@ -834,6 +933,8 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
             request_kwargs["codex_turn_state"] = codex_turn_state
         if opencode_session_id is not None:
             request_kwargs["opencode_session_id"] = opencode_session_id
+        if recovery is not None:
+            request_kwargs["recovery"] = recovery
         response = await async_chat_stream_request(
             context.config.chat_provider.chat_url,
             payload,
@@ -869,6 +970,8 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
                 request_kwargs["codex_turn_state"] = codex_turn_state
             if opencode_session_id is not None:
                 request_kwargs["opencode_session_id"] = opencode_session_id
+            if recovery is not None:
+                request_kwargs["recovery"] = recovery
             response = await async_provider_request(
                 "POST",
                 context.config.chat_provider.chat_url,
@@ -879,7 +982,7 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
             effective_model = response.effective_model or effective_model
             notice_codes = response.notice_codes
         except http_client.HttpRequestCancelled:
-            raise StreamCancelled()
+            raise recoveries.Cancelled()
     if not isinstance(data, dict):
         raise protocols.ProtocolError(
             "chat response must be a JSON object", payload=data)

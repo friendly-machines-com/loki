@@ -37,7 +37,6 @@ def setUpModule():
 class _FakeReader:
     def __init__(self):
         self.keys = asyncio.Queue()
-        self.cancel_requested = False
         self.cancel_event = asyncio.Event()
 
     async def read_key(self):
@@ -279,7 +278,6 @@ class ImmediateCommandTests(unittest.TestCase):
                     contextlib.redirect_stdout(self.output):
                 session = self.make_session()
                 session.user_messages.put_nowait("already queued")
-                session.reader.cancel_requested = True
                 session.reader.cancel_event.set()
                 try:
                     terminal_frontend._terminal_agent_event({"type": "assistant_start"})
@@ -299,7 +297,6 @@ class ImmediateCommandTests(unittest.TestCase):
                     self.assertTrue(terminal_frontend._terminal_activity.turn_running)
                     self.assertEqual(session.user_messages.pending_entries()[0].text,
                                      "already queued")
-                    self.assertTrue(session.reader.cancel_requested)
                     self.assertTrue(session.reader.cancel_event.is_set())
                     self.assertEqual(self.session.transcript_items, self.initial)
                     self.assertFalse(self.session.chat_log_dirty)

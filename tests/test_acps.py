@@ -632,7 +632,7 @@ class EntrypointTests(unittest.TestCase):
 
 
 class _ACPFrontFixture:
-    async def _front(self, env, workspace, *, closed_stderr=False):
+    async def _front(self, env, workspace, *, closed_stderr=False, on_diagnostics=None):
         command = loki_acp_command()
         if closed_stderr:
             command = [sys.executable, '-c',
@@ -642,9 +642,19 @@ class _ACPFrontFixture:
             *command, env=env, cwd=workspace,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
-        # Drain diagnostics while the child runs; a full stderr pipe must not
-        # stall the protocol. Register the backstop before readiness assertions.
-        diagnostics = asyncio.create_task(process.stderr.read())
+
+        # One reader drains and retains diagnostics through shutdown. Retry wire
+        # tests can observe the actual backoff announcement without racing this
+        # reader or replacing the real child/HTTP/hook boundary with a mock.
+        async def read_diagnostics():
+            data = bytearray()
+            while chunk := await process.stderr.read(65536):
+                data.extend(chunk)
+                if on_diagnostics is not None:
+                    on_diagnostics(data)
+            return bytes(data)
+
+        diagnostics = asyncio.create_task(read_diagnostics())
 
         async def cleanup():
             if process.returncode is None:
@@ -3696,7 +3706,7 @@ class WorkerSessionContractTests(unittest.TestCase):
             loki.CREDENTIALS = old_credentials
 
     def test_acp_turn_end_hook_outcomes(self):
-        from loki_agent import loki, protocols
+        from loki_agent import loki, protocols, tool_runtime
         from loki_agent.acp_worker import TurnFailure, Worker
         from loki_agent.sessions import Session
 
@@ -3719,7 +3729,11 @@ class WorkerSessionContractTests(unittest.TestCase):
                         raise asyncio.CancelledError()
                     return "answer"
 
-                pipeline = mock.Mock(turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+                # Real notification-only configuration: an unspecified mock
+                # attribute must not accidentally select a recovery policy.
+                pipeline = tool_runtime.ToolHookPipeline()
+                pipeline.turn_end_hooks.append(object())
+                pipeline.finish_turn = mock.AsyncMock()
                 with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                         mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
                         mock.patch.object(loki, "current_model", return_value="test"), \

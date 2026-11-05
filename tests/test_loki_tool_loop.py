@@ -36,10 +36,10 @@ from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
 from loki_agent import savefiles
 from loki_agent import terminals
-from loki_agent import connections, tool_contracts
+from loki_agent import connections, tool_contracts, tool_runtime
 from loki_agent import files as file_operations
 from loki_agent import jobs as job_runtime
-from loki_agent import model_requests
+from loki_agent import model_requests, recoveries
 from loki_agent import web_tools
 
 
@@ -106,10 +106,9 @@ class ScriptedInputSession:
         # Scripted input is never interactive, so terminal_ask_user yields
         # no seam and the Ask tool stays unadvertised.
         self.interactive = False
-        self.reader = types.SimpleNamespace(
-            cancel_requested=False,
-            cancel_event=mock.Mock(),
-        )
+        # Match the real reader's cancellation authority, not a truthy mock
+        # whose is_set result invents cancellation during ordinary inference.
+        self.reader = types.SimpleNamespace(cancel_event=asyncio.Event())
 
     async def get(self):
         while True:
@@ -180,7 +179,9 @@ class TerminalImageCommandTests(unittest.TestCase):
                         raise KeyboardInterrupt()
                     return "answer"
 
-                pipeline = mock.Mock(turn_end_hooks=[object()], finish_turn=mock.AsyncMock())
+                pipeline = tool_runtime.ToolHookPipeline()
+                pipeline.turn_end_hooks.append(object())
+                pipeline.finish_turn = mock.AsyncMock()
                 with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
                         mock.patch.object(terminal_frontend, "input_session",
                                           return_value=ScriptedInputSession(["hi", "/quit"])), \
@@ -6453,6 +6454,49 @@ class RequestTimeCredentialTests(unittest.TestCase):
             calls[1][model_requests.LLM_IDEMPOTENCY_HEADER_OPENAI],
         )
 
+    def test_shared_policy_keeps_401_refresh_separate_and_preserves_request_key(self):
+        async def scenario(stream):
+            self._install_subscription(stream=stream)
+            calls = []
+            counts = []
+            value = {"object": "response", "status": "completed", "output": []}
+
+            async def policy(payload, *, cancel_event):
+                counts.append(payload["retry_count"])
+                return recoveries.RetryDecision(0)
+
+            async def streaming(url, payload, headers, on_text_delta, cancel_check, **kwargs):
+                calls.append(dict(headers))
+                if len(calls) == 1:
+                    raise model_requests.StreamingApiError(url, 401, "Unauthorized", "{}")
+                if len(calls) == 2:
+                    raise protocols.ResponseApiError("overloaded", code="server_is_overloaded", retryable=False)
+                return protocols.ProviderResponse(value)
+
+            async def buffered(method, url, **kwargs):
+                self.assertEqual(kwargs["retry_max_attempts"], 1)
+                calls.append(dict(kwargs["headers_in"]))
+                status = [401, 503, 200][min(len(calls) - 1, 2)]
+                return http_client.HttpResponse(url, status, "test", {}, json.dumps(value).encode())
+
+            event = asyncio.Event()
+            recovery = recoveries.TurnRecovery(policy, event)
+            with mock.patch.object(model_requests, "_async_chat_stream_request_once", new=streaming), \
+                    mock.patch.object(http_client, "async_http_request", new=buffered):
+                turn = await loki.async_chat_completion(
+                    [formats.message_item("user", "hello")], tools=[],
+                    cancel_check=event.is_set, recovery=recovery)
+            self.assertTrue(turn.complete)
+            self.assertEqual(counts, [0])
+            self.assertEqual([headers["Authorization"] for headers in calls],
+                             ["Bearer access-old", "Bearer access-new", "Bearer access-new"])
+            keys = [headers[model_requests.LLM_IDEMPOTENCY_HEADER_OPENAI] for headers in calls]
+            self.assertEqual(keys, [keys[0]] * 3)
+
+        for stream in [False, True]:
+            with self.subTest(stream=stream):
+                asyncio.run(scenario(stream))
+
     def test_streaming_response_failure_retries_when_classified_retryable(self):
         self._install_subscription(stream=True)
         calls = []
@@ -7110,7 +7154,7 @@ class StreamingCompletionTests(unittest.TestCase):
         with mock.patch(
                 'loki_agent.model_requests.http_client.async_http_stream',
                 side_effect=fake_http_stream):
-            with self.assertRaises(model_requests.StreamCancelled):
+            with self.assertRaises(recoveries.Cancelled):
                 asyncio.run(loki.async_chat_completion(
                     [formats.message_item("user", "hello")],
                     tools=[],
@@ -7223,7 +7267,7 @@ class StreamingToolLoopTests(unittest.TestCase):
         async def chat_fn(
                 items, on_text_delta, *, codex_turn_state):
             on_text_delta("partial")
-            raise model_requests.StreamCancelled()
+            raise recoveries.Cancelled()
 
         result = asyncio.run(loki.run_tool_loop_async(
             transcript,

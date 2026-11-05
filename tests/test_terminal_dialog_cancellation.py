@@ -40,7 +40,6 @@ class KeyboardSession(terminals.InputSession):
         self.command = command
         self.interrupt = interrupt
         self.reader = self
-        self.cancel_requested = False
         self.cancel_event = asyncio.Event()
         self.normal_keys_after_interrupt = 0
 
@@ -61,7 +60,6 @@ class KeyboardSession(terminals.InputSession):
                 self.modals.append(self._modal)
             event = self.dialog_events.pop(0)
             if event.kind == "CTRL_C":
-                self.cancel_requested = True
                 self.cancel_event.set()
                 # Only a resumed normal producer can deliver this next input.
                 for key in answer("/quit" if self.command else "next message"):
@@ -70,7 +68,7 @@ class KeyboardSession(terminals.InputSession):
                     raise self.interrupt()
             return event
         event = await self.normal_events.get()
-        if self.cancel_requested:
+        if self.cancel_event.is_set():
             self.normal_keys_after_interrupt += 1
         return event
 

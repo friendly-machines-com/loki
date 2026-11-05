@@ -297,7 +297,6 @@ class ImmediateTerminalPsTests(unittest.TestCase):
             class Reader:
                 def __init__(self):
                     self.keys = asyncio.Queue()
-                    self.cancel_requested = False
                     self.cancel_event = asyncio.Event()
 
                 async def read_key(self):
@@ -364,7 +363,6 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     self.assertNotIn("\x1b]777", output.getvalue())
                     await command("/ps stop " + job.id)
                     self.assertEqual(job.status, "stopping")
-                    self.assertFalse(session.reader.cancel_requested)
                     self.assertFalse(session.reader.cancel_event.is_set())
                     await command("/ps kill " + job.id)
                     result_job, outcome, _stdout, _stderr = await asyncio.wait_for(foreground, 5)
@@ -378,14 +376,12 @@ class ImmediateTerminalPsTests(unittest.TestCase):
 
                     # /ps remains immediate during exclusive modal input, and
                     # must neither answer the modal nor consume pending input.
-                    session.reader.cancel_requested = True
                     session.reader.cancel_event.set()
                     async with session.modal() as modal:
                         answer = asyncio.create_task(modal.prompt("Confirm: "))
                         try:
                             await command("/ps all")
                             self.assertFalse(answer.done())
-                            self.assertTrue(session.reader.cancel_requested)
                             self.assertTrue(session.reader.cancel_event.is_set())
                             feed("no")
                             self.assertEqual(await asyncio.wait_for(answer, 3), "no")

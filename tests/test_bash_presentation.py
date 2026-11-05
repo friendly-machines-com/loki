@@ -359,7 +359,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
                 # yields no seam and the Ask tool stays unadvertised.
                 inner_self.interactive = False
                 inner_self.reader = types.SimpleNamespace(
-                    cancel_requested=False, cancel_event=asyncio.Event())
+                    cancel_event=asyncio.Event())
 
             async def __aenter__(inner_self):
                 return inner_self

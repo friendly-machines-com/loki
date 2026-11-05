@@ -15,7 +15,7 @@ from loki_agent.connections import ConnectionDescriptor, ConnectionDescriptorErr
 from loki_agent.credentials import CredentialInventory
 from loki_agent.sessions import Session
 from loki_agent import connections
-from loki_agent import model_requests
+from loki_agent import model_requests, recoveries
 
 
 CAPACITY = usages.ContextCapacity(1000, "configured")
@@ -362,7 +362,7 @@ class PresentationTests(unittest.TestCase):
     def test_cancelled_or_failed_exchange_cannot_publish_new_usage(self):
         from loki_agent.acp_worker import Worker
 
-        for error in (model_requests.StreamCancelled(), OSError("offline")):
+        for error in [recoveries.Cancelled(), OSError("offline")]:
             with self.subTest(error=type(error).__name__):
                 session = Session(runtime_config=config())
                 session.transcript_items.append(response(session))

@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import process_outputs, host_process
+from . import process_outputs, host_process, recoveries
 
 
 class ToolSchemaError(ValueError):
@@ -595,6 +595,12 @@ class ToolHookPipeline:
         self.gate_hooks = []
         self.post_hooks = []
         self.turn_end_hooks = []
+        # load_hook_pipeline supplies validated policy commands; recover_turn
+        # consumes the first explicit decision. make_turn_recovery captures this
+        # pipeline once for terminal/ACP; request replay and history continuation
+        # share that object's accounting, not another counter in this list.
+        # Final observers stay in turn_end_hooks and cannot authorize inference.
+        self.turn_error_hooks = []
 
     def add_pre(self, hook_id, callback, on_error="deny", matcher=None):
         self.pre_hooks.append(RegisteredHook(
@@ -611,7 +617,35 @@ class ToolHookPipeline:
     @property
     def has_custom_hooks(self):
         return bool(self.pre_hooks or self.gate_hooks or self.post_hooks
-                    or self.turn_end_hooks)
+                    or self.turn_end_hooks or self.turn_error_hooks)
+
+    async def recover_turn(self, payload, *, cancel_event):
+        """Run policy in config order; no decision here executes a retry.
+
+        TurnRecovery is the sole caller and keeps counters/cancellation outside
+        JSON. Reuse the existing command runner and turn-hook configuration:
+        final notification cannot veto an outcome, while this policy runs before
+        that boundary. A command failure or invalid decision preserves the
+        original failure rather than recursively recovering a hook failure.
+        """
+        for hook in self.turn_error_hooks:
+            try:
+                result = await _run_hook_command(
+                    hook.command, payload, payload["cwd"], hook.timeout_ms,
+                    cancel_event=cancel_event,
+                    stderr_reporter=hook.stderr_reporter)
+                decision = recoveries.RetryDecision.from_output(result)
+                if decision is not None:
+                    return decision
+            except recoveries.Cancelled:
+                raise
+            except Exception as error:
+                if cancel_event.is_set():
+                    raise recoveries.Cancelled() from error
+                print(f"Turn-error hook {hook.hook_id!r} failed: "
+                      f"{type(error).__name__}: {error}", file=sys.stderr)
+                return recoveries.RetryDecision(None)
+        return recoveries.RetryDecision(None)
 
     async def finish_turn(self, payload):
         # A completed turn cannot be denied or rolled back. Hook failures are
@@ -805,7 +839,10 @@ def _hook_environment(environ=None):
 async def _run_hook_command(command, payload, cwd, timeout_ms,
                             stdout_limit=1_000_000,
                             stderr_limit=100_000,
-                            stderr_reporter: Callable[..., Any] | None = None):
+                            stderr_reporter: Callable[..., Any] | None = None,
+                            cancel_event: asyncio.Event | None = None):
+    if cancel_event is not None and cancel_event.is_set():
+        raise recoveries.Cancelled()
     try:
         stdin_data = json.dumps(
             payload,
@@ -849,6 +886,11 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
 
     stdin_task = asyncio.create_task(write_stdin())
 
+    operation = asyncio.gather(
+        stdin_task, stdout_task, stderr_task, process.wait())
+    cancel_task = (asyncio.create_task(cancel_event.wait())
+                   if cancel_event is not None else None)
+
     async def terminate():
         process.stdin.close()
         if process.returncode is None:
@@ -864,13 +906,23 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
             stdin_task, stdout_task, stderr_task, stdin_closed, return_exceptions=True)
 
     try:
-        operation = asyncio.gather(
-            stdin_task, stdout_task, stderr_task, process.wait())
-        if timeout_ms is None:
-            _stdin_result, stdout, stderr, returncode = await operation
+        if cancel_task is None:
+            if timeout_ms is None:
+                _stdin_result, stdout, stderr, returncode = await operation
+            else:
+                _stdin_result, stdout, stderr, returncode = await asyncio.wait_for(
+                    operation, timeout=timeout_ms / 1000)
         else:
-            _stdin_result, stdout, stderr, returncode = await asyncio.wait_for(
-                operation, timeout=timeout_ms / 1000)
+            done, _pending = await asyncio.wait(
+                [operation, cancel_task],
+                timeout=None if timeout_ms is None else timeout_ms / 1000,
+                return_when=asyncio.FIRST_COMPLETED)
+            if cancel_event.is_set():
+                # The exception handler owns cleanup for this branch too.
+                raise recoveries.Cancelled()
+            if operation not in done:
+                raise asyncio.TimeoutError()
+            _stdin_result, stdout, stderr, returncode = operation.result()
     except asyncio.TimeoutError as error:
         await terminate()
         raise HookExecutionError(
@@ -878,6 +930,10 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
     except BaseException:
         await terminate()
         raise
+    finally:
+        if cancel_task is not None:
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     if returncode != 0:
         detail = f": {stderr_text}" if stderr_text else ""
@@ -1032,14 +1088,19 @@ def _external_hook_from_dict(
     ), on_error
 
 
-def _turn_end_hook_from_dict(value, path, stderr_reporter=None):
+def _turn_hook_from_dict(value, location, stderr_reporter=None):
+    """Share argv/timeout validation without importing tool-only semantics.
+
+    location is a JSON configuration field address for diagnostics, not a
+    filesystem lookup key. Neither turn hook gets a default execution deadline.
+    """
     if not isinstance(value, dict):
-        raise HookConfigurationError(f"{path} must be an object")
+        raise HookConfigurationError(f"{location} must be an object")
     if "tools" in value or "workspace_side_effects" in value or "on_error" in value:
         raise HookConfigurationError(
-            f"{path} does not support tools, workspace_side_effects, or on_error")
+            f"{location} does not support tools, workspace_side_effects, or on_error")
     hook, _ = _external_hook_from_dict(
-        value, path, None, stderr_reporter=stderr_reporter)
+        value, location, None, stderr_reporter=stderr_reporter)
     return hook
 
 
@@ -1053,7 +1114,7 @@ def load_hook_pipeline(path, stderr_reporter=None):
     if not isinstance(config, dict):
         raise HookConfigurationError(
             "hook configuration must be an object")
-    allowed = {"pre_tool_call", "pre_tool_gate", "post_tool_call", "turn_end"}
+    allowed = {"pre_tool_call", "pre_tool_gate", "post_tool_call", "turn_end", "turn_error"}
     unexpected = sorted(set(config) - allowed)
     if unexpected:
         raise HookConfigurationError(
@@ -1106,16 +1167,21 @@ def load_hook_pipeline(path, stderr_reporter=None):
                     on_error=on_error or "continue",
                     matcher=hook.matches,
                 )
-    values = config.get("turn_end", [])
-    if not isinstance(values, list):
-        raise HookConfigurationError("turn_end must be a list")
-    for index, value in enumerate(values):
-        hook = _turn_end_hook_from_dict(
-            value, f"turn_end[{index}]", stderr_reporter)
-        if hook.hook_id in seen_ids:
-            raise HookConfigurationError(f"duplicate hook id {hook.hook_id!r}")
-        seen_ids.add(hook.hook_id)
-        pipeline.turn_end_hooks.append(hook)
+    # Both are user-turn commands with the same process boundary, not tools.
+    # Only their consumer differs: recovery decisions versus final observers.
+    for section, hooks in [
+            ["turn_end", pipeline.turn_end_hooks],
+            ["turn_error", pipeline.turn_error_hooks]]:
+        values = config.get(section, [])
+        if not isinstance(values, list):
+            raise HookConfigurationError(f"{section} must be a list")
+        for index, value in enumerate(values):
+            hook = _turn_hook_from_dict(
+                value, f"{section}[{index}]", stderr_reporter)
+            if hook.hook_id in seen_ids:
+                raise HookConfigurationError(f"duplicate hook id {hook.hook_id!r}")
+            seen_ids.add(hook.hook_id)
+            hooks.append(hook)
     return pipeline
 
 

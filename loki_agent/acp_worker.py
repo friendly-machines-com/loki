@@ -53,7 +53,12 @@ class Worker:
         self.session = session
         self.write = write
         self.session_id = session_id
+        # The session reuses one event, cleared only when admitting a new
+        # prompt. session/cancel and close set it; requests query is_set, and
+        # tools/recovery wait on the same state. Replays must never clear it.
         self.cancel_event = asyncio.Event()
+        # Admission/configuration guards and close borrow this owner through
+        # _answer's final response write, including hook/backoff/cleanup time.
         self._prompt_task: asyncio.Task | None = None
         # Reverse requests to the front (model questions). The front owns
         # the client channel; the worker only ever asks within its session.
@@ -961,6 +966,7 @@ class Worker:
             })
             return
         cancel_check = self.cancel_event.is_set
+        recovery = loki.make_turn_recovery(self.cancel_event)
         advertised, withheld = self._ask_advertised_tools()
         advertised = skills.tools_for_model(advertised, loki.LOKI_CONFIG_DIR)
 
@@ -974,6 +980,8 @@ class Worker:
             }
             if on_reasoning_delta is not None:
                 kwargs["on_reasoning_delta"] = on_reasoning_delta
+            if recovery is not None:
+                kwargs["recovery"] = recovery
             return await loki.async_chat_completion(
                 items, advertised, True, False, **kwargs)
 
@@ -981,12 +989,16 @@ class Worker:
             loki.mark_chat_log_dirty()
             self._publish_context_usage(live=True)
 
+        # The existing prompt task owns replay/continuation, backoff and hook
+        # cleanup through this await. _prompt then saves/notifies once and
+        # _answer writes the sole reply; recovery adds no separate lifecycle.
         return await loki.run_tool_loop_async(
             self.session.transcript_items,
             chat_fn=chat_fn,
             on_event=on_event,
             cancel_check=cancel_check,
             cancel_event=self.cancel_event,
+            recovery=recovery,
             stream_chat=True,
             on_response=on_response,
             thinking=thinking,

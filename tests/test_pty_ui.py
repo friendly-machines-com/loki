@@ -848,7 +848,7 @@ def _pty_child(argv):
                         print('CONTROL_READY', flush=True)
                         events = [await reader.read_key() for _ in range(3)]
                         assert [event.kind for event in events] == ['BACKSPACE', 'BACKSPACE_WORD', 'CTRL_C'], events
-                        assert reader.cancel_requested and reader.cancel_event.is_set()
+                        assert reader.cancel_event.is_set()
             finally:
                 if os.name == 'posix':
                     native.tcsetattr(0, native.TCSANOW, before)
@@ -959,7 +959,7 @@ def _pty_child(argv):
     if mode == "cancel-flag":
         async def main():
             reader, key_kind = await read_cancel(False)
-            if reader.cancel_requested and key_kind == "CTRL_C":
+            if reader.cancel_event.is_set() and key_kind == "CTRL_C":
                 sys.stdout.buffer.write(b"CANCEL_SET\n")
             else:
                 sys.stdout.buffer.write(
@@ -1046,7 +1046,7 @@ class PtyCtrlCTests(unittest.TestCase):
 
     With ISIG left set on the tty, the driver eats Ctrl+C and delivers
     SIGINT to the foreground process group before the byte reaches
-    AsyncKeyReader, so cancel_requested never becomes True and a running
+    AsyncKeyReader, so cancel_event is never set and a running
     turn cannot be cancelled between tool calls.  These tests pin the
     ISIG-clearing behavior of TerminalMode end to end.
     """
@@ -1073,7 +1073,7 @@ class PtyCtrlCTests(unittest.TestCase):
 
     def test_ctrl_c_sets_cancel_flag_in_reader(self):
         # End to end: with ISIG clear, a 0x03 byte written to the pty is
-        # seen by AsyncKeyReader as CTRL_C and sets cancel_requested.
+        # seen by AsyncKeyReader as CTRL_C and sets cancel_event.
         handle = self._spawn_child("cancel-flag")
         try:
             output = bytearray()

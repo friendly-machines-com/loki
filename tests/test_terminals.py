@@ -441,7 +441,6 @@ class TerminalControlBytesTests(unittest.TestCase):
                 for values, kind in zip(expected, ('BACKSPACE', 'BACKSPACE_WORD', 'CTRL_C')):
                     for byte in sorted(values):
                         self.assertEqual(feed_bytes(reader, bytes((byte,))), [terminals.KeyEvent(kind)])
-                self.assertTrue(reader.cancel_requested)
                 self.assertTrue(reader.cancel_event.is_set())
 
 
@@ -483,14 +482,12 @@ class AsyncKeyReaderTests(unittest.TestCase):
             DEFAULT_CONTROL_BYTES[0], DEFAULT_CONTROL_BYTES[1], frozenset((0x18,)))
         reader = terminals.AsyncKeyReader(fd=123)
         self.assertNotIn(terminals.KeyEvent('CTRL_C'), feed_bytes(reader, b'\x03'))
-        self.assertFalse(reader.cancel_requested)
         self.assertFalse(reader.cancel_event.is_set())
 
         self.assertEqual(
             feed_bytes(reader, b"\x18"),
             [terminals.KeyEvent("CTRL_C")],
         )
-        self.assertTrue(reader.cancel_requested)
         self.assertTrue(reader.cancel_event.is_set())
 
     def test_uses_configured_character_and_word_erase_bytes(self):
@@ -664,7 +661,7 @@ class AsyncKeyReaderTests(unittest.TestCase):
             feed_bytes(reader, b"\x1b\x03"),
             [terminals.KeyEvent("CTRL_C")],
         )
-        self.assertTrue(reader.cancel_requested)
+        self.assertTrue(reader.cancel_event.is_set())
 
     def test_unknown_csi_is_discarded_atomically(self):
         reader = terminals.AsyncKeyReader(fd=0)
@@ -712,7 +709,6 @@ class AsyncKeyReaderTests(unittest.TestCase):
             feed_bytes(reader, b"\x1b[99;5u"),
             [terminals.KeyEvent("CTRL_C")],
         )
-        self.assertTrue(reader.cancel_requested)
         self.assertTrue(reader.cancel_event.is_set())
         self.assertEqual(
             feed_bytes(reader, b"\x1b[119;6u"),
@@ -729,13 +725,11 @@ class AsyncKeyReaderTests(unittest.TestCase):
         reader = terminals.AsyncKeyReader(fd=123)
 
         self.assertEqual(feed_bytes(reader, b"\x1b[99;5u"), [])
-        self.assertFalse(reader.cancel_requested)
         self.assertFalse(reader.cancel_event.is_set())
         self.assertEqual(
             feed_bytes(reader, b"\x1b[120;5u"),
             [terminals.KeyEvent("CTRL_C")],
         )
-        self.assertTrue(reader.cancel_requested)
         self.assertTrue(reader.cancel_event.is_set())
 
     def test_decodes_kitty_text_repeat_and_ignores_release(self):

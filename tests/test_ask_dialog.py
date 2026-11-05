@@ -33,7 +33,7 @@ class DialogSession:
         self.prompts = []
         self.interactive = interactive
         self.reader = types.SimpleNamespace(
-            cancel_requested=False, cancel_event=asyncio.Event())
+            cancel_event=asyncio.Event())
 
     @contextlib.asynccontextmanager
     async def modal(self):
