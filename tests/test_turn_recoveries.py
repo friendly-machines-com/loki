@@ -72,6 +72,16 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
         return name
 
     def config(self, value):
+        # Hook configuration entries carry a mandatory cwd. Tests that do not
+        # care about location run their hook in the session directory; the
+        # per-phase location test supplies a distinct directory explicitly.
+        for section in ["pre_tool_call", "pre_tool_gate", "post_tool_call",
+                        "turn_end", "turn_error"]:
+            entries = value.get(section, [])
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                entry.setdefault("cwd", self.session.shell_cwd)
         return tool_runtime.load_hook_pipeline(self.make_file(json.dumps(value)))
 
     def policy(self, arguments: list):
@@ -265,34 +275,36 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             with self.assertRaises(tool_runtime.HookConfigurationError):
                 self.config(value)
 
-    async def test_all_hook_phases_run_in_payload_cwd_and_do_not_inherit_secrets(self):
-        for phase in ["pre_tool_call", "pre_tool_gate", "post_tool_call", "turn_end", "turn_error"]:
-            with self.subTest(phase=phase):
-                record = self.make_file()
-                command = [sys.executable, "-c", (
-                    "import json,os,sys; p=json.load(sys.stdin); i=os.stat('.'); "
-                    "p['process_cwd']=[i.st_dev,i.st_ino]; p['secret']=os.getenv('LOKI_API_KEY'); "
-                    "json.dump(p,open(sys.argv[1],'w')); print('{}')"), record]
-                pipeline = self.config({phase: [{"id": "record", "command": command}]})
-                invocation = tool_runtime.ToolInvocation(
-                    "call", "Example", {}, {}, {}, {"type": "object"}, cwd=self.session.shell_cwd)
-                expected = os.stat(self.session.shell_cwd)
-                with mock.patch.dict(os.environ, {"LOKI_API_KEY": "must-not-leak"}):
-                    if phase == "turn_end":
-                        await pipeline.finish_turn({"event": phase, "cwd": self.session.shell_cwd})
-                    elif phase == "turn_error":
-                        await pipeline.recover_turn({"event": phase, "cwd": self.session.shell_cwd},
-                                                    cancel_event=asyncio.Event())
-                    elif phase == "post_tool_call":
-                        await pipeline.finish(invocation, tool_runtime.ToolOutcome("success", True, True, "done"))
-                    else:
-                        await pipeline.prepare(invocation)
-                with open(record, encoding="utf-8") as source:
-                    payload = json.load(source)
-                self.assertEqual(payload["process_cwd"], [expected.st_dev, expected.st_ino])
-                self.assertIsNone(payload["secret"])
-                context = payload.get("invocation", payload)
-                self.assertEqual(context["cwd"], self.session.shell_cwd)
+    async def test_all_hook_phases_run_in_configured_cwd_and_do_not_inherit_secrets(self):
+        with tempfile.TemporaryDirectory() as configured:
+            for phase in ["pre_tool_call", "pre_tool_gate", "post_tool_call", "turn_end", "turn_error"]:
+                with self.subTest(phase=phase):
+                    record = self.make_file()
+                    command = [sys.executable, "-c", (
+                        "import json,os,sys; p=json.load(sys.stdin); i=os.stat('.'); "
+                        "p['process_cwd']=[i.st_dev,i.st_ino]; p['secret']=os.getenv('LOKI_API_KEY'); "
+                        "json.dump(p,open(sys.argv[1],'w')); print('{}')"), record]
+                    pipeline = self.config({phase: [{"id": "record", "command": command,
+                                                     "cwd": configured}]})
+                    invocation = tool_runtime.ToolInvocation(
+                        "call", "Example", {}, {}, {}, {"type": "object"}, cwd=self.session.shell_cwd)
+                    expected = os.stat(configured)
+                    with mock.patch.dict(os.environ, {"LOKI_API_KEY": "must-not-leak"}):
+                        if phase == "turn_end":
+                            await pipeline.finish_turn({"event": phase, "cwd": self.session.shell_cwd})
+                        elif phase == "turn_error":
+                            await pipeline.recover_turn({"event": phase, "cwd": self.session.shell_cwd},
+                                                        cancel_event=asyncio.Event())
+                        elif phase == "post_tool_call":
+                            await pipeline.finish(invocation, tool_runtime.ToolOutcome("success", True, True, "done"))
+                        else:
+                            await pipeline.prepare(invocation)
+                    with open(record, encoding="utf-8") as source:
+                        payload = json.load(source)
+                    self.assertEqual(payload["process_cwd"], [expected.st_dev, expected.st_ino])
+                    self.assertIsNone(payload["secret"])
+                    context = payload.get("invocation", payload)
+                    self.assertEqual(context["cwd"], self.session.shell_cwd)
 
     async def test_real_buffered_503_replays_prepared_body_and_key(self):
         requests = await self.serve([
@@ -645,12 +657,15 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
         delay = "1800" if cancel else "0"
         hooks = self.make_file(json.dumps({
             "turn_error": [
-                {"id": "observe-error", "command": observe_command},
+                {"id": "observe-error", "command": observe_command,
+                 "cwd": config.name},
                 {"id": "retry", "command": [
                     sys.executable, script, "--initial-delay", delay,
-                    "--overload-initial-delay", delay]},
+                    "--overload-initial-delay", delay],
+                 "cwd": config.name},
             ],
-            "turn_end": [{"id": "observe-end", "command": observe_command}],
+            "turn_end": [{"id": "observe-end", "command": observe_command,
+                          "cwd": config.name}],
         }), directory=config.name)
         environment = child_environment(
             HOME=config.name, XDG_CONFIG_HOME=config.name,

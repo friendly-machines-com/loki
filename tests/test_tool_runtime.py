@@ -391,6 +391,7 @@ class ExternalHookTests(unittest.TestCase):
                         "id": "external.transform",
                         "tools": ["Example"],
                         "command": [sys.executable, "-c", script],
+                        "cwd": directory,
                     }],
                 }, stream)
             source_environ = dict(os.environ)
@@ -475,6 +476,7 @@ class ExternalHookTests(unittest.TestCase):
                         "id": "external.post",
                         "tools": ["Example"],
                         "command": [sys.executable, "-c", script],
+                        "cwd": directory,
                     }],
                 }, stream)
             pipeline = tool_runtime.load_hook_pipeline(config_path)
@@ -511,6 +513,7 @@ class ExternalHookTests(unittest.TestCase):
                     "pre_tool_call": [{
                         "id": "external.timeout",
                         "command": [sys.executable, "-c", script],
+                        "cwd": directory,
                         "timeout_ms": 10,
                     }],
                 }, stream)
@@ -616,11 +619,29 @@ class ExternalHookTests(unittest.TestCase):
                     "argv list"):
                 tool_runtime.load_hook_pipeline(config_path)
 
+            for cwd in [None, ""]:
+                for section in ["pre_tool_call", "pre_tool_gate",
+                                "post_tool_call", "turn_end", "turn_error"]:
+                    with open(config_path, "w", encoding="utf-8") as stream:
+                        json.dump({
+                            section: [{
+                                "id": "bad.cwd",
+                                "command": [sys.executable, "-c", "print('{}')"],
+                                "cwd": cwd,
+                            }],
+                        }, stream)
+                    with self.subTest(section=section, cwd=cwd), \
+                            self.assertRaisesRegex(
+                                tool_runtime.HookConfigurationError,
+                                r"\.cwd must be a nonempty string"):
+                        tool_runtime.load_hook_pipeline(config_path)
+
             with open(config_path, "w", encoding="utf-8") as stream:
                 json.dump({
                     "post_tool_call": [{
                         "id": "bad.post",
                         "command": [sys.executable, "-c", "print('{}')"],
+                        "cwd": directory,
                         "on_error": "deny",
                     }],
                 }, stream)
@@ -928,7 +949,8 @@ class TurnEndHookTests(unittest.TestCase):
         self.assertEqual(payload["error_message"], "broken turn")
 
     def test_turn_end_command_has_no_default_timeout(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+                tempfile.TemporaryDirectory() as configured:
             config_path = os.path.join(directory, "hooks.json")
             output = os.path.join(directory, "payload.json")
             with open(config_path, "w", encoding="utf-8") as stream:
@@ -940,6 +962,7 @@ class TurnEndHookTests(unittest.TestCase):
                                 "payload['child_cwd']=os.getcwd(); "
                                 "json.dump(payload, open(sys.argv[1], 'w')); "
                                 "print('{}')", output],
+                    "cwd": configured,
                 }]}, stream)
             pipeline = tool_runtime.load_hook_pipeline(config_path)
             self.assertIsNone(pipeline.turn_end_hooks[0].timeout_ms)
@@ -950,7 +973,7 @@ class TurnEndHookTests(unittest.TestCase):
             with open(output, encoding="utf-8") as stream:
                 payload = json.load(stream)
             self.assertEqual(payload["cwd"], directory)
-            self.assertEqual(payload["child_cwd"], directory)
+            self.assertEqual(payload["child_cwd"], configured)
             self.assertEqual(payload["event"], "turn_end")
             self.assertEqual(payload["reason"], "max_loops")
             self.assertEqual(payload["text"], "last text")
@@ -962,6 +985,7 @@ class TurnEndHookTests(unittest.TestCase):
                 json.dump({"turn_end": [{
                     "id": "slow", "command": [
                         sys.executable, "-c", "import time; time.sleep(1)"],
+                    "cwd": directory,
                     "timeout_ms": 20,
                 }]}, stream)
             pipeline = tool_runtime.load_hook_pipeline(config_path)

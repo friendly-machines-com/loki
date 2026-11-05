@@ -283,6 +283,7 @@ Loki's built-in input repair.
             "id": "normalize",
             "tools": ["Write", "Edit"],
             "command": ["/home/me/bin/loki-normalize"],
+            "cwd": "/home/me/project",
             "timeout_ms": 2000,
             "on_error": "deny"
         }
@@ -291,7 +292,8 @@ Loki's built-in input repair.
         {
             "id": "policy",
             "tools": ["Bash"],
-            "command": ["/home/me/bin/loki-policy"]
+            "command": ["/home/me/bin/loki-policy"],
+            "cwd": "/home/me/project"
         }
     ],
     "post_tool_call": [
@@ -299,6 +301,7 @@ Loki's built-in input repair.
             "id": "format",
             "tools": ["Write", "Edit"],
             "command": ["/home/me/bin/loki-format"],
+            "cwd": "/home/me/project",
             "timeout_ms": 10000,
             "on_error": "continue",
             "workspace_side_effects": true
@@ -306,6 +309,11 @@ Loki's built-in input repair.
     ]
 }
 ```
+
+Every hook entry requires `cwd`: a nonempty string. The hook subprocess runs
+in that directory, whatever the session shell directory is. Supply an absolute
+path; a relative value resolves against the hook runner's process context,
+which is not the session directory.
 
 Hooks run sequentially in configuration order and receive one JSON object on
 stdin. Pre-hook input has `event: "pre_tool_call"` and an `invocation` object
@@ -339,12 +347,13 @@ once per model response. It does not run for Explore subagent turns or local
 commands. For example:
 
 ```json
-{"turn_end": [{"id": "notify", "command": ["/home/me/bin/loki-notify"]}]}
+{"turn_end": [{"id": "notify", "command": ["/home/me/bin/loki-notify"], "cwd": "/home/me"}]}
 ```
 
 Each command receives `{"event":"turn_end","reason":"completed",
-"cwd":"...","text":"..."}` on stdin. `cwd` is the session shell cwd
-at turn end and is also the hook subprocess's working directory. `reason` may
+"cwd":"...","text":"..."}` on stdin. Hooks run in their configured `cwd`
+directory; the payload's `cwd` is the session shell cwd at turn end, reported
+as data, not the hook subprocess's working directory. `reason` may
 also be `cancelled`, `error`, or `max_loops`; `text` is the last returned
 assistant text, if any. For `reason: "error"`, the input also includes
 `error_type` and `error_message`. Event-reported errors use their event type
@@ -381,7 +390,8 @@ library and can be copied elsewhere.
 {
     "turn_error": [{
         "id": "retry",
-        "command": ["<python-executable>", "<retry-script-filename>"]
+        "command": ["<python-executable>", "<retry-script-filename>"],
+        "cwd": "/home/me"
     }]
 }
 ```

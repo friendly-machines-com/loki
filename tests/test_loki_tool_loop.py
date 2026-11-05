@@ -3624,9 +3624,11 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
             hook_config.write_text(json.dumps({
                 'pre_tool_call': [{'id': 'external.transform', 'tools': ['WebSearch'],
-                                   'command': [sys.executable, '-c', script, str(hook_log), str(source)]}],
+                                   'command': [sys.executable, '-c', script, str(hook_log), str(source)],
+                                   'cwd': directory}],
                 'post_tool_call': [{'id': 'external.post', 'tools': ['WebSearch'],
-                                    'command': [sys.executable, '-c', script, str(hook_log), str(source)]}],
+                                    'command': [sys.executable, '-c', script, str(hook_log), str(source)],
+                                    'cwd': directory}],
             }), encoding='utf-8')
             store = CredentialStore({f'{name}_API_KEY': f'leased-{name}-secret'
                                      for name in ['A', 'B', 'CHAT', 'ANTHROPIC', 'C']})

@@ -631,7 +631,7 @@ class ToolHookPipeline:
         for hook in self.turn_error_hooks:
             try:
                 result = await _run_hook_command(
-                    hook.command, payload, payload["cwd"], hook.timeout_ms,
+                    hook.command, payload, hook.cwd, hook.timeout_ms,
                     cancel_event=cancel_event,
                     stderr_reporter=hook.stderr_reporter)
                 decision = recoveries.RetryDecision.from_output(result)
@@ -653,7 +653,7 @@ class ToolHookPipeline:
         for hook in self.turn_end_hooks:
             try:
                 await _run_hook_command(
-                    hook.command, payload, payload["cwd"], hook.timeout_ms,
+                    hook.command, payload, hook.cwd, hook.timeout_ms,
                     stderr_reporter=hook.stderr_reporter)
             except Exception as error:
                 print(f"Turn-end hook {hook.hook_id!r} failed: "
@@ -967,6 +967,7 @@ class ExternalHook:
     hook_id: str
     tools: list
     command: list
+    cwd: str
     timeout_ms: int
     workspace_side_effects: bool = False
     event_name: str = "pre_tool_call"
@@ -995,7 +996,7 @@ class ExternalHook:
                 "event": self.event_name,
                 "invocation": invocation.to_hook_dict(),
             },
-            invocation.cwd,
+            self.cwd,
             self.timeout_ms,
             stderr_reporter=self.stderr_reporter,
         )
@@ -1027,7 +1028,7 @@ class ExternalHook:
                 "invocation": invocation.to_hook_dict(),
                 "outcome": outcome.to_hook_dict(),
             },
-            invocation.cwd,
+            self.cwd,
             self.timeout_ms,
             stderr_reporter=self.stderr_reporter,
         )
@@ -1062,6 +1063,10 @@ def _external_hook_from_dict(
                        for part in command)):
         raise HookConfigurationError(
             f"{path}.command must be a nonempty argv list")
+    cwd = value.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        raise HookConfigurationError(
+            f"{path}.cwd must be a nonempty string")
     timeout_ms = value.get("timeout_ms", default_timeout)
     if ((timeout_ms is None and default_timeout is not None)
             or (timeout_ms is not None and
@@ -1082,6 +1087,7 @@ def _external_hook_from_dict(
         hook_id,
         list(tools),
         list(command),
+        cwd,
         timeout_ms,
         workspace_side_effects=side_effects,
         stderr_reporter=stderr_reporter,
