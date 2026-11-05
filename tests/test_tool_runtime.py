@@ -11,11 +11,17 @@ from unittest import mock
 
 from loki_entrypoints import child_environment, configure_container, entrypoint
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
+from settings_fixtures import write_user_settings
 
 
-from loki_agent import formats
+from loki_agent import formats, settings
 from loki_agent import tool_runtime
 from loki_agent import loki
+
+
+def load_hooks(file):
+    configuration = asyncio.run(settings.load_settings(files=[file], strict=True))
+    return tool_runtime.build_hook_pipeline(configuration.hooks)
 
 
 ARRAY_SCHEMA = {
@@ -329,15 +335,12 @@ class HookPipelineTests(unittest.TestCase):
 class ExternalHookTests(unittest.TestCase):
     def test_invalid_hook_configuration_exits_before_terminal_startup(self):
         with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
-            with open(config_path, "w", encoding="utf-8") as stream:
-                stream.write("{invalid")
+            write_user_settings(directory, "[hook.pre_tool_call.\nbroken = yes")
             env = child_environment(
                 HOME=directory,
                 PATH=os.environ.get("PATH", ""),
                 TERM="dumb",
-                LOKI_HOOKS=config_path,
-                XDG_CONFIG_HOME=os.path.join(directory, "config"),
+                XDG_CONFIG_HOME=directory,
                 XDG_STATE_HOME=os.path.join(directory, "state"),
             )
 
@@ -355,7 +358,7 @@ class ExternalHookTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("Hook configuration error:", result.stderr)
+        self.assertIn("Configuration error:", result.stderr)
         self.assertNotIn("\x1b", result.stdout + result.stderr)
 
     def test_hook_environment_carries_scratch_but_not_credentials(self):
@@ -384,16 +387,15 @@ class ExternalHookTests(unittest.TestCase):
             "json.dump({'arguments':a}, sys.stdout)"
         )
         with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
+            config_path = os.path.join(directory, "settings.ini")
             with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({
-                    "pre_tool_call": [{
-                        "id": "external.transform",
-                        "tools": ["Example"],
-                        "command": [sys.executable, "-c", script],
-                        "cwd": directory,
-                    }],
-                }, stream)
+                stream.write(
+                    "[hook.pre_tool_call.external.transform]\n"
+                    "tools.0 = Example\n"
+                    f"command.0 = {sys.executable}\n"
+                    "command.1 = -c\n"
+                    f"command.2 = {script}\n"
+                    f"cwd = {directory}\n")
             source_environ = dict(os.environ)
             source_environ.update({
                 "LOKI_API_KEY": "secret",
@@ -404,7 +406,7 @@ class ExternalHookTests(unittest.TestCase):
                     "_hook_environment",
                     return_value=tool_runtime._hook_environment(
                         source_environ)):
-                pipeline = tool_runtime.load_hook_pipeline(config_path)
+                pipeline = load_hooks(config_path)
                 invocation = tool_runtime.ToolInvocation(
                     call_id="call_external",
                     tool_name="Example",
@@ -469,17 +471,16 @@ class ExternalHookTests(unittest.TestCase):
             "json.dump({'note':'post note'}, sys.stdout)"
         )
         with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
+            config_path = os.path.join(directory, "settings.ini")
             with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({
-                    "post_tool_call": [{
-                        "id": "external.post",
-                        "tools": ["Example"],
-                        "command": [sys.executable, "-c", script],
-                        "cwd": directory,
-                    }],
-                }, stream)
-            pipeline = tool_runtime.load_hook_pipeline(config_path)
+                stream.write(
+                    "[hook.post_tool_call.external.post]\n"
+                    "tools.0 = Example\n"
+                    f"command.0 = {sys.executable}\n"
+                    "command.1 = -c\n"
+                    f"command.2 = {script}\n"
+                    f"cwd = {directory}\n")
+            pipeline = load_hooks(config_path)
             invocation = tool_runtime.ToolInvocation(
                 call_id="call_external",
                 tool_name="Example",
@@ -507,17 +508,16 @@ class ExternalHookTests(unittest.TestCase):
     def test_pre_hook_timeout_denies_without_tool_execution(self):
         script = "import time; time.sleep(1)"
         with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
+            config_path = os.path.join(directory, "settings.ini")
             with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({
-                    "pre_tool_call": [{
-                        "id": "external.timeout",
-                        "command": [sys.executable, "-c", script],
-                        "cwd": directory,
-                        "timeout_ms": 10,
-                    }],
-                }, stream)
-            pipeline = tool_runtime.load_hook_pipeline(config_path)
+                stream.write(
+                    "[hook.pre_tool_call.external.timeout]\n"
+                    f"command.0 = {sys.executable}\n"
+                    "command.1 = -c\n"
+                    f"command.2 = {script}\n"
+                    f"cwd = {directory}\n"
+                    "timeout_ms = 10\n")
+            pipeline = load_hooks(config_path)
             invocation = tool_runtime.ToolInvocation(
                 call_id="call_timeout",
                 tool_name="Example",
@@ -605,50 +605,50 @@ class ExternalHookTests(unittest.TestCase):
 
     def test_invalid_hook_config_is_rejected_before_use(self):
         with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
-            with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({
-                    "pre_tool_call": [{
-                        "id": "bad",
-                        "command": "shell string is forbidden",
-                    }],
-                }, stream)
+            config_path = os.path.join(directory, "settings.ini")
 
+            def write(text):
+                with open(config_path, "w", encoding="utf-8") as stream:
+                    stream.write(text)
+
+            write("[hook.pre_tool_call.bad]\ncommand.0 = true\n")
             with self.assertRaisesRegex(
-                    tool_runtime.HookConfigurationError,
-                    "argv list"):
-                tool_runtime.load_hook_pipeline(config_path)
+                    settings.HookConfigurationError,
+                    "cwd.*required|cwd must not be empty"):
+                load_hooks(config_path)
 
-            for cwd in [None, ""]:
-                for section in ["pre_tool_call", "pre_tool_gate",
-                                "post_tool_call", "turn_end", "turn_error"]:
-                    with open(config_path, "w", encoding="utf-8") as stream:
-                        json.dump({
-                            section: [{
-                                "id": "bad.cwd",
-                                "command": [sys.executable, "-c", "print('{}')"],
-                                "cwd": cwd,
-                            }],
-                        }, stream)
-                    with self.subTest(section=section, cwd=cwd), \
-                            self.assertRaisesRegex(
-                                tool_runtime.HookConfigurationError,
-                                r"\.cwd must be a nonempty string"):
-                        tool_runtime.load_hook_pipeline(config_path)
+            for phase in ["pre_tool_call", "pre_tool_gate",
+                          "post_tool_call", "turn_end", "turn_error"]:
+                write(f"[hook.{phase}.bad]\ncommand.0 = true\ncwd = \n")
+                with self.subTest(phase=phase, cwd="empty"), \
+                        self.assertRaisesRegex(
+                            settings.HookConfigurationError,
+                            "cwd.*required|cwd must not be empty"):
+                    load_hooks(config_path)
+                write(f"[hook.{phase}.bad]\ncwd = {directory}\n")
+                with self.subTest(phase=phase, cwd="missing-command"), \
+                        self.assertRaisesRegex(
+                            settings.HookConfigurationError,
+                            "command is required"):
+                    load_hooks(config_path)
 
-            with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({
-                    "post_tool_call": [{
-                        "id": "bad.post",
-                        "command": [sys.executable, "-c", "print('{}')"],
-                        "cwd": directory,
-                        "on_error": "deny",
-                    }],
-                }, stream)
+            write("[hook.turn_eror.typo]\ncommand.0 = true\n"
+                  f"cwd = {directory}\n")
+            with self.assertLogs("loki_agent.settings", level="WARNING") as warnings:
+                pipeline = load_hooks(config_path)
+            self.assertFalse(pipeline.has_custom_hooks)
+            self.assertIn("unsupported hook phase", warnings.output[0])
+
+            write("[turn_error.not_a_hook]\ncommand.0 = true\n")
+            pipeline = load_hooks(config_path)
+            self.assertFalse(pipeline.has_custom_hooks)
+
+            write("[hook.post_tool_call.bad.post]\ncommand.0 = true\n"
+                  f"cwd = {directory}\non_error = deny\n")
             with self.assertRaisesRegex(
-                    tool_runtime.HookConfigurationError,
+                    settings.HookConfigurationError,
                     "cannot be 'deny'"):
-                tool_runtime.load_hook_pipeline(config_path)
+                load_hooks(config_path)
 
 
 class LokiToolRuntimeIntegrationTests(unittest.TestCase):
@@ -951,21 +951,21 @@ class TurnEndHookTests(unittest.TestCase):
     def test_turn_end_command_has_no_default_timeout(self):
         with tempfile.TemporaryDirectory() as directory, \
                 tempfile.TemporaryDirectory() as configured:
-            config_path = os.path.join(directory, "hooks.json")
+            config_path = os.path.join(directory, "settings.ini")
             output = os.path.join(directory, "payload.json")
             with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({"turn_end": [{
-                    "id": "record",
-                    "command": [sys.executable, "-c",
-                                "import json,os,sys,time; time.sleep(.05); "
-                                "payload=json.load(sys.stdin); "
-                                "payload['child_cwd']=os.getcwd(); "
-                                "json.dump(payload, open(sys.argv[1], 'w')); "
-                                "print('{}')", output],
-                    "cwd": configured,
-                }]}, stream)
-            pipeline = tool_runtime.load_hook_pipeline(config_path)
-            self.assertIsNone(pipeline.turn_end_hooks[0].timeout_ms)
+                stream.write(
+                    "[hook.turn_end.record]\n"
+                    f"command.0 = {sys.executable}\n"
+                    "command.1 = -c\n"
+                    "command.2 = import json,os,sys,time; time.sleep(.05); "
+                    "payload=json.load(sys.stdin); "
+                    "payload['child_cwd']=os.getcwd(); "
+                    "json.dump(payload, open(sys.argv[1], 'w')); print('{}')\n"
+                    f"command.3 = {output}\n"
+                    f"cwd = {configured}\n")
+            pipeline = load_hooks(config_path)
+            self.assertIsNone(pipeline.turn_end_hooks[0].config.timeout_ms)
             with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
                 with mock.patch.object(loki, "current_cwd", return_value=directory):
                     asyncio.run(loki.run_turn_end_hooks_async(
@@ -980,15 +980,16 @@ class TurnEndHookTests(unittest.TestCase):
 
     def test_turn_end_timeout_and_failure_do_not_change_turn(self):
         with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
+            config_path = os.path.join(directory, "settings.ini")
             with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({"turn_end": [{
-                    "id": "slow", "command": [
-                        sys.executable, "-c", "import time; time.sleep(1)"],
-                    "cwd": directory,
-                    "timeout_ms": 20,
-                }]}, stream)
-            pipeline = tool_runtime.load_hook_pipeline(config_path)
+                stream.write(
+                    "[hook.turn_end.slow]\n"
+                    f"command.0 = {sys.executable}\n"
+                    "command.1 = -c\n"
+                    "command.2 = import time; time.sleep(1)\n"
+                    f"cwd = {directory}\n"
+                    "timeout_ms = 20\n")
+            pipeline = load_hooks(config_path)
             with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
                 with mock.patch("sys.stderr") as stderr:
                     asyncio.run(loki.run_turn_end_hooks_async(
@@ -997,16 +998,17 @@ class TurnEndHookTests(unittest.TestCase):
 
     def test_turn_end_rejects_tool_options_and_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "hooks.json")
-            for value in [
-                    {"turn_end": [{"id": "x", "command": ["true"],
-                                   "tools": ["Bash"]}]},
-                    {"pre_tool_call": [{"id": "x", "command": ["true"]}],
-                     "turn_end": [{"id": "x", "command": ["true"]}]}]:
+            config_path = os.path.join(directory, "settings.ini")
+            for text, message in [
+                    [f"[hook.turn_end.x]\ncommand.0 = true\ncwd = {directory}\n"
+                     "tools.0 = Bash\n", "does not support tools"],
+                    [f"[hook.pre_tool_call.x]\ncommand.0 = true\ncwd = {directory}\n"
+                     f"[hook.turn_end.x]\ncommand.0 = true\ncwd = {directory}\n",
+                     "duplicate hook id"]]:
                 with open(config_path, "w", encoding="utf-8") as stream:
-                    json.dump(value, stream)
-                with self.assertRaises(tool_runtime.HookConfigurationError):
-                    tool_runtime.load_hook_pipeline(config_path)
+                    stream.write(text)
+                with self.assertRaisesRegex(settings.HookConfigurationError, message):
+                    load_hooks(config_path)
 
 
 if __name__ == "__main__":

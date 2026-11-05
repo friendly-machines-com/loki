@@ -10,13 +10,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import process_outputs, host_process, recoveries
+from .settings import HookSettings
 
 
 class ToolSchemaError(ValueError):
-    pass
-
-
-class HookConfigurationError(ValueError):
     pass
 
 
@@ -595,7 +592,7 @@ class ToolHookPipeline:
         self.gate_hooks = []
         self.post_hooks = []
         self.turn_end_hooks = []
-        # load_hook_pipeline supplies validated policy commands; recover_turn
+        # Settings supplies validated policy commands; recover_turn
         # consumes the first explicit decision. make_turn_recovery captures this
         # pipeline once for terminal/ACP; request replay and history continuation
         # share that object's accounting, not another counter in this list.
@@ -631,7 +628,7 @@ class ToolHookPipeline:
         for hook in self.turn_error_hooks:
             try:
                 result = await _run_hook_command(
-                    hook.command, payload, hook.cwd, hook.timeout_ms,
+                    hook.config.command, payload, hook.config.cwd, hook.config.timeout_ms,
                     cancel_event=cancel_event,
                     stderr_reporter=hook.stderr_reporter)
                 decision = recoveries.RetryDecision.from_output(result)
@@ -642,7 +639,7 @@ class ToolHookPipeline:
             except Exception as error:
                 if cancel_event.is_set():
                     raise recoveries.Cancelled() from error
-                print(f"Turn-error hook {hook.hook_id!r} failed: "
+                print(f"Turn-error hook {hook.config.hook_id!r} failed: "
                       f"{type(error).__name__}: {error}", file=sys.stderr)
                 return recoveries.RetryDecision(None)
         return recoveries.RetryDecision(None)
@@ -653,10 +650,10 @@ class ToolHookPipeline:
         for hook in self.turn_end_hooks:
             try:
                 await _run_hook_command(
-                    hook.command, payload, hook.cwd, hook.timeout_ms,
+                    hook.config.command, payload, hook.config.cwd, hook.config.timeout_ms,
                     stderr_reporter=hook.stderr_reporter)
             except Exception as error:
-                print(f"Turn-end hook {hook.hook_id!r} failed: "
+                print(f"Turn-end hook {hook.config.hook_id!r} failed: "
                       f"{type(error).__name__}: {error}", file=sys.stderr)
 
     @staticmethod
@@ -964,17 +961,11 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
 
 @dataclass
 class ExternalHook:
-    hook_id: str
-    tools: list
-    command: list
-    cwd: str
-    timeout_ms: int
-    workspace_side_effects: bool = False
-    event_name: str = "pre_tool_call"
+    config: HookSettings
     stderr_reporter: Callable[..., Any] | None = None
 
     def matches(self, tool_name):
-        return "*" in self.tools or tool_name in self.tools
+        return "*" in self.config.tools or tool_name in self.config.tools
 
     def _side_effects(self, result):
         changed_paths = result.get("changed_paths", [])
@@ -984,20 +975,20 @@ class ExternalHook:
             raise HookExecutionError(
                 "changed_paths must be a list of strings")
         invalidate_all = (
-            self.workspace_side_effects and not changed_paths)
+            self.config.workspace_side_effects and not changed_paths)
         return changed_paths, invalidate_all
 
     async def pre(self, invocation):
         if not self.matches(invocation.tool_name):
             return PreHookDecision()
         result = await _run_hook_command(
-            self.command,
+            self.config.command,
             {
-                "event": self.event_name,
+                "event": self.config.phase,
                 "invocation": invocation.to_hook_dict(),
             },
-            self.cwd,
-            self.timeout_ms,
+            self.config.cwd,
+            self.config.timeout_ms,
             stderr_reporter=self.stderr_reporter,
         )
         action = result.get("action", "continue")
@@ -1022,14 +1013,14 @@ class ExternalHook:
         if not self.matches(invocation.tool_name):
             return PostHookDecision()
         result = await _run_hook_command(
-            self.command,
+            self.config.command,
             {
                 "event": "post_tool_call",
                 "invocation": invocation.to_hook_dict(),
                 "outcome": outcome.to_hook_dict(),
             },
-            self.cwd,
-            self.timeout_ms,
+            self.config.cwd,
+            self.config.timeout_ms,
             stderr_reporter=self.stderr_reporter,
         )
         note = result.get("note")
@@ -1043,151 +1034,29 @@ class ExternalHook:
         )
 
 
-def _external_hook_from_dict(
-        value, path, default_timeout, stderr_reporter=None):
-    if not isinstance(value, dict):
-        raise HookConfigurationError(f"{path} must be an object")
-    hook_id = value.get("id")
-    if not isinstance(hook_id, str) or not hook_id:
-        raise HookConfigurationError(
-            f"{path}.id must be a nonempty string")
-    tools = value.get("tools", ["*"])
-    if (not isinstance(tools, list) or not tools
-            or not all(isinstance(tool, str) and tool
-                       for tool in tools)):
-        raise HookConfigurationError(
-            f"{path}.tools must be a nonempty list of strings")
-    command = value.get("command")
-    if (not isinstance(command, list) or not command
-            or not all(isinstance(part, str) and part
-                       for part in command)):
-        raise HookConfigurationError(
-            f"{path}.command must be a nonempty argv list")
-    cwd = value.get("cwd")
-    if not isinstance(cwd, str) or not cwd:
-        raise HookConfigurationError(
-            f"{path}.cwd must be a nonempty string")
-    timeout_ms = value.get("timeout_ms", default_timeout)
-    if ((timeout_ms is None and default_timeout is not None)
-            or (timeout_ms is not None and
-                (not isinstance(timeout_ms, int)
-                 or isinstance(timeout_ms, bool)
-                 or timeout_ms < 1))):
-        raise HookConfigurationError(
-            f"{path}.timeout_ms must be a positive integer")
-    side_effects = value.get("workspace_side_effects", False)
-    if not isinstance(side_effects, bool):
-        raise HookConfigurationError(
-            f"{path}.workspace_side_effects must be boolean")
-    on_error = value.get("on_error")
-    if on_error is not None and on_error not in ["deny", "continue"]:
-        raise HookConfigurationError(
-            f"{path}.on_error must be 'deny' or 'continue'")
-    return ExternalHook(
-        hook_id,
-        list(tools),
-        list(command),
-        cwd,
-        timeout_ms,
-        workspace_side_effects=side_effects,
-        stderr_reporter=stderr_reporter,
-    ), on_error
+def build_hook_pipeline(definitions, stderr_reporter=None):
+    """Bind already-decoded Settings.hooks to runtime behavior, without I/O.
 
-
-def _turn_hook_from_dict(value, location, stderr_reporter=None):
-    """Share argv/timeout validation without importing tool-only semantics.
-
-    location is a JSON configuration field address for diagnostics, not a
-    filesystem lookup key. Neither turn hook gets a default execution deadline.
+    Settings owns the schema, defaults and order. These wrappers borrow its
+    definitions and only add the process-output callback; no option is copied
+    into a parallel runtime configuration record.
     """
-    if not isinstance(value, dict):
-        raise HookConfigurationError(f"{location} must be an object")
-    if "tools" in value or "workspace_side_effects" in value or "on_error" in value:
-        raise HookConfigurationError(
-            f"{location} does not support tools, workspace_side_effects, or on_error")
-    hook, _ = _external_hook_from_dict(
-        value, location, None, stderr_reporter=stderr_reporter)
-    return hook
-
-
-def load_hook_pipeline(path, stderr_reporter=None):
-    try:
-        with open(path, "r", encoding="utf-8") as stream:
-            config = json.load(stream)
-    except (OSError, json.JSONDecodeError) as error:
-        raise HookConfigurationError(
-            f"could not load hook configuration {path!r}: {error}") from error
-    if not isinstance(config, dict):
-        raise HookConfigurationError(
-            "hook configuration must be an object")
-    allowed = {"pre_tool_call", "pre_tool_gate", "post_tool_call", "turn_end", "turn_error"}
-    unexpected = sorted(set(config) - allowed)
-    if unexpected:
-        raise HookConfigurationError(
-            "unknown hook configuration keys: "
-            + ", ".join(unexpected))
     pipeline = ToolHookPipeline()
-    seen_ids = set()
-    for section, default_timeout in [
-            ("pre_tool_call", 2000),
-            ("pre_tool_gate", 2000),
-            ("post_tool_call", 10000)]:
-        values = config.get(section, [])
-        if not isinstance(values, list):
-            raise HookConfigurationError(
-                f"{section} must be a list")
-        for index, value in enumerate(values):
-            hook, on_error = _external_hook_from_dict(
-                value,
-                f"{section}[{index}]",
-                default_timeout,
-                stderr_reporter=stderr_reporter,
-            )
-            hook.event_name = section
-            if section == "post_tool_call" and on_error == "deny":
-                raise HookConfigurationError(
-                    f"{section}[{index}].on_error cannot be 'deny': "
-                    "post-tool failures cannot undo an attempted tool")
-            if hook.hook_id in seen_ids:
-                raise HookConfigurationError(
-                    f"duplicate hook id {hook.hook_id!r}")
-            seen_ids.add(hook.hook_id)
-            if section == "pre_tool_call":
-                pipeline.add_pre(
-                    hook.hook_id,
-                    hook.pre,
-                    on_error=on_error or "deny",
-                    matcher=hook.matches,
-                )
-            elif section == "pre_tool_gate":
-                pipeline.add_gate(
-                    hook.hook_id,
-                    hook.pre,
-                    on_error=on_error or "deny",
-                    matcher=hook.matches,
-                )
-            else:
-                pipeline.add_post(
-                    hook.hook_id,
-                    hook.post,
-                    on_error=on_error or "continue",
-                    matcher=hook.matches,
-                )
-    # Both are user-turn commands with the same process boundary, not tools.
-    # Only their consumer differs: recovery decisions versus final observers.
-    for section, hooks in [
-            ["turn_end", pipeline.turn_end_hooks],
-            ["turn_error", pipeline.turn_error_hooks]]:
-        values = config.get(section, [])
-        if not isinstance(values, list):
-            raise HookConfigurationError(f"{section} must be a list")
-        for index, value in enumerate(values):
-            hook = _turn_hook_from_dict(
-                value, f"{section}[{index}]", stderr_reporter)
-            if hook.hook_id in seen_ids:
-                raise HookConfigurationError(f"duplicate hook id {hook.hook_id!r}")
-            seen_ids.add(hook.hook_id)
-            hooks.append(hook)
+    for config in definitions:
+        hook = ExternalHook(config, stderr_reporter=stderr_reporter)
+        if config.phase == "turn_end":
+            pipeline.turn_end_hooks.append(hook)
+        elif config.phase == "turn_error":
+            pipeline.turn_error_hooks.append(hook)
+        elif config.phase == "pre_tool_call":
+            pipeline.add_pre(config.hook_id, hook.pre,
+                             on_error=config.on_error, matcher=hook.matches)
+        elif config.phase == "pre_tool_gate":
+            pipeline.add_gate(config.hook_id, hook.pre,
+                              on_error=config.on_error, matcher=hook.matches)
+        else:
+            pipeline.add_post(config.hook_id, hook.post,
+                              on_error=config.on_error, matcher=hook.matches)
     return pipeline
 
 

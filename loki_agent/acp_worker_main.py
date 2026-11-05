@@ -48,7 +48,7 @@ async def amain(owner_fd: int, capability_fd: int, write) -> int:
 
 
 async def _serve_connected_runtime(runtime, write):
-    from . import acps, connections, loki
+    from . import acps, connections, loki, settings
     from .acp_worker import Worker
     from .sessions import Session
 
@@ -62,10 +62,11 @@ async def _serve_connected_runtime(runtime, write):
             # response.
             pass
         try:
-            loki.configure_tool_hook_pipeline()
-        except loki.tool_runtime.HookConfigurationError as error:
+            configuration = await settings.load_settings(strict=True)
+            loki.configure_tool_hook_pipeline(configuration)
+        except settings.SettingsError as error:
             print(
-                f"Hook configuration error: {error!r}",
+                f"Configuration error: {error!r}",
                 file=sys.stderr,
             )
             return 2

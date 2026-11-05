@@ -12,7 +12,7 @@ from response_header_fixtures import setUpModule as set_up_response_headers
 from settings_fixtures import setUpModule as set_up_default_settings
 from config_fixtures import setUpModule as set_up_config
 from loki_agent import authentications, loki, models, protocols, provider_controls
-from loki_agent import terminal_frontend, terminals
+from loki_agent import settings, terminal_frontend, terminals
 from loki_agent.credentials import CredentialStore
 from loki_agent import connections
 from loki_agent import jobs as job_runtime
@@ -147,10 +147,10 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(terminal_frontend, "run_terminal_turn_async") as turn:
             if interrupt is asyncio.CancelledError:
                 with self.assertRaises(asyncio.CancelledError):
-                    await terminal_frontend.async_main([])
+                    await terminal_frontend.async_main([], settings.Settings())
             else:
                 self.assertEqual(await asyncio.wait_for(
-                    self.run_dialog(terminal_frontend.async_main([])), 2), 0)
+                    self.run_dialog(terminal_frontend.async_main([], settings.Settings())), 2), 0)
                 self.assertGreater(inputs.normal_keys_after_interrupt, 0)
                 self.assertEqual(self.stderr.getvalue().count("Model selection cancelled."), 1)
             self.assertEqual(loki.current_model(), "current-model")

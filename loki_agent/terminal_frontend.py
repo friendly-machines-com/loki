@@ -37,7 +37,6 @@ from . import subagents
 from . import terminals
 from . import texts
 from . import tool_contracts
-from . import tool_runtime
 from .connections import (
     ConnectionDescriptorError,
     connection_display_fields,
@@ -1394,7 +1393,7 @@ async def _run_account_controls_async(command_text, session):
         await _confirm_account_action(modal, action, as_json)
 
 
-async def async_main(args) -> int:
+async def async_main(args, configuration: settings.Settings) -> int:
     try:
         options, args = parse_cli_args(args)
     except getopt.GetoptError as error:
@@ -1449,8 +1448,7 @@ async def async_main(args) -> int:
             toolset or "Explore", prompt_arg)
         return 0
 
-    ui_settings = await settings.load_settings(on_error=lambda error: _print_text_line(
-        "Could not load settings: ", error, file=sys.stderr, multiline=True))
+    ui_settings = configuration
     log_filename = None
     for option_name, option_value in options:
         if option_name == '--resume' or option_name == '-r':
@@ -1974,11 +1972,15 @@ async def _run_frontend(args) -> int:
     if status is not None:
         return status
     try:
+        configuration = await settings.load_settings(
+            strict=True, on_error=lambda warning: _print_text_line(
+                "Configuration warning: ", warning,
+                file=sys.stderr, multiline=True))
         configure_tool_hook_pipeline(
-            stderr_reporter=_report_hook_stderr)
-    except tool_runtime.HookConfigurationError as error:
+            configuration, stderr_reporter=_report_hook_stderr)
+    except settings.SettingsError as error:
         _print_text_line(
-            "Hook configuration error: ", error,
+            "Configuration error: ", error,
             file=sys.stderr, multiline=True)
         sys.stderr.flush()
         return 2
@@ -2023,7 +2025,7 @@ async def _run_frontend(args) -> int:
 
     async def run_with_session_cleanup():
         try:
-            return await async_main(args)
+            return await async_main(args, configuration)
         finally:
             manager = current_session().job_manager
             if manager is not None:

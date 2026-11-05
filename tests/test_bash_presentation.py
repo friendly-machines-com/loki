@@ -394,7 +394,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             ):
                 if setting is not None:
                     await settings.update_user_settings({"terminal.show_bash_stdout": setting})
-                self.assertEqual(await terminal_frontend.async_main([]), 0)
+                self.assertEqual(await terminal_frontend.async_main([], await settings.load_settings()), 0)
                 self.assertEqual("stdout-secret" in output.getvalue(), bool(setting))
                 self.assertIn("stderr-message", output.getvalue())
         self.assertEqual(seen, [False, False, True])
@@ -405,7 +405,8 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(terminal_frontend, "build_config_from_env", return_value=self.session.runtime_config),
             mock.patch.object(terminal_frontend.subagents, "run_cli_async", new=mock.AsyncMock()),
         ):
-            self.assertEqual(await terminal_frontend.async_main(["--headless", "--prompt=test"]), 0)
+            self.assertEqual(await terminal_frontend.async_main(
+                ["--headless", "--prompt=test"], settings.Settings()), 0)
             load.assert_not_awaited()
 
     @unittest.skipUnless(os.name == "posix", "requires a POSIX shell")

@@ -14,8 +14,9 @@ from unittest import mock
 import test_acps as acp_fixtures
 from loki_entrypoints import child_environment, configure_container
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
+from settings_fixtures import write_user_settings
 from loki_agent import acps, connections, formats, http_client, loki, model_requests
-from loki_agent import protocols, recoveries, terminal_frontend, tool_runtime
+from loki_agent import protocols, recoveries, settings, terminal_frontend, tool_runtime
 from loki_agent.acp_worker import Worker
 from loki_agent.sessions import Session
 
@@ -72,9 +73,12 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
         return name
 
     def config(self, value):
-        # Hook configuration entries carry a mandatory cwd. Tests that do not
-        # care about location run their hook in the session directory; the
-        # per-phase location test supplies a distinct directory explicitly.
+        # Fixtures stay dict-shaped for readability; this helper emits the
+        # settings-file INI: one section per hook named <phase>.<id>, with
+        # indexed options for lists. Hook configuration entries carry a
+        # mandatory cwd; tests that do not care about location run in the
+        # session directory, and the per-phase location test supplies a
+        # distinct directory explicitly.
         for section in ["pre_tool_call", "pre_tool_gate", "post_tool_call",
                         "turn_end", "turn_error"]:
             entries = value.get(section, [])
@@ -82,7 +86,24 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                 continue
             for entry in entries:
                 entry.setdefault("cwd", self.session.shell_cwd)
-        return tool_runtime.load_hook_pipeline(self.make_file(json.dumps(value)))
+        lines = []
+        for section, entries in value.items():
+            for entry in entries:
+                lines.append(f"[hook.{section}.{entry['id']}]")
+                for key, item in entry.items():
+                    if key == "id":
+                        continue
+                    if isinstance(item, list):
+                        for index, part in enumerate(item):
+                            lines.append(f"{key}.{index} = {part}")
+                    elif isinstance(item, bool):
+                        lines.append(f"{key} = {'yes' if item else 'no'}")
+                    else:
+                        lines.append(f"{key} = {item}")
+                lines.append("")
+        configuration = settings.from_parser(
+            settings.read_ini(self.make_file("\n".join(lines))))
+        return tool_runtime.build_hook_pipeline(configuration.hooks)
 
     def policy(self, arguments: list):
         command = [sys.executable, self.script]
@@ -186,7 +207,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                  [5, 10, 20, 40, 60, 60, 60, None]],
                 [["--multiplier", "1"], [5, 5, 5, 5]]]:
             pipeline = self.policy(arguments)
-            self.assertIsNone(pipeline.turn_error_hooks[0].timeout_ms)
+            self.assertIsNone(pipeline.turn_error_hooks[0].config.timeout_ms)
             for count, delay in enumerate(expected):
                 decision = await pipeline.recover_turn({
                     "event": "turn_error", "cwd": self.session.shell_cwd,
@@ -266,13 +287,12 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
 
     def test_configuration_reuses_turn_hook_restrictions(self):
         for field in ["tools", "on_error", "workspace_side_effects"]:
-            with self.subTest(field=field), self.assertRaises(tool_runtime.HookConfigurationError):
+            with self.subTest(field=field), self.assertRaises(settings.HookConfigurationError):
                 self.config({"turn_error": [{"id": "retry", "command": ["policy"], field: True}]})
         for value in [
-                {"turn_error": {}},
                 {"turn_error": [{"id": "same", "command": ["policy"]}],
                  "turn_end": [{"id": "same", "command": ["notify"]}]}]:
-            with self.assertRaises(tool_runtime.HookConfigurationError):
+            with self.assertRaises(settings.HookConfigurationError):
                 self.config(value)
 
     async def test_all_hook_phases_run_in_configured_cwd_and_do_not_inherit_secrets(self):
@@ -655,25 +675,28 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             "print('{}')\n", directory=config.name)
         observe_command = [sys.executable, observer, witness]
         delay = "1800" if cancel else "0"
-        hooks = self.make_file(json.dumps({
-            "turn_error": [
-                {"id": "observe-error", "command": observe_command,
-                 "cwd": config.name},
-                {"id": "retry", "command": [
-                    sys.executable, script, "--initial-delay", delay,
-                    "--overload-initial-delay", delay],
-                 "cwd": config.name},
-            ],
-            "turn_end": [{"id": "observe-end", "command": observe_command,
-                          "cwd": config.name}],
-        }), directory=config.name)
+
+        def hook_section(name, command):
+            lines = [f"[{name}]"]
+            lines.extend(f"command.{index} = {part}"
+                         for index, part in enumerate(command))
+            lines.append(f"cwd = {config.name}")
+            return "\n".join(lines) + "\n"
+
+        configuration_text = "".join([
+            hook_section("hook.turn_error.observe-error", observe_command),
+            hook_section("hook.turn_error.retry", [
+                sys.executable, script, "--initial-delay", delay,
+                "--overload-initial-delay", delay]),
+            hook_section("hook.turn_end.observe-end", observe_command),
+        ])
+        write_user_settings(config.name, configuration_text)
         environment = child_environment(
             HOME=config.name, XDG_CONFIG_HOME=config.name,
             XDG_STATE_HOME=state.name, PATH=os.environ.get("PATH", ""),
             TERM="dumb", LOKI_PROVIDER=protocols.OPENAI_RESPONSES,
             LOKI_API_BASE=self.session.runtime_config.chat_provider.chat_url,
-            LOKI_MODEL="test", LOKI_STREAM="1" if stream else "0",
-            LOKI_HOOKS=hooks)
+            LOKI_MODEL="test", LOKI_STREAM="1" if stream else "0")
         configure_container(environment, workspace)
         backoff = asyncio.Event()
 

@@ -1,5 +1,7 @@
 import asyncio
 import configparser
+import contextlib
+import os
 import dataclasses
 import pathlib
 import tempfile
@@ -188,6 +190,139 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
                 await task
         await self.update({"terminal.show_bash_stdout": True})
         self.assertTrue((await self.load()).terminal.show_bash_stdout)
+
+    async def test_preferences_and_hooks_share_one_read_and_definition(self):
+        from loki_agent import tool_runtime
+
+        self.file.write_text(
+            "[terminal]\nshow_read_stdout = yes\n"
+            "[hook.turn_error.retry]\ncommand.0 = selected interpreter\n"
+            "command.1 = script name;#%literal\ncwd = selected cwd\n",
+            encoding="utf-8")
+        with mock.patch.object(settings, "read_ini", wraps=settings.read_ini) as read:
+            value = await self.load(strict=True)
+        read.assert_called_once_with(self.file)
+        self.assertTrue(value.terminal.show_read_stdout)
+        self.assertEqual(len(value.hooks), 1)
+        hook = value.hooks[0]
+        self.assertEqual(hook.command, ["selected interpreter", "script name;#%literal"])
+        self.assertEqual(hook.cwd, "selected cwd")
+        self.assertIsNone(hook.timeout_ms)
+        self.assertEqual(hook.tools, ["*"])
+        self.assertIs(tool_runtime.build_hook_pipeline(value.hooks).turn_error_hooks[0].config, hook)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            hook.cwd = "changed"
+
+    async def test_all_phase_defaults_are_supplied_by_configuration(self):
+        rows = [["pre_tool_call", 2000, "deny"], ["pre_tool_gate", 2000, "deny"],
+                ["post_tool_call", 10000, "continue"], ["turn_end", None, None],
+                ["turn_error", None, None]]
+        self.file.write_text("".join(
+            f"[hook.{phase}.{phase}]\ncommand.0 = selected-command\ncwd = chosen\n"
+            for phase, _, _ in rows), encoding="utf-8")
+        value = await self.load(strict=True)
+        self.assertEqual([[hook.phase, hook.timeout_ms, hook.on_error]
+                          for hook in value.hooks], rows)
+
+    async def test_malformed_known_hook_options_are_not_ignored(self):
+        for options in ["command.2 = lost", "command.01 = ambiguous", "command.x = wrong",
+                        "command = bare", "command.1 =", "tools.1 = Bash", "cwd.extra = wrong",
+                        "timeout_ms = 0", "timeout_ms = invalid", "on_error = unknown",
+                        "workspace_side_effects = maybe"]:
+            with self.subTest(options=options):
+                self.file.write_text(
+                    "[hook.pre_tool_call.test]\ncommand.0 = selected-command\n"
+                    f"cwd = chosen\n{options}\n", encoding="utf-8")
+                with self.assertRaises(settings.HookConfigurationError):
+                    await self.load(strict=True)
+
+    async def test_turn_hook_indexed_tool_options_are_rejected(self):
+        for phase in ["turn_end", "turn_error"]:
+            for option in ["tools.0 = Bash", "on_error = continue", "workspace_side_effects = yes"]:
+                with self.subTest(phase=phase, option=option):
+                    self.file.write_text(
+                        f"[hook.{phase}.test]\ncommand.0 = selected-command\n"
+                        f"cwd = chosen\n{option}\n", encoding="utf-8")
+                    with self.assertRaisesRegex(settings.HookConfigurationError, "does not support"):
+                        await self.load(strict=True)
+
+    async def test_unknown_values_are_reported_and_preserved_by_preference_updates(self):
+        self.file.write_text(
+            "[terminal]\nFutureOption = %unchanged%\n"
+            "[hook.turn_error.first]\ncommand.0 = chosen\ncwd = chosen-cwd\nFutureOption = value\n"
+            "[hook.future_phase.later]\nFutureRequirement = value\n"
+            "[hook.turn_end.last]\ncommand.0 = notify\ncwd = elsewhere\n"
+            "[future_category]\nOption = value\n", encoding="utf-8")
+        before = settings.read_ini(self.file)
+        warnings = []
+        value = await self.load(strict=True, on_error=warnings.append)
+        self.assertEqual([hook.hook_id for hook in value.hooks], ["first", "last"])
+        self.assertTrue(any("unsupported hook phase" in str(warning) for warning in warnings))
+        self.assertTrue(any("FutureOption" in str(warning) for warning in warnings))
+        self.assertTrue(any("future_category" in str(warning) for warning in warnings))
+        updated = await self.update({"terminal.show_bash_stdout": True})
+        self.assertEqual(updated.hooks, value.hooks)
+        after = settings.read_ini(self.file)
+        self.assertEqual(after.sections(), before.sections())
+        for section in before.sections():
+            for key, text in before.items(section):
+                self.assertEqual(after.get(section, key), text)
+
+    async def test_layers_override_hook_fields_without_reordering_definitions(self):
+        self.file.write_text(
+            "[hook.turn_error.first]\ncommand.0 = chosen\ncommand.1 = original\ncwd = lower\n"
+            "[hook.turn_end.last]\ncommand.0 = notify\ncwd = lower\n", encoding="utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as resource:
+            resource.write("[hook.turn_error.first]\ncommand.1 = upper\ncwd = upper\n")
+            upper = resource.name
+        self.addCleanup(os.unlink, upper)
+        value = await settings.load_settings(files=[self.file, upper], strict=True)
+        self.assertEqual([hook.hook_id for hook in value.hooks], ["first", "last"])
+        self.assertEqual(value.hooks[0].command, ["chosen", "upper"])
+        self.assertEqual(value.hooks[0].cwd, "upper")
+        self.assertEqual(value.hooks[1].cwd, "lower")
+
+    async def test_startup_strict_read_does_not_silently_drop_hooks(self):
+        self.file.write_text("[broken section\n", encoding="utf-8")
+        with self.assertRaises(settings.SettingsError):
+            await self.load(strict=True)
+
+    async def test_terminal_startup_passes_the_single_configuration_snapshot(self):
+        from loki_agent import loki, terminal_frontend as frontend
+
+        self.file.write_text(
+            "[terminal]\nshow_read_stdout = yes\n"
+            "[hook.turn_end.notify]\ncommand.0 = notify\ncwd = configured\n",
+            encoding="utf-8")
+        read_ini = settings.read_ini
+
+        def read(file):
+            parser = read_ini(file)
+            # Any second read would observe different preferences and no hooks.
+            self.file.write_text("[terminal]\nshow_read_stdout = no\n", encoding="utf-8")
+            return parser
+
+        async def run(args, configuration):
+            self.assertTrue(configuration.terminal.show_read_stdout)
+            self.assertEqual(len(configuration.hooks), 1)
+            self.assertIs(loki.TOOL_HOOK_PIPELINE.turn_end_hooks[0].config, configuration.hooks[0])
+            return 0
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(settings, "user_path", return_value=self.file))
+            read_call = stack.enter_context(mock.patch.object(settings, "read_ini", side_effect=read))
+            stack.enter_context(mock.patch.object(loki, "TOOL_HOOK_PIPELINE"))
+            stack.enter_context(mock.patch.object(frontend, "async_main", new=run))
+            stack.enter_context(mock.patch.object(frontend, "current_session", return_value=mock.Mock(job_manager=None)))
+            stack.enter_context(mock.patch.object(frontend, "current_chat_log_path", return_value=None))
+            stack.enter_context(mock.patch.object(frontend, "terminal_output_mode", return_value=contextlib.nullcontext()))
+            stack.enter_context(mock.patch.object(frontend, "initialize_terminal_overlay"))
+            stack.enter_context(mock.patch.object(frontend, "restore_terminal_overlay"))
+            stack.enter_context(mock.patch.object(frontend.signal, "signal"))
+            if hasattr(frontend.signal, "pthread_sigmask"):
+                stack.enter_context(mock.patch.object(frontend.signal, "pthread_sigmask"))
+            self.assertEqual(await frontend._run_frontend([]), 0)
+            read_call.assert_called_once_with(self.file)
 
     @unittest.skipUnless(hasattr(pathlib.Path, "symlink_to"), "requires symlink support")
     async def test_update_keeps_dotfile_symlink(self):

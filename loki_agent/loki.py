@@ -2434,22 +2434,11 @@ async def run_turn_end_hooks_async(events, text="", *, error=None):
     await pipeline.finish_turn(payload)
 
 
-def configure_tool_hook_pipeline(environ=os.environ, stderr_reporter=None):
-    """Load trusted user-selected command hooks; project hooks are never automatic."""
+def configure_tool_hook_pipeline(configuration, stderr_reporter=None):
+    """Install hooks from the owning frontend's already-loaded configuration."""
     global TOOL_HOOK_PIPELINE
-    configured = environ.get("LOKI_HOOKS")
-    if configured is None:
-        default_path = os.path.join(LOKI_CONFIG_DIR, "hooks.json")
-        configured = default_path if os.path.isfile(default_path) else ""
-    if configured.strip().lower() in ["", "0", "none", "off"]:
-        TOOL_HOOK_PIPELINE = tool_runtime.ToolHookPipeline()
-        return None
-    path = os.path.expanduser(configured)
-    if not os.path.isabs(path):
-        path = os.path.join(STARTUP_CWD, path)
-    TOOL_HOOK_PIPELINE = tool_runtime.load_hook_pipeline(
-        path, stderr_reporter=stderr_reporter)
-    return path
+    TOOL_HOOK_PIPELINE = tool_runtime.build_hook_pipeline(
+        configuration.hooks, stderr_reporter=stderr_reporter)
 
 
 def _model_request_context():

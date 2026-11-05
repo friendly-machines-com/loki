@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from loki_agent import terminals
+from loki_agent import settings, terminals
 from terminal_resource_fixtures import ModeEnvironment, ReaderEnvironment
 
 
@@ -195,7 +195,7 @@ class FrontendTerminalOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 mode.__enter__.side_effect = lambda: actions.append('output enter')
                 mode.__exit__.side_effect = lambda *args: actions.append('output exit')
 
-                async def run(args):
+                async def run(args, configuration):
                     actions.append('run')
                     if fails:
                         raise OSError('frontend failed')
@@ -205,6 +205,8 @@ class FrontendTerminalOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     stack.enter_context(mock.patch.object(frontend.signal, 'signal'))
                     if hasattr(frontend.signal, 'pthread_sigmask'):
                         stack.enter_context(mock.patch.object(frontend.signal, 'pthread_sigmask'))
+                    stack.enter_context(mock.patch.object(
+                        settings, 'load_settings', new=mock.AsyncMock(return_value=settings.Settings())))
                     stack.enter_context(mock.patch.object(frontend, 'configure_tool_hook_pipeline'))
                     stack.enter_context(mock.patch.object(frontend, 'terminal_output_mode', return_value=mode))
                     stack.enter_context(mock.patch.object(frontend, 'current_chat_log_path', return_value=None))

@@ -295,7 +295,7 @@ def _configuration_checks() -> list[Check]:
                   for name, access in mutations.items())
     # Optional files may be missing or deliberately unreadable. Their consumers
     # report read errors; here only mutation rights must always be refused.
-    for name in ["SYSTEM.md", "settings.ini", "hooks.json"]:
+    for name in ["SYSTEM.md", "settings.ini"]:
         file = os.path.join(directory, name)
         error = _attempt(file, windows_api.AccessMask.GENERIC_READ)
         if error is not None and error.status in [

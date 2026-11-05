@@ -88,7 +88,7 @@ class ProbeContainmentTests(unittest.TestCase):
         self.allow(CONFIG, windows_api.AccessMask.GENERIC_READ)
         self.allow(STATE, windows_api.AccessMask.GENERIC_READ)
         self.allow(STATE, windows_api.AccessMask.GENERIC_WRITE)
-        for name in ["SYSTEM.md", "settings.ini", "hooks.json"]:
+        for name in ["SYSTEM.md", "settings.ini"]:
             self.deny(os.path.join(CONFIG, name), windows_api.AccessMask.GENERIC_READ,
                       status=windows_api.ERROR_FILE_NOT_FOUND)
 
@@ -171,7 +171,7 @@ class ProbeContainmentTests(unittest.TestCase):
                 windows_api.AccessMask.DELETE,
                 windows_api.AccessMask.WRITE_DAC,
                 windows_api.AccessMask.WRITE_OWNER]
-        for name in ["SYSTEM.md", "settings.ini", "hooks.json"]:
+        for name in ["SYSTEM.md", "settings.ini"]:
             expected[os.path.join(CONFIG, name)] = [windows_api.AccessMask.GENERIC_READ]
         self.assertEqual({path for path, _access in self.attempts}, set(expected))
         for asset, rights in expected.items():
@@ -227,7 +227,7 @@ class ProbeContainmentTests(unittest.TestCase):
                 self.assertEqual(len(failures), 1, failures)
 
     def test_existing_configuration_files_are_readable_but_not_mutable(self):
-        for name in ["SYSTEM.md", "settings.ini", "hooks.json"]:
+        for name in ["SYSTEM.md", "settings.ini"]:
             for access in [windows_api.AccessMask.GENERIC_WRITE,
                            windows_api.AccessMask.FILE_WRITE_DATA,
                            windows_api.AccessMask.FILE_WRITE_ATTRIBUTES,

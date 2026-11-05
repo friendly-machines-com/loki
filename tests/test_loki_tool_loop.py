@@ -34,7 +34,7 @@ from loki_agent import openai_models
 from loki_agent import protocols
 from loki_agent.connections import ConnectionDescriptor
 from loki_agent.credentials import CredentialInventory, CredentialStore
-from loki_agent import savefiles
+from loki_agent import savefiles, settings
 from loki_agent import terminals
 from loki_agent import connections, tool_contracts, tool_runtime
 from loki_agent import files as file_operations
@@ -194,9 +194,9 @@ class TerminalImageCommandTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     if outcome == "raised":
                         with self.assertRaisesRegex(RuntimeError, "turn failed"):
-                            asyncio.run(terminal_frontend.async_main([]))
+                            asyncio.run(terminal_frontend.async_main([], settings.Settings()))
                     else:
-                        self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+                        self.assertEqual(asyncio.run(terminal_frontend.async_main([], settings.Settings())), 0)
                 pipeline.finish_turn.assert_awaited_once()
                 payload = pipeline.finish_turn.await_args.args[0]
                 self.assertEqual(payload["event"], "turn_end")
@@ -335,7 +335,7 @@ class TerminalImageCommandTests(unittest.TestCase):
                             new=turn_runner or capture_turn
                         ), contextlib.redirect_stdout(
                                 stdout), contextlib.redirect_stderr(stderr):
-            status = asyncio.run(terminal_frontend.async_main([]))
+            status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
         return status, captured, stdout.getvalue(), stderr.getvalue()
 
     def test_model_receives_original_user_text(self):
@@ -1350,7 +1350,7 @@ class ModelLoadingTests(unittest.TestCase):
                         ), mock.patch(
                             "loki_agent.terminal_frontend.load_models_async",
                             new=loader), contextlib.redirect_stderr(stderr):
-                status = asyncio.run(terminal_frontend.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
 
         loader.assert_not_awaited()
         self.assertEqual(status, 0)
@@ -1388,7 +1388,7 @@ class ModelLoadingTests(unittest.TestCase):
                                       new=mock.AsyncMock(return_value='ok')),
                     contextlib.redirect_stdout(stdout),
                 ):
-                    self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+                    self.assertEqual(asyncio.run(terminal_frontend.async_main([], settings.Settings())), 0)
                 self.assertEqual(stdout.getvalue().count(hint), expected)
                 self.assertNotIn(hint, str(loki.current_transcript()))
                 loki.save_chat_log()
@@ -1418,7 +1418,7 @@ class ModelLoadingTests(unittest.TestCase):
             mock.patch.object(terminal_frontend, 'run_terminal_turn_async', new=turn),
             contextlib.redirect_stdout(stdout),
         ):
-            self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+            self.assertEqual(asyncio.run(terminal_frontend.async_main([], settings.Settings())), 0)
         self.assertEqual(turns, 2)
         self.assertEqual(stdout.getvalue().count('Hint:'), 1)
 
@@ -1470,7 +1470,7 @@ class ModelLoadingTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(
                     terminal_frontend, 'config_from_modelsdev_selection',
                     side_effect=[real_config, dummy_config]))
-                task = asyncio.create_task(terminal_frontend.async_main([]))
+                task = asyncio.create_task(terminal_frontend.async_main([], settings.Settings()))
                 try:
                     self.assertEqual(await prompts.get(), '!')
                     for old_seed, new_seed in [['!', ''], ['', '!']]:
@@ -1511,7 +1511,7 @@ class ModelLoadingTests(unittest.TestCase):
                         ), mock.patch(
                             "loki_agent.terminal_frontend.load_models_async",
                             new=loader):
-                status = asyncio.run(terminal_frontend.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
 
         loader.assert_not_awaited()
         self.assertEqual(status, 0)
@@ -1537,7 +1537,7 @@ class ModelLoadingTests(unittest.TestCase):
                 new=loader), mock.patch(
                     "loki_agent.terminal_frontend.subagents.run_cli_async",
                     new=runner), contextlib.redirect_stderr(stderr):
-            status = asyncio.run(terminal_frontend.async_main(["--headless"]))
+            status = asyncio.run(terminal_frontend.async_main(["--headless"], settings.Settings()))
 
         loader.assert_not_awaited()
         runner.assert_not_awaited()
@@ -1555,7 +1555,7 @@ class ModelLoadingTests(unittest.TestCase):
         with mock.patch(
                 "loki_agent.terminal_frontend.subagents.run_cli_async",
                 new=runner), contextlib.redirect_stderr(stderr):
-            status = asyncio.run(terminal_frontend.async_main(["--headless"]))
+            status = asyncio.run(terminal_frontend.async_main(["--headless"], settings.Settings()))
 
         runner.assert_not_awaited()
         self.assertEqual(status, 2)
@@ -1575,7 +1575,7 @@ class ModelLoadingTests(unittest.TestCase):
                     "loki_agent.terminal_frontend.input_session",
                     return_value=session), contextlib.redirect_stderr(stderr):
                 status = asyncio.run(
-                    terminal_frontend.async_main([f"--resume={missing}"]))
+                    terminal_frontend.async_main([f"--resume={missing}"], settings.Settings()))
 
         self.assertEqual(status, 1)
         self.assertIn("Could not resume chat:", stderr.getvalue())
@@ -1597,7 +1597,7 @@ class ModelLoadingTests(unittest.TestCase):
                     "loki_agent.terminal_frontend.input_session",
                     return_value=session), contextlib.redirect_stderr(stderr):
                 status = asyncio.run(
-                    terminal_frontend.async_main([f"--resume={path}"]))
+                    terminal_frontend.async_main([f"--resume={path}"], settings.Settings()))
 
         self.assertEqual(status, 1)
         self.assertIn(
@@ -1660,7 +1660,7 @@ class ModelLoadingTests(unittest.TestCase):
                             "loki_agent.terminal_frontend.restore_output_area_after_input"), \
                     contextlib.redirect_stdout(stdout):
                 status = asyncio.run(
-                    terminal_frontend.async_main([f"--resume={path}"]))
+                    terminal_frontend.async_main([f"--resume={path}"], settings.Settings()))
 
         confirm.assert_awaited_once()
         self.assertEqual(status, 0)
@@ -1714,7 +1714,7 @@ class ModelLoadingTests(unittest.TestCase):
                     mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
                     mock.patch.object(terminal_frontend, "run_terminal_turn_async", runner), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
-                status = asyncio.run(terminal_frontend.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
             self.assertEqual(status, 0)
             saved = Store(store.path).snapshot()["endpoints"]
             self.assertEqual(saved[0]["headers"]["x-remaining"]["value"], "8")
@@ -1760,7 +1760,7 @@ class ModelLoadingTests(unittest.TestCase):
                         mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
                         mock.patch.object(terminal_frontend, "run_terminal_turn_async", runner), \
                         contextlib.redirect_stdout(io.StringIO()) as output:
-                    self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+                    self.assertEqual(asyncio.run(terminal_frontend.async_main([], settings.Settings())), 0)
                 current_output, all_output = output.getvalue().split("User: /status all", 1)
                 self.assertIn("selected-only", current_output)
                 self.assertNotIn("other-credential-only", current_output)
@@ -1793,7 +1793,7 @@ class ModelLoadingTests(unittest.TestCase):
                         ), mock.patch(
                             "loki_agent.terminal_frontend.run_terminal_turn_async",
                             new=runner), contextlib.redirect_stderr(stderr):
-                status = asyncio.run(terminal_frontend.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
 
         runner.assert_not_awaited()
         self.assertEqual(status, 0)
@@ -1839,7 +1839,7 @@ class ModelLoadingTests(unittest.TestCase):
                         "loki_agent.terminal_frontend.modelsdev."
                         "run_flat_model_picker_async",
                         new=mock.AsyncMock(return_value=None)):
-                status = asyncio.run(terminal_frontend.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
 
         loader.assert_awaited_once()
         self.assertEqual(status, 0)
@@ -1901,7 +1901,7 @@ class ModelLoadingTests(unittest.TestCase):
                             mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=path), \
                             mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
                             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([]), 10), 0)
+                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([], settings.Settings()), 10), 0)
                         loki.save_chat_log()
                         self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
                         await session.job_manager.close_session_owned()
@@ -1930,7 +1930,7 @@ class ModelLoadingTests(unittest.TestCase):
                         mock.patch.object(terminals, "open_terminal_stdin"), \
                         mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
                         contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10), 0)
+                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10), 0)
                     self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
                     loki.save_chat_log()
                     await resumed.job_manager.close_session_owned()
@@ -1996,7 +1996,7 @@ class ModelLoadingTests(unittest.TestCase):
                                         "run_flat_model_picker_async",
                                         new=mock.AsyncMock(
                                             side_effect=pick_flat)):
-                status = asyncio.run(terminal_frontend.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
 
         self.assertEqual(status, 0)
         self.assertEqual(len(seen_explicit), 1)
@@ -2067,7 +2067,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
                             "openrouter", provider, model))),
                     contextlib.redirect_stdout(io.StringIO()),
                     contextlib.redirect_stderr(io.StringIO())):
-                status = asyncio.run(terminal_frontend.async_main([]))
+                status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
             with open(path, "r", encoding="utf-8") as stream:
                 saved = json.load(stream)
 
@@ -2137,7 +2137,7 @@ class TerminalReasoningEffortTests(unittest.TestCase):
                     mock.patch.object(terminals, "redraw_status_bar", side_effect=paint),
                     contextlib.redirect_stdout(io.StringIO()),
                     contextlib.redirect_stderr(io.StringIO())):
-                self.assertEqual(asyncio.run(terminal_frontend.async_main([])), 0)
+                self.assertEqual(asyncio.run(terminal_frontend.async_main([], settings.Settings())), 0)
 
         expected = ["low", "max", "low", "high", "high"]
         self.assertEqual([payload["reasoning"]["effort"] for payload in payloads], expected)
@@ -2437,7 +2437,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 prepare("https://local.example/v1/chat/completions", "beta", protocols.OPENAI_CHAT)
                 with mock.patch.object(loki, "CREDENTIALS", CredentialStore(startup_values)):
                     self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main(
-                        ["--headless", "--prompt=credentialless startup"]), 10), 0)
+                        ["--headless", "--prompt=credentialless startup"], settings.Settings()), 10), 0)
                 self.assertIsNone(loki.current_config().auth_spec)
                 self.assertFalse(loki.current_config().stream)
                 self.assertEqual(phase["queue"], [])
@@ -2560,7 +2560,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
                         mock.patch.object(terminals, "open_terminal_stdin"), \
                         mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
-                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10), 0)
+                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10), 0)
                     loki.save_chat_log()
                 self.assertEqual(phase["queue"], [])
                 with self.assertRaises(StopIteration):
@@ -2645,7 +2645,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
                     mock.patch.object(terminals, "open_terminal_stdin"), \
                     mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
-                self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10), 0)
+                self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10), 0)
                 self.assertEqual(loki.current_config().chat_provider.max_tokens, 1234)
                 self.assertEqual(loki.current_config().stream, variant == "credentialless")
                 self.assertEqual(loki.current_transcript()[:len(before["events"])], before["events"])
@@ -2875,7 +2875,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
                         mock.patch.object(terminals, "open_terminal_stdin"), \
                         mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
-                    status = await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"]), 10)
+                    status = await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10)
                     self.assertEqual(status, 0)
                     if not approve:
                         self.assertEqual(pathlib.Path(path).read_bytes(), before)
@@ -3594,7 +3594,6 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
             notes = root / 'notes.md'
             path = str(root / 'chat-switch.json')
             hook_log = root / 'hook-events.jsonl'
-            hook_config = root / 'hooks.json'
             script = (
                 'import json,pathlib,sys\n'
                 'p=json.load(sys.stdin); i=p["invocation"]; a=i["effective_arguments"]\n'
@@ -3622,14 +3621,28 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 ' pathlib.Path(sys.argv[2]).write_text("marker post\\n")\n'
                 ' json.dump({"changed_paths":[sys.argv[2]],"note":"post observed"},sys.stdout)\n'
             )
-            hook_config.write_text(json.dumps({
-                'pre_tool_call': [{'id': 'external.transform', 'tools': ['WebSearch'],
-                                   'command': [sys.executable, '-c', script, str(hook_log), str(source)],
-                                   'cwd': directory}],
-                'post_tool_call': [{'id': 'external.post', 'tools': ['WebSearch'],
-                                    'command': [sys.executable, '-c', script, str(hook_log), str(source)],
-                                    'cwd': directory}],
-            }), encoding='utf-8')
+            with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=directory, delete=False) as resource:
+                resource.write(script)
+                hook_script = resource.name
+            with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=directory, delete=False) as resource:
+                resource.write(
+                    '[hook.pre_tool_call.external.transform]\n'
+                    'tools.0 = WebSearch\n'
+                    f'command.0 = {sys.executable}\n'
+                    f'command.1 = {hook_script}\n'
+                    f'command.2 = {hook_log}\n'
+                    f'command.3 = {source}\n'
+                    f'cwd = {directory}\n'
+                    '[hook.post_tool_call.external.post]\n'
+                    'tools.0 = WebSearch\n'
+                    f'command.0 = {sys.executable}\n'
+                    f'command.1 = {hook_script}\n'
+                    f'command.2 = {hook_log}\n'
+                    f'command.3 = {source}\n'
+                    f'cwd = {directory}\n')
+                hook_config = resource.name
             store = CredentialStore({f'{name}_API_KEY': f'leased-{name}-secret'
                                      for name in ['A', 'B', 'CHAT', 'ANTHROPIC', 'C']})
             from loki_agent import credential_storages
@@ -3881,7 +3894,8 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 ], 'read and search', private=True)
                 self.assertEqual(dispatched[0], ('Read', {'file_path': str(source)}))
                 self.assertIn(source_key, loki.file_state)
-                self.assertEqual(loki.configure_tool_hook_pipeline({'LOKI_HOOKS': str(hook_config)}), str(hook_config))
+                configuration = settings.from_parser(settings.read_ini(hook_config))
+                loki.configure_tool_hook_pipeline(configuration)
                 pipeline = loki.TOOL_HOOK_PIPELINE
                 pipeline.add_pre('custom.transform', transform, matcher=lambda name: name == 'WebSearch')
                 pipeline.add_gate('observing.gate', gate, matcher=lambda name: name == 'WebSearch')
@@ -3941,7 +3955,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     loki.apply_runtime_config(connections.config_from_connection_descriptor(descriptor, owner.inventory))
                     hooks_before = hook_records()
                     child_count = len(children)
-                    self.assertIsNone(loki.configure_tool_hook_pipeline({'LOKI_HOOKS': 'off'}))
+                    loki.configure_tool_hook_pipeline(settings.Settings())
                     self.assertFalse(loki.TOOL_HOOK_PIPELINE.has_custom_hooks)
                     await turn('ANTHROPIC', protocols.ANTHROPIC_MESSAGES, [
                         ('off-search', 'WebSearch', {'query': 'loki', 'allowed_domains': 'example.com'})], 'final resume', restored=True)
@@ -4778,7 +4792,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     with mock.patch.object(loki, '_DEFAULT_SESSION', resumed), \
                             mock.patch.object(terminal_frontend, 'input_session', return_value=input_session), \
                             mock.patch.object(terminal_frontend._ResumeTranscriptPresenter, 'write', new=observe_present):
-                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main(['resume']), 5), 0)
+                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main(['resume'], settings.Settings()), 5), 0)
                         self.assertEqual(resumed.chat_log_path, paths[selected_label])
                         self.assertFalse(resumed.chat_log_dirty)
                         self.assertFalse(input_session.active)

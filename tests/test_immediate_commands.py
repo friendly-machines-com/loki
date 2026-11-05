@@ -22,7 +22,7 @@ from test_terminals import RecordingTerminal
 
 from loki_agent import (
     connections, file_locks, formats, loki, models, protocols,
-    terminal_frontend, terminals,
+    settings, terminal_frontend, terminals,
 )
 from loki_agent.provider_controls import ControlAction, ControlResult
 from loki_agent.response_headers import Store
@@ -784,7 +784,7 @@ class ImmediateCommandTests(unittest.TestCase):
                                       return_value=spec), \
                     contextlib.redirect_stdout(self.output), \
                     contextlib.redirect_stderr(io.StringIO()):
-                frontend = asyncio.create_task(terminal_frontend.async_main([]))
+                frontend = asyncio.create_task(terminal_frontend.async_main([], settings.Settings()))
                 async with asyncio.timeout(3):
                     if mode == "cancel":
                         await started.wait()
@@ -1230,7 +1230,7 @@ class ImmediateQueueTests(unittest.TestCase):
                     contextlib.redirect_stdout(self.output), \
                     contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, "input failed"):
-                    await terminal_frontend.async_main([])
+                    await terminal_frontend.async_main([], settings.Settings())
                 self.assertIsNone(terminal_frontend._queued_inputs.session)
                 self.assertEqual(terminal_frontend._queued_inputs.staged_images, [])
 

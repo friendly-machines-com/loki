@@ -194,9 +194,11 @@ their own specialized instructions; they do not load this file.
 
 ## User settings
 
-Terminal preferences are read from the optional `~/.config/loki/settings.ini`
-(or `$XDG_CONFIG_HOME/loki/settings.ini`). No file is needed: every preference
-has a built-in default, and startup never creates or rewrites the file.
+Configuration is read from the optional `~/.config/loki/settings.ini`
+(or `$XDG_CONFIG_HOME/loki/settings.ini`). The same startup read supplies
+terminal preferences and hook definitions. No file is needed: preferences
+have built-in defaults, and no hooks run unless configured. Startup never
+creates or rewrites the file.
 
 Bash stdout, Read file contents, and successful Skill instruction dumps are
 hidden from automatic terminal tool-result display by default. To show any of
@@ -221,9 +223,19 @@ enable the setting to display those older results in full. Older Read results
 also show a notice when hidden (errors remain visible). New Read results keep
 errors, empty/binary/image notices, and tool notes visible in both views.
 
-Application code reads and updates preferences through `loki_agent.settings`,
-not through frontend file parsing. Explicit updates preserve unrelated INI
-values but rewrite formatting and do not retain comments.
+Application code loads one `Settings` value through `loki_agent.settings`:
+`terminal` contains display preferences and `hooks` contains ordered command
+definitions. Frontends do not parse files. Explicit preference updates preserve
+hook sections, order, and unknown values, but rewrite formatting and do not
+retain comments. Keep any disabled hook definitions you need to retain outside
+this file rather than relying on comments surviving an update.
+
+Unknown sections and options are reported but preserved for version skew.
+Known fields still apply; unknown hook phases are reported and do not run.
+Malformed supported hook fields or a malformed configuration file fail startup
+instead of silently removing configured hooks. The preferences API also
+supports explicit layered files: later explicit options override earlier ones;
+a hook is identified by its section name, and first appearance fixes its order.
 
 ## Tool hooks
 
@@ -270,50 +282,49 @@ runs -- until an out-of-band output channel exists there.
 Loki checks tool input before execution, corrects some unambiguous formatting
 mistakes, and reports any corrections. Other invalid calls are rejected.
 
-Loki also supports trusted external tool hooks. Set `LOKI_HOOKS` to an explicit
-JSON configuration path, or place user-owned configuration at
-`~/.config/loki/hooks.json`. Repository hook files are never loaded
-automatically. Set `LOKI_HOOKS=off` to disable external hooks while retaining
-Loki's built-in input repair.
+Loki also supports trusted external tool hooks. They are configured as
+sections of the user settings file, `~/.config/loki/settings.ini`; nothing is
+loaded from the repository. A section named `hook.<phase>.<id>` defines one
+hook; hooks for a phase run in file order. Remove its section to disable it.
+Terminal preferences remain in `[terminal]`; hook definitions are under
+`hook.`. Unknown categories are reported, not treated as either one.
 
-```json
-{
-    "pre_tool_call": [
-        {
-            "id": "normalize",
-            "tools": ["Write", "Edit"],
-            "command": ["/home/me/bin/loki-normalize"],
-            "cwd": "/home/me/project",
-            "timeout_ms": 2000,
-            "on_error": "deny"
-        }
-    ],
-    "pre_tool_gate": [
-        {
-            "id": "policy",
-            "tools": ["Bash"],
-            "command": ["/home/me/bin/loki-policy"],
-            "cwd": "/home/me/project"
-        }
-    ],
-    "post_tool_call": [
-        {
-            "id": "format",
-            "tools": ["Write", "Edit"],
-            "command": ["/home/me/bin/loki-format"],
-            "cwd": "/home/me/project",
-            "timeout_ms": 10000,
-            "on_error": "continue",
-            "workspace_side_effects": true
-        }
-    ]
-}
+```ini
+[hook.pre_tool_call.normalize]
+tools.0 = Write
+tools.1 = Edit
+command.0 = /home/me/bin/loki-normalize
+cwd = /home/me/project
+timeout_ms = 2000
+on_error = deny
+
+[hook.pre_tool_gate.policy]
+tools.0 = Bash
+command.0 = /home/me/bin/loki-policy
+cwd = /home/me/project
+
+[hook.post_tool_call.format]
+tools.0 = Write
+tools.1 = Edit
+command.0 = /home/me/bin/loki-format
+cwd = /home/me/project
+timeout_ms = 10000
+on_error = continue
+workspace_side_effects = yes
 ```
 
-Every hook entry requires `cwd`: a nonempty string. The hook subprocess runs
-in that directory, whatever the session shell directory is. Supply an absolute
-path; a relative value resolves against the hook runner's process context,
-which is not the session directory.
+Every hook requires `cwd`: a nonempty string naming the directory the hook
+subprocess runs in, independently of the session shell directory. A relative
+value resolves against the hook runner's process context, not the session.
+Loki passes the parsed cwd and command operands to the process creator without
+path rewriting.
+
+Lists use indexed options (`command.0`, `command.1`, `tools.0`, ...), beginning
+at zero with no gaps. Each command/tool value must be nonempty. Values follow
+INI syntax: surrounding whitespace is removed by the parser, indented lines
+continue a value, and quotes are literal rather than shell quoting. There is
+no interpolation, so `%` is literal. Arguments containing spaces do not need
+quotes. Tools default to `*` when no `tools.N` options are supplied.
 
 Hooks run sequentially in configuration order and receive one JSON object on
 stdin. Pre-hook input has `event: "pre_tool_call"` and an `invocation` object
@@ -346,8 +357,10 @@ once after the entire model/tool loop (including cancellation or failure), not
 once per model response. It does not run for Explore subagent turns or local
 commands. For example:
 
-```json
-{"turn_end": [{"id": "notify", "command": ["/home/me/bin/loki-notify"], "cwd": "/home/me"}]}
+```ini
+[hook.turn_end.notify]
+command.0 = /home/me/bin/loki-notify
+cwd = /home/me
 ```
 
 Each command receives `{"event":"turn_end","reason":"completed",
@@ -369,11 +382,11 @@ There is **no default timeout** for turn-end hooks; set a positive `timeout_ms`
 on an entry if a limit is desired. With no `turn_end` entries, no hook process
 is started. Turn-end entries do not accept `tools`, `on_error`, or
 `workspace_side_effects`.
-Commands are argv arrays, not shell strings; stdout is reserved for the single
-JSON response, while stderr remains diagnostic. Hook subprocesses receive a
-minimal environment without Loki API credentials. A hook configured with
-`workspace_side_effects: true` must return `changed_paths` listing the files it
-changed.
+Commands are indexed options, not shell strings; stdout is reserved for the
+single JSON response, while stderr remains diagnostic. Hook subprocesses
+receive a minimal environment without Loki API credentials. A hook with
+`workspace_side_effects = yes` must return `changed_paths` listing the files
+it changed.
 
 ### Retrying failed model requests
 
@@ -381,19 +394,15 @@ For long-running terminal and ACP conversations, the example retry hook tells
 Loki to wait and try again after a model-service failure. The same prompt stays
 active while Loki waits.
 
-Add this entry to your hook configuration (`hooks.json`, or the file selected
-by `LOKI_HOOKS`). Replace the placeholders with your Python executable and the
-filename of `contrib/hooks/retries.py`. The script uses only Python's standard
-library and can be copied elsewhere.
+Add this section to your `settings.ini`. Replace the placeholders with your
+Python executable and the filename of `contrib/hooks/retries.py`. The script
+uses only Python's standard library and can be copied elsewhere.
 
-```json
-{
-    "turn_error": [{
-        "id": "retry",
-        "command": ["<python-executable>", "<retry-script-filename>"],
-        "cwd": "/home/me"
-    }]
-}
+```ini
+[hook.turn_error.retry]
+command.0 = <python-executable>
+command.1 = <retry-script-filename>
+cwd = /home/me
 ```
 
 The example's defaults are:
