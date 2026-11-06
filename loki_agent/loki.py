@@ -1674,7 +1674,16 @@ async def run_tool_loop_async(
             finish_live_text(False, "cancelled" if cancel_check() else "error")
         if recovery is not None and loop_count < max_loops:
             try:
-                if await recovery.retry(failure):
+                # saved=True is used only after the current assistant_text
+                # has been extracted/rendered. A buffered incomplete response
+                # can therefore have produced output without any live deltas.
+                if await recovery.retry(
+                        failure, recovery_point="history_resample",
+                        output_started=bool(live_text_parts or live_reasoning
+                                            or (saved and assistant_text)
+                                            or getattr(failure.get("error"),
+                                                       "output_started", False)),
+                        response_saved=saved):
                     return True
             except recoveries.Cancelled:
                 pass

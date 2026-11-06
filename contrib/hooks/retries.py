@@ -3,9 +3,10 @@
 A configured user turn uses this policy INSTEAD OF the fixed LLM request retry
 policy. Loki supplies one retry_count shared by prepared-request replay and
 history continuation; it retains request identity and owns cancellable waits.
-By default, every formal turn_error remains retryable, including connection/DNS
-failures before generation starts. Only --max-retries imposes a count limit.
-Overload diagnostics select a slower initial delay using the same turn-wide
+Native context-window overflow finishes: replaying unchanged input cannot make
+it fit. Other formal turn_error failures remain retryable, including connection/
+DNS failures before generation starts. Only --max-retries imposes a count limit.
+Native overload facts select a slower initial delay using the same turn-wide
 count, not a second budget. This script neither imports Loki nor retains state
 or locates any other file. Provider retry-delay minimums are enforced by Loki,
 not duplicated here.
@@ -49,13 +50,24 @@ def main():
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         parser.error("retry_count must be a nonnegative integer")
     result = {"action": "finish"}
-    if payload.get("event") == "turn_error" and (
+    code = payload.get("provider_code")
+    category = payload.get("error_category")
+    provider_type = payload.get("provider_error_type")
+    # A formal failure is not a retry decision. This example policy stops on
+    # native context overflow because neither waiting nor replaying the same
+    # input can fix it; Loki has no compaction action here. Do not infer this
+    # from prose, and do not use the built-in quick-retry flag: a user-selected
+    # hook owns long-wait recovery, including overloads that flag excludes.
+    context_overflow = code == "context_length_exceeded" or category == "context_window"
+    if payload.get("event") == "turn_error" and not context_overflow and (
             args.max_retries is None or count < args.max_retries):
         delay = args.initial_delay
-        message = payload.get("error_message")
-        # Loki already selected a formal failure. Its diagnostic only chooses
-        # the backoff base; assistant text is not used to discover errors.
-        if isinstance(message, str) and "overload" in message.casefold():
+        # Provider prose is diagnostic text, not a stable error discriminator.
+        # Classify using the current structured contract only; unclassified
+        # failures use ordinary backoff, even if their message says overload.
+        overloaded = (code in ["server_is_overloaded", "slow_down"]
+                      or category == "overloaded" or provider_type == "overloaded_error")
+        if overloaded:
             delay = args.overload_initial_delay
         if delay:
             try:

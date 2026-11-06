@@ -800,6 +800,8 @@ def _pty_child(argv):
     restoration and resize delivery. ``isig`` checks interrupt processing;
     ``cancel-flag``/``cancel-event`` report the effect of one input key;
     ``control-settings`` checks native settings through real input and actions.
+    ``retry-cause`` checks frontend diagnostics while keyboard input is pending,
+    then uses real Ctrl+C to verify that the retry wait is cancelled.
     """
     import asyncio
 
@@ -814,6 +816,60 @@ def _pty_child(argv):
         native = _terminals.host_terminal_windows
         return (native._console_mode(native._handle(0)), native._GetConsoleCP(),
                 native._console_mode(native._GetStdHandle(native.STD_OUTPUT_HANDLE)))
+
+    if mode == 'retry-cause':
+        from loki_agent import connections, formats, loki, model_requests
+        from loki_agent import protocols, recoveries, terminal_frontend, tool_runtime
+        from response_header_fixtures import isolated_response_headers
+
+        async def retry_cause():
+            # The existing PTY component child exercises real terminal output
+            # and keyboard cancellation. Fake only provider failure and policy:
+            # no terminal renderer/status mocks may hide an encoding failure.
+            with isolated_response_headers():
+                session = loki.current_session()
+                session.runtime_config = connections.make_runtime_config(
+                    "https://example.test/responses", protocols.OPENAI_RESPONSES,
+                    model="test")
+                session.transcript_items.append(formats.message_item("user", "work"))
+                reader = _terminals.AsyncKeyReader(0)
+                calls = []
+
+                async def fail(*args, **kwargs):
+                    calls.append(True)
+                    raise model_requests.ApiError(
+                        "https://example.test/responses", 503, "Service Unavailable",
+                        "provider unavailable \x1b]777;owned\x07 \udc9b \ud800")
+
+                async def wait_policy(payload, *, cancel_event):
+                    return recoveries.RetryDecision(3600)
+
+                pipeline = tool_runtime.ToolHookPipeline()
+                pipeline.turn_error_hooks.append(object())
+                events = []
+                with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
+                        mock.patch.object(pipeline, "recover_turn", new=wait_policy), \
+                        mock.patch.object(terminal_frontend, "async_chat_completion", new=fail), \
+                        _terminals.TerminalMode(0, enabled=True):
+                    async with reader:
+                        print("RETRY_PROMPT_READY User: ", end="", flush=True)
+                        turn = asyncio.create_task(terminal_frontend.run_terminal_turn_async(
+                            session.transcript_items, cancel_event=reader.cancel_event,
+                            turn_events=events))
+                        try:
+                            key = await reader.read_key()
+                            assert key.kind == "CTRL_C", key
+                            await turn
+                        finally:
+                            if not turn.done():
+                                turn.cancel()
+                            await asyncio.gather(turn, return_exceptions=True)
+                assert len(calls) == 1, calls
+                assert any(event["type"] == "response_cancelled" for event in events), events
+                print("RETRY_CANCELLED", flush=True)
+
+        asyncio.run(retry_cause())
+        return 0
 
     if mode == 'capture':
         async def capture():
@@ -1055,6 +1111,36 @@ class PtyCtrlCTests(unittest.TestCase):
         return pty_backend.spawn_pty(
             [sys.executable, str(pathlib.Path(__file__).resolve()),
              "--pty-child", mode])
+
+    def test_retry_cause_is_emitted_safely_before_cancelling_live_prompt(self):
+        handle = self._spawn_child("retry-cause")
+        try:
+            output = bytearray()
+            _read_until(handle, output, "RETRY_PROMPT_READY")
+            _read_until(handle, output, "http_status=503")
+            # This capture precedes cancellation: it cannot be a final error
+            # printed only after recovery stops. Legitimate ANSI is allowed;
+            # the provider's OSC and raw surrogate bytes are not.
+            pending = bytes(output)
+            self.assertIn(b"Retrying in 3600 seconds.", pending)
+            self.assertIn(b"api_error", pending)
+            self.assertIn(b"provider unavailable", pending)
+            self.assertIn(b"\\udc9b", pending)
+            self.assertIn(b"\\ud800", pending)
+            pending.decode("utf-8", "strict")
+            tracker = _SgrStreamTracker()
+            tracker.feed(pending)
+            self.assertFalse(tracker.osc_param_emitted("777"))
+            self.assertNotIn(b"RETRY_CANCELLED", pending)
+            handle.write(b"\x03")
+            exit_code, output = _read_to_exit(handle, output)
+            self.assertEqual(exit_code, 0, output)
+            self.assertIn(b"RETRY_CANCELLED", output)
+        finally:
+            try:
+                handle.terminate()
+            finally:
+                handle.close()
 
     def test_terminal_mode_clears_isig(self):
         # Direct: enter TerminalMode on a fresh pty and inspect the flag.

@@ -274,20 +274,33 @@ Every successful edit re-lists the entries. A
 staged image cannot be re-pointed; delete it and stage another with
 `/image PATH`. Listing and editing never touch a running turn. `/account`
 without a control id, and `/account CONTROL ACTION`, stay queued behind a
-running turn because they interact. Immediate commands
-are declared in one place (`loki_agent/command_deliveries.py`); on ACP every
-command is an ordinary prompt -- the worker rejects it while another prompt
-runs -- until an out-of-band output channel exists there.
+running turn because they require interaction. In ACP, wait for the current
+prompt to finish before issuing these commands.
 
 Loki checks tool input before execution, corrects some unambiguous formatting
 mistakes, and reports any corrections. Other invalid calls are rejected.
 
-Loki also supports trusted external tool hooks. They are configured as
-sections of the user settings file, `~/.config/loki/settings.ini`; nothing is
-loaded from the repository. A section named `hook.<phase>.<id>` defines one
-hook; hooks for a phase run in file order. Remove its section to disable it.
-Terminal preferences remain in `[terminal]`; hook definitions are under
-`hook.`. Unknown categories are reported, not treated as either one.
+## Hooks
+
+Use hooks to add your own tool checks, format files after edits, receive a
+notification when Loki finishes, or keep a request running through provider
+outages. The [retry hook](#retrying-failed-model-requests) is bundled and ready
+to configure. The other examples below assume you already have suitable hook
+programs; replace the sample program paths with yours.
+
+Add hooks to `~/.config/loki/settings.ini`. Each section configures one hook.
+Hooks of the same kind run in file order. Loki does not load hook settings from
+the repository. Restart Loki (or your ACP agent) after changing these settings;
+remove a hook's section and restart to disable it.
+
+### Tool checks and formatters
+
+- `pre_tool_call`: check or adjust a proposed tool call before it runs.
+- `pre_tool_gate`: approve or reject the call after adjustments.
+- `post_tool_call`: run after the tool finishes, for example to format edits.
+
+Choose the tools with `tools.0`, `tools.1`, and so on; omit them to apply the
+hook to all tools. For example:
 
 ```ini
 [hook.pre_tool_call.normalize]
@@ -313,133 +326,89 @@ on_error = continue
 workspace_side_effects = yes
 ```
 
-Every hook requires `cwd`: a nonempty string naming the directory the hook
-subprocess runs in, independently of the session shell directory. A relative
-value resolves against the hook runner's process context, not the session.
-Loki passes the parsed cwd and command operands to the process creator without
-path rewriting.
+Every hook requires `cwd`: an existing directory where the hook should run.
+It is independent of the chat's shell directory; use an absolute path to avoid
+ambiguity.
 
-Lists use indexed options (`command.0`, `command.1`, `tools.0`, ...), beginning
-at zero with no gaps. Each command/tool value must be nonempty. Values follow
-INI syntax: surrounding whitespace is removed by the parser, indented lines
-continue a value, and quotes are literal rather than shell quoting. There is
-no interpolation, so `%` is literal. Arguments containing spaces do not need
-quotes. Tools default to `*` when no `tools.N` options are supplied.
+Put the program in `command.0` and each argument in the next numbered option,
+with no gaps. Arguments containing spaces do not need quotes: INI quotes are
+literal, not shell quoting. INI trims surrounding whitespace; `%` is literal.
 
-Hooks run sequentially in configuration order and receive one JSON object on
-stdin. Pre-hook input has `event: "pre_tool_call"` and an `invocation` object
-containing the call ID, tool name, original and effective arguments, schema,
-current validation issues, cwd, model, provider, and prior adjustments. A
-pre-transformer writes one of:
+Hook programs receive JSON on stdin and use stdout for their hook reply, not
+log messages. Send logs to stderr. The bundled
+[`contrib/hooks/retries.py`](contrib/hooks/retries.py) is a working example.
+Hooks do not receive Loki's API credentials.
 
-```json
-{"action": "continue"}
-{"action": "continue", "arguments": {"replacement": "input"}, "note": "why"}
-{"action": "deny", "message": "model-readable reason"}
-```
+A failing before-tool hook blocks the tool by default. A failing after-tool
+hook reports the problem but cannot undo work the tool has already done.
 
-A `pre_tool_gate` has the same input and decisions but cannot replace
-arguments. It sees the final validated input after all transformers.
-Post-hook input additionally contains the terminal `outcome`, including
-whether the tool executed and its real result. A post-hook may return a
-model-visible note and workspace paths it changed:
+### Notifications when Loki finishes
 
-```json
-{"note": "formatter ran", "changed_paths": ["src/example.py"]}
-```
-
-Post-hooks cannot replace the real tool result or cause automatic
-re-execution. A pre-hook error denies execution by default. A post-hook error
-preserves the outcome and tells the model that the tool had already executed.
-
-For user-facing terminal and ACP turns, an optional `turn_end` section runs
-once after the entire model/tool loop (including cancellation or failure), not
-once per model response. It does not run for Explore subagent turns or local
-commands. For example:
+To run your notification hook once Loki finishes answering a prompt, add:
 
 ```ini
 [hook.turn_end.notify]
 command.0 = /home/me/bin/loki-notify
 cwd = /home/me
+# Optional: stop the notification program if it runs longer than 5 seconds.
+# timeout_ms = 5000
 ```
 
-Each command receives `{"event":"turn_end","reason":"completed",
-"cwd":"...","text":"..."}` on stdin. Hooks run in their configured `cwd`
-directory; the payload's `cwd` is the session shell cwd at turn end, reported
-as data, not the hook subprocess's working directory. `reason` may
-also be `cancelled`, `error`, or `max_loops`; `text` is the last returned
-assistant text, if any. For `reason: "error"`, the input also includes
-`error_type` and `error_message`. Event-reported errors use their event type
-(e.g. `stream_error` or `network_error`); unexpected turn exceptions use their
-exception class name (e.g. `RuntimeError`). The message is a string, or `null`
-when the event provides no message. If multiple failures occur, an unexpected
-exception takes precedence; otherwise the first error event supplies the details.
-These fields are absent for non-error outcomes. Transcript-save errors are not
-turn errors.
-Hooks run in order; their JSON stdout is validated but cannot change the
-completed turn. Failures are reported to stderr and do not change the result.
-There is **no default timeout** for turn-end hooks; set a positive `timeout_ms`
-on an entry if a limit is desired. With no `turn_end` entries, no hook process
-is started. Turn-end entries do not accept `tools`, `on_error`, or
-`workspace_side_effects`.
-Commands are indexed options, not shell strings; stdout is reserved for the
-single JSON response, while stderr remains diagnostic. Hook subprocesses
-receive a minimal environment without Loki API credentials. A hook with
-`workspace_side_effects = yes` must return `changed_paths` listing the files
-it changed.
+Use your own notification hook program in place of `loki-notify`. It runs after
+success, failure, or cancellation in the terminal and ACP. It does not run for
+local commands or internal subagents. A notification failure does not change
+the chat result. Without `timeout_ms`, Loki waits for the program to finish.
 
 ### Retrying failed model requests
 
-For long-running terminal and ACP conversations, the example retry hook tells
-Loki to wait and try again after a model-service failure. The same prompt stays
-active while Loki waits.
+Enable the bundled retry hook if you want Loki to keep your current prompt
+active through provider or network outages instead of making you resubmit it.
+This works in the terminal and ACP.
 
-Add this section to your `settings.ini`. Replace the placeholders with your
-Python executable and the filename of `contrib/hooks/retries.py`. The script
-uses only Python's standard library and can be copied elsewhere.
+Add this to `~/.config/loki/settings.ini`, replacing the paths with your Python
+executable, the bundled script, and an existing working directory. Then restart
+Loki or your ACP agent.
 
 ```ini
 [hook.turn_error.retry]
-command.0 = <python-executable>
-command.1 = <retry-script-filename>
-cwd = /home/me
+command.0 = /absolute/path/to/python3
+command.1 = /absolute/path/to/loki/contrib/hooks/retries.py
+cwd = /an/existing/directory
+
+# Optional: uncomment both lines to allow at most six retries per prompt.
+# command.2 = --max-retries
+# command.3 = 6
 ```
 
-The example's defaults are:
+By default:
 
-- Ordinary failures: start with a **5-second** delay.
-- Errors whose reported message contains `overload`: start with **10 minutes**.
-- Double the delay with each retry, up to **30 minutes**, then keep that delay.
-- **No retry-count limit.** Press Ctrl+C in the terminal or cancel the ACP
-  prompt to stop recovery.
+- Ordinary failures wait **5 seconds** before the first retry.
+- Recognized server-overload errors wait **10 minutes** before the first retry.
+- Waits double with each retry, up to **30 minutes**.
+- There is **no retry-count limit** unless you set `--max-retries`.
+- Recognized context-limit errors stop. The conversation needs to be smaller;
+  retrying does not shrink it or compact it automatically.
 
-Both schedules use the number of retries already made in the current turn;
-intermediate successful requests do not reset it. A provider's minimum retry
-wait, when available, takes precedence even if longer than 30 minutes. Run the
-script with `--help` to see its optional arguments.
+To change the waits, pass `--initial-delay`, `--overload-initial-delay`,
+`--multiplier`, or `--max-delay` as additional numbered command arguments, with
+the option and its value in separate entries. Delay values are seconds;
+`--multiplier` is the growth factor. Run the script with `--help` for all
+options. A provider's requested retry wait can exceed your chosen cap.
 
-The example retries reported API, connection, DNS, stream and provider errors,
-and failed or incomplete answers, including token-limit stops. It does not
-distinguish temporary failures from persistent ones: invalid credentials or
-an oversized conversation can keep failing until you cancel. Tool errors,
-model refusals, cancellation, local conversation-format errors and unexpected
-programming errors do not trigger the hook. Assistant text is not searched for
-error messages. Headless and Explore subagent runs do not use this hook.
+While waiting, Loki reports the failure reason and the next wait. In ACP, look
+in your client's agent/server logs for these messages. To stop retrying, press
+**Ctrl+C** in the terminal or **cancel the prompt** in your ACP client.
 
-Without a recovery hook, Loki retries only some temporary failures, such as
-connection resets or refusals, normally making up to three attempts. Automatic
-retries stop once answer or reasoning text has arrived. With the hook enabled,
-Loki asks it after each eligible failure rather than making three attempts
-first. Refreshing an expired login can add requests.
+Read the failure reason: waiting cannot fix invalid credentials, and some quota
+errors require waiting for an account reset or changing your account limits.
+This hook retries model requests, not failed shell commands or other tools.
+Retries can repeat generated text or provider work and may be billed again.
 
-Retries may be billed again and can repeat displayed text or server-side work.
-Completed local tools are not deliberately rerun, and incomplete tool calls are
-not executed. Retrying does not reset the turn's model-response limit. A broken
-hook or invalid decision ends recovery with the original failure. There is no
-default hook timeout; `timeout_ms` can set one.
+If Loki reports a hook error, check the Python and script paths and that `cwd`
+exists. A broken hook stops recovery rather than retrying itself.
 
-A configured `turn_end` hook runs once after the final outcome, not after each
-retry.
+To disable retries, remove the `[hook.turn_error.retry]` section and restart
+Loki or your ACP agent.
 
 ## Saved sessions
 

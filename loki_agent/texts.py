@@ -12,13 +12,19 @@ _SINGLE_LINE_CONTROL_TRANSLATIONS.update({
     code: f"\\x{code:02x}"
     for code in range(0x80, 0xa0)
 })
+# Surrogates are not terminal text. In particular, surrogateescape would turn
+# U+DC80..U+DCFF back into arbitrary bytes at the output-encoding boundary.
+_SINGLE_LINE_CONTROL_TRANSLATIONS.update({
+    code: f"\\u{code:04x}"
+    for code in range(0xd800, 0xe000)
+})
 _MULTILINE_CONTROL_TRANSLATIONS = dict(
     _SINGLE_LINE_CONTROL_TRANSLATIONS)
 del _MULTILINE_CONTROL_TRANSLATIONS[ord("\n")]
 
 
 def escape_terminal_text(text: str, *, multiline: bool) -> str:
-    """Neutralize terminal controls without classifying other Unicode."""
+    """Neutralize terminal controls and surrogates, preserving other Unicode."""
     if not isinstance(text, str):
         raise TypeError("terminal text must be a string")
     translations = (

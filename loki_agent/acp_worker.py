@@ -17,6 +17,7 @@ from . import (
     formats,
     loki,
     models as modelsdev,
+    recoveries,
     replays,
 )
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
@@ -1015,8 +1016,10 @@ class Worker:
                 return (
                     error.formatted()
                     if hasattr(error, "formatted") else str(error))
-            if kind in ["network_error", "stream_error",
-                        "transcript_error", "provider_error"]:
+            if kind == "network_error":
+                detail = recoveries.failure_fields(event)["error_message"]
+                return f"network error: {detail}"
+            if kind in ["stream_error", "transcript_error", "provider_error"]:
                 return f"{kind.replace('_', ' ')}: {event.get('error')}"
             if kind == "response_failed":
                 return (

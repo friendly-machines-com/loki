@@ -841,9 +841,14 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
     if cancel_event is not None and cancel_event.is_set():
         raise recoveries.Cancelled()
     try:
+        # Hook input may contain lossless filename surrogates or decoded
+        # provider/log strings. Raw UTF-8 cannot encode those: recovery would
+        # stop before policy ever runs. JSON escapes preserve the exact string
+        # for the hook's parser; this changes wire spelling, not lookup keys or
+        # the logical message. Do not repair/drop characters with encode errors.
         stdin_data = json.dumps(
             payload,
-            ensure_ascii=False,
+            ensure_ascii=True,
             separators=(",", ":"),
         ).encode("utf-8")
     except (TypeError, ValueError) as error:

@@ -146,13 +146,43 @@ class StreamProtocolError(ProtocolError):
     def __init__(self, message, payload=None):
         super().__init__(message, payload=payload)
 
+    @classmethod
+    def from_provider_error(cls, payload):
+        """Keep facts from explicit Chat, Messages and Responses SSE errors.
+
+        The ordinary constructor also handles broken framing/transport. Its
+        diagnostic payload is not proof of a native API error. Only producers
+        that recognized an error event use this constructor; otherwise parsing
+        a generic payload here could invent a context/overload classification.
+        Keep the same exception type and text so fixed retry behavior does not
+        change, but let the configured hook see facts instead of parsing text.
+        The existing ProtocolError snapshot owns the error details throughout.
+        """
+        error = cls(_stream_error_text(payload), payload=payload)
+        details = error.payload.get("error") or error.payload
+        fields = provider_error_fields(details)
+        error.code = fields.get("provider_code")
+        error.provider_error_type = fields.get("provider_error_type")
+        # Responses uses type="error" for the flat SSE event envelope, unlike
+        # Anthropic's nested error.type. It is not a failure classification;
+        # reporting it as an error type would conflate two different protocol
+        # fields. The original event type remains in error_details.
+        if details is error.payload and details.get("type") == "error":
+            error.provider_error_type = None
+        error.category = fields.get("error_category")
+        error.error_details = details
+        error.error_message = fields.get("error_message", str(error))
+        error.retry_after = _response_retry_after(error.code, error.error_message)
+        return error
+
 
 class ResponseApiError(ProtocolError):
     """A provider's terminal response.failed, not malformed/interrupted SSE.
 
     response_failed_error is the one classifier for stream accumulators and
     decoded-response handling. code is the provider string; category describes
-    it for diagnostics. retryable governs the EXISTING fixed request replay
+    it for diagnostics; unknown codes have no category. A retry decision is not
+    an error category. retryable governs the EXISTING fixed request replay
     policy before output, not eligibility for a user-selected recovery policy.
     retry_after is an optional relative minimum in seconds from that failed
     response: fixed request backoff and TurnRecovery both consume it. Keeping
@@ -161,13 +191,19 @@ class ResponseApiError(ProtocolError):
     """
 
     def __init__(
-            self, message, *, code=None, category="retryable",
-            retryable=False, retry_after=None, payload=None):
+            self, message, *, code=None, category=None,
+            retryable=False, retry_after=None, payload=None,
+            provider_error_type=None):
         self.code = code
         self.category = category
         self.retryable = retryable
         self.retry_after = retry_after
+        self.provider_error_type = provider_error_type
         super().__init__(message, payload=payload)
+        # ProtocolError already owns a snapshot. Expose only its error portion
+        # to recovery policy, not the whole response or a second mutable copy.
+        response = self.payload.get("response") if isinstance(self.payload, dict) else None
+        self.error_details = response.get("error") if isinstance(response, dict) else None
 
     def formatted(self):
         label = "Responses API error"
@@ -439,6 +475,46 @@ def _response_retry_after(code, message):
     return delay
 
 
+# One owner for native error categories and the existing fixed quick-retry
+# decisions. HTTP and SSE adapters share the facts; user hook policy must not
+# inherit the quick-retry decision as its own eligibility rule.
+_RESPONSE_ERROR_CLASSES = {
+    "context_length_exceeded": ("context_window", False),
+    "insufficient_quota": ("quota", False),
+    "usage_not_included": ("subscription", False),
+    "cyber_policy": ("cyber_policy", False),
+    "invalid_prompt": ("invalid_request", False),
+    "bio_policy": ("invalid_request", False),
+    "server_is_overloaded": ("overloaded", False),
+    "slow_down": ("overloaded", False),
+}
+
+
+def provider_error_fields(error):
+    """Parse an error envelope into facts, not retry authorization.
+
+    HTTP errors and native Responses failures share this extraction. Only named
+    fields cross into the hook envelope; provider data cannot replace its event,
+    retry count, or other caller-owned fields.
+    """
+    fields = {}
+    if not isinstance(error, dict):
+        return fields
+    for source, target in [
+            ("code", "provider_code"),
+            ("type", "provider_error_type"),
+            ("message", "error_message")]:
+        value = error.get(source)
+        if isinstance(value, str) and value:
+            fields[target] = value
+    classification = _RESPONSE_ERROR_CLASSES.get(fields.get("provider_code"))
+    if classification is not None:
+        fields["error_category"] = classification[0]
+    elif fields.get("provider_error_type") == "overloaded_error":
+        fields["error_category"] = "overloaded"
+    return fields
+
+
 def response_failed_error(event):
     """Classify native failure data for SSE and decoded-response consumers.
 
@@ -449,25 +525,11 @@ def response_failed_error(event):
     """
     response = event.get("response")
     error = response.get("error") if isinstance(response, dict) else None
-    code = error.get("code") if isinstance(error, dict) else None
-    message = error.get("message") if isinstance(error, dict) else None
-    if not isinstance(code, str):
-        code = None
-    if not isinstance(message, str) or not message:
-        message = "the provider returned response.failed"
-
-    categories = {
-        "context_length_exceeded": ("context_window", False),
-        "insufficient_quota": ("quota", False),
-        "usage_not_included": ("subscription", False),
-        "cyber_policy": ("cyber_policy", False),
-        "invalid_prompt": ("invalid_request", False),
-        "bio_policy": ("invalid_request", False),
-        "server_is_overloaded": ("overloaded", False),
-        "slow_down": ("overloaded", False),
-    }
-    category, retryable = categories.get(
-        code, ("retryable", True))
+    fields = provider_error_fields(error)
+    code = fields.get("provider_code")
+    message = fields.get("error_message", "the provider returned response.failed")
+    category, retryable = _RESPONSE_ERROR_CLASSES.get(
+        code, (None, True))
     return ResponseApiError(
         message,
         code=code,
@@ -475,6 +537,7 @@ def response_failed_error(event):
         retryable=retryable,
         retry_after=_response_retry_after(code, message),
         payload=event,
+        provider_error_type=fields.get("provider_error_type"),
     )
 
 
@@ -1002,8 +1065,7 @@ class OpenAIChatStreamAccumulator:
             raise StreamProtocolError(
                 "OpenAI Chat stream event must be an object")
         if chunk.get("error"):
-            raise StreamProtocolError(
-                _stream_error_text(chunk["error"]), payload=chunk)
+            raise StreamProtocolError.from_provider_error(chunk)
         for key in [
                 "id", "object", "created", "model", "system_fingerprint",
                 "service_tier", "usage"]:
@@ -1300,10 +1362,7 @@ class AnthropicMessagesStreamAccumulator:
                 "Anthropic stream event must be an object")
         event_type = data.get("type") or event.event
         if event_type == "error":
-            raise StreamProtocolError(
-                _stream_error_text(data.get("error") or data),
-                payload=data,
-            )
+            raise StreamProtocolError.from_provider_error(data)
         if event_type == "message_start":
             message = data.get("message")
             if not isinstance(message, dict):
@@ -1670,9 +1729,7 @@ class OpenAIResponsesStreamAccumulator:
 
     def finish(self):
         if self.stream_error is not None:
-            raise StreamProtocolError(
-                _stream_error_text(self.stream_error),
-                payload=self.stream_error)
+            raise StreamProtocolError.from_provider_error(self.stream_error)
         if self.completed_response is None:
             if self.incomplete_response is not None:
                 return self._finish_response(self.incomplete_response)

@@ -157,6 +157,18 @@ class BoundedRendererTests(unittest.TestCase):
             terminals.render_markdown(logical, style=True),
         )
 
+    def test_surrogates_escape_in_batch_and_split_stream_without_removing_styles(self):
+        for style in [False, True]:
+            text = "**bold** \ud800\udc9b\udfff"
+            rendered = terminals.render_markdown(text, style=style)
+            expected = (f"{BOLD}bold{RESET}" if style else "**bold**") + " \\ud800\\udc9b\\udfff"
+            self.assertEqual(rendered, expected)
+            for split in range(len(text) + 1):
+                renderer = terminals.BoundedMarkdownAnsi(style=style)
+                self.assertEqual(self.collect(renderer, [text[:split], text[split:]]), expected)
+            self.assertEqual(rendered.encode("utf-8", "strict"),
+                             rendered.encode("utf-8", "surrogateescape"))
+
     def test_non_ansi_mode_still_neutralizes_source_controls(self):
         renderer = terminals.BoundedMarkdownAnsi(style=False)
 

@@ -1539,6 +1539,16 @@ class TerminalTextOutputTests(unittest.TestCase):
         self.assertNotIn("\r", displayed)
         self.assertNotIn("\x00", displayed)
 
+    def test_surrogates_are_printable_before_output_encoding(self):
+        logical = "\ud800\udc9b\udfff"
+        for multiline in [False, True]:
+            out = io.StringIO()
+            terminals.terminal.write_text(logical, multiline=multiline, file=out)
+            self.assertEqual(out.getvalue(), "\\ud800\\udc9b\\udfff")
+            self.assertEqual(out.getvalue().encode("utf-8", "strict"),
+                             out.getvalue().encode("utf-8", "surrogateescape"))
+            self.assertNotIn(b"\x9b", out.getvalue().encode("utf-8", "surrogateescape"))
+
     def test_writer_preserves_unicode_outside_terminal_control_ranges(self):
         logical = (
             "e\u0301 \u6a21\u578b "

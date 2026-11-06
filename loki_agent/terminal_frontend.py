@@ -635,7 +635,8 @@ def _terminal_agent_event(event: dict, *, ui_settings=None):
         print()
         terminal.set_background_color(ERROR_COLOR)
         print(f"{computer}: NETWORK ERROR: ", end="")
-        terminal.write_text(event["error"], multiline=True)
+        terminal.write_text(
+            recoveries.failure_fields(event)["error_message"], multiline=True)
         terminal.reset_colors_and_flags()
         print()
     elif kind == "transcript_error":

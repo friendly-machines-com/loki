@@ -2300,12 +2300,12 @@ class StreamAccumulatorTests(unittest.TestCase):
                 '"output":[]}}'))
 
         self.assertEqual(raised.exception.code, "server_error")
-        self.assertEqual(raised.exception.category, "retryable")
+        self.assertIsNone(raised.exception.category)
         self.assertTrue(raised.exception.retryable)
         self.assertEqual(
             raised.exception.payload["response"]["id"], "resp_1")
 
-    def test_response_failure_classes_match_codex(self):
+    def test_response_failure_categories_are_separate_from_fixed_retry_decisions(self):
         cases = [
             ("context_length_exceeded", "context_window", False),
             ("insufficient_quota", "quota", False),
@@ -2315,7 +2315,7 @@ class StreamAccumulatorTests(unittest.TestCase):
             ("bio_policy", "invalid_request", False),
             ("server_is_overloaded", "overloaded", False),
             ("slow_down", "overloaded", False),
-            ("unknown_transient_error", "retryable", True),
+            ("unknown_transient_error", None, True),
         ]
         for code, category, retryable in cases:
             with self.subTest(code=code):

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import math
 import sys
 
-from . import formats
+from . import formats, texts
 
 
 # model_requests.failure_event classifies request exceptions and the decoded
@@ -81,14 +81,23 @@ def failure_fields(failure):
     status/protocol_data/stop_reason after preserving a real response in history.
     Neither producer's data becomes executable identity or request authority.
 
-    Both turn_error policy and turn_end notification consume error_type and the
-    nullable error_message. incomplete_reason preserves a native token-limit
-    reason, never guessed from assistant text. retry_after_seconds is an existing
-    provider minimum, not a newly parsed header or a policy-generated backoff;
-    TurnRecovery enforces it, and policy may inspect it before choosing to stop.
+    Both turn_error policy and turn_end notification need the provider's facts,
+    not just str(exception): ApiError's string is only an HTTP summary, and it
+    loses the body explaining quota limits; it also loses native codes needed
+    to distinguish context overflow from overload. Serialize named facts here,
+    keeping the original exception for final frontend formatting. Raw provider
+    dictionaries stay nested and cannot supply event, retry_count, or authority.
+    The built-in retryable flag is deliberately NOT a hook eligibility gate.
+
+    incomplete_reason preserves a native token-limit reason, never guessed from
+    assistant text. retry_after_seconds is this failure's provider minimum, not
+    a generated backoff or a lookup in the saved status display. TurnRecovery
+    enforces it only after the hook elects to retry.
     """
     cause = failure.get("error")
-    detail = cause
+    detail = getattr(cause, "error_message", cause)
+    if isinstance(cause, OSError) and not str(cause):
+        detail = f"{type(cause).__name__} (errno={cause.errno!r}, no OS message)"
     protocol_data = failure.get("protocol_data")
     native = (protocol_data.get(formats.OPENAI_RESPONSES)
               if isinstance(protocol_data, dict) else None)
@@ -107,6 +116,34 @@ def failure_fields(failure):
         "error_type": failure["type"],
         "error_message": str(detail) if detail is not None else None,
     }
+    for attribute, name in [
+            ("code", "provider_code"),
+            ("provider_error_type", "provider_error_type"),
+            ("category", "error_category")]:
+        value = getattr(cause, attribute, None)
+        if isinstance(value, str) and value:
+            fields[name] = value
+    status = getattr(cause, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        fields["http_status"] = status
+    # HTTP delivery errors wrap the original OSError in .cause; interrupted
+    # stream bodies retain it through raise-from. Stringifying either wrapper
+    # loses errno. Follow those existing typed links without changing the
+    # failure kind or guessing an OS error number from its diagnostic text.
+    network_cause = cause if isinstance(cause, OSError) else getattr(cause, "__cause__", None)
+    if isinstance(network_cause, OSError):
+        underlying = getattr(network_cause, "cause", None)
+        if network_cause.errno is None and isinstance(underlying, OSError):
+            network_cause = underlying
+        number = network_cause.errno
+        if isinstance(number, int) and not isinstance(number, bool):
+            fields["network_errno"] = number
+    details = getattr(cause, "error_details", None)
+    if details is not None:
+        fields["error_details"] = details
+    rate_headers = getattr(cause, "rate_limit_headers", None)
+    if rate_headers:
+        fields["rate_limit_headers"] = rate_headers
     if failure["type"] == "response_incomplete":
         fields["incomplete_reason"] = (
             incomplete_reason if isinstance(incomplete_reason, str) else None)
@@ -118,6 +155,28 @@ def failure_fields(failure):
         except OverflowError:
             pass
     return fields
+
+
+def _retry_notice(delay, fields):
+    """Explain a pending retry on the shared terminal/ACP stderr channel.
+
+    Final error rendering cannot help while an unlimited hook keeps retrying:
+    it may never run. Print the cause before each wait instead. This core module
+    must not import the terminal frontend (ACP has no terminal); the shared
+    literal-text escape boundary neutralizes provider controls and surrogates
+    before stderr encoding, without changing the hook's original input.
+    """
+    parts = [f"Retrying in {delay:g} seconds."]
+    for name in ["error_type", "error_message", "http_status", "provider_code",
+                 "provider_error_type", "error_category", "network_errno",
+                 "incomplete_reason"]:
+        if name in fields:
+            parts.append(f"{name}={fields[name]!r}")
+    if fields.get("response_saved"):
+        parts.append("The previous response was saved.")
+    elif fields.get("output_started"):
+        parts.append("The previous response was interrupted.")
+    return texts.escape_terminal_text(" ".join(parts), multiline=False)
 
 
 class TurnRecovery:
@@ -157,7 +216,8 @@ class TurnRecovery:
             self._finished = True
             raise Cancelled()
 
-    async def retry(self, failure):
+    async def retry(self, failure, *, recovery_point="request_replay",
+                    output_started=False, response_saved=False):
         self._check_cancelled()
         if self._finished:
             return False
@@ -165,6 +225,13 @@ class TurnRecovery:
             raise ValueError("recovery requires a model failure")
         try:
             fields = failure_fields(failure)
+            # Request executors can replay an unchanged prepared request; the
+            # history owner can instead resample after an interrupted or saved
+            # response. Policy needs that distinction, but cannot fabricate it
+            # from provider text or take ownership of either operation.
+            fields.update(recovery_point=recovery_point,
+                          output_started=output_started,
+                          response_saved=response_saved)
             decision = await self._policy({
                 "event": "turn_error", "retry_count": self._retry_count,
                 **fields,
@@ -178,7 +245,7 @@ class TurnRecovery:
             # A policy's generated-delay cap must not shorten a provider's
             # existing minimum. One owner applies this rule to both borrowers.
             delay = max(decision.delay_seconds, fields.get("retry_after_seconds", 0))
-            print(f"Retrying in {delay:g} seconds.", file=sys.stderr)
+            print(_retry_notice(delay, fields), file=sys.stderr, flush=True)
             try:
                 await asyncio.wait_for(self._cancel_event.wait(), timeout=delay)
             except asyncio.TimeoutError:

@@ -8,6 +8,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -15,6 +16,8 @@ import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pprint import pformat
 
 from . import authentications, connections, formats, http_client, protocols, recoveries, sse
@@ -94,8 +97,46 @@ class CodexTurnState:
             self.value = value
 
 
+def _http_retry_after(headers):
+    """Retain the server's HTTP wait minimum for user-turn recovery.
+
+    Native Responses wait hints do not cover an HTTP 429/503 rejection, and
+    ApiError previously discarded these headers. The status display is not an
+    alternative: its saved observations may belong to a different response.
+    Use only this failure's header; malformed/nonfinite values supply no wait
+    rather than authorizing an invalid or infinite sleep.
+    """
+    value = headers.get("retry-after")
+    if not isinstance(value, str):
+        return None
+    value = value.strip(" \t")
+    try:
+        if value and value.isascii() and value.isdecimal():
+            delay = float(value)
+        else:
+            if any(ord(character) < 32 or ord(character) == 127 for character in value):
+                return None
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            delay = max(0, deadline.timestamp() - time.time())
+        return delay if math.isfinite(delay) else None
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
 class ApiError(Exception):
-    def __init__(self, request_url: str, status: int, reason: str, body_text: str):
+    """One failed HTTP response, retained for rendering and recovery policy.
+
+    str(error) intentionally stays the short status summary. A hook deciding
+    whether to wait needs the native context/quota code and body explanation,
+    so retain those parsed facts rather than making policy parse display text.
+    The error owns this response's body and wait hints; neither credentials nor
+    the unrelated saved response-header store enter the hook payload.
+    """
+
+    def __init__(self, request_url: str, status: int, reason: str, body_text: str,
+                 *, headers=None):
         self.request_url = request_url
         self.status = status
         self.reason = reason
@@ -104,6 +145,34 @@ class ApiError(Exception):
             self.body = json.loads(body_text) if body_text else None
         except json.JSONDecodeError:
             self.body = None
+        details = self.body.get("error", self.body) if isinstance(self.body, dict) else self.body
+        self.error_details = details if details is not None else body_text
+        fields = protocols.provider_error_fields(details)
+        self.code = fields.get("provider_code")
+        self.provider_error_type = fields.get("provider_error_type")
+        self.category = fields.get("error_category")
+        self.error_message = fields.get("error_message") or (
+            details if isinstance(details, str) and details else body_text or self.summary())
+        headers = headers or {}
+        waits = [_http_retry_after(headers),
+                 protocols._response_retry_after(self.code, self.error_message)]
+        self.retry_after = max((wait for wait in waits
+                                if isinstance(wait, int | float)
+                                and math.isfinite(wait) and wait >= 0), default=None)
+        # Advisory rate-limit facts, not authority to retry or mandatory waits.
+        # These come only from this failed response, not the status store.
+        self.rate_limit_headers = {
+            name: value for name, value in headers.items()
+            if isinstance(name, str) and isinstance(value, str)
+            and name in {
+                "x-codex-primary-used-percent", "x-codex-secondary-used-percent",
+                "x-codex-primary-window-minutes", "x-codex-secondary-window-minutes",
+                "x-codex-primary-reset-at", "x-codex-secondary-reset-at",
+                "x-ratelimit-limit-requests", "x-ratelimit-limit-tokens",
+                "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens",
+                "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
+            }
+        }
         super().__init__(self.summary())
 
     def summary(self) -> str:
@@ -127,6 +196,49 @@ class ApiError(Exception):
 
 class StreamingApiError(ApiError):
     def formatted(self) -> str:
+        # Rationale: retain the conditional opt-out hint on streaming HTTP failures:
+        # API compatibility does not establish streaming capability. A backend
+        # may reject streaming while remaining usable without it, so the error
+        # must expose the operator's non-streaming recovery option.
+        #
+        # Protocol contracts checked on 2026-11-05:
+        # - Anthropic Messages (POST /v1/messages): stream is optional; true
+        #   selects SSE. HTTP 400 / invalid_request_error describes invalid
+        #   request format/content, not specifically unsupported streaming.
+        #   The checked docs specify no dedicated streaming-unsupported code.
+        # - OpenAI Chat Completions (POST /v1/chat/completions): stream is
+        #   optional, defaults to false, and selects SSE when true. Parameter
+        #   support can differ by model. The checked docs specify no particular
+        #   status/code combination for unsupported streaming.
+        # - OpenAI Responses (POST /v1/responses): stream is optional, defaults
+        #   to false, and selects typed SSE events when true. An SSE error event
+        #   does not establish unsupported streaming; the checked docs specify
+        #   no dedicated streaming-unsupported rejection code.
+        #
+        # Those official APIs support streaming, but third-party "compatible"
+        # implementations need not implement every optional feature or share
+        # error codes. HTTP 400 alone is not a capability verdict, and parsing
+        # arbitrary provider messages would not supply a reliable contract.
+        # Keep the workaround conditional rather than requiring a guessed
+        # diagnosis: its presence on a 429/503 does not claim streaming caused
+        # that failure, and the hint does not determine retry eligibility.
+        #
+        # The approved fallback is manual: report the actual error and suggest
+        # LOKI_STREAM=0. Do not silently change modes and resend inference;
+        # that can duplicate generation/output. If the original response is
+        # ordinary JSON rather than SSE, accept it WITHOUT a second request.
+        # Any narrowing/removal must preserve the explicit recovery guidance.
+        # Regression contract: HTTP 400 with "stream unsupported" includes
+        # this hint; an ordinary JSON response causes no resubmission.
+        #
+        # Sources for the protocol facts (absence here does not mean no
+        # implementation can ever emit its own streaming-unsupported code):
+        # <https://platform.claude.com/docs/en/api/messages/create>
+        # <https://platform.claude.com/docs/en/api/errors>
+        # <https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create>
+        # <https://developers.openai.com/api/reference/resources/responses/methods/create>
+        # <https://developers.openai.com/api/docs/guides/streaming-responses>
+        # <https://developers.openai.com/api/docs/guides/error-codes>
         return (
             super().formatted()
             + "\nStreaming was requested. If this server does not support "
@@ -168,7 +280,6 @@ def failure_event(error):
         kind = "provider_error"
     elif isinstance(error, OSError):
         kind = "network_error"
-        error = str(error) or f"{type(error).__name__}() (errno={error.errno!r}, no OS message)"
     else:
         return None
     return {"type": kind, "error": error}
@@ -415,7 +526,8 @@ async def async_provider_request(
             continue
         response_text = http_client.decode_text(response.body, response.headers)
         if response.status >= 400:
-            error = ApiError(request_url, response.status, response.reason, response_text)
+            error = ApiError(request_url, response.status, response.reason, response_text,
+                             headers=response.headers)
             if recovery is not None and await recovery.retry(failure_event(error)):
                 continue
             raise error
@@ -578,12 +690,13 @@ async def _async_chat_stream_request_once(
             except OSError as e:
                 if first_chunk:
                     raise protocols.StreamProtocolError(
-                        f"stream interrupted after output began: {e}") from e
+                        f"HTTP response body interrupted: {e}") from e
                 raise
             response_text = http_client.decode_text(
                 response_body, response.headers)
             raise StreamingApiError(
-                request_url, response.status, response.reason, response_text)
+                request_url, response.status, response.reason, response_text,
+                headers=response.headers)
 
         if _stream_body_kind(
                 response.header("content-type"), first_chunk) == "json":
@@ -593,7 +706,7 @@ async def _async_chat_stream_request_once(
             except OSError as e:
                 if first_chunk:
                     raise protocols.StreamProtocolError(
-                        f"stream interrupted after output began: {e}") from e
+                        f"HTTP response body interrupted: {e}") from e
                 raise
             try:
                 return protocols.ProviderResponse(
@@ -664,7 +777,7 @@ async def _async_chat_stream_request_once(
         except OSError as e:
             if received_body:
                 raise protocols.StreamProtocolError(
-                    f"stream interrupted after output began: {e}") from e
+                    f"HTTP response body interrupted: {e}") from e
             raise
         return protocols.ProviderResponse(
             accumulator.finish(),
@@ -749,6 +862,10 @@ async def async_chat_stream_request(
             raise recoveries.Cancelled()
         except (ApiError, protocols.ResponseApiError, protocols.StreamProtocolError,
                 protocols.ProtocolError, OSError) as exc:
+            # Preserve observed model-output progress when the same exception
+            # reaches the history owner. HTTP body bytes alone are not output,
+            # and a formatted error string cannot communicate that distinction.
+            exc.output_started = output_started
             if (isinstance(exc, StreamingApiError)
                     and exc.status == 401
                     and lease is not None

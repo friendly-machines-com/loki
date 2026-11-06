@@ -7109,41 +7109,39 @@ class StreamingCompletionTests(unittest.TestCase):
                     model_requests._stream_body_kind(content_type, chunk), expected)
 
     def test_transport_failure_after_first_event_is_not_retried(self):
-        calls = []
-        deltas = []
+        # Receiving HTTP/SSE bytes is not the same as receiving model text.
+        # Preserve fixed-policy no-replay behavior in both cases, but expose
+        # actual model progress to recovery rather than inferring it from bytes.
+        for delta in [{"content": "partial"}, {"role": "assistant"}]:
+            with self.subTest(delta=delta):
+                calls = []
+                deltas = []
 
-        async def response_body():
-            yield (
-                b'data: {"choices":[{"index":0,'
-                b'"delta":{"content":"partial"}}]}\n\n')
-            raise ConnectionResetError("reset")
+                async def response_body():
+                    yield ("data: " + json.dumps({"choices": [
+                        {"index": 0, "delta": delta}]}) + "\n\n").encode()
+                    raise ConnectionResetError("reset")
 
-        @contextlib.asynccontextmanager
-        async def fake_http_stream(method, request_url, **kwargs):
-            calls.append(request_url)
-            yield model_requests.http_client.HttpStreamResponse(
-                request_url,
-                200,
-                "OK",
-                {"content-type": "text/event-stream"},
-                response_body(),
-            )
+                @contextlib.asynccontextmanager
+                async def fake_http_stream(method, request_url, **kwargs):
+                    calls.append(request_url)
+                    yield model_requests.http_client.HttpStreamResponse(
+                        request_url, 200, "OK",
+                        {"content-type": "text/event-stream"}, response_body())
 
-        with mock.patch(
-                'loki_agent.model_requests.http_client.async_http_stream',
-                side_effect=fake_http_stream):
-            with self.assertRaisesRegex(
-                    protocols.StreamProtocolError,
-                    "after output began"):
-                asyncio.run(loki.async_chat_completion(
-                    [formats.message_item("user", "hello")],
-                    tools=[],
-                    on_text_delta=deltas.append,
-                ))
+                with mock.patch(
+                        'loki_agent.model_requests.http_client.async_http_stream',
+                        side_effect=fake_http_stream):
+                    with self.assertRaisesRegex(
+                            protocols.StreamProtocolError,
+                            "HTTP response body interrupted") as raised:
+                        asyncio.run(loki.async_chat_completion(
+                            [formats.message_item("user", "hello")], tools=[],
+                            on_text_delta=deltas.append))
 
-        self.assertEqual(calls, [
-            "http://localhost:8000/v1/chat/completions"])
-        self.assertEqual(deltas, ["partial"])
+                self.assertEqual(calls, ["http://localhost:8000/v1/chat/completions"])
+                self.assertEqual(deltas, ["partial"] if "content" in delta else [])
+                self.assertEqual(raised.exception.output_started, bool(deltas))
 
     def test_cancel_closes_stream_without_final_response(self):
         cancelled = {"value": False}

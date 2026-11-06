@@ -16,7 +16,7 @@ from loki_entrypoints import child_environment, configure_container
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 from settings_fixtures import write_user_settings
 from loki_agent import acps, connections, formats, http_client, loki, model_requests
-from loki_agent import protocols, recoveries, settings, terminal_frontend, tool_runtime
+from loki_agent import protocols, recoveries, settings, sse, terminal_frontend, tool_runtime
 from loki_agent.acp_worker import Worker
 from loki_agent.sessions import Session
 
@@ -155,8 +155,10 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                     content = json.dumps(content).encode()
                 status = reply.get("status", 200)
                 kind = "text/event-stream" if stream else "application/json"
+                extra = "".join(f"{name}: {value}\r\n"
+                                for name, value in reply.get("headers", {}).items())
                 writer.write((f"HTTP/1.1 {status} Test\r\nContent-Type: {kind}\r\n"
-                              f"Content-Length: {len(content)}\r\nConnection: close\r\n\r\n").encode() + content)
+                              f"Content-Length: {len(content)}\r\n{extra}Connection: close\r\n\r\n").encode() + content)
                 await writer.drain()
             finally:
                 writer.close()
@@ -185,6 +187,185 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             f"http://127.0.0.1:{port}/responses", protocols.OPENAI_RESPONSES,
             model="test", stream=stream)
         return requests
+
+    def test_hook_facts_preserve_native_codes_http_bodies_and_errno(self):
+        details = {"code": "context_length_exceeded", "message": "Input is too large",
+                   "type": "invalid_request_error", "event": "not authority"}
+        native = protocols.response_failed_error({"response": {"error": details}})
+        http = model_requests.ApiError("https://example.test/responses", 400, "Bad Request",
+                                       json.dumps({"error": details}))
+        decoded = formats.openai_responses_response_to_items({
+            "object": "response", "status": "failed", "output": [], "error": details})
+        for error in [native, http, decoded]:
+            fields = recoveries.failure_fields(model_requests.failure_event(error))
+            self.assertEqual(fields["provider_code"], "context_length_exceeded")
+            self.assertEqual(fields["error_category"], "context_window")
+            self.assertEqual(fields["error_message"], "Input is too large")
+            self.assertEqual(fields["provider_error_type"], "invalid_request_error")
+            self.assertEqual(fields["error_details"], details)
+            self.assertNotIn("retryable", fields)
+            self.assertNotIn("event", fields)
+        for body in ["You've reached your 5-hour usage limit.",
+                     '{"error":{"message":"Usage limit reached","code":"insufficient_quota"}}']:
+            error = model_requests.ApiError("https://example.test/responses", 429,
+                                            "Too Many Requests", body)
+            fields = recoveries.failure_fields(model_requests.failure_event(error))
+            self.assertEqual(fields["http_status"], 429)
+            self.assertIn("limit", fields["error_message"])
+        unknown = protocols.response_failed_error({"response": {"error": {
+            "code": "new_provider_error", "message": "Unknown failure"}}})
+        unknown_fields = recoveries.failure_fields(model_requests.failure_event(unknown))
+        self.assertEqual(unknown_fields["provider_code"], "new_provider_error")
+        self.assertNotIn("error_category", unknown_fields)
+        network = socket.gaierror(-3, "Temporary failure in name resolution")
+        failure = model_requests.failure_event(network)
+        self.assertIs(failure["error"], network)
+        self.assertEqual(recoveries.failure_fields(failure)["network_errno"], -3)
+        delivery = http_client.HttpRequestDeliveryError(network, False)
+        stream = protocols.StreamProtocolError("HTTP response body interrupted")
+        stream.__cause__ = delivery
+        for wrapped in [delivery, stream]:
+            fields = recoveries.failure_fields(model_requests.failure_event(wrapped))
+            self.assertEqual(fields["network_errno"], -3)
+        empty = recoveries.failure_fields(model_requests.failure_event(OSError()))
+        self.assertIn("no OS message", empty["error_message"])
+        self.assertIn("no OS message", Worker._turn_failure([
+            model_requests.failure_event(OSError())]))
+
+    async def test_native_stream_error_events_keep_facts_in_each_protocol(self):
+        for constructor, payload, code, category in [
+                (protocols.OpenAIChatStreamAccumulator, {"error": {
+                    "code": "context_length_exceeded", "type": "invalid_request_error",
+                    "message": "too large"}}, "context_length_exceeded", "context_window"),
+                (protocols.AnthropicMessagesStreamAccumulator, {"type": "error", "error": {
+                    "type": "overloaded_error", "message": "busy"}}, None, "overloaded"),
+                (protocols.OpenAIResponsesStreamAccumulator, {
+                    "type": "error", "code": "context_length_exceeded", "message": "too large"},
+                    "context_length_exceeded", "context_window"),
+                (protocols.OpenAIResponsesStreamAccumulator, {
+                    "type": "error", "code": None, "message": "Overloaded"}, None, None)]:
+            with self.subTest(protocol=constructor.__name__):
+                accumulator = constructor(lambda text: None)
+                decoder = sse.SseDecoder()
+                with self.assertRaises(protocols.StreamProtocolError) as raised:
+                    for event in decoder.feed(("event: error\ndata: " + json.dumps(payload) + "\n\n").encode()):
+                        accumulator.feed(event)
+                    accumulator.finish()
+                failure = model_requests.failure_event(raised.exception)
+                fields = recoveries.failure_fields(failure)
+                self.assertEqual(Worker._turn_failure([failure]),
+                                 f"stream error: {raised.exception}")
+                self.assertEqual(fields.get("provider_code"), code)
+                self.assertEqual(fields.get("error_category"), category)
+                if "error" not in payload:
+                    self.assertNotIn("provider_error_type", fields)
+                details = payload.get("error") or payload
+                self.assertEqual(fields["error_details"], details)
+                self.assertEqual(fields["error_message"], details["message"])
+                decision = await self.policy([]).recover_turn({
+                    "event": "turn_error", "retry_count": 0, **fields,
+                }, cancel_event=asyncio.Event())
+                self.assertEqual(decision, recoveries.RetryDecision(
+                    None if category == "context_window" else 600 if category == "overloaded" else 5))
+        malformed = protocols.StreamProtocolError("malformed event", payload={
+            "code": "context_length_exceeded", "message": "not a native error event"})
+        fields = recoveries.failure_fields(model_requests.failure_event(malformed))
+        self.assertNotIn("provider_code", fields)
+        self.assertEqual(fields["error_message"], "malformed event")
+
+    def test_http_wait_hints_and_reset_facts_survive_without_credentials(self):
+        with mock.patch.object(model_requests.time, "time", return_value=0):
+            for header in ["60", "Thu, 01 Jan 1970 00:01:00 GMT"]:
+                error = model_requests.ApiError(
+                    "https://example.test/responses", 429,
+                    "Too Many Requests", "Usage limit reached", headers={
+                        "retry-after": header, "x-codex-primary-reset-at": "12345",
+                        "authorization": "must-not-cross", "set-cookie": "must-not-cross"})
+                fields = recoveries.failure_fields(model_requests.failure_event(error))
+                self.assertEqual(fields["retry_after_seconds"], 60)
+                self.assertEqual(fields["rate_limit_headers"],
+                                 {"x-codex-primary-reset-at": "12345"})
+                self.assertNotIn("must-not-cross", json.dumps(fields))
+        for header in ["-1", "NaN", "inf", "1.5", "9" * 500, "60\r\nInjected: yes"]:
+            error = model_requests.ApiError(
+                "https://example.test/responses", 429,
+                "Too Many Requests", "Usage limit reached", headers={"retry-after": header})
+            fields = recoveries.failure_fields(model_requests.failure_event(error))
+            self.assertNotIn("retry_after_seconds", fields)
+        error = model_requests.ApiError(
+            "https://example.test/responses", 429,
+            "Too Many Requests", "You've reached your 5-hour usage limit.")
+        self.assertNotIn("retry_after_seconds",
+                         recoveries.failure_fields(model_requests.failure_event(error)))
+
+    async def test_example_policy_uses_facts_without_reinterpreting_prose(self):
+        for facts, expected in [
+                ({"provider_code": "context_length_exceeded"}, None),
+                ({"error_category": "context_window"}, None),
+                ({"provider_code": "server_is_overloaded", "error_message": "Busy"}, 600),
+                ({"provider_error_type": "overloaded_error", "error_message": "Busy"}, 600),
+                ({"provider_code": "invalid_prompt", "error_message": "word overload"}, 5),
+                ({"error_message": "overloaded"}, 5),
+                ({"error_message": "context_length_exceeded"}, 5)]:
+            decision = await self.policy([]).recover_turn({
+                "event": "turn_error", "retry_count": 0, "error_type": "api_error", **facts,
+            }, cancel_event=asyncio.Event())
+            self.assertEqual(decision, recoveries.RetryDecision(expected))
+
+    async def test_context_http_failure_stops_example_but_custom_hook_can_retry(self):
+        for stream in [False, True]:
+            with self.subTest(stream=stream):
+                failure = {"status": 400, "body": {"error": {
+                    "code": "context_length_exceeded", "message": "Input is too large"}}}
+                requests = await self.serve([failure, {"body": response()}], stream=stream)
+                events = []
+                self.assertEqual(await self.run_loop(stream_chat=stream, on_event=events.append), "")
+                self.assertEqual(len(requests), 1)
+                self.assertEqual([event["type"] for event in events], ["api_error"])
+                self.assertIn("Input is too large", events[0]["error"].formatted())
+                requests = await self.serve([failure, {"body": response()}], stream=stream)
+                policy = mock.AsyncMock(return_value=recoveries.RetryDecision(0))
+                with mock.patch.object(self.pipeline, "recover_turn", new=policy):
+                    self.assertEqual(await self.run_loop(stream_chat=stream), "done")
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(policy.await_args.args[0]["provider_code"], "context_length_exceeded")
+
+    async def test_real_http_wait_headers_reach_policy_in_both_modes(self):
+        for stream in [False, True]:
+            with self.subTest(stream=stream):
+                requests = await self.serve([
+                    {"status": 429, "body": "5-hour usage limit", "headers": {
+                        "Retry-After": "0", "x-codex-primary-reset-at": "12345"}},
+                    {"body": response()},
+                ], stream=stream)
+                policy = mock.AsyncMock(return_value=recoveries.RetryDecision(0))
+                with mock.patch.object(self.pipeline, "recover_turn", new=policy):
+                    self.assertEqual(await self.run_loop(stream_chat=stream), "done")
+                facts = policy.await_args.args[0]
+                self.assertEqual(facts["retry_after_seconds"], 0)
+                self.assertEqual(facts["error_message"], "5-hour usage limit")
+                self.assertEqual(facts["rate_limit_headers"],
+                                 {"x-codex-primary-reset-at": "12345"})
+                self.assertEqual(len(requests), 2)
+
+    async def test_retry_notice_shows_cause_without_changing_hook_text(self):
+        message = "busy\n\x1b]0;owned\x07 \udc9b \ud800"
+        error = protocols.ResponseApiError(message, code="server_is_overloaded",
+                                           category="overloaded", retryable=False)
+        policy = mock.AsyncMock(return_value=recoveries.RetryDecision(0))
+        owner = recoveries.TurnRecovery(policy, asyncio.Event())
+        self.assertTrue(await owner.retry(model_requests.failure_event(error)))
+        payload = policy.await_args.args[0]
+        self.assertEqual(payload["error_message"], message)
+        self.assertEqual(payload["provider_code"], "server_is_overloaded")
+        self.assertEqual(payload["recovery_point"], "request_replay")
+        notice = self.stderr.getvalue()
+        for value in ["Retrying in 0 seconds.", "api_error", "server_is_overloaded",
+                      "busy", "\\udc9b", "\\ud800"]:
+            self.assertIn(value, notice)
+        self.assertNotIn("\x1b", notice)
+        self.assertNotIn(b"\x9b", notice.encode("utf-8", "surrogateescape"))
+        self.assertEqual(len(notice.splitlines()), 1)
 
     def test_policy_does_not_indirectly_parse_its_selected_filename_for_help(self):
         with open(self.script, encoding="utf-8") as source:
@@ -406,6 +587,11 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
         self.assertEqual([entry["retry_count"] for entry in observed], [0, 1])
         self.assertEqual([entry["error_type"] for entry in observed], ["api_error", "response_incomplete"])
         self.assertEqual(observed[1]["incomplete_reason"], "max_output_tokens")
+        self.assertEqual(observed[0]["provider_code"], "server_is_overloaded")
+        self.assertEqual(observed[0]["recovery_point"], "request_replay")
+        self.assertFalse(observed[0]["response_saved"])
+        self.assertEqual(observed[1]["recovery_point"], "history_resample")
+        self.assertTrue(observed[1]["response_saved"])
         self.assertEqual(len(requests), 3)
         keys = [request["headers"][b"idempotency-key"] for request in requests]
         self.assertEqual(keys[0], keys[1])
@@ -460,8 +646,14 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                 raise protocols.StreamProtocolError("EOF after output")
             return protocols.ProviderResponse(response())
 
-        with mock.patch.object(model_requests, "_async_chat_stream_request_once", new=request_once):
+        policy = mock.AsyncMock(return_value=recoveries.RetryDecision(0))
+        with mock.patch.object(model_requests, "_async_chat_stream_request_once", new=request_once), \
+                mock.patch.object(self.pipeline, "recover_turn", new=policy):
             self.assertEqual(await self.run_loop(stream_chat=True), "done")
+        facts = policy.await_args.args[0]
+        self.assertEqual(facts["recovery_point"], "history_resample")
+        self.assertTrue(facts["output_started"])
+        self.assertFalse(facts["response_saved"])
         self.assertEqual(len(calls), 2)
         self.assertNotEqual(calls[0]["headers"]["Idempotency-Key"], calls[1]["headers"]["Idempotency-Key"])
         self.assertEqual(calls[0]["body"], calls[1]["body"])
@@ -492,6 +684,8 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                     self.assertEqual(turn.metadata["status"], "incomplete")
                     self.assertEqual(await self.run_loop(mock.AsyncMock(side_effect=[turn, answer()])), "done")
                     self.assertEqual(observed[-1]["incomplete_reason"], reason)
+                    self.assertTrue(observed[-1]["response_saved"])
+                    self.assertTrue(observed[-1]["output_started"])
         self.assertEqual([entry["retry_count"] for entry in observed], [0, 0, 0])
 
     async def test_incomplete_tools_are_closed_without_execution_and_limits_do_not_reset(self):
@@ -578,25 +772,31 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
         self.assertEqual(recoveries.failure_fields(failure)["retry_after_seconds"], .125)
 
     async def test_provider_minimum_is_not_shortened_by_generated_delay_cap(self):
-        event = asyncio.Event()
-        ready = asyncio.Event()
-        minimum = protocols.ResponseApiError("rate limited", retry_after=3600)
-        original_wait = asyncio.wait_for
-        delays = []
+        for minimum in [
+                protocols.ResponseApiError("rate limited", retry_after=3600),
+                model_requests.ApiError(
+                    "https://example.test/responses", 429,
+                    "Too Many Requests", "rate limited", headers={"retry-after": "3600"})]:
+            event = asyncio.Event()
+            ready = asyncio.Event()
+            original_wait = asyncio.wait_for
+            delays = []
 
-        async def wait(operation, timeout):
-            delays.append(timeout)
-            ready.set()
-            return await original_wait(operation, timeout)
+            async def wait(operation, timeout):
+                delays.append(timeout)
+                ready.set()
+                return await original_wait(operation, timeout)
 
-        recovery = recoveries.TurnRecovery(mock.AsyncMock(return_value=recoveries.RetryDecision(0)), event)
-        with mock.patch.object(recoveries.asyncio, "wait_for", new=wait):
-            task = asyncio.create_task(recovery.retry({"type": "api_error", "error": minimum}))
-            await ready.wait()
-            event.set()
-            with self.assertRaises(recoveries.Cancelled):
-                await task
-        self.assertEqual(delays, [3600])
+            recovery = recoveries.TurnRecovery(
+                mock.AsyncMock(return_value=recoveries.RetryDecision(0)), event)
+            with mock.patch.object(recoveries.asyncio, "wait_for", new=wait):
+                task = asyncio.create_task(recovery.retry({"type": "api_error", "error": minimum}))
+                await ready.wait()
+                event.set()
+                with self.assertRaises(recoveries.Cancelled):
+                    await task
+            self.assertEqual(delays, [3600])
+            self.assertIn("Retrying in 3600 seconds.", self.stderr.getvalue())
 
     async def test_real_hook_is_reaped_when_cancelled(self):
         started = asyncio.Event()
@@ -656,7 +856,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
         completed = (sse_response("response.completed", response())
                      if stream else response())
         requests = await self.serve([
-            {"status": 503, "body": {"error": "temporarily unavailable"}},
+            {"status": 503, "body": {"error": "temporarily unavailable \x1b]0;owned\x07 \udc9b"}},
             {"body": completed, "received": received, "release": release},
         ], stream=stream)
         config = tempfile.TemporaryDirectory()
@@ -699,9 +899,14 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             LOKI_MODEL="test", LOKI_STREAM="1" if stream else "0")
         configure_container(environment, workspace)
         backoff = asyncio.Event()
+        diagnostic_bytes = bytearray()
 
         def on_diagnostics(data):
-            if b"Retrying in 1800 seconds." in data:
+            diagnostic_bytes.extend(data)
+            start = diagnostic_bytes.find(b"Retrying in 1800 seconds.")
+            # Wait for the complete diagnostic, not one conveniently unsplit
+            # read chunk, so assertions cover what the client has received.
+            if start >= 0 and b"\n" in diagnostic_bytes[start:]:
                 backoff.set()
 
         front, diagnostics = await self._front(
@@ -754,6 +959,11 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             self.assertIn("already running", busy["error"]["message"])
             self.assertFalse(prompt_reply.done(), messages)
             if cancel:
+                self.assertIn(b"temporarily unavailable", diagnostic_bytes)
+                self.assertIn(b"api_error", diagnostic_bytes)
+                self.assertIn(b"http_status=503", diagnostic_bytes)
+                self.assertIn(b"\\udc9b", diagnostic_bytes)
+                self.assertNotIn(b"\x1b", diagnostic_bytes)
                 front.stdin.write((json.dumps(acps.notification(
                     "session/cancel", {"sessionId": session_id})) + "\n").encode())
                 await front.stdin.drain()
@@ -767,6 +977,11 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             await front.wait()
             errors = await diagnostics
             self.assertEqual(front.returncode, 0, errors.decode(errors="replace"))
+            self.assertIn(b"temporarily unavailable", errors)
+            self.assertIn(b"api_error", errors)
+            self.assertIn(b"http_status=503", errors)
+            self.assertIn(b"\\udc9b", errors)
+            self.assertNotIn(b"\x1b", errors)
         finally:
             release.set()
             for task in [milestone, reader]:
