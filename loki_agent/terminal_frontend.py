@@ -36,7 +36,6 @@ from . import skills
 from . import subagents
 from . import terminals
 from . import texts
-from . import tool_contracts
 from .connections import (
     ConnectionDescriptorError,
     connection_display_fields,
@@ -52,13 +51,10 @@ from .loki import (
     ERROR_COLOR,
     EXPLORE_TOOLS,
     PLAN_TOOLS,
-    TOOLS,
     TOOL_CALL_COLOR,
-    _remember_session_toolset,
     _status_api_base,
     active_connection_descriptor,
     apply_runtime_config,
-    async_chat_completion,
     change_shell_cwd_from_text,
     configure_tool_hook_pipeline,
     connection_from_session_state,
@@ -770,37 +766,8 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     read_only = current_agent_mode() in ["explore", "plan"]
     mode_tools = (
         PLAN_TOOLS if current_agent_mode() == "plan" else EXPLORE_TOOLS)
-    active_tools = (
-        [
-            tool for tool in TOOLS
-            if tool.get("function", {}).get("name") in mode_tools
-        ]
-        if read_only else TOOLS
-    )
-    if ask_user is None:
-        # Same rule as run_tool_loop_async: without somebody to answer, the
-        # model is never offered the question tool at all.
-        active_tools = tool_contracts.without_ask_tool(active_tools)
-    active_tools = skills.tools_for_model(active_tools, _core.LOKI_CONFIG_DIR)
-
-    async def chat_fn(
-            items, on_text_delta, *, codex_turn_state, on_reasoning_delta=None):
-        kwargs = {
-            "on_text_delta": on_text_delta,
-            "cancel_check": cancel_check,
-            "codex_turn_state": codex_turn_state,
-            "reasoning_effort": reasoning_effort,
-            "thinking": thinking,
-        }
-        if on_reasoning_delta is not None:
-            kwargs["on_reasoning_delta"] = on_reasoning_delta
-        if recovery is not None:
-            kwargs["recovery"] = recovery
-        return await async_chat_completion(
-            items, active_tools, True, False, **kwargs)
 
     def on_response(turn, event):
-        _remember_session_toolset(active_tools)
         current_session().context_snapshot(live=True)
         _redraw_status()
 
@@ -817,7 +784,6 @@ async def run_terminal_turn_async(transcript_items: list, cancel_check=None,
     return await run_tool_loop_async(
         transcript_items,
         allowed=mode_tools if read_only else None,
-        chat_fn=chat_fn,
         on_event=on_event,
         cancel_check=cancel_check,
         stream_chat=True,
@@ -1409,8 +1375,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
             print("Configuration error: model missing; set LOKI_MODEL.",
                   file=sys.stderr)
             return 2
-        await subagents.run_cli_async(
-            toolset or "Explore", prompt_arg)
+        await subagents.run_cli_async(toolset or "Explore", prompt_arg)
         return 0
 
     ui_settings = configuration
@@ -1576,14 +1541,14 @@ async def async_main(args, configuration: settings.Settings) -> int:
         # The first normal frame needs the selected provider and loaded history.
         # Startup modals retain the reader without enabling the normal producer.
         await session.start()
-        while True:
+        while current_session().active:
             # Show completed dispatch effects before admitting the next queued input.
             # Busy turns and modals redraw through the out-of-band callbacks.
             _redraw_status()
             user_in = await session.user_messages.get()
             restore_output_area_after_input()
 
-            if user_in is None:  # EOF sentinel from the producer
+            if user_in is None or not current_session().active:
                 break
 
             # An empty prompt submits staged images without inventing text.
@@ -1992,9 +1957,8 @@ async def _run_frontend(args) -> int:
         try:
             return await async_main(args, configuration)
         finally:
-            manager = current_session().job_manager
-            if manager is not None:
-                await manager.close_session_owned()
+            state = current_session()
+            state.begin_close()
 
     exit_status = 1
     output_settings = terminal_output_mode()

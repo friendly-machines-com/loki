@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -6,10 +7,11 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from job_fixtures import job_manager
 
 from loki_agent import loki
 from loki_agent.sessions import Session
-from loki_agent import files as file_operations, jobs as job_runtime
+from loki_agent import files as file_operations
 
 
 class GlobTests(unittest.TestCase):
@@ -28,7 +30,7 @@ class GlobTests(unittest.TestCase):
                             {'hidden': True, 'no_ignore': False},
                             {'hidden': True, 'no_ignore': True}]:
                 with self.subTest(asynchronous=asynchronous, options=options), \
-                        tempfile.TemporaryDirectory() as directory:
+                        tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as job_scope:
                     workspace = Path(directory) / 'workspace'
                     workspace.mkdir()
                     contents = {
@@ -46,7 +48,7 @@ class GlobTests(unittest.TestCase):
                         # Independent, distinct times make ordering observable.
                         stamp = 1_000_000_000 + index
                         os.utime(path, (stamp, stamp))
-                    manager = job_runtime.JobManager(str(Path(directory) / 'jobs'))
+                    manager = job_manager(str(Path(directory) / 'jobs'), cleanup=job_scope.callback)
                     session = Session(shell_cwd=str(workspace),
                                       job_manager=manager)
                     hidden = options.get('hidden', False)
@@ -147,9 +149,9 @@ class GlobTests(unittest.TestCase):
                             self.assertTrue(job.process._transport.is_closing())
 
     def test_missing_search_targets_are_checked_by_the_external_program(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as job_scope:
             target = str(Path(directory) / 'missing')
-            manager = job_runtime.JobManager(str(Path(directory) / 'jobs'))
+            manager = job_manager(str(Path(directory) / 'jobs'), cleanup=job_scope.callback)
             session = Session(shell_cwd=directory, job_manager=manager)
             for name, handler in {'Glob': loki._handle_glob_async,
                                   'Grep': loki._handle_grep_async}.items():
@@ -166,8 +168,8 @@ class GlobTests(unittest.TestCase):
                                      'Error: ripgrep failed with exit code 2\ntarget unavailable')
 
     def test_cancel_reaches_a_running_search_and_reaps_its_child(self):
-        with tempfile.TemporaryDirectory() as directory:
-            manager = job_runtime.JobManager(str(Path(directory) / 'jobs'))
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as job_scope:
+            manager = job_manager(str(Path(directory) / 'jobs'), cleanup=job_scope.callback)
             session = Session(shell_cwd=directory, job_manager=manager)
 
             async def scenario():

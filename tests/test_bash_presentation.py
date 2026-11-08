@@ -9,6 +9,7 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from job_fixtures import job_manager
 from config_fixtures import setUpModule  # noqa: F401 - unittest hook
 
 from loki_agent import acp_events, formats, loki, process_outputs, protocols, savefiles
@@ -178,15 +179,16 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = pathlib.Path(directory.name)
-        self.manager = job_runtime.JobManager(str(self.directory))
+        self.manager = job_manager(str(self.directory), cleanup=self.addCleanup,
+                                   async_cleanup=self.addAsyncCleanup)
         self.session = loki.Session(
             shell_cwd=str(self.directory), job_manager=self.manager,
             runtime_config=connections.make_runtime_config(
                 "http://example.invalid/v1", protocols.DUMMY, model="test-model"))
+        self.addCleanup(self.session.response_headers.close)
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
         self.addCleanup(patch.stop)
-        self.addAsyncCleanup(self.manager.aclose)
 
     async def execute(self, command="test-command", *, pipeline=None, **arguments):
         call = formats.tool_call_item("bash-call", "Bash", {"command": command, **arguments})

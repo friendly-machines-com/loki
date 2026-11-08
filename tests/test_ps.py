@@ -10,6 +10,9 @@ import tempfile
 import unittest
 from unittest import mock
 
+from job_fixtures import job_manager
+from process_lifecycle_fixtures import observe_fixture_state
+from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 from loki_agent import acp_commands, loki
 from loki_agent.sessions import Session
 from loki_agent import tool_contracts
@@ -21,14 +24,14 @@ class PsTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.manager = job_runtime.JobManager(directory.name)
-        self.addCleanup(self.manager.close)
+        self.manager = job_manager(directory.name, cleanup=self.addCleanup)
         # These unit-test jobs have no descendant processes. Real surviving
         # groups are exercised in test_job_process_groups.py.
         groups = mock.patch.object(job_runtime.host_process, 'group_exists', return_value=False)
         groups.start()
         self.addCleanup(groups.stop)
         self.session = Session(job_manager=self.manager)
+        self.addCleanup(self.session.response_headers.close)
         patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
         patch.start()
         self.addCleanup(patch.stop)
@@ -46,6 +49,11 @@ class PsTests(unittest.TestCase):
             group_active=status in ['running', 'stopping'],
             process=mock.Mock(returncode=None))
         self.manager.jobs[job_id] = job
+        # No actor exists for these mocks. After all live-child assertions,
+        # observe their synthetic exit while the no-descendant fixture remains
+        # installed, before the manager's stricter retirement check runs.
+        self.addCleanup(self.manager._refresh_job, job)
+        self.addCleanup(setattr, job.process, 'returncode', 0)
         return job
 
     def test_job_changes_notify_after_the_state_is_updated(self):
@@ -269,7 +277,8 @@ class PsTests(unittest.TestCase):
         self.assertEqual((parsed.name, parsed.argument), ("status", ""))
 
     def test_acp_does_not_advertise_or_handle_ps(self):
-        with mock.patch.object(loki, "LOKI_CONFIG_DIR", self.manager.base_dir):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(loki, "LOKI_CONFIG_DIR", directory):
             self.assertNotIn("ps", [command["name"]
                                     for command in acp_commands.advertised_commands()])
         for text in ["/ps", "/ps 1", "/ps all", "/ps stop 1", "/ps kill 1", "/ps stop"]:
@@ -282,17 +291,31 @@ class PsTests(unittest.TestCase):
 
 class ImmediateTerminalPsTests(unittest.TestCase):
     def test_input_owner_lists_tails_stops_and_kills_without_dequeueing(self):
+        self._input_owner_journey()
+
+    def test_ps_acknowledgement_observes_normal_input_failure(self):
+        with self.assertRaisesRegex(AssertionError, 'operation ended before expected fixture event'):
+            self._input_owner_journey(failure='normal')
+
+    def test_ps_acknowledgement_observes_modal_input_failure(self):
+        with self.assertRaisesRegex(RuntimeError, 'injected modal input failure'):
+            self._input_owner_journey(failure='modal')
+
+    def _input_owner_journey(self, failure=None):
         from loki_agent import formats, terminal_frontend, terminals
         from process_lifecycle_fixtures import ProcessResources
 
         async def scenario(root):
-            manager = job_runtime.JobManager(os.path.join(root, "jobs"))
+            manager = job_manager(os.path.join(root, "jobs"),
+                                  cleanup=job_scope.callback, runner=job_runner)
             conversation = Session(job_manager=manager, shell_cwd=root,
                                    transcript_items=[formats.message_item("user", "busy")])
+            self.addCleanup(conversation.response_headers.close)
             initial = list(conversation.transcript_items)
             output = io.StringIO()
             counts = []
             handled = []
+            input_failure = None
 
             class Reader:
                 def __init__(self):
@@ -300,7 +323,10 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     self.cancel_event = asyncio.Event()
 
                 async def read_key(self):
-                    return await self.keys.get()
+                    key = await self.keys.get()
+                    if input_failure is not None:
+                        raise input_failure
+                    return key
 
             def submit(text):
                 consumed = terminal_frontend._submit_immediate(text)
@@ -321,40 +347,47 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     "if hasattr(signal, 'SIGBREAK'):\n"
                     "    signal.signal(signal.SIGBREAK, signal.SIG_IGN)\n"
                     "print('job-ready\\x1b]777;PS_TAIL_ATTACK\\x07', flush=True)\n"
-                    "time.sleep(60)\n"
+                    "while True: time.sleep(1)\n"
                 )
+                # Only the explicit /ps kill may complete this controlled job.
                 foreground = asyncio.create_task(manager.run_foreground(
-                    [sys.executable, "-c", script], "controlled job", 60_000, cwd=root))
+                    [sys.executable, "-c", script], "controlled job", None, cwd=root))
                 resources = None
 
                 def feed(text):
                     session.reader.keys.put_nowait(terminals.KeyEvent("TEXT", text))
                     session.reader.keys.put_nowait(terminals.KeyEvent("ENTER"))
 
-                async def command(text):
+                async def command(text, owner=None):
                     previous = len(handled)
                     feed(text)
-                    async with asyncio.timeout(3):
-                        while len(handled) == previous:
-                            await asyncio.sleep(0)
+                    # Normal input can be replaced after modal exit. Borrow the
+                    # actual current reader, not a stale captured producer.
+                    await observe_fixture_state(
+                        lambda: len(handled) != previous,
+                        session._producer if owner is None else owner)
                     self.assertEqual(handled[-1], text)
                     self.assertEqual(session.user_messages.message_count, 1)
                     self.assertEqual(counts, [1])
                     self.assertEqual(conversation.transcript_items, initial)
 
                 try:
-                    async with asyncio.timeout(5):
-                        while True:
-                            job = next(iter(manager.jobs.values()), None)
-                            if job is not None and job.process is not None:
-                                if "job-ready" in manager._spool_tail(job, 'stdout.log'):
-                                    break
-                            await asyncio.sleep(.01)
+                    while True:
+                        job = next(iter(manager.jobs.values()), None)
+                        if job is not None and job.process is not None:
+                            if "job-ready" in manager._spool_tail(job, 'stdout.log'):
+                                break
+                            self.assertIsNone(job.process.returncode,
+                                              manager._spool_tail(job, 'stderr.log'))
+                        self.assertFalse(foreground.done(), 'job ended before readiness')
+                        await asyncio.sleep(.01)
                     resources = ProcessResources(job.process)
                     feed("ordinary prompt")
-                    async with asyncio.timeout(3):
-                        while session.user_messages.message_count != 1:
-                            await asyncio.sleep(0)
+                    while session.user_messages.message_count != 1:
+                        self.assertFalse(session._producer.done(), 'input producer ended before queueing prompt')
+                        await asyncio.sleep(0)
+                    if failure == 'normal':
+                        input_failure = RuntimeError('injected normal input failure')
                     await command("/ps")
                     await command("/ps all")
                     self.assertIn(f"{job.id}. status=running", output.getvalue())
@@ -365,7 +398,7 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     self.assertEqual(job.status, "stopping")
                     self.assertFalse(session.reader.cancel_event.is_set())
                     await command("/ps kill " + job.id)
-                    result_job, outcome, _stdout, _stderr = await asyncio.wait_for(foreground, 5)
+                    result_job, outcome, _stdout, _stderr = await foreground
                     self.assertIs(result_job, job)
                     self.assertEqual(outcome, "completed")
                     self.assertEqual(job.status, "stopped")
@@ -380,11 +413,13 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     async with session.modal() as modal:
                         answer = asyncio.create_task(modal.prompt("Confirm: "))
                         try:
-                            await command("/ps all")
+                            if failure == 'modal':
+                                input_failure = RuntimeError('injected modal input failure')
+                            await command("/ps all", owner=answer)
                             self.assertFalse(answer.done())
                             self.assertTrue(session.reader.cancel_event.is_set())
                             feed("no")
-                            self.assertEqual(await asyncio.wait_for(answer, 3), "no")
+                            self.assertEqual(await answer, "no")
                         finally:
                             if not answer.done():
                                 answer.cancel()
@@ -400,15 +435,16 @@ class ImmediateTerminalPsTests(unittest.TestCase):
                     for job in manager.jobs.values():
                         if job.process is not None and job.process.returncode is None:
                             job_runtime.host_process.signal_group(job.process, job.pgid, job_runtime.host_process.FORCE)
-                            await asyncio.wait_for(job.process.wait(), 3)
+                            await job.process.wait()
                     if not foreground.done():
                         foreground.cancel()
-                    await asyncio.wait_for(asyncio.gather(foreground, return_exceptions=True), 3)
+                    await asyncio.gather(foreground, return_exceptions=True)
                     if resources is not None:
                         await resources.cleanup()
 
-        with tempfile.TemporaryDirectory() as root:
-            asyncio.run(scenario(root))
+        with tempfile.TemporaryDirectory() as root, asyncio.Runner() as job_runner, \
+                contextlib.ExitStack() as job_scope:
+            job_runner.run(scenario(root))
 
 
 if __name__ == "__main__":

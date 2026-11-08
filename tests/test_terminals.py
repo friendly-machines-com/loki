@@ -8,7 +8,7 @@ import sys
 import unittest
 from unittest import mock
 
-
+from process_lifecycle_fixtures import observe_fixture
 from loki_agent import terminals
 
 
@@ -1332,8 +1332,8 @@ class InputHistoryTests(unittest.TestCase):
                 session.reader.keys.put_nowait(event)
             producer = asyncio.create_task(session._produce())
             try:
-                submitted = await asyncio.wait_for(session.user_messages.get(), 1)
-                await asyncio.wait_for(next_prompt_open.wait(), 1)
+                submitted = await observe_fixture(session.user_messages.get(), producer)
+                await observe_fixture(next_prompt_open.wait(), producer)
                 # The turn consumer records the message after the next input
                 # field opens. Even if the API then fails, recall must work
                 # without reopening that field or submitting another message.
@@ -1345,7 +1345,7 @@ class InputHistoryTests(unittest.TestCase):
                 events.append(terminals.KeyEvent("ENTER"))
                 for event in events:
                     session.reader.keys.put_nowait(event)
-                result = await asyncio.wait_for(session.user_messages.get(), 1)
+                result = await observe_fixture(session.user_messages.get(), producer)
                 self.assertEqual(
                     result, "draft" if restore_draft else "submitted message")
             finally:

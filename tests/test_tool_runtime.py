@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import copy
 import json
 import os
@@ -9,7 +8,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_entrypoints import child_environment, configure_container, entrypoint
+from loki_entrypoints import child_environment, configure_container, loki_command
+from process_lifecycle_fixtures import (
+    ProcessResources, observe_fixture, observe_fixture_state, observe_process_exit,
+)
+from loki_agent import host_process
+# This existing module fixture retains the state root and sanctioned bootstrap
+# through each hook's real join. The core creator borrows that root; another
+# temporary root per hook would duplicate acquisition and cleanup ownership.
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 from settings_fixtures import write_user_settings
 
@@ -21,7 +27,8 @@ from loki_agent import loki
 
 def load_hooks(file):
     configuration = asyncio.run(settings.load_settings(files=[file], strict=True))
-    return tool_runtime.build_hook_pipeline(configuration.hooks)
+    return tool_runtime.build_hook_pipeline(
+        configuration.hooks, create_exec=loki._tool_process_creator())
 
 
 ARRAY_SCHEMA = {
@@ -333,6 +340,89 @@ class HookPipelineTests(unittest.TestCase):
 
 
 class ExternalHookTests(unittest.TestCase):
+    def test_every_completed_hook_retires_its_process_scope(self):
+        async def scenario(output, status, failed):
+            created = []
+            retired = []
+            create = loki._tool_process_creator()
+
+            async def observed(*command, **options):
+                process = await create(*command, **options)
+                created.append(ProcessResources(process))
+                close = process.aclose
+
+                async def closing():
+                    await close()
+                    retired.append(True)
+
+                process.aclose = closing
+                return process
+
+            script = ('import json,sys; json.load(sys.stdin); '
+                      f'print({output!r}); sys.exit({status})')
+            try:
+                with mock.patch.object(host_process, 'release_group', wraps=host_process.release_group) as release:
+                    operation = tool_runtime._run_hook_command(
+                        [sys.executable, '-c', script], {}, None, None, create_exec=observed)
+                    if failed:
+                        with self.assertRaises(tool_runtime.HookExecutionError):
+                            await operation
+                    else:
+                        self.assertEqual(await operation, {})
+                    self.assertEqual(retired, [True])
+                    self.assertEqual(len(created), 1)
+                    created[0].assert_released(self)
+                    release.assert_called_once_with(created[0].process)
+                    if sys.platform == 'win32':
+                        self.assertIsNone(created[0].process._family)
+                        self.assertIsNone(created[0].native.job)
+            finally:
+                for resources in created:
+                    await resources.cleanup()
+                    host_process.release_group(resources.process)
+
+        for output, status, failed in [['{}', 0, False], ['[]', 0, True], ['{}', 3, True]]:
+            with self.subTest(output=output, status=status):
+                asyncio.run(scenario(output, status, failed))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'native creation ownership control')
+    def test_turn_cancellation_retires_a_hook_held_during_creation(self):
+        async def scenario():
+            watching = asyncio.Event()
+            created = []
+
+            class TurnCancel(asyncio.Event):
+                async def wait(self):
+                    watching.set()
+                    return await super().wait()
+
+            cancel = TurnCancel()
+            original = host_process.create_posix_process
+
+            async def observed(*command, **options):
+
+                async def ready(process):
+                    created.append(ProcessResources(process))
+                    self.assertTrue(watching.is_set(), 'cancellation was not owned during creation')
+                    cancel.set()
+                    await asyncio.Future()
+
+                return await original(*command, after_spawn=ready, **options)
+
+            try:
+                with mock.patch.object(host_process, 'create_posix_process', side_effect=observed):
+                    with self.assertRaises(loki.recoveries.Cancelled):
+                        await tool_runtime._run_hook_command(
+                            [sys.executable, '-c', 'import sys; sys.stdin.buffer.read(1)'],
+                            {}, None, None, create_exec=loki._tool_process_creator(), cancel_event=cancel)
+                self.assertEqual(len(created), 1)
+                created[0].assert_released(self)
+            finally:
+                for resources in created:
+                    await resources.cleanup()
+
+        asyncio.run(scenario())
+
     def test_invalid_hook_configuration_exits_before_terminal_startup(self):
         with tempfile.TemporaryDirectory() as directory:
             write_user_settings(directory, "[hook.pre_tool_call.\nbroken = yes")
@@ -348,13 +438,12 @@ class ExternalHookTests(unittest.TestCase):
             os.makedirs(workspace)
             configure_container(env, workspace)
             result = subprocess.run(
-                [entrypoint("loki"), "--headless"],
+                [*loki_command(), "--headless"],
                 cwd=workspace,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=10,
             )
 
         self.assertEqual(result.returncode, 2, result.stderr)
@@ -401,11 +490,7 @@ class ExternalHookTests(unittest.TestCase):
                 "LOKI_API_KEY": "secret",
                 "UNRELATED_SECRET": "secret",
             })
-            with mock.patch.object(
-                    tool_runtime,
-                    "_hook_environment",
-                    return_value=tool_runtime._hook_environment(
-                        source_environ)):
+            with mock.patch.dict(os.environ, source_environ, clear=True):
                 pipeline = load_hooks(config_path)
                 invocation = tool_runtime.ToolInvocation(
                     call_id="call_external",
@@ -456,7 +541,8 @@ class ExternalHookTests(unittest.TestCase):
                     [sys.executable, "-c", script],
                     {},
                     directory,
-                    1000,
+                    None,
+                    create_exec=loki._tool_process_creator(),
                 ))
         finally:
             os.close(runtime_read)
@@ -501,12 +587,14 @@ class ExternalHookTests(unittest.TestCase):
     def test_windows_hook_bootstrap_path_does_not_expand_the_credential_environment(self):
         environment = {'SystemRoot': 'C:/Windows', 'PATH': 'tools', 'TEMP': 'scratch',
                        'LOKI_API_KEY': 'secret', 'OPENAI_API_KEY': 'secret', 'LOCALAPPDATA': 'private'}
-        with mock.patch.object(os, 'name', 'nt'):
+        with mock.patch.object(sys, 'platform', 'win32'):
             result = tool_runtime._hook_environment(environment)
         self.assertEqual(result, {'SystemRoot': 'C:/Windows', 'PATH': 'tools', 'TEMP': 'scratch'})
 
     def test_pre_hook_timeout_denies_without_tool_execution(self):
-        script = "import time; time.sleep(1)"
+        # The requested expiry owns retirement; this actor cannot complete
+        # normally even if startup or the controller is delayed past the budget.
+        script = "import threading; threading.Event().wait()"
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "settings.ini")
             with open(config_path, "w", encoding="utf-8") as stream:
@@ -533,71 +621,142 @@ class ExternalHookTests(unittest.TestCase):
         self.assertIn("timed out", result.denied_reason)
 
     def test_hook_timeout_includes_blocked_stdin_transfer(self):
-        script = "import time; time.sleep(10)"
+        script = "import threading; threading.Event().wait()"
 
         async def scenario(directory):
             loop = asyncio.get_running_loop()
             previous = loop.get_exception_handler()
             errors = []
+            created = []
+            create = loki._tool_process_creator()
             loop.set_exception_handler(lambda _loop, context: errors.append(context))
-            started = loop.time()
+
+            async def observed(*command, **options):
+                process = await create(*command, **options)
+                created.append(ProcessResources(process))
+                return process
+
             try:
+                # The requested timeout covers blocked protocol transfer, not
+                # interpreter/namespace startup speed. Assert the failure and
+                # released resources instead of imposing an unrelated watchdog.
                 with self.assertRaisesRegex(
                         tool_runtime.HookExecutionError,
                         "hook timed out after 20ms"):
-                    await asyncio.wait_for(
-                        tool_runtime._run_hook_command(
-                            [sys.executable, "-c", script],
-                            {"large": "x" * 2_000_000}, directory, 20),
-                        timeout=1)
+                    await tool_runtime._run_hook_command(
+                        [sys.executable, "-c", script],
+                        {"large": "x" * 2_000_000}, directory, 20, create_exec=observed)
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
+                self.assertEqual(len(created), 1)
+                created[0].assert_released(self)
                 self.assertEqual(errors, [])
-                return loop.time() - started
             finally:
+                for resources in created:
+                    await resources.cleanup()
                 loop.set_exception_handler(previous)
 
         with tempfile.TemporaryDirectory() as directory:
-            elapsed = asyncio.run(scenario(directory))
-
-        self.assertLess(elapsed, 0.5)
+            asyncio.run(scenario(directory))
 
     def test_cancelled_hook_joins_stdin_close_without_protocol_errors(self):
+        child = (
+            'import os,socket,sys\n'
+            's=socket.create_connection(("127.0.0.1",int(sys.argv[1])))\n'
+            's.sendall(str(os.getpid()).encode()+b"\\n")\n'
+            'while s.recv(1): s.sendall(b"r")\n')
+        self._hook_cancellation_journey(child)
+
+    def test_hook_descendant_startup_failure_reaches_fixture_owner(self):
+        with self.assertRaisesRegex(tool_runtime.HookExecutionError, "injected descendant startup failure"):
+            self._hook_cancellation_journey('raise RuntimeError("injected descendant startup failure")')
+
+    def _hook_cancellation_journey(self, child):
+        # The positive cancellation path and independent startup refusal use
+        # the same actual hook, descendant and failure-aware fixture ownership.
         async def scenario(directory):
             loop = asyncio.get_running_loop()
             previous = loop.get_exception_handler()
             errors = []
             loop.set_exception_handler(lambda _loop, context: errors.append(context))
-            started = asyncio.Event()
+            connected = loop.create_future()
+            cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
             processes = []
-            spawn = tool_runtime.host_process.create_exec
+            create = loki._tool_process_creator()
+
+            async def accept(reader, writer):
+                connected.set_result((reader, writer))
 
             async def observed(*arguments, **options):
-                process = await spawn(*arguments, **options)
-                processes.append(process)
-                started.set()
+                process = await create(*arguments, **options)
+                processes.append(ProcessResources(process))
+                close = process.aclose
+
+                async def closing():
+                    # Hold the actual retirement fence, not a second leader
+                    # waiter. Startup failure must still reach its own observer.
+                    if operation is not None and operation.cancelling():
+                        cleanup_started.set()
+                        await release_cleanup.wait()
+                    return await close()
+                process.aclose = closing
                 return process
 
-            operation = None
+            server = await asyncio.start_server(accept, '127.0.0.1', 0)
+            port = server.sockets[0].getsockname()[1]
+            release_leader = os.path.join(directory, 'release-leader')
+            leader = (
+                'import os,subprocess,sys,time\n'
+                f'command=subprocess.Popen([sys.executable,"-c",{child!r},{str(port)!r}],stdin=subprocess.DEVNULL)\n'
+                f'while not os.path.exists({release_leader!r}):\n'
+                '    if command.poll() is not None:\n'
+                '        raise RuntimeError("hook descendant exited before fixture release: " + str(command.returncode))\n'
+                '    time.sleep(.01)\n')
+            operation = writer = exited = None
             try:
-                with mock.patch.object(tool_runtime.host_process, 'create_exec', new=observed):
-                    operation = asyncio.create_task(tool_runtime._run_hook_command(
-                        [sys.executable, '-c', 'import time; time.sleep(60)'],
-                        {'large': 'x' * 2_000_000}, directory, None))
-                    await started.wait()
-                    operation.cancel()
-                    with self.assertRaises(asyncio.CancelledError):
-                        await operation
+                operation = asyncio.create_task(tool_runtime._run_hook_command(
+                    [sys.executable, '-c', leader], {}, directory, None, create_exec=observed))
+                # The held leader must forward descendant startup failure;
+                # otherwise no connection can arrive and this wait has no owner.
+                await observe_fixture_state(connected.done, operation)
+                reader, writer = connected.result()
+                pid = int(await reader.readline())
+                exited = observe_process_exit(self, pid)
+                await processes[0].process.stdin.wait_closed()
+                with open(release_leader, 'w'):
+                    pass
+                await observe_fixture_state(
+                    lambda: processes[0].process.returncode is not None, operation)
+                self.assertFalse(operation.done())  # Descendant still holds both output pipes.
+                operation.cancel()
+                await observe_fixture(cleanup_started.wait(), operation)
+                operation.cancel()  # Teardown must also survive a second cancellation.
+                release_cleanup.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await operation
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
-                self.assertIsNotNone(processes[0].returncode)
-                with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
-                    await processes[0].stdin.wait_closed()
+                processes[0].assert_released(self)
+                writer.write(b'p')
+                await writer.drain()
+                self.assertEqual(await reader.readexactly(1), b'r')
+                self.assertFalse(exited())  # Cleanup closed our pipes, not the permitted descendant.
                 self.assertEqual(errors, [])
             finally:
+                release_cleanup.set()
+                if writer is not None:
+                    writer.close()
+                    await writer.wait_closed()
                 if operation is not None and not operation.done():
                     operation.cancel()
                     await asyncio.gather(operation, return_exceptions=True)
+                for resources in processes:
+                    await resources.cleanup()
+                if exited is not None:
+                    while not exited():
+                        await asyncio.sleep(0)
+                server.close()
+                await server.wait_closed()
                 loop.set_exception_handler(previous)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -681,7 +840,7 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
 
         def execute(input_text):
             received.append(input_text)
-            return "custom result"
+            return tool_runtime.tool_result(True, 'custom result')
 
         registry = loki._build_tool_registry(
             [{
@@ -901,7 +1060,7 @@ class TurnEndHookTests(unittest.TestCase):
     def test_no_hooks_do_not_start_subprocess_or_build_payload(self):
         with mock.patch.object(loki, "TOOL_HOOK_PIPELINE",
                                tool_runtime.ToolHookPipeline()):
-            with mock.patch.object(tool_runtime.host_process,
+            with mock.patch.object(host_process,
                                    "create_exec") as spawn:
                 asyncio.run(loki.run_turn_end_hooks_async([], "hello"))
                 spawn.assert_not_called()
@@ -986,7 +1145,7 @@ class TurnEndHookTests(unittest.TestCase):
                     "[hook.turn_end.slow]\n"
                     f"command.0 = {sys.executable}\n"
                     "command.1 = -c\n"
-                    "command.2 = import time; time.sleep(1)\n"
+                    "command.2 = import threading; threading.Event().wait()\n"
                     f"cwd = {directory}\n"
                     "timeout_ms = 20\n")
             pipeline = load_hooks(config_path)
@@ -995,6 +1154,8 @@ class TurnEndHookTests(unittest.TestCase):
                     asyncio.run(loki.run_turn_end_hooks_async(
                         [{"type": "response_cancelled"}]))
                 self.assertTrue(stderr.write.called)
+                diagnostic = "".join(str(call.args[0]) for call in stderr.write.call_args_list)
+                self.assertIn("HookExecutionError: hook timed out after 20ms", diagnostic)
 
     def test_turn_end_rejects_tool_options_and_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as directory:

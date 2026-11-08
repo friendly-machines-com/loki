@@ -169,12 +169,7 @@ class ReaderEnvironment:
                         if 'started' in self.failures:
                             raise RuntimeError('injected started')
 
-                    def join_thread(timeout=None):
-                        if not self.failures.intersection(('stop', 'signal')):
-                            join(timeout)
-
                     thread.start = start_thread
-                    thread.join = join_thread
                     self.threads.append((thread, join))
                     return thread
 
@@ -183,7 +178,11 @@ class ReaderEnvironment:
                     stack.enter_context(mock.patch.object(native, name, new=replacement))
                 stack.enter_context(mock.patch.object(native.threading, 'Thread', new=make_thread))
                 self.acquisitions = ('event', 'thread', 'start', 'started')
-                self.releases = ('stop', 'signal', 'close')
+                # Physical exit is awaited, not a timed join that can fail.
+                # Signal refusal retains the live thread. Close refusal occurs
+                # after exit: the source consumes its record, while this fixture
+                # still knows its injected call left a live event for backstop.
+                self.releases = ('signal', 'close')
             try:
                 yield self
             finally:
@@ -199,11 +198,14 @@ class ReaderEnvironment:
                         signal(event)
                     for thread, join in self.threads:
                         if thread.ident is not None:
-                            join(3)
+                            # The gate and native stop event were released above;
+                            # join their actual completion, not a clock estimate.
+                            join()
                             if thread.is_alive():
                                 raise RuntimeError('fixture reader did not stop')
                     for event in list(self.events):
-                        close(event)
+                        if close(event):
+                            self.events.discard(event)
                 os.close(self.write_fd)
                 os.close(self.read_fd)
 

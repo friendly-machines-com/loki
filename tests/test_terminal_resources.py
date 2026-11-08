@@ -9,6 +9,7 @@ from unittest import mock
 
 from loki_agent import settings, terminals
 from terminal_resource_fixtures import ModeEnvironment, ReaderEnvironment
+from process_lifecycle_fixtures import observe_fixture
 
 
 class TerminalModeOwnershipTests(unittest.TestCase):
@@ -104,11 +105,18 @@ class TerminalModeOwnershipTests(unittest.TestCase):
 
 class ByteReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def assert_reusable(self, environment):
+        retained_events = set(environment.events)
         reader = terminals.AsyncByteReader(environment.read_fd)
         async with reader:
             os.write(environment.write_fd, b'usable')
-            self.assertEqual(await asyncio.wait_for(reader.read(), 2), b'usable')
-        environment.assert_released(self)
+            self.assertEqual(await reader.read(), b'usable')
+        if os.name == 'posix':
+            environment.assert_released(self)
+        else:
+            # A prior injected close refusal belongs to the fixture's known-
+            # live backstop, not to this new input-reader generation.
+            self.assertEqual(environment.events, retained_events)
+            self.assertTrue(all(not thread.is_alive() for thread, _ in environment.threads))
 
     async def test_success_and_repeated_cleanup_preserve_borrowed_input(self):
         with ReaderEnvironment(asyncio.get_running_loop()).installed() as environment:
@@ -138,7 +146,7 @@ class ByteReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
         with ReaderEnvironment(asyncio.get_running_loop()).installed() as environment:
             reader = terminals.AsyncByteReader(environment.read_fd)
             environment.exit_gate.clear()
-            environment.failures.update((environment.acquisitions[-1], 'stop'))
+            environment.failures.update((environment.acquisitions[-1], environment.releases[0]))
             try:
                 with self.assertRaises((OSError, RuntimeError)) as caught:
                     await reader.__aenter__()
@@ -150,7 +158,7 @@ class ByteReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
             environment.assert_released(self)
             await self.assert_reusable(environment)
 
-    async def test_failed_stop_retains_resources_until_retry(self):
+    async def test_failed_cleanup_reports_error_and_preserves_borrowed_input(self):
         with ReaderEnvironment(asyncio.get_running_loop()).installed() as environment:
             for stage in environment.releases:
                 with self.subTest(stage=stage):
@@ -159,11 +167,17 @@ class ByteReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     if stage in ['stop', 'signal']:
                         environment.exit_gate.clear()
                     environment.failures.add(stage)
+                    retained_events = None
                     try:
                         with self.assertRaises((OSError, RuntimeError)):
                             await reader.__aexit__(None, None, None)
                         environment.assert_borrowed(self)
-                        if stage == 'stop':
+                        if stage == 'close' and os.name != 'posix':
+                            retained_events = set(environment.events)
+                            self.assertTrue(retained_events)
+                            self.assertIsNone(reader._windows_reader)
+                            self.assertTrue(all(not thread.is_alive() for thread, _ in environment.threads))
+                        if stage == environment.releases[0]:
                             if os.name == 'posix':
                                 self.assertTrue(environment.registered)
                                 with mock.patch.object(terminals.os, 'read', return_value=b'late') as read:
@@ -180,8 +194,15 @@ class ByteReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         environment.failures.clear()
                         environment.exit_gate.set()
                         await reader.__aexit__(None, None, None)
-                    environment.assert_released(self)
+                    if retained_events is None:
+                        environment.assert_released(self)
+                    else:
+                        # The production closer must not retry an uncertain
+                        # numeric handle after its fault has been removed.
+                        self.assertEqual(environment.events, retained_events)
                     await self.assert_reusable(environment)
+        if os.name != 'posix':
+            self.assertFalse(environment.events)  # Explicit fixture backstop ran last.
 
 
 class FrontendTerminalOwnershipTests(unittest.IsolatedAsyncioTestCase):
@@ -292,7 +313,7 @@ class InputSessionOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(all(coro.cr_frame is None for coro in rejected_coroutines))
                     else:
                         await session.__aenter__()
-                        await asyncio.wait_for(started.wait(), 1)
+                        await observe_fixture(started.wait(), session._producer)
                         with self.assertRaisesRegex(RuntimeError, 'injected'):
                             await session.__aexit__(None, None, None)
                     expected = {name.removesuffix('_exit') for name in faults if name in ['reader_exit', 'mode_exit']}
@@ -336,14 +357,14 @@ class InputSessionOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         self.assertFalse(started.is_set())
                         self.assertIsNone(session._producer)
                     await session.start()
-                    await started.wait()
+                    await observe_fixture(started.wait(), session._producer)
                     producer = session._producer
                     await session.start()
                     self.assertIs(session._producer, producer)
                     started.clear()
                     async with session.modal():
                         self.assertIsNone(session._producer)
-                    await started.wait()
+                    await observe_fixture(started.wait(), session._producer)
                     self.assertIsNot(session._producer, producer)
             environment.assert_released(self)
             self.assertIsNone(session._producer)
@@ -378,10 +399,10 @@ class InputSessionOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.Future()
 
                 task = asyncio.create_task(run())
-                await asyncio.wait_for(entered.wait(), 1)
+                await observe_fixture(entered.wait(), task)
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
-                    await asyncio.wait_for(task, 2)
+                    await task
                 environment.assert_released(self)
                 self.assertIsNone(session._producer)
                 await session.__aexit__(None, None, None)
@@ -393,9 +414,16 @@ class KeyReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
         with ReaderEnvironment(loop).installed() as environment:
             reader = terminals.AsyncKeyReader(environment.read_fd, watch_resize=True, output_fd=1)
             operation = 'add_signal_handler' if os.name == 'posix' else 'call_later'
+            install = getattr(loop, operation)
+
+            def fail_resize(value, callback, *args, **kwargs):
+                if callback in [reader._on_resize, reader._poll_resize]:
+                    raise OSError('resize installation failed')
+                return install(value, callback, *args, **kwargs)
+
             with (
                 mock.patch.object(terminals.os, 'get_terminal_size', return_value=os.terminal_size((80, 24))),
-                mock.patch.object(loop, operation, side_effect=OSError('resize installation failed')),
+                mock.patch.object(loop, operation, side_effect=fail_resize),
                 self.assertRaisesRegex(OSError, 'resize installation failed'),
             ):
                 await reader.__aenter__()
@@ -440,7 +468,7 @@ class KeyReaderOwnershipTests(unittest.IsolatedAsyncioTestCase):
             reader = terminals.AsyncKeyReader(environment.read_fd)
             await reader.__aenter__()
             environment.exit_gate.clear()
-            environment.failures.add('stop')
+            environment.failures.add(environment.releases[0])
             try:
                 with self.assertRaises((OSError, RuntimeError)):
                     await reader.__aexit__(None, None, None)

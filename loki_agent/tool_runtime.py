@@ -9,7 +9,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import process_outputs, host_process, recoveries
+from . import host_process, process_outputs, recoveries
+from .lifetimes import finish_cleanup
 from .settings import HookSettings
 
 
@@ -629,7 +630,7 @@ class ToolHookPipeline:
             try:
                 result = await _run_hook_command(
                     hook.config.command, payload, hook.config.cwd, hook.config.timeout_ms,
-                    cancel_event=cancel_event,
+                    cancel_event=cancel_event, create_exec=hook.create_exec,
                     stderr_reporter=hook.stderr_reporter)
                 decision = recoveries.RetryDecision.from_output(result)
                 if decision is not None:
@@ -651,7 +652,7 @@ class ToolHookPipeline:
             try:
                 await _run_hook_command(
                     hook.config.command, payload, hook.config.cwd, hook.config.timeout_ms,
-                    stderr_reporter=hook.stderr_reporter)
+                    create_exec=hook.create_exec, stderr_reporter=hook.stderr_reporter)
             except Exception as error:
                 print(f"Turn-end hook {hook.config.hook_id!r} failed: "
                       f"{type(error).__name__}: {error}", file=sys.stderr)
@@ -823,17 +824,17 @@ def _hook_environment(environ=None):
         "HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "SHELL",
         "TEMP", "TERM", "TMP", "TMPDIR", "USER",
     }
-    if os.name == 'nt':
+    if sys.platform == 'win32':
         # Winsock provider loading expands SYSTEMROOT even for an ordinary
         # Python hook importing asyncio. This OS path is not credential state.
         allowed.add('SYSTEMROOT')
     return {
         key: value for key, value in source_environ.items()
-        if (key.upper() if os.name == 'nt' else key) in allowed or key.startswith("LC_")
+        if (key.upper() if sys.platform == 'win32' else key) in allowed or key.startswith("LC_")
     }
 
 
-async def _run_hook_command(command, payload, cwd, timeout_ms,
+async def _run_hook_command(command, payload, cwd, timeout_ms, *, create_exec,
                             stdout_limit=1_000_000,
                             stderr_limit=100_000,
                             stderr_reporter: Callable[..., Any] | None = None,
@@ -854,88 +855,90 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
     except (TypeError, ValueError) as error:
         raise HookExecutionError(
             f"hook input is not JSON-compatible: {error}") from error
-    try:
-        process = await host_process.create_exec(
-            *command,
-            owning=False,
-            cwd=cwd,
-            env=_hook_environment(),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            close_fds=True,
-        )
-    except OSError as error:
-        raise HookExecutionError(
-            f"could not start hook command: {error}") from error
-    stdout_task = asyncio.create_task(
-        _read_stream_limited(process.stdout, stdout_limit))
-    stderr_task = asyncio.create_task(
-        _read_stream_limited(process.stderr, stderr_limit))
 
-    # This waiter owns the protocol's stdin-close future. Cancelling the write
-    # task must not cancel that future before pipe_connection_lost completes it.
-    stdin_closed = asyncio.create_task(process.stdin.wait_closed())
-
-    async def write_stdin():
+    async def exchange():
         try:
-            process.stdin.write(stdin_data)
-            await process.stdin.drain()
-        finally:
-            process.stdin.close()
-            with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
-                await asyncio.shield(stdin_closed)
+            process = await create_exec(
+                *command, owning=False, cwd=cwd, env=_hook_environment(),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, close_fds=True)
+        except OSError as error:
+            raise HookExecutionError(
+                f"could not start hook command: {error}") from error
+        tasks = []
+        stdin_closed = None
+        try:
+            # Preserve the protocol's close future until its native pipe ends.
+            # The writer may be cancelled while its finally is observing it.
+            stdin_closed = asyncio.create_task(process.stdin.wait_closed())
+            tasks.append(stdin_closed)
+            stdout_task = asyncio.create_task(
+                _read_stream_limited(process.stdout, stdout_limit))
+            tasks.append(stdout_task)
+            stderr_task = asyncio.create_task(
+                _read_stream_limited(process.stderr, stderr_limit))
+            tasks.append(stderr_task)
 
-    stdin_task = asyncio.create_task(write_stdin())
+            async def write_stdin():
+                try:
+                    process.stdin.write(stdin_data)
+                    await process.stdin.drain()
+                finally:
+                    process.stdin.close()
+                    with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+                        await asyncio.shield(stdin_closed)
 
-    operation = asyncio.gather(
-        stdin_task, stdout_task, stderr_task, process.wait())
-    cancel_task = (asyncio.create_task(cancel_event.wait())
-                   if cancel_event is not None else None)
-
-    async def terminate():
-        process.stdin.close()
-        if process.returncode is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        await process.wait()
-        for task in [stdin_task, stdout_task, stderr_task]:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(
-            stdin_task, stdout_task, stderr_task, stdin_closed, return_exceptions=True)
-
-    try:
-        if cancel_task is None:
-            if timeout_ms is None:
-                _stdin_result, stdout, stderr, returncode = await operation
-            else:
-                _stdin_result, stdout, stderr, returncode = await asyncio.wait_for(
-                    operation, timeout=timeout_ms / 1000)
-        else:
+            stdin_task = asyncio.create_task(write_stdin())
+            tasks.append(stdin_task)
+            exit_task = asyncio.create_task(process.wait())
+            tasks.append(exit_task)
+            exchange_tasks = [stdin_task, stdout_task, stderr_task, exit_task]
             done, _pending = await asyncio.wait(
-                [operation, cancel_task],
-                timeout=None if timeout_ms is None else timeout_ms / 1000,
-                return_when=asyncio.FIRST_COMPLETED)
+                exchange_tasks, timeout=None if timeout_ms is None else timeout_ms / 1000,
+                return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                task.result()
+            if len(done) != len(exchange_tasks):
+                raise HookExecutionError(f"hook timed out after {timeout_ms}ms")
+            return [stdout_task.result(), stderr_task.result(), exit_task.result()]
+        finally:
+            async def retire():
+                for task in tasks:
+                    if task is not stdin_closed and not task.done():
+                        task.cancel()
+                try:
+                    # aclose aborts our pipes before joining native retirement;
+                    # leader wait alone neither joins that fence nor owns family
+                    # release. A completed hook must release its scope too.
+                    await process.aclose()
+                finally:
+                    try:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    finally:
+                        host_process.release_group(process)
+
+            await finish_cleanup(retire())
+
+    if cancel_event is None:
+        stdout, stderr, returncode = await exchange()
+    else:
+        # The existing cooperative-cancellation race must cover creation as well
+        # as stdio. The creator owns unpublished rollback; exchange owns the
+        # returned process. There is no second process/retirement owner here.
+        operation = asyncio.create_task(exchange())
+        cancel_task = None
+        try:
+            cancel_task = asyncio.create_task(cancel_event.wait())
+            await asyncio.wait([operation, cancel_task], return_when=asyncio.FIRST_COMPLETED)
             if cancel_event.is_set():
-                # The exception handler owns cleanup for this branch too.
                 raise recoveries.Cancelled()
-            if operation not in done:
-                raise asyncio.TimeoutError()
-            _stdin_result, stdout, stderr, returncode = operation.result()
-    except asyncio.TimeoutError as error:
-        await terminate()
-        raise HookExecutionError(
-            f"hook timed out after {timeout_ms}ms") from error
-    except BaseException:
-        await terminate()
-        raise
-    finally:
-        if cancel_task is not None:
-            cancel_task.cancel()
-            await asyncio.gather(cancel_task, return_exceptions=True)
+            stdout, stderr, returncode = operation.result()
+        finally:
+            tasks = [task for task in [operation, cancel_task] if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await finish_cleanup(asyncio.gather(*tasks, return_exceptions=True))
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     if returncode != 0:
         detail = f": {stderr_text}" if stderr_text else ""
@@ -967,6 +970,10 @@ async def _run_hook_command(command, payload, cwd, timeout_ms,
 @dataclass
 class ExternalHook:
     config: HookSettings
+    # A Session-bound capability supplied separately from configuration. It
+    # retains the selected state owner and rechecks admission at publication;
+    # hook JSON and the reduced child environment never select this authority.
+    create_exec: Callable[..., Any]
     stderr_reporter: Callable[..., Any] | None = None
 
     def matches(self, tool_name):
@@ -994,7 +1001,7 @@ class ExternalHook:
             },
             self.config.cwd,
             self.config.timeout_ms,
-            stderr_reporter=self.stderr_reporter,
+            create_exec=self.create_exec, stderr_reporter=self.stderr_reporter,
         )
         action = result.get("action", "continue")
         arguments = result.get("arguments", _UNSET)
@@ -1026,7 +1033,7 @@ class ExternalHook:
             },
             self.config.cwd,
             self.config.timeout_ms,
-            stderr_reporter=self.stderr_reporter,
+            create_exec=self.create_exec, stderr_reporter=self.stderr_reporter,
         )
         note = result.get("note")
         if note is not None and not isinstance(note, str):
@@ -1039,16 +1046,17 @@ class ExternalHook:
         )
 
 
-def build_hook_pipeline(definitions, stderr_reporter=None):
-    """Bind already-decoded Settings.hooks to runtime behavior, without I/O.
+def build_hook_pipeline(definitions, *, create_exec, stderr_reporter=None):
+    """Bind decoded Settings.hooks to the runtime's Session-owned creator.
 
     Settings owns the schema, defaults and order. These wrappers borrow its
-    definitions and only add the process-output callback; no option is copied
-    into a parallel runtime configuration record.
+    definitions and add only runtime capabilities/callbacks. The creator comes
+    from the live owner, never the configuration, invocation JSON or reduced
+    child environment; all phases use it with their configured cwd.
     """
     pipeline = ToolHookPipeline()
     for config in definitions:
-        hook = ExternalHook(config, stderr_reporter=stderr_reporter)
+        hook = ExternalHook(config, create_exec=create_exec, stderr_reporter=stderr_reporter)
         if config.phase == "turn_end":
             pipeline.turn_end_hooks.append(hook)
         elif config.phase == "turn_error":

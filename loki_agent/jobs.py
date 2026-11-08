@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from . import credential_capabilities, executables, files, host_ipc, host_process
 from . import private_files
 from . import process_outputs, tool_contracts, tool_runtime
+from .lifetimes import finish_cleanup
 
 
 def _bash_output(stdout: str, stderr: str, exit_code: int | None,
@@ -133,8 +134,10 @@ class JobManager:
     transitions instead of adding thread locks to event-loop-owned state.
     """
 
-    def __init__(self, base_dir: str):
-        self.base_dir = base_dir
+    def __init__(self, base_dir: str, *, directory, create_exec):
+        # The caller owns the selected root and writer/ordinary launch policy.
+        # A displayed base pathname is never authority to select another root.
+        self._create_exec = create_exec
         self.session_id = str(uuid.uuid4())
         self.session_dir = os.path.join(base_dir, self.session_id)
         # One retained handle to the session directory, opened at construction
@@ -150,15 +153,32 @@ class JobManager:
         self._active_subagents = 0
         # A local synchronous observer, bound only while a frontend owns it.
         self.on_change = None
-        self._session_directory()
+        try:
+            private_files.create_directory_at(directory, self.session_id)
+            self._session_fd = private_files.open_directory_at(directory, self.session_id)
+        except OSError as error:
+            raise OSError(f"could not create job session directory: {error}") from error
 
     def close(self) -> None:
         if any(not task.done() for task in self._monitors):
             raise RuntimeError("job monitors must be joined with aclose()")
         self._closed = True
-        if self._session_fd is not None:
+        pending = False
+        with contextlib.ExitStack() as cleanup:
+            for job in self.jobs.values():
+                # Failed exit observation is not the ordinary background-job
+                # detach policy. Keep its control and exit-bookkeeping storage
+                # in this manager, while independently retiring other families.
+                if (job.status == 'monitor_error' and job.process is not None
+                        and (job.process.returncode is None or job.group_active)):
+                    pending = True
+                else:
+                    cleanup.callback(host_process.release_group, job.process)
+            if pending:
+                raise RuntimeError('A command\'s exit could not be established')
             fd, self._session_fd = self._session_fd, None
-            private_files.close(fd)
+            if fd is not None:
+                cleanup.callback(private_files.close, fd)
 
     def __del__(self):
         if getattr(self, '_session_fd', None) is not None:
@@ -166,35 +186,65 @@ class JobManager:
             with contextlib.suppress(OSError):
                 private_files.close(fd)
 
+    def begin_close(self):
+        """Revoke admission now; the operation owner still joins its launches.
+
+        Session shutdown cannot await child exit before prompt/hook/creation
+        cleanup: those children may themselves be waiting for owner EOF. This
+        synchronous boundary reuses _closed; retained storage remains available
+        for exit bookkeeping until the final aclose, after operation quiescence.
+        """
+        self._closed = True
+        for job in self.jobs.values():
+            if job.status == 'starting':
+                job.status = 'owner_closed'
+            elif job.session_owned and job.status in ['running', 'stopping']:
+                job.status = 'owner_closing'
+        with contextlib.ExitStack() as cleanup:
+            for job in self.jobs.values():
+                if job.session_owned:
+                    cleanup.callback(self._revoke_credential_capability, job)
+                    cleanup.callback(self._close_owner_signal, job)
+
     async def aclose(self):
-        if self._closed:
+        if self._session_fd is None:
             return
-        try:
-            await self.close_session_owned()
-        finally:
+
+        async def retire():
+            failures = []
+            try:
+                self.begin_close()
+            except Exception as error:
+                failures.append(error)
+            try:
+                await self.close_session_owned()
+            except Exception as error:
+                failures.append(error)
             tasks = list(self._monitors)
             for task in tasks:
                 task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            self.close()
+            outcomes = await asyncio.gather(
+                *tasks,
+                *(job.process.aclose() for job in self.jobs.values()
+                  if job.process is not None and job.process.returncode is not None),
+                return_exceptions=True)
+            self._monitors.difference_update(tasks)
+            failures.extend(error for error in outcomes if isinstance(error, Exception))
+            try:
+                self.close()
+            except Exception as error:
+                failures.append(error)
+            if len(failures) == 1:
+                raise failures[0]
+            if failures:
+                raise ExceptionGroup('job cleanup failed', failures)
+
+        await finish_cleanup(retire())
 
     def _session_directory(self):
-        """The retained session-directory handle, creating the tree once."""
-        if self._closed:
-            raise ValueError("job storage is closed")
+        """Borrow retained storage, including during closed-admission cleanup."""
         if self._session_fd is None:
-            base_fd = private_files.open_directory_tree(self.base_dir)
-            try:
-                try:
-                    private_files.create_directory_at(base_fd, self.session_id)
-                except OSError as error:
-                    raise OSError(
-                        f"could not create job session directory: {error}") from error
-                self._session_fd = private_files.open_directory_at(
-                    base_fd, self.session_id)
-            finally:
-                private_files.close(base_fd)
+            raise ValueError("job storage is closed")
         return self._session_fd
 
     def _job_directory(self, job_id: str, *, create=False):
@@ -220,12 +270,7 @@ class JobManager:
                 facts = private_files.information(fd)
                 if not facts.regular or facts.reparse_point:
                     raise OSError("job spool is not a regular file")
-                view = memoryview(data)
-                while view:
-                    count = private_files.write(fd, view)
-                    if count <= 0:
-                        raise OSError("spool write made no progress")
-                    view = view[count:]
+                private_files.write_all(fd, data)
             finally:
                 private_files.close(fd)
         finally:
@@ -248,8 +293,9 @@ class JobManager:
         except BaseException:
             operation.close()
             raise
+        # Keep completed outcomes until the final owner joins them; discarding
+        # a failed monitor here would lose its cleanup failure before aclose.
         self._monitors.add(task)
-        task.add_done_callback(self._monitors.discard)
 
     def _reserve_subagent_slot(self, job: Job):
         # This check-and-increment contains no await and JobManager belongs to
@@ -324,10 +370,7 @@ class JobManager:
         job.owner_signal_fd = None
         if end is None:
             return
-        try:
-            host_ipc.close_end(end)
-        except OSError:
-            pass
+        host_ipc.close_end(end)
 
     @staticmethod
     def _revoke_credential_capability(job: Job):
@@ -361,21 +404,28 @@ class JobManager:
             job.error = error
         job.finished_at = time.time()
         job.finished_at_iso = _now_iso()
-        self._close_owner_signal(job)
-        self._revoke_credential_capability(job)
-        self._release_subagent_slot(job)
-        self._write_metadata(job)
+        with contextlib.ExitStack() as cleanup:
+            cleanup.callback(self._write_metadata, job)
+            cleanup.callback(self._release_subagent_slot, job)
+            cleanup.callback(self._revoke_credential_capability, job)
+            cleanup.callback(self._close_owner_signal, job)
 
     def _record_exit(self, job: Job, exit_code: int):
         # Status records why Loki ended the job; exit_code/signal record
         # how the child process actually terminated.
         job.signal = -exit_code if exit_code < 0 else None
         job.exit_code = exit_code
-        self._close_owner_signal(job)
-        self._revoke_credential_capability(job)
-        # The capacity limit counts direct subagent children, not descendants
-        # left in their groups. Leader exit releases that reservation now.
-        self._release_subagent_slot(job)
+        try:
+            with contextlib.ExitStack() as cleanup:
+                # Capacity counts direct children, not surviving descendants.
+                # Observed leader exit releases it even if channel close fails.
+                cleanup.callback(self._release_subagent_slot, job)
+                cleanup.callback(self._revoke_credential_capability, job)
+                cleanup.callback(self._close_owner_signal, job)
+        except Exception as error:
+            job.error = f'Command cleanup failed: {error}'
+            self._write_metadata(job)
+            raise
         if self._group_exists(job):
             # Keep a surviving group signalable, including after a soft stop.
             # Normal foreground completion still returns the leader's result;
@@ -399,7 +449,7 @@ class JobManager:
         self._finalize_job(job, status)
 
     def _refresh_job(self, job: Job):
-        if job.status not in ["running", "stopping"]:
+        if job.status not in ["running", "stopping", "owner_closing", "monitor_error"]:
             return
         exit_code = job.process.returncode
         if exit_code is not None:
@@ -410,6 +460,8 @@ class JobManager:
                      env: dict | None = None, cwd: str | None = None,
                      session_owned: bool = False,
                      credential_refs=None, credential_authority=None, credential_destinations=None, subagent: bool = False) -> Job:
+        if self._closed:
+            raise RuntimeError('This conversation has closed')
         if session_owned and shell:
             raise ValueError(
                 "session-owned jobs require a direct executable")
@@ -513,7 +565,7 @@ class JobManager:
                         # Windows shell=True uses cmd.exe's /c protocol even
                         # with an executable override. Keep the script as one
                         # Bash -c argument rather than reinterpret its quoting.
-                        proc = await host_process.create_exec(
+                        proc = await self._create_exec(
                             executables.BASH, '-c', str(spawn_command),
                             owning=False, before_resume=check_starting,
                             stdin=stdin,
@@ -528,7 +580,7 @@ class JobManager:
                         child_ends = [
                             end for end in [owner_child, credential_child]
                             if end is not None]
-                        proc = await host_process.create_exec(
+                        proc = await self._create_exec(
                             *spawn_command,
                             owning=subagent, before_resume=check_starting,
                             stdin=stdin,
@@ -540,6 +592,17 @@ class JobManager:
                             **host_process.spawn_kwargs(),
                             **host_ipc.spawn_kwargs(child_ends),
                         )
+                    # Physical ownership precedes fallible stdio/directory
+                    # cleanup and logical publication. A failed exit waiter
+                    # must leave the created child in this existing job table.
+                    job.process = proc
+                    job.owner_signal_fd = owner_parent
+                    parent_handed_off = True
+                    job.credential_capability = credential_server
+                    capability_handed_off = True
+                    job.pid = proc.pid
+                    job.pgid = host_process.process_group(proc, proc.pid)
+                    job.group_active = True
                 finally:
                     # The child duplicated or inherited the end at launch, so
                     # this copy is no longer needed either way.
@@ -553,28 +616,50 @@ class JobManager:
             # The session may have revoked this job while it was launching.
             # Publishing it now would leave a live child nobody owns.
             check_starting()
-            job.process = proc
-            job.owner_signal_fd = owner_parent
-            parent_handed_off = True
-            job.credential_capability = credential_server
-            capability_handed_off = True
-            job.pid = proc.pid
-            job.pgid = host_process.process_group(proc, proc.pid)
-            job.group_active = True
             job.status = "running"
             self._write_metadata(job)
             return job
         except BaseException as error:
             if proc is not None:
-                # A child exists, so end it before recording anything. An
-                # unowned live process is the one outcome this must not leave.
-                with contextlib.suppress(Exception):
-                    host_process.signal_group(
-                        proc, getattr(job, "pgid", None) or proc.pid,
-                        host_process.FORCE)
-                    job.group_active = False
-                with contextlib.suppress(Exception):
-                    await proc.wait()
+                unpublished = job.status != 'running'
+                job.status = 'stopping'
+
+                async def retire():
+                    async with contextlib.AsyncExitStack() as cleanup:
+                        cleanup.push_async_callback(self._close_credential_capability, job)
+                        try:
+                            try:
+                                self._close_owner_signal(job)
+                            finally:
+                                self._revoke_credential_capability(job)
+                        finally:
+                            try:
+                                try:
+                                    host_process.signal_group(proc, job.pgid, host_process.FORCE)
+                                finally:
+                                    await proc.wait()
+                            finally:
+                                if proc.returncode is not None:
+                                    self._release_subagent_slot(job)
+                        host_process.release_group(proc)
+                        job.group_active = False
+
+                try:
+                    await finish_cleanup(retire(), preserve_failure=True)
+                    if unpublished:
+                        job.process = None  # Never publish a successfully retired launch.
+                except BaseException as cleanup_error:
+                    # A failed observer is not exit or permission to detach.
+                    # Reuse the existing failed-monitor state and retained job;
+                    # no terminal timestamp, capacity release or retry is inferred.
+                    job.status = 'monitor_error'
+                    job.error = f'Command cleanup failed: {cleanup_error}'
+                    if proc.returncode is not None:
+                        self._record_exit(job, proc.returncode)
+                    else:
+                        with contextlib.suppress(Exception):
+                            self._write_metadata(job)
+                    raise
             revoked = isinstance(
                 error, (asyncio.CancelledError, _JobRevokedDuringLaunch))
             try:
@@ -622,16 +707,18 @@ class JobManager:
             job.status = "monitor_error"
             job.finished_at = time.time()
             job.finished_at_iso = _now_iso()
-            self._close_owner_signal(job)
-            self._revoke_credential_capability(job)
-            # A broken waiter does not prove that the child exited. Retain its
-            # slot and fail closed instead of admitting an extra live child.
             try:
-                self._append_spool(job, 'stderr.log',
-                                   f'\n[job monitor error: {type(e).__name__}: {e}]\n'.encode('utf-8'))
+                with contextlib.ExitStack() as cleanup:
+                    cleanup.callback(self._revoke_credential_capability, job)
+                    cleanup.callback(self._close_owner_signal, job)
             finally:
-                # The changed state must reach observers even if spooling fails.
-                self._write_metadata(job)
+                # A broken waiter does not prove that the child exited. Retain
+                # its slot, but record the failure even if revocation also fails.
+                try:
+                    self._append_spool(job, 'stderr.log',
+                                       f'\n[job monitor error: {type(e).__name__}: {e}]\n'.encode('utf-8'))
+                finally:
+                    self._write_metadata(job)
         finally:
             await self._close_credential_capability(job)
 
@@ -797,6 +884,7 @@ class JobManager:
         if host_process.group_exists(job.process, job.pgid):
             return True
         job.group_active = False
+        host_process.release_group(job.process)
         return False
 
     @staticmethod
@@ -807,12 +895,15 @@ class JobManager:
             host_process.signal_group(job.process, job.pgid, signum)
         except ProcessLookupError:
             job.group_active = False
+            host_process.release_group(job.process)
             return False
-        if signum == host_process.FORCE:
+        if signum == host_process.FORCE and job.status != 'monitor_error':
+            # Failed observers still require actual exit/group-absence proof.
             # Non-child zombies may keep a PGID present until their adopter
             # reaps them. Once SIGKILL is delivered, do not wait forever for
             # that or later signal a recycled historical PGID.
             job.group_active = False
+            host_process.release_group(job.process)
         return True
 
     async def _wait_for_group(self, job: Job, grace_s: float) -> bool:
@@ -833,19 +924,7 @@ class JobManager:
                         self._signal_process_group(job, host_process.FORCE)
             return await job.process.wait()
 
-        # A cancelled caller must join its teardown before relinquishing the
-        # group. Repeated cancellation must not strand the escalation task.
-        task = asyncio.create_task(finish())
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    pass
-            task.result()
-            raise
+        return await finish_cleanup(finish())
 
     async def _finish_owned_job(self, job: Job):
         try:
@@ -862,42 +941,56 @@ class JobManager:
         await self._close_credential_capability(job)
 
     async def close_session_owned(self):
-        """End and reap every live process owned by this Loki session."""
+        """Revoke every owned child before joining any, even if recording fails."""
         owned = []
         cleanup = []
+        failures = []
         for job in list(self.jobs.values()):
-            self._refresh_job(job)
+            try:
+                self._refresh_job(job)
+            except Exception as error:
+                failures.append(error)
             if not job.session_owned:
                 continue
+            finished = False
+            if job.process is not None and job.process.returncode is not None:
+                try:
+                    finished = not self._group_exists(job)
+                except Exception as error:
+                    failures.append(error)
             if job.process is None:
                 if job.status == "starting":
-                    # Launch still in flight: revoke it so it cannot publish a
-                    # live child nobody owns. _spawn re-checks after launching.
                     job.status = "owner_closed"
-                self._close_owner_signal(job)
-                self._revoke_credential_capability(job)
                 cleanup.append(job)
-                continue
-            if job.process.returncode is not None and not self._group_exists(job):
-                self._close_owner_signal(job)
-                self._revoke_credential_capability(job)
+            elif finished:
                 cleanup.append(job)
-                continue
-            job.status = "owner_closing"
-            self._write_metadata(job)
-            # EOF asks a cooperating Loki child to cancel its current work.
-            # Process-group signals below enforce the ownership boundary if
-            # the child is stuck or does not understand the owner channel.
-            self._close_owner_signal(job)
-            self._revoke_credential_capability(job)
-            owned.append(job)
-        if cleanup:
-            await asyncio.gather(
-                *(self._close_credential_capability(job)
-                  for job in cleanup))
-        if owned:
-            await asyncio.gather(
-                *(self._finish_owned_job(job) for job in owned))
+            else:
+                if job.status != 'monitor_error':
+                    job.status = "owner_closing"
+                owned.append(job)
+                try:
+                    self._write_metadata(job)
+                except Exception as error:
+                    failures.append(error)
+            try:
+                with contextlib.ExitStack() as revoke:
+                    revoke.callback(self._revoke_credential_capability, job)
+                    revoke.callback(self._close_owner_signal, job)
+            except Exception as error:
+                failures.append(error)
+
+        async def settle():
+            outcomes = await asyncio.gather(
+                *(self._close_credential_capability(job) for job in cleanup),
+                *(self._finish_owned_job(job) for job in owned),
+                return_exceptions=True)
+            failures.extend(error for error in outcomes if isinstance(error, Exception))
+            if len(failures) == 1:
+                raise failures[0]
+            if failures:
+                raise ExceptionGroup('owned jobs could not be retired', failures)
+
+        await finish_cleanup(settle())
 
     def _get_job(self, job_id: str) -> Job | None:
         job = self.jobs.get(str(job_id))
@@ -960,7 +1053,7 @@ class JobManager:
             return f"Error: unknown job id {job_id!r}"
         # This whole transition contains no await, so the event-loop reaper
         # cannot run between signal dispatch and the new state being recorded.
-        if job.status not in ["running", "stopping"]:
+        if job.status not in ["running", "stopping", "monitor_error"]:
             return f"Job {job.id} is not running (status={job.status})."
         if job.status == "stopping" and not force:
             return (
@@ -970,7 +1063,8 @@ class JobManager:
         if not self._signal_process_group(job, sig):
             self._refresh_job(job)
             return f"Job {job.id} is no longer running."
-        job.status = "stopping"
+        if job.status != 'monitor_error':
+            job.status = "stopping"
         self._write_metadata(job)
         return (f"Sent {host_process.label(sig)} to job {job.id} "
                 f"(pgid={job.pgid}).")

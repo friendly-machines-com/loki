@@ -810,9 +810,13 @@ class AsyncByteReader:
         # loop/reader when release fails so a later exit can finish cleanup.
         self._stopping = True
         if self._windows_reader is not None:
-            self._windows_reader.stop()
-            self._windows_reader = None
-            self.loop = None
+            reader = self._windows_reader
+            try:
+                await reader.aclose()
+            finally:
+                if reader.closed:
+                    self._windows_reader = None
+                    self.loop = None
             return
         try:
             if self._reader_registered and self.loop is not None:

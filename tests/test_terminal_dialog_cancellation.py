@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from job_fixtures import job_manager
+from process_lifecycle_fixtures import observe_fixture
 from response_header_fixtures import setUpModule as set_up_response_headers
 from settings_fixtures import setUpModule as set_up_default_settings
 from config_fixtures import setUpModule as set_up_config
@@ -15,7 +17,6 @@ from loki_agent import authentications, loki, models, protocols, provider_contro
 from loki_agent import settings, terminal_frontend, terminals
 from loki_agent.credentials import CredentialStore
 from loki_agent import connections
-from loki_agent import jobs as job_runtime
 
 
 def setUpModule():
@@ -79,12 +80,12 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.directory.cleanup)
         self.agent_session = loki.Session(
             shell_cwd=self.directory.name,
-            job_manager=job_runtime.JobManager(self.directory.name),
+            job_manager=job_manager(self.directory.name, cleanup=self.addCleanup,
+                                    async_cleanup=self.addAsyncCleanup),
             runtime_config=connections.make_runtime_config(
                 "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
                 model="claude-opus-4-5"),
         )
-        self.addAsyncCleanup(self.agent_session.job_manager.close_session_owned)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", self.agent_session))
@@ -111,7 +112,9 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
 
     async def assert_next_input(self, inputs):
         self.assert_modal_released(inputs)
-        self.assertEqual(await asyncio.wait_for(inputs.user_messages.get(), 1), "next message")
+        producer = inputs._producer
+        self.assertIsNotNone(producer)
+        self.assertEqual(await observe_fixture(inputs.user_messages.get(), producer), "next message")
         self.assertGreater(inputs.normal_keys_after_interrupt, 0)
 
     async def run_model_dialog(self, events, *, offline=False, interrupt=KeyboardInterrupt):
@@ -149,8 +152,8 @@ class DialogCancellationTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await terminal_frontend.async_main([], settings.Settings())
             else:
-                self.assertEqual(await asyncio.wait_for(
-                    self.run_dialog(terminal_frontend.async_main([], settings.Settings())), 2), 0)
+                self.assertEqual(await self.run_dialog(
+                    terminal_frontend.async_main([], settings.Settings())), 0)
                 self.assertGreater(inputs.normal_keys_after_interrupt, 0)
                 self.assertEqual(self.stderr.getvalue().count("Model selection cancelled."), 1)
             self.assertEqual(loki.current_model(), "current-model")

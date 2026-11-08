@@ -209,7 +209,7 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hook.cwd, "selected cwd")
         self.assertIsNone(hook.timeout_ms)
         self.assertEqual(hook.tools, ["*"])
-        self.assertIs(tool_runtime.build_hook_pipeline(value.hooks).turn_error_hooks[0].config, hook)
+        self.assertIs(tool_runtime.build_hook_pipeline(value.hooks, create_exec=mock.AsyncMock()).turn_error_hooks[0].config, hook)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             hook.cwd = "changed"
 

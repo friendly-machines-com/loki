@@ -220,9 +220,8 @@ class TurnAdvertisementTests(unittest.IsolatedAsyncioTestCase):
         self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
             model="claude-opus-4-5"))
-        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.addCleanup(self.session.response_headers.close)
+        self.enterContext(mock.patch.object(loki, "_DEFAULT_SESSION", self.session))
 
     async def _turn(self, **kwargs):
         advertised = []
@@ -234,7 +233,7 @@ class TurnAdvertisementTests(unittest.IsolatedAsyncioTestCase):
                 [formats.message_item("assistant", "answer")])
 
         with mock.patch.object(
-                    terminal_frontend, "async_chat_completion", completion), \
+                    loki, "async_chat_completion", completion), \
                 mock.patch.object(terminal_frontend, "_terminal_agent_event"), \
                 mock.patch.object(terminal_frontend.terminals,
                                   "redraw_status_bar"), \
@@ -269,9 +268,8 @@ class LoopAdvertisementTests(unittest.IsolatedAsyncioTestCase):
         self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
             model="claude-opus-4-5"))
-        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.addCleanup(self.session.response_headers.close)
+        self.enterContext(mock.patch.object(loki, "_DEFAULT_SESSION", self.session))
 
     async def _loop(self, **kwargs):
         advertised = []

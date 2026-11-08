@@ -18,7 +18,9 @@ from unittest import mock
 
 from settings_fixtures import setUpModule as set_up_default_settings
 from config_fixtures import setUpModule as set_up_config
+from response_header_fixtures import setUpModule as set_up_response_headers
 from test_terminals import RecordingTerminal
+from process_lifecycle_fixtures import observe_fixture, observe_fixture_state
 
 from loki_agent import (
     authentications, connections, file_locks, formats, loki, models, openai_models, protocols,
@@ -32,6 +34,8 @@ from loki_agent.sessions import Session
 def setUpModule():
     set_up_config()
     set_up_default_settings()
+    # Unit frontends are state owners too; never depend on writable user state.
+    set_up_response_headers()
 
 
 class _FakeReader:
@@ -39,29 +43,30 @@ class _FakeReader:
         self.keys = asyncio.Queue()
         self.cancel_event = asyncio.Event()
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        pass
+
     async def read_key(self):
         return await self.keys.get()
 
 
 class ImmediateCommandTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = directory.name
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
         self.session = Session(
             shell_cwd=self.root,
             transcript_items=[formats.message_item("user", "busy")])
+        self.addCleanup(self.session.response_headers.close)
         self.initial = list(self.session.transcript_items)
-        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.enterContext(mock.patch.object(loki, "_DEFAULT_SESSION", self.session))
         self.addCleanup(terminal_frontend._immediate_tasks.clear)
         self.addCleanup(terminal_frontend.terminal.assistant_markdown.reset)
-        activity_patch = mock.patch.object(
+        self.enterContext(mock.patch.object(
             terminal_frontend, "_terminal_activity",
-            terminal_frontend.TerminalActivityStatus())
-        activity_patch.start()
-        self.addCleanup(activity_patch.stop)
+            terminal_frontend.TerminalActivityStatus()))
         self.output = io.StringIO()
         self.handled = []
 
@@ -96,17 +101,39 @@ class ImmediateCommandTests(unittest.TestCase):
     async def command(self, session, text):
         previous = len(self.handled)
         self.feed(session, text)
-        async with asyncio.timeout(3):
-            while len(self.handled) == previous:
-                await asyncio.sleep(0)
-            # Async handlers are scheduled; let them finish before asserting.
-            pending = list(terminal_frontend._immediate_tasks)
-            if pending:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True), 3)
+        await observe_fixture_state(
+            lambda: len(self.handled) > previous, session._producer)
+        # Async handlers are scheduled; let them finish before asserting.
+        pending = list(terminal_frontend._immediate_tasks)
+        if pending:
+            await asyncio.gather(*pending)
         self.assertEqual(self.handled[-1], text)
         self.assertEqual(session.user_messages.message_count, 0)
         self.assertEqual(self.session.transcript_items, self.initial)
+
+    def test_command_observes_failed_input_owner(self):
+        async def scenario():
+            session = self.make_session()
+            session._producer = asyncio.get_running_loop().create_future()
+            session._producer.set_exception(OSError("input owner failed"))
+            before = asyncio.all_tasks()
+            with self.assertRaisesRegex(OSError, "input owner failed"):
+                await self.command(session, "/ps")
+            self.assertFalse(session._producer.cancelled())
+            self.assertEqual(asyncio.all_tasks(), before)
+        asyncio.run(scenario())
+
+    def test_command_observes_input_owner_exit_before_admission(self):
+        async def scenario():
+            session = self.make_session()
+            session._producer = asyncio.get_running_loop().create_future()
+            session._producer.set_result(None)
+            before = asyncio.all_tasks()
+            with self.assertRaisesRegex(AssertionError, "operation ended before expected fixture event"):
+                await self.command(session, "/ps")
+            self.assertFalse(session._producer.cancelled())
+            self.assertEqual(asyncio.all_tasks(), before)
+        asyncio.run(scenario())
 
     def test_todo_is_a_synchronous_snapshot_during_a_running_turn(self):
         async def scenario():
@@ -131,32 +158,30 @@ class ImmediateCommandTests(unittest.TestCase):
                     mock.patch.object(loki, "async_chat_completion",
                                       side_effect=AssertionError("turn started")), \
                     contextlib.redirect_stdout(self.output):
-                session = self.make_session()
-                session._producer = asyncio.create_task(session._produce())
-                try:
-                    terminal_frontend._terminal_agent_event({"type": "assistant_start"})
-                    terminal_frontend._terminal_agent_event({
-                        "type": "assistant_delta", "content": "before **pen"})
-                    await self.command(session, "/todo")
-                    rendered = self.output.getvalue()
-                    self.assertIn("/todo:\nTodos:\n", rendered)
-                    self.assertIn("1. [completed] (high) Inspect^[]777;ATTACK^G", rendered)
-                    self.assertIn("2. [in_progress] (medium) Implement", rendered)
-                    self.assertIn("3. [pending] (low) Verify", rendered)
-                    self.assertNotIn("\x1b]777", rendered)
-                    self.assertEqual(terminal_frontend._immediate_tasks, set())
-                    self.assertFalse(turn.done())
-                    self.assertTrue(terminal_frontend._terminal_activity.turn_running)
-                    self.assertFalse(session.reader.cancel_event.is_set())
-                    self.assertEqual(self.session.session_todos, original_todos)
-                    self.assertFalse(self.session.chat_log_dirty)
-                    terminal_frontend._terminal_agent_event({
-                        "type": "assistant_delta", "content": "ding** after"})
-                    terminal_frontend._terminal_agent_event({"type": "assistant_end"})
-                finally:
-                    release.set()
-                    await turn
-                    await session._pause()
+                async with self.make_session() as session:
+                    try:
+                        terminal_frontend._terminal_agent_event({"type": "assistant_start"})
+                        terminal_frontend._terminal_agent_event({
+                            "type": "assistant_delta", "content": "before **pen"})
+                        await self.command(session, "/todo")
+                        rendered = self.output.getvalue()
+                        self.assertIn("/todo:\nTodos:\n", rendered)
+                        self.assertIn("1. [completed] (high) Inspect^[]777;ATTACK^G", rendered)
+                        self.assertIn("2. [in_progress] (medium) Implement", rendered)
+                        self.assertIn("3. [pending] (low) Verify", rendered)
+                        self.assertNotIn("\x1b]777", rendered)
+                        self.assertEqual(terminal_frontend._immediate_tasks, set())
+                        self.assertFalse(turn.done())
+                        self.assertTrue(terminal_frontend._terminal_activity.turn_running)
+                        self.assertFalse(session.reader.cancel_event.is_set())
+                        self.assertEqual(self.session.session_todos, original_todos)
+                        self.assertFalse(self.session.chat_log_dirty)
+                        terminal_frontend._terminal_agent_event({
+                            "type": "assistant_delta", "content": "ding** after"})
+                        terminal_frontend._terminal_agent_event({"type": "assistant_end"})
+                    finally:
+                        release.set()
+                        await turn
             self.assertIn(terminals.BOLD + "pending" + terminals.RESET,
                           self.output.getvalue())
 
@@ -187,9 +212,7 @@ class ImmediateCommandTests(unittest.TestCase):
                     mock.patch.object(terminal_frontend,
                                       "restore_output_area_after_input"), \
                     contextlib.redirect_stdout(self.output):
-                session = self.make_session()
-                session._producer = asyncio.create_task(session._produce())
-                try:
+                async with self.make_session() as session:
                     await self.command(session, "/todo clear")
                     self.assertIn("usage: /todo", self.output.getvalue())
                     self.assertEqual(self.session.session_todos, [None])
@@ -199,8 +222,6 @@ class ImmediateCommandTests(unittest.TestCase):
                     await self.command(session, "/todo")
                     self.assertIn("No todos for this session.", self.output.getvalue())
                     self.assertFalse(session._producer.done())
-                finally:
-                    await session._pause()
             self.assertFalse(self.session.chat_log_dirty)
 
         asyncio.run(scenario())
@@ -279,6 +300,7 @@ class ImmediateCommandTests(unittest.TestCase):
             observe(200, {"x-remaining": "8"})
             self.session.response_headers = store
             release = asyncio.Event()
+            session = self.make_session()
             turn = asyncio.create_task(release.wait())
             terminal_frontend._terminal_activity.set_turn_running(True)
             with mock.patch.object(terminal_frontend.terminal,
@@ -290,7 +312,6 @@ class ImmediateCommandTests(unittest.TestCase):
                     mock.patch.object(loki, "async_chat_completion",
                                       side_effect=AssertionError("turn started")), \
                     contextlib.redirect_stdout(self.output):
-                session = self.make_session()
                 session.user_messages.put_nowait("already queued")
                 session.reader.cancel_event.set()
                 try:
@@ -374,9 +395,7 @@ class ImmediateCommandTests(unittest.TestCase):
                                       "restore_output_area_after_input"), \
                     contextlib.redirect_stdout(self.output), \
                     contextlib.redirect_stderr(self.output):
-                session = self.make_session()
-                session._producer = asyncio.create_task(session._produce())
-                try:
+                async with self.make_session() as session:
                     for error in [OSError("unavailable\x1b]777;ATTACK\x07"),
                                   RuntimeError("unexpected failure")]:
                         with mock.patch.object(store, "snapshot", side_effect=error):
@@ -390,8 +409,6 @@ class ImmediateCommandTests(unittest.TestCase):
                     self.assertIn("display closed", logs.output[0])
                     await self.command(session, "/status all")
                     self.assertFalse(session._producer.done())
-                finally:
-                    await session._pause()
             rendered = self.output.getvalue()
             self.assertIn("Could not read response status: unavailable^[]777;ATTACK^G", rendered)
             self.assertNotIn("\x1b]777", rendered)
@@ -411,7 +428,7 @@ class ImmediateCommandTests(unittest.TestCase):
                     contextlib.redirect_stdout(self.output):
                 session = self.make_session()
                 session.user_messages.put_nowait("already queued")
-                try:
+                async with session:
                     async with session.modal() as modal:
                         self.feed(session, "/status all")
                         self.feed(session, "chosen answer")
@@ -421,8 +438,6 @@ class ImmediateCommandTests(unittest.TestCase):
                         self.assertFalse(terminal_frontend._immediate_tasks)
                         self.assertEqual(session.user_messages.message_count, 1)
                         self.assertEqual(self.session.transcript_items, self.initial)
-                finally:
-                    await session._pause()
 
         asyncio.run(scenario())
 
@@ -444,12 +459,8 @@ class ImmediateCommandTests(unittest.TestCase):
                         provider_controls, "find_control",
                         return_value=spec), \
                     contextlib.redirect_stdout(self.output):
-                session = self.make_session()
-                session._producer = asyncio.create_task(session._produce())
-                try:
+                async with self.make_session() as session:
                     await self.command(session, "/account usage")
-                finally:
-                    await session._pause()
             spec.read.assert_awaited_once()
             rendered = self.output.getvalue()
             self.assertIn("usage: fine", rendered)
@@ -504,35 +515,39 @@ class ImmediateCommandTests(unittest.TestCase):
                 session._producer = asyncio.create_task(session._produce())
                 turn = asyncio.create_task(streaming_turn())
                 try:
-                    async with asyncio.timeout(3):
-                        await turn_started.wait()
-                        self.feed(session, "/account usage")
-                        await read_started.wait()
-                        # Move the streaming cursor AFTER the admission echo,
-                        # before completing the delayed network read.
-                        terminal_frontend._terminal_agent_event({
-                            "type": "assistant_delta",
-                            "content": "ASSISTANT-PART-A"})
-                        release_read.set()
-                        if error is None:
-                            answer = "ACCOUNT-RESULT"
-                        elif isinstance(error, OSError):
-                            answer = f"Could not read account usage: {error}"
-                        else:
-                            answer = f"Command failed: {error}"
-                        while answer not in self.output.getvalue():
-                            await asyncio.sleep(0)
-                        # Assert visibility while the turn is STILL BLOCKED,
-                        # without draining tasks or releasing that turn.
-                        self.assertFalse(turn.done())
-                        self.assertTrue(terminal_frontend._terminal_activity.turn_running)
-                        self.assertIn(
-                            f"ASSISTANT-PART-A\n/account usage:\n{answer}\n",
-                            self.output.getvalue())
-                        self.assertTrue(terminal_frontend.terminal.assistant_markdown.active)
-                        self.assertEqual(session.user_messages.message_count, 0)
-                        self.assertEqual(self.session.transcript_items, self.initial)
-                        self.assertFalse(session.reader.cancel_event.is_set())
+                    await observe_fixture(turn_started.wait(), turn)
+                    previous = len(self.handled)
+                    self.feed(session, "/account usage")
+                    await observe_fixture_state(
+                        lambda: len(self.handled) > previous, session._producer)
+                    handlers = list(terminal_frontend._immediate_tasks)
+                    self.assertTrue(handlers)
+                    await observe_fixture(
+                        read_started.wait(), session._producer, *handlers)
+                    # Move the streaming cursor AFTER the admission echo,
+                    # before completing the delayed network read.
+                    terminal_frontend._terminal_agent_event({
+                        "type": "assistant_delta",
+                        "content": "ASSISTANT-PART-A"})
+                    release_read.set()
+                    if error is None:
+                        answer = "ACCOUNT-RESULT"
+                    elif isinstance(error, OSError):
+                        answer = f"Could not read account usage: {error}"
+                    else:
+                        answer = f"Command failed: {error}"
+                    await asyncio.gather(*handlers)
+                    # Join the admitted read, not the still-blocked turn. Missing
+                    # rendering then fails the assertion instead of hanging.
+                    self.assertFalse(turn.done())
+                    self.assertTrue(terminal_frontend._terminal_activity.turn_running)
+                    self.assertIn(
+                        f"ASSISTANT-PART-A\n/account usage:\n{answer}\n",
+                        self.output.getvalue())
+                    self.assertTrue(terminal_frontend.terminal.assistant_markdown.active)
+                    self.assertEqual(session.user_messages.message_count, 0)
+                    self.assertEqual(self.session.transcript_items, self.initial)
+                    self.assertFalse(session.reader.cancel_event.is_set())
                 finally:
                     release_turn.set()
                     await turn
@@ -588,12 +603,8 @@ class ImmediateCommandTests(unittest.TestCase):
                         return_value=spec), \
                     contextlib.redirect_stdout(self.output), \
                     contextlib.redirect_stderr(errors):
-                session = self.make_session()
-                session._producer = asyncio.create_task(session._produce())
-                try:
+                async with self.make_session() as session:
                     await self.command(session, "/account usage")
-                finally:
-                    await session._pause()
             self.assertIn(
                 "/account usage:\nCould not read account usage: no key\n",
                 self.output.getvalue())
@@ -623,11 +634,12 @@ class ImmediateCommandTests(unittest.TestCase):
             "https://current.example/v1/responses", protocols.OPENAI_RESPONSES,
             model="current-B", reasoning_effort_profile=profile)
         authority_a, authority_b = object(), object()
+        later_headers = Store(os.path.join(self.root, "later-headers.json"))
+        self.addCleanup(later_headers.close)
         later = Session(
             shell_cwd=self.root, runtime_config=current,
             credential_authority=authority_b, reasoning_effort_preference="max",
-            response_headers=Store(os.path.join(self.root, "later-headers.json")))
-        self.addCleanup(later.response_headers.close)
+            response_headers=later_headers)
         seen = {}
 
         async def scenario():
@@ -755,7 +767,9 @@ class ImmediateCommandTests(unittest.TestCase):
             class GatedInput(ScriptedInputSession):
                 async def get(inner):
                     self.assertTrue(inner.on_submit("/account usage"))
-                    await started.wait()
+                    handlers = list(terminal_frontend._immediate_tasks)
+                    self.assertEqual(len(handlers), 1)
+                    await observe_fixture(started.wait(), handlers[0])
                     if mode == "exception":
                         raise RuntimeError("input failed")
                     if mode == "cancel":
@@ -787,7 +801,13 @@ class ImmediateCommandTests(unittest.TestCase):
                 return input_owner
 
             spec = mock.Mock(read=read)
-            with mock.patch.object(loki, "CREDENTIALS", CredentialStore({})), \
+            # Direct async_main bypasses the production Session owner. Retire
+            # this invocation on its own loop, after frontend cancellation/join;
+            # a later invocation must acquire a fresh Session.
+            session = Session(shell_cwd=self.root)
+            self.addCleanup(session.response_headers.close)
+            with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                    mock.patch.object(loki, "CREDENTIALS", CredentialStore({})), \
                     mock.patch.object(terminal_frontend, "input_session",
                                       side_effect=open_input), \
                     mock.patch.object(terminal_frontend, "new_chat_log_path",
@@ -798,27 +818,36 @@ class ImmediateCommandTests(unittest.TestCase):
                                       return_value=spec), \
                     contextlib.redirect_stdout(self.output), \
                     contextlib.redirect_stderr(io.StringIO()):
-                frontend = asyncio.create_task(terminal_frontend.async_main([], settings.Settings()))
-                async with asyncio.timeout(3):
-                    if mode == "cancel":
-                        await started.wait()
-                        frontend.cancel()
-                        with self.assertRaises(asyncio.CancelledError):
-                            await frontend
-                    elif mode == "exception":
-                        with self.assertRaisesRegex(RuntimeError, "input failed"):
-                            await frontend
-                    else:
-                        self.assertEqual(await frontend, 0)
-                self.assertTrue(cancellation.is_set())
-                self.assertEqual(events, ["read ended", "input closed"])
-                self.assertEqual(attempted_admissions, [False])
-                self.assertFalse(terminal_frontend._immediate_tasks)
-                output_at_exit = self.output.getvalue()
-                release.set()
-                await asyncio.sleep(0)
-                self.assertEqual(self.output.getvalue(), output_at_exit)
-                self.assertNotIn("LATE-ANSWER", output_at_exit)
+                try:
+                    frontend = asyncio.create_task(terminal_frontend.async_main([], settings.Settings()))
+                    try:
+                        if mode == "cancel":
+                            await observe_fixture(started.wait(), frontend)
+                            frontend.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await frontend
+                        elif mode == "exception":
+                            with self.assertRaisesRegex(RuntimeError, "input failed"):
+                                await frontend
+                        else:
+                            self.assertEqual(await frontend, 0)
+                    finally:
+                        if not frontend.done():
+                            frontend.cancel()
+                        await asyncio.gather(frontend, return_exceptions=True)
+                    self.assertTrue(cancellation.is_set())
+                    self.assertEqual(events, ["read ended", "input closed"])
+                    self.assertEqual(attempted_admissions, [False])
+                    self.assertFalse(terminal_frontend._immediate_tasks)
+                    output_at_exit = self.output.getvalue()
+                    release.set()
+                    await asyncio.sleep(0)
+                    self.assertEqual(self.output.getvalue(), output_at_exit)
+                    self.assertNotIn("LATE-ANSWER", output_at_exit)
+                finally:
+                    await session.close_state()
+            with self.assertRaises(ValueError):
+                session.response_headers.snapshot()
 
         for mode in ["quit", "eof", "exception", "cancel"]:
             with self.subTest(mode=mode):
@@ -861,9 +890,11 @@ class ImmediateCommandTests(unittest.TestCase):
                     contextlib.redirect_stdout(self.output), \
                     self.assertLogs("loki_agent.terminal_frontend", level="ERROR") as logs:
                 self.assertTrue(terminal_frontend._submit_immediate("/account usage"))
-                async with asyncio.timeout(3):
-                    while terminal_frontend._immediate_tasks:
-                        await asyncio.sleep(0)
+                failures = await asyncio.gather(
+                    *list(terminal_frontend._immediate_tasks), return_exceptions=True)
+                self.assertEqual(len(failures), 1)
+                self.assertIsInstance(failures[0], OSError)
+                self.assertEqual(str(failures[0]), "display closed")
             self.assertIn("display closed", logs.output[0])
             self.assertEqual(self.session.transcript_items, self.initial)
 
@@ -884,22 +915,17 @@ class ImmediateQueueTests(unittest.TestCase):
     image_collection = "images"
 
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = directory.name
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
         self.session = Session(
             shell_cwd=self.root,
             transcript_items=[formats.message_item("user", "busy")])
+        self.addCleanup(self.session.response_headers.close)
         self.initial = list(self.session.transcript_items)
-        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.enterContext(mock.patch.object(loki, "_DEFAULT_SESSION", self.session))
         self.output = io.StringIO()
         self.handled = []
-        queue_patch = mock.patch.object(
-            terminal_frontend, "_queued_inputs", terminal_frontend._QueuedInputs())
-        queue_patch.start()
-        self.addCleanup(queue_patch.stop)
+        self.enterContext(mock.patch.object(
+            terminal_frontend, "_queued_inputs", terminal_frontend._QueuedInputs()))
         self.addCleanup(terminal_frontend._immediate_tasks.clear)
         self.addCleanup(terminal_frontend._queued_inputs.reset, None)
 
@@ -910,17 +936,15 @@ class ImmediateQueueTests(unittest.TestCase):
     async def enqueue(self, session, text):
         session.reader.keys.put_nowait(terminals.KeyEvent("TEXT", text))
         session.reader.keys.put_nowait(terminals.KeyEvent("ENTER"))
-        async with asyncio.timeout(3):
-            while text not in self.pending_texts(session):
-                await asyncio.sleep(0)
+        await observe_fixture_state(
+            lambda: text in self.pending_texts(session), session._producer)
 
     async def command(self, session, text):
         previous = len(self.handled)
         session.reader.keys.put_nowait(terminals.KeyEvent("TEXT", text))
         session.reader.keys.put_nowait(terminals.KeyEvent("ENTER"))
-        async with asyncio.timeout(3):
-            while len(self.handled) == previous:
-                await asyncio.sleep(0)
+        await observe_fixture_state(
+            lambda: len(self.handled) > previous, session._producer)
         self.assertEqual(self.handled[-1], text)
         self.assertEqual(self.session.transcript_items, self.initial)
 
@@ -943,11 +967,8 @@ class ImmediateQueueTests(unittest.TestCase):
                     on_queue_size_change=lambda count: None)
                 session.reader = _FakeReader()
                 terminal_frontend._queued_inputs.reset(session)
-                session._producer = asyncio.create_task(session._produce())
-                try:
+                async with session:
                     await script(session)
-                finally:
-                    await session._pause()
 
         asyncio.run(scenario())
 
@@ -1243,10 +1264,15 @@ class ImmediateQueueTests(unittest.TestCase):
                                       "restore_output_area_after_input"), \
                     contextlib.redirect_stdout(self.output), \
                     contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaisesRegex(RuntimeError, "input failed"):
-                    await terminal_frontend.async_main([], settings.Settings())
-                self.assertIsNone(terminal_frontend._queued_inputs.session)
-                self.assertEqual(terminal_frontend._queued_inputs.staged_images, [])
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "input failed"):
+                        await terminal_frontend.async_main([], settings.Settings())
+                    self.assertIsNone(terminal_frontend._queued_inputs.session)
+                    self.assertEqual(terminal_frontend._queued_inputs.staged_images, [])
+                finally:
+                    await self.session.close_state()
+            with self.assertRaises(ValueError):
+                self.session.response_headers.snapshot()
 
         asyncio.run(scenario())
 

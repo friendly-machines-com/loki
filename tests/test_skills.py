@@ -10,7 +10,7 @@ from unittest import mock
 
 from config_fixtures import setUpModule as set_up_config
 from response_header_fixtures import setUpModule as set_up_response_headers
-from loki_entrypoints import child_environment, configure_container, entrypoint
+from loki_entrypoints import child_environment, configure_container, loki_command
 from process_lifecycle_fixtures import ProcessResources
 from test_acps import _ACPFrontFixture
 from test_pty_ui import _read_to_exit, _read_until, _SgrStreamTracker
@@ -88,21 +88,21 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
 
     async def terminal(self, name):
         process = await asyncio.create_subprocess_exec(
-            entrypoint('loki'), '--dangerously-skip-permissions',
+            *loki_command(), '--dangerously-skip-permissions',
             cwd=self.workspace, env=self.environment_for(name),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
         resources = ProcessResources(process)
         self.addAsyncCleanup(resources.cleanup)
         stdout, stderr = await process.communicate(('/' + name + ' ' + _ARGUMENT + '\n/quit\n').encode())
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        # This stdlib driver belongs to the fixture, not Loki's launch owner.
         self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
-        resources.assert_released(self)
-        return stdout.decode(errors='replace'), stderr.decode(errors='replace')
+        # Piped text uses native newline translation; compare its text content,
+        # not a platform-specific CRLF spelling of the canonical skill body.
+        return stdout.decode(errors='replace').replace('\r\n', '\n'), stderr.decode(errors='replace')
 
     async def acp(self, name):
-        front, diagnostics = await self._front(self.environment_for(name), self.workspace)
+        front, diagnostics = await self._front(self.environment_for(name), self.workspace, cleanup=self.addAsyncCleanup)
         await self._request(front, 1, 'initialize', {'protocolVersion': 1})
         opened, _preceding = await self._request(front, 2, 'session/new', {'cwd': self.workspace})
         session_id = opened['sessionId']
@@ -143,7 +143,7 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
         """The real TTY must reveal skills before input and execute the user's request."""
         environment = self.environment_for(_NAME)
         environment['TERM'] = 'xterm'
-        handle = pty_backend.spawn_pty([entrypoint('loki')], env=environment, cwd=self.workspace)
+        handle = pty_backend.spawn_pty(loki_command(), env=environment, cwd=self.workspace)
         captured = bytearray()
         try:
             _read_until(handle, captured, 'User: !')
@@ -228,7 +228,6 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                         await loki.run_tool_loop_async(transcript, allowed={'Skill'})
 
                 with mock.patch.object(loki, 'async_chat_completion', new=model), \
-                        mock.patch.object(terminal_frontend, 'async_chat_completion', new=model), \
                         mock.patch.object(terminal_frontend, '_terminal_agent_event'):
                     await run_turn()
                     self.assertEqual(received[0], [original_user])
@@ -249,8 +248,7 @@ class SkillFrontendTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
                                                  if tool.get('function', {}).get('name') == 'Skill'))
                         return [formats.message_item('assistant', 'next')]
 
-                    with mock.patch.object(loki, 'async_chat_completion', new=next_turn), \
-                            mock.patch.object(terminal_frontend, 'async_chat_completion', new=next_turn):
+                    with mock.patch.object(loki, 'async_chat_completion', new=next_turn):
                         await run_turn()
                     self.assertEqual(formats.item_text(received[0][-1]), 'Another task')
                     self.assertIn('Changed after first request', descriptions[0])

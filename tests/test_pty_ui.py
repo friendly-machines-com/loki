@@ -849,7 +849,7 @@ def _pty_child(argv):
                 events = []
                 with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
                         mock.patch.object(pipeline, "recover_turn", new=wait_policy), \
-                        mock.patch.object(terminal_frontend, "async_chat_completion", new=fail), \
+                        mock.patch.object(loki, "async_chat_completion", new=fail), \
                         _terminals.TerminalMode(0, enabled=True):
                     async with reader:
                         print("RETRY_PROMPT_READY User: ", end="", flush=True)
