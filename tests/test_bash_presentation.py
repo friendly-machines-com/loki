@@ -5,12 +5,14 @@ import io
 import json
 import os
 import pathlib
+import sys
 import tempfile
 import types
 import unittest
 from unittest import mock
-from job_fixtures import job_manager
 from config_fixtures import setUpModule  # noqa: F401 - unittest hook
+from job_fixtures import job_manager
+from process_lifecycle_fixtures import observe_fixture_state
 
 from loki_agent import acp_events, formats, loki, process_outputs, protocols, savefiles
 from loki_agent import settings, terminal_frontend, tool_runtime
@@ -49,6 +51,30 @@ def replay_text(events, show_stdout=None):
 
 
 class PresentationTests(unittest.TestCase):
+    def test_all_model_schemas_allow_explicit_null_but_keep_timeout_optional(self):
+        definition = loki.TOOL_REGISTRY["Bash"]["definition"]
+        description = definition["function"]["description"]
+        self.assertNotIn("null", description)
+        self.assertNotIn("infinity", description)
+        schemas = [
+            definition["function"]["parameters"],
+            formats.openai_tools_to_anthropic_tools([definition])[0]["input_schema"],
+            formats.openai_tools_to_responses_tools([definition])[0]["parameters"],
+            formats.openai_tools_to_responses_lite_tools([definition])[0]["tools"][0]["parameters"],
+        ]
+        for schema in schemas:
+            with self.subTest(schema=schema):
+                self.assertNotIn("timeout", schema["required"])
+                for arguments in [{"command": "example"},
+                                  {"command": "example", "timeout": None},
+                                  {"command": "example", "timeout": 0},
+                                  {"command": "example", "timeout": 1234}]:
+                    self.assertEqual(tool_runtime.validate_schema(schema, arguments), [])
+                description = schema["properties"]["timeout"]["description"]
+                self.assertIn(str(tool_contracts.BASH_DEFAULT_TIMEOUT_MS), description)
+                self.assertNotIn("null", description)
+                self.assertNotIn("infinity", description)
+
     def render(self, event, show_stdout=False):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -190,43 +216,155 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    async def execute(self, command="test-command", *, pipeline=None, **arguments):
+    async def execute(self, command="test-command", *, pipeline=None, extra_context=None, **arguments):
         call = formats.tool_call_item("bash-call", "Bash", {"command": command, **arguments})
         result, _execution = await loki.execute_tool_call_async(
-            call, hook_pipeline=pipeline or tool_runtime.ToolHookPipeline())
+            call, hook_pipeline=pipeline or tool_runtime.ToolHookPipeline(), extra_context=extra_context)
         return result
 
     async def test_completed_capture_preserves_original_model_text(self):
         job = types.SimpleNamespace(exit_code=7)
-        with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(
-                return_value=[job, "completed", "stdout-secret", "stderr-message"])):
-            result = await self.execute()
-        self.assertEqual(result["content"],
-                         "status: completed\nexit_code: 7\n[stdout]\nstdout-secret\n[stderr]\nstderr-message")
-        self.assertEqual(result["process_output"]["stdout"], "stdout-secret")
-        self.assertEqual(result["process_output"]["stderr"], "stderr-message")
-
-    async def test_timeout_and_cancellation_keep_both_captured_channels(self):
-        job = types.SimpleNamespace(exit_code=-15)
-        for status in ["timed_out", "cancelled"]:
-            with self.subTest(status=status), mock.patch.object(
+        for arguments, budget in [
+                [{}, tool_contracts.BASH_DEFAULT_TIMEOUT_MS],
+                [{"timeout": None}, None],
+                [{"timeout": 0}, 0],
+                [{"timeout": 1234}, 1234]]:
+            with self.subTest(arguments=arguments), mock.patch.object(
                     self.manager, "run_foreground", new=mock.AsyncMock(
-                        return_value=[job, status, "partial-stdout", "partial-stderr"])):
-                result = await self.execute(timeout=100)
-                self.assertFalse(result["ok"])
-                output = process_outputs.ProcessOutput.from_dict(result["process_output"])
-                self.assertIn("partial-stdout", output.stdout)
-                self.assertIn("partial-stderr", output.stderr)
-                hidden = output.render(show_stdout=False)
-                self.assertNotIn("partial-stdout", hidden)
-                self.assertIn("partial-stderr", hidden)
-                if status == "timed_out":
-                    self.assertIn("command timed out", hidden)
+                        return_value=[job, "completed", "stdout-secret", "stderr-message"])) as run:
+                result = await self.execute(**arguments)
+                self.assertEqual(run.await_args.args[2], budget)
+                self.assertEqual(result["content"],
+                                 "status: completed\nexit_code: 7\n[stdout]\nstdout-secret\n[stderr]\nstderr-message")
+                self.assertEqual(result["process_output"]["stdout"], "stdout-secret")
+                self.assertEqual(result["process_output"]["stderr"], "stderr-message")
+
+    async def test_programmatic_foreground_entries_distinguish_omission_from_null(self):
+        job = types.SimpleNamespace(exit_code=0)
+        for caller in [self.manager.run_shell, loki.run_bash_async]:
+            for arguments, budget in [
+                    [{}, tool_contracts.BASH_DEFAULT_TIMEOUT_MS],
+                    [{"timeout": None}, None],
+                    [{"timeout": 0}, 0],
+                    [{"timeout": 1234}, 1234],
+                    [{"timeout": tool_contracts.BASH_MAX_TIMEOUT_MS + 1},
+                     tool_contracts.BASH_MAX_TIMEOUT_MS]]:
+                with self.subTest(caller=caller, arguments=arguments), mock.patch.object(
+                        self.manager, "run_foreground", new=mock.AsyncMock(
+                            return_value=[job, "completed", "out", "err"])) as run:
+                    await caller("example", **arguments)
+                    self.assertEqual(run.await_args.args[2], budget)
+
+    async def _assert_timeout_refused(self, value):
+        with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock()) as run:
+            result = await self.execute(timeout=value)
+        self.assertFalse(result["ok"])
+        self.assertIn("timeout", result["content"])
+        run.assert_not_awaited()
+
+    async def test_negative_timeout_is_refused(self):
+        await self._assert_timeout_refused(-1)
+
+    async def test_string_infinity_timeout_is_refused(self):
+        await self._assert_timeout_refused("infinity")
+
+    async def test_numeric_infinity_timeout_is_refused(self):
+        await self._assert_timeout_refused(float("inf"))
+
+    async def test_boolean_timeout_is_refused(self):
+        await self._assert_timeout_refused(True)
+
+    async def test_timeout_above_the_model_schema_maximum_is_refused(self):
+        await self._assert_timeout_refused(tool_contracts.BASH_MAX_TIMEOUT_MS + 1)
+
+    async def test_explicit_null_keeps_real_foreground_ownership_through_release(self):
+        await self._real_null_journey(cancelled=False)
+
+    async def test_explicit_null_still_observes_user_cancellation_and_joins_child(self):
+        await self._real_null_journey(cancelled=True)
+
+    async def _real_null_journey(self, *, cancelled):
+        release = os.path.join(self.directory, "release-null")
+        cancel_event = asyncio.Event()
+        script = (
+            "import os,time\n"
+            "print('null-ready', flush=True)\n"
+            f"while not os.path.exists({release!r}): time.sleep(0.01)\n"
+            "print('null-finished', flush=True)\n")
+        # Exercise the public tool adapter and actual child/metadata ownership.
+        # Native Python's -c is portable; separate existing tests retain real
+        # Bash parsing. The controller, not a finite sleep, releases this actor.
+        with mock.patch.object(job_runtime.executables, "BASH", sys.executable):
+            operation = asyncio.create_task(self.execute(
+                script, timeout=None, extra_context={"cancel_event": cancel_event}))
+            try:
+                await observe_fixture_state(
+                    lambda: any(job.process is not None and
+                                "null-ready" in self.manager._spool_tail(job, "stdout.log")
+                                for job in self.manager.jobs.values()), operation)
+                job = next(iter(self.manager.jobs.values()))
+                self.assertIsNone(job.timeout_ms)
+                self.assertFalse(job.background)
+                self.assertIsNone(job.process.returncode)
+                if cancelled:
+                    cancel_event.set()
                 else:
-                    self.assertIn("interrupted by user", hidden)
-                    self.assertEqual(result["content"],
-                                     "Tool call interrupted by user (SIGINT to the job's process group)"
-                                     "; partial output:\npartial-stdout")
+                    with open(release, "a"):
+                        pass
+                result = await operation
+                self.assertIsNotNone(job.process.returncode)
+                if cancelled:
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(job.status, "cancelled")
+                    self.assertIn("interrupted by user", result["content"])
+                    self.assertNotIn("null-finished", result["process_output"]["stdout"])
+                else:
+                    self.assertTrue(result["ok"], result["content"])
+                    self.assertIn("null-finished", result["process_output"]["stdout"])
+                    self.assertEqual(job.process.returncode, 0)
+                with open(job.metadata_path, encoding="utf-8") as stream:
+                    self.assertIsNone(json.load(stream)["timeout_ms"])
+            finally:
+                with open(release, "a"):
+                    pass
+                if not operation.done():
+                    operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+    async def test_zero_budget_expires_instead_of_selecting_the_default(self):
+        with mock.patch.object(job_runtime.executables, "BASH", sys.executable):
+            result = await self.execute("import threading; threading.Event().wait()", timeout=0)
+        self.assertFalse(result["ok"])
+        self.assertIn("timed_out", result["content"])
+        job = next(iter(self.manager.jobs.values()))
+        self.assertEqual(job.timeout_ms, 0)
+        self.assertIsNotNone(job.process.returncode)
+
+    async def test_timeout_keeps_both_captured_channels(self):
+        await self._interrupted_capture("timed_out")
+
+    async def test_cancellation_keeps_both_captured_channels(self):
+        await self._interrupted_capture("cancelled")
+
+    async def _interrupted_capture(self, status):
+        job = types.SimpleNamespace(exit_code=-15)
+        with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(
+                return_value=[job, status, "partial-stdout", "partial-stderr"])):
+            result = await self.execute(timeout=100)
+        self.assertFalse(result["ok"])
+        output = process_outputs.ProcessOutput.from_dict(result["process_output"])
+        self.assertIn("partial-stdout", output.stdout)
+        self.assertIn("partial-stderr", output.stderr)
+        hidden = output.render(show_stdout=False)
+        self.assertNotIn("partial-stdout", hidden)
+        self.assertIn("partial-stderr", hidden)
+        if status == "timed_out":
+            self.assertIn("command timed out", hidden)
+        else:
+            self.assertIn("interrupted by user", hidden)
+            self.assertEqual(result["content"],
+                             "Tool call interrupted by user (SIGINT to the job's process group)"
+                             "; partial output:\npartial-stdout")
 
     async def test_launch_error_remains_visible_in_replay_without_stdout(self):
         with mock.patch.object(self.manager, "run_foreground", new=mock.AsyncMock(side_effect=OSError("launch denied"))):
@@ -405,7 +543,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch.object(settings, "load_settings", new=mock.AsyncMock()) as load,
             mock.patch.object(terminal_frontend, "build_config_from_env", return_value=self.session.runtime_config),
-            mock.patch.object(terminal_frontend.subagents, "run_cli_async", new=mock.AsyncMock()),
+            mock.patch.object(terminal_frontend.subagents, 'run_cli_async', new=mock.AsyncMock(return_value=0)),
         ):
             self.assertEqual(await terminal_frontend.async_main(
                 ["--headless", "--prompt=test"], settings.Settings()), 0)
@@ -419,7 +557,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started["process_output"]["stdout"], "")
         job = next(iter(self.manager.jobs.values()))
         try:
-            await asyncio.wait_for(job.process.wait(), 3)
+            await job.process.wait()
             result = await loki.dispatch_tool_async("JobStatus", {"job_id": job.id})
             self.assertEqual(result["process_output"]["stdout"], "bg-stdout")
             self.assertEqual(result["process_output"]["stderr"], "bg-stderr")
@@ -433,7 +571,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == "posix", "requires a POSIX shell")
     async def test_real_foreground_bash_keeps_channels_separate(self):
-        result = await self.execute("printf 'real-stdout'; printf 'real-stderr' >&2; exit 9")
+        result = await self.execute("printf 'real-stdout'; printf 'real-stderr' >&2; exit 9", timeout=None)
         self.assertEqual(result["process_output"]["stdout"], "real-stdout")
         self.assertEqual(result["process_output"]["stderr"], "real-stderr")
         hidden = process_outputs.presentation_text(result["content"], result["process_output"])

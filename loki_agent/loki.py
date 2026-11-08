@@ -828,7 +828,9 @@ def _build_tool_registry(tools: list, handlers: dict) -> dict:
     return registry
 
 
-async def run_bash_async(command: str, timeout: int | None = None, description: str = "",
+async def run_bash_async(command: str,
+                         timeout: int | None = tool_contracts.BASH_DEFAULT_TIMEOUT_MS,
+                         description: str = "",
                          run_in_background: bool = False,
                          cancel_event: asyncio.Event | None = None,
                          cwd: str | None = None, *, structured=False):
@@ -969,7 +971,7 @@ def _handle_bash(args: dict):
 
 async def _handle_bash_async(args: dict, extra_context=None):
     return await run_bash_async(args["command"],
-                                timeout=args.get("timeout"),
+                                timeout=args.get("timeout", tool_contracts.BASH_DEFAULT_TIMEOUT_MS),
                                 description=args.get("description", ""),
                                 run_in_background=args.get("run_in_background", False),
                                 cancel_event=(extra_context or {}).get("cancel_event")

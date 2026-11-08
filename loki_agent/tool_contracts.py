@@ -135,7 +135,8 @@ TOOLS = [
                 "",
                 "- Commands run in the current Loki cwd. Use /cd DIR to change that cwd; cd inside a Bash command only affects that one command.",
                 "- IMPORTANT: Avoid using this tool to run `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user.",
-                f"- `timeout` is in milliseconds: default {BASH_DEFAULT_TIMEOUT_MS}, max {BASH_MAX_TIMEOUT_MS}.",
+                f"- Foreground `timeout` is in milliseconds: omitting it uses {BASH_DEFAULT_TIMEOUT_MS}; numeric values have a maximum of {BASH_MAX_TIMEOUT_MS}.",
+                "- Numeric `0` is a zero-duration budget. Background jobs have no execution deadline and use JobStop for termination.",
                 "- `run_in_background` starts a detached job with stdout/stderr spooled to files. Use Jobs/JobStatus/JobStop to inspect or control it. No `&` needed.",
                 "",
                 "# Git",
@@ -145,8 +146,11 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command to execute"},
-                    "timeout": {"type": "integer", "minimum": 0, "maximum": BASH_MAX_TIMEOUT_MS,
-                                "description": f"Optional timeout in milliseconds (max {BASH_MAX_TIMEOUT_MS})"},
+                    "timeout": {"type": ["integer", "null"], "minimum": 0, "maximum": BASH_MAX_TIMEOUT_MS,
+                                "description": (
+                                    f"Foreground timeout in milliseconds; omitted defaults to {BASH_DEFAULT_TIMEOUT_MS}, "
+                                    f"numeric maximum {BASH_MAX_TIMEOUT_MS}. "
+                                    "0 is a zero-duration budget. Cancellation and cleanup remain active.")},
                     "description": {"type": "string", "description": "\n".join([
                         'Clear, concise description of what this command does in active voice. Never use words like "complex" or "risk" in the description - just describe what it does.',
                         "",

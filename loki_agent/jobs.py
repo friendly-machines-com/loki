@@ -784,18 +784,24 @@ class JobManager:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def run_shell(self, command: str, timeout: int | None = None, description: str = "",
+    async def run_shell(self, command: str,
+                        timeout: int | None = tool_contracts.BASH_DEFAULT_TIMEOUT_MS,
+                        description: str = "",
                         run_in_background: bool = False,
                         cancel_event: asyncio.Event | None = None,
                         cwd: str | None = None, *, structured=False):
         if command is None:
-            return "Error: command is required"
+            raise ValueError('command is required')
         if command.strip() == "":
             return _shell_result(
                 _bash_output("", "", 0, no_output_expected=True), structured=structured)
 
-        timeout_ms = int(timeout) if timeout else tool_contracts.BASH_DEFAULT_TIMEOUT_MS
-        timeout_ms = min(timeout_ms, tool_contracts.BASH_MAX_TIMEOUT_MS)
+        # Omission retains the finite public default; explicit None (JSON null)
+        # opts into the caller's lifetime. run_foreground already owns exit,
+        # cancellation and joined retirement without a duration, so no detached
+        # job, infinite numeric value or second waiting mechanism is needed.
+        timeout_ms = (None if timeout is None else
+                      min(int(timeout), tool_contracts.BASH_MAX_TIMEOUT_MS))
         cwd = cwd or os.getcwd()
 
         if run_in_background:
@@ -837,6 +843,10 @@ class JobManager:
                 _bash_output(stdout, stderr, job.exit_code, status="timed_out"),
                 structured=structured, ok=False)
 
+        # Preserve Bash's existing execution contract: a normally completed
+        # command returns its actual exit code as data, including nonzero codes
+        # used by commands such as diff/test. Launch failure, timeout and user
+        # cancellation are tool failures; stderr text does not decide status.
         return _shell_result(
             _bash_output(stdout, stderr, job.exit_code), structured=structured)
 
