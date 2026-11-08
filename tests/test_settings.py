@@ -248,8 +248,11 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
             hook.cwd = "changed"
 
     async def test_all_phase_defaults_are_supplied_by_configuration(self):
-        rows = [["pre_tool_call", 2000, "deny"], ["pre_tool_gate", 2000, "deny"],
-                ["post_tool_call", 10000, "continue"], ["turn_end", None, None],
+        # The default everywhere is no execution deadline: hooks legitimately
+        # perform work whose completion has no guaranteed wall time, and a
+        # configured timeout_ms is the user's deliberate budget.
+        rows = [["pre_tool_call", None, "deny"], ["pre_tool_gate", None, "deny"],
+                ["post_tool_call", None, "continue"], ["turn_end", None, None],
                 ["turn_error", None, None]]
         self.file.write_text("".join(
             f"[hook.{phase}.{phase}]\ncommand.0 = selected-command\ncwd = chosen\n"

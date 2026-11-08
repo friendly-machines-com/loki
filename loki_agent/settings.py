@@ -68,11 +68,14 @@ class HookConfigurationError(SettingsError):
 
 
 # Each phase owns its timeout and error-action defaults here, not in another
-# decoder or the execution pipeline. None means no hook execution deadline.
+# decoder or the execution pipeline. The default is None: no hook execution
+# deadline. Hooks legitimately perform local or remote work whose completion
+# has no guaranteed wall time, so a configured ``timeout_ms`` is the user's
+# deliberate abandonment budget, never an automatic default.
 _HOOK_PHASES = {
-    "pre_tool_call": [2000, "deny"],
-    "pre_tool_gate": [2000, "deny"],
-    "post_tool_call": [10000, "continue"],
+    "pre_tool_call": [None, "deny"],
+    "pre_tool_gate": [None, "deny"],
+    "post_tool_call": [None, "continue"],
     "turn_end": [None, None],
     "turn_error": [None, None],
 }
