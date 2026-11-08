@@ -559,23 +559,12 @@ async def async_provider_request(
 
 
 async def _next_stream_chunk(iterator, cancel_check):
+    # Refuse to resume the body after a cancelling delta. HttpBodyStream owns
+    # the active read and gives revocation priority over its simultaneous
+    # result or failure; a second supervisor here adds no independent owner.
     if cancel_check():
         raise recoveries.Cancelled()
-    task = asyncio.ensure_future(anext(iterator))
-    try:
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=0.05)
-            if done:
-                return task.result()
-            if cancel_check():
-                raise recoveries.Cancelled()
-    finally:
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
+    return await anext(iterator)
 
 
 async def _collect_stream_body(iterator, first_chunk, cancel_check):
@@ -947,7 +936,10 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
         # deterministically. LOKI_DUMMY_STREAM_CHUNKS optionally supplies a
         # JSON array of deltas. A test can make the provider pause after its
         # first delta by setting LOKI_DUMMY_STREAM_GATE to a path that the test
-        # creates after observing the corresponding terminal output.
+        # creates after observing the corresponding terminal output. The gate
+        # belongs to that controller: an elapsed watchdog cannot establish
+        # startup failure. Release, request cancellation or enclosing runtime
+        # owner loss ends the hold; normal non-gated dummy replies are unchanged.
         reply = os.environ.get("LOKI_DUMMY_REPLY", "ok")
         raw_chunks = os.environ.get("LOKI_DUMMY_STREAM_CHUNKS")
         if context.config.stream and on_text_delta and raw_chunks is not None:
@@ -964,16 +956,15 @@ async def async_chat_completion(transcript_items: list, tools, report_errors: bo
                     "of strings")
             gate = os.environ.get("LOKI_DUMMY_STREAM_GATE")
             for index, chunk in enumerate(chunks):
+                # Cancellation also wins when the controller releases the file
+                # and revokes the request in the same event-loop turn.
+                if cancel_check and cancel_check():
+                    raise recoveries.Cancelled()
                 on_text_delta(chunk)
                 if index == 0 and gate:
-                    deadline = time.monotonic() + 10
                     while not os.path.exists(gate):
                         if cancel_check and cancel_check():
                             raise recoveries.Cancelled()
-                        if time.monotonic() >= deadline:
-                            raise protocols.ProtocolError(
-                                "timed out waiting for "
-                                "LOKI_DUMMY_STREAM_GATE")
                         await asyncio.sleep(0.01)
         # A test hook that makes the canned reply a tool call instead of text,
         # so a test can drive the model/tool loop through a real tool execution

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from job_fixtures import job_manager
 
 from loki_agent import authentications, credential_storages, files, jobs
 from loki_agent import private_files, response_headers, windows_api
@@ -49,8 +50,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         self.decoy.mkdir()
 
     async def test_job_reads_writes_and_new_jobs_ignore_recreated_parent(self):
-        manager = jobs.JobManager(str(self.parent / 'jobs'))
-        self.addAsyncCleanup(manager.aclose)
+        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup)
         # The manager must already be anchored before the first child launch.
         self.replace_parent()
         decoy_session = self.decoy / 'jobs' / manager.session_id
@@ -158,7 +158,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
             store.snapshot()
 
     async def test_background_monitor_is_joined_before_handle_close_without_killing_job(self):
-        manager = jobs.JobManager(str(self.parent / 'jobs'))
+        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup)
         release = self.root / 'release'
         job = await manager.run_background_exec([
             sys.executable, '-c',
@@ -212,8 +212,7 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX symlink and FIFO primitives')
     async def test_job_symlink_directory_and_nonregular_spools_are_refused(self):
-        manager = jobs.JobManager(str(self.parent / 'jobs'))
-        self.addAsyncCleanup(manager.aclose)
+        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup)
         target = self.root / 'target'
         target.mkdir()
         (Path(manager.session_dir) / '1').symlink_to(target, target_is_directory=True)

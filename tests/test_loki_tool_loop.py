@@ -15,7 +15,9 @@ import types
 import unittest
 from unittest import mock
 from loki_entrypoints import child_environment, configure_container, entrypoint
-from response_header_fixtures import setUpModule as set_up_response_headers
+from job_fixtures import job_manager, managed_jobs
+from process_lifecycle_fixtures import observe_fixture
+from response_header_fixtures import isolated_response_headers, setUpModule as set_up_response_headers
 from settings_fixtures import setUpModule as set_up_default_settings
 from config_fixtures import setUpModule as set_up_config
 
@@ -43,9 +45,6 @@ from loki_agent import model_requests, recoveries
 from loki_agent import web_tools
 
 
-_MISSING = object()
-
-
 def setUpModule():
     set_up_config()
     set_up_response_headers()
@@ -71,31 +70,6 @@ def _codex_model(slug="gpt-5-codex", **overrides):
 
 def _effort_profile(*values):
     return modelsdev.ReasoningEffortProfile(list(values))
-
-
-def save_loki_state(names):
-    """Snapshot session fields (plus CREDENTIALS) by name."""
-    session = loki.current_session()
-    out = {}
-    for name in names:
-        if name == "CREDENTIALS":
-            out[name] = getattr(loki, name, _MISSING)
-        else:
-            out[name] = getattr(session, name, _MISSING)
-    return out
-
-
-def restore_loki_state(saved):
-    session = loki.current_session()
-    for name, value in saved.items():
-        target = loki if name == "CREDENTIALS" else session
-        if value is _MISSING:
-            try:
-                delattr(target, name)
-            except AttributeError:
-                pass
-        else:
-            setattr(target, name, value)
 
 
 class ScriptedInputSession:
@@ -135,32 +109,18 @@ class ScriptedInputSession:
         raise AssertionError(f"unexpected real modal prompt: {prompt!r}")
 
 
+# A fresh fixture-owned Session replaces field-by-field snapshot/restore.
+# CREDENTIALS is a separate module global; tests that assign it retain its own
+# patch. Live jobs still need their manager/Runner cleanup before Store release.
 class TerminalImageCommandTests(unittest.TestCase):
-    _state_names = [
-        "CREDENTIALS",
-        "runtime_config",
-        "transcript_items",
-        "session_todos",
-        "session_toolsets",
-        "session_state",
-        "chat_log_path",
-        "chat_log_dirty",
-        "job_manager",
-        "shell_cwd",
-        "previous_shell_cwd",
-        "agent_mode",
-        "last_instructed_agent_mode",
-    ]
-
     def setUp(self):
-        self.saved_state = save_loki_state(self._state_names)
-
-    def tearDown(self):
-        restore_loki_state(self.saved_state)
+        self.enterContext(isolated_response_headers())
+        self.enterContext(mock.patch.object(loki, "CREDENTIALS", loki.CREDENTIALS))
 
     def test_terminal_turn_end_hook_outcomes(self):
         for outcome in ["completed", "stream_error", "raised", "cancelled"]:
-            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmpdir:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmpdir, \
+                    isolated_response_headers():
                 loki.CREDENTIALS = CredentialStore({
                     "LOKI_API_BASE": "https://example.test/v1/chat/completions",
                     "LOKI_MODEL": "test-model",
@@ -216,15 +176,16 @@ class TerminalImageCommandTests(unittest.TestCase):
     def test_loader_snapshots_relative_png_and_detects_real_type(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data = b"\x89PNG\r\n\x1a\npayload"
-            path = pathlib.Path(tmpdir, "picture.dat")
-            path.write_bytes(data)
+            path = os.path.join(tmpdir, 'picture.dat')
+            with open(path, 'wb') as stream:
+                stream.write(data)
 
             image = terminal_frontend.load_image_attachment(
                 "picture.dat", base_dir=tmpdir)
-            path.write_bytes(b"changed later")
+            with open(path, 'wb') as stream:
+                stream.write(b'changed later')
 
-        self.assertEqual(
-            os.path.realpath(image.path), os.path.realpath(path))
+        self.assertEqual(image.path, path)
         self.assertEqual(image.media_type, "image/png")
         self.assertEqual(image.byte_size, len(data))
         self.assertEqual(
@@ -530,8 +491,9 @@ class TerminalImageCommandTests(unittest.TestCase):
 
     def test_job_redraw_observer_is_scoped_to_terminal_input(self):
         for fail in [False, True]:
-            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
-                manager = job_runtime.JobManager(directory)
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory, \
+                    contextlib.ExitStack() as job_scope:
+                manager = job_manager(directory, cleanup=job_scope.callback)
                 previous = mock.Mock()
                 manager.on_change = previous
                 loki.current_session().job_manager = manager
@@ -588,128 +550,105 @@ class TerminalImageCommandTests(unittest.TestCase):
 
 
 class ProviderReinstallTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+
     def test_reinstall_does_not_carry_custom_auth_to_new_provider(self):
-        saved = save_loki_state(["runtime_config"])
-        try:
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://custom.example.test/v1/chat/completions",
-                protocols.OPENAI_CHAT,
-                model="old-model",
-                credential_ref=(
-                    authentications.CredentialRef.environment(
-                        "CUSTOM_API_KEY")),
-                auth_header="X-Custom-Key",
-            ))
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://custom.example.test/v1/chat/completions",
+            protocols.OPENAI_CHAT,
+            model="old-model",
+            credential_ref=(
+                authentications.CredentialRef.environment(
+                    "CUSTOM_API_KEY")),
+            auth_header="X-Custom-Key",
+        ))
 
-            loki.reinstall_provider(
-                model="claude-model",
-                url="https://api.anthropic.com",
-                provider_kind=protocols.ANTHROPIC_MESSAGES,
-                provider_id="anthropic",
-                credential_ref=(
-                    authentications.CredentialRef.environment(
-                        "ANTHROPIC_API_KEY")),
-            )
+        loki.reinstall_provider(
+            model="claude-model",
+            url="https://api.anthropic.com",
+            provider_kind=protocols.ANTHROPIC_MESSAGES,
+            provider_id="anthropic",
+            credential_ref=(
+                authentications.CredentialRef.environment(
+                    "ANTHROPIC_API_KEY")),
+        )
 
-            self.assertIsNone(
-                loki.current_config().auth_spec.header_name)
-            self.assertEqual(
-                loki.current_config().auth_spec.scheme, "anthropic")
-        finally:
-            restore_loki_state(saved)
+        self.assertIsNone(
+            loki.current_config().auth_spec.header_name)
+        self.assertEqual(
+            loki.current_config().auth_spec.scheme, "anthropic")
 
     def test_reinstall_does_not_invent_credential_for_new_provider(self):
-        saved = save_loki_state(["runtime_config"])
-        try:
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://old.example.test/v1/responses",
-                protocols.OPENAI_RESPONSES,
-                model="old-model",
-                credential_ref=(
-                    authentications.CredentialRef.environment(
-                        "OLD_API_KEY")),
-            ))
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://old.example.test/v1/responses",
+            protocols.OPENAI_RESPONSES,
+            model="old-model",
+            credential_ref=(
+                authentications.CredentialRef.environment(
+                    "OLD_API_KEY")),
+        ))
 
-            loki.reinstall_provider(
-                model="new-model",
-                url="https://new.example.test/v1/responses",
-                provider_id="new",
-            )
+        loki.reinstall_provider(
+            model="new-model",
+            url="https://new.example.test/v1/responses",
+            provider_id="new",
+        )
 
-            self.assertIsNone(loki.current_config().auth_spec)
-        finally:
-            restore_loki_state(saved)
+        self.assertIsNone(loki.current_config().auth_spec)
 
     def test_reinstall_provider_requires_startup_config(self):
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
 
-        try:
-            loki.current_session().runtime_config = None
-            with self.assertRaises(RuntimeError):
-                loki.reinstall_provider(model="model-a")
-        finally:
-            restore_loki_state(old_values)
+        loki.current_session().runtime_config = None
+        with self.assertRaises(RuntimeError):
+            loki.reinstall_provider(model="model-a")
 
     def test_reinstall_preserves_status_only_for_the_same_catalog_entry(self):
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
 
-        try:
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://example.test/v1",
-                protocols.OPENAI_CHAT,
-                model="old-model",
-                provider_id="provider",
-                credential_ref=authentications.CredentialRef.environment(
-                    "PROVIDER_API_KEY"),
-                model_status="deprecated",
-            ))
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://example.test/v1",
+            protocols.OPENAI_CHAT,
+            model="old-model",
+            provider_id="provider",
+            credential_ref=authentications.CredentialRef.environment(
+                "PROVIDER_API_KEY"),
+            model_status="deprecated",
+        ))
 
-            loki.reinstall_provider(model="old-model")
-            self.assertEqual(
-                loki.current_config().model_status, "deprecated")
+        loki.reinstall_provider(model="old-model")
+        self.assertEqual(
+            loki.current_config().model_status, "deprecated")
 
-            loki.reinstall_provider(model="new-model")
-            self.assertIsNone(loki.current_config().model_status)
-        finally:
-            restore_loki_state(old_values)
+        loki.reinstall_provider(model="new-model")
+        self.assertIsNone(loki.current_config().model_status)
 
     def test_reinstall_preserves_request_profile_only_for_same_model(self):
-        saved = save_loki_state(["runtime_config"])
-        try:
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://chatgpt.com/backend-api/codex/responses",
-                protocols.OPENAI_RESPONSES,
-                model="gpt-5.6-sol",
-                provider_id="openai-subscription",
-                credential_ref=(
-                    authentications.CredentialRef.openai_subscription()),
-                openai_request_profile=_codex_model(
-                    "gpt-5.6-sol", use_responses_lite=True),
-            ))
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://chatgpt.com/backend-api/codex/responses",
+            protocols.OPENAI_RESPONSES,
+            model="gpt-5.6-sol",
+            provider_id="openai-subscription",
+            credential_ref=(
+                authentications.CredentialRef.openai_subscription()),
+            openai_request_profile=_codex_model(
+                "gpt-5.6-sol", use_responses_lite=True),
+        ))
 
-            loki.reinstall_provider(model="gpt-5.6-sol")
-            self.assertTrue(
-                loki.current_config().chat_provider.responses_lite)
+        loki.reinstall_provider(model="gpt-5.6-sol")
+        self.assertTrue(
+            loki.current_config().chat_provider.responses_lite)
 
-            with self.assertRaisesRegex(
-                    protocols.ProtocolError,
-                    "require authenticated request profile"):
-                loki.reinstall_provider(model="gpt-5.5")
-        finally:
-            restore_loki_state(saved)
+        with self.assertRaisesRegex(
+                protocols.ProtocolError,
+                "require authenticated request profile"):
+            loki.reinstall_provider(model="gpt-5.5")
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+
     def test_reasoning_preference_is_sticky_across_model_capabilities(self):
-        saved = save_loki_state([
-            "runtime_config",
-            "reasoning_effort_preference",
-            "session_state",
-            "chat_log_path",
-            "chat_log_dirty",
-        ])
         first = connections.make_runtime_config(
             "https://api.openai.com/v1/responses",
             protocols.OPENAI_RESPONSES,
@@ -729,39 +668,36 @@ class RuntimeConfigTests(unittest.TestCase):
             protocols.OPENAI_RESPONSES,
             model="unsupported",
         )
-        try:
-            loki.current_session().session_state = {}
-            loki.current_session().chat_log_path = None
-            loki.apply_runtime_config(first)
-            loki.current_session().reasoning_effort_preference = "high"
-            self.assertEqual(loki.effective_reasoning_effort(), "high")
+        loki.current_session().session_state = {}
+        loki.current_session().chat_log_path = None
+        loki.apply_runtime_config(first)
+        loki.current_session().reasoning_effort_preference = "high"
+        self.assertEqual(loki.effective_reasoning_effort(), "high")
 
-            loki.apply_runtime_config(narrower)
-            self.assertIsNone(loki.effective_reasoning_effort())
-            self.assertEqual(
-                loki.current_reasoning_effort_preference(), "high")
-            self.assertIn(
-                "preferred high is unavailable",
-                loki.reasoning_effort_default_text(),
-            )
+        loki.apply_runtime_config(narrower)
+        self.assertIsNone(loki.effective_reasoning_effort())
+        self.assertEqual(
+            loki.current_reasoning_effort_preference(), "high")
+        self.assertIn(
+            "preferred high is unavailable",
+            loki.reasoning_effort_default_text(),
+        )
 
-            loki.apply_runtime_config(unsupported)
-            self.assertIsNone(loki.effective_reasoning_effort())
-            self.assertIsNone(loki.reasoning_effort_status_text())
+        loki.apply_runtime_config(unsupported)
+        self.assertIsNone(loki.effective_reasoning_effort())
+        self.assertIsNone(loki.reasoning_effort_status_text())
 
-            loki.apply_runtime_config(first)
-            self.assertEqual(loki.effective_reasoning_effort(), "high")
+        loki.apply_runtime_config(first)
+        self.assertEqual(loki.effective_reasoning_effort(), "high")
 
-            loki.set_reasoning_effort(None)
-            self.assertIsNone(
-                loki.current_reasoning_effort_preference())
-            self.assertIsNone(loki.effective_reasoning_effort())
-            self.assertEqual(
-                loki.reasoning_effort_status_text(),
-                "unknown",
-            )
-        finally:
-            restore_loki_state(saved)
+        loki.set_reasoning_effort(None)
+        self.assertIsNone(
+            loki.current_reasoning_effort_preference())
+        self.assertIsNone(loki.effective_reasoning_effort())
+        self.assertEqual(
+            loki.reasoning_effort_status_text(),
+            "unknown",
+        )
 
     def test_effort_status_shows_only_the_active_value(self):
         config = connections.make_runtime_config(
@@ -771,6 +707,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 ["low", "medium", "high"]),
         )
         session = loki.Session(runtime_config=config)
+        self.addCleanup(session.response_headers.close)
         with mock.patch.object(loki, "_DEFAULT_SESSION", session):
             # No fabricated provider default: with no selection and no
             # advertised default, the level is the model's own, unknown
@@ -808,53 +745,32 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.reasoning_effort_profile, profile)
 
     def test_reasoning_preference_round_trips_in_session_state(self):
-        saved = save_loki_state([
-            "runtime_config",
-            "reasoning_effort_preference",
-            "transcript_items",
-            "session_todos",
-            "session_toolsets",
-            "session_state",
-            "chat_log_path",
-            "chat_log_dirty",
-            "conversation_id",
-        ])
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-reasoning.json")
-                loki.apply_runtime_config(connections.make_runtime_config(
-                    "https://api.openai.com/v1/responses",
-                    protocols.OPENAI_RESPONSES,
-                    model="gpt-test",
-                    provider_id="openai",
-                    reasoning_effort_profile=_effort_profile(
-                        "low", "high"),
-                ))
-                loki.new_chat_log(path)
-                loki.set_thinking_controls({"effort": "high"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-reasoning.json")
+            loki.apply_runtime_config(connections.make_runtime_config(
+                "https://api.openai.com/v1/responses",
+                protocols.OPENAI_RESPONSES,
+                model="gpt-test",
+                provider_id="openai",
+                reasoning_effort_profile=_effort_profile(
+                    "low", "high"),
+            ))
+            loki.new_chat_log(path)
+            loki.set_thinking_controls({"effort": "high"})
 
-                with open(path, "r", encoding="utf-8") as stream:
-                    blob = json.load(stream)
-                self.assertEqual(
-                    blob["session_state"]["reasoning_effort"], "high")
+            with open(path, "r", encoding="utf-8") as stream:
+                blob = json.load(stream)
+            self.assertEqual(
+                blob["session_state"]["reasoning_effort"], "high")
 
-                loki.current_session().reasoning_effort_preference = None
-                loki.load_chat_log(path)
-                self.assertEqual(
-                    loki.current_reasoning_effort_preference(), "high")
-                self.assertEqual(
-                    loki.effective_reasoning_effort(), "high")
-        finally:
-            restore_loki_state(saved)
+            loki.current_session().reasoning_effort_preference = None
+            loki.load_chat_log(path)
+            self.assertEqual(
+                loki.current_reasoning_effort_preference(), "high")
+            self.assertEqual(
+                loki.effective_reasoning_effort(), "high")
 
     def test_tool_loop_snapshots_reasoning_effort_for_all_requests(self):
-        saved = save_loki_state([
-            "runtime_config",
-            "reasoning_effort_preference",
-            "session_state",
-            "chat_log_path",
-            "chat_log_dirty",
-        ])
         seen = []
 
         async def completion(
@@ -875,40 +791,30 @@ class RuntimeConfigTests(unittest.TestCase):
                 fn_name, args, allowed=None, extra_context=None):
             return {"ok": True, "content": "contents"}
 
-        try:
-            loki.current_session().session_state = {}
-            loki.current_session().chat_log_path = None
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://api.openai.com/v1/responses",
-                protocols.OPENAI_RESPONSES,
-                model="gpt-test",
-                provider_id="openai",
-                reasoning_effort_profile=_effort_profile("low", "high"),
+        loki.current_session().session_state = {}
+        loki.current_session().chat_log_path = None
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://api.openai.com/v1/responses",
+            protocols.OPENAI_RESPONSES,
+            model="gpt-test",
+            provider_id="openai",
+            reasoning_effort_profile=_effort_profile("low", "high"),
+        ))
+        loki.current_session().reasoning_effort_preference = "high"
+        with (
+                mock.patch.object(
+                    loki, "async_chat_completion", new=completion),
+                mock.patch.object(
+                    loki, "dispatch_tool_async", new=dispatch)):
+            result = asyncio.run(loki.run_tool_loop_async(
+                [formats.message_item("user", "read")],
+                max_loops=3,
             ))
-            loki.current_session().reasoning_effort_preference = "high"
-            with (
-                    mock.patch.object(
-                        loki, "async_chat_completion", new=completion),
-                    mock.patch.object(
-                        loki, "dispatch_tool_async", new=dispatch)):
-                result = asyncio.run(loki.run_tool_loop_async(
-                    [formats.message_item("user", "read")],
-                    max_loops=3,
-                ))
-        finally:
-            restore_loki_state(saved)
 
         self.assertEqual(result, "done")
         self.assertEqual(seen, ["high", "high"])
 
     def test_tool_loop_snapshots_model_default_explicitly(self):
-        saved = save_loki_state([
-            "runtime_config",
-            "reasoning_effort_preference",
-            "session_state",
-            "chat_log_path",
-            "chat_log_dirty",
-        ])
         seen = []
 
         async def completion(
@@ -920,24 +826,21 @@ class RuntimeConfigTests(unittest.TestCase):
                 formats.message_item("assistant", "done"),
             ])
 
-        try:
-            loki.current_session().session_state = {}
-            loki.current_session().chat_log_path = None
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://api.openai.com/v1/responses",
-                protocols.OPENAI_RESPONSES,
-                model="gpt-test",
-                provider_id="openai",
-                reasoning_effort_profile=_effort_profile("low", "high"),
+        loki.current_session().session_state = {}
+        loki.current_session().chat_log_path = None
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://api.openai.com/v1/responses",
+            protocols.OPENAI_RESPONSES,
+            model="gpt-test",
+            provider_id="openai",
+            reasoning_effort_profile=_effort_profile("low", "high"),
+        ))
+        loki.current_session().reasoning_effort_preference = None
+        with mock.patch.object(
+                loki, "async_chat_completion", new=completion):
+            result = asyncio.run(loki.run_tool_loop_async(
+                [formats.message_item("user", "hello")],
             ))
-            loki.current_session().reasoning_effort_preference = None
-            with mock.patch.object(
-                    loki, "async_chat_completion", new=completion):
-                result = asyncio.run(loki.run_tool_loop_async(
-                    [formats.message_item("user", "hello")],
-                ))
-        finally:
-            restore_loki_state(saved)
 
         self.assertEqual(result, "done")
         self.assertEqual(seen, [None])
@@ -1269,15 +1172,8 @@ class RuntimeConfigTests(unittest.TestCase):
 
 class ModelLoadingTests(unittest.TestCase):
     def setUp(self):
-        names = [
-            "runtime_config", "CREDENTIALS", "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "job_manager",
-            "shell_cwd", "previous_shell_cwd",
-        ]
-        self.old_values = save_loki_state(names)
-
-    def tearDown(self):
-        restore_loki_state(self.old_values)
+        self.enterContext(isolated_response_headers())
+        self.enterContext(mock.patch.object(loki, "CREDENTIALS", loki.CREDENTIALS))
 
     def test_provider_model_discovery_does_not_select_a_model(self):
         loki.apply_runtime_config(connections.make_runtime_config(
@@ -1702,8 +1598,8 @@ class ModelLoadingTests(unittest.TestCase):
             "/status", "/status --json", "/status all", "/status all --json",
             "/status save", "/quit"])
         runner = mock.AsyncMock()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = Store(os.path.join(tmpdir, "status.json"))
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                contextlib.closing(Store(os.path.join(tmpdir, "status.json"))) as store:
             store.observer("https://example.test/chat", None, "test")(
                 200, {"x-remaining": "8"})
             with mock.patch.object(loki.current_session(), "response_headers", store), \
@@ -1716,7 +1612,8 @@ class ModelLoadingTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 status = asyncio.run(terminal_frontend.async_main([], settings.Settings()))
             self.assertEqual(status, 0)
-            saved = Store(store.path).snapshot()["endpoints"]
+            with contextlib.closing(Store(store.path)) as readback:
+                saved = readback.snapshot()["endpoints"]
             self.assertEqual(saved[0]["headers"]["x-remaining"]["value"], "8")
             current_output, all_output = output.getvalue().split("User: /status all", 1)
             self.assertIn("No active HTTP chat connection", current_output)
@@ -1735,14 +1632,14 @@ class ModelLoadingTests(unittest.TestCase):
         endpoint = "https://example.test/v1/chat/completions"
         for authenticated in [False, True]:
             with self.subTest(authenticated=authenticated), \
-                    tempfile.TemporaryDirectory() as tmpdir:
+                    tempfile.TemporaryDirectory() as tmpdir, \
+                    contextlib.closing(Store(os.path.join(tmpdir, "status.json"))) as store:
                 environment = {"LOKI_API_BASE": endpoint, "LOKI_MODEL": "model"}
                 credential = None
                 if authenticated:
                     environment["LOKI_API_KEY"] = "test-key"
                     credential = "env:LOKI_API_KEY"
                 loki.CREDENTIALS = CredentialStore(environment)
-                store = Store(os.path.join(tmpdir, "status.json"))
                 store.observer(endpoint, credential, "model")(
                     200, {"selected-only": "1"})
                 store.observer(endpoint, "env:OTHER", "model")(
@@ -1868,11 +1765,15 @@ class ModelLoadingTests(unittest.TestCase):
                 response({"data": [{"id": "first-model"}, {"id": "selected-model"}]}),
                 response(answer("fallback durable answer")), response(answer("fallback resumed answer"))])
             catalog_attempts = []
-            with tempfile.TemporaryDirectory() as directory:
+            async with contextlib.AsyncExitStack() as job_scope:
+                directory = job_scope.enter_context(tempfile.TemporaryDirectory())
+                # Later manager callbacks must retire before either Session's Store.
+                stores = job_scope.enter_context(contextlib.ExitStack())
                 path = os.path.join(directory, "chat-fallback.json")
-                session = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(directory))
+                session = loki.Session(shell_cwd=directory, job_manager=job_manager(
+                    directory, cleanup=job_scope.callback, async_cleanup=job_scope.push_async_callback))
+                stores.callback(session.response_headers.close)
                 session.credential_authority = owner.broker
-                self.addCleanup(lambda: asyncio.run(session.job_manager.close_session_owned()))
 
                 class Input(ScriptedInputSession):
                     async def prompt(inner_self, prompt=None, history=None, *, initial_text=""):
@@ -1891,9 +1792,7 @@ class ModelLoadingTests(unittest.TestCase):
                     self.assertIn(host, ("catalog.example.test", "provider.example.test"))
                     return await connector.open_connection(host, port, **kwargs)
 
-                saved = modelsdev._index_cache
-                modelsdev._index_cache = None
-                try:
+                with mock.patch.object(modelsdev, '_index_cache', None):
                     with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
                             mock.patch.object(loki, "CREDENTIALS", owner.inventory), \
                             mock.patch.object(asyncio, "open_connection", side_effect=connect), \
@@ -1901,12 +1800,10 @@ class ModelLoadingTests(unittest.TestCase):
                             mock.patch.object(terminal_frontend, "new_chat_log_path", return_value=path), \
                             mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
                             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([], settings.Settings()), 10), 0)
+                        self.assertEqual(await terminal_frontend.async_main([], settings.Settings()), 0)
                         loki.save_chat_log()
                         self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
                         await session.job_manager.close_session_owned()
-                finally:
-                    modelsdev._index_cache = saved
                 saved = json.loads(pathlib.Path(path).read_text())
                 self.assertEqual(saved["session_state"]["connection"]["models_url"], models_url)
                 self.assertEqual(saved["session_state"]["connection"]["model"], "selected-model")
@@ -1914,9 +1811,11 @@ class ModelLoadingTests(unittest.TestCase):
                 self.assertNotIn("fallback-secret", pathlib.Path(path).read_text())
                 self.assertEqual(catalog_attempts, ["models.dev"])
                 fresh = credential_supervisors.CredentialSupervisor(CredentialStore({"LOKI_API_KEY": "fallback-secret"}))
-                resumed = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(os.path.join(directory, "resumed-jobs")))
+                resumed = loki.Session(shell_cwd=directory, job_manager=job_manager(
+                    os.path.join(directory, 'resumed-jobs'), cleanup=job_scope.callback,
+                    async_cleanup=job_scope.push_async_callback))
+                stores.callback(resumed.response_headers.close)
                 resumed.credential_authority = fresh.broker
-                self.addCleanup(lambda: asyncio.run(resumed.job_manager.close_session_owned()))
 
                 class ResumeInput(ScriptedInputSession):
                     async def prompt(inner_self, prompt=None, history=None):
@@ -1930,7 +1829,7 @@ class ModelLoadingTests(unittest.TestCase):
                         mock.patch.object(terminals, "open_terminal_stdin"), \
                         mock.patch.object(terminal_frontend, "restore_output_area_after_input"), \
                         contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10), 0)
+                    self.assertEqual(await terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 0)
                     self.assertEqual(loki.current_config().chat_provider.models_url, models_url)
                     loki.save_chat_log()
                     await resumed.job_manager.close_session_owned()
@@ -2008,23 +1907,9 @@ class ModelLoadingTests(unittest.TestCase):
 
 
 class TerminalReasoningEffortTests(unittest.TestCase):
-    _state_names = [
-        "CREDENTIALS",
-        "runtime_config",
-        "reasoning_effort_preference",
-        "transcript_items",
-        "session_todos",
-        "session_toolsets",
-        "session_state",
-        "chat_log_path",
-        "chat_log_dirty",
-    ]
-
     def setUp(self):
-        self.saved = save_loki_state(self._state_names)
-
-    def tearDown(self):
-        restore_loki_state(self.saved)
+        self.enterContext(isolated_response_headers())
+        self.enterContext(mock.patch.object(loki, "CREDENTIALS", loki.CREDENTIALS))
 
     def test_effort_command_selects_and_persists_value(self):
         loki.CREDENTIALS = CredentialStore({
@@ -2203,17 +2088,19 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "ZHIPU_API_KEY": "unused-zhipu-secret", "LOKI_MAX_TOKENS": "1234",
             "LOKI_ANTHROPIC_VERSION": "2024-01-01", "LOKI_STREAM": "0"}
         storage = credential_storages.JsonCredentialStorage(str(root / "credentials"))
+        self.addCleanup(storage.close)
         owner = credential_supervisors.CredentialSupervisor(CredentialStore(values), storage)
-        session = loki.Session(shell_cwd=str(root), job_manager=job_runtime.JobManager(str(root / "jobs")))
+        # Register Store cleanup before managers so LIFO cleanup joins managers first.
+        stores = self.enterContext(contextlib.ExitStack())
+        session = loki.Session(shell_cwd=str(root), job_manager=job_manager(
+            str(root / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup))
+        stores.callback(session.response_headers.close)
         session.credential_authority = owner.broker
-        self.addAsyncCleanup(session.job_manager.close_session_owned)
         requests, prompts, approvals = [], [], []
         output = io.StringIO()
         errors = io.StringIO()
         phase = {}
-        saved_index = modelsdev._index_cache
-        self.addCleanup(setattr, modelsdev, "_index_cache", saved_index)
-        modelsdev._index_cache = None
+        self.enterContext(mock.patch.object(modelsdev, '_index_cache', None))
 
         def reply(text=None, tool=False):
             if phase["protocol"] == protocols.ANTHROPIC_MESSAGES:
@@ -2284,12 +2171,12 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         async def serve(reader, writer):
             service_tasks.append(asyncio.current_task())
             try:
-                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+                head = await reader.readuntil(b"\r\n\r\n")
                 lines = head.decode("latin-1").split("\r\n")
                 method, target, version = lines[0].split(" ")
                 self.assertEqual(version, "HTTP/1.1")
                 headers = dict(line.split(": ", 1) for line in lines[1:] if line)
-                body = await asyncio.wait_for(reader.readexactly(int(headers.get("Content-Length", "0"))), 5)
+                body = await reader.readexactly(int(headers.get("Content-Length", "0")))
                 url = "https://" + headers["Host"] + target
                 wire_requests.append((method, url))
                 response = await request(method, url, headers_in=headers, body=body)
@@ -2300,20 +2187,20 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     response_body = b"".join([chunk async for chunk in response_chunks(json.loads(response_body))])
                 writer.write(b"HTTP/1.1 200 OK\r\n" + f"Content-Type: {content_type}\r\n".encode()
                              + f"Content-Length: {len(response_body)}\r\n\r\n".encode() + response_body)
-                await asyncio.wait_for(writer.drain(), 5)
+                await writer.drain()
             except Exception as error:
                 service_errors.append(error)
             finally:
                 writer.close()
-                await asyncio.wait_for(writer.wait_closed(), 5)
+                await writer.wait_closed()
 
         server = await asyncio.start_server(serve, "127.0.0.1", 0)
 
         async def close_service():
             server.close()
-            await asyncio.wait_for(server.wait_closed(), 5)
+            await server.wait_closed()
             if service_tasks:
-                await asyncio.wait_for(asyncio.gather(*service_tasks), 10)
+                await asyncio.gather(*service_tasks)
 
         self.addAsyncCleanup(close_service)
         port = server.sockets[0].getsockname()[1]
@@ -2340,8 +2227,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         async def turn(prompt):
             loki.set_session_connection(loki.active_connection_descriptor())
             loki.current_transcript().append(formats.message_item("user", prompt))
-            answer = await asyncio.wait_for(loki.run_tool_loop_async(
-                loki.current_transcript(), allowed={"Read"}, max_loops=3), 10)
+            answer = await loki.run_tool_loop_async(
+                loki.current_transcript(), allowed={"Read"}, max_loops=3)
             self.assertEqual(phase["queue"], [])
             self.assertEqual(answer, phase["answer"])
             loki.mark_chat_log_dirty()
@@ -2436,8 +2323,8 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                                       LOKI_PROVIDER=protocols.OPENAI_CHAT, LOKI_MODEL="beta")
                 prepare("https://local.example/v1/chat/completions", "beta", protocols.OPENAI_CHAT)
                 with mock.patch.object(loki, "CREDENTIALS", CredentialStore(startup_values)):
-                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main(
-                        ["--headless", "--prompt=credentialless startup"], settings.Settings()), 10), 0)
+                    self.assertEqual(await terminal_frontend.async_main(
+                        ["--headless", "--prompt=credentialless startup"], settings.Settings()), 0)
                 self.assertIsNone(loki.current_config().auth_spec)
                 self.assertFalse(loki.current_config().stream)
                 self.assertEqual(phase["queue"], [])
@@ -2560,7 +2447,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
                         mock.patch.object(terminals, "open_terminal_stdin"), \
                         mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
-                    self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10), 0)
+                    self.assertEqual(await terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 0)
                     loki.save_chat_log()
                 self.assertEqual(phase["queue"], [])
                 with self.assertRaises(StopIteration):
@@ -2608,9 +2495,10 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 fresh_values["LOKI_AUTH_HEADER"] = "X-Custom-Key"
             fresh_owner = credential_supervisors.CredentialSupervisor(CredentialStore(fresh_values), storage)
             self.assertIsNot(fresh_owner.broker, owner.broker)
-            resumed = loki.Session(shell_cwd=str(root), job_manager=job_runtime.JobManager(str(root / "resumed-jobs")))
+            resumed = loki.Session(shell_cwd=str(root), job_manager=job_manager(
+                str(root / 'resumed-jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup))
+            stores.callback(resumed.response_headers.close)
             resumed.credential_authority = fresh_owner.broker
-            self.addAsyncCleanup(resumed.job_manager.close_session_owned)
             descriptor = before["session_state"]["connection"]
             if variant == "credentialless":
                 self.assertIsNone(descriptor["credential"])
@@ -2645,7 +2533,7 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
                     mock.patch.object(terminals, "open_terminal_stdin"), \
                     mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
-                self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10), 0)
+                self.assertEqual(await terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 0)
                 self.assertEqual(loki.current_config().chat_provider.max_tokens, 1234)
                 self.assertEqual(loki.current_config().stream, variant == "credentialless")
                 self.assertEqual(loki.current_transcript()[:len(before["events"])], before["events"])
@@ -2690,12 +2578,10 @@ class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(rendered.index("\nUsable models:\n"), rendered.index("\nUsable providers:\n"))
             if variant == "custom":
                 self.assertGreaterEqual(rendered.count("\nUsable providers:\n"), 5)
-            await asyncio.wait_for(asyncio.gather(*service_tasks), 10)
+            await close_service()
             self.assertEqual(service_errors, [])
             self.assertTrue(all(task.done() for task in service_tasks))
             self.assertEqual(len(wire_requests), len(requests) + 2)
-            server.close()
-            await asyncio.wait_for(server.wait_closed(), 5)
             self.assertFalse(server.is_serving())
 
 
@@ -2708,9 +2594,11 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def _workflow(self, *, stream, approve=True):
         from loki_agent import credential_storages
-        with tempfile.TemporaryDirectory() as directory:
+        async with contextlib.AsyncExitStack() as job_scope:
+            directory = job_scope.enter_context(tempfile.TemporaryDirectory())
             root = pathlib.Path(directory)
             storage = credential_storages.JsonCredentialStorage(str(root / "credentials"))
+            job_scope.callback(storage.close)
             await storage.store_openai_login(authentications.OpenAITokenSet(
                 access_token="leased-access-sentinel", refresh_token="durable-refresh-sentinel",
                 id_token="identity-sentinel", account_id="account-sentinel",
@@ -2720,7 +2608,10 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             path = str(root / f"chat-{chat_id}.json")
             requests, catalog_requests = [], []
             output, errors = io.StringIO(), io.StringIO()
-            initial = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / "jobs")))
+            stores = job_scope.enter_context(contextlib.ExitStack())
+            initial = loki.Session(shell_cwd=directory, job_manager=job_manager(
+                str(root / 'jobs'), cleanup=job_scope.callback, async_cleanup=job_scope.push_async_callback))
+            stores.callback(initial.response_headers.close)
             initial.credential_authority = supervisor.broker
             initial.session_todos = [{"content": "inspect durable workflow", "status": "pending", "priority": "high"}]
 
@@ -2832,8 +2723,8 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 loki.current_session().session_todos = initial.session_todos = [
                     {"content": "inspect durable workflow", "status": "pending", "priority": "high"}]
                 loki.current_transcript().append(formats.message_item("user", "run tools"))
-                first = await asyncio.wait_for(loki.run_tool_loop_async(
-                    loki.current_transcript(), max_loops=4, allowed={"TodoRead"}), 10)
+                first = await loki.run_tool_loop_async(
+                    loki.current_transcript(), max_loops=4, allowed={"TodoRead"})
                 self.assertEqual(first, "first durable answer")
                 results = [item for item in loki.current_transcript() if item.get("type") == "tool_result"]
                 self.assertEqual([item["call_id"] for item in results], ["todo-call"])
@@ -2859,8 +2750,11 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                                      for job in initial.job_manager.jobs.values()))
 
                 reopened_storage = credential_storages.JsonCredentialStorage(storage.directory)
+                job_scope.callback(reopened_storage.close)
                 reopened_owner = credential_supervisors.CredentialSupervisor(CredentialStore({}), reopened_storage)
-                resumed = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / "resumed-jobs")))
+                resumed = loki.Session(shell_cwd=directory, job_manager=job_manager(
+                    str(root / 'resumed-jobs'), cleanup=job_scope.callback, async_cleanup=job_scope.push_async_callback))
+                stores.callback(resumed.response_headers.close)
                 resumed.credential_authority = reopened_owner.broker
 
                 class Input(ScriptedInputSession):
@@ -2875,7 +2769,7 @@ class SubscriptionInferenceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         mock.patch.object(terminal_frontend, "input_session", return_value=inputs), \
                         mock.patch.object(terminals, "open_terminal_stdin"), \
                         mock.patch.object(terminal_frontend, "restore_output_area_after_input"):
-                    status = await asyncio.wait_for(terminal_frontend.async_main([f"--resume={path}"], settings.Settings()), 10)
+                    status = await terminal_frontend.async_main([f"--resume={path}"], settings.Settings())
                     self.assertEqual(status, 0)
                     if not approve:
                         self.assertEqual(pathlib.Path(path).read_bytes(), before)
@@ -2977,10 +2871,11 @@ class ExitStatusTests(unittest.TestCase):
 
 class StatusTextTests(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch.multiple(
-            loki.current_session(), session_todos=[], chat_log_dirty=False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.enterContext(isolated_response_headers())
+        # Content/style assertions observe application text, not platform
+        # cursor/autowrap framing. The layout tests below supply their own sink.
+        for name in ['disable_autowrap', 'enable_autowrap', 'carriage_return']:
+            self.enterContext(mock.patch.object(terminal_frontend.terminal, name))
 
     def test_full_status_rows_stay_on_two_rows_and_other_output_wraps(self):
         # Model only ASCII graphic output, DECAWM, CR and LF. The PTY test
@@ -3114,18 +3009,16 @@ class StatusTextTests(unittest.TestCase):
         self.assertIn("/todo:0/0, /queue", terminal_frontend.status_text())
 
     def test_todo_progress_uses_restored_session_records_without_trusting_their_shape(self):
-        session = loki.Session()
-        self.addCleanup(session.response_headers.close)
+        session = loki.current_session()
         # Saved logs admit a list without validating each todo record.
         records = [None, "not a record", {}, {"status": "completed"}]
-        with mock.patch.object(loki, "_DEFAULT_SESSION", session):
-            session.replace_transcript([], records, [], {}, "restored.json")
-            with contextlib.redirect_stdout(io.StringIO()) as output:
-                terminal_frontend._write_status_text()
-            self.assertIn("/todo:1/4, /queue", terminal_frontend.status_text())
-            self.assertIn("/todo:\033[1m1/4\033[22m, /queue", output.getvalue())
-            session.replace_transcript([], [], [], {}, "new.json")
-            self.assertIn("/todo:0/0, /queue", terminal_frontend.status_text())
+        session.replace_transcript([], records, [], {}, "restored.json")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            terminal_frontend._write_status_text()
+        self.assertIn("/todo:1/4, /queue", terminal_frontend.status_text())
+        self.assertIn("/todo:\033[1m1/4\033[22m, /queue", output.getvalue())
+        session.replace_transcript([], [], [], {}, "new.json")
+        self.assertIn("/todo:0/0, /queue", terminal_frontend.status_text())
 
     def test_status_bar_bolds_only_nonidle_and_nonzero_activity_values(self):
         for running, messages, images in (
@@ -3170,10 +3063,9 @@ class StatusTextTests(unittest.TestCase):
                 job = types.SimpleNamespace(
                     status=state, group_active=group_active,
                     process=types.SimpleNamespace(returncode=returncode))
-                session = loki.Session(job_manager=types.SimpleNamespace(
-                    jobs={"1": finished, "2": job}))
                 activity = terminal_frontend.TerminalActivityStatus()
-                with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                with mock.patch.object(loki.current_session(), 'job_manager', types.SimpleNamespace(
+                        jobs={"1": finished, "2": job})), \
                         mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     terminal_frontend._write_status_text()
@@ -3189,8 +3081,7 @@ class StatusTextTests(unittest.TestCase):
     def test_ps_is_plain_without_a_job_manager_or_with_no_jobs(self):
         for manager in (None, types.SimpleNamespace(jobs={})):
             with self.subTest(manager=manager):
-                session = loki.Session(job_manager=manager)
-                with mock.patch.object(loki, "_DEFAULT_SESSION", session), \
+                with mock.patch.object(loki.current_session(), 'job_manager', manager), \
                         mock.patch.object(terminal_frontend, "_terminal_activity",
                                           terminal_frontend.TerminalActivityStatus()), \
                         mock.patch.object(loki, "current_job_manager",
@@ -3218,16 +3109,11 @@ class StatusTextTests(unittest.TestCase):
                 self.assertIn("/trace thinking", remote)
 
     def test_status_text_shows_none_when_no_model_is_selected(self):
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
 
-        try:
-            loki.current_session().runtime_config = None
-            with mock.patch.object(loki, "reasoning_effort_status_text",
-                                   return_value=None):
-                text = terminal_frontend.status_text()
-        finally:
-            restore_loki_state(old_values)
+        loki.current_session().runtime_config = None
+        with mock.patch.object(loki, "reasoning_effort_status_text",
+                               return_value=None):
+            text = terminal_frontend.status_text()
 
         self.assertIn("Model: none, Context: unknown; /model", text)
         self.assertNotIn("Model: ;", text)
@@ -3250,34 +3136,29 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(redraw.call_count, 3)
 
     def test_status_text_includes_short_api_base_before_model_without_url_secrets(self):
-        names = ["runtime_config", "shell_cwd"]
-        old_values = save_loki_state(names)
 
-        try:
-            loki.current_session().shell_cwd = loki.STARTUP_CWD
-            chat_provider = protocols.Provider(
-                kind=protocols.OPENAI_CHAT,
-                input_url="https://user:pass@example.test:8443/base/path/v1/chat/completions?token=secret#fragment",
-                chat_url="https://example.test:8443/base/path/chat/completions",
-                models_url=None,
-                model_urls=[],
-                headers={},
-                max_tokens=4096,
-            )
-            loki.current_session().runtime_config = connections.RuntimeConfig(
-                chat_provider=chat_provider,
-                model="model-x"
-            )
-            # model is derived from runtime_config set above
+        loki.current_session().shell_cwd = loki.STARTUP_CWD
+        chat_provider = protocols.Provider(
+            kind=protocols.OPENAI_CHAT,
+            input_url="https://user:pass@example.test:8443/base/path/v1/chat/completions?token=secret#fragment",
+            chat_url="https://example.test:8443/base/path/chat/completions",
+            models_url=None,
+            model_urls=[],
+            headers={},
+            max_tokens=4096,
+        )
+        loki.current_session().runtime_config = connections.RuntimeConfig(
+            chat_provider=chat_provider,
+            model="model-x"
+        )
+        # model is derived from runtime_config set above
 
-            text = terminal_frontend.status_text(
-                terminal_frontend.TerminalActivityStatus(
-                    turn_running=True,
-                    queued_prompts=2,
-                    queued_images=1,
-                ))
-        finally:
-            restore_loki_state(old_values)
+        text = terminal_frontend.status_text(
+            terminal_frontend.TerminalActivityStatus(
+                turn_running=True,
+                queued_prompts=2,
+                queued_images=1,
+            ))
 
         self.assertEqual(
             text,
@@ -3294,19 +3175,14 @@ class StatusTextTests(unittest.TestCase):
         self.assertNotIn("secret", text)
 
     def test_status_text_escapes_controls_in_dynamic_fields(self):
-        names = ["runtime_config", "shell_cwd"]
-        old_values = save_loki_state(names)
 
-        try:
-            loki.current_session().runtime_config = None
-            loki.current_session().shell_cwd = (
-                "/tmp/unsafe\x1b[2J\nnext")
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                terminal_frontend._write_status_text()
-            displayed = output.getvalue()
-        finally:
-            restore_loki_state(old_values)
+        loki.current_session().runtime_config = None
+        loki.current_session().shell_cwd = (
+            "/tmp/unsafe\x1b[2J\nnext")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            terminal_frontend._write_status_text()
+        displayed = output.getvalue()
 
         self.assertIn(
             "Local: CWD: /tmp/unsafe^[[2J^Jnext, turn: ", displayed)
@@ -3344,6 +3220,7 @@ class TerminalJobStatusTtyTests(unittest.IsolatedAsyncioTestCase):
         process = None
         resources = None
         with tempfile.TemporaryDirectory() as directory:
+            job_release = os.path.join(directory, "job-release")
             environment = child_environment(
                 PATH=os.environ.get("PATH", ""), HOME=directory,
                 XDG_CONFIG_HOME=os.path.join(directory, "config"),
@@ -3352,7 +3229,8 @@ class TerminalJobStatusTtyTests(unittest.IsolatedAsyncioTestCase):
                 LOKI_PROVIDER="dummy", LOKI_MODEL="dummy",
                 LOKI_DUMMY_TOOL_CALL=json.dumps({
                     "name": "Bash", "arguments": {
-                        "command": "sleep 2", "run_in_background": background}}))
+                        "command": "while test ! -e job-release; do sleep 0.01; done",
+                        "run_in_background": background}}))
             try:
                 process = await asyncio.create_subprocess_exec(
                     entrypoint("loki"), "--dangerously-skip-permissions",
@@ -3364,15 +3242,10 @@ class TerminalJobStatusTtyTests(unittest.IsolatedAsyncioTestCase):
 
                 async def read_until(marker):
                     captured = bytearray()
-                    try:
-                        async with asyncio.timeout(10):
-                            while marker not in captured:
-                                chunk = await reader.read(65536)
-                                self.assertTrue(chunk, captured.decode("utf-8", errors="replace"))
-                                captured.extend(chunk)
-                    except TimeoutError:
-                        self.fail("No terminal update for " + repr(marker)
-                                  + "\n" + captured.decode("utf-8", errors="replace"))
+                    while marker not in captured:
+                        chunk = await reader.read(65536)
+                        self.assertTrue(chunk, captured.decode("utf-8", errors="replace"))
+                        captured.extend(chunk)
                     return captured
 
                 first_frame = await read_until(b"User: !")
@@ -3380,12 +3253,18 @@ class TerminalJobStatusTtyTests(unittest.IsolatedAsyncioTestCase):
                 os.write(master, b"\x7frun a job\n")
                 started = await read_until(b"\033[1m/ps\033[22m")
                 self.assertIn(b"turn: \033[1mrunning\033[22m", started)
+                # Keep the running frame observable regardless of scheduling;
+                # only this controller releases the real Bash job afterward.
+                with open(job_release, "a"):
+                    pass
                 # No keystrokes or tool calls between these two observations.
                 await read_until(b"/cd DIR, /ps, /image PATH")
                 os.write(master, b"\x7f/quit\n")
-                self.assertEqual(await asyncio.wait_for(process.wait(), 5), 0)
+                self.assertEqual(await process.wait(), 0)
                 resources.assert_released(self)
             finally:
+                with open(job_release, "a"):
+                    pass
                 if resources is not None:
                     await resources.cleanup()
                 if slave is not None:
@@ -3647,17 +3526,20 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                                      for name in ['A', 'B', 'CHAT', 'ANTHROPIC', 'C']})
             from loki_agent import credential_storages
             approval_storage = credential_storages.JsonCredentialStorage(str(root / 'credentials'))
+            self.addCleanup(approval_storage.close)
             owner = credential_supervisors.CredentialSupervisor(store, approval_storage)
-            session = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / 'jobs')))
+            stores = self.enterContext(contextlib.ExitStack())
+            session = loki.Session(shell_cwd=directory, job_manager=job_manager(
+                str(root / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup))
+            stores.callback(session.response_headers.close)
             session.credential_authority = owner.broker
-            self.addAsyncCleanup(session.job_manager.close_session_owned)
             children, dispatched, events, search_queries, captured = [], [], [], [], []
             outcomes, originals, expected_replay, expected_terminal = {}, {}, [], []
             diagnostics = io.StringIO()
             real_dispatch = loki.dispatch_tool_async
             real_spawn = job_runtime.host_process.create_exec
             phase = {}
-            source_key = file_operations.observation_key(str(source))
+            source_key = str(source)
 
             async def spawn(*args, **kwargs):
                 if args[0] == 'test-search-program':
@@ -3679,7 +3561,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 async def reap():
                     if child.returncode is None:
                         child.kill()
-                        await asyncio.wait_for(child.wait(), 5)
+                        await child.wait()
                 self.addAsyncCleanup(reap)
                 return child
 
@@ -3837,9 +3719,9 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 advertised = [spec['definition'] for name, spec in loki.TOOL_REGISTRY.items()
                               if name in allowed]
                 loki._remember_session_toolset(advertised)
-                result = await asyncio.wait_for(loki.run_tool_loop_async(
+                result = await loki.run_tool_loop_async(
                     transcript, allowed=allowed,
-                    max_loops=len(calls) + 2, on_event=events.append), 20)
+                    max_loops=len(calls) + 2, on_event=events.append)
                 self.assertEqual(result, answer)
                 self.assertEqual(phase['queue'], [])
                 self.assertEqual([item['type'] for item in transcript[start:]],
@@ -3871,15 +3753,15 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
             def reopen():
                 new_owner = credential_supervisors.CredentialSupervisor(store, approval_storage)
-                new = loki.Session(shell_cwd=directory, job_manager=job_runtime.JobManager(str(root / 'reopened-jobs')))
+                new = loki.Session(shell_cwd=directory, job_manager=job_manager(
+                    str(root / 'reopened-jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup))
+                stores.callback(new.response_headers.close)
                 new.credential_authority = new_owner.broker
-                self.addAsyncCleanup(new.job_manager.close_session_owned)
                 return new
 
             with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
                     mock.patch.object(loki, 'CREDENTIALS', owner.inventory), \
                     mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()), \
-                    mock.patch.object(loki, 'file_state', {}), \
                     mock.patch.object(loki, 'dispatch_tool_async', new=dispatch), \
                     mock.patch.object(job_runtime.host_process, 'create_exec', new=spawn), \
                     mock.patch.object(file_operations.executables, 'RIPGREP', 'test-search-program'), \
@@ -3919,7 +3801,6 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 await session.job_manager.close_session_owned()
                 resumed = reopen()
                 with mock.patch.object(loki, '_DEFAULT_SESSION', resumed):
-                    loki.file_state.clear()
                     loki.load_chat_log(path)
                     self.assertEqual(loki.current_toolsets(), first_toolsets)
                     descriptor = loki.connection_from_session_state(loki.current_state())
@@ -3948,7 +3829,6 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     await resumed.job_manager.close_session_owned()
                 final_session = reopen()
                 with mock.patch.object(loki, '_DEFAULT_SESSION', final_session):
-                    loki.file_state.clear()
                     loki.load_chat_log(path)
                     descriptor = loki.connection_from_session_state(loki.current_state())
                     self.assertEqual(descriptor.provider_id, 'ANTHROPIC')
@@ -4068,25 +3948,6 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrimaryModelSwitchResumeTests(unittest.TestCase):
-    _GLOBAL_NAMES = [
-        "runtime_config", "chat_log_path", "session_state",
-        "chat_log_dirty", "transcript_items", "session_todos",
-        "session_toolsets", "shell_cwd", "previous_shell_cwd",
-    ]
-
-    @contextlib.contextmanager
-    def _isolated_runtime(self):
-        session = loki.current_session()
-        old_values = {}
-        for name in self._GLOBAL_NAMES:
-            value = getattr(session, name, _MISSING)
-            old_values[name] = _MISSING if value is _MISSING \
-                else copy.deepcopy(value)
-        try:
-            yield
-        finally:
-            restore_loki_state(old_values)
-
     @staticmethod
     def _request_sequence(responses, captured):
         queued = list(responses)
@@ -4094,7 +3955,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
         async def request(
                 method, request_url, payload=None, request_headers=None,
                 report_errors=False, show_timing=False,
-                codex_turn_state=None, *, context):
+                cancel_check=None, codex_turn_state=None, *, context):
             if context.config is None or context.config.chat_provider.chat_url != request_url:
                 raise AssertionError("request context does not match its selected connection")
             if not queued:
@@ -4281,7 +4142,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
         )
 
     def test_incomplete_tool_call_and_media_survive_resume_and_switch(self):
-        with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
+        with isolated_response_headers(), tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-incomplete.json")
             responses_config = connections.make_runtime_config(
                 "https://responses.example/v1/responses",
@@ -4448,7 +4309,7 @@ class PrimaryModelSwitchResumeTests(unittest.TestCase):
 
     def test_anthropic_server_tool_replays_at_origin_and_sanitizes_on_switch(
             self):
-        with self._isolated_runtime(), tempfile.TemporaryDirectory() as tmpdir:
+        with isolated_response_headers(), tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "chat-server-tool.json")
             provider_a = connections.make_runtime_config(
                 "https://anthropic-a.example/v1/messages",
@@ -4626,7 +4487,10 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
         import uuid
 
         for selected_index in [2, 3]:
-            with self.subTest(selected_index=selected_index), tempfile.TemporaryDirectory() as directory:
+            async with contextlib.AsyncExitStack() as job_scope:
+                job_scope.enter_context(self.subTest(selected_index=selected_index))
+                directory = job_scope.enter_context(tempfile.TemporaryDirectory())
+                stores = job_scope.enter_context(contextlib.ExitStack())
                 root = pathlib.Path(directory)
                 chat_dir = root / 'missing' / '.loki' / 'chats'
                 self.assertFalse(chat_dir.exists())
@@ -4714,14 +4578,14 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result['type'], 'tool_result')
                     self.assertEqual(result['call_id'], f'read-{label}')
                     self.assertEqual(formats.item_text(result), f'1\tevidence {label}')
-                    self.assertIn(file_operations.observation_key(str(root / f'{label}.txt')), loki.file_state)
+                    self.assertIn(str(root / f'{label}.txt'), loki.file_state)
                     return formats.DecodedTurn([
                         formats.message_item('assistant', f'answer {label}')])
 
                 async def fresh_session():
-                    session = loki.Session(shell_cwd=directory,
-                                           job_manager=job_runtime.JobManager(str(root / 'jobs')))
-                    self.addAsyncCleanup(session.job_manager.close_session_owned)
+                    session = loki.Session(shell_cwd=directory, job_manager=job_manager(
+                        str(root / 'jobs'), cleanup=job_scope.callback, async_cleanup=job_scope.push_async_callback))
+                    stores.callback(session.response_headers.close)
                     return session
 
                 def read_blob(path):
@@ -4743,11 +4607,10 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
 
                 with mock.patch.object(loki, 'CHAT_LOG_DIR', str(chat_dir)), \
                         mock.patch.object(loki, 'CREDENTIALS', store), \
-                        mock.patch.object(loki, 'file_state', {}), \
                         mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', loki.tool_runtime.ToolHookPipeline()), \
                         mock.patch.object(terminal_frontend, '_terminal_activity', terminal_frontend.TerminalActivityStatus()), \
                         mock.patch.object(terminal_frontend, 'terminal', terminal), \
-                        mock.patch.object(terminal_frontend, 'async_chat_completion', new=completion), \
+                        mock.patch.object(loki, 'async_chat_completion', new=completion), \
                         mock.patch.object(terminals, 'redraw_status_bar'), \
                         mock.patch.object(terminals, 'open_terminal_stdin'), \
                         mock.patch.object(terminal_frontend, 'restore_output_area_after_input'), \
@@ -4763,18 +4626,17 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                             if not paths:
                                 self.assertFalse(chat_dir.exists())
                             loki.new_chat_log(path)
-                            self.assertTrue(chat_dir.is_dir())
-                            self.assertEqual(loki.current_chat_log_path(), os.path.realpath(path))
+                            self.assertEqual(loki.current_chat_log_path(), path)
                             self.assertTrue(session.chat_log_dirty)
                             self.assertFalse(pathlib.Path(path).exists())
                             (root / f'{label}.txt').write_text(f'evidence {label}\n', encoding='utf-8')
                             session.transcript_items.append(formats.message_item('user', f'{label} request'))
                             phase.update(label=label, count=0)
-                            self.assertEqual(await asyncio.wait_for(
-                                terminal_frontend.run_terminal_turn_async(session.transcript_items), 5),
-                                f'answer {label}')
+                            self.assertEqual(await terminal_frontend.run_terminal_turn_async(
+                                session.transcript_items), f'answer {label}')
                             loki.mark_chat_log_dirty()
                             self.assertTrue(loki.save_chat_log())
+                            self.assertTrue(chat_dir.is_dir())
                             self.assertFalse(session.chat_log_dirty)
                             paths[label], saved[label] = path, read_blob(path)
                             formats.validate_events(saved[label]['events'])
@@ -4792,7 +4654,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     with mock.patch.object(loki, '_DEFAULT_SESSION', resumed), \
                             mock.patch.object(terminal_frontend, 'input_session', return_value=input_session), \
                             mock.patch.object(terminal_frontend._ResumeTranscriptPresenter, 'write', new=observe_present):
-                        self.assertEqual(await asyncio.wait_for(terminal_frontend.async_main(['resume'], settings.Settings()), 5), 0)
+                        self.assertEqual(await terminal_frontend.async_main(['resume'], settings.Settings()), 0)
                         self.assertEqual(resumed.chat_log_path, paths[selected_label])
                         self.assertFalse(resumed.chat_log_dirty)
                         self.assertFalse(input_session.active)
@@ -4846,6 +4708,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatLogPathTests(unittest.TestCase):
+
     def test_bare_resume_names_resolve_to_local_loki_chat_directory(self):
         self.assertEqual(
             loki.resolve_chat_log_path("abc"),
@@ -4857,17 +4720,17 @@ class ChatLogPathTests(unittest.TestCase):
         )
 
     def test_path_like_resume_arguments_stay_explicit(self):
-        # normpath on both sides: the argument keeps its own separators.
-        self.assertEqual(
-            os.path.normpath(loki.resolve_chat_log_path("./chat-abc.json")),
-            os.path.normpath(
-                os.path.join(loki.STARTUP_CWD, "./chat-abc.json")),
-        )
-        self.assertEqual(
-            os.path.normpath(loki.resolve_chat_log_path("logs/chat-abc.json")),
-            os.path.normpath(
-                os.path.join(loki.STARTUP_CWD, "logs", "chat-abc.json")),
-        )
+        """CLI qualification chooses a namespace, not permission to simplify an operand."""
+        operands = ['./chat-abc.json', 'logs/chat-abc.json',
+                    'link/../logs/chat-abc.json', 'logs//chat-abc.json/']
+        if os.name == 'nt':
+            operands.extend([r'C:chat-abc.json', r'\logs\chat-abc.json',
+                             r'\\server\share\chat-abc.json'])
+        for operand in operands:
+            with self.subTest(operand=operand):
+                self.assertEqual(
+                    loki.resolve_chat_log_path(operand),
+                    os.path.join(loki.STARTUP_CWD, operand))
 
 
 class SessionPickerTests(unittest.TestCase):
@@ -4886,6 +4749,7 @@ class SessionPickerTests(unittest.TestCase):
             os.utime(path, (mtime, mtime))
         return path
 
+    @contextlib.contextmanager
     def _make_picker(self, dirpath, inputs):
         """Build a modal session that reads from `inputs` (a list of strings).
 
@@ -4893,9 +4757,7 @@ class SessionPickerTests(unittest.TestCase):
         the list is exhausted (so infinite loops fail the test rather than
         hang it).
         """
-        # Point CHAT_LOG_DIR at the tempdir for _chat_log_paths().
-        saved_log_dir = loki.CHAT_LOG_DIR
-        loki.CHAT_LOG_DIR = dirpath
+        # Enumerate the fixture's saved logs rather than the startup workspace.
         iterator = iter(inputs)
 
         class _FakeModal:
@@ -4922,7 +4784,6 @@ class SessionPickerTests(unittest.TestCase):
                 return _FakeModal()
 
         session = _FakeSession()
-        saved_terminal = terminal_frontend.terminal
 
         class _FakeTerminal:
             def save_cursor_position(self, *a, **k):
@@ -4945,24 +4806,16 @@ class SessionPickerTests(unittest.TestCase):
                 terminals._TerminalTextOutput.write_text(
                     self, text, multiline=multiline, file=file)
 
-        terminal_frontend.terminal = _FakeTerminal()
-
-        def restore():
-            loki.CHAT_LOG_DIR = saved_log_dir
-            terminal_frontend.terminal = saved_terminal
-
-        return restore, session
+        with mock.patch.object(loki, 'CHAT_LOG_DIR', dirpath), \
+                mock.patch.object(terminal_frontend, 'terminal', _FakeTerminal()):
+            yield session
 
     def test_picker_filter_matches_all_words_in_any_order(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha beta"}', mtime=1000)
             self._write_chat(tmpdir, "bbb", '{"text":"beta gamma"}', mtime=2000)
-            restore, session = self._make_picker(
-                tmpdir, ["filter beta alpha", "1"])
-            try:
+            with self._make_picker(tmpdir, ["filter beta alpha", "1"]) as session:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
             # Only the aaa log contains both "beta" and "alpha".
             self.assertTrue(result.endswith("chat-aaa.json"))
 
@@ -4971,12 +4824,8 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "aaa", '{"text":"error 404 in nginx"}', mtime=1000)
             self._write_chat(tmpdir, "bbb", '{"text":"something else"}', mtime=2000)
             # Bare "404" should NOT match (parsed as int, out of range, ignored).
-            restore, session = self._make_picker(
-                tmpdir, ["404", "filter 404", "1"])
-            try:
+            with self._make_picker(tmpdir, ["404", "filter 404", "1"]) as session:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
             self.assertTrue(result.endswith("chat-aaa.json"))
 
     def test_picker_bare_filter_clears(self):
@@ -4984,23 +4833,16 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(tmpdir, "aaa", '{"text":"alpha beta"}', mtime=1000)
             self._write_chat(tmpdir, "bbb", '{"text":"gamma delta"}', mtime=2000)
             # Narrow to one match, then clear with bare "filter", then pick 2.
-            (restore, session) = self._make_picker(
-                tmpdir, ["filter alpha", "filter", "2"])
-            try:
+            with self._make_picker(tmpdir, ["filter alpha", "filter", "2"]) as session:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
             # After clearing, both visible; "2" = bbb (newest last).
             self.assertTrue(result.endswith("chat-bbb.json"))
 
     def test_picker_empty_input_cancels(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_chat(tmpdir, "aaa", '{"text":"alpha"}', mtime=1000)
-            restore, session = self._make_picker(tmpdir, [""])
-            try:
+            with self._make_picker(tmpdir, [""]) as session:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
             self.assertIsNone(result)
 
     def test_picker_preview_handles_partial_json(self):
@@ -5009,11 +4851,8 @@ class SessionPickerTests(unittest.TestCase):
             self._write_chat(
                 tmpdir, "broken", '{"text":"hi there this is truncated', mtime=1000)
             # No closing quote, no closing brace -- regex should still grab "hi there...".
-            restore, session = self._make_picker(tmpdir, ["1"])
-            try:
+            with self._make_picker(tmpdir, ["1"]) as session:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
             self.assertTrue(result.endswith("chat-broken.json"))
 
     def test_picker_unrecognized_input_keeps_filter(self):
@@ -5023,115 +4862,84 @@ class SessionPickerTests(unittest.TestCase):
             # "alpha" (no prefix) is unrecognized: not "filter ...", not an int,
             # not empty. Should re-render with the current (empty) filter, then
             # "1" selects the first row.
-            restore, session = self._make_picker(tmpdir, ["alpha", "1"])
-            try:
+            with self._make_picker(tmpdir, ["alpha", "1"]) as session:
                 result = asyncio.run(terminal_frontend.run_session_picker_async(session))
-            finally:
-                restore()
             self.assertTrue(result.endswith("chat-aaa.json"))
 
 
-class ShellCwdTests(unittest.TestCase):
+class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+
     def test_change_shell_cwd_does_not_change_process_cwd(self):
-        names = ["shell_cwd", "previous_shell_cwd"]
-        old_values = save_loki_state(names)
         process_cwd = os.getcwd()
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                loki.change_shell_cwd(tmpdir)
-                resolved = os.path.realpath(tmpdir)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loki.change_shell_cwd(tmpdir)
 
-                self.assertEqual(loki.current_cwd(), resolved)
-                self.assertEqual(os.getcwd(), process_cwd)
-                self.assertEqual(
-                    loki._resolve_path("file.txt"),
-                    os.path.join(resolved, "file.txt"))
-        finally:
-            restore_loki_state(old_values)
+            self.assertEqual(loki.current_cwd(), tmpdir)
+            self.assertEqual(os.getcwd(), process_cwd)
+            self.assertEqual(
+                loki._resolve_path("file.txt"),
+                os.path.join(tmpdir, "file.txt"))
 
-    def test_bash_runs_in_shell_cwd(self):
-        names = ["shell_cwd", "previous_shell_cwd", "job_manager"]
-        old_values = save_loki_state(names)
-
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+    async def test_bash_runs_in_shell_cwd(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async with managed_jobs(os.path.join(tmpdir, 'jobs')) as manager:
                 workdir = os.path.join(tmpdir, "work")
                 os.mkdir(workdir)
-                loki.current_session().job_manager = job_runtime.JobManager(os.path.join(tmpdir, "jobs"))
+                loki.current_session().job_manager = manager
                 loki.change_shell_cwd(workdir)
-
-                # Report a native path rather than the shell's rendering: the
-                # Git Bash pwd prints /c/... which no Windows path comparison
-                # can use.
-                executable = sys.executable.replace(os.sep, "/")
-                result = asyncio.run(loki.run_bash_async(
-                    f"{shlex.quote(executable)} -c "
-                    "\"import os; print(os.getcwd())\""))
-                jobs = list(loki.current_job_manager().jobs.values())
-        finally:
-            restore_loki_state(old_values)
-
-        self.assertIn("[stdout]\n" + os.path.realpath(workdir), result)
-        self.assertEqual(os.path.basename(jobs[0].stdout_path), "stdout.log")
-        self.assertEqual(os.path.basename(jobs[0].stderr_path), "stderr.log")
+                # Query native cwd, not Git Bash's /c/... rendering. Keep
+                # JSON in the structured stdout field, not marker-parsed text.
+                executable = sys.executable.replace(os.sep, '/')
+                result = await loki.run_bash_async(
+                    timeout=None, command=f'{shlex.quote(executable)} -c '
+                    '\"import os,json; print(json.dumps(os.getcwd()))\"', structured=True)
+                self.assertTrue(result['ok'], result['content'])
+                reported = json.loads(result['process_output']['stdout'])
+                self.assertTrue(os.path.samefile(reported, workdir))
+                jobs = list(manager.jobs.values())
+                self.assertEqual(jobs[0].stdout_path, os.path.join(jobs[0].spool_dir, 'stdout.log'))
+                self.assertEqual(jobs[0].stderr_path, os.path.join(jobs[0].spool_dir, 'stderr.log'))
 
     def test_save_chat_log_persists_shell_cwd(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "shell_cwd",
-            "previous_shell_cwd",
-        ]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                cwd = os.path.join(tmpdir, "work")
-                os.mkdir(cwd)
-                path = os.path.join(tmpdir, "chat-test.json")
-                loki.new_chat_log(path)
-                loki.change_shell_cwd(cwd)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = os.path.join(tmpdir, "work")
+            os.mkdir(cwd)
+            path = os.path.join(tmpdir, "chat-test.json")
+            loki.new_chat_log(path)
+            loki.change_shell_cwd(cwd)
 
-                loki.save_chat_log()
+            loki.save_chat_log()
 
-                with open(path, "r", encoding="utf-8") as f:
-                    blob = json.load(f)
-        finally:
-            restore_loki_state(old_values)
+            with open(path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
 
         self.assertEqual(
-            blob["session_state"]["shell_cwd"], os.path.realpath(cwd))
+            blob["session_state"]["shell_cwd"], cwd)
 
     def test_save_chat_log_persists_connection_without_credential_value(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos",
-            "runtime_config", ]
-        sentinel = object()
-        old_values = {
-            name: loki.current_session().__dict__.get(name, sentinel) for name in names}
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                config = connections.make_runtime_config(
-                    "https://openrouter.ai/api/v1",
-                    protocols.OPENAI_CHAT,
-                    model="z-ai/glm",
-                    provider_id="openrouter",
-                    provider_name="OpenRouter",
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "OPENROUTER_API_KEY")),
-                    model_status="deprecated",
-                )
-                loki.apply_runtime_config(config)
-                loki.new_chat_log(path)
-                loki.save_chat_log()
-                text = pathlib.Path(path).read_text(encoding="utf-8")
-                blob = json.loads(text)
-        finally:
-            restore_loki_state(old_values)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            config = connections.make_runtime_config(
+                "https://openrouter.ai/api/v1",
+                protocols.OPENAI_CHAT,
+                model="z-ai/glm",
+                provider_id="openrouter",
+                provider_name="OpenRouter",
+                credential_ref=(
+                    authentications.CredentialRef.environment(
+                        "OPENROUTER_API_KEY")),
+                model_status="deprecated",
+            )
+            loki.apply_runtime_config(config)
+            loki.new_chat_log(path)
+            loki.save_chat_log()
+            text = pathlib.Path(path).read_text(encoding="utf-8")
+            blob = json.loads(text)
 
         connection = blob["session_state"]["connection"]
         self.assertEqual(connection["provider_id"], "openrouter")
@@ -5148,244 +4956,192 @@ class ShellCwdTests(unittest.TestCase):
         self.assertNotIn("do-not-persist-this", text)
 
     def test_loading_and_clean_cleanup_leave_chat_bytes_unchanged(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "runtime_config",
-            "shell_cwd", "previous_shell_cwd",
-        ]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                descriptor = ConnectionDescriptor(
-                    provider_id="openrouter",
-                    provider_name="OpenRouter",
-                    model="z-ai/glm",
-                    chat_url="https://openrouter.ai/api/v1/chat/completions",
-                    models_url="https://openrouter.ai/api/v1/models",
-                    protocol=protocols.OPENAI_CHAT,
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "OPENROUTER_API_KEY")),
-                )
-                blob = formats.new_log_blob(
-                    loki.initial_transcript_items(), [])
-                blob["session_state"] = {
-                    "shell_cwd": tmpdir,
-                    "connection": descriptor.to_dict(),
-                    "future_field": {"keep": True},
-                }
-                original = json.dumps(
-                    blob, separators=(",", ":"), sort_keys=True).encode()
-                pathlib.Path(path).write_bytes(original)
-                loki.current_session().runtime_config = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            descriptor = ConnectionDescriptor(
+                provider_id="openrouter",
+                provider_name="OpenRouter",
+                model="z-ai/glm",
+                chat_url="https://openrouter.ai/api/v1/chat/completions",
+                models_url="https://openrouter.ai/api/v1/models",
+                protocol=protocols.OPENAI_CHAT,
+                credential_ref=(
+                    authentications.CredentialRef.environment(
+                        "OPENROUTER_API_KEY")),
+            )
+            blob = formats.new_log_blob(
+                loki.initial_transcript_items(), [])
+            blob["session_state"] = {
+                "shell_cwd": tmpdir,
+                "connection": descriptor.to_dict(),
+                "future_field": {"keep": True},
+            }
+            original = json.dumps(
+                blob, separators=(",", ":"), sort_keys=True).encode()
+            pathlib.Path(path).write_bytes(original)
+            loki.current_session().runtime_config = None
 
-                loki.load_chat_log(path)
-                saved = loki.save_chat_log()
+            loki.load_chat_log(path)
+            saved = loki.save_chat_log()
 
-                self.assertFalse(saved)
-                self.assertFalse(loki.current_session().chat_log_dirty)
-                self.assertEqual(pathlib.Path(path).read_bytes(), original)
-                self.assertEqual(
-                    loki.current_state()["connection"], descriptor.to_dict())
-                self.assertEqual(
-                    loki.current_state()["future_field"], {"keep": True})
-        finally:
-            restore_loki_state(old_values)
+            self.assertFalse(saved)
+            self.assertFalse(loki.current_session().chat_log_dirty)
+            self.assertEqual(pathlib.Path(path).read_bytes(), original)
+            self.assertEqual(
+                loki.current_state()["connection"], descriptor.to_dict())
+            self.assertEqual(
+                loki.current_state()["future_field"], {"keep": True})
 
     def test_later_save_preserves_unavailable_loaded_connection(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "runtime_config",
-            "shell_cwd", "previous_shell_cwd",
-        ]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                descriptor = ConnectionDescriptor(
-                    provider_id="openrouter",
-                    provider_name="OpenRouter",
-                    model="z-ai/glm",
-                    chat_url="https://openrouter.ai/api/v1/chat/completions",
-                    models_url="https://openrouter.ai/api/v1/models",
-                    protocol=protocols.OPENAI_CHAT,
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "OPENROUTER_API_KEY")),
-                )
-                blob = formats.new_log_blob(
-                    loki.initial_transcript_items(), [])
-                legacy_connection = descriptor.to_dict()
-                legacy_connection["api_url"] = "https://openrouter.ai/api/v1"
-                blob["session_state"] = {
-                    "shell_cwd": tmpdir,
-                    "connection": legacy_connection,
-                    "future_field": "retained",
-                }
-                pathlib.Path(path).write_text(
-                    json.dumps(blob), encoding="utf-8")
-                loki.current_session().runtime_config = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            descriptor = ConnectionDescriptor(
+                provider_id="openrouter",
+                provider_name="OpenRouter",
+                model="z-ai/glm",
+                chat_url="https://openrouter.ai/api/v1/chat/completions",
+                models_url="https://openrouter.ai/api/v1/models",
+                protocol=protocols.OPENAI_CHAT,
+                credential_ref=(
+                    authentications.CredentialRef.environment(
+                        "OPENROUTER_API_KEY")),
+            )
+            blob = formats.new_log_blob(
+                loki.initial_transcript_items(), [])
+            legacy_connection = descriptor.to_dict()
+            legacy_connection["api_url"] = "https://openrouter.ai/api/v1"
+            blob["session_state"] = {
+                "shell_cwd": tmpdir,
+                "connection": legacy_connection,
+                "future_field": "retained",
+            }
+            pathlib.Path(path).write_text(
+                json.dumps(blob), encoding="utf-8")
+            loki.current_session().runtime_config = None
 
-                loki.load_chat_log(path)
-                loki.mark_chat_log_dirty()
-                self.assertTrue(loki.save_chat_log())
+            loki.load_chat_log(path)
+            loki.mark_chat_log_dirty()
+            self.assertTrue(loki.save_chat_log())
 
-                after = json.loads(
-                    pathlib.Path(path).read_text(encoding="utf-8"))
-                self.assertEqual(
-                    after["session_state"]["connection"],
-                    descriptor.to_dict(),
-                )
-                self.assertEqual(
-                    after["session_state"]["future_field"], "retained")
-        finally:
-            restore_loki_state(old_values)
+            after = json.loads(
+                pathlib.Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(
+                after["session_state"]["connection"],
+                descriptor.to_dict(),
+            )
+            self.assertEqual(
+                after["session_state"]["future_field"], "retained")
 
     def test_resumed_chat_does_not_adopt_explicit_runtime_connection(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos", "runtime_config", "shell_cwd", "previous_shell_cwd",
-        ]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                saved_descriptor = ConnectionDescriptor(
-                    provider_id="saved",
-                    provider_name="Saved",
-                    model="saved-model",
-                    chat_url="https://saved.example/v1/chat/completions",
-                    models_url="https://saved.example/v1/models",
-                    protocol=protocols.OPENAI_CHAT,
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "SAVED_API_KEY")),
-                )
-                blob = formats.new_log_blob(
-                    loki.initial_transcript_items(), [])
-                blob["session_state"] = {
-                    "shell_cwd": tmpdir,
-                    "connection": saved_descriptor.to_dict(),
-                }
-                pathlib.Path(path).write_text(
-                    json.dumps(blob), encoding="utf-8")
-                loki.apply_runtime_config(connections.make_runtime_config(
-                    "https://override.example/v1",
-                    protocols.OPENAI_CHAT,
-                    model="override-model",
-                    credential_ref=(
-                        authentications.CredentialRef.environment(
-                            "LOKI_API_KEY")),
-                ))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            saved_descriptor = ConnectionDescriptor(
+                provider_id="saved",
+                provider_name="Saved",
+                model="saved-model",
+                chat_url="https://saved.example/v1/chat/completions",
+                models_url="https://saved.example/v1/models",
+                protocol=protocols.OPENAI_CHAT,
+                credential_ref=(
+                    authentications.CredentialRef.environment(
+                        "SAVED_API_KEY")),
+            )
+            blob = formats.new_log_blob(
+                loki.initial_transcript_items(), [])
+            blob["session_state"] = {
+                "shell_cwd": tmpdir,
+                "connection": saved_descriptor.to_dict(),
+            }
+            pathlib.Path(path).write_text(
+                json.dumps(blob), encoding="utf-8")
+            loki.apply_runtime_config(connections.make_runtime_config(
+                "https://override.example/v1",
+                protocols.OPENAI_CHAT,
+                model="override-model",
+                credential_ref=(
+                    authentications.CredentialRef.environment(
+                        "LOKI_API_KEY")),
+            ))
 
-                loki.load_chat_log(path)
-                loki.mark_chat_log_dirty()
-                loki.save_chat_log()
+            loki.load_chat_log(path)
+            loki.mark_chat_log_dirty()
+            loki.save_chat_log()
 
-                after = json.loads(
-                    pathlib.Path(path).read_text(encoding="utf-8"))
-                self.assertEqual(
-                    after["session_state"]["connection"],
-                    saved_descriptor.to_dict(),
-                )
-        finally:
-            restore_loki_state(old_values)
+            after = json.loads(
+                pathlib.Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(
+                after["session_state"]["connection"],
+                saved_descriptor.to_dict(),
+            )
 
     def test_chat_save_atomically_replaces_existing_snapshot(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos",
-        ]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                loki.new_chat_log(path)
-                loki.save_chat_log()
-                first_inode = os.stat(path).st_ino
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            loki.new_chat_log(path)
+            loki.save_chat_log()
+            first_inode = os.stat(path).st_ino
 
-                loki.current_transcript().append(
-                    formats.message_item("user", "changed"))
-                loki.mark_chat_log_dirty()
-                loki.save_chat_log()
+            loki.current_transcript().append(
+                formats.message_item("user", "changed"))
+            loki.mark_chat_log_dirty()
+            loki.save_chat_log()
 
-                self.assertNotEqual(os.stat(path).st_ino, first_inode)
-                self.assertEqual(
-                    [name for name in os.listdir(tmpdir)
-                     if name.endswith(".tmp")],
-                    [],
-                )
-        finally:
-            restore_loki_state(old_values)
+            self.assertNotEqual(os.stat(path).st_ino, first_inode)
+            self.assertEqual(
+                [name for name in os.listdir(tmpdir)
+                 if name.endswith(".tmp")],
+                [],
+            )
 
     def test_failed_atomic_publish_preserves_previous_snapshot(self):
-        names = [
-            "chat_log_path", "session_state", "chat_log_dirty",
-            "transcript_items", "session_todos",
-        ]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "chat-test.json")
-                loki.new_chat_log(path)
-                loki.save_chat_log()
-                original = pathlib.Path(path).read_bytes()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-test.json")
+            loki.new_chat_log(path)
+            loki.save_chat_log()
+            original = pathlib.Path(path).read_bytes()
 
-                loki.current_transcript().append(
-                    formats.message_item("user", "must not publish"))
-                loki.mark_chat_log_dirty()
-                # Patch the seam the publisher uses, not os.replace: on Windows
-                # the publish is private_files.replace_at (a handle-relative
-                # rename), so an os.replace patch would never fire there.
-                with mock.patch(
-                        "loki_agent.files.private_files.replace_at",
-                        side_effect=OSError("publish failed")):
-                    with self.assertRaisesRegex(OSError, "publish failed"):
-                        loki.save_chat_log()
+            loki.current_transcript().append(
+                formats.message_item("user", "must not publish"))
+            loki.mark_chat_log_dirty()
+            # Patch the seam the publisher uses, not os.replace: on Windows
+            # the publish is private_files.replace_at (a handle-relative
+            # rename), so an os.replace patch would never fire there.
+            with mock.patch(
+                    "loki_agent.files.private_files.replace_at",
+                    side_effect=OSError("publish failed")):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    loki.save_chat_log()
 
-                self.assertEqual(pathlib.Path(path).read_bytes(), original)
-                self.assertTrue(loki.current_session().chat_log_dirty)
-                self.assertEqual(
-                    [name for name in os.listdir(tmpdir)
-                     if name.endswith(".tmp")],
-                    [],
-                )
-        finally:
-            restore_loki_state(old_values)
+            self.assertEqual(pathlib.Path(path).read_bytes(), original)
+            self.assertTrue(loki.current_session().chat_log_dirty)
+            self.assertEqual(
+                [name for name in os.listdir(tmpdir)
+                 if name.endswith(".tmp")],
+                [],
+            )
 
     def test_load_session_state_restores_shell_cwd(self):
-        names = ["shell_cwd", "previous_shell_cwd"]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                loki.load_session_state({"shell_cwd": tmpdir})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loki.load_session_state({"shell_cwd": tmpdir})
 
-                self.assertEqual(loki.current_cwd(), os.path.realpath(tmpdir))
-        finally:
-            restore_loki_state(old_values)
+            self.assertEqual(loki.current_cwd(), tmpdir)
 
     def test_explicit_apply_shell_cwd_false_keeps_the_launch_directory(self):
-        names = ["shell_cwd", "previous_shell_cwd"]
-        old_values = save_loki_state(names)
 
-        try:
-            with tempfile.TemporaryDirectory() as saved_dir:
-                with tempfile.TemporaryDirectory() as launch_dir:
-                    loki.change_shell_cwd(launch_dir)
-                    loki.load_session_state(
-                        {"shell_cwd": saved_dir}, apply_shell_cwd=False)
+        with tempfile.TemporaryDirectory() as saved_dir:
+            with tempfile.TemporaryDirectory() as launch_dir:
+                selected = loki.change_shell_cwd(launch_dir)
+                loki.load_session_state(
+                    {"shell_cwd": saved_dir}, apply_shell_cwd=False)
 
-                    self.assertEqual(
-                        loki.current_cwd(), os.path.realpath(launch_dir))
-        finally:
-            restore_loki_state(old_values)
+                self.assertEqual(
+                    loki.current_cwd(), selected)
 
     def test_saved_connection_confirmation_is_explicit(self):
         descriptor = ConnectionDescriptor(
@@ -5460,14 +5216,36 @@ class ShellCwdTests(unittest.TestCase):
 
 
 class SubagentLaunchTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+        self.enterContext(mock.patch.object(loki, "CREDENTIALS", loki.CREDENTIALS))
+
+    @contextlib.asynccontextmanager
+    async def _connected_runtime(self):
+        # Race tests lend a coroutine to a real runtime; the subagent-entry
+        # helper below instead owns a complete CLI invocation. Transfer these
+        # child ends directly so no supervisor copy can conceal owner EOF.
+        delegation = await credential_supervisors.RuntimeDelegation.create(
+            authentications.CredentialBroker())
+        try:
+            owner, delegation.owner_child = delegation.owner_child, None
+            capability, delegation.credential_child = delegation.credential_child, None
+            runtime = await credential_runtimes.CredentialRuntime.connect(owner, capability)
+            self.assertIsNotNone(runtime)
+            try:
+                yield [delegation, runtime]
+            finally:
+                await runtime.close()
+        finally:
+            await delegation.close()
+
     async def _run_delegated_subagent(self, args, credentials=None):
         supervisor = credential_supervisors.CredentialSupervisor(
             credentials or CredentialStore({}))
         delegation = await supervisor.delegate()
-        if os.name == "posix":
-            # Duplicate the descriptors so the delegation can close its own
-            # copies; a Windows endpoint is used directly and the delegation is
-            # closed after the subagent finishes instead.
+        if sys.platform != "win32":
+            # Duplicate descriptors before releasing the supervisor's copies.
+            # Windows transfers its endpoints directly at the entry below.
             owner_end = os.dup(delegation.owner_child)
             capability_end = os.dup(delegation.credential_child)
             delegation.child_spawned()
@@ -5480,33 +5258,69 @@ class SubagentLaunchTests(unittest.TestCase):
             if "--root-conversation-id" not in args:
                 args = [*args, "--root-conversation-id",
                         loki.current_session().root_conversation_id]
-            return await subagents.async_main([
+            args = [
                 *args,
                 "--session-owner-fd", str(job_runtime.host_ipc.reference(owner_end)),
                 "--credential-capability-fd",
                 str(job_runtime.host_ipc.reference(capability_end)),
-            ])
+            ]
+            if sys.platform == "win32":
+                # The in-process entry parses new endpoint records over these
+                # same handles. Only that adopter may close them from here.
+                delegation.owner_child = delegation.credential_child = None
+            return await subagents.async_main(args)
         finally:
             await delegation.close()
 
+    def test_delegated_fixture_transfers_windows_ends_before_adoption(self):
+        ipc = job_runtime.host_ipc
+        server = mock.Mock(close=mock.AsyncMock())
+        delegation = credential_supervisors.RuntimeDelegation(
+            server, ipc.PipeEndpoint(read=71), None, ipc.PipeEndpoint(read=72, write=73))
+        supervisor = mock.Mock(delegate=mock.AsyncMock(return_value=delegation))
+
+        async def adopt(arguments):
+            owner = ipc.PipeEndpoint.parse(arguments[arguments.index('--session-owner-fd') + 1])
+            capability = ipc.PipeEndpoint.parse(arguments[arguments.index('--credential-capability-fd') + 1])
+            try:
+                self.assertIsNone(delegation.owner_child)
+                self.assertIsNone(delegation.credential_child)
+            finally:
+                # The assertion must precede this red-test backstop: leave no
+                # stale parent record able to close an already-adopted handle.
+                delegation.owner_child = delegation.credential_child = None
+                owner.close()
+                capability.close()
+            return 23
+
+        with mock.patch.object(sys, 'platform', 'win32'), mock.patch.object(
+                credential_supervisors, 'CredentialSupervisor', return_value=supervisor), mock.patch.object(
+                ipc, 'reference', side_effect=lambda endpoint: endpoint.reference()), mock.patch.object(
+                ipc.windows_api, 'close_handle') as close, mock.patch.object(
+                subagents, 'async_main', new=adopt):
+            self.assertEqual(asyncio.run(self._run_delegated_subagent([
+                'Explore', '--root-conversation-id', 'fixture-root'])), 23)
+        self.assertEqual([call.args[0] for call in close.call_args_list], [71, 72, 73])
+        server.close.assert_awaited_once_with()
+
     def test_subagent_launch_reuses_its_own_dispatcher(self):
-        saved = save_loki_state(["subagent_depth"])
-        old_argv = sys.argv[:]
         cases = [
-            ['posix', False, './loki.py', ['./loki.py']],
-            ['posix', False, './loki-acp', ['./loki-acp']],
-            ['nt', False, './loki.py', [sys.executable, './loki.py']],
-            ['nt', False, './loki-acp', [sys.executable, './loki-acp']],
-            ['nt', False, 'C:/built/loki-acp.exe', ['C:/built/loki-acp.exe']],
-            ['nt', True, 'C:/built/loki.exe', ['C:/built/loki.exe']],
+            ['linux', False, './loki.py', ['./loki.py']],
+            ['linux', False, './loki-acp', ['./loki-acp']],
+            ['darwin', False, './loki.py', ['./loki.py']],
+            ['freebsd14', False, './loki-acp', ['./loki-acp']],
+            ['win32', False, './loki.py', [sys.executable, './loki.py']],
+            ['win32', False, './loki-acp', [sys.executable, './loki-acp']],
+            ['win32', False, 'C:/built/loki-acp.exe', ['C:/built/loki-acp.exe']],
+            ['win32', True, 'C:/built/loki.exe', ['C:/built/loki.exe']],
         ]
-        try:
+        with mock.patch.object(sys, 'argv', sys.argv[:]):
             for depth in [0, 2]:
                 loki.current_session().subagent_depth = depth
                 for platform, frozen, selected, prefix in cases:
                     sys.argv = [selected]
                     with self.subTest(depth=depth, platform=platform, frozen=frozen, selected=selected), \
-                            mock.patch.object(os, 'name', platform), \
+                            mock.patch.object(sys, 'platform', platform), \
                             mock.patch.object(sys, 'frozen', frozen, create=True):
                         result = loki._subagent_argv('Explore', 'inspect this')
                     self.assertEqual(result, [
@@ -5514,30 +5328,23 @@ class SubagentLaunchTests(unittest.TestCase):
                         '--root-conversation-id', loki.current_session().root_conversation_id,
                         '--prompt', 'inspect this', '--shell-cwd', loki.current_cwd(),
                     ])
-        finally:
-            sys.argv = old_argv
-            restore_loki_state(saved)
 
     def test_both_entrypoints_can_run_real_subagent(self):
-        saved = save_loki_state([
-            "runtime_config", "credential_authority", "job_manager"])
-        old_argv = sys.argv[:]
-
         async def in_process(tmpdir, parent_entrypoint):
-            session = loki.current_session()
-            session.credential_authority = (
-                authentications.CredentialBroker())
-            session.job_manager = job_runtime.JobManager(
-                os.path.join(tmpdir, "jobs"))
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "http://dummy.invalid/v1",
-                protocols.DUMMY,
-                model="dummy-model",
-            ))
-            # The packaged entrypoint on Windows; the checkout script on POSIX.
-            sys.argv = [entrypoint(parent_entrypoint)]
-            return await loki.run_agent_async(
-                "recursive launch", "inspect this")
+            async with managed_jobs(os.path.join(tmpdir, 'jobs')) as manager:
+                session = loki.current_session()
+                session.credential_authority = (
+                    authentications.CredentialBroker())
+                session.job_manager = manager
+                loki.apply_runtime_config(connections.make_runtime_config(
+                    "http://dummy.invalid/v1",
+                    protocols.DUMMY,
+                    model="dummy-model",
+                ))
+                # The packaged entrypoint on Windows; the checkout script on POSIX.
+                sys.argv = [entrypoint(parent_entrypoint)]
+                return await loki.run_agent_async(
+                    "recursive launch", "inspect this")
 
         def headless(tmpdir):
             # The terminal subagent re-proves containment, so on Windows it
@@ -5574,58 +5381,43 @@ class SubagentLaunchTests(unittest.TestCase):
             self.assertIn("ok", result.stdout)
             self.assertNotIn("Error:", result.stdout)
 
-        try:
+        with mock.patch.object(sys, 'argv', sys.argv[:]):
             with tempfile.TemporaryDirectory() as tmpdir:
                 for parent_entrypoint in ["loki", "loki-acp"]:
                     with self.subTest(entrypoint=parent_entrypoint):
                         if os.name == "nt" and parent_entrypoint == "loki":
                             headless(tmpdir)
                         else:
-                            result = asyncio.run(
-                                in_process(tmpdir, parent_entrypoint))
+                            result = asyncio.run(in_process(tmpdir, parent_entrypoint))
                             self.assertNotIn("Error:", result)
                             self.assertIn("ok", result)
-        finally:
-            sys.argv = old_argv
-            restore_loki_state(saved)
 
     def test_subagent_inherits_process_cwd_and_receives_shell_cwd(self):
-        saved = save_loki_state(["shell_cwd"])
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                loki.current_session().shell_cwd = tmpdir
-                manager = mock.Mock()
-                manager.run_exec = mock.AsyncMock(return_value=(
-                    types.SimpleNamespace(exit_code=0),
-                    "exited",
-                    "",
-                    "",
-                ))
-                with mock.patch.object(
-                        loki, "current_job_manager",
-                        return_value=manager):
-                    asyncio.run(loki.run_agent_async(
-                        "inspect", "inspect this"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loki.current_session().shell_cwd = tmpdir
+            manager = mock.Mock()
+            manager.run_exec = mock.AsyncMock(return_value=(
+                types.SimpleNamespace(exit_code=0),
+                "exited",
+                "",
+                "",
+            ))
+            with mock.patch.object(
+                    loki, "current_job_manager",
+                    return_value=manager):
+                asyncio.run(loki.run_agent_async(
+                    "inspect", "inspect this"))
 
-                args, kwargs = manager.run_exec.await_args
-                self.assertEqual(kwargs["cwd"], os.getcwd())
-                self.assertTrue(kwargs["session_owned"])
-                self.assertTrue(kwargs["subagent"])
-                self.assertEqual(
-                    args[0][-2:],
-                    ["--shell-cwd", tmpdir],
-                )
-        finally:
-            restore_loki_state(saved)
+            args, kwargs = manager.run_exec.await_args
+            self.assertEqual(kwargs["cwd"], os.getcwd())
+            self.assertTrue(kwargs["session_owned"])
+            self.assertTrue(kwargs["subagent"])
+            self.assertEqual(
+                args[0][-2:],
+                ["--shell-cwd", tmpdir],
+            )
 
     def test_subagent_receives_only_current_credential_capability(self):
-        saved = save_loki_state([
-            "runtime_config",
-            "reasoning_effort_preference",
-            "session_state",
-            "chat_log_path",
-            "chat_log_dirty",
-        ])
         credential = (
             authentications.CredentialRef.openai_subscription())
         profile = _codex_model(
@@ -5646,27 +5438,24 @@ class SubagentLaunchTests(unittest.TestCase):
             "",
             "",
         ))
-        try:
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://chatgpt.com/backend-api/codex/responses",
-                protocols.OPENAI_RESPONSES,
-                model="gpt-5-codex",
-                provider_id="openai-subscription",
-                credential_ref=credential,
-                auth_scheme="openai-subscription",
-                openai_request_profile=profile,
-                reasoning_effort_profile=effort_profile,
-            ))
-            loki.current_session().session_state = {}
-            loki.current_session().chat_log_path = None
-            loki.current_session().reasoning_effort_preference = "high"
-            with mock.patch.object(
-                    loki, "current_job_manager",
-                    return_value=manager):
-                asyncio.run(loki.run_agent_async(
-                    "inspect", "inspect this"))
-        finally:
-            restore_loki_state(saved)
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://chatgpt.com/backend-api/codex/responses",
+            protocols.OPENAI_RESPONSES,
+            model="gpt-5-codex",
+            provider_id="openai-subscription",
+            credential_ref=credential,
+            auth_scheme="openai-subscription",
+            openai_request_profile=profile,
+            reasoning_effort_profile=effort_profile,
+        ))
+        loki.current_session().session_state = {}
+        loki.current_session().chat_log_path = None
+        loki.current_session().reasoning_effort_preference = "high"
+        with mock.patch.object(
+                loki, "current_job_manager",
+                return_value=manager):
+            asyncio.run(loki.run_agent_async(
+                "inspect", "inspect this"))
 
         _args, kwargs = manager.run_exec.await_args
         self.assertEqual(kwargs["credential_refs"], {credential})
@@ -5694,6 +5483,14 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertNotIn("LOKI_REASONING_EFFORT", kwargs["env"])
         self.assertEqual(json.loads(kwargs["env"]["LOKI_TURN_THINKING"])["settings"]["effort"], "high")
 
+    def test_subagent_help_keeps_selected_program_without_replaying_controls(self):
+        program = '/chosen/link/../loki\x1b[31m'
+        with mock.patch.object(subagents.sys, 'argv', [program]):
+            help_text = subagents.usage()
+        self.assertIn('/chosen/link/../loki', help_text)
+        self.assertNotIn('\x1b', help_text)
+        self.assertIn('--subagent TYPE', help_text)
+
     def test_subagent_depth_is_bounded_at_the_entrypoint(self):
         self.assertEqual(
             subagents.parse_args([
@@ -5709,30 +5506,26 @@ class SubagentLaunchTests(unittest.TestCase):
                     "Explore", "--subagent-depth", value])
 
     def test_maximum_depth_neither_advertises_nor_runs_agent(self):
-        saved = save_loki_state(["subagent_depth", "agent_mode"])
         session = loki.current_session()
         session.subagent_depth = tool_contracts.MAX_SUBAGENT_DEPTH
         captured = {}
 
-        async def fake_loop(messages, allowed, *, thinking):
-            self.assertEqual(thinking.traces, "off")
+        async def fake_loop(messages, allowed, *, thinking, on_event=None):
+            self.assertEqual(thinking.traces, 'off')
             captured["messages"] = messages
             captured["allowed"] = allowed
             return "done"
 
-        try:
-            with mock.patch.object(
-                    loki, "run_tool_loop_async", side_effect=fake_loop):
-                result = asyncio.run(
-                    subagents.run_prompt_async("Explore", "inspect"))
-            manager = mock.Mock()
-            with mock.patch.object(
-                    loki, "current_job_manager",
-                    return_value=manager):
-                launch_result = asyncio.run(loki.run_agent_async(
-                    "nested", "inspect"))
-        finally:
-            restore_loki_state(saved)
+        with mock.patch.object(
+                loki, "run_tool_loop_async", side_effect=fake_loop):
+            result = asyncio.run(
+                subagents.run_prompt_async("Explore", "inspect"))
+        manager = mock.Mock()
+        with mock.patch.object(
+                loki, "current_job_manager",
+                return_value=manager):
+            denied = asyncio.run(loki.run_agent_async('nested', 'inspect'))
+            self.assertIn('maximum subagent depth', denied)
 
         self.assertEqual(result, "done")
         self.assertNotIn("Agent", captured["allowed"])
@@ -5741,29 +5534,24 @@ class SubagentLaunchTests(unittest.TestCase):
             "maximum delegation depth",
             formats.item_text(captured["messages"][0]),
         )
-        self.assertIn("maximum subagent depth", launch_result)
         manager.run_exec.assert_not_called()
         manager.run_background_exec.assert_not_called()
 
     def test_lower_depth_advertises_recursive_agent(self):
-        saved = save_loki_state(["subagent_depth", "agent_mode"])
         session = loki.current_session()
         session.subagent_depth = tool_contracts.MAX_SUBAGENT_DEPTH - 1
         captured = {}
 
-        async def fake_loop(messages, allowed, *, thinking):
-            self.assertEqual(thinking.traces, "off")
+        async def fake_loop(messages, allowed, *, thinking, on_event=None):
+            self.assertEqual(thinking.traces, 'off')
             captured["messages"] = messages
             captured["allowed"] = allowed
             return "done"
 
-        try:
-            with mock.patch.object(
-                    loki, "run_tool_loop_async", side_effect=fake_loop):
-                asyncio.run(
-                    subagents.run_prompt_async("Explore", "inspect"))
-        finally:
-            restore_loki_state(saved)
+        with mock.patch.object(
+                loki, "run_tool_loop_async", side_effect=fake_loop):
+            asyncio.run(
+                subagents.run_prompt_async("Explore", "inspect"))
 
         self.assertIn("Agent", captured["allowed"])
         self.assertNotIn("Ask", captured["allowed"])
@@ -5777,97 +5565,99 @@ class SubagentLaunchTests(unittest.TestCase):
 
     def test_subagent_operation_is_cancelled_when_owner_fd_closes(self):
         async def scenario():
-            read_fd, write_fd = os.pipe()
-            owner = credential_runtimes.SessionOwner(read_fd)
-            cancelled = asyncio.Event()
+            async with self._connected_runtime() as owned:
+                delegation, runtime = owned
+                started = asyncio.Event()
+                revoked_at_cancellation = []
 
-            class CredentialClient:
-                async def wait_closed(self):
-                    await asyncio.Event().wait()
+                async def operation():
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        revoked_at_cancellation.append(runtime.credential_client.closed)
 
-            async def operation():
+                task = asyncio.create_task(runtime.run(operation()))
                 try:
-                    await asyncio.Event().wait()
+                    await observe_fixture(started.wait(), task)
+                    owner, delegation.owner_parent = delegation.owner_parent, None
+                    job_runtime.host_ipc.close_end(owner)
+                    completed, _result = await task
+                    self.assertEqual(revoked_at_cancellation, [True])
+                    return completed
                 finally:
-                    cancelled.set()
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
-            try:
-                runtime = credential_runtimes.CredentialRuntime(
-                    owner, CredentialClient())
-                task = asyncio.create_task(
-                    runtime.run(operation()))
-                await asyncio.sleep(0)
-                os.close(write_fd)
-                write_fd = None
-                completed, _result = await asyncio.wait_for(
-                    task, timeout=1)
-                return completed, cancelled.is_set()
-            finally:
-                if write_fd is not None:
-                    os.close(write_fd)
-                await owner.close()
+        self.assertFalse(asyncio.run(scenario()))
 
-        completed, cancelled = asyncio.run(scenario())
-        self.assertFalse(completed)
-        self.assertTrue(cancelled)
-
-    def test_owner_revocation_wins_simultaneous_operation_completion(self):
+    def test_preclosed_owner_refuses_to_start_operation(self):
         async def scenario():
-            owner_closed = asyncio.get_running_loop().create_future()
-            owner_closed.set_result(b"")
+            async with self._connected_runtime() as owned:
+                delegation, runtime = owned
+                owner, delegation.owner_parent = delegation.owner_parent, None
+                job_runtime.host_ipc.close_end(owner)
+                await runtime.owner.closed_task
+                ran = False
 
-            class Owner:
-                closed_task = owner_closed
+                async def operation():
+                    nonlocal ran
+                    ran = True
+                    return "too late"
 
-            class CredentialClient:
-                async def wait_closed(self):
-                    await asyncio.Event().wait()
-
-            ran = False
-
-            async def operation():
-                nonlocal ran
-                ran = True
-                return "too late"
-
-            runtime = credential_runtimes.CredentialRuntime(
-                Owner(), CredentialClient())
-            completed, result = await runtime.run(operation())
-            return completed, result, ran
+                completed, result = await runtime.run(operation())
+                return [completed, result, ran]
 
         completed, result, ran = asyncio.run(scenario())
         self.assertFalse(completed)
         self.assertIsNone(result)
         self.assertFalse(ran)
 
+    def test_owner_revocation_wins_simultaneous_operation_completion(self):
+        async def scenario():
+            async with self._connected_runtime() as owned:
+                delegation, runtime = owned
+
+                async def operation():
+                    owner, delegation.owner_parent = delegation.owner_parent, None
+                    job_runtime.host_ipc.close_end(owner)
+                    await runtime.owner.closed_task
+                    return "too late"
+
+                completed, result = await runtime.run(operation())
+                self.assertTrue(runtime.credential_client.closed)
+                return [completed, result]
+
+        completed, result = asyncio.run(scenario())
+        self.assertFalse(completed)
+        self.assertIsNone(result)
+
     def test_runtime_task_cancellation_cancels_its_operation(self):
         async def scenario():
-            owner_closed = asyncio.get_running_loop().create_future()
-            operation_cancelled = asyncio.Event()
+            async with self._connected_runtime() as owned:
+                _delegation, runtime = owned
+                started = asyncio.Event()
+                revoked_at_cancellation = []
 
-            class Owner:
-                closed_task = owner_closed
+                async def operation():
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        revoked_at_cancellation.append(runtime.credential_client.closed)
 
-            class CredentialClient:
-                async def wait_closed(self):
-                    await asyncio.Event().wait()
-
-            async def operation():
+                task = asyncio.create_task(runtime.run(operation()))
                 try:
-                    await asyncio.Event().wait()
+                    await observe_fixture(started.wait(), task)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    self.assertEqual(revoked_at_cancellation, [True])
                 finally:
-                    operation_cancelled.set()
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
-            runtime = credential_runtimes.CredentialRuntime(
-                Owner(), CredentialClient())
-            task = asyncio.create_task(runtime.run(operation()))
-            await asyncio.sleep(0)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-            return operation_cancelled.is_set()
-
-        self.assertTrue(asyncio.run(scenario()))
+        asyncio.run(scenario())
 
     def test_owner_close_cancels_pending_credential_handshake(self):
         async def scenario():
@@ -5882,7 +5672,7 @@ class SubagentLaunchTests(unittest.TestCase):
                             capability_fd, owner))
                     await asyncio.sleep(0)
                     job_runtime.host_ipc.close_end(owner_parent)
-                    result = await asyncio.wait_for(task, timeout=1)
+                    result = await task
                     self.assertEqual(capability_fd.handles(), [])
                     return result
                 finally:
@@ -5899,7 +5689,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 await asyncio.sleep(0)
                 os.close(write_fd)
                 write_fd = None
-                result = await asyncio.wait_for(task, timeout=1)
+                result = await task
                 return result
             finally:
                 if write_fd is not None:
@@ -5911,48 +5701,30 @@ class SubagentLaunchTests(unittest.TestCase):
 
     def test_subagent_operation_is_cancelled_when_broker_closes(self):
         async def scenario():
-            if os.name != "posix":
-                owner_parent, owner_child = job_runtime.host_ipc.owner_channel()
-                owner = credential_runtimes.SessionOwner(owner_child)
+            async with self._connected_runtime() as owned:
+                delegation, runtime = owned
+                started = asyncio.Event()
+                revoked_at_cancellation = []
 
-                def release_owner():
-                    job_runtime.host_ipc.close_end(owner_parent)
-            else:
-                read_fd, write_fd = os.pipe()
-                owner = credential_runtimes.SessionOwner(read_fd)
+                async def operation():
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        revoked_at_cancellation.append(runtime.credential_client.closed)
 
-                def release_owner():
-                    os.close(write_fd)
-            broker_closed = asyncio.Event()
-            cancelled = asyncio.Event()
-
-            class CredentialClient:
-                async def wait_closed(self):
-                    await broker_closed.wait()
-
-            async def operation():
+                task = asyncio.create_task(runtime.run(operation()))
                 try:
-                    await asyncio.Event().wait()
+                    await observe_fixture(started.wait(), task)
+                    await delegation.credential_server.close()
+                    completed, _result = await task
+                    self.assertEqual(revoked_at_cancellation, [True])
+                    return completed
                 finally:
-                    cancelled.set()
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
-            try:
-                runtime = credential_runtimes.CredentialRuntime(
-                    owner, CredentialClient())
-                task = asyncio.create_task(
-                    runtime.run(operation()))
-                await asyncio.sleep(0)
-                broker_closed.set()
-                completed, _result = await asyncio.wait_for(
-                    task, timeout=1)
-                return completed, cancelled.is_set()
-            finally:
-                release_owner()
-                await owner.close()
-
-        completed, cancelled = asyncio.run(scenario())
-        self.assertFalse(completed)
-        self.assertTrue(cancelled)
+        self.assertFalse(asyncio.run(scenario()))
 
     def test_subagent_refuses_owner_fd_without_credential_capability(self):
         if os.name != "posix":
@@ -5983,62 +5755,43 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertEqual(status, 2)
 
     def test_subagent_cwd_failure_returns_usage_error(self):
-        saved = save_loki_state(
-            ["credential_authority", "CREDENTIALS", "shell_cwd"])
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                missing = os.path.join(directory, "missing")
-                with contextlib.redirect_stderr(io.StringIO()):
-                    status = asyncio.run(
-                        self._run_delegated_subagent([
-                            "Explore",
-                            "--shell-cwd", missing,
-                        ]))
-        finally:
-            restore_loki_state(saved)
+        with tempfile.TemporaryDirectory() as directory:
+            missing = os.path.join(directory, "missing")
+            with contextlib.redirect_stderr(io.StringIO()):
+                status = asyncio.run(
+                    self._run_delegated_subagent([
+                        "Explore",
+                        "--shell-cwd", missing,
+                    ]))
 
         self.assertEqual(status, 2)
 
     def test_subagent_configuration_failure_returns_usage_error(self):
-        saved = save_loki_state(
-            ["credential_authority", "CREDENTIALS"])
-        try:
-            with mock.patch.object(
-                    connections,
-                    "build_config_from_env",
-                    side_effect=ValueError("invalid config")), \
-                    contextlib.redirect_stderr(io.StringIO()):
-                status = asyncio.run(
-                    self._run_delegated_subagent(["Explore"]))
-        finally:
-            restore_loki_state(saved)
+        with mock.patch.object(
+                connections,
+                "build_config_from_env",
+                side_effect=ValueError("invalid config")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status = asyncio.run(
+                self._run_delegated_subagent(["Explore"]))
 
         self.assertEqual(status, 2)
 
     def test_subagent_model_is_required(self):
-        saved = save_loki_state(
-            ["credential_authority", "CREDENTIALS", "runtime_config"])
-        try:
-            with mock.patch.object(
-                    connections, "build_config_from_env"), \
-                    mock.patch.object(
-                        subagents._core, "apply_runtime_config"), \
-                    mock.patch.object(
-                        subagents._core, "current_model",
-                        return_value=""), \
-                    contextlib.redirect_stderr(io.StringIO()):
-                status = asyncio.run(
-                    self._run_delegated_subagent(["Explore"]))
-        finally:
-            restore_loki_state(saved)
+        with mock.patch.object(
+                connections, "build_config_from_env"), \
+                mock.patch.object(
+                    subagents._core, "apply_runtime_config"), \
+                mock.patch.object(
+                    subagents._core, "current_model",
+                    return_value=""), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status = asyncio.run(
+                self._run_delegated_subagent(["Explore"]))
 
         self.assertEqual(status, 2)
 
     def test_subagent_tree_identity_is_installed_forwarded_and_restored(self):
-        saved = save_loki_state([
-            "credential_authority", "CREDENTIALS", "runtime_config",
-            "reasoning_effort_preference",
-        ])
         root = "35b2d314-fdfb-466f-bbd6-4f479fc82eb4"
         session = loki.current_session()
         previous_root = session.delegated_root_conversation_id
@@ -6049,79 +5802,64 @@ class SubagentLaunchTests(unittest.TestCase):
             self.assertEqual(session.root_conversation_id, root)
             self.assertEqual(session.conversation_id, thread)
             argv = loki._subagent_argv("Explore", "nested search")
-            nested = subagents.parse_args(argv[2:])
+            nested = subagents.parse_args(argv[argv.index("--subagent") + 1:])
             self.assertEqual(nested.root_conversation_id, root)
             raise RuntimeError("failed child")
 
-        try:
-            with mock.patch.object(
-                    connections, "build_config_from_env",
-                    return_value=connections.make_runtime_config(
-                        "dummy://local", protocols.DUMMY, model="dummy")), \
-                    mock.patch.object(subagents, "run_cli_async", new=run):
-                with self.assertRaisesRegex(RuntimeError, "failed child"):
-                    asyncio.run(self._run_delegated_subagent([
-                        "Explore", "--root-conversation-id", root,
-                    ]))
-            self.assertEqual(session.delegated_root_conversation_id, previous_root)
-        finally:
-            restore_loki_state(saved)
+        with mock.patch.object(
+                connections, "build_config_from_env",
+                return_value=connections.make_runtime_config(
+                    "dummy://local", protocols.DUMMY, model="dummy")), \
+                mock.patch.object(subagents, "run_cli_async", new=run):
+            with self.assertRaisesRegex(RuntimeError, "failed child"):
+                asyncio.run(self._run_delegated_subagent([
+                    "Explore", "--root-conversation-id", root,
+                ]))
+        self.assertEqual(session.delegated_root_conversation_id, previous_root)
 
     def test_subagent_cli_applies_explicit_shell_cwd(self):
-        saved = save_loki_state([
-            "credential_authority", "CREDENTIALS", "runtime_config",
-            "shell_cwd",
-        ])
-        runner = mock.AsyncMock()
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir, \
-                    mock.patch.object(
-                        connections, "build_config_from_env"), \
-                    mock.patch.object(
-                        subagents._core, "apply_runtime_config"), \
-                    mock.patch.object(
-                        subagents._core, "current_model",
-                        return_value="model"), \
-                    mock.patch.object(
-                        subagents, "run_cli_async",
-                        new=runner):
-                status = asyncio.run(
-                    self._run_delegated_subagent([
-                        "Explore",
-                        "--prompt", "inspect this",
-                        "--shell-cwd", tmpdir,
-                    ]))
+        runner = mock.AsyncMock(return_value=0)
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                mock.patch.object(
+                    connections, "build_config_from_env"), \
+                mock.patch.object(
+                    subagents._core, "apply_runtime_config"), \
+                mock.patch.object(
+                    subagents._core, "current_model",
+                    return_value="model"), \
+                mock.patch.object(
+                    subagents, "run_cli_async",
+                    new=runner):
+            status = asyncio.run(
+                self._run_delegated_subagent([
+                    "Explore",
+                    "--prompt", "inspect this",
+                    "--shell-cwd", tmpdir,
+                ]))
 
-                self.assertEqual(status, 0)
-                self.assertEqual(loki.current_cwd(), tmpdir)
-                self.assertEqual(os.getcwd(), loki.STARTUP_CWD)
-        finally:
-            restore_loki_state(saved)
+            self.assertEqual(status, 0)
+            self.assertEqual(loki.current_cwd(), tmpdir)
+            self.assertEqual(os.getcwd(), loki.STARTUP_CWD)
 
     def test_subagent_environment_contains_no_request_secret(self):
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
         source_env = {
             "PATH": os.environ.get("PATH", ""),
             "OPENROUTER_API_KEY": "unrelated-key",
         }
         CredentialStore.capture(dict(source_env))
-        try:
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "https://example.test/v1",
-                protocols.OPENAI_CHAT,
-                model="active-model",
-                credential_ref=(
-                    authentications.CredentialRef.environment(
-                        "EXAMPLE_API_KEY")),
-                models_url="https://example.test/custom-models",
-                max_tokens=12345,
-                anthropic_version="2026-01-02",
-                auth_header="X-Custom-Key",
-            ))
-            child_env = loki._subagent_env(environ=source_env)
-        finally:
-            restore_loki_state(old_values)
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "https://example.test/v1",
+            protocols.OPENAI_CHAT,
+            model="active-model",
+            credential_ref=(
+                authentications.CredentialRef.environment(
+                    "EXAMPLE_API_KEY")),
+            models_url="https://example.test/custom-models",
+            max_tokens=12345,
+            anthropic_version="2026-01-02",
+            auth_header="X-Custom-Key",
+        ))
+        child_env = loki._subagent_env(environ=source_env)
 
         self.assertNotIn("LOKI_API_KEY", child_env)
         self.assertEqual(child_env["LOKI_STREAM"], "0")
@@ -6141,19 +5879,14 @@ class SubagentLaunchTests(unittest.TestCase):
         self.assertNotIn("OPENROUTER_API_KEY", child_env)
 
     def test_subagent_environment_preserves_credentialless_connection(self):
-        names = ["runtime_config"]
-        old_values = save_loki_state(names)
-        try:
-            loki.apply_runtime_config(connections.make_runtime_config(
-                "http://localhost:8000/v1",
-                protocols.OPENAI_CHAT,
-                model="local-model",
-                stream=True,
-            ))
-            child_env = loki._subagent_env(
-                environ={"LOKI_API_KEY": "must-not-leak"})
-        finally:
-            restore_loki_state(old_values)
+        loki.apply_runtime_config(connections.make_runtime_config(
+            "http://localhost:8000/v1",
+            protocols.OPENAI_CHAT,
+            model="local-model",
+            stream=True,
+        ))
+        child_env = loki._subagent_env(
+            environ={"LOKI_API_KEY": "must-not-leak"})
 
         self.assertEqual(child_env["LOKI_API_BASE"],
                          "http://localhost:8000/v1")
@@ -6166,11 +5899,7 @@ class SubagentLaunchTests(unittest.TestCase):
 
 class RequestTimeCredentialTests(unittest.TestCase):
     def setUp(self):
-        self.saved = save_loki_state(
-            ["runtime_config", "credential_authority"])
-
-    def tearDown(self):
-        restore_loki_state(self.saved)
+        self.enterContext(isolated_response_headers())
 
     def _install_subscription(self, *, stream=False):
         async def refresh(refresh_token):
@@ -6704,18 +6433,13 @@ class RequestTimeCredentialTests(unittest.TestCase):
 
 class StreamingCompletionTests(unittest.TestCase):
     def setUp(self):
-        self.old_runtime_config = loki.current_config()
-        self.old_model = loki.current_model()
+        self.enterContext(isolated_response_headers())
         loki.apply_runtime_config(connections.make_runtime_config(
             "http://localhost:8000/v1",
             protocols.OPENAI_CHAT,
             model="local-model",
             stream=True,
         ))
-
-    def tearDown(self):
-        loki.current_session().runtime_config = self.old_runtime_config
-        # model restored with runtime_config above
 
     def test_text_delta_arrives_before_stream_completion(self):
         async def scenario():
@@ -6759,10 +6483,17 @@ class StreamingCompletionTests(unittest.TestCase):
                     tools=[],
                     on_text_delta=on_delta,
                 ))
-                await asyncio.wait_for(first_seen.wait(), timeout=1)
-                self.assertFalse(task.done())
-                release.set()
-                items = await task
+                try:
+                    # A request/parser failure before its first delta is an
+                    # operation failure, not an event to wait for forever.
+                    await observe_fixture(first_seen.wait(), task)
+                    self.assertFalse(task.done())
+                    release.set()
+                    items = await task
+                finally:
+                    release.set()
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
             return payloads, deltas, items
 
         payloads, deltas, items = asyncio.run(scenario())
@@ -6808,13 +6539,8 @@ class StreamingCompletionTests(unittest.TestCase):
             with mock.patch(
                     'loki_agent.model_requests.http_client.async_http_stream',
                     side_effect=fake_http_stream):
-                return await asyncio.wait_for(
-                    loki.async_chat_completion(
-                        [formats.message_item("user", "hello")],
-                        tools=[],
-                    ),
-                    timeout=0.2,
-                )
+                return await loki.async_chat_completion(
+                    [formats.message_item("user", "hello")], tools=[])
 
         turn = asyncio.run(scenario())
 
@@ -7150,7 +6876,9 @@ class StreamingCompletionTests(unittest.TestCase):
             yield (
                 b'data: {"choices":[{"index":0,'
                 b'"delta":{"content":"partial"}}]}\n\n')
-            await asyncio.sleep(60)
+            # The preceding delta requests cancellation. A subsequent body
+            # read is the regression itself, not work to hide behind a sleep.
+            raise AssertionError('stream body resumed after cancellation')
 
         @contextlib.asynccontextmanager
         async def fake_http_stream(method, request_url, **kwargs):
@@ -7178,6 +6906,9 @@ class StreamingCompletionTests(unittest.TestCase):
 
 
 class StreamingToolLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+
     def test_stderr_diagnostic_flushes_stdout_first(self):
         class TrackingStdout(io.StringIO):
             def __init__(self):
@@ -7305,6 +7036,9 @@ class StreamingToolLoopTests(unittest.TestCase):
 
 
 class ResponsesToolLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+
     def test_provider_notice_is_saved_and_emitted_but_not_model_input(self):
         transcript = [formats.message_item("user", "hello")]
         events = []
@@ -7415,17 +7149,13 @@ class ResponsesToolLoopTests(unittest.TestCase):
             dispatched.append((fn_name, args))
             return {"ok": True, "content": "contents"}
 
-        old_dispatch = loki.dispatch_tool_async
-        try:
-            loki.dispatch_tool_async = fake_dispatch
+        with mock.patch.object(loki, 'dispatch_tool_async', fake_dispatch):
             result = asyncio.run(loki.run_tool_loop_async(
                 transcript,
                 chat_fn=chat_fn,
                 on_event=events.append,
                 max_loops=2,
             ))
-        finally:
-            loki.dispatch_tool_async = old_dispatch
 
         self.assertEqual(result, "")
         self.assertEqual(response_number, 2)
@@ -7623,15 +7353,18 @@ class ResponsesToolLoopTests(unittest.TestCase):
 
 
 class HarnessProjectionTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_response_headers())
+
     def test_allowed_subset_advertisement_and_real_execution_enforcement(self):
         with tempfile.TemporaryDirectory() as directory:
             target = pathlib.Path(directory) / 'reviewed.txt'
             target.write_text('read-only sentinel', encoding='utf-8')
-            session = loki.Session(shell_cwd=directory)
             requests = []
 
             async def completion(items, tools, model=None, *, codex_turn_state,
-                                 reasoning_effort=None, thinking=None):
+                                 reasoning_effort=None, thinking=None, cancel_check=None):
+                self.assertTrue(callable(cancel_check))
                 self.assertEqual({tool['function']['name'] for tool in tools},
                                  {'Read', 'Grep'})
                 requests.append(copy.deepcopy(items))
@@ -7659,8 +7392,7 @@ class HarnessProjectionTests(unittest.TestCase):
                     formats.message_item('assistant', 'inspected without changes')])
 
             transcript = [formats.message_item('user', 'inspect')]
-            with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
-                    mock.patch.object(loki, 'file_state', {}), \
+            with mock.patch.object(loki.current_session(), 'shell_cwd', directory), \
                     mock.patch.object(loki, 'async_chat_completion', completion):
                 result = asyncio.run(loki.run_tool_loop_async(
                     transcript, allowed={'Read', 'Grep'}))
@@ -7682,13 +7414,9 @@ class HarnessProjectionTests(unittest.TestCase):
                 formats.message_item("assistant", "final"),
             ])
 
-        old_completion = loki.async_chat_completion
-        try:
-            loki.async_chat_completion = fake_completion
+        with mock.patch.object(loki, 'async_chat_completion', fake_completion):
             result = asyncio.run(loki.run_toolless_completion_async(
                 [formats.message_item("user", "hello")]))
-        finally:
-            loki.async_chat_completion = old_completion
 
         self.assertEqual(result, "commentary\nfinal")
 
@@ -7696,8 +7424,11 @@ class HarnessProjectionTests(unittest.TestCase):
         transcript = [formats.message_item("user", "hello")]
         records = []
         body = {"error": {"message": "full marker"}}
+        requested = False
 
         async def chat_fn(items, *, codex_turn_state):
+            nonlocal requested
+            requested = True
             raise model_requests.ApiError(
                 "https://provider.test/v1/responses",
                 429,
@@ -7715,6 +7446,7 @@ class HarnessProjectionTests(unittest.TestCase):
         self.assertEqual(result, "")
         self.assertEqual(
             [item["type"] for item in transcript], ["message"])
+        self.assertTrue(requested, 'cancellation must not impersonate the failed provider request')
         self.assertEqual(records, [])
 
 
@@ -7729,11 +7461,9 @@ class QuestionGuardTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self._state = save_loki_state(
-            ["agent_mode", "last_instructed_agent_mode", "job_manager"])
-
-    def tearDown(self):
-        restore_loki_state(self._state)
+        # Both turns and their real Bash child share one loop through cleanup.
+        self.runner = self.enterContext(asyncio.Runner())
+        self.enterContext(isolated_response_headers(runner=self.runner))
 
     def _context_for(self, text):
         items = [formats.message_item("user", text)]
@@ -7776,7 +7506,7 @@ class QuestionGuardTests(unittest.TestCase):
         async def scripted_chat(items, *, codex_turn_state):
             return first_calls.pop(0)
 
-        asyncio.run(loki.run_tool_loop_async(
+        self.runner.run(loki.run_tool_loop_async(
             transcript, chat_fn=scripted_chat))
         # The Bash call in this question turn must have been refused --
         # the refusal reason can only enter the transcript that way.
@@ -7792,7 +7522,7 @@ class QuestionGuardTests(unittest.TestCase):
             return second_calls.pop(0)
 
         before = len(transcript)
-        asyncio.run(loki.run_tool_loop_async(
+        self.runner.run(loki.run_tool_loop_async(
             transcript, chat_fn=scripted_chat2))
         self.assertNotIn(
             "answering the user's question", str(transcript[before:]))
@@ -7813,15 +7543,15 @@ class QuestionGuardTests(unittest.TestCase):
             root = pathlib.Path(directory)
             target = root / 'reviewed.txt'
             target.write_text('preserve these bytes', encoding='utf-8')
-            manager = cleanup.enter_context(contextlib.closing(job_runtime.JobManager(str(root / 'jobs'))))
+            manager = job_manager(str(root / 'jobs'), cleanup=cleanup.callback)
             baseline = set(root.iterdir())
             session = loki.Session(shell_cwd=directory, job_manager=manager)
+            self.addCleanup(session.response_headers.close)
             quote = (subprocess.list2cmdline([str(target)]) if os.name == 'nt'
                      else shlex.quote(str(target)))
-            with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
-                    mock.patch.object(loki, 'file_state', {}):
+            with mock.patch.object(loki, '_DEFAULT_SESSION', session):
                 extra = self._context_for('what does run_edit do?')
-                read = asyncio.run(loki.dispatch_tool_async(
+                read = self.runner.run(loki.dispatch_tool_async(
                     'Read', {'file_path': str(target)}, extra_context=extra))
                 self.assertTrue(read['ok'])
                 self.assertIn('preserve these bytes', read['content'])
@@ -7835,7 +7565,7 @@ class QuestionGuardTests(unittest.TestCase):
                                    'content': 'clobbered'}),
                         ('Bash', {'command': f'echo clobbered > {quote}'})):
                     with self.subTest(tool=name):
-                        result = asyncio.run(loki.dispatch_tool_async(
+                        result = self.runner.run(loki.dispatch_tool_async(
                             name, args, extra_context=extra))
                         self.assertFalse(result['ok'])
                         self.assertIn("answering the user's question",
@@ -7895,7 +7625,7 @@ class QuestionGuardTests(unittest.TestCase):
         async def scripted_chat(items, *, codex_turn_state):
             return replies.pop(0)
 
-        asyncio.run(loki.run_tool_loop_async(
+        self.runner.run(loki.run_tool_loop_async(
             transcript, chat_fn=scripted_chat))
         self.assertIn("answering the user's question", str(transcript))
         hint = loki._refused_tool_hint(
@@ -7967,10 +7697,8 @@ class QuestionGuardTests(unittest.TestCase):
 
 class ThinkingControlsTests(unittest.TestCase):
     def setUp(self):
-        self.session = loki.Session()
-        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.enterContext(isolated_response_headers())
+        self.session = loki.current_session()
         self.session.runtime_config = connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES,
             model="claude-opus-4-5", provider_id="anthropic",
@@ -8056,7 +7784,8 @@ class ThinkingControlsTests(unittest.TestCase):
         seen = []
 
         async def completion(items, tools, *, codex_turn_state,
-                             reasoning_effort=None, thinking=None):
+                             reasoning_effort=None, thinking=None, cancel_check=None):
+            self.assertTrue(callable(cancel_check))
             seen.append(thinking)
             if len(seen) == 1:
                 # A mid-turn preference change must not affect this turn.

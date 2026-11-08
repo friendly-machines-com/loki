@@ -28,6 +28,7 @@ from . import model_requests
 from . import recoveries
 from . import files
 from . import jobs
+from . import host_process, private_files
 from . import web_tools
 from . import tool_contracts
 from . import formats
@@ -446,10 +447,41 @@ def reasoning_traces_status_text():
     return text
 
 
+def _tool_process_creator():
+    # Capture the owner, not an fd number which could be closed and reused.
+    # Hook payloads and their reduced environments never select this authority.
+    session = current_session()
+
+    async def create(*arguments, **options):
+        session.require_active()
+        before_resume = options.pop('before_resume', None)
+
+        def check_owner():
+            session.require_active()
+            if before_resume is not None:
+                before_resume()
+
+        return await host_process.create_exec(
+            *arguments, before_resume=check_owner, **options)
+
+    return create
+
+
 def current_job_manager():
     session = current_session()
+    session.require_active()
     if session.job_manager is None:
-        session.job_manager = jobs.JobManager(LOKI_JOB_STATE_DIR)
+        # A hook can run before the first job. Select jobs under the root this
+        # Session already owns, even if an ancestor spelling moved meanwhile.
+        root = session.response_headers.directory_handle
+        private_files.create_directory_at(root, 'jobs')
+        directory = private_files.open_directory_at(root, 'jobs')
+        try:
+            session.job_manager = jobs.JobManager(
+                LOKI_JOB_STATE_DIR, directory=directory,
+                create_exec=_tool_process_creator())
+        finally:
+            private_files.close(directory)
     return session.job_manager
 
 
@@ -1142,6 +1174,8 @@ def _refused_tool_hint(fn_name, args, allowed):
 
 
 def _tool_access_error(fn_name: str, args=None, allowed=None, extra_context=None):
+    if not current_session().active:
+        return 'This conversation has closed'
     inhibit_edits = (extra_context or {}).get('inhibit_edits', False)
     spec = TOOL_REGISTRY.get(fn_name)
     if spec is None:
@@ -1606,7 +1640,12 @@ async def run_tool_loop_async(
         cancel_check = cancel_event.is_set
     if recovery is not None and recovery.cancel_event is not cancel_event:
         raise ValueError("recovery and inference must share the owning turn event")
-    completion_cancel_check = cancel_check
+    session = current_session()
+    requested_cancel = cancel_check
+    cancel_check = lambda: not session.active or (requested_cancel is not None and requested_cancel())
+    # Sampling and dispatch borrow the same owner-aware predicate. Capturing
+    # only the turn event here would miss Session/broker loss during a request.
+    advertised_tools = None
     if chat_fn is None:
         advertised_tools = (
             TOOLS if allowed is None else [
@@ -1631,15 +1670,12 @@ async def run_tool_loop_async(
                 kwargs["on_text_delta"] = on_text_delta
             if on_reasoning_delta is not None:
                 kwargs["on_reasoning_delta"] = on_reasoning_delta
-            if completion_cancel_check is not None:
-                kwargs["cancel_check"] = completion_cancel_check
+            kwargs["cancel_check"] = cancel_check
             if recovery is not None:
                 kwargs["recovery"] = recovery
             return async_chat_completion(items, **kwargs)
     if on_event is None:
         on_event = lambda event: None
-    if cancel_check is None:
-        cancel_check = lambda: False
     if on_response is None:
         on_response = lambda turn, event: None
     if max_loops < 1:
@@ -1659,6 +1695,10 @@ async def run_tool_loop_async(
     def append_turn(turn):
         response_event = turn.to_event()
         transcript_items.append(response_event)
+        if advertised_tools is not None:
+            # The sampler owns the offered snapshot; terminal and ACP must
+            # record that same snapshot, not independently rebuild it later.
+            _remember_session_toolset(advertised_tools)
         on_response(turn, response_event)
 
     def append_unexecuted_results(tool_calls, reason):
@@ -2201,7 +2241,7 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
         raise ValueError(
             f"maximum subagent depth reached ({tool_contracts.MAX_SUBAGENT_DEPTH})")
     command = [sys.argv[0]]
-    if (os.name == 'nt' and not getattr(sys, 'frozen', False)
+    if (sys.platform == 'win32' and not getattr(sys, 'frozen', False)
             and not sys.argv[0].lower().endswith('.exe')):
         # CreateProcess cannot execute a Python source dispatcher directly.
         # An explicitly selected built dispatcher remains its own image, even
@@ -2405,7 +2445,7 @@ def make_turn_recovery(cancel_event):
 async def run_turn_end_hooks_async(events, text="", *, error=None):
     """Notify user-facing turn hooks after the model/tool loop has stopped."""
     pipeline = TOOL_HOOK_PIPELINE
-    if not pipeline.turn_end_hooks:
+    if not pipeline.turn_end_hooks or not current_session().active:
         return
     error_kinds = recoveries.MODEL_FAILURE_TYPES | {"transcript_error"}
     failure = next((event for event in events
@@ -2434,10 +2474,15 @@ async def run_turn_end_hooks_async(events, text="", *, error=None):
 
 
 def configure_tool_hook_pipeline(configuration, stderr_reporter=None):
-    """Install hooks from the owning frontend's already-loaded configuration."""
+    """Install one config snapshot with this Session's launch capability.
+
+    The creator captures the live Session, not hook input. It rechecks
+    admission before launch/publication; configuration cannot bypass runtime
+    revocation. Job storage is selected through the Session's retained Store.
+    """
     global TOOL_HOOK_PIPELINE
     TOOL_HOOK_PIPELINE = tool_runtime.build_hook_pipeline(
-        configuration.hooks, stderr_reporter=stderr_reporter)
+        configuration.hooks, create_exec=_tool_process_creator(), stderr_reporter=stderr_reporter)
 
 
 def _model_request_context():

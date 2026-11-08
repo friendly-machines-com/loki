@@ -192,6 +192,16 @@ class Store:
             raise ValueError("response status storage is closed")
         return self._directory_fd
 
+    @property
+    def directory_handle(self):
+        """Borrow this Session's selected state root; the Store still owns it.
+
+        Jobs and tool setup must agree with existing state I/O after a rename,
+        not independently reopen the configured spelling. Session shutdown closes
+        jobs before this owner, and launches take their own short-lived copies.
+        """
+        return self._directory()
+
     def observer(self, endpoint, credential, model, provider_id=None,
                  provider_name=None):
         """Freeze non-secret request context before the first network await."""
