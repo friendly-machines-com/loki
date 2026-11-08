@@ -4,7 +4,7 @@
 The POSIX module's two guarantees are reproduced here with the native calls
 the storage investigation measured:
 
-* **No reparse point is followed.**  Every child is opened with
+* **Protected child opens refuse reparse points.** Every child is opened with
   ``FILE_OPEN_REPARSE_POINT``, so the object acted on is the link itself; the
   storage then refuses it because :class:`FileFacts` reports ``reparse_point``.
   State owners validate the opened root; ``open_directory_at`` refuses a
@@ -25,8 +25,8 @@ What the privacy check does and does not cover is stated at
 
 from __future__ import annotations
 
-import os
 import ntpath
+import os
 
 from . import windows_acl, windows_api
 from .credential_errors import CredentialStorageError
@@ -299,12 +299,15 @@ def make_private_directory(path: str) -> None:
         _raise_oserror(error)
 
 
-def open_directory(path: str):
+def open_directory(path: str, *, follow_symlinks=False):
+    # Preserve protected-root selection by default. Ordinary file publishers
+    # request native parent lookup explicitly, without rewriting the pathname.
+    flags = windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS
+    if not follow_symlinks:
+        flags |= windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT
     try:
         handle = windows_api.open_with_access(
-            path, windows_api.AccessMask.GENERIC_READ,
-            flags=(windows_api.FileFlags.FILE_FLAG_BACKUP_SEMANTICS
-                   | windows_api.NtCreateOptions.FILE_OPEN_REPARSE_POINT))
+            path, windows_api.AccessMask.GENERIC_READ, flags=flags)
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
     try:
@@ -330,7 +333,7 @@ def open_read_at(directory, name: str):
         windows_api.NtCreateDisposition.FILE_OPEN, _NON_DIRECTORY)
 
 
-def create_exclusive_at(directory, name: str, mode: int, *, append=False, user_owned=False):
+def create_exclusive_at(directory, name: str, mode: int, *, permission_control=False, user_owned=False):
     _check_name(name)
     # ``mode`` is a POSIX concept.  On POSIX the mode makes the new file
     # private regardless of the directory; here the file's access comes from the
@@ -342,15 +345,15 @@ def create_exclusive_at(directory, name: str, mode: int, *, append=False, user_o
     # refuses.
     # The new file's privacy is the caller's decision: it describes the
     # handle it was given before writing anything.
-    # Job output is an inherited file capability, not a pathname grant. Acquire
-    # only APPEND_DATA at the exclusive create itself: a later reopen would let
-    # a replaced directory entry select a different object.
-    access = (windows_api.AccessMask.FILE_APPEND_DATA | windows_api.AccessMask.READ_CONTROL
-              if append else windows_api.AccessMask.GENERIC_WRITE)
+    access = (windows_api.AccessMask.GENERIC_WRITE | windows_api.AccessMask.FILE_READ_ATTRIBUTES
+              | windows_api.AccessMask.SYNCHRONIZE)
+    if permission_control:
+        # Editor publication copies the destination's DACL onto this object.
+        # Ordinary state/credential creation and inherited job captures must
+        # not acquire that additional authority merely because they can write.
+        access |= windows_api.AccessMask.WRITE_DAC
     return _open_relative(
-        directory, name,
-        access | windows_api.AccessMask.FILE_READ_ATTRIBUTES
-        | windows_api.AccessMask.SYNCHRONIZE,
+        directory, name, access,
         windows_api.NtCreateDisposition.FILE_CREATE, _NON_DIRECTORY,
         windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL, user_owned=user_owned)
 
@@ -427,8 +430,8 @@ def create_directory_at(directory, name: str, mode: int = 0o700):
 
 def open_append_at(directory, name: str):
     _check_name(name)
-    # FILE_APPEND_DATA without FILE_WRITE_DATA is the handle-scoped append-only
-    # right: seeks write at the end without granting arbitrary overwrite.
+    # Owner diagnostics append at EOF without changing the child's capture
+    # position. This does not restrict the child's independently held handle.
     return _open_relative(
         directory, name,
         windows_api.AccessMask.FILE_APPEND_DATA

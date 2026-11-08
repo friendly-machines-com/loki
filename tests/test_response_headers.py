@@ -10,9 +10,10 @@ import unittest
 from unittest import mock
 from loki_entrypoints import configure_container, entrypoint
 from response_header_fixtures import isolated_response_headers
+from process_lifecycle_fixtures import close_fixture_connection
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 
-from loki_agent import file_locks
+from loki_agent import file_locks, private_files
 from loki_agent import http_client, loki, protocols, response_headers
 from loki_agent.sessions import Session
 from loki_agent import connections
@@ -21,12 +22,17 @@ from loki_agent import model_requests
 
 class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.workspace = os.path.join(self.directory.name, "workspace")
-        os.makedirs(self.workspace)
-        self.path = os.path.join(self.directory.name, "headers.json")
-        self.store = response_headers.Store(self.path)
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.path = os.path.join(self.directory, "headers.json")
+        self.store = self.enterContext(contextlib.closing(response_headers.Store(self.path)))
+
+    def test_explicit_invalid_filename_does_not_select_default_or_create_storage(self):
+        with mock.patch.object(response_headers, '_snapshot_location', side_effect=AssertionError('default selected')), \
+                mock.patch.object(private_files, 'open_directory_tree') as acquire:
+            for operand in ['', '.', '..', self.path + '/']:
+                with self.subTest(operand=operand), self.assertRaisesRegex(ValueError, 'must name a file'):
+                    response_headers.Store(operand)
+            acquire.assert_not_called()
 
     def observe(self, store=None, headers=None, status=200, model="one",
                 credential="env:KEY", provider=None):
@@ -38,21 +44,26 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         protected = Path(self.path)
         protected.write_bytes(b"user-owned status must not be read or changed")
         original = protected.read_bytes()
-        existing_session = Session(response_headers=response_headers.Store(self.path))
-        with mock.patch.object(response_headers, "snapshot_path", return_value=self.path), \
+        existing_store = self.enterContext(contextlib.closing(response_headers.Store(self.path)))
+        existing_session = Session(response_headers=existing_store)
+        with mock.patch.object(response_headers, '_snapshot_location',
+                               return_value=(self.directory, 'headers.json')), \
                 mock.patch.object(loki, "_DEFAULT_SESSION", existing_session):
             with isolated_response_headers() as isolated_path:
-                # Cover both the session created before fixture setup and new
-                # sessions created by worker/subagent tests after setup.
-                for index, session in enumerate((loki.current_session(), Session())):
-                    session.response_headers.observer(
-                        f"https://test.example/{index}", None, "test-model")(
-                            200, {"content-type": "application/json"})
-                    await session.response_headers.save_on_exit()
-                saved = response_headers.Store(isolated_path).snapshot()["endpoints"]
-                self.assertEqual({entry["endpoint"] for entry in saved}, {
-                    "https://test.example/0", "https://test.example/1"})
-                self.assertEqual(protected.read_bytes(), original)
+                # Cover a pre-existing default and a newly constructed session,
+                # releasing both test-owned stores before their directory.
+                new_session = Session()
+                with contextlib.closing(new_session.response_headers):
+                    for index, session in enumerate([loki.current_session(), new_session]):
+                        session.response_headers.observer(
+                            f"https://test.example/{index}", None, "test-model")(
+                                200, {"content-type": "application/json"})
+                        await session.response_headers.save_on_exit()
+                    with contextlib.closing(response_headers.Store(isolated_path)) as inspected:
+                        saved = inspected.snapshot()['endpoints']
+                    self.assertEqual({entry["endpoint"] for entry in saved}, {
+                        "https://test.example/0", "https://test.example/1"})
+                    self.assertEqual(protected.read_bytes(), original)
         self.assertFalse(Path(isolated_path).exists())
         self.assertEqual(protected.read_bytes(), original)
 
@@ -101,7 +112,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(response_headers.time, "time_ns", return_value=30_000_000_000):
             self.observe(headers={"x-other": "yes"})
         await self.store.save()
-        document = response_headers.Store(self.path).snapshot()
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            document = reopened.snapshot()
         with mock.patch.object(response_headers.time, "time", return_value=120.5):
             text = response_headers.render(document)
         self.assertIn("00:02:01 UTC (in 1 second) [retained observation]", text)
@@ -249,7 +261,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
                                return_value=(start + 60) * 10**9):
             observer(200, {"date": "a later response without quota headers"})
         await self.store.save()
-        document = response_headers.Store(self.path).snapshot()
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            document = reopened.snapshot()
         for elapsed, expected in (
                 (3600, "resets at 2024-01-01 02:00:00 UTC (in 1 hour)"),
                 (7199.5, "resets at 2024-01-01 02:00:00 UTC (in 1 second)"),
@@ -318,7 +331,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         # Saved data is untrusted too: inspection must apply the same filter.
         values["set-cookie"]["value"] = "secret-from-file"
         Path(self.path).write_text(json.dumps(document))
-        loaded = response_headers.Store(self.path).snapshot()
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            loaded = reopened.snapshot()
         self.assertNotIn("secret-from-file", json.dumps(loaded))
 
     async def test_snapshot_filters_endpoint_and_credential_including_anonymous(self):
@@ -328,6 +342,7 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.observe(credential=None)
         await self.store.save()
         live = response_headers.Store(self.path)
+        self.addCleanup(live.close)
         live.observer("https://other.example/chat", "env:KEY", "model")(
             200, {"remaining": "1"})
         live.observer(endpoint, "env:KEY", "model")(
@@ -360,13 +375,15 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_older_runtime_exiting_last_cannot_overwrite_newer(self):
         other = response_headers.Store(self.path)
+        self.addCleanup(other.close)
         with mock.patch.object(response_headers.time, "time_ns", return_value=1):
             self.observe(headers={"x-remaining": "10", "x-reset": "soon"})
         with mock.patch.object(response_headers.time, "time_ns", return_value=2):
             self.observe(other, {"x-remaining": "9"})
         await other.save()
         await self.store.save()
-        entry = response_headers.Store(self.path).snapshot()["endpoints"][0]
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            entry = reopened.snapshot()["endpoints"][0]
         self.assertEqual(entry["headers"]["x-remaining"]["value"], "9")
         self.assertEqual(entry["headers"]["x-reset"]["value"], "soon")
         if os.name == "posix":
@@ -425,41 +442,6 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved.snapshot()["endpoints"][0]["headers"]
                              ["x-remaining"]["value"], "5")
 
-    def test_try_save_publication_failures_keep_dirty_and_release_the_lock(self):
-        self.observe()
-        self.assertTrue(self.store.try_save())
-        sync = response_headers.private_files.fsync
-
-        def fail_directory_sync(fd):
-            if fd == self.store._directory():
-                raise OSError("directory sync failed")
-            sync(fd)
-
-        for failure in ["replace", "directory_sync"]:
-            with self.subTest(failure=failure):
-                original = Path(self.path).read_bytes()
-                self.observe(headers={"x-remaining": failure})
-                patch = (mock.patch.object(response_headers.private_files, "replace_at",
-                                           side_effect=OSError("replace failed"))
-                         if failure == "replace" else
-                         mock.patch.object(response_headers.private_files, "fsync",
-                                           side_effect=fail_directory_sync))
-                with patch, self.assertRaises(OSError):
-                    self.store.try_save()
-                self.assertTrue(self.store.dirty)
-                if failure == "replace":
-                    self.assertEqual(Path(self.path).read_bytes(), original)
-                else:
-                    with contextlib.closing(response_headers.Store(self.path)) as saved:
-                        self.assertEqual(saved.snapshot()["endpoints"][0]["headers"]
-                                         ["x-remaining"]["value"], failure)
-                self.assertFalse(any(name.startswith(".headers.json.")
-                                     for name in os.listdir(self.directory.name)))
-                # A leaked lock would make the retry fail, not merely leak a
-                # descriptor. Both failure stages must leave retry ownership.
-                self.assertTrue(self.store.try_save())
-                self.assertFalse(self.store.dirty)
-
     async def test_async_save_retries_contention_and_includes_new_observations(self):
         with mock.patch.object(response_headers.time, "time_ns", return_value=1):
             self.observe(headers={"x-remaining": "10", "x-reset": "soon"})
@@ -505,38 +487,70 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Could not save", errors.getvalue())
             self.assertEqual(Path(self.path).read_bytes(), original)
         await self.store.save()
-        saved = response_headers.Store(self.path).snapshot()["endpoints"][0]
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            saved = reopened.snapshot()["endpoints"][0]
         self.assertEqual(saved["headers"]["x-remaining"]["value"], "5")
 
-    async def test_bad_snapshot_and_failed_write_preserve_existing_file(self):
+    async def test_bad_snapshot_is_preserved_until_removed_then_observations_can_retry(self):
         self.observe()
-        Path(self.path).write_text("not JSON")
+        with open(self.path, 'w', encoding='utf-8') as stream:
+            stream.write('not JSON')
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             await self.store.save_on_exit()
-        self.assertIn("Could not save", errors.getvalue())
-        self.assertEqual(Path(self.path).read_text(), "not JSON")
+        self.assertIn('Could not save', errors.getvalue())
+        with open(self.path, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), 'not JSON')
+        self.assertTrue(self.store.dirty)
         os.unlink(self.path)
         await self.store.save()
-        original = Path(self.path).read_bytes()
-        self.observe(headers={"x-remaining": "5"})
-        # The publish goes through the platform seam: POSIX ends at
-        # os.replace, Windows at the retained-directory rename, so patch
-        # whichever one this platform actually uses.
-        if os.name == "posix":
-            publish = mock.patch.object(
-                response_headers.os, "replace",
-                side_effect=OSError("disk unavailable"))
-        else:
-            publish = mock.patch.object(
-                response_headers.private_files, "replace_at",
-                side_effect=OSError("disk unavailable"))
-        with publish:
+        self.assertFalse(self.store.dirty)
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            saved = reopened.snapshot()['endpoints'][0]
+        self.assertEqual(saved['headers']['x-remaining']['value'], '10')
+
+    def test_failed_replace_preserves_existing_file_and_dirty_observations_for_retry(self):
+        self.observe()
+        self.assertTrue(self.store.try_save())
+        with open(self.path, 'rb') as stream:
+            original = stream.read()
+        self.observe(headers={'x-remaining': '5'})
+        with mock.patch.object(private_files, 'replace_at', side_effect=OSError('disk unavailable')):
             with self.assertRaises(OSError):
-                await self.store.save()
-        self.assertEqual(Path(self.path).read_bytes(), original)
-        await self.store.save()
-        saved = response_headers.Store(self.path).snapshot()["endpoints"][0]
-        self.assertEqual(saved["headers"]["x-remaining"]["value"], "5")
+                self.store.try_save()
+        with open(self.path, 'rb') as stream:
+            self.assertEqual(stream.read(), original)
+        self.assertTrue(self.store.dirty)
+        self.assertFalse(any(name.startswith('.headers.json.') for name in os.listdir(self.directory)))
+        # Immediate retry proves the failed publication released its real lock.
+        self.assertTrue(self.store.try_save())
+        self.assertFalse(self.store.dirty)
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            saved = reopened.snapshot()['endpoints'][0]
+        self.assertEqual(saved['headers']['x-remaining']['value'], '5')
+
+    def test_directory_sync_failure_leaves_published_observations_dirty_for_retry(self):
+        self.observe()
+        self.assertTrue(self.store.try_save())
+        self.observe(headers={'x-remaining': '5'})
+        sync = private_files.fsync
+
+        def failed_directory_sync(handle):
+            if handle == self.store.directory_handle:
+                raise OSError('directory sync failed')
+            sync(handle)
+
+        with mock.patch.object(private_files, 'fsync', side_effect=failed_directory_sync):
+            with self.assertRaisesRegex(OSError, 'directory sync failed'):
+                self.store.try_save()
+        self.assertTrue(self.store.dirty)
+        with open(self.path, encoding='utf-8') as stream:
+            self.assertEqual(json.load(stream)['endpoints'][0]['headers']['x-remaining']['value'], '5')
+        self.assertFalse(any(name.startswith('.headers.json.') for name in os.listdir(self.directory)))
+        self.assertTrue(self.store.try_save())
+        self.assertFalse(self.store.dirty)
+        with contextlib.closing(response_headers.Store(self.path)) as reopened:
+            saved = reopened.snapshot()['endpoints'][0]
+        self.assertEqual(saved['headers']['x-remaining']['value'], '5')
 
     async def test_inspection_escapes_and_never_flushes(self):
         self.observe(headers={"x-odd": "\x1b[2J\nsecret"})
@@ -545,8 +559,8 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("\\x1b", rendered)
         self.assertFalse(os.path.exists(self.path))
         await self.store.save()
-        with mock.patch.object(response_headers, "snapshot_path",
-                               return_value=self.path):
+        with mock.patch.object(response_headers, '_snapshot_location',
+                               return_value=(self.directory, 'headers.json')):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(response_headers.main(["--json"]), 0)
         self.assertEqual(json.loads(output.getvalue())["endpoints"][0]
@@ -555,34 +569,27 @@ class ResponseHeadersTests(unittest.IsolatedAsyncioTestCase):
 
 class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.workspace = os.path.join(self.directory.name, "workspace")
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.workspace = os.path.join(self.directory, "workspace")
         os.makedirs(self.workspace)
-        self.previous = loki._DEFAULT_SESSION
-        self.session = Session(response_headers=response_headers.Store(
-            os.path.join(self.directory.name, "headers.json")))
-        loki._DEFAULT_SESSION = self.session
-        self.addCleanup(setattr, loki, "_DEFAULT_SESSION", self.previous)
+        self.enterContext(isolated_response_headers())
+        self.session = loki.current_session()
 
     async def start_child(self, *arguments, **options):
         child = await asyncio.create_subprocess_exec(*arguments, **options)
-        # Registered after the directory cleanup, hence run before it. A
-        # timed-out communicate() cancels readers, not the child process.
+        # Registered after directory cleanup, hence run before it. Cancelling
+        # readers or failing an assertion does not retire the child.
         self.addAsyncCleanup(self.stop_child, child)
         return child
 
     async def stop_child(self, child):
         if child.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                child.terminate()
-        try:
-            await asyncio.wait_for(child.communicate(), 5)
-        except asyncio.TimeoutError:
-            if child.returncode is None:
+            if child.stdin is not None:
+                child.stdin.close()  # The real ACP front joins its worker on EOF.
+            else:
                 with contextlib.suppress(ProcessLookupError):
-                    child.kill()
-            await asyncio.wait_for(child.communicate(), 5)
+                    child.kill()  # Failure backstop, not a timed execution policy.
+        await child.communicate()
 
     async def test_child_cleanup_reaps_after_timeout_cancellation_or_assertion(self):
         for outcome in ['timeout', 'cancel', 'assertion']:
@@ -596,13 +603,13 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                     # into a different line ending than the test expects.
                     child = await self.start_child(
                         sys.executable, '-c',
-                        'import sys, time; '
+                        'import sys, threading; '
                         "sys.stdout.buffer.write(b'ready\\n'); "
-                        'sys.stdout.buffer.flush(); time.sleep(60)',
+                        'sys.stdout.buffer.flush(); threading.Event().wait()',
                         cwd=self.workspace, stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE)
                     try:
-                        line = await asyncio.wait_for(child.stdout.readline(), 5)
+                        line = await child.stdout.readline()
                         self.assertEqual(line, b'ready\n')
                         self.assertIsNone(child.returncode)
                         if outcome == 'assertion':
@@ -624,23 +631,29 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         # On Windows a child still using this cwd would prevent removal.
         os.rmdir(self.workspace)
 
-    async def test_child_cleanup_escalates_and_drains_after_terminate_timeout(self):
-        child = mock.Mock(returncode=None)
+    async def test_child_cleanup_signals_its_owner_and_joins_without_a_watchdog(self):
+        for front in [False, True]:
+            with self.subTest(front=front):
+                child = mock.Mock(returncode=None, stdin=mock.Mock() if front else None)
 
-        async def communicate():
-            if child.kill.called:
-                child.returncode = 1
-                return b'', b''
-            raise asyncio.TimeoutError
+                async def communicate():
+                    if front:
+                        child.stdin.close.assert_called_once_with()
+                        child.kill.assert_not_called()
+                    else:
+                        child.kill.assert_called_once_with()
+                    child.returncode = 1
+                    return b'', b''
 
-        child.communicate = mock.AsyncMock(side_effect=communicate)
-        await self.stop_child(child)
-        child.terminate.assert_called_once_with()
-        child.kill.assert_called_once_with()
-        self.assertEqual(child.communicate.await_count, 2)
-        self.assertEqual(child.returncode, 1)
+                child.communicate = mock.AsyncMock(side_effect=communicate)
+                await self.stop_child(child)
+                child.terminate.assert_not_called()
+                self.assertEqual(child.communicate.await_count, 1)
+                self.assertEqual(child.returncode, 1)
 
     async def server(self, responses):
+        cleanup = contextlib.AsyncExitStack()
+
         async def serve(reader, writer):
             try:
                 request = await reader.readuntil(b"\r\n\r\n")
@@ -652,17 +665,53 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 writer.close()
                 await writer.wait_closed()
-        server = await asyncio.start_server(serve, "127.0.0.1", 0)
-        self.addAsyncCleanup(self.close_server, server)
+
+        def accept(reader, writer):
+            task = asyncio.create_task(serve(reader, writer))
+            cleanup.push_async_callback(close_fixture_connection, task, writer)
+            return task
+
+        server = await asyncio.start_server(accept, "127.0.0.1", 0, start_serving=False)
+        self.addAsyncCleanup(self.close_server, server, cleanup)
+        await server.start_serving()
         port = server.sockets[0].getsockname()[1]
         url = f"http://127.0.0.1:{port}/v1/chat/completions"
         loki.apply_runtime_config(connections.make_runtime_config(
             url, protocols.OPENAI_CHAT, model="test-model"))
         return url
 
-    async def close_server(self, server):
+    async def close_server(self, server, cleanup):
         server.close()
-        await server.wait_closed()
+        try:
+            await cleanup.aclose()
+        finally:
+            await server.wait_closed()
+
+    async def test_server_close_reports_completed_handler_failure(self):
+        server = mock.Mock(start_serving=mock.AsyncMock(), wait_closed=mock.AsyncMock())
+        server.sockets = [mock.Mock()]
+        server.sockets[0].getsockname.return_value = ('127.0.0.1', 4321)
+        reader = mock.Mock(readuntil=mock.AsyncMock(return_value=b'GET / HTTP/1.1\r\n\r\n'))
+        failure = RuntimeError('header server close failed')
+        writer = mock.Mock(drain=mock.AsyncMock(), wait_closed=mock.AsyncMock(side_effect=failure))
+        cleanups = []
+        with mock.patch.object(asyncio, 'start_server', new=mock.AsyncMock(return_value=server)) as start, \
+                mock.patch.object(self, 'addAsyncCleanup', side_effect=lambda *args: cleanups.append(args)):
+            try:
+                await self.server([b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'])
+                operation = start.await_args.args[0](reader, writer)
+                task = asyncio.create_task(operation) if asyncio.iscoroutine(operation) else operation
+                await asyncio.gather(task, return_exceptions=True)
+                close, *arguments = cleanups.pop()
+                with self.assertRaises(RuntimeError) as caught:
+                    await close(*arguments)
+                self.assertIs(caught.exception, failure)
+            finally:
+                for close, *arguments in reversed(cleanups):
+                    await close(*arguments)
+        writer.close.assert_called()
+        server.close.assert_called_once()
+        server.wait_closed.assert_awaited_once()
 
     async def test_buffered_error_and_stream_body_failure_capture_headers(self):
         for stream in [False, True]:
@@ -699,8 +748,8 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                        if not key.startswith("LOKI_")
                        and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
         environment.update({
-            "XDG_STATE_HOME": self.directory.name,
-            "XDG_CONFIG_HOME": os.path.join(self.directory.name, "config"),
+            "XDG_STATE_HOME": self.directory,
+            "XDG_CONFIG_HOME": os.path.join(self.directory, "config"),
             "LOKI_API_BASE": url, "LOKI_MODEL": "test-model",
             "LOKI_API_KEY": "test-key-not-for-recording",
         })
@@ -709,9 +758,9 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             entrypoint("loki"), "--headless", "--prompt", "Say ok",
             cwd=self.workspace, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        output, errors = await asyncio.wait_for(child.communicate(), 20)
+        output, errors = await child.communicate()
         self.assertEqual(child.returncode, 0, errors.decode())
-        snapshot = Path(self.directory.name) / "loki" / "response-headers.json"
+        snapshot = Path(self.directory) / "loki" / "response-headers.json"
         saved = json.loads(snapshot.read_text())
         self.assertEqual(saved["endpoints"][0]["headers"]["x-remaining"]["value"], "12")
         self.assertNotIn("test-key-not-for-recording", snapshot.read_text())
@@ -720,7 +769,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
             entrypoint("loki"), "status", "--json",
             cwd=self.workspace, env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        output, errors = await asyncio.wait_for(child.communicate(), 10)
+        output, errors = await child.communicate()
         self.assertEqual(child.returncode, 0, errors.decode())
         self.assertEqual(json.loads(output), saved)
 
@@ -735,8 +784,8 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                        if not key.startswith("LOKI_")
                        and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
         environment.update({
-            "XDG_STATE_HOME": self.directory.name,
-            "XDG_CONFIG_HOME": os.path.join(self.directory.name, "config"),
+            "XDG_STATE_HOME": self.directory,
+            "XDG_CONFIG_HOME": os.path.join(self.directory, "config"),
             "LOKI_API_BASE": url, "LOKI_MODEL": "test-model",
             "LOKI_API_KEY": "test-key",
         })
@@ -752,7 +801,7 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                                + "\n").encode())
             await child.stdin.drain()
             while True:
-                line = await asyncio.wait_for(child.stdout.readline(), 15)
+                line = await child.stdout.readline()
                 self.assertTrue(line, "ACP front exited before replying")
                 reply = json.loads(line)
                 if reply.get("id") == number:
@@ -767,11 +816,11 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "sessionId": opened["sessionId"],
                 "prompt": [{"type": "text", "text": "Say ok"}]})
             child.stdin.close()
-            output, errors = await asyncio.wait_for(child.communicate(), 10)
+            output, errors = await child.communicate()
             self.assertEqual(child.returncode, 0, errors.decode())
         finally:
             await self.stop_child(child)
-        snapshot = Path(self.directory.name) / "loki" / "response-headers.json"
+        snapshot = Path(self.directory) / "loki" / "response-headers.json"
         saved = json.loads(snapshot.read_text())
         self.assertEqual(saved["endpoints"][0]["headers"]["x-remaining"]["value"], "11")
 
@@ -797,5 +846,5 @@ class ResponseCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["latest"]["model"], "test-model")
         before = self.session.response_headers.snapshot()
         self.session.replace_transcript([], [], [], {},
-                                        os.path.join(self.directory.name, "chat.json"))
+                                        os.path.join(self.directory, "chat.json"))
         self.assertEqual(self.session.response_headers.snapshot(), before)

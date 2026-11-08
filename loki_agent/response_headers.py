@@ -42,10 +42,9 @@ def _safe_value(name, value):
     return "[redacted]" if name.lower() in SENSITIVE_HEADERS else value
 
 
-def snapshot_path():
-    # One source of truth for the state location: this used to re-derive
-    # XDG_STATE_HOME independently, which is how the two copies could drift.
-    return os.path.join(paths.loki_state_dir(), "response-headers.json")
+def _snapshot_location():
+    """Keep default components together without formatting then parsing a path."""
+    return paths.loki_state_dir(), 'response-headers.json'
 
 
 def sanitized_endpoint(url):
@@ -160,12 +159,21 @@ def _document(entries):
 
 class Store:
     def __init__(self, path=None):
-        self.path = path or snapshot_path()
         self._directory_fd = None
-        directory = os.path.dirname(self.path) or '.'
-        self._name = os.path.basename(self.path)
-        if self._name in ['', '.', '..']:
-            raise ValueError("response status path must name a file")
+        if path is None:
+            # The default producer already owns both components. Do not build
+            # an operation pathname merely to recover its parent and leaf.
+            directory, self._name = _snapshot_location()
+            self.path = os.path.join(directory, self._name)
+        else:
+            # An explicit file override needs a parent handle and entry for
+            # retained reads/locks/publication. Neither view is an identity key.
+            self.path = path
+            directory, self._name = os.path.split(path)
+            if self._name in ['', '.', '..']:
+                raise ValueError('response status path must name a file')
+            # A bare filename uses the process's native current directory.
+            directory = directory or '.'
         self._directory_fd = private_files.open_directory_tree(directory)
         self.observations = {}
         self.dirty = False
@@ -266,7 +274,6 @@ class Store:
         # The directory was acquired at construction. All reads, locks and
         # publication use that object, even after its ancestors are renamed.
         directory_fd = self._directory()
-        temporary_name = None
         try:
             lock_fd = private_files.open_lock_file_at(
                 directory_fd, name + ".lock", 0o600)
@@ -289,28 +296,10 @@ class Store:
             content = json.dumps(_document(entries), indent=2, ensure_ascii=True)
             if len(content) > MAX_SNAPSHOT_BYTES:
                 raise ValueError("response status snapshot is too large")
-            temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(12)}"
-            fd = private_files.create_exclusive_at(
-                directory_fd, temporary_name, 0o600)
-            try:
-                view = memoryview((content + "\n").encode("utf-8"))
-                while view:
-                    written = private_files.write(fd, view)
-                    if written <= 0:
-                        raise OSError("short response status write")
-                    view = view[written:]
-                private_files.fsync(fd)
-            finally:
-                private_files.close(fd)
-            private_files.replace_at(directory_fd, temporary_name, name)
-            private_files.fsync(directory_fd)
-            temporary_name = None
+            private_files.publish_synced_bytes_at(directory_fd, name, (content + "\n").encode("utf-8"))
             self.dirty = False
             return True
         finally:
-            if temporary_name is not None:
-                with contextlib.suppress(OSError):
-                    private_files.unlink_at(directory_fd, temporary_name)
             private_files.close(lock_fd)
 
     async def save(self):

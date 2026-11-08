@@ -21,7 +21,8 @@ from job_fixtures import bootstrap_command
 def isolated_response_headers(*, runner=None):
     with tempfile.TemporaryDirectory(prefix="loki-test-status-") as directory:
         path = os.path.join(directory, "response-headers.json")
-        with mock.patch.object(response_headers, "snapshot_path", return_value=path):
+        with mock.patch.object(response_headers, '_snapshot_location',
+                               return_value=(directory, 'response-headers.json')):
             session = Session()
             with contextlib.closing(session.response_headers):
                 # Core unit workflows have no frontend caller identity. Select

@@ -16,11 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import configparser
-import contextlib
 import io
 import logging
 import os
-import secrets
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass, replace
 
 from . import file_locks, paths, private_files
@@ -107,16 +105,35 @@ def _parser():
     return parser
 
 
-def read_ini(file):
+def read_ini(file, *, directory_fd=None, name=None):
     """Read one bounded INI file: size-capped, UTF-8, no [DEFAULT] section.
 
-    The configuration decoder and locked writer share this access mechanism;
-    runtime consumers receive Settings, not a second file-loading interface.
+    The configuration decoder and locked writer share this access mechanism.
+    The writer supplies its retained directory/entry so a concurrent ancestor
+    rename cannot redirect the locked read. Runtime consumers receive Settings,
+    not another file-loading interface or a retained filesystem capability.
     """
     parser = _parser()
     try:
-        with open(file, "rb") as source:
-            data = source.read(_MAX_BYTES + 1)
+        if directory_fd is None:
+            with open(file, "rb") as source:
+                data = source.read(_MAX_BYTES + 1)
+        else:
+            # A locked update must read through its retained publication
+            # directory. Settings need regularity facts, not credential policy.
+            descriptor = private_files.open_read_at(directory_fd, name)
+            try:
+                facts = private_files.information(descriptor)
+                if not facts.regular or facts.reparse_point:
+                    raise SettingsError(f"Settings file is not a regular file: {file}")
+                data = bytearray()
+                while len(data) <= _MAX_BYTES:
+                    chunk = private_files.read(descriptor, min(65536, _MAX_BYTES + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+            finally:
+                private_files.close(descriptor)
         if len(data) > _MAX_BYTES:
             raise SettingsError(f"Settings file is too large: {file}")
         parser.read_string(data.decode("utf-8"), source=str(file))
@@ -319,20 +336,29 @@ async def update_user_settings(changes, *, file=None) -> Settings:
     selected = user_path() if file is None else os.fspath(file)
     if not changes:
         return from_parser(read_ini(selected), file=selected)
-    # Keep user-managed dotfile symlinks intact. Both aliases lock and publish
-    # to the selected target, rather than replacing the link itself.
-    target = os.path.realpath(selected)
-    directory, name = os.path.split(target)
+    # Only updates need the editor's final-symlink selection. Import that
+    # writer dependency here: files imports tool_runtime, whose HookSettings
+    # annotation must not become a cycle when settings is imported first.
+    from . import files
+
+    # User-managed final symlinks must survive atomic saves. Their selected
+    # target may have a different parent, so only after that selection do we
+    # obtain the parent/entry pair needed by retained locking and publication.
+    # Ancestor lookup belongs to the native directory open, not a normalizer.
     try:
+        target = files._write_destination(selected)
+        directory, name = os.path.split(target)
+        if name in ['', '.', '..']:
+            raise SettingsError(f'Settings destination must name a file: {selected}')
+        directory = directory or '.'
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        directory_fd = private_files.open_directory(directory)
+        directory_fd = private_files.open_directory(directory, follow_symlinks=True)
     except OSError as error:
         raise SettingsError(f"Could not save settings {selected}: {error}") from error
     lock_fd = None
-    temporary_name = None
     try:
         lock_fd = private_files.open_lock_file_at(directory_fd, name + ".lock", 0o600)
-        facts = private_files.describe(lock_fd)
+        facts = private_files.information(lock_fd)
         if not facts.regular or facts.reparse_point:
             raise SettingsError("Settings lock is not a regular file")
         deadline = asyncio.get_running_loop().time() + 0.25
@@ -344,7 +370,7 @@ async def update_user_settings(changes, *, file=None) -> Settings:
                 if asyncio.get_running_loop().time() >= deadline:
                     raise SettingsError("Settings file is busy")
                 await asyncio.sleep(0.01)
-        parser = read_ini(target)
+        parser = read_ini(target, directory_fd=directory_fd, name=name)
         _overrides(parser, target)
         for qualified, value in changes.items():
             definition = definitions[qualified]
@@ -362,28 +388,14 @@ async def update_user_settings(changes, *, file=None) -> Settings:
         data = output.getvalue().encode("utf-8")
         if len(data) > _MAX_BYTES:
             raise SettingsError("Settings file is too large")
-        temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(12)}"
-        fd = private_files.create_exclusive_at(directory_fd, temporary_name, 0o600)
-        try:
-            view = memoryview(data)
-            while view:
-                written = private_files.write(fd, view)
-                if written <= 0:
-                    raise OSError("short settings write")
-                view = view[written:]
-            private_files.fsync(fd)
-        finally:
-            private_files.close(fd)
-        private_files.replace_at(directory_fd, temporary_name, name)
-        temporary_name = None
-        private_files.fsync(directory_fd)
+        private_files.publish_synced_bytes_at(directory_fd, name, data)
     except OSError as error:
         raise SettingsError(f"Could not save settings {selected}: {error}") from error
     finally:
-        if temporary_name is not None:
-            with contextlib.suppress(OSError):
-                private_files.unlink_at(directory_fd, temporary_name)
-        if lock_fd is not None:
-            private_files.close(lock_fd)
-        private_files.close(directory_fd)
+        # A lock-close failure must not prevent release of the retained directory.
+        try:
+            if lock_fd is not None:
+                private_files.close(lock_fd)
+        finally:
+            private_files.close(directory_fd)
     return result

@@ -145,3 +145,7 @@ _.get_extra_info
 # The ACP delegation test asserts this winerror alongside ERROR_BROKEN_PIPE
 # for writes into a closed anonymous pipe: either code means the peer is gone.
 ERROR_NO_DATA
+
+# Production publication moved to handle-bound permissions; tests still
+# arrange pathname DACLs with this setter (atomic writes, setup, recovery).
+set_named_dacl

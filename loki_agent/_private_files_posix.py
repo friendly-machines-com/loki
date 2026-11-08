@@ -1,8 +1,8 @@
 """POSIX credential-file primitives: descriptor-relative, symlink-refusing.
 
-Every open refuses a symlink in its final component (``O_NOFOLLOW``) and is
-made relative to the already-open directory descriptor, so the object acted on
-is the one checked rather than a pathname resolved a second time.
+Protected roots and child opens refuse final symlinks (``O_NOFOLLOW``).
+Ordinary file publishers explicitly follow native lookup for their selected
+parent directory; subsequent operations still use that retained directory.
 """
 
 from __future__ import annotations
@@ -54,9 +54,12 @@ def make_private_directory(path: str) -> None:
     os.makedirs(path, mode=0o700, exist_ok=True)
 
 
-def open_directory(path: str) -> int:
+def open_directory(path: str, *, follow_symlinks=False) -> int:
+    # State-root acquisition refuses a final link. An ordinary filename's
+    # parent instead follows native lookup before publication retains it.
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    return os.open(path, _no_follow(flags))
+    flags = flags | getattr(os, 'O_CLOEXEC', 0) if follow_symlinks else _no_follow(flags)
+    return os.open(path, flags)
 
 
 def _check_name(name):
@@ -91,10 +94,10 @@ def open_read_at(directory_fd: int, name: str) -> int:
     return os.open(name, _no_follow(flags), dir_fd=directory_fd)
 
 
-def create_exclusive_at(directory_fd: int, name: str, mode: int, *, append=False, user_owned=False) -> int:
+def create_exclusive_at(directory_fd: int, name: str, mode: int, *, permission_control=False, user_owned=False) -> int:
+    # New POSIX files already belong to the effective user; user_owned needs no
+    # extra operation. fchmod likewise needs no extra creation-handle right.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if append:
-        flags |= os.O_APPEND
     return os.open(name, _no_follow(flags), mode, dir_fd=directory_fd)
 
 
@@ -128,7 +131,12 @@ def read(fd, size):
 
 
 def binary_file(fd, mode):
-    """Transfer an owned descriptor into a Python subprocess-compatible file."""
+    """Consume a native descriptor as a standard Python binary stream.
+
+    Python file/subprocess consumers borrow its fileno; the file alone closes
+    it. Even construction failure consumes the descriptor, so the caller must
+    never run a second native close after this ownership boundary.
+    """
     try:
         return os.fdopen(fd, mode)
     except BaseException:

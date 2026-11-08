@@ -1,5 +1,6 @@
 """Trusted state owners follow retained objects, not stolen ancestor names."""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -7,10 +8,10 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from job_fixtures import job_manager
 
+from job_fixtures import job_manager
 from loki_agent import authentications, credential_storages, files, jobs
-from loki_agent import private_files, response_headers, windows_api
+from loki_agent import private_files, response_headers, settings, windows_api
 
 
 def token(label):
@@ -50,7 +51,8 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         self.decoy.mkdir()
 
     async def test_job_reads_writes_and_new_jobs_ignore_recreated_parent(self):
-        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup)
+        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup,
+                              async_cleanup=self.addAsyncCleanup)
         # The manager must already be anchored before the first child launch.
         self.replace_parent()
         decoy_session = self.decoy / 'jobs' / manager.session_id
@@ -86,18 +88,73 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'closed'):
             manager.job_status(first.id)
 
-    async def test_job_output_handles_append_after_seek_and_refuse_replacement(self):
+    async def test_job_output_handles_allow_overwrite_and_truncate_but_refuse_replacement(self):
+        """Jobs own their capture bytes, but creation must not overwrite an existing entry."""
         directory = private_files.open_directory(str(self.parent))
         self.addCleanup(private_files.close, directory)
-        with jobs.JobManager._open_spool_stream(directory, 'stdout.log') as stream:
-            stream.write(b'first')
-            stream.flush()
-            stream.seek(0)
-            stream.write(b'second')
-        self.assertEqual((self.parent / 'stdout.log').read_bytes(), b'firstsecond')
-        with self.assertRaises(FileExistsError):
-            jobs.JobManager._open_spool_stream(directory, 'stdout.log')
-        self.assertEqual((self.parent / 'stdout.log').read_bytes(), b'firstsecond')
+        for name in ['stdout.log', 'stderr.log']:
+            with self.subTest(name=name):
+                with jobs.JobManager._open_spool_stream(directory, name) as stream:
+                    stream.write(b'original longer output')
+                    stream.flush()
+                    stream.seek(0)
+                    stream.write(b'new')
+                    stream.flush()
+                    stream.truncate(3)
+                self.assertEqual(jobs._read_spool_tail(directory, name, 100), 'new')
+                with self.assertRaises(FileExistsError):
+                    jobs.JobManager._open_spool_stream(directory, name)
+                self.assertEqual(jobs._read_spool_tail(directory, name, 100), 'new')
+
+    async def test_launched_jobs_rewrite_captures_without_redirecting_job_state(self):
+        """Inherited output is mutable data; real process exit, not saved text, owns status."""
+        manager = job_manager(str(self.parent), cleanup=self.addCleanup,
+                              async_cleanup=self.addAsyncCleanup)
+        script = (
+            "import os,sys\n"
+            "for fd, text in [[1, sys.argv[1]], [2, sys.argv[2]]]:\n"
+            "    data = text.encode('ascii')\n"
+            "    os.write(fd, b'original longer output' * 32)\n"
+            "    os.lseek(fd, 0, os.SEEK_SET)\n"
+            "    os.write(fd, data)\n"
+            "    os.ftruncate(fd, len(data))\n"
+            "sys.exit(7)\n")
+        completed = []
+        for background in [False, True]:
+            with self.subTest(background=background):
+                stdout = json.dumps({'status': 'running', 'pid': 0, 'background': background})
+                stderr = json.dumps({'status': 'failed', 'exit_code': 0, 'background': background})
+                command = [sys.executable, '-c', script, stdout, stderr]
+                if background:
+                    job = await manager.run_background_exec(command)
+                    await job.process.wait()
+                else:
+                    job, status, output, errors = await manager.run_exec(command)
+                    self.assertEqual(status, 'completed')
+                    self.assertEqual(output, stdout)
+                    self.assertEqual(errors, stderr)
+                report = manager.job_status(job.id)
+                self.assertEqual(job.status, 'exited')
+                self.assertEqual(job.exit_code, 7)
+                self.assertEqual(job.pid, job.process.pid)
+                self.assertTrue(report.startswith(
+                    f'job_id: {job.id}\nstatus: exited\npid: {job.process.pid}\n'), report)
+                self.assertIn('\nexit_code: 7\n', report)
+                with open(job.metadata_path, 'w', encoding='utf-8') as stream:
+                    json.dump({'id': 'forged', 'status': 'running', 'pid': 0, 'exit_code': 0}, stream)
+                self.assertIn(f'{job.id}. status=exited pid={job.pid} exit=7 ', manager.list_jobs())
+                self.assertIn('\nexit_code: 7\n', manager.job_status(job.id))
+                completed.append([job, stdout, stderr])
+                # A later launch gets its own endpoints. Rewriting those must
+                # not redirect the earlier job's captures.
+                for other, expected_output, expected_errors in completed:
+                    with open(other.stdout_path, 'rb') as stream:
+                        self.assertEqual(stream.read(), expected_output.encode('ascii'))
+                    with open(other.stderr_path, 'rb') as stream:
+                        self.assertEqual(stream.read(), expected_errors.encode('ascii'))
+                    self.assertEqual(other.exit_code, 7)
+                    self.assertEqual(other.pid, other.process.pid)
+                    self.assertEqual(manager.jobs[other.id].pid, other.process.pid)
 
     async def test_credential_reads_refresh_approvals_and_logout_ignore_decoy(self):
         storage = credential_storages.JsonCredentialStorage(str(self.parent / 'credentials'))
@@ -158,7 +215,8 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
             store.snapshot()
 
     async def test_background_monitor_is_joined_before_handle_close_without_killing_job(self):
-        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup)
+        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup,
+                              async_cleanup=self.addAsyncCleanup)
         release = self.root / 'release'
         job = await manager.run_background_exec([
             sys.executable, '-c',
@@ -173,6 +231,81 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
             release.touch()
             await job.process.wait()
             await manager.aclose()
+
+    async def _assert_publication_collision(self, file, publish, error, retained):
+        """Exclusive-create failure grants no ownership of the entry that blocked it."""
+        with open(file, 'rb') as stream:
+            original = stream.read()
+        create = private_files.create_exclusive_at
+        foreign = b'belongs to another publication'
+        collisions = []
+
+        def collide(root, name, mode, **options):
+            fd = create(root, name, mode, **options)
+            try:
+                private_files.write(fd, foreign)
+            finally:
+                private_files.close(fd)
+            collisions.append(name)
+            return create(root, name, mode, **options)  # The real exclusive create must fail.
+
+        with mock.patch.object(private_files, 'create_exclusive_at', side_effect=collide):
+            with self.assertRaises(error):
+                result = publish()
+                if asyncio.iscoroutine(result):
+                    await result
+        self.assertEqual(len(collisions), 1)
+        with open(file, 'rb') as stream:
+            self.assertEqual(stream.read(), original)
+        fd = private_files.open_read_at(retained, collisions[0])
+        try:
+            self.assertEqual(private_files.read(fd, len(foreign) + 1), foreign)
+        finally:
+            private_files.close(fd)
+
+    async def test_editor_collision_never_deletes_an_unacquired_temporary(self):
+        file = os.path.join(self.parent, 'editor')
+        with open(file, 'wb') as stream:
+            stream.write(b'original editor contents')
+        directory = private_files.open_directory(str(self.parent))
+        self.addCleanup(private_files.close, directory)
+        await self._assert_publication_collision(
+            file, lambda: files.atomic_write_text(file, 'replacement'), FileExistsError, directory)
+
+    async def test_metadata_collision_never_deletes_an_unacquired_temporary(self):
+        file = os.path.join(self.parent, 'metadata')
+        with open(file, 'wb') as stream:
+            stream.write(b'original metadata')
+        directory = private_files.open_directory(str(self.parent))
+        self.addCleanup(private_files.close, directory)
+        await self._assert_publication_collision(
+            file, lambda: files.atomic_write_text_at(directory, 'metadata', 'replacement'), FileExistsError, directory)
+
+    async def test_settings_collision_never_deletes_an_unacquired_temporary(self):
+        file = os.path.join(self.parent, 'settings')
+        with open(file, 'wb') as stream:
+            stream.write(b'[terminal]\nshow_bash_stdout = false\n')
+        directory = private_files.open_directory(str(self.parent))
+        self.addCleanup(private_files.close, directory)
+        await self._assert_publication_collision(file, lambda: settings.update_user_settings(
+            {'terminal.show_bash_stdout': True}, file=file), settings.SettingsError, directory)
+
+    async def test_headers_collision_never_deletes_an_unacquired_temporary(self):
+        file = os.path.join(self.parent, 'headers')
+        with open(file, 'wb') as stream:
+            stream.write(b'{"version": 1, "endpoints": []}')
+        store = response_headers.Store(file)
+        self.addCleanup(store.close)
+        store.observer('https://example.invalid/v1', None, 'model')(200, {'x-test': 'value'})
+        await self._assert_publication_collision(file, store.save, FileExistsError, store.directory_handle)
+
+    async def test_credentials_collision_never_deletes_an_unacquired_temporary(self):
+        storage = credential_storages.JsonCredentialStorage(os.path.join(self.parent, 'credentials'))
+        self.addCleanup(storage.close)
+        await storage.store_openai_login(token('original'))
+        await self._assert_publication_collision(
+            storage.file_path, lambda: storage.store_openai_login(token('replacement')),
+            credential_storages.CredentialStorageError, storage.directory_handle)
 
     async def test_relative_atomic_publication_cleans_failed_temporary(self):
         directory = private_files.open_directory(str(self.parent))
@@ -212,7 +345,8 @@ class RetainedDirectoryTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX symlink and FIFO primitives')
     async def test_job_symlink_directory_and_nonregular_spools_are_refused(self):
-        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup, async_cleanup=self.addAsyncCleanup)
+        manager = job_manager(str(self.parent / 'jobs'), cleanup=self.addCleanup,
+                              async_cleanup=self.addAsyncCleanup)
         target = self.root / 'target'
         target.mkdir()
         (Path(manager.session_dir) / '1').symlink_to(target, target_is_directory=True)

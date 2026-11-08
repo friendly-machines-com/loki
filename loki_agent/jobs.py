@@ -256,11 +256,11 @@ class JobManager:
 
     @staticmethod
     def _open_spool_stream(directory, name):
-        # Only these already-open output objects cross to the child. On Windows
-        # APPEND_DATA without WRITE_DATA cannot overwrite or truncate captured
-        # output, even if the child seeks; state paths remain non-writable.
+        # Only these already-open output objects cross to the child. The job
+        # may overwrite or truncate its own captures; this grants no directory
+        # access or authority over the runtime's in-memory job state.
         return private_files.binary_file(
-            private_files.create_exclusive_at(directory, name, 0o600, append=True), 'ab')
+            private_files.create_exclusive_at(directory, name, 0o600), 'wb')
 
     def _append_spool(self, job, name, data):
         directory = self._job_directory(job.id)

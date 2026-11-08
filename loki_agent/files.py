@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import os
 import stat
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,42 +26,30 @@ _UMASK = os.umask(0)          # probe: sets umask to 0 momentarily, returns the 
 os.umask(_UMASK)             # restore immediately; no concurrent code runs at startup
 
 
-if os.name == "posix":
-    def _apply_destination_permissions(file_path, fd, tmp_path, target_mode):
-        """Set the captured mode through the open descriptor."""
-        fchmod = getattr(os, 'fchmod', None)
-        if fchmod is not None:
-            fchmod(fd, target_mode)
-        else:
-            # This legacy fallback lacks the descriptor branch's protection
-            # against replacement of the temporary directory entry.
-            os.chmod(tmp_path, target_mode)
-else:
-    def _apply_destination_permissions(file_path, fd, tmp_path, target_mode):
-        """Preserve the destination's DACL on the temporary file.
-
-        Windows has no file modes.  The destination's DACL is captured by name
-        (mirroring the POSIX mode capture).  The descriptor from ``mkstemp`` was
-        not opened with ``WRITE_DAC``, so the DACL is applied by pathname -- the
-        same fallback and the same limitation as the POSIX ``os.chmod`` branch:
-        a replaced temporary entry could receive it instead.  A destination that
-        does not exist yet keeps the inherited default DACL, which is what a
-        plain create would have given it.
-        """
-        from . import windows_api
-        try:
-            sddl = windows_api.dacl_sddl(file_path)
-        except windows_api.WindowsResourceError:
-            raise
-        except windows_api.WindowsApiError as error:
-            if error.status in [windows_api.ERROR_FILE_NOT_FOUND,
-                                windows_api.ERROR_PATH_NOT_FOUND]:
-                # A destination that does not exist yet keeps the inherited
-                # default DACL; any other read failure must not be papered over.
-                return
-            raise
-        if sddl is not None:
-            windows_api.set_named_dacl(tmp_path, sddl)
+def _apply_destination_permissions(file_path, fd, target_mode):
+    """Preserve destination permissions on the owned publication object."""
+    if sys.platform != 'win32':
+        os.fchmod(fd, target_mode)
+        return
+    from . import windows_api
+    try:
+        sddl = windows_api.dacl_sddl(file_path)
+    except windows_api.WindowsResourceError:
+        raise  # Cleanup failure cannot authorize inheriting a different DACL.
+    except windows_api.WindowsApiError as error:
+        if error.status in [windows_api.ERROR_FILE_NOT_FOUND,
+                            windows_api.ERROR_PATH_NOT_FOUND]:
+            # A missing destination keeps normal inheritance. Permission-read
+            # errors are not evidence that the destination has no permissions.
+            return
+        raise
+    if sddl is not None:
+        # These are both kernel-rendered DACLs, including inheritance controls.
+        # An inherited match already preserves the requested permissions; do not
+        # require a denied, redundant ACL mutation on OWNER RIGHTS objects.
+        # A mismatch still requires the real update, never a weaker fallback.
+        if windows_api.handle_dacl_sddl(fd) != sddl:
+            windows_api.set_handle_dacl(fd, sddl)
 
 
 @dataclass(frozen=True)
@@ -184,31 +173,56 @@ def atomic_write_text(file_path: str, content: str):
         target_mode = os.stat(file_path).st_mode & 0o7777
     except FileNotFoundError:
         target_mode = 0o666 & ~_UMASK
-    os.makedirs(directory, exist_ok=True)
-    # The directory is opened once, and both the temporary file and the
-    # replacement happen inside that open directory: the open *is* the kernel's
-    # resolution of it.  Handing the directory's name to the standard allocator
-    # instead lets its internal abspath() collapse '..' or a link lexically, so
-    # the temporary file lands in a different directory from the destination.
-    directory_fd = private_files.open_directory(directory)
-    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    # The editor already needs this native directory acquisition. Recursive
+    # creation first is not a harmless existence check: makedirs inspects
+    # ancestors even when this directory exists, and a contained Windows writer
+    # can use its workspace without permission to inspect C:\. Only a genuinely
+    # missing directory needs creation; access/type failures must propagate.
     try:
+        directory_fd = private_files.open_directory(directory, follow_symlinks=True)
+    except FileNotFoundError:
+        os.makedirs(directory, exist_ok=True)
+        directory_fd = private_files.open_directory(directory, follow_symlinks=True)
+    # Both the temporary file and replacement use this acquired directory: its
+    # open is the kernel's resolution. A pathname-based standard allocator can
+    # instead collapse '..' or a link lexically and select a different parent.
+    temporary = None
+    try:
+        # Name generation belongs inside the acquired directory's cleanup scope.
+        candidate = f'.{name}.{uuid.uuid4().hex}.tmp'
         descriptor = private_files.create_exclusive_at(
-            directory_fd, temporary, 0o600)
-        try:
-            private_files.write(descriptor, content.encode('utf-8'))
-            _apply_destination_permissions(
-                file_path, descriptor,
-                os.path.join(directory, temporary), target_mode)
-        finally:
-            private_files.close(descriptor)
+            directory_fd, candidate, 0o600, permission_control=True)
+        # A colliding entry belongs to another publication; cleanup acquires
+        # responsibility for this name only after exclusive creation succeeds.
+        temporary = candidate
+        if sys.platform == 'win32':
+            try:
+                # Settle the ACL before bytes can be exposed under a different
+                # inherited grant, while this scope still owns the native HANDLE.
+                _apply_destination_permissions(file_path, descriptor, target_mode)
+            except BaseException:
+                private_files.close(descriptor)
+                raise
+        # Native creation/rename preserve the kernel-selected parent. Content
+        # delivery needs no separate raw-write protocol: binary_file already
+        # adapts the acquired object to the standard buffered writer. It consumes
+        # ownership even if wrapping fails; only the stream closes it afterward.
+        with private_files.binary_file(descriptor, 'wb') as stream:
+            stream.write(content.encode('utf-8'))
+            stream.flush()
+            if sys.platform != 'win32':
+                # Buffered bytes must reach the file before chmod, because a
+                # subsequent write could clear the captured POSIX set-ID bits.
+                _apply_destination_permissions(file_path, stream.fileno(), target_mode)
         private_files.replace_at(directory_fd, temporary, name)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            private_files.unlink_at(directory_fd, temporary)
-        raise
+        temporary = None
     finally:
-        private_files.close(directory_fd)
+        try:
+            if temporary is not None:
+                with contextlib.suppress(OSError):
+                    private_files.unlink_at(directory_fd, temporary)
+        finally:
+            private_files.close(directory_fd)
 
 
 def atomic_write_text_at(directory_fd, name: str, content: str):
@@ -226,12 +240,7 @@ def atomic_write_text_at(directory_fd, name: str, content: str):
         descriptor = private_files.create_exclusive_at(directory_fd, temporary, 0o600)
         created = True
         try:
-            view = memoryview(content.encode('utf-8'))
-            while view:
-                count = private_files.write(descriptor, view)
-                if count <= 0:
-                    raise OSError("state write made no progress")
-                view = view[count:]
+            private_files.write_all(descriptor, content.encode('utf-8'))
         finally:
             private_files.close(descriptor)
         private_files.replace_at(directory_fd, temporary, name)

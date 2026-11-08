@@ -350,8 +350,8 @@ class CreatorRevocationTests(unittest.IsolatedAsyncioTestCase):
         from loki_agent import authentications, credential_capabilities, loki
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-                response_headers, 'snapshot_path',
-                return_value=directory + os.sep + 'response-headers.json'):
+                response_headers, '_snapshot_location',
+                return_value=[directory, 'response-headers.json']):
             async with contextlib.AsyncExitStack() as cleanup:
                 session = loki.Session()
                 cleanup.callback(session.response_headers.close)

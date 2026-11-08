@@ -1,17 +1,20 @@
-"""File primitives for a private directory, selected once per platform.
+"""Native file primitives for retained directories, selected per platform.
 
-``JsonCredentialStorage`` is one algorithm over a directory and a few files.
-The parts that differ per platform are opening those files without following a
-symlink, reading/writing/flushing/closing the open object, creating/replacing/
-removing them relative to the directory, and describing an open object (is it a
-regular file, who owns it, is it private); those are chosen here once, so the
-storage code has no platform branch and there is no second copy of the
-algorithm.
+Credential, settings/header, job and editor publishers share native acquisition
+and relative publication mechanisms, not permission or durability policies.
+Those remain with each owner rather than a second copy of the platform calls.
 
 Read, write, fsync and close live in the platform module rather than here
 because the token they operate on is the platform's: a POSIX descriptor is an
 ``int`` that ``os.*`` understands, a Windows handle is not, so a single
 ``os.read`` for both would be wrong on one of them.
+
+``binary_file`` is the explicit consuming boundary for Python file consumers:
+job stdout/stderr need subprocess-compatible descriptors, while editor and
+ledger writers use standard buffered I/O. It wraps the already-acquired object
+rather than reopening a pathname, and transfers close ownership even on
+construction failure. Native-token owners retain the raw operations when the
+same token still serves their validation, synchronization and cleanup protocol.
 
 ``FileFacts`` and ``CredentialStorageError`` live in their own leaf modules,
 below this module and the platform modules, so a platform module can import
@@ -24,7 +27,9 @@ directory before it is opened.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import secrets
 import sys
 
 from .credential_errors import CredentialStorageError
@@ -95,6 +100,33 @@ def write_all(handle, data):
         view = view[written:]
 
 
+def publish_synced_bytes_at(directory, name, data):
+    """Publish inherited state bytes; the caller retains its directory and lock.
+
+    POSIX creation uses mode0600; Windows keeps the directory's inherited DACL.
+    This is not editor permission preservation or private credential validation.
+    Directory synchronization has the existing platform semantics.
+    """
+    temporary = None
+    try:
+        candidate = f".{name}.{os.getpid()}.{secrets.token_hex(12)}"
+        handle = create_exclusive_at(directory, candidate, 0o600)
+        # Failed exclusive creation never acquires another publication's entry.
+        temporary = candidate
+        try:
+            write_all(handle, data)
+            fsync(handle)
+        finally:
+            close(handle)
+        replace_at(directory, temporary, name)
+        temporary = None
+        fsync(directory)
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                unlink_at(directory, temporary)
+
+
 def open_directory_tree(path, mode=0o700):
     """Acquire a state directory, creating missing children from native opens.
 
@@ -146,6 +178,7 @@ __all__ = [
     "open_directory_tree",
     "open_lock_file_at",
     "open_read_at",
+    "publish_synced_bytes_at",
     "read",
     "replace_at",
     "seek",
