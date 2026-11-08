@@ -11,6 +11,7 @@ import asyncio
 import ctypes
 from contextlib import ExitStack, contextmanager
 import logging
+import ntpath
 import os
 import sys
 from ctypes import wintypes
@@ -522,12 +523,20 @@ def prepare_local(process, command, environment, current_directory, handles, sta
             if not owning:
                 compatible += f'(A;;GA;;;{role})'
             expected_default = api.set_token_default_dacl(primary, compatible)
+        search_path = False
+        if not owning:
+            # Only a bare external command requests Win32 image search.
+            # Qualified images stay explicit: NULL/non-NULL application names
+            # differ in extension and length rules. This native syntax view
+            # selects the API parameter, never rewrites or identifies the file.
+            directory, _name = ntpath.split(command[0])
+            search_path = not directory
         process.information = api.ProcessInformation()
         process.information = api.create_process_suspended(
             command[0], command[1:], information=process.information, current_directory=current_directory,
             inherited_handles=handles, environment=environment, standard_handles=standard_handles,
             primary_token=primary, object_security=security, creationflags=creationflags,
-            search_path=not owning and not os.path.dirname(command[0]))
+            search_path=search_path)
         process.pid = process.information.dwProcessId
         rights = api.TokenAccess.TOKEN_QUERY
         if owning:

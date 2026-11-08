@@ -572,10 +572,24 @@ class LocalLaunchTests(unittest.TestCase):
         self._identity_failure(False, 'package')
 
     def test_only_bare_external_commands_use_windows_command_lookup(self):
-        with self.calls(False) as seen:
-            runtime.prepare_local(runtime.ContainedProcess(None), ['cmd.exe', '/c', 'exit'], {},
-                                  '/workspace', [], [1, 2, 3], owning=False)
-            self.assertTrue(seen['create'].call_args.kwargs['search_path'])
+        """Qualification chooses a native launch parameter; it must never rewrite the image."""
+        cases = [
+            ['cmd.exe', True],
+            [r'.\cmd.exe', False],
+            ['tools/cmd.exe', False],
+            [r'C:cmd.exe', False],
+            [r'C:\tools\cmd.exe', False],
+            [r'\tools\cmd.exe', False],
+            [r'\\server\share\cmd.exe', False],
+        ]
+        for image, search in cases:
+            for owning in [False, True]:
+                with self.subTest(image=image, owning=owning), self.calls(owning) as seen:
+                    runtime.prepare_local(runtime.ContainedProcess(None), [image, '/c', 'exit'], {},
+                                          '/workspace', [], [1, 2, 3], owning=owning)
+                    self.assertEqual(seen['create'].call_args.args[0], image)
+                    self.assertEqual(seen['create'].call_args.kwargs['search_path'],
+                                     search and not owning)
 
     def _identity_failure(self, owning, mismatch):
         with self.calls(owning, mismatch=mismatch) as seen:
