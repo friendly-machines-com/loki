@@ -6,23 +6,27 @@ over pipes with the dummy provider (no network): initialize, session/new
 """
 
 import asyncio
-import io
 import errno
+import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from unittest import mock
-from loki_agent import private_files
 from loki_entrypoints import child_environment, configure_container, loki_acp_command
 from directory_fixtures import directory_alias
 from response_header_fixtures import setUpModule as set_up_response_headers
+from settings_fixtures import write_user_settings
 from config_fixtures import setUpModule as set_up_config
-from process_lifecycle_fixtures import close_fixture_connection, observe_fixture, observe_process_exit
+from process_lifecycle_fixtures import (
+    ProcessResources, close_fixture_connection, observe_fixture, observe_process_exit,
+    process_lifecycle, windows_process_environment)
 
 from loki_agent import (
     __version__,
@@ -35,7 +39,7 @@ from loki_agent import (
     streams,
 )
 from loki_agent.credentials import CredentialStore, is_credential_name
-from loki_agent import connections, paths as app_paths
+from loki_agent import connections, paths as app_paths, private_files
 from loki_agent import jobs as job_runtime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -235,6 +239,215 @@ class FrontInputFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(asyncio.all_tasks() - before)
         finally:
             await source.close()
+
+
+class FramingTests(unittest.IsolatedAsyncioTestCase):
+    def checked_writer(self, output):
+        with mock.patch.object(acps.os, 'dup', return_value=123), \
+                mock.patch.object(acps.os, 'fdopen', return_value=output):
+            return acps.make_writer(0)
+
+    async def front_frame(self, payload):
+        from loki_agent import credential_storages
+
+        reader = acps.AsyncFdLineReader(0)
+        sent = asyncio.Event()
+        first = True
+        output = io.StringIO()
+        checked = self.checked_writer(output)
+
+        def write(message):
+            checked(message)
+            sent.set()
+
+        async def receive():
+            nonlocal first
+            if first:
+                first = False
+                return payload
+            await sent.wait()  # EOF must not cancel an unstarted admitted task.
+            return b''
+
+        reader._reader._receive = receive
+        storage = mock.Mock(load_openai_subscription=mock.Mock(return_value=None))
+        with mock.patch.object(acps, 'AsyncFdLineReader', return_value=reader), \
+                mock.patch.object(acps, 'quarantine_stdout'), \
+                mock.patch.object(acps, 'make_writer', return_value=write), \
+                mock.patch.object(credential_storages, 'JsonCredentialStorage', return_value=storage):
+            status = await acp_main.amain(CredentialStore({}))
+        storage.close.assert_called_once_with()
+        return status, json.loads(output.getvalue())
+
+    async def test_front_retires_an_oversized_input_with_a_protocol_error(self):
+        status, reply = await self.front_frame(b'x' * (16 * 1024 * 1024 + 1))
+        self.assertEqual(status, 2)
+        self.assertIsNone(reply['id'])
+        self.assertEqual(reply['error']['code'], acps.INVALID_REQUEST)
+
+    async def test_unanswerable_identifier_is_rejected_before_dispatch(self):
+        payload = json.dumps(acps.request('x' * (16 * 1024 * 1024 - 80), 'initialize', {})).encode() + b'\n'
+        self.assertLessEqual(len(payload) - 1, 16 * 1024 * 1024)
+        with mock.patch.object(acp.Front, 'initialize', return_value={}) as initialize:
+            status, reply = await self.front_frame(payload)
+        self.assertEqual(status, 0)
+        initialize.assert_not_called()
+        self.assertIsNone(reply['id'])
+        self.assertEqual(reply['error']['code'], acps.INVALID_REQUEST)
+
+    async def test_failed_size_preflight_retires_an_open_without_joining_itself(self):
+        output = io.StringIO()
+        front = acp.Front(lambda: None, self.checked_writer(output), CredentialStore({}))
+        channel = mock.Mock(close=mock.AsyncMock())
+        identifier = 'x' * (16 * 1024 * 1024 - 1024)
+
+        async def opened(method, params, **options):
+            owner = options['owner']
+            owner.state, owner.channel = 'active', channel
+            return {'sessionId': owner.session_id, 'configOptions': [
+                {'id': 'model', 'options': [{'value': 'v', 'name': 'm' * 65536}]}]}
+
+        try:
+            with mock.patch.object(front, 'dispatch', new=opened):
+                front.handle(acps.request(identifier, 'session/new', {'cwd': ROOT}))
+                await asyncio.gather(*list(front._tasks))
+            channel.close.assert_awaited_once_with()
+            self.assertEqual(front._sessions, {})
+            reply = json.loads(output.getvalue())
+            self.assertEqual(reply['id'], identifier)
+            self.assertTrue('error' in reply, list(reply))
+        finally:
+            await front.shutdown()
+
+    async def test_acp_reader_accepts_the_exact_budget_and_eof_tail(self):
+        body = b'x' * (16 * 1024 * 1024)
+        reader = acps.AsyncFdLineReader(0)
+        reader._reader._receive = mock.AsyncMock(side_effect=[body + b'\n', body, b''])
+        self.assertEqual(await reader.readline(), body + b'\n')
+        self.assertEqual(await reader.readline(), body)
+        self.assertEqual(await reader.readline(), b'')
+
+    async def test_acp_reader_rejects_a_line_above_the_approved_budget(self):
+        reader = acps.AsyncFdLineReader(0)
+        reader._reader._receive = mock.AsyncMock(
+            side_effect=[b'x' * (16 * 1024 * 1024 + 1) + b'\n', b''])
+        with self.assertRaises(acps.TransportError):
+            await reader.readline()
+
+    def test_structured_message_limit_is_checked_before_any_write(self):
+        output = io.StringIO()
+        write = self.checked_writer(output)
+        with self.assertRaises(acps.TransportError):
+            write(acps.response(1, result='x' * (16 * 1024 * 1024 + 1)))
+        self.assertEqual(output.getvalue(), '')
+
+    def test_large_text_updates_preserve_unicode_and_json_escaping(self):
+        output = io.StringIO()
+        write = self.checked_writer(output)
+        text = '\x00\U0001f600' * (2 * 1024 * 1024)
+        message = acps.notification('session/update', {
+            'sessionId': 's',
+            'update': {
+                'sessionUpdate': 'agent_message_chunk',
+                'content': {'type': 'text', 'text': text},
+            },
+        })
+        write(message)
+        self.assertEqual(message['params']['update']['content']['text'], text)
+        lines = output.getvalue().splitlines()
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(len(line.encode('utf-8')) <= 16 * 1024 * 1024 for line in lines))
+        self.assertEqual(''.join(json.loads(line)['params']['update']['content']['text']
+                                 for line in lines), text)
+
+    async def test_worker_returns_a_bounded_error_for_an_oversized_result(self):
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addCleanup(session.response_headers.close)
+        output = io.StringIO()
+        worker = Worker(session, self.checked_writer(output))
+        self.addAsyncCleanup(worker.close)
+        with mock.patch.object(worker, 'dispatch', new=mock.AsyncMock(
+                return_value='x' * (16 * 1024 * 1024 + 1))):
+            await worker.handle(acps.request(7, 'test', {}))
+        reply = json.loads(output.getvalue())
+        self.assertEqual(reply['id'], 7)
+        self.assertTrue('error' in reply, list(reply))
+        self.assertIn('16777216', reply['error']['message'])
+        self.assertLessEqual(len(output.getvalue().encode('utf-8')), 16 * 1024 * 1024 + 1)
+
+    async def test_response_limit_handles_an_identifier_that_cannot_be_echoed(self):
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addCleanup(session.response_headers.close)
+        output = io.StringIO()
+        worker = Worker(session, self.checked_writer(output))
+        self.addAsyncCleanup(worker.close)
+        with mock.patch.object(worker, 'dispatch', new=mock.AsyncMock(
+                side_effect=acps.TransportError('refused'))):
+            await worker.handle(acps.request('x' * (16 * 1024 * 1024 + 1), 'test', {}))
+        reply = json.loads(output.getvalue())
+        self.assertTrue(reply['id'] is None, 'oversized identifier was echoed')
+        self.assertIn('error', reply)
+        self.assertLessEqual(len(output.getvalue().encode('utf-8')), 16 * 1024 * 1024 + 1)
+
+    async def test_pending_open_rejects_local_commands_before_prompt_admission(self):
+        from loki_agent import acp_worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addCleanup(session.response_headers.close)
+        replies = []
+        worker = acp_worker.Worker(session, replies.append)
+        self.addAsyncCleanup(worker.close)
+        worker._pending_open = acp_worker.PendingSessionOpen(None, acp_worker._UNCHANGED, 'session/new')
+        worker.cancel_event.set()
+        with mock.patch.object(acp_worker.acp_commands, 'run', new=mock.AsyncMock()) as command:
+            await worker.handle(acps.request(1, 'session/prompt', {
+                'sessionId': 's', 'prompt': [{'type': 'text', 'text': '!must-not-run'}]}), concurrent=True)
+            self.assertIsNone(worker._prompt_task)
+            self.assertTrue(worker.cancel_event.is_set())
+            self.assertEqual(session.transcript_items, [])
+            self.assertEqual(replies[0]['error']['code'], acps.INVALID_PARAMS)
+            command.assert_not_awaited()
+
+    async def test_pending_open_rejects_configuration_mutation_and_selection(self):
+        from loki_agent import acp_worker
+        from loki_agent.sessions import Session
+
+        session = Session()
+        self.addCleanup(session.response_headers.close)
+        replies = []
+        worker = acp_worker.Worker(session, replies.append)
+        self.addAsyncCleanup(worker.close)
+        pending = acp_worker.PendingSessionOpen(None, acp_worker._UNCHANGED, 'session/new')
+        worker._pending_open = pending
+        with mock.patch.object(worker, 'set_config_option', return_value={}) as change, \
+                mock.patch.object(worker, 'describe_config_selection', return_value={}) as describe:
+            for method in ['session/set_config_option', 'session/describe_config_selection']:
+                await worker.handle(acps.request(method, method, {'configId': 'model', 'value': 'unused'}))
+                self.assertEqual(replies[-1]['error']['code'], acps.INVALID_PARAMS)
+                self.assertIs(worker._pending_open, pending)
+            change.assert_not_called()
+            describe.assert_not_called()
+        await worker.handle(acps.request(3, 'session/cancel', {}))
+        self.assertEqual(replies[-1]['result'], {})
+
+    def test_response_and_notification_shapes(self):
+        self.assertEqual(
+            acps.response(7, result={"a": 1}),
+            {"jsonrpc": "2.0", "id": 7, "result": {"a": 1}})
+        self.assertEqual(
+            acps.response(7, error={"code": -32601, "message": "x"})["error"],
+            {"code": -32601, "message": "x"})
+        self.assertNotIn("result", acps.response(
+            7, error={"code": -1, "message": "x"}))
+        note = acps.notification("session/update", {"sessionId": "s"})
+        self.assertNotIn("id", note)
+        self.assertEqual(note["method"], "session/update")
 
 
 class AsyncFdLineReaderTests(unittest.IsolatedAsyncioTestCase):
@@ -927,6 +1140,24 @@ class QuarantineTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_subagent_gate_failure_refuses_dispatch_and_root_capture(self):
+        from loki_agent import runtime_isolation, windows_api
+
+        for failure in [runtime_isolation.RuntimeIsolationError('gate refused'),
+                        windows_api.WindowsApiError('native verification failed')]:
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(runtime_isolation, 'verify_contained_runtime', side_effect=failure), \
+                    mock.patch.object(acp_main, 'protect_credential_process') as protect, \
+                    mock.patch.object(acp_main, 'capture_process_credentials') as capture, \
+                    mock.patch.object(acp_main, 'configure_logging') as logging, \
+                    mock.patch('loki_agent.subagents.main', return_value=31) as dispatch, \
+                    mock.patch.object(sys, 'argv', ['loki-acp', '--subagent', 'Explore']), \
+                    mock.patch.object(sys, 'stderr', io.StringIO()):
+                self.assertEqual(acp_main.main(), 2)
+                protect.assert_not_called()
+                capture.assert_not_called()
+                logging.assert_not_called()
+                dispatch.assert_not_called()
 
     def test_subagent_uses_inherited_worker_authority(self):
         from loki_agent import runtime_isolation
@@ -962,25 +1193,6 @@ class EntrypointTests(unittest.TestCase):
             "--session-owner-fd", "7",
             "--credential-capability-fd", "8",
         ])
-
-    def test_subagent_gate_failure_refuses_dispatch_and_root_capture(self):
-        from loki_agent import runtime_isolation, windows_api
-
-        for failure in [runtime_isolation.RuntimeIsolationError('gate refused'),
-                        windows_api.WindowsApiError('native verification failed')]:
-            with self.subTest(failure=type(failure).__name__), \
-                    mock.patch.object(runtime_isolation, 'verify_contained_runtime', side_effect=failure), \
-                    mock.patch.object(acp_main, 'protect_credential_process') as protect, \
-                    mock.patch.object(acp_main, 'capture_process_credentials') as capture, \
-                    mock.patch.object(acp_main, 'configure_logging') as logging, \
-                    mock.patch('loki_agent.subagents.main', return_value=31) as dispatch, \
-                    mock.patch.object(sys, 'argv', ['loki-acp', '--subagent', 'Explore']), \
-                    mock.patch.object(sys, 'stderr', io.StringIO()):
-                self.assertEqual(acp_main.main(), 2)
-                protect.assert_not_called()
-                capture.assert_not_called()
-                logging.assert_not_called()
-                dispatch.assert_not_called()
 
 
 class WorkerStartupCleanupTests(unittest.IsolatedAsyncioTestCase):
@@ -1128,140 +1340,6 @@ class _ACPFrontFixture:
         route = 'messages' if protocol == protocols.ANTHROPIC_MESSAGES else 'chat/completions'
         return f'http://{host}:{port}/v1/{route}', requests, authorizations
 
-    async def _search_file(self, workspace, name, owner, *, nonce=None):
-        # Initial records need complete JSON; replies must additionally match
-        # this request's nonce. In both cases an actual owner is mandatory.
-        path = os.path.join(workspace, name)
-
-        async def published():
-            while True:
-                try:
-                    with open(path, encoding='utf-8') as stream:
-                        record = json.load(stream)
-                    if nonce is None or record['nonce'] == nonce:
-                        return record
-                except (FileNotFoundError, json.JSONDecodeError):
-                    pass
-                await asyncio.sleep(0.01)
-
-        return await observe_fixture(published(), owner)
-
-    _observe_process_exit = observe_process_exit
-
-    async def _front(self, env, workspace, *, cleanup, closed_stderr=False, protected_installation=False,
-                     lifetime_boundary=False, on_diagnostics=None):
-        command = loki_acp_command()
-        if (protected_installation or lifetime_boundary) and sys.platform.startswith('linux'):
-            # Trusted outer-fixture setup, before the actual sanctioned front.
-            # Reuse the deployment fixture's mount operations, never install
-            # protection in a hook/tool payload or change the host's mounts.
-            prepare = '''import ctypes, json, os, sys
-sys.path[:0] = [sys.argv[1], os.path.join(sys.argv[1], 'tests')]
-from loki_agent import runtime_isolations as isolation
-from test_state_isolations import mount_call, retained_mount_flags, MS_BIND, MS_REMOUNT
-options = json.loads(sys.argv[2])
-libc = ctypes.CDLL(None, use_errno=True)
-uid, gid = os.getuid(), os.getgid()
-isolation._unshare_user_and_mount_namespaces(libc)
-isolation._map_current_identity(uid, gid)
-mount_call(libc, None, '/', isolation._MS_REC | isolation._MS_PRIVATE)
-if options['readonly']:
-    mount_call(libc, sys.argv[1], sys.argv[1], MS_BIND)
-    mount_call(libc, None, sys.argv[1], MS_BIND | MS_REMOUNT |
-               retained_mount_flags(sys.argv[1]) | isolation._MS_RDONLY)
-if options['lifetime']:
-    # POSIX ordinary jobs intentionally outlive worker close. The fixture's
-    # outer init supplies root retirement, not a new per-command kill policy.
-    if libc.unshare(0x20000000) != 0:
-        raise OSError(ctypes.get_errno(), 'outer fixture PID namespace failed')
-    child = os.fork()
-    if child:
-        isolation._drop_namespace_capabilities(libc)
-        _pid, status = os.waitpid(child, 0)
-        raise SystemExit(os.waitstatus_to_exitcode(status))
-isolation._drop_namespace_capabilities(libc)
-os.execv(sys.argv[3], sys.argv[3:])
-'''
-            options = {'readonly': protected_installation, 'lifetime': lifetime_boundary}
-            command = [sys.executable, '-c', prepare, ROOT, json.dumps(options), *command]
-        if closed_stderr:
-            command = [sys.executable, '-c',
-                       'import os,sys; os.close(2); os.execv(sys.argv[1], sys.argv[1:])',
-                       *command]
-        process = await asyncio.create_subprocess_exec(
-            *command, env=env, cwd=workspace, limit=64 * 1024,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
-
-        # One reader drains and retains diagnostics through shutdown. Retry wire
-        # tests can observe the actual backoff announcement without racing this
-        # reader or replacing the real child/HTTP/hook boundary with a mock.
-        async def read_diagnostics():
-            data = bytearray()
-            while chunk := await process.stderr.read(65536):
-                data.extend(chunk)
-                if on_diagnostics is not None:
-                    on_diagnostics(data)
-            return bytes(data)
-
-        diagnostics = asyncio.create_task(read_diagnostics())
-
-        cleanup(self._close_front, process, diagnostics)
-        return process, diagnostics
-
-    async def _close_front(self, process, diagnostics):
-        # EOF already makes the real front cancel operations and join every
-        # worker/delegation. Killing only the front can leave a worker's cwd
-        # held while the fixture is removing its workspace on Windows.
-        if process.returncode is None:
-            process.stdin.close()
-        # A failed assertion may leave protocol messages unread. Discard them
-        # while shutting down so pipe backpressure cannot prevent the join.
-        while await process.stdout.read(65536):
-            pass
-        await process.wait()
-        await diagnostics
-
-    async def _response(self, front, request_id):
-        preceding = []
-        while True:
-            line = await front.stdout.readline()
-            self.assertTrue(line, "ACP front exited before its response")
-            message = json.loads(line)
-            if message.get("id") == request_id:
-                self.assertNotIn("error", message, message)
-                return message["result"], preceding
-            preceding.append(message)
-
-    async def _request(self, front, request_id, method, params):
-        front.stdin.write((json.dumps(acps.request(
-            request_id, method, params)) + "\n").encode())
-        await front.stdin.drain()
-        return await self._response(front, request_id)
-
-    async def _finish(self, front, diagnostics, session_id):
-        result, _ = await self._request(
-            front, 90, "session/close", {"sessionId": session_id})
-        self.assertEqual(result, {})
-        # The original owner must no longer route requests to the closed worker.
-        front.stdin.write((json.dumps(acps.request(
-            91, "session/prompt", {"sessionId": session_id,
-                                   "prompt": [{"type": "text", "text": "forbidden"}]}))
-                           + "\n").encode())
-        await front.stdin.drain()
-        while True:
-            line = await front.stdout.readline()
-            self.assertTrue(line, "front exited before rejecting closed session")
-            message = json.loads(line)
-            if message.get("id") == 91:
-                self.assertIn("unknown session", message["error"]["message"])
-                break
-        front.stdin.close()
-        await front.wait()
-        stderr = await diagnostics
-        self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
-        self.assertEqual(await front.stdout.read(), b"")
-
     def _controlled_search(self, root, workspace, label, *, cwd=None):
         """A real rg leader and descendant, controlled by fresh file handshakes."""
         environment = child_environment(
@@ -1367,6 +1445,24 @@ else:
             'pattern': 'CONTROLLED_SEARCH_OUTPUT_' + label, 'path': payload, 'output_mode': 'content'}})
         return environment
 
+    async def _search_file(self, workspace, name, owner, *, nonce=None):
+        # Initial records need complete JSON; replies must additionally match
+        # this request's nonce. In both cases an actual owner is mandatory.
+        path = os.path.join(workspace, name)
+
+        async def published():
+            while True:
+                try:
+                    with open(path, encoding='utf-8') as stream:
+                        record = json.load(stream)
+                    if nonce is None or record['nonce'] == nonce:
+                        return record
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
+                await asyncio.sleep(0.01)
+
+        return await observe_fixture(published(), owner)
+
     async def _ping_search(self, workspace, role, nonce, label, *, exited):
         # A surviving actor may outlive its original request/leader. Observe
         # its held kernel identity, not a request that legitimately finished.
@@ -1390,6 +1486,122 @@ else:
         finally:
             watching.cancel()
             await asyncio.gather(watching, return_exceptions=True)
+
+    _observe_process_exit = observe_process_exit
+
+    async def _front(self, env, workspace, *, cleanup, closed_stderr=False, protected_installation=False,
+                     lifetime_boundary=False, on_diagnostics=None):
+        command = loki_acp_command()
+        if (protected_installation or lifetime_boundary) and sys.platform.startswith('linux'):
+            # Trusted outer-fixture setup, before the actual sanctioned front.
+            # Reuse the deployment fixture's mount operations, never install
+            # protection in a hook/tool payload or change the host's mounts.
+            prepare = '''import ctypes, json, os, sys
+sys.path[:0] = [sys.argv[1], os.path.join(sys.argv[1], 'tests')]
+from loki_agent import runtime_isolations as isolation
+from test_state_isolations import mount_call, retained_mount_flags, MS_BIND, MS_REMOUNT
+options = json.loads(sys.argv[2])
+libc = ctypes.CDLL(None, use_errno=True)
+uid, gid = os.getuid(), os.getgid()
+isolation._unshare_user_and_mount_namespaces(libc)
+isolation._map_current_identity(uid, gid)
+mount_call(libc, None, '/', isolation._MS_REC | isolation._MS_PRIVATE)
+if options['readonly']:
+    mount_call(libc, sys.argv[1], sys.argv[1], MS_BIND)
+    mount_call(libc, None, sys.argv[1], MS_BIND | MS_REMOUNT |
+               retained_mount_flags(sys.argv[1]) | isolation._MS_RDONLY)
+if options['lifetime']:
+    # POSIX ordinary jobs intentionally outlive worker close. The fixture's
+    # outer init supplies root retirement, not a new per-command kill policy.
+    if libc.unshare(0x20000000) != 0:
+        raise OSError(ctypes.get_errno(), 'outer fixture PID namespace failed')
+    child = os.fork()
+    if child:
+        isolation._drop_namespace_capabilities(libc)
+        _pid, status = os.waitpid(child, 0)
+        raise SystemExit(os.waitstatus_to_exitcode(status))
+isolation._drop_namespace_capabilities(libc)
+os.execv(sys.argv[3], sys.argv[3:])
+'''
+            options = {'readonly': protected_installation, 'lifetime': lifetime_boundary}
+            command = [sys.executable, '-c', prepare, ROOT, json.dumps(options), *command]
+        if closed_stderr:
+            command = [sys.executable, '-c',
+                       'import os,sys; os.close(2); os.execv(sys.argv[1], sys.argv[1:])',
+                       *command]
+        process = await asyncio.create_subprocess_exec(
+            *command, env=env, cwd=workspace, limit=acps.MAX_MESSAGE_BYTES,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+
+        # One reader drains and retains diagnostics through shutdown. Retry wire
+        # tests can observe the actual backoff announcement without racing this
+        # reader or replacing the real child/HTTP/hook boundary with a mock.
+        async def read_diagnostics():
+            data = bytearray()
+            while chunk := await process.stderr.read(65536):
+                data.extend(chunk)
+                if on_diagnostics is not None:
+                    on_diagnostics(data)
+            return bytes(data)
+
+        diagnostics = asyncio.create_task(read_diagnostics())
+
+        cleanup(self._close_front, process, diagnostics)
+        return process, diagnostics
+
+    async def _close_front(self, process, diagnostics):
+        # EOF already makes the real front cancel operations and join every
+        # worker/delegation. Killing only the front can leave a worker's cwd
+        # held while the fixture is removing its workspace on Windows.
+        if process.returncode is None:
+            process.stdin.close()
+        # A failed assertion may leave protocol messages unread. Discard them
+        # while shutting down so pipe backpressure cannot prevent the join.
+        while await process.stdout.read(65536):
+            pass
+        await process.wait()
+        await diagnostics
+
+    async def _response(self, front, request_id):
+        preceding = []
+        while True:
+            line = await front.stdout.readline()
+            self.assertTrue(line, "ACP front exited before its response")
+            message = json.loads(line)
+            if message.get("id") == request_id:
+                self.assertNotIn("error", message, message)
+                return message["result"], preceding
+            preceding.append(message)
+
+    async def _request(self, front, request_id, method, params):
+        front.stdin.write((json.dumps(acps.request(
+            request_id, method, params)) + "\n").encode())
+        await front.stdin.drain()
+        return await self._response(front, request_id)
+
+    async def _finish(self, front, diagnostics, session_id):
+        result, _ = await self._request(
+            front, 90, "session/close", {"sessionId": session_id})
+        self.assertEqual(result, {})
+        # The original owner must no longer route requests to the closed worker.
+        front.stdin.write((json.dumps(acps.request(
+            91, "session/prompt", {"sessionId": session_id,
+                                   "prompt": [{"type": "text", "text": "forbidden"}]}))
+                           + "\n").encode())
+        await front.stdin.drain()
+        while True:
+            line = await front.stdout.readline()
+            self.assertTrue(line, "front exited before rejecting closed session")
+            message = json.loads(line)
+            if message.get("id") == 91:
+                self.assertIn("unknown session", message["error"]["message"])
+                break
+        front.stdin.close()
+        await front.wait()
+        stderr = await diagnostics
+        self.assertEqual(front.returncode, 0, stderr.decode(errors="replace"))
+        self.assertEqual(await front.stdout.read(), b"")
 
 
 class ProviderFixtureOwnershipTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
@@ -1439,7 +1651,231 @@ class ProviderFixtureOwnershipTests(_ACPFrontFixture, unittest.IsolatedAsyncioTe
         await self._exercise_cleanup(complete=False)
 
 
+class WorkerSessionNameTests(unittest.TestCase):
+    def test_invalid_or_unregistered_ids_are_rejected_before_loading_or_discovery(self):
+        """An ID cannot escape its catalogue or publish worker state before admission."""
+        from loki_agent import loki
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        for method in ['session/new', 'session/load', 'session/resume']:
+            for name in ['nested/name', 'invalid\x00name', 'bad name', 'bad\u2603',
+                         'bad\x1b[31m', 'bad\x9b31m', 'bad\udc9b31m', 'chat-saved.json']:
+                with self.subTest(method=method, name=name), tempfile.TemporaryDirectory() as workspace:
+                    session = Session(shell_cwd=workspace)
+                    self.addCleanup(session.response_headers.close)
+                    worker = Worker(session, lambda message: None)
+                    with mock.patch.object(loki, '_DEFAULT_SESSION', session), \
+                            mock.patch.object(models, 'ensure_index', new=mock.AsyncMock()) as discover:
+                        with self.assertRaisesRegex(acps.TransportError, 'session name') as failed:
+                            asyncio.run(worker.prepare_open({
+                                'cwd': workspace, 'sessionId': name, 'openMethod': method}))
+                        self.assertEqual(failed.exception.code, acps.INVALID_PARAMS)
+                        self.assertIsNone(worker._pending_open)
+                        self.assertEqual(worker.session_id, 'worker')
+                        discover.assert_not_awaited()
+                    self.assertEqual(os.listdir(workspace), [])
+
+    def test_front_refuses_invalid_saved_ids_before_reserving_or_spawning(self):
+        async def scenario(root):
+            for method in ['session/load', 'session/resume']:
+                for name in [mock.sentinel.missing, None, '', False, True, 0, 42, 1.5,
+                             [], [1], {}, {'id': 'saved'}, 'bad name', 'bad\u2603',
+                             '\x1b[31m', '\x9b31m', '\udc9b31m']:
+                    with self.subTest(method=method, name=name):
+                        params = {'cwd': root}
+                        if name is not mock.sentinel.missing:
+                            params['sessionId'] = name
+                        messages = []
+                        front = acp.Front(lambda: None, messages.append, CredentialStore({}))
+                        with mock.patch.object(front.credential_supervisor, 'delegate',
+                                               new=mock.AsyncMock()) as delegate:
+                            try:
+                                front.handle(acps.request(1, method, params))
+                                self.assertEqual(messages[0]['error']['code'], acps.INVALID_PARAMS)
+                                self.assertEqual(front._sessions, {})
+                                self.assertFalse(front._tasks)
+                                delegate.assert_not_awaited()
+                            finally:
+                                await front.shutdown()
+
+        with tempfile.TemporaryDirectory() as root:
+            asyncio.run(scenario(root))
+
+
+class SessionListingTests(unittest.TestCase):
+    def front(self):
+        return acp.Front(lambda: None, lambda message: None, CredentialStore({}))
+
+    def write_log(self, workspace, session_id, state, modified=1000):
+        root = app_paths.chat_log_dir_for(workspace)
+        os.makedirs(root, exist_ok=True)
+        # The log's complete filename is needed beneath the selected root;
+        # state values are JSON metadata and never enter this construction.
+        path = os.path.join(root, f'chat-{session_id}.json')
+        with open(path, 'w', encoding='utf-8') as stream:
+            json.dump({'session_state': state}, stream)
+        os.utime(path, (modified, modified))
+        return path
+
+    def test_workspace_owns_listing_after_cd_and_after_saved_cwd_disappears(self):
+        with tempfile.TemporaryDirectory() as workspace, \
+                tempfile.TemporaryDirectory() as changed, \
+                tempfile.TemporaryDirectory() as gone, \
+                tempfile.TemporaryDirectory() as startup:
+            raw = changed + '/./'
+            changed_log = self.write_log(workspace, 'changed', {'shell_cwd': raw}, 2000)
+            gone_log = self.write_log(workspace, 'gone', {'shell_cwd': gone}, 1000)
+            self.write_log(startup, 'other', {'cwd': startup}, 3000)
+            os.rmdir(gone)
+            before = {}
+            for path in [changed_log, gone_log]:
+                with open(path, 'rb') as stream:
+                    before[path] = stream.read()
+            with mock.patch.object(acp, 'CHAT_LOG_DIR', app_paths.chat_log_dir_for(startup)):
+                front = self.front()
+                result = front.list_sessions({'cwd': workspace})
+                self.assertEqual(result, {'sessions': [
+                    {'sessionId': 'gone', 'cwd': gone, 'updatedAt': '1970-01-01T00:16:40+00:00'},
+                    {'sessionId': 'changed', 'cwd': raw, 'updatedAt': '1970-01-01T00:33:20+00:00'},
+                ]})
+                self.assertEqual([entry['sessionId'] for entry in front.list_sessions({})['sessions']],
+                                 ['other'])
+            self.assertFalse(os.path.exists(gone))
+            for path in [changed_log, gone_log]:
+                with open(path, 'rb') as stream:
+                    self.assertEqual(stream.read(), before[path])
+
+    def test_missing_log_directory_is_not_created_by_either_listing(self):
+        from loki_agent import savefiles
+
+        with tempfile.TemporaryDirectory() as workspace:
+            root = app_paths.chat_log_dir_for(workspace)
+            self.assertFalse(os.path.exists(root))
+            self.assertEqual(self.front().list_sessions({'cwd': workspace}), {'sessions': []})
+            self.assertEqual(savefiles.chat_log_entries(root), [])
+            self.assertEqual(
+                savefiles.resolve_chat_log_path('saved', workspace, root, mock.Mock()),
+                os.path.join(root, 'chat-saved.json'))
+            self.assertFalse(os.path.exists(root))
+            self.assertEqual(os.listdir(workspace), [])
+
+    def test_invalid_saved_metadata_is_not_a_front_failure(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            self.write_log(workspace, 'kept', {'shell_cwd': workspace})
+            for session_id, state in [['list', ['not', 'a', 'mapping']],
+                                      ['number', {'shell_cwd': 3}],
+                                      ['empty', {'shell_cwd': ''}],
+                                      ['missing', None]]:
+                self.write_log(workspace, session_id, state)
+            invalid = self.write_log(workspace, 'bytes', {'shell_cwd': workspace})
+            with open(invalid, 'wb') as stream:
+                stream.write(b'\xff')
+            result = self.front().list_sessions({'cwd': workspace})
+            self.assertEqual([entry['sessionId'] for entry in result['sessions']], ['kept'])
+
+    @unittest.skipUnless(os.name == 'posix', 'native POSIX FIFO and symlink types')
+    def test_special_file_and_link_to_special_file_are_not_read(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            self.write_log(workspace, 'kept', {'shell_cwd': workspace})
+            fifo = self.write_log(workspace, 'pipe', {'shell_cwd': workspace})
+            os.unlink(fifo)
+            os.mkfifo(fifo)
+            link = self.write_log(workspace, 'link', {'shell_cwd': workspace})
+            os.unlink(link)
+            os.symlink(fifo, link)
+            directory = self.write_log(workspace, 'directory', {'shell_cwd': workspace})
+            os.unlink(directory)
+            os.mkdir(directory)
+            result = self.front().list_sessions({'cwd': workspace})
+            self.assertEqual([entry['sessionId'] for entry in result['sessions']], ['kept'])
+            self.assertTrue(os.path.islink(link))
+
+    @unittest.skipUnless(os.name == 'posix', 'native POSIX file symlinks')
+    def test_regular_file_link_preserves_the_selected_filename(self):
+        with tempfile.TemporaryDirectory() as workspace, \
+                tempfile.TemporaryDirectory() as other:
+            raw = other + '/./'
+            target = self.write_log(other, 'target', {'shell_cwd': raw})
+            link = self.write_log(workspace, 'linked', {'shell_cwd': 'replaced fixture'})
+            os.unlink(link)
+            os.symlink(target, link)
+            from loki_agent import savefiles
+            with savefiles.open_chat_log(link) as (stream, _facts):
+                self.assertTrue(os.get_blocking(stream.fileno()))
+            result = self.front().list_sessions({'cwd': workspace})
+            self.assertEqual(result, {'sessions': [{
+                'sessionId': 'linked', 'cwd': raw, 'updatedAt': '1970-01-01T00:16:40+00:00'}]})
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(os.readlink(link), target)
+
+    def test_timestamp_and_metadata_describe_the_same_opened_file(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            original = self.write_log(workspace, 'original', {'shell_cwd': 'original cwd'}, 1000)
+            replacement = self.write_log(workspace, 'replacement', {'shell_cwd': 'replacement cwd'}, 2000)
+            open_file = os.open
+            attempted = False
+            replaced = False
+            blocked = None
+
+            def select(path, flags):
+                nonlocal attempted, replaced, blocked
+                descriptor = open_file(path, flags)
+                if path == original and not attempted:
+                    attempted = True
+                    try:
+                        os.replace(replacement, original)
+                        replaced = True
+                    except PermissionError as error:
+                        # A native CRT reader can deny delete sharing. Prove
+                        # that closing it removes the obstruction below.
+                        if os.name != 'nt' or error.winerror not in [5, 32]:
+                            os.close(descriptor)
+                            raise
+                        blocked = error.winerror
+                    except BaseException:
+                        os.close(descriptor)
+                        raise
+                return descriptor
+
+            with mock.patch.object(acp.os, 'open', side_effect=select):
+                result = self.front().list_sessions({'cwd': workspace})
+            self.assertTrue(attempted)
+            self.assertTrue(replaced or blocked is not None)
+            if blocked is not None:
+                os.replace(replacement, original)
+            selected = [entry for entry in result['sessions'] if entry['sessionId'] == 'original']
+            self.assertEqual(selected, [{
+                'sessionId': 'original', 'cwd': 'original cwd',
+                'updatedAt': '1970-01-01T00:16:40+00:00'}])
+
+
 class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_large_prompt_and_replay_cross_the_real_worker_channel(self):
+        text = 'large ACP text ' * 6000 + 'END'
+        self.assertGreater(len(text.encode('utf-8')), 65536)
+        with tempfile.TemporaryDirectory() as root:
+            async with AsyncExitStack() as cleanup:
+                env = self._front_env(root)
+                workspace = _configured_workspace(root)
+                front, diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
+                await self._request(front, 1, 'initialize', {})
+                opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+                session_id = opened['sessionId']
+                result, _ = await self._request(front, 3, 'session/prompt', {
+                    'sessionId': session_id, 'prompt': [{'type': 'text', 'text': text}]})
+                self.assertEqual(result['stopReason'], 'end_turn')
+                await self._finish(front, diagnostics, session_id)
+                restored, diagnostics = await self._front(env, workspace, cleanup=cleanup.push_async_callback)
+                await self._request(restored, 1, 'initialize', {})
+                _reply, updates = await self._request(restored, 2, 'session/load', {
+                    'cwd': workspace, 'sessionId': session_id})
+                chunks = [message['params']['update']['content']['text'] for message in updates
+                          if message.get('method') == 'session/update'
+                          and message['params']['update']['sessionUpdate'] == 'user_message_chunk']
+                self.assertEqual(''.join(chunks), text)
+                await self._finish(restored, diagnostics, session_id)
+
     def _front_env(self, tmpdir):
         env = dict(os.environ)
         env.update({
@@ -1456,50 +1892,6 @@ class FrontWorkerTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
         os.makedirs(workspace, exist_ok=True)
         configure_container(env, workspace)
         return env
-
-    async def test_ini_logging_reaches_the_front_not_the_contained_worker(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = os.path.join(directory, "logging.ini")
-            # The handler arg is a Python literal that fileConfig evals, so the
-            # path must be repr'd: a raw Windows path would be consumed by
-            # backslash escapes before that eval ran, and the front would exit
-            # before opening its protocol loop.
-            trace_prefix = os.path.join(directory, "trace-")
-            with open(config, "w") as stream:
-                stream.write("""[loggers]
-keys=root
-[handlers]
-keys=trace
-[formatters]
-keys=
-[logger_root]
-level=DEBUG
-handlers=trace
-[handler_trace]
-class=FileHandler
-args=(%r + str(__import__('os').getpid()), 'a')
-""" % trace_prefix)
-            env = self._front_env(directory)
-            workspace = _configured_workspace(directory)
-            env["LOKI_LOG_CONFIG"] = os.path.relpath(config, workspace)
-            front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
-            await self._request(front, 1, "initialize", {"protocolVersion": 1})
-            opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
-            session_id = opened["sessionId"]
-            reply, updates = await self._request(front, 3, "session/prompt", {
-                "sessionId": session_id, "prompt": [{"type": "text", "text": "logging probe"}],
-            })
-            self.assertEqual(reply, {"stopReason": "end_turn"})
-            self.assertEqual(_tool_updates(updates, session_id), _assistant_chunks("acp reply text"))
-            await self._finish(front, diagnostics, session_id)
-            # The front is uncontained and loads the INI.  The separately
-            # execed worker is contained: it refuses any configuration the
-            # invoker names (it cannot be assumed able to read it or write its
-            # handlers' targets) and logs to stderr instead, so only the front
-            # opens a trace file.
-            traces = [name for name in os.listdir(directory)
-                      if name.startswith("trace-")]
-            self.assertEqual(len(traces), 1)
 
     def test_front_delegates_credentials_without_worker_environment_values(self):
         credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
@@ -1571,18 +1963,57 @@ args=(%r + str(__import__('os').getpid()), 'a')
             asyncio.run(front.credential_broker.lease(
                 credential, destination="https://example.test/unapproved"))
 
-    def test_real_front_scrubs_and_real_worker_never_receives_credential(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = {
-                name: value
-                for name, value in self._front_env(tmpdir).items()
-                if not is_credential_name(name)
-            }
-            credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
-            credential_value = "secret-" + ("v" * 137)
-            env[credential_name] = credential_value
-            env["LOKI_ACP_AFTER"] = "visible"
+    async def _windows_environment_control(self, name, value):
+        # Deliberately bypass ONLY the fixture caller's sanitized environment.
+        # This real owning worker must expose the injected value to the reader;
+        # otherwise a later "absent" observation could conceal a startup leak.
+        async with process_lifecycle('loki-acp') as fixture:
+            delegation = await fixture.supervisor.delegate()
+            environment = dict(fixture.supervisor.environment)
+            environment.update({name: value, 'LOKI_ACP_AFTER': 'visible'})
+            process = fixture.record_process(await acp.runtime_isolation.start_worker(
+                fixture.workspace, environment, delegation,
+                credential_directory=fixture.supervisor.storage.directory_handle))
+            delegation.child_spawned()
+            channel = acp.WorkerChannel('environment-control', process, lambda message: None, delegation)
+            try:
+                self.assertEqual(await channel.request('session/cancel', {}), {})
+                raw = windows_process_environment(process.pid, os.getpid())
+                self.assertIn(name.encode() + b'=' + value.encode() + b'\0', raw)
+                self.assertIn(b'LOKI_ACP_AFTER=visible\0', raw)
+            finally:
+                await channel.close()
+            await fixture.assert_released(self)
 
+    async def test_real_front_logging_and_environment_isolation_share_one_worker(self):
+        tmpdir = self.enterContext(tempfile.TemporaryDirectory())
+        # Logging and credential isolation observe the same front/worker split;
+        # keep the unsanitized observer control separate from this configuration.
+        config = os.path.join(tmpdir, "logging.ini")
+        trace_prefix = os.path.join(tmpdir, "trace-")
+        # fileConfig evaluates a Python literal: repr preserves Windows slashes.
+        with open(config, "w") as stream:
+            stream.write("""[loggers]
+keys=root
+[handlers]
+keys=trace
+[formatters]
+keys=
+[logger_root]
+level=DEBUG
+handlers=trace
+[handler_trace]
+class=FileHandler
+args=(%r + str(__import__('os').getpid()), 'a')
+""" % trace_prefix)
+        env = {name: value for name, value in self._front_env(tmpdir).items()
+               if not is_credential_name(name)}
+        credential_name = "LOKI_ACP_BOOTSTRAP_TEST_TOKEN"
+        credential_value = "secret-" + ("v" * 137)
+        env[credential_name] = credential_value
+        env["LOKI_ACP_AFTER"] = "visible"
+        env.pop('PYTHONPATH', None)
+        if os.name != 'nt':
             observer_dir = os.path.join(tmpdir, "observer")
             report_dir = os.path.join(tmpdir, "reports")
             os.makedirs(observer_dir)
@@ -1600,27 +2031,6 @@ _capture = credentials.capture_process_credentials
 
 
 def native_environment():
-    if os.name == "nt":
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        get = kernel.GetEnvironmentStringsW
-        get.restype = ctypes.c_void_p
-        free = kernel.FreeEnvironmentStringsW
-        free.argtypes = [ctypes.c_void_p]
-        free.restype = ctypes.c_int
-        pointer = get()
-        if not pointer:
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            entries, address = [], pointer
-            while True:
-                text = ctypes.wstring_at(address)
-                if not text:
-                    break
-                entries.append(text)
-                address += (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
-            return b"\0".join(entry.encode("utf-8") for entry in entries)
-        finally:
-            free(pointer)
     if sys.platform == "darwin":
         libc = ctypes.CDLL(None, use_errno=True)
         libc.sysctl.argtypes = (
@@ -1651,8 +2061,6 @@ def report_environment():
         "after_present": after in raw,
     }
     if sys.platform.startswith("linux"):
-        # Linux overwrites the original records in place, so the filler and the
-        # record that follows it are observable.  Windows removes them instead.
         report["filler_present"] = filler in raw.split(b"\0")
         report["after_follows_filler"] = (
             raw.find(after) > raw.find(filler + b"\0")
@@ -1678,139 +2086,91 @@ if "--worker" in sys.argv:
             with open(sitecustomize, "w", encoding="ascii") as stream:
                 stream.write(observer)
             env["LOKI_TEST_REPORT_DIR"] = report_dir
-            env["PYTHONPATH"] = os.pathsep.join(
-                [observer_dir, ROOT])
+            env["PYTHONPATH"] = os.pathsep.join([observer_dir, ROOT])
+        else:
+            await self._windows_environment_control(credential_name, credential_value)
 
-            # Drive the front the way the product drives a worker channel:
-            # an asyncio subprocess read line by line (WorkerChannel), under
-            # the default event-loop policy the entrypoints themselves use.
-            # stderr stays inherited, so a failing front or worker explains
-            # itself in the runner log.
-            async def converse(process):
-                async def send(message):
-                    process.stdin.write(
-                        (json.dumps(message) + "\n").encode("utf-8"))
-                    await process.stdin.drain()
+        workspace = _configured_workspace(tmpdir)
+        env["LOKI_LOG_CONFIG"] = os.path.relpath(config, workspace)
+        front, diagnostics = await self._front(env, workspace, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+        opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+        if os.name == 'nt':
+            # Frozen apps cannot load sitecustomize. The unrestricted fixture
+            # parent already has the owner's read authority; no token or DACL
+            # is relaxed and no observer code executes inside either app.
+            observer = await asyncio.create_subprocess_exec(
+                'powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                "Get-CimInstance Win32_Process -Filter 'ParentProcessId = %d' | "
+                "Where-Object {$_.CommandLine -like '*--worker*'} | Select-Object -ExpandProperty ProcessId" % front.pid,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            self.addAsyncCleanup(ProcessResources(observer).cleanup)
+            output, errors = await observer.communicate()
+            self.assertEqual(observer.returncode, 0, errors.decode(errors='replace'))
+            workers = [int(line) for line in output.split()]
+            self.assertEqual(len(workers), 1, workers)
+            reports = []
+            for pid, parent, worker in [[front.pid, os.getpid(), False], [workers[0], front.pid, True]]:
+                raw = windows_process_environment(pid, parent)
+                reports.append({'pid': pid, 'worker': worker,
+                                'name_present': credential_name.encode() + b'=' in raw,
+                                'value_present': credential_value.encode() in raw,
+                                'after_present': b'LOKI_ACP_AFTER=visible\0' in raw})
+        else:
+            reports = []
+            for name in os.listdir(report_dir):
+                with open(os.path.join(report_dir, name), encoding='ascii') as stream:
+                    reports.append(json.load(stream))
+        self.assertEqual(len(reports), 2)
+        front_report = next(report for report in reports if not report['worker'])
+        worker_report = next(report for report in reports if report['worker'])
+        for report in reports:
+            self.assertFalse(report['name_present'])
+            self.assertFalse(report['value_present'])
+            self.assertTrue(report['after_present'])
+        if sys.platform.startswith('linux'):
+            # Preserve the original in-place scrub and inherited-cover oracles;
+            # the external Windows observer is not evidence for these mechanisms.
+            self.assertTrue(front_report['filler_present'])
+            self.assertTrue(front_report['after_follows_filler'])
+            self.assertFalse(worker_report['filler_present'])
+            self.assertFalse(worker_report['after_follows_filler'])
+            credential_dir = os.path.join(tmpdir, 'config', 'loki', 'credentials')
+            with open(f"/proc/{worker_report['pid']}/mountinfo", encoding='ascii') as stream:
+                worker_mounts = stream.read()
+            self.assertTrue(any(f' {credential_dir} ' in line and ' - tmpfs ' in line
+                                for line in worker_mounts.splitlines()), worker_mounts)
+        session_id = opened['sessionId']
+        reply, updates = await self._request(front, 3, "session/prompt", {
+            "sessionId": session_id, "prompt": [{"type": "text", "text": "logging probe"}],
+        })
+        self.assertEqual(reply, {"stopReason": "end_turn"})
+        self.assertEqual(_tool_updates(updates, session_id), _assistant_chunks("acp reply text"))
+        await self._finish(front, diagnostics, session_id)
+        # Only the uncontained front loads the INI. The contained worker cannot
+        # assume access to its configuration or handler targets and uses stderr.
+        # Check the front's actual pid, not merely that some process logged.
+        traces = [name for name in os.listdir(tmpdir) if name.startswith("trace-")]
+        self.assertEqual(traces, ["trace-%d" % front.pid])
 
-                async def reply(reply_id):
-                    while True:
-                        line = await asyncio.wait_for(
-                            process.stdout.readline(), 30)
-                        self.assertTrue(
-                            line,
-                            "front closed its protocol output",
-                        )
-                        message = json.loads(line.decode("utf-8"))
-                        if message.get("id") == reply_id:
-                            return message
-
-                await send({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {"protocolVersion": 1},
-                })
-                self.assertIn("result", await reply(1))
-                await send({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "session/new",
-                    "params": {"cwd": _configured_workspace(tmpdir)},
-                })
-                self.assertIn("result", await reply(2))
-
-            async def run():
-                process = await asyncio.create_subprocess_exec(
-                    *loki_acp_command(),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=None,
-                    env=env,
-                    cwd=os.path.join(tmpdir, "workspace"),
-                )
-                try:
-                    await converse(process)
-                    # Read the observer reports before tearing the
-                    # front down: the Linux check below needs the
-                    # worker's live /proc entry.
-                    report_names = os.listdir(report_dir)
-                    self.assertEqual(len(report_names), 2)
-                    reports = []
-                    for name in report_names:
-                        with open(
-                                os.path.join(report_dir, name),
-                                encoding="ascii") as stream:
-                            reports.append(json.load(stream))
-                    front_report = next(
-                        report for report in reports if not report["worker"])
-                    worker_report = next(
-                        report for report in reports if report["worker"])
-
-                    for report in reports:
-                        self.assertFalse(report["name_present"])
-                        self.assertFalse(report["value_present"])
-                        self.assertTrue(report["after_present"])
-                    if sys.platform.startswith("linux"):
-                        # Linux overwrites the credential record in place and
-                        # covers the directory with a tmpfs; both are Linux
-                        # mechanisms.  The tmpfs cover is containment, whose
-                        # Windows counterpart is the AppContainer gate exercised
-                        # by test_windows_runtime and test_runtime_gate.  The
-                        # in-place overwrite is a scrub-in-place detail: Windows
-                        # removes the record instead (see report_environment),
-                        # so it has no counterpart assertion here.
-                        self.assertTrue(front_report["filler_present"])
-                        self.assertTrue(front_report["after_follows_filler"])
-                        self.assertFalse(worker_report["filler_present"])
-                        self.assertFalse(worker_report["after_follows_filler"])
-                        credential_dir = os.path.join(
-                            tmpdir, "config", "loki", "credentials")
-                        with open(
-                                f"/proc/{worker_report['pid']}/mountinfo",
-                                encoding="ascii") as stream:
-                            worker_mounts = stream.read()
-                        self.assertTrue(any(
-                            f" {credential_dir} " in line
-                            and " - tmpfs " in line
-                            for line in worker_mounts.splitlines()
-                        ), worker_mounts)
-                finally:
-                    process.stdin.close()
-                    try:
-                        await asyncio.wait_for(process.wait(), 5)
-                    except asyncio.TimeoutError:
-                        process.kill()
-                        await process.wait()
-
-            asyncio.run(run())
-
-    def test_unknown_session_is_error(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+    async def test_unknown_session_is_error(self):
+        async with AsyncExitStack() as cleanup:
+            tmpdir = cleanup.enter_context(tempfile.TemporaryDirectory())
             env = self._front_env(tmpdir)
-            front = subprocess.Popen(
-                loki_acp_command(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env, cwd=os.path.join(tmpdir, "workspace"))
-            self.addCleanup(_close_process_streams, front)
-            try:
-                front.stdin.write(json.dumps({
-                    "jsonrpc": "2.0", "id": 9,
-                    "method": "session/prompt",
-                    "params": {"sessionId": "nope",
-                               "prompt": [{"type": "text", "text": "x"}]},
-                }) + "\n")
-                front.stdin.flush()
-                line = front.stdout.readline()
-                reply = json.loads(line)
-                self.assertEqual(reply["id"], 9)
-                self.assertIn("error", reply)
-            finally:
-                front.stdin.close()
-                try:
-                    front.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    front.kill()
-                    front.wait()
+            front, _diagnostics = await self._front(
+                env, _configured_workspace(tmpdir), cleanup=cleanup.push_async_callback)
+            # Negative replies stay raw: _response deliberately requires success.
+            front.stdin.write((json.dumps({
+                "jsonrpc": "2.0", "id": 9,
+                "method": "session/prompt",
+                "params": {"sessionId": "nope",
+                           "prompt": [{"type": "text", "text": "x"}]},
+            }) + "\n").encode())
+            await front.stdin.drain()
+            line = await front.stdout.readline()
+            reply = json.loads(line)
+            self.assertEqual(reply["id"], 9)
+            self.assertIn("error", reply)
 
 
 class EventMapperTests(unittest.TestCase):
@@ -2333,6 +2693,13 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
         self.assertFalse(owner.cancelled())
         self.assertEqual(asyncio.all_tasks(), before)
 
+    async def test_ping_refuses_an_actor_that_exited_without_a_reply(self):
+        workspace = self.enterContext(tempfile.TemporaryDirectory())
+        before = asyncio.all_tasks()
+        with self.assertRaisesRegex(AssertionError, 'child exited before replying'):
+            await self._ping_search(workspace, 'child', 'fresh-request', 'A', exited=lambda: True)
+        self.assertEqual(asyncio.all_tasks(), before)
+
     def _saved_tool_turn(self, path, user, call_id, args, result, answers):
         from loki_agent import formats
 
@@ -2403,7 +2770,7 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
                     'LOKI_PROVIDER': 'dummy', 'LOKI_API_BASE': 'http://dummy.invalid/v1',
                     'LOKI_MODEL': 'dummy-model', 'LOKI_DUMMY_REPLY': 'Directory view checked.',
                     'LOKI_DUMMY_TOOL_CALL': json.dumps({'name': 'Bash', 'arguments': {
-                        'command': command,
+                        'command': command, 'timeout': None,
                         'description': 'Check the configured directory view'}}),
                 })
                 front, diagnostics = await self._front(
@@ -2444,7 +2811,7 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
     async def test_shipped_front_real_tool_updates_save_and_close(self):
         root = self.enterContext(tempfile.TemporaryDirectory())
         workspace, payload, command, result = _tool_fixture(root)
-        args = {"command": command, "description": "Read the relative fixture"}
+        args = {"command": command, "timeout": None, "description": "Read the relative fixture"}
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith("LOKI_")
                        and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
@@ -2476,194 +2843,6 @@ class ToolStreamingJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCa
         path = os.path.join(app_paths.chat_log_dir_for(workspace), f"chat-{session_id}.json")
         self._saved_tool_turn(path, "Run the real file proof",
                               "dummy-tool-call", args, result, ["Tool complete."])
-
-    async def test_resource_real_tool_continuation_save_and_fresh_replay(self):
-        await self._resource_tool_continuation()
-
-    async def test_resource_fixture_closes_state_after_configuration_failure(self):
-        await self._resource_fixture_failure('loki_agent.loki.apply_runtime_config')
-
-    async def test_resource_fixture_closes_state_after_prompt_failure(self):
-        await self._resource_fixture_failure('loki_agent.acp_worker.Worker.prompt')
-
-    async def _resource_fixture_failure(self, target):
-        from loki_agent import sessions
-
-        # Reuse the real resource journey and retain its Sessions beyond scope
-        # exit: a destructor cannot supply false evidence of fixture cleanup.
-        # Each failure is independently selectable and happens before Bash runs.
-        original = sessions.Session
-        held = []
-
-        def create(*arguments, **keywords):
-            session = original(*arguments, **keywords)
-            held.append(session)
-            return session
-
-        try:
-            with mock.patch.object(sessions, 'Session', side_effect=create), \
-                    mock.patch(target, side_effect=RuntimeError('resource fixture injected failure')):
-                with self.assertRaisesRegex(RuntimeError, 'resource fixture injected failure'):
-                    await self._resource_tool_continuation()
-            self.assertEqual(len(held), 1, 'failure must occur after Session state acquisition')
-            for session in held:
-                with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
-                    session.response_headers.directory_handle
-        finally:
-            # Release even a failing red control without relying on its GC.
-            for session in held:
-                await session.close_state()
-
-    async def _resource_tool_continuation(self):
-        import copy
-        from contextlib import AsyncExitStack
-        from pathlib import Path
-        from loki_agent import formats, loki, paths, protocols, response_headers
-        from loki_agent.acp_worker import Worker
-        from loki_agent.sessions import Session
-
-        # The fixture, not Worker.close(), owns each Session's retained state.
-        # Register it before setup can fail; this outer stack joins state after
-        # the worker backstop and before removing the workspace it refers to.
-        async with AsyncExitStack() as stack:
-            root = stack.enter_context(tempfile.TemporaryDirectory())
-            workspace, payload, command, result = _tool_fixture(root)
-            environment = {key: value for key, value in os.environ.items()
-                           if not key.startswith("LOKI_")
-                           and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
-            environment.update({"HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
-                                "XDG_STATE_HOME": os.path.join(root, "state")})
-            stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
-            credentials = CredentialStore({
-                "LOKI_PROVIDER": "openai", "LOKI_API_BASE": "https://provider.invalid/v1",
-                "LOKI_MODEL": "tool-model", "LOKI_STREAM": "1",
-            })
-            stack.enter_context(mock.patch.object(loki, "CREDENTIALS", credentials))
-            state_root = paths.loki_state_dir(environment)
-            session = Session(shell_cwd=workspace, response_headers=response_headers.Store(
-                os.path.join(state_root, 'response-headers.json')))
-            stack.push_async_callback(session.close_state)
-            stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
-            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(state_root, "jobs")))
-            stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
-            loki.apply_runtime_config(connections.build_config_from_env(credentials=credentials))
-            messages = []
-            session_id = "tool-workflow"
-            worker = Worker(session, messages.append, session_id)
-            workers = [worker]
-            args = {"command": command, "description": "Read the relative fixture"}
-            call_id = "provider-call-73"
-            resource = {"name": "payload.txt", "uri": Path(workspace, "payload.txt").as_uri(),
-                        "title": "Source \u03b1", "description": "A uniquely populated local file",
-                        "mimeType": "text/plain", "size": len(payload)}
-            user = "inspect this\n[ACP resource link]\n" + json.dumps(resource, ensure_ascii=False)
-            requests = []
-
-            async def completion(items, *, tools, **kwargs):
-                self.assertIsInstance(tools, list)
-                self.assertFalse(kwargs["cancel_check"]())
-                requests.append(copy.deepcopy(items))
-                self.assertLessEqual(len(requests), 2, "unexpected additional provider request")
-                if len(requests) == 1:
-                    for chunk in ["Inspecting ", "resource."]:
-                        kwargs["on_text_delta"](chunk)
-                    return formats.DecodedTurn([
-                        formats.message_item("assistant", "Inspecting resource."),
-                        formats.tool_call_item(call_id, "Bash", args),
-                    ], {"protocol": protocols.OPENAI_CHAT})
-                for chunk in ["Tool ", "complete."]:
-                    kwargs["on_text_delta"](chunk)
-                return formats.DecodedTurn([
-                    formats.message_item("assistant", "Tool complete."),
-                ], {"protocol": protocols.OPENAI_CHAT})
-
-            stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
-            try:
-                await worker.prepare_open({
-                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"})
-                worker.commit_open()
-                messages.clear()
-                reply = await worker.prompt({
-                    "sessionId": session_id,
-                    "prompt": [{"type": "text", "text": "inspect this"},
-                               {"type": "resource_link", **resource, "unadvertised": "must not leak"}],
-                })
-                self.assertEqual(reply, {"stopReason": "end_turn"})
-                self.assertEqual(len(requests), 2)
-                for request in requests:
-                    self.assertEqual([item["content"] for item in request
-                                      if item.get("role") == "user"],
-                                     [[{"type": "text", "text": user}]])
-                followup = requests[1]
-                self.assertEqual([item["type"] for item in followup[-3:]],
-                                 ["message", "model_response", "tool_result"])
-                self.assertEqual(followup[-2]["items"][0], {
-                    "type": "message", "role": "assistant",
-                    "content": [{"type": "text", "text": "Inspecting resource."}],
-                })
-                continued_call = followup[-2]["items"][1]
-                self.assertEqual(continued_call["call_id"], call_id)
-                self.assertEqual(continued_call["name"], "Bash")
-                self.assertEqual(json.loads(continued_call["arguments"]), args)
-                self.assertEqual(len(followup[-2]["items"]), 2)
-                self.assertEqual(followup[-1]["call_id"], call_id)
-                self.assertEqual(followup[-1]["content"], [{"type": "text", "text": result}])
-                self.assertIs(followup[-1]["is_error"], False)
-                self.assertEqual(_tool_updates(messages, session_id),
-                                 _assistant_chunks("Inspecting ", "resource.")
-                                 + _call_and_result(call_id, command, workspace, result)
-                                 + _assistant_chunks("Tool ", "complete."))
-                with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
-                    self.assertEqual(stream.read(), payload)
-                self.assertIsNotNone(session.job_manager)
-                self.assertEqual(len(session.job_manager.jobs), 1)
-                job = next(iter(session.job_manager.jobs.values()))
-                self.assertEqual(job.cwd, workspace)
-                self.assertEqual(job.status, "exited")
-                self.assertEqual(job.exit_code, 0)
-                self.assertEqual(job.process.returncode, 0)
-                with open(job.stdout_path, encoding="utf-8") as stream:
-                    self.assertEqual(stream.read(), payload.decode())
-                with open(job.stderr_path, encoding="utf-8") as stream:
-                    self.assertEqual(stream.read(), "")
-                path = session.chat_log_path
-                self.assertEqual(path, os.path.join(
-                    app_paths.chat_log_dir_for(workspace), f'chat-{session_id}.json'))
-                saved = self._saved_tool_turn(path, user, call_id, args, result,
-                                              ["Inspecting resource.", "Tool complete."])
-                await worker.close()
-                restored_session = Session(shell_cwd=workspace)
-                stack.push_async_callback(restored_session.close_state)
-                loki._DEFAULT_SESSION = restored_session
-                restored = Worker(restored_session, messages.append, session_id)
-                workers.append(restored)
-                messages.clear()
-                await restored.prepare_open({
-                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/load",
-                    "replay": False})
-                self.assertEqual(restored_session.transcript_items, saved["events"])
-                self.assertEqual(_tool_updates(messages, session_id), [])
-                restored.commit_open()
-                self.assertEqual(_tool_updates(messages, session_id), [
-                    {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": user}},
-                    *_assistant_chunks("Inspecting resource."),
-                    {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Bash",
-                     "kind": "other", "status": "completed"},
-                    {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Tool result: Bash",
-                     "kind": "other", "status": "completed"},
-                    *_assistant_chunks("Tool complete."),
-                ])
-                self.assertEqual(len(requests), 2, "load must not perform inference")
-                with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
-                    self.assertEqual(stream.read(), payload, "load must not execute historical calls")
-                await restored.close()
-            finally:
-                # Backstop only: owned job exit/output was asserted above.
-                for owner in workers:
-                    await owner.close()
-        for owner in workers:
-            with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
-                owner.session.response_headers.directory_handle
 
     async def test_independent_frontends_overlap_without_sharing_shutdown(self):
         if sys.platform != 'win32' and not sys.platform.startswith('linux'):
@@ -2885,12 +3064,380 @@ print('ACP_AGENT_ORDINARY_COMMAND_OBSERVED')
         self.assertFalse(results[0]['is_error'])
         self.assertIn('External search complete.', json.dumps(results[0]))
 
-    async def test_ping_refuses_an_actor_that_exited_without_a_reply(self):
-        workspace = self.enterContext(tempfile.TemporaryDirectory())
-        before = asyncio.all_tasks()
-        with self.assertRaisesRegex(AssertionError, 'child exited before replying'):
-            await self._ping_search(workspace, 'child', 'fresh-request', 'A', exited=lambda: True)
-        self.assertEqual(asyncio.all_tasks(), before)
+    async def test_shipped_front_host_hooks_preserve_phase_authority(self):
+        if sys.platform != 'win32' and not sys.platform.startswith('linux'):
+            self.skipTest('the read-only outer-installation fixture needs Linux mount namespaces')
+        root = self.enterContext(tempfile.TemporaryDirectory(prefix='acp-hook-workflow-'))
+        workspace = os.path.join(root, 'workspace')
+        private_files.make_private_directory(workspace)
+        environment = child_environment(
+            HOME=root, PATH=os.environ.get('PATH', ''), TERM='dumb',
+            XDG_STATE_HOME=os.path.join(root, 'state'),
+            LOKI_PROVIDER='openai', LOKI_MODEL='workflow-model', LOKI_STREAM='0',
+            LOKI_API_KEY='synthetic-hook-key')
+        # Host-owned definitions live under the selected program installation,
+        # never the agent workspace. Setup supplies Windows program READ grants;
+        # Linux's trusted outer fixture seals this installation before exec.
+        program_directory = ROOT
+        if sys.platform == 'win32':
+            from loki_agent import windows_api
+            with ExitStack() as handles:
+                image = windows_api.open_with_access(
+                    loki_acp_command()[0], windows_api.AccessMask.FILE_READ_ATTRIBUTES,
+                    flags=windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
+                handles.callback(windows_api.close_handle, image)
+                parent = windows_api.open_parent_directory(image)
+                self.assertIsNotNone(parent, 'the selected program has no installation directory')
+                handles.callback(windows_api.close_handle, parent)
+                # Navigation metadata from the selected image, not a textual
+                # dirname guess which could choose an executable alias's parent.
+                program_directory = windows_api.kernel_path_from_handle(parent)
+        # These definitions need integrity, not secrecy from the runtime.
+        # Inherit the installation's READ grant instead of an OWNER-RIGHTS-only
+        # protected temporary-directory ACL that blocks program inheritance.
+        host_directory = os.path.join(program_directory, 'host-hook-fixture-' + str(uuid.uuid4()))
+        os.mkdir(host_directory)
+        self.addCleanup(shutil.rmtree, host_directory)
+        environment['XDG_CONFIG_HOME'] = host_directory
+        script = os.path.join(host_directory, 'hook.py')
+        configuration = os.path.join(host_directory, 'loki', 'settings.ini')
+        witness = os.path.join(workspace, 'hooks.jsonl')
+        state = app_paths.loki_state_dir(environment)
+        hook_source = '''import json, os, sys
+phase, witness, state = sys.argv[1:]
+payload = json.load(sys.stdin)
+invocation = payload.get('invocation', {})
+arguments = invocation.get('effective_arguments', {})
+pattern = arguments.get('pattern')
+os.listdir(state)
+record = {'phase': phase, 'payload': payload, 'state_read': True, 'cwd': os.getcwd()}
+try:
+    with open(os.path.join(state, 'forbidden-hook-publication'), 'xb') as stream:
+        stream.write(b'forbidden')
+except OSError as error:
+    record['mutation'] = error.errno
+else:
+    record['mutation'] = 'allowed'
+with open(witness, 'a', encoding='utf-8') as stream:
+    stream.write(json.dumps(record) + '\\n')
+reply = {}
+if phase == 'pre_tool_call':
+    if pattern == 'pre-rewrite':
+        reply['arguments'] = {**arguments, 'pattern': 'HOST_HOOK_OUTPUT'}
+    elif pattern == 'pre-veto':
+        reply = {'action': 'deny', 'message': 'host pre veto'}
+elif phase == 'pre_tool_gate':
+    if pattern == 'gate-veto':
+        reply = {'action': 'deny', 'message': 'host gate veto'}
+    elif pattern == 'gate-rewrite':
+        reply['arguments'] = {**arguments, 'pattern': 'HOST_HOOK_OUTPUT'}
+elif phase == 'post_tool_call':
+    reply = {'note': 'host post note', 'content': 'FORGED_HOOK_OUTCOME',
+             'ok': False, 'arguments': {'pattern': 'must not rerun'}}
+elif phase == 'turn_end':
+    reply = {'action': 'deny', 'message': 'must not roll back'}
+print(json.dumps(reply))
+if phase == 'turn_end':
+    raise SystemExit(17)
+'''
+        with open(script, 'w', encoding='utf-8') as stream:
+            stream.write(hook_source)
+        definitions = []
+        for phase in ['pre_tool_call', 'pre_tool_gate', 'post_tool_call', 'turn_end']:
+            definitions.append(f'[hook.{phase}.{phase}]\ncwd = {workspace}\n')
+            for index, argument in enumerate([sys.executable, script, phase, witness, state]):
+                definitions.append(f'command.{index} = {argument}\n')
+            if phase != 'turn_end':
+                definitions.append('tools.0 = Grep\n')
+        original_configuration = ''.join(definitions)
+        write_user_settings(host_directory, original_configuration)
+        # This static-key workflow seals the complete configuration under the
+        # same host-controlled installation as its code. Provision the real
+        # private credential directory before the outer fixture makes it
+        # readonly; the supervisor only needs to read it here, not rotate/login.
+        from loki_agent import credential_storages
+        with mock.patch.dict(os.environ, environment, clear=True):
+            storage = credential_storages.JsonCredentialStorage()
+            storage.close()
+        payload_path = os.path.join(workspace, 'payload.txt')
+        with open(payload_path, 'w', encoding='utf-8') as stream:
+            stream.write('HOST_HOOK_OUTPUT\n')
+        calls = []
+        for pattern in ['pre-rewrite', 'pre-veto', 'gate-veto', 'gate-rewrite']:
+            calls.append({'id': pattern, 'type': 'function', 'function': {
+                'name': 'Grep', 'arguments': json.dumps({
+                    'pattern': pattern, 'path': payload_path, 'output_mode': 'content'})}})
+
+        async def respond(request):
+            completed = {message.get('tool_call_id') for message in request['messages']}
+            if 'pre-rewrite' not in completed:
+                selected = calls
+            elif 'read-configuration' not in completed:
+                selected = [{'id': name, 'type': 'function', 'function': {
+                    'name': 'Read', 'arguments': json.dumps({'file_path': path})}}
+                    for name, path in [['read-code', script], ['read-configuration', configuration]]]
+            elif 'write-configuration' not in completed:
+                selected = [{'id': name, 'type': 'function', 'function': {
+                    'name': 'Write', 'arguments': json.dumps({'file_path': path, 'content': 'tampered'})}}
+                    for name, path in [['write-code', script], ['write-configuration', configuration]]]
+            else:
+                return {'role': 'assistant', 'content': 'Host hook workflow complete.'}
+            return {'role': 'assistant', 'content': None, 'tool_calls': selected}
+
+        url, requests, authorizations = await self._provider(respond)
+        environment['LOKI_API_BASE'] = url
+        configure_container(environment, workspace)
+        front, diagnostics = await self._front(environment, workspace, protected_installation=True, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+        opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+        session_id = opened['sessionId']
+        reply, _messages = await self._request(front, 3, 'session/prompt', {
+            'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'Exercise the host policy'}]})
+        self.assertEqual(reply, {'stopReason': 'end_turn'})
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(authorizations, ['Bearer synthetic-hook-key'] * 4)
+        results = {message['tool_call_id']: message['content']
+                   for message in requests[-1]['messages'] if message.get('role') == 'tool'}
+        self.assertIn('HOST_HOOK_OUTPUT', results['pre-rewrite'])
+        self.assertIn('host post note', results['pre-rewrite'])
+        self.assertNotIn('FORGED_HOOK_OUTCOME', results['pre-rewrite'])
+        self.assertIn('host pre veto', results['pre-veto'])
+        self.assertIn('host gate veto', results['gate-veto'])
+        self.assertIn('cannot replace tool arguments', results['gate-rewrite'])
+        # Model-visible error prose differs by failure boundary/platform; the
+        # existing ACP outcome flag is the status contract. Still require the
+        # real permission-denial codes below, not merely a failed operation.
+        failed_calls = {update['toolCallId'] for update in _tool_updates(_messages, session_id)
+                        if update['sessionUpdate'] == 'tool_call_update'
+                        and update.get('status') == 'failed'}
+        for call_id in ['write-code', 'write-configuration']:
+            self.assertIn(call_id, failed_calls)
+            self.assertTrue(any(code in results[call_id] for code in [
+                '[Errno 30]', '[Errno 13]', '[WinError 5]', 'failed: 0xc0000022']), results[call_id])
+        with open(script, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), hook_source)
+        with open(configuration, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), original_configuration)
+        with open(witness, encoding='utf-8') as stream:
+            records = [json.loads(line) for line in stream]
+        for record in records:
+            self.assertTrue(record['state_read'], record)
+            self.assertEqual(record['cwd'], workspace)
+            self.assertIn(record['mutation'], [errno.EROFS, errno.EACCES, errno.EPERM], record)
+        self.assertEqual([record['phase'] for record in records].count('turn_end'), 1)
+        posts = {record['payload']['invocation']['call_id']: record['payload']['outcome']
+                 for record in records if record['phase'] == 'post_tool_call'}
+        self.assertEqual(set(posts), {'pre-rewrite', 'pre-veto', 'gate-veto', 'gate-rewrite'})
+        self.assertTrue(posts['pre-rewrite']['executed'])
+        for call_id in ['pre-veto', 'gate-veto', 'gate-rewrite']:
+            self.assertFalse(posts[call_id]['executed'], posts[call_id])
+        # Local commands do not become a second user-facing inference turn.
+        await self._request(front, 4, 'session/prompt', {
+            'sessionId': session_id, 'prompt': [{'type': 'text', 'text': '/status'}]})
+        self.assertEqual(len(requests), 4)
+        with open(witness, encoding='utf-8') as stream:
+            self.assertEqual([json.loads(line) for line in stream], records)
+        await self._finish(front, diagnostics, session_id)
+        self.assertIn(b'Turn-end hook', await diagnostics)
+        job_records = []
+        for directory, _children, names in os.walk(os.path.join(state, 'jobs')):
+            if 'job.json' in names:
+                with open(os.path.join(directory, 'job.json'), encoding='utf-8') as stream:
+                    job_records.append(json.load(stream))
+        self.assertEqual(len(job_records), 1, job_records)
+        self.assertEqual(job_records[0]['exit_code'], 0)
+        saved_path = os.path.join(app_paths.chat_log_dir_for(workspace), f'chat-{session_id}.json')
+        with open(saved_path, encoding='utf-8') as stream:
+            saved = json.load(stream)
+        self.assertIn('Host hook workflow complete.', json.dumps(saved))
+
+    async def test_resource_real_tool_continuation_save_and_fresh_replay(self):
+        await self._resource_tool_continuation()
+
+    async def test_resource_fixture_closes_state_after_configuration_failure(self):
+        await self._resource_fixture_failure('loki_agent.loki.apply_runtime_config')
+
+    async def test_resource_fixture_closes_state_after_prompt_failure(self):
+        await self._resource_fixture_failure('loki_agent.acp_worker.Worker.prompt')
+
+    async def _resource_fixture_failure(self, target):
+        from loki_agent import sessions
+
+        # Reuse the real resource journey and retain its Sessions beyond scope
+        # exit: a destructor cannot supply false evidence of fixture cleanup.
+        # Each failure is independently selectable and happens before Bash runs.
+        original = sessions.Session
+        held = []
+
+        def create(*arguments, **keywords):
+            session = original(*arguments, **keywords)
+            held.append(session)
+            return session
+
+        try:
+            with mock.patch.object(sessions, 'Session', side_effect=create), \
+                    mock.patch(target, side_effect=RuntimeError('resource fixture injected failure')):
+                with self.assertRaisesRegex(RuntimeError, 'resource fixture injected failure'):
+                    await self._resource_tool_continuation()
+            self.assertEqual(len(held), 1, 'failure must occur after Session state acquisition')
+            for session in held:
+                with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
+                    session.response_headers.directory_handle
+        finally:
+            # Release even a failing red control without relying on its GC.
+            for session in held:
+                await session.close_state()
+
+    async def _resource_tool_continuation(self):
+        import copy
+        from contextlib import AsyncExitStack
+        from pathlib import Path
+        from loki_agent import formats, loki, paths, protocols, response_headers
+        from loki_agent.acp_worker import Worker
+        from loki_agent.sessions import Session
+
+        # The fixture, not Worker.close(), owns each Session's retained state.
+        # Register it before setup can fail; this outer stack joins state after
+        # the worker backstop and before removing the workspace it refers to.
+        async with AsyncExitStack() as stack:
+            root = stack.enter_context(tempfile.TemporaryDirectory())
+            workspace, payload, command, result = _tool_fixture(root)
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("LOKI_")
+                           and not key.endswith(("_KEY", "_TOKEN", "_PAT"))}
+            environment.update({"HOME": root, "XDG_CONFIG_HOME": os.path.join(root, "config"),
+                                "XDG_STATE_HOME": os.path.join(root, "state")})
+            stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
+            credentials = CredentialStore({
+                "LOKI_PROVIDER": "openai", "LOKI_API_BASE": "https://provider.invalid/v1",
+                "LOKI_MODEL": "tool-model", "LOKI_STREAM": "1",
+            })
+            stack.enter_context(mock.patch.object(loki, "CREDENTIALS", credentials))
+            state_root = paths.loki_state_dir(environment)
+            session = Session(shell_cwd=workspace, response_headers=response_headers.Store(
+                os.path.join(state_root, 'response-headers.json')))
+            stack.push_async_callback(session.close_state)
+            stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
+            stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(state_root, "jobs")))
+            stack.enter_context(mock.patch.object(models, "ensure_index", new=mock.AsyncMock(return_value=({}, {}))))
+            loki.apply_runtime_config(connections.build_config_from_env(credentials=credentials))
+            messages = []
+            session_id = "tool-workflow"
+            worker = Worker(session, messages.append, session_id)
+            workers = [worker]
+            args = {"command": command, "timeout": None, "description": "Read the relative fixture"}
+            call_id = "provider-call-73"
+            resource = {"name": "payload.txt", "uri": Path(workspace, "payload.txt").as_uri(),
+                        "title": "Source \u03b1", "description": "A uniquely populated local file",
+                        "mimeType": "text/plain", "size": len(payload)}
+            user = "inspect this\n[ACP resource link]\n" + json.dumps(resource, ensure_ascii=False)
+            requests = []
+
+            async def completion(items, *, tools, **kwargs):
+                self.assertIsInstance(tools, list)
+                self.assertFalse(kwargs["cancel_check"]())
+                requests.append(copy.deepcopy(items))
+                self.assertLessEqual(len(requests), 2, "unexpected additional provider request")
+                if len(requests) == 1:
+                    for chunk in ["Inspecting ", "resource."]:
+                        kwargs["on_text_delta"](chunk)
+                    return formats.DecodedTurn([
+                        formats.message_item("assistant", "Inspecting resource."),
+                        formats.tool_call_item(call_id, "Bash", args),
+                    ], {"protocol": protocols.OPENAI_CHAT})
+                for chunk in ["Tool ", "complete."]:
+                    kwargs["on_text_delta"](chunk)
+                return formats.DecodedTurn([
+                    formats.message_item("assistant", "Tool complete."),
+                ], {"protocol": protocols.OPENAI_CHAT})
+
+            stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
+            try:
+                await worker.prepare_open({
+                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/new"})
+                worker.commit_open()
+                messages.clear()
+                reply = await worker.prompt({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "inspect this"},
+                               {"type": "resource_link", **resource, "unadvertised": "must not leak"}],
+                })
+                self.assertEqual(reply, {"stopReason": "end_turn"})
+                self.assertEqual(len(requests), 2)
+                for request in requests:
+                    self.assertEqual([item["content"] for item in request
+                                      if item.get("role") == "user"],
+                                     [[{"type": "text", "text": user}]])
+                followup = requests[1]
+                self.assertEqual([item["type"] for item in followup[-3:]],
+                                 ["message", "model_response", "tool_result"])
+                self.assertEqual(followup[-2]["items"][0], {
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "text", "text": "Inspecting resource."}],
+                })
+                continued_call = followup[-2]["items"][1]
+                self.assertEqual(continued_call["call_id"], call_id)
+                self.assertEqual(continued_call["name"], "Bash")
+                self.assertEqual(json.loads(continued_call["arguments"]), args)
+                self.assertEqual(len(followup[-2]["items"]), 2)
+                self.assertEqual(followup[-1]["call_id"], call_id)
+                self.assertEqual(followup[-1]["content"], [{"type": "text", "text": result}])
+                self.assertIs(followup[-1]["is_error"], False)
+                self.assertEqual(_tool_updates(messages, session_id),
+                                 _assistant_chunks("Inspecting ", "resource.")
+                                 + _call_and_result(call_id, command, workspace, result)
+                                 + _assistant_chunks("Tool ", "complete."))
+                with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
+                    self.assertEqual(stream.read(), payload)
+                self.assertIsNotNone(session.job_manager)
+                self.assertEqual(len(session.job_manager.jobs), 1)
+                job = next(iter(session.job_manager.jobs.values()))
+                self.assertEqual(job.cwd, workspace)
+                self.assertEqual(job.status, "exited")
+                self.assertEqual(job.exit_code, 0)
+                self.assertEqual(job.process.returncode, 0)
+                with open(job.stdout_path, encoding="utf-8") as stream:
+                    self.assertEqual(stream.read(), payload.decode())
+                with open(job.stderr_path, encoding="utf-8") as stream:
+                    self.assertEqual(stream.read(), "")
+                path = session.chat_log_path
+                self.assertEqual(path, os.path.join(
+                    app_paths.chat_log_dir_for(workspace), f'chat-{session_id}.json'))
+                saved = self._saved_tool_turn(path, user, call_id, args, result,
+                                              ["Inspecting resource.", "Tool complete."])
+                await worker.close()
+                restored_session = Session(shell_cwd=workspace)
+                stack.push_async_callback(restored_session.close_state)
+                loki._DEFAULT_SESSION = restored_session
+                restored = Worker(restored_session, messages.append, session_id)
+                workers.append(restored)
+                messages.clear()
+                await restored.prepare_open({
+                    "sessionId": session_id, "cwd": workspace, "openMethod": "session/load",
+                    "replay": False})
+                self.assertEqual(restored_session.transcript_items, saved["events"])
+                self.assertEqual(_tool_updates(messages, session_id), [])
+                restored.commit_open()
+                self.assertEqual(_tool_updates(messages, session_id), [
+                    {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": user}},
+                    *_assistant_chunks("Inspecting resource."),
+                    {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Bash",
+                     "kind": "other", "status": "completed"},
+                    {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Tool result: Bash",
+                     "kind": "other", "status": "completed"},
+                    *_assistant_chunks("Tool complete."),
+                ])
+                self.assertEqual(len(requests), 2, "load must not perform inference")
+                with open(os.path.join(workspace, "executed.txt"), "rb") as stream:
+                    self.assertEqual(stream.read(), payload, "load must not execute historical calls")
+                await restored.close()
+            finally:
+                # Backstop only: owned job exit/output was asserted above.
+                for owner in workers:
+                    await owner.close()
+        for owner in workers:
+            with self.assertRaisesRegex(ValueError, 'response status storage is closed'):
+                owner.session.response_headers.directory_handle
 
 
 def _command_fixture(root):
@@ -3147,8 +3694,9 @@ class LocalCommandJourneyTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCas
                             "type": "message", "role": "system", "content": [{
                                 "type": "text",
                                 "text": (
-                                    f"Current Loki cwd changed to: {destination}. "
-                                    "Relative tool paths and Bash commands now run from this directory."),
+                                    f"Current shell cwd changed to: {destination}. "
+                                    "Relative tool paths now resolve against this directory; Bash commands now start here. "
+                                    "Loki's process cwd is unchanged."),
                             }],
                         })
                     self.assertEqual(session.transcript_items, initial)
@@ -3208,11 +3756,10 @@ class _LocalWorkerProcess:
     Worker.handle generates every reply and update. EOF drives Worker.close;
     wait observes that operation, rather than supplying cleanup in assertions.
     """
-
     def __init__(self, session, session_id, before_request):
         from loki_agent.acp_worker import Worker
         self.before_request = before_request
-        self.stdout = asyncio.StreamReader(limit=64 * 1024)
+        self.stdout = asyncio.StreamReader(limit=acps.MAX_MESSAGE_BYTES)
         self.stdin = self
         self.returncode = None
         self.buffer = bytearray()
