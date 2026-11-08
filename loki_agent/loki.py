@@ -1666,7 +1666,7 @@ async def run_tool_loop_async(
             transcript_items.append(formats.tool_result_for_call(
                 call, reason, is_error=True))
 
-    async def recover_failure(failure, *, saved=False):
+    async def recover_failure(failure: dict, *, saved=False):
         # The same object was already available to prepared-request replay.
         # A terminal request decision is latched there; do not create/reset a
         # second budget here. Only this loop may continue canonical history.
@@ -1711,7 +1711,7 @@ async def run_tool_loop_async(
         loop_count += 1
         live_text_started = False
         live_text_parts = []
-        live_reasoning = {}
+        live_reasoning: dict[tuple, str] = {}
         open_reasoning = None
 
         def close_reasoning(complete=True, reason=None):
@@ -1787,24 +1787,12 @@ async def run_tool_loop_async(
             finish_live_text(False, "error")
             on_event({"type": "transcript_error", "error": e})
             return ""
-        except protocols.ResponseApiError as error:
-            if await recover_failure(model_requests.failure_event(error)):
-                continue
-            return ""
-        except protocols.StreamProtocolError as error:
-            if await recover_failure(model_requests.failure_event(error)):
-                continue
-            return ""
-        except protocols.ProtocolError as error:
-            if await recover_failure(model_requests.failure_event(error)):
-                continue
-            return ""
-        except model_requests.ApiError as error:
-            if await recover_failure(model_requests.failure_event(error)):
-                continue
-            return ""
-        except OSError as error:
-            if await recover_failure(model_requests.failure_event(error)):
+        except (protocols.ProtocolError, model_requests.ApiError, OSError) as error:
+            # None is the completed-turn branch; every caught exception
+            # type maps to a failure event.
+            failure = model_requests.failure_event(error)
+            assert failure is not None
+            if await recover_failure(failure):
                 continue
             return ""
         except BaseException:
@@ -1882,6 +1870,8 @@ async def run_tool_loop_async(
                     "was incomplete.",
                 )
             failure = model_requests.failure_event(turn)
+            # None is the completed-turn branch; this response is incomplete.
+            assert failure is not None
             if await recover_failure(failure, saved=True):
                 continue
             return assistant_text

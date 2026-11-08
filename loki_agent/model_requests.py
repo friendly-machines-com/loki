@@ -245,7 +245,7 @@ class StreamingApiError(ApiError):
               "streaming, set LOKI_STREAM=0.")
 
 
-def failure_event(error):
+def failure_event(error) -> dict | None:
     """Preserve one request failure in the existing model/tool event vocabulary.
 
     Prepared-request replay and the tool loop have explicit exception boundaries.
