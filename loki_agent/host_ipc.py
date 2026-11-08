@@ -9,8 +9,8 @@ Two channels need this: the session-lifetime channel and the credential
 capability channel.  POSIX keeps a pipe for the first and an AF_UNIX socket for
 the second, exactly as before.
 
-Windows uses anonymous pipes: one for owner lifetime, two for the bidirectional
-credential channel. The tested Windows interpreters do not expose AF_UNIX;
+Windows uses directly inherited secured pipes: one for owner lifetime, two for
+the bidirectional credential channel. The tested Windows interpreters do not expose AF_UNIX;
 CPython's TCP-emulated socketpair would instead introduce an address-reachable
 listener and a connection-substitution check. Neither is needed for endpoints
 handed directly to a child.
@@ -21,36 +21,14 @@ inherited-handle list and protection of processes holding the handles -- not a
 promise that every Windows version implements anonymous pipes without a name.
 No additional allocation or launch protocol is involved.
 
-This module's channels are the credential and owner channels and the job
-channels.  The ACP worker's stdio is not here: it is overlapped named pipes in
-``windows_subprocesses``, where asyncio owns the I/O.
+The secured overlapped allocator is shared with subprocess stdio. Confidential
+owner/credential channels remain separate one-way ends and never acquire the
+stdio writer's duplex data-read grant. Inheritance and explicit process-handle
+lists, not names or a second handshake, select the child's ends.
 
-Both channels are therefore the same shape on Windows: a private channel,
-parent end non-inheritable, child end inheritable and named in the handle list.
-
-**The Windows ends are :class:`PipeEndpoint`.**  Every channel is a
-``(parent endpoint, child endpoint)`` pair at all times.  On Windows an
-endpoint wraps one handle per direction (the owner channel is unidirectional,
-so its endpoints have one handle each; the credential channel is
-bidirectional, so the child endpoint carries a read handle and a write handle
-and the parent endpoint carries the complementary two).  Only the child
-endpoint's handles are ever inherited or named in the child's handle list, and
-``reference``/``handles`` take the endpoint object -- never a bare handle -- so
-a caller cannot hand over the wrong side.  The child ends are distinct and
-unidirectional: the child cannot read its own requests or write its own
-responses.
-
-POSIX keeps the objects it always had -- an ``int`` descriptor for the owner
-channel and a ``socket.socket`` for the credential channel -- so its behaviour
-and tests are unchanged; the endpoints are a Windows type.  ``open_streams``
-and ``watch_closed`` are the transport-neutral seam the runtime layer uses: the
-Windows implementation builds an :class:`asyncio.StreamReader` fed by
-``handle_reader.HandleReader`` and flushes writes from a dedicated thread, so a
-blocking ``WriteFile`` on a full pipe never freezes the event loop.  Those
-threads are this module's remaining cost: the reader thread joins with a
-timeout on stop, and a writer thread blocked in ``WriteFile`` on a full pipe
-cannot be stopped until its peer closes, which is why the ACP worker's stdio
-does not use them.
+Pending asynchronous I/O belongs to the adopted endpoint's stream owner. Kernel
+completion, including joined cancellation, precedes endpoint closure; there are
+no IPC reader/writer threads or fixed joins. EOF stdin remains synchronous.
 """
 
 from __future__ import annotations
@@ -58,19 +36,155 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import ctypes
+from ctypes import wintypes
 import os
-import secrets
 import socket
+import secrets
 import sys
-import threading
+import uuid
+import warnings
+
+from .lifetimes import finish_cleanup
+from .streams import BufferedReader
 
 from . import windows_api
 
-# A confirmed pair is one whose two ends really are connected to each other.
-# The nonce round-trip cannot fail for a POSIX ``socketpair()``; it exists
-# because the Windows pair is built around a filesystem name, and ``accept``
-# cannot say whose connection it accepted, so a process that wins the
-# bind/connect race would otherwise be handed one end of a foreign connection.
+PIPE_ACCESS_DUPLEX = 0x00000003
+PIPE_ACCESS_INBOUND = 0x00000001
+PIPE_WAIT = 0x00000000
+PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+ERROR_PIPE_BUSY = 231
+ERROR_PIPE_CONNECTED = 535
+ERROR_ACCESS_DENIED = 5
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+BUFSIZE = 8192
+_MAX_NAME_ATTEMPTS = 20
+
+
+if sys.platform == "win32":
+    def overlapped_pipe(*, duplex=False, overlapped=(True, True), bufsize=BUFSIZE):
+        """Like ``os.pipe()`` but with overlapped support and using handles.
+
+        Returns ``(h1, h2)``: ``h1`` is the ``CreateNamedPipe`` end and ``h2`` the
+        connecting client. ``overlapped`` selects each endpoint's native I/O mode:
+        child stdio remains synchronous; both capability-channel ends are async.
+        """
+        create_pipe = windows_api.bind(
+            "kernel32", "CreateNamedPipeW", ctypes.c_void_p, wintypes.LPCWSTR,
+            wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+            wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p)
+        connect = windows_api.bind(
+            "kernel32", "ConnectNamedPipe", wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p)
+
+        if duplex:
+            openmode = PIPE_ACCESS_DUPLEX
+            access = windows_api.AccessMask.GENERIC_READ | windows_api.AccessMask.GENERIC_WRITE
+            obsize, ibsize = bufsize, bufsize
+        else:
+            openmode = PIPE_ACCESS_INBOUND
+            access = windows_api.AccessMask.GENERIC_WRITE
+            obsize, ibsize = 0, bufsize
+        openmode |= windows_api.FileFlags.FILE_FLAG_FIRST_PIPE_INSTANCE
+        if overlapped[0]:
+            openmode |= windows_api.FileFlags.FILE_FLAG_OVERLAPPED
+        client_flags = (windows_api.FileFlags.FILE_FLAG_OVERLAPPED if overlapped[1] else 0)
+
+        # The pipe name is not a control: the ends are connected here and only the
+        # child's inherited handle reaches the child.  The DACL nevertheless keeps
+        # the default one -- which grants Everyone read -- from applying while the
+        # name is briefly visible in the namespace.
+        policy = pipe_policy(duplex=duplex)
+        with contextlib.ExitStack() as rollback:
+            with windows_api._converted_security_descriptor(policy['descriptor']) as descriptor:
+                attributes = windows_api.SecurityAttributes(
+                    ctypes.sizeof(windows_api.SecurityAttributes), descriptor, 0)
+                for attempt in range(_MAX_NAME_ATTEMPTS):
+                    # Contained creators need the LOCAL pipe namespace. The ACP front
+                    # remains uncontained; its existing child-handle protocol is intact.
+                    prefix = r"\\.\pipe\LOCAL" if policy['package'] is not None else r"\\.\pipe"
+                    address = prefix + "\\" + "loki-worker-" + uuid.uuid4().hex
+                    handle = create_pipe(address, openmode, PIPE_WAIT
+                                         | PIPE_REJECT_REMOTE_CLIENTS, 1, obsize,
+                                         ibsize, 0, ctypes.byref(attributes))
+                    if handle and handle != INVALID_HANDLE_VALUE:
+                        server = handle
+                        rollback.callback(windows_api.close_handle, server)
+                        break
+                    status = ctypes.get_last_error()
+                    # Another process holding this name cannot be distinguished from
+                    # a name collision here; try another random name either way.
+                    if (attempt == _MAX_NAME_ATTEMPTS - 1
+                            or status not in [ERROR_PIPE_BUSY, ERROR_ACCESS_DENIED]):
+                        raise windows_api.WindowsApiError("CreateNamedPipeW failed", status=status)
+                client = windows_api.open_with_access(
+                    address, access, creation=windows_api.FileCreateDisposition.OPEN_EXISTING,
+                    flags=client_flags, share_mode=0)
+                rollback.callback(windows_api.close_handle, client)
+                # The client connected first, so this reports ERROR_PIPE_CONNECTED.
+                if not connect(server, None):
+                    status = ctypes.get_last_error()
+                    if status != ERROR_PIPE_CONNECTED:
+                        raise windows_api.WindowsApiError("ConnectNamedPipe failed", status=status)
+            # Both ends are still unpublished while the shared descriptor retires.
+            # Rollback attempts each acquired close even when another one raises.
+            rollback.pop_all()
+            return server, client
+
+
+class PipeHandle:
+    """The file-like raw owner lent to the public proactor pipe adapters.
+
+    Those adapters notify their protocol before raw close; a close exception is
+    otherwise only a loop diagnostic. Retain that one release failure so the
+    owning process can report it after protocol retirement, without another
+    closer task or another attempt on the consumed native handle.
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+        self._close_error: BaseException | None = None
+
+    def __repr__(self):
+        handle = (f'handle={self._handle!r}' if self._handle is not None
+                  else 'closed')
+        return f'<{self.__class__.__name__} {handle}>'
+
+    @property
+    def handle(self):
+        return self._handle
+
+    def fileno(self):
+        """The raw Windows handle: what the proactor's pipe calls expect."""
+        if self._handle is None:
+            raise ValueError("I/O operation on closed pipe")
+        return self._handle
+
+    def close(self):
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                windows_api.close_handle(handle)
+            except BaseException as error:
+                self._close_error = error
+                raise
+
+    def raise_close_error(self):
+        if self._close_error is not None:
+            raise self._close_error
+
+    def __del__(self, _warn=warnings.warn):
+        if self._handle is not None:
+            _warn(f"unclosed {self!r}", ResourceWarning, source=self)
+            self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
 _PAIR_CONFIRM_BYTES = 32
 _PAIR_CONFIRM_TIMEOUT = 5.0
 
@@ -163,10 +277,27 @@ def pipe_policy(*, duplex=False):
     return {'descriptor': descriptor, 'package': package}
 
 
-def private_pipe(inherit: bool = True):
-    """Allocate one-way private IPC; only owning runtimes get credential ends."""
-    return windows_api.create_pipe(
-        inherit=inherit, security_descriptor=pipe_policy()['descriptor'])
+if sys.platform == "win32":
+    def private_pipe(inherit: bool = True, *, overlapped=False):
+        """One-way private ends; only asynchronous channel callers request overlap.
+
+        EOF stdin remains synchronous. Owner/credential endpoints use the same
+        secured allocator as stdio without its duplex data-read permission.
+        """
+        if not overlapped:
+            return windows_api.create_pipe(
+                inherit=inherit, security_descriptor=pipe_policy()['descriptor'])
+        read, write = overlapped_pipe()
+        try:
+            for handle in [read, write]:
+                windows_api.set_handle_information(handle, windows_api.HandleFlags.HANDLE_FLAG_INHERIT,
+                                                   windows_api.HandleFlags.HANDLE_FLAG_INHERIT if inherit else 0)
+        except BaseException:
+            with contextlib.ExitStack() as cleanup:
+                cleanup.callback(windows_api.close_handle, write)
+                cleanup.callback(windows_api.close_handle, read)
+            raise
+        return read, write
 
 
 def eof_stdin():
@@ -214,47 +345,48 @@ def eof_stdin():
     return read, close
 
 
-def _private_pipe_pair():
-    """Two private one-way pipes forming a bidirectional byte channel.
+if sys.platform == "win32":
+    def _private_pipe_pair():
+        """Two private one-way pipes forming a bidirectional byte channel.
 
-    Returns ``(request, response)``, each a ``(parent, child)`` pair.  The
-    request pipe carries child-to-parent bytes (``request`` is
-    ``(parent_read, child_write)``); the response pipe carries parent-to-child
-    bytes (``response`` is ``(child_read, parent_write)``).  A delegated
-    process receives exactly the two ``child`` handles through the explicit
-    handle list, and the two ``parent`` handles stay here with inheritance
-    cleared.
+        Returns ``(request, response)``, each a ``(parent, child)`` pair.  The
+        request pipe carries child-to-parent bytes (``request`` is
+        ``(parent_read, child_write)``); the response pipe carries parent-to-child
+        bytes (``response`` is ``(child_read, parent_write)``).  A delegated
+        process receives exactly the two ``child`` handles through the explicit
+        handle list, and the two ``parent`` handles stay here with inheritance
+        cleared.
 
-    No connection by address is part of this handoff, so ``confirm_pair`` is
-    unnecessary. The pipe DACL and protection of handle holders must also deny
-    unauthorized access/recovery; anonymity is not that security proof.
+        The creator connects both ends before handoff. The pipe DACL and
+        protection of handle holders must also deny
+        unauthorized access/recovery; anonymity is not that security proof.
 
-    Defined outside the platform branch because it depends only on
-    ``windows_api``'s import-safe declarations; calling it off Windows raises
-    the same ``WindowsUnavailableError`` any other Windows call does.
-    """
-    request_read, request_write = private_pipe()
-    try:
-        response_read, response_write = private_pipe()
-    except BaseException:
-        windows_api.close_handle(request_read)
-        windows_api.close_handle(request_write)
-        raise
-    try:
-        # Only the child's ends stay inheritable; the parent's ends are cleared
-        # so they can never be inherited by an unrestricted child.
-        windows_api.clear_handle_inheritance(request_read)
-        windows_api.clear_handle_inheritance(response_write)
-    except BaseException:
-        for handle in [request_read, request_write,
-                       response_read, response_write]:
-            windows_api.close_handle(handle)
-        raise
-    return (request_read, request_write), (response_read, response_write)
+        Only Windows channel factories allocate these native handles. POSIX
+        credential channels use the kernel's connected socketpair instead.
+        """
+        request_read, request_write = private_pipe(overlapped=True)
+        try:
+            response_read, response_write = private_pipe(overlapped=True)
+        except BaseException:
+            with contextlib.ExitStack() as cleanup:
+                cleanup.callback(windows_api.close_handle, request_write)
+                cleanup.callback(windows_api.close_handle, request_read)
+            raise
+        try:
+            # Only the child's ends stay inheritable; the parent's ends are cleared
+            # so they can never be inherited by an unrestricted child.
+            windows_api.clear_handle_inheritance(request_read)
+            windows_api.clear_handle_inheritance(response_write)
+        except BaseException:
+            with contextlib.ExitStack() as cleanup:
+                for handle in [response_write, response_read, request_write, request_read]:
+                    cleanup.callback(windows_api.close_handle, handle)
+            raise
+        return (request_read, request_write), (response_read, response_write)
 
 
 class PipeEndpoint:
-    """One side of a Windows anonymous-pipe channel.
+    """One side of a directly inherited Windows pipe channel.
 
     ``read``/``write`` are Windows handles, or ``None`` when that direction is
     absent.  The owner channel is unidirectional (parent write-only, child
@@ -308,163 +440,145 @@ class PipeEndpoint:
         return cls(read, write)
 
     def close(self) -> None:
-        for handle in self.handles():
-            windows_api.close_handle(handle)
+        handles = self.handles()
+        # Consume once even on failure; retrying a possibly invalid numeric
+        # handle could close a replacement. Errors still propagate after both
+        # independent ends have received their release attempt.
         self.read = self.write = None
+        with contextlib.ExitStack() as cleanup:
+            for handle in reversed(handles):
+                cleanup.callback(windows_api.close_handle, handle)
 
 
 def is_endpoint(value) -> bool:
-    """Whether ``value`` is a Windows pipe endpoint (never true on POSIX)."""
+    """Whether a value carries native pipe handles rather than a CRT/POSIX fd."""
     return isinstance(value, PipeEndpoint)
 
 
-class _HandleWriter:
-    """Flush queued bytes to a Windows handle from one thread.
+class _PipeStreams:
+    """Own an adopted overlapped endpoint and its serial byte operations.
 
-    A blocking ``WriteFile`` on a full pipe must not run on the loop thread, or
-    it freezes every task -- the same reason ``HandleReader`` exists for the
-    read side (anonymous pipe handles support no overlapped I/O, so the
-    proactor loop cannot take them).  Writes are queued and flushed in order by
-    a single thread; the loop only enqueues and awaits the drain signal.
-    Closing the peer's complementary end makes an in-flight ``WriteFile`` fail,
-    which is what lets teardown stop a blocked thread.
+    Public asyncio's write-pipe adapter requires read access; private proactor
+    hooks are not a supported substitute. The native operation primitive owns
+    pending buffers, so this replaces two threads and a forwarding pump rather
+    than adding another queue/reader lifecycle. No address or new authority is
+    introduced, and closing admission never closes handles under active I/O.
     """
 
-    def __init__(self, handle, loop):
-        self.handle = handle
-        self.loop = loop
-        self._pending = collections.deque()
-        self._lock = threading.Lock()
-        self._wake = threading.Event()
-        self._stop = threading.Event()
-        self._drained = None
-        self._error = None
-        self.thread = None
-
-    def start(self) -> None:
-        self._drained = asyncio.Event()
-        self.thread = threading.Thread(
-            target=self._run, name="loki-handle-writer", daemon=True)
-        self.thread.start()
-
-    def write(self, data) -> None:
-        with self._lock:
-            self._pending.append(bytes(data))
-        self._wake.set()
-
-    def _run(self) -> None:
-        while True:
-            # Poll the stop event as well as the work event, so an idle writer
-            # is not a thread that can never be joined.
-            self._wake.wait(0.05)
-            self._wake.clear()
-            failure = None
-            while True:
-                with self._lock:
-                    if not self._pending:
-                        break
-                    chunk = self._pending.popleft()
-                try:
-                    offset = 0
-                    while offset < len(chunk):
-                        offset += windows_api.write_file(
-                            self.handle, chunk[offset:])
-                except BaseException as error:  # noqa: BLE001 - re-raised on loop
-                    failure = error
-                    break
-            if failure is not None:
-                with self._lock:
-                    self._pending.clear()
-                self._error = failure
-                self._signal()
-                return
-            self._signal()
-            if self._stop.is_set():
-                return
-
-    def _signal(self) -> None:
-        try:
-            self.loop.call_soon_threadsafe(self._set_drained)
-        except RuntimeError:
-            # The loop is closed; teardown is already running.
-            pass
-
-    def _set_drained(self) -> None:
-        if self._drained is not None:
-            self._drained.set()
-
-    async def drain(self) -> None:
-        while True:
-            if self._error is not None:
-                raise self._error
-            with self._lock:
-                if not self._pending:
-                    return
-            # Clear, then re-check under the lock: a flush that completed
-            # between the check and the clear must not be lost, or this waits
-            # for a signal that already fired.
-            self._drained.clear()
-            with self._lock:
-                if not self._pending:
-                    continue
-            await self._drained.wait()
-
-    def close(self) -> None:
-        self._stop.set()
-        self._wake.set()
-
-    def stop_and_join(self, timeout: float = 2.0) -> None:
-        self.close()
-        if self.thread is not None:
-            self.thread.join(timeout)
-            if self.thread.is_alive():
-                # Closing a handle under a live writer is worse than failing.
-                raise RuntimeError("handle writer thread did not stop")
-            self.thread = None
-
-
-async def _feed_reader(reader: "asyncio.StreamReader", queue) -> None:
-    """Forward the reader thread's byte posts into an asyncio StreamReader."""
-    while True:
-        data = await queue.get()
-        if not data:
-            reader.feed_eof()
-            return
-        reader.feed_data(data)
-
-
-class _PipeStreamWriter:
-    """A ``StreamWriter``-shaped adapter over a handle writer and its reader.
-
-    The credential client and server are written against
-    ``StreamReader``/``StreamWriter``; this lets the Windows pipe transport
-    satisfy that interface without a parallel protocol implementation.  Writes
-    are queued to the writer thread, reads come from the handle reader, and
-    closing the adapter stops both threads and closes the endpoint's handles.
-    """
-
-    def __init__(self, source, pump, sink, endpoint):
-        self._source = source
-        self._pump = pump
-        self._sink = sink
+    def __init__(self, endpoint, *, limit=None):
         self._endpoint = endpoint
+        self._reader = BufferedReader(self._receive, 65536 if limit is None else limit)
+        self._reading = None
+        self._writing = None
+        self._pending = collections.deque()
+        self._closing = False
 
-    def write(self, data) -> None:
-        self._sink.write(data)
+    @property
+    def transport(self):
+        """The same operation owner implements the public writer transport seam."""
+        return self
 
-    async def drain(self) -> None:
-        await self._sink.drain()
+    def is_closing(self):
+        return self._closing
 
-    def close(self) -> None:
-        self._sink.close()
-        self._source.stop()
-        if not self._pump.done():
-            self._pump.cancel()
+    def abort(self):
+        self.close()
 
-    async def wait_closed(self) -> None:
-        await asyncio.gather(self._pump, return_exceptions=True)
-        self._sink.stop_and_join()
-        self._endpoint.close()
+    async def readline(self):
+        return await self._reader.readline()
+
+    async def _receive(self):
+        if self._closing:
+            raise ConnectionError('pipe is closed')
+        if self._reading is not None:
+            raise RuntimeError('pipe already has a reader')
+        self._reading = asyncio.create_task(windows_api.read_pipe(self._endpoint.read))
+        try:
+            return await self._reading
+        except windows_api.WindowsApiError as error:
+            raise OSError(None, str(error), None, error.status) from error
+        finally:
+            self._reading = None
+
+    def write(self, data):
+        if self._closing:
+            raise ConnectionError('pipe is closed')
+        if self._writing is not None and self._writing.done():
+            self._writing.result()
+        if data:
+            self._pending.append(bytes(data))
+            if self._writing is None or self._writing.done():
+                self._writing = asyncio.create_task(self._flush())
+
+    async def _flush(self):
+        try:
+            while self._pending:
+                await windows_api.write_pipe(self._endpoint.write, self._pending.popleft())
+        except windows_api.WindowsApiError as error:
+            kind = BrokenPipeError if error.status in windows_api.PIPE_CLOSED_ERRORS else OSError
+            raise kind(None, str(error), None, error.status) from error
+
+    async def drain(self):
+        if self._writing is not None:
+            await asyncio.shield(self._writing)
+
+    def close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._pending.clear()
+        for task in [self._reading, self._writing]:
+            if task is not None and not task.done():
+                task.cancel()
+
+    async def wait_closed(self):
+        self.close()
+
+        async def retire():
+            try:
+                outcomes = await asyncio.gather(*[
+                    task for task in [self._reading, self._writing] if task is not None],
+                    return_exceptions=True)
+            finally:
+                self._endpoint.close()
+            for outcome in outcomes:
+                if isinstance(outcome, Exception):
+                    raise outcome
+
+        await finish_cleanup(retire())
+
+
+def close_end(end) -> None:
+    """Release the original channel object, not a reconstructed handle copy."""
+    if is_endpoint(end) or isinstance(end, socket.socket):
+        end.close()
+    else:
+        os.close(end)
+
+
+def watch_closed(end):
+    """Borrow an owner end; the caller owns its release after watcher retirement.
+
+    SessionOwner and direct process fixtures use the same close-only protocol.
+    Clear fd inheritance here, before a returned coroutine can first run; sockets
+    keep their existing public-stream adaptation and native pipes their I/O join.
+    """
+    if isinstance(end, socket.socket):
+        async def socket_closed():
+            reader, writer = await asyncio.open_connection(sock=end)
+            try:
+                return await reader.read()
+            finally:
+                writer.close()
+        return socket_closed()
+    if is_endpoint(end):
+        async def pipe_closed():
+            while await windows_api.read_pipe(end.read):
+                pass
+        return pipe_closed()
+    os.set_inheritable(end, False)
+    from . import acps
+    return acps.AsyncFdLineReader(end).readline()
 
 
 if sys.platform != "win32":
@@ -482,9 +596,8 @@ if sys.platform != "win32":
     def owner_channel():
         """(parent end, child end) for the session-lifetime channel.
 
-        A pipe carries no name, so there is no connection for another process
-        to race; ``confirm_pair`` does not apply to its two unidirectional ends
-        and is not needed.
+        The kernel creates both unidirectional ends; no connection by address
+        selects the child endpoint.
         """
         with contextlib.ExitStack() as cleanup:
             read_fd, write_fd = os.pipe()
@@ -498,7 +611,7 @@ if sys.platform != "win32":
             return write_fd, child_fd
 
     def socket_pair():
-        """A connected AF_UNIX pair, confirmed as our own; ``socketpair``."""
+        """The kernel creates both connected ends; there is no rendezvous."""
         pair = socket.socketpair()
         confirm_pair(*pair)
         return pair
@@ -529,12 +642,6 @@ if sys.platform != "win32":
         return {"pass_fds": list(
             fd for end in references for fd in handles(end))}
 
-    def close_end(end) -> None:
-        if isinstance(end, socket.socket):
-            end.close()
-        else:
-            os.close(end)
-
     def child_endpoint(value):
         """The child's view of a reference: the descriptor it names."""
         fd = int(value)
@@ -550,32 +657,25 @@ if sys.platform != "win32":
         end.setblocking(False)
         return await asyncio.open_connection(sock=end, limit=limit)
 
-    async def watch_closed(end):
-        """Await EOF on an inherited owner-channel end."""
-        if isinstance(end, socket.socket):
-            reader, writer = await asyncio.open_connection(sock=end)
-            try:
-                await reader.read()
-            finally:
-                writer.close()
-        else:
-            os.set_inheritable(end, False)
-            from . import acps
-            await acps.AsyncFdLineReader(end).readline()
-
 else:
     import subprocess
 
     def owner_channel():
-        """An anonymous pipe pair: the parent's write end is the lifetime.
+        """A one-way inherited pipe: the parent's write end is the lifetime.
 
         The parent keeps the write end and closes it to signal the child; the
         child reads.  Only the child's read handle stays inheritable.
         """
-        read_handle, write_handle = private_pipe()
-        windows_api.clear_handle_inheritance(write_handle)
-        return (PipeEndpoint(write=write_handle),
-                PipeEndpoint(read=read_handle))
+        with contextlib.ExitStack() as rollback:
+            read_handle, write_handle = private_pipe(overlapped=True)
+            rollback.callback(windows_api.close_handle, read_handle)
+            rollback.callback(windows_api.close_handle, write_handle)
+            # Neither raw end has a caller until inheritance and both endpoint
+            # owners are ready. A failed flag update must retire both ends here.
+            windows_api.clear_handle_inheritance(write_handle)
+            ends = (PipeEndpoint(write=write_handle), PipeEndpoint(read=read_handle))
+            rollback.pop_all()
+            return ends
 
     def socket_pair():
         """The credential channel: two explicitly secured one-way pipes."""
@@ -604,43 +704,12 @@ else:
                             for handle in handles(end)]}
         return {"startupinfo": startup}
 
-    def close_end(end) -> None:
-        end.close()
-
     def child_endpoint(value):
         """The child's view of a reference: the endpoint the handles name."""
         return (value if isinstance(value, PipeEndpoint)
                 else PipeEndpoint.parse(value))
 
     async def open_streams(end, limit=None):
-        """Build ``StreamReader``/``StreamWriter``-shaped streams over pipes."""
-        from . import handle_reader
-
-        loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader(limit=limit)
-        queue = asyncio.Queue()
-        source = handle_reader.HandleReader(
-            None, loop, queue, eof_sentinel=True, handle=end.read)
-        source.start()
-        pump = loop.create_task(
-            _feed_reader(reader, queue), name="loki-pipe-reader")
-        sink = _HandleWriter(end.write, loop)
-        sink.start()
-        return reader, _PipeStreamWriter(source, pump, sink, end)
-
-    async def watch_closed(end):
-        """Await EOF on an inherited owner-channel read end."""
-        from . import handle_reader
-
-        loop = asyncio.get_running_loop()
-        queue = asyncio.Queue()
-        source = handle_reader.HandleReader(
-            None, loop, queue, eof_sentinel=True, handle=end.read)
-        source.start()
-        try:
-            while True:
-                data = await queue.get()
-                if not data:
-                    return
-        finally:
-            source.stop()
+        """One operation owner replaces the former reader/writer threads."""
+        stream = _PipeStreams(end, limit=limit)
+        return stream, stream

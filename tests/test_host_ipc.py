@@ -1,10 +1,10 @@
 """Tests for the IPC seam's POSIX contract and its Windows endpoint types.
 
-The Windows channel is now two anonymous pipes (AF_UNIX is unreachable through
-CPython), and its endpoint/encoder/stream classes depend only on import-safe
-declarations, so they are exercised here on Linux with the Windows calls
-mocked.  The POSIX half runs for real: a connected pair, a channel whose close
-is EOF, and the reference/spawn/validation contract the child depends on.
+The Windows channel uses two inherited one-way pipes (AF_UNIX is unreachable
+through CPython). Its endpoint/stream classes have portable tests with native
+calls mocked; allocator ABI cases run only where the Windows definitions exist.
+The POSIX half runs for real: a connected pair, a channel whose close is EOF,
+and the reference/spawn/validation contract the child depends on.
 """
 
 import asyncio
@@ -20,17 +20,15 @@ import unittest
 from unittest import mock
 
 from loki_agent import host_ipc
-from loki_agent import windows_subprocesses
 
 
 @contextlib.contextmanager
 def mocked_named_pipe(server_handle, *, client_handle=0x22, connect_error=None,
-                      open_error=None):
-    """The Win32 calls ``windows_subprocesses.pipe()`` makes, with state.
+                      open_error=None, release_error=None):
+    """The Win32 calls ``host_ipc.overlapped_pipe()`` makes, with state.
 
-    The named-pipe pair is Windows-only in effect but depends only on
-    declarations, like the anonymous pair above, so its creation attributes
-    and failure paths are exercised on the same host that runs the rest.
+    The Windows allocator's creation attributes and acquisition failures are
+    checked with native calls substituted, not treated as kernel enforcement.
     """
     state = {"created": [], "closed": [], "connected": [], "last_error": 0, 'token_closed': False}
     token = object()
@@ -61,12 +59,17 @@ def mocked_named_pipe(server_handle, *, client_handle=0x22, connect_error=None,
         ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0x5EC
         return 1
 
+    def free_descriptor(pointer):
+        state['descriptor_released'] = pointer.value
+        if release_error is not None:
+            raise release_error
+
     def bound(library, symbol, *signature):
         return {
             "CreateNamedPipeW": named_pipe,
             "ConnectNamedPipe": connect,
             "ConvertStringSecurityDescriptorToSecurityDescriptorW": convert,
-            "LocalFree": lambda *args: None,
+            "LocalFree": free_descriptor,
         }[symbol]
 
     def open_client(*args, **kwargs):
@@ -74,16 +77,16 @@ def mocked_named_pipe(server_handle, *, client_handle=0x22, connect_error=None,
             raise open_error
         return client_handle
 
-    with mock.patch.object(windows_subprocesses.api, "bind",
+    with mock.patch.object(host_ipc.windows_api, "bind",
                            side_effect=bound), \
-            mock.patch.object(windows_subprocesses.api, "current_user_sid",
+            mock.patch.object(host_ipc.windows_api, "current_user_sid",
                               return_value="S-1-5-21-9"), \
-            mock.patch.object(windows_subprocesses.api, 'current_process_handle', return_value=10), \
-            mock.patch.object(windows_subprocesses.api, 'open_process_token', return_value=token), \
-            mock.patch.object(windows_subprocesses.api, 'token_is_app_container', return_value=False), \
-            mock.patch.object(windows_subprocesses.api, "open_with_access",
+            mock.patch.object(host_ipc.windows_api, 'current_process_handle', return_value=10), \
+            mock.patch.object(host_ipc.windows_api, 'open_process_token', return_value=token), \
+            mock.patch.object(host_ipc.windows_api, 'token_is_app_container', return_value=False), \
+            mock.patch.object(host_ipc.windows_api, "open_with_access",
                               side_effect=open_client) as opened, \
-            mock.patch.object(windows_subprocesses.api, "close_handle", side_effect=close), \
+            mock.patch.object(host_ipc.windows_api, "close_handle", side_effect=close), \
             mock.patch.object(ctypes, "get_last_error",
                               side_effect=lambda: state["last_error"],
                               create=True):
@@ -93,40 +96,7 @@ def mocked_named_pipe(server_handle, *, client_handle=0x22, connect_error=None,
             raise AssertionError('pipe identity query retained its token handle')
 
 
-class PairConfirmationTests(unittest.TestCase):
-    """The ends handed over must be each other's.
-
-    POSIX ``socketpair()`` cannot be substituted, so these run the same check
-    the Windows hand-built pair depends on -- on the only host where it can be
-    exercised portably.
-    """
-
-    def pair(self):
-        first, second = socket.socketpair()
-        self.addCleanup(first.close)
-        self.addCleanup(second.close)
-        return first, second
-
-    def test_a_connected_pair_confirms_and_stays_usable(self):
-        first, second = self.pair()
-
-        host_ipc.confirm_pair(first, second)
-
-        second.sendall(b"after")
-        self.assertEqual(first.recv(5), b"after")
-
-    def test_ends_from_two_different_pairs_are_refused_and_closed(self):
-        first, _first_peer = self.pair()
-        second, _second_peer = self.pair()
-
-        with mock.patch.object(host_ipc, "_PAIR_CONFIRM_TIMEOUT", 0.05):
-            with self.assertRaises(host_ipc.PairConfirmationError):
-                host_ipc.confirm_pair(first, second)
-
-        self.assertEqual(first.fileno(), -1)
-        self.assertEqual(second.fileno(), -1)
-
-
+@unittest.skipUnless(sys.platform == 'win32', 'Windows native pipe allocation')
 class PrivatePipeCreationTests(unittest.TestCase):
     @contextlib.contextmanager
     def identity(self, contained):
@@ -193,20 +163,20 @@ class PrivatePipeCreationTests(unittest.TestCase):
         self.assertEqual(calls['create_pipe'].call_count, 1)
 
 
+@unittest.skipUnless(sys.platform == 'win32', 'Windows native pipe allocation')
 class PrivatePipePairTests(unittest.TestCase):
-    """Portable contract of the Windows pipe pair, with the calls mocked.
+    """Windows pipe-pair ABI and ownership, with the native calls substituted.
 
-    The primitive is Windows-only in effect but depends only on declarations,
-    so the marshalling, the parent-end inheritance clearing and both cleanup
-    paths are checked here; the pipe handles themselves need Windows.  This is
-    the transport that replaces the unreachable AF_UNIX emulation.
+    Marshalling, parent-end inheritance clearing and cleanup are checked here;
+    native enforcement remains separate. This transport replaces the unreachable
+    AF_UNIX emulation.
     """
 
     def test_only_the_child_ends_stay_inheritable(self):
         created = iter([(0x10, 0x11), (0x12, 0x13)])
         cleared = []
         with mock.patch.object(host_ipc, "private_pipe",
-                               side_effect=lambda: next(created)), \
+                               side_effect=lambda *, overlapped: next(created)), \
                 mock.patch.object(host_ipc.windows_api,
                                   "clear_handle_inheritance",
                                   side_effect=cleared.append), \
@@ -226,7 +196,7 @@ class PrivatePipePairTests(unittest.TestCase):
         # the pipe is created with our own descriptor -- the default one
         # grants Everyone read -- and refuses remote clients.
         with mocked_named_pipe(0x30) as state:
-            server, client = windows_subprocesses.pipe(
+            server, client = host_ipc.overlapped_pipe(
                 overlapped=(False, True), duplex=True)
         self.assertEqual((server, client), (0x30, 0x22))
         created_pipe = state["created"][0]
@@ -247,7 +217,7 @@ class PrivatePipePairTests(unittest.TestCase):
         # The stdout pair is the mirror image: the front's read end is the
         # overlapped one, the child's write end is not.
         with mocked_named_pipe(0x31) as state:
-            windows_subprocesses.pipe(overlapped=(True, False))
+            host_ipc.overlapped_pipe(overlapped=(True, False))
         self.assertEqual(state["created"][0]["mode"] & 0x40000000, 0x40000000)
         self.assertEqual(state["opened"].call_args.kwargs["flags"], 0)
 
@@ -268,12 +238,31 @@ class PrivatePipePairTests(unittest.TestCase):
         # behind, and a connect the kernel refuses closes both ends.
         with mocked_named_pipe(0x30, open_error=OSError("no client")) as state:
             with self.assertRaises(OSError):
-                windows_subprocesses.pipe(overlapped=(True, False))
+                host_ipc.overlapped_pipe(overlapped=(True, False))
         self.assertEqual(state["closed"], [0x30])
         with mocked_named_pipe(0x30, connect_error=5) as state:
-            with self.assertRaises(windows_subprocesses.api.WindowsApiError):
-                windows_subprocesses.pipe(overlapped=(True, False))
-        self.assertEqual(state["closed"], [0x30, 0x22])
+            with self.assertRaises(host_ipc.windows_api.WindowsApiError):
+                host_ipc.overlapped_pipe(overlapped=(True, False))
+        self.assertEqual(state["closed"], [0x22, 0x30])
+
+    def test_descriptor_cleanup_failure_retires_both_unpublished_named_ends(self):
+        failure = OSError('descriptor cleanup failed')
+        with mocked_named_pipe(0x30, release_error=failure) as state:
+            with self.assertRaises(OSError) as caught:
+                host_ipc.overlapped_pipe(overlapped=(True, False))
+        self.assertIs(caught.exception, failure)
+        self.assertCountEqual(state['closed'], [0x30, 0x22])
+        self.assertEqual(state['descriptor_released'], 0x5EC)
+
+    def test_owner_channel_inheritance_failure_closes_both_unpublished_ends(self):
+        failure = OSError('cannot clear owner write inheritance')
+        with mock.patch.object(host_ipc, 'private_pipe', return_value=[201, 202]), \
+                mock.patch.object(host_ipc.windows_api, 'clear_handle_inheritance', side_effect=failure), \
+                mock.patch.object(host_ipc.windows_api, 'close_handle') as close:
+            with self.assertRaises(OSError) as caught:
+                host_ipc.owner_channel()
+        self.assertIs(caught.exception, failure)
+        self.assertCountEqual(close.call_args_list, [mock.call(201), mock.call(202)])
 
     def test_inheritance_failure_closes_all_four_ends(self):
         closed = []
@@ -293,13 +282,13 @@ class PrivatePipePairTests(unittest.TestCase):
 class SocketPairTests(unittest.TestCase):
     def test_the_pair_is_connected_in_both_directions(self):
         if os.name != "posix":
-            # Two anonymous pipes: the parent end carries the request read and
+            # Two inherited one-way pipes: the parent end carries the request read and
             # the response write, the child end the complementary two, and only
             # the parent ends have inheritance cleared.
             created = iter([(0x10, 0x11), (0x12, 0x13)])
             cleared = []
             with mock.patch.object(host_ipc, "private_pipe",
-                                   side_effect=lambda: next(created)), \
+                                   side_effect=lambda *, overlapped: next(created)), \
                     mock.patch.object(host_ipc.windows_api,
                                       "clear_handle_inheritance",
                                       side_effect=cleared.append):
@@ -321,17 +310,12 @@ class SocketPairTests(unittest.TestCase):
 class OwnerChannelTests(unittest.TestCase):
     def test_closing_the_parent_end_is_eof_for_the_child(self):
         if os.name != "posix":
-            import msvcrt
             parent_end, child_end = host_ipc.owner_channel()
-            # The child owns only the read end; the fd takes ownership of that
-            # handle, so the endpoint must not close it a second time.
-            fd = msvcrt.open_osfhandle(child_end.read, os.O_RDONLY)
-            child_end.read = None
             try:
                 host_ipc.close_end(parent_end)
-                self.assertEqual(os.read(fd, 1), b"")
+                self.assertEqual(asyncio.run(host_ipc.windows_api.read_pipe(child_end.read, 1)), b"")
             finally:
-                os.close(fd)
+                host_ipc.close_end(child_end)
             return
         parent_end, child_end = host_ipc.owner_channel()
         self.addCleanup(os.close, child_end)
@@ -524,6 +508,11 @@ os.close(report)
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_native_allocators_exist_only_on_windows(self):
+        for name in ['overlapped_pipe', 'private_pipe', '_private_pipe_pair']:
+            with self.subTest(name=name):
+                self.assertEqual(hasattr(host_ipc, name), sys.platform == 'win32')
+
     def test_a_reference_names_the_child_end(self):
         if os.name != "posix":
             endpoint = host_ipc.PipeEndpoint(read=0x11, write=0x22)
@@ -551,6 +540,40 @@ class ReferenceTests(unittest.TestCase):
     def test_a_descriptor_that_was_not_inherited_is_rejected(self):
         with self.assertRaises(ValueError):
             host_ipc.child_endpoint("1")
+
+
+class PairConfirmationTests(unittest.TestCase):
+    """The ends handed over must be each other's.
+
+    POSIX ``socketpair()`` cannot be substituted, so these run the same check
+    the Windows hand-built pair depends on -- on the only host where it can be
+    exercised portably.
+    """
+
+    def pair(self):
+        first, second = socket.socketpair()
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        return first, second
+
+    def test_a_connected_pair_confirms_and_stays_usable(self):
+        first, second = self.pair()
+
+        host_ipc.confirm_pair(first, second)
+
+        second.sendall(b"after")
+        self.assertEqual(first.recv(5), b"after")
+
+    def test_ends_from_two_different_pairs_are_refused_and_closed(self):
+        first, _first_peer = self.pair()
+        second, _second_peer = self.pair()
+
+        with mock.patch.object(host_ipc, "_PAIR_CONFIRM_TIMEOUT", 0.05):
+            with self.assertRaises(host_ipc.PairConfirmationError):
+                host_ipc.confirm_pair(first, second)
+
+        self.assertEqual(first.fileno(), -1)
+        self.assertEqual(second.fileno(), -1)
 
 
 class PipeEndpointTests(unittest.TestCase):
@@ -581,6 +604,25 @@ class PipeEndpointTests(unittest.TestCase):
             host_ipc.PipeEndpoint(read=1, write=2).close()
         self.assertEqual(closed, [1, 2])
 
+    def test_close_failure_attempts_both_ends_once_and_reports_failure(self):
+        endpoint = host_ipc.PipeEndpoint(read=101, write=102)
+        failure = host_ipc.windows_api.WindowsApiError('CloseHandle failed', status=6)
+        closed = []
+
+        def close(handle):
+            closed.append(handle)
+            if handle == 101:
+                raise failure
+
+        with mock.patch.object(host_ipc.windows_api, 'close_handle', side_effect=close):
+            with self.assertRaises(host_ipc.windows_api.WindowsApiError) as caught:
+                endpoint.close()
+            self.assertIs(caught.exception, failure)
+            self.assertCountEqual(closed, [101, 102])
+            self.assertEqual(endpoint.handles(), [])
+            endpoint.close()
+        self.assertEqual(len(closed), 2)
+
     def test_is_endpoint_distinguishes_windows_endpoints(self):
         self.assertTrue(host_ipc.is_endpoint(host_ipc.PipeEndpoint(read=1)))
         self.assertFalse(host_ipc.is_endpoint(3))
@@ -596,72 +638,89 @@ class PipeEndpointTests(unittest.TestCase):
 
 
 class HandleWriterTests(unittest.IsolatedAsyncioTestCase):
-    """The writer thread keeps a blocking WriteFile off the event loop."""
+    """Actual write-operation completion, not a queue emptied by a thread."""
 
     async def test_writes_are_flushed_in_order(self):
         written = []
 
-        def write_file(handle, data):
+        async def write(handle, data):
             written.append((handle, bytes(data)))
-            return len(data)
 
-        with mock.patch.object(host_ipc.windows_api, "write_file",
-                               side_effect=write_file):
-            writer = host_ipc._HandleWriter(0xAA, asyncio.get_running_loop())
-            writer.start()
+        with mock.patch.object(host_ipc.windows_api, 'write_pipe', new=write), \
+                mock.patch.object(host_ipc.windows_api, 'close_handle'):
+            writer = host_ipc._PipeStreams(host_ipc.PipeEndpoint(write=0xAA))
             try:
-                writer.write(b"one")
-                writer.write(b"two")
+                writer.write(b'one')
+                writer.write(b'two')
                 await writer.drain()
             finally:
-                writer.stop_and_join()
-
-        self.assertEqual(written, [(0xAA, b"one"), (0xAA, b"two")])
+                await writer.wait_closed()
+        self.assertEqual(written, [(0xAA, b'one'), (0xAA, b'two')])
 
     async def test_short_writes_are_completed(self):
         written = bytearray()
 
-        def write_file(handle, data):
-            piece = bytes(data)[:2]
+        async def write(handle, buffer, size, operation):
+            self.assertEqual(operation, 'WriteFile')
+            piece = buffer.raw[:min(size, 2)]
             written.extend(piece)
             return len(piece)
 
-        with mock.patch.object(host_ipc.windows_api, "write_file",
-                               side_effect=write_file):
-            writer = host_ipc._HandleWriter(1, asyncio.get_running_loop())
-            writer.start()
+        with mock.patch.object(host_ipc.windows_api, '_pipe_io', new=write), \
+                mock.patch.object(host_ipc.windows_api, 'close_handle'):
+            writer = host_ipc._PipeStreams(host_ipc.PipeEndpoint(write=1))
             try:
-                writer.write(b"abcdef")
+                writer.write(b'abcdef')
                 await writer.drain()
             finally:
-                writer.stop_and_join()
-
-        self.assertEqual(bytes(written), b"abcdef")
+                await writer.wait_closed()
+        self.assertEqual(bytes(written), b'abcdef')
 
     async def test_a_write_failure_is_raised_by_drain(self):
-        def write_file(handle, data):
-            raise OSError("pipe closed")
-
-        with mock.patch.object(host_ipc.windows_api, "write_file",
-                               side_effect=write_file):
-            writer = host_ipc._HandleWriter(1, asyncio.get_running_loop())
-            writer.start()
+        with mock.patch.object(host_ipc.windows_api, 'write_pipe', new=mock.AsyncMock(
+                side_effect=OSError('pipe closed'))), \
+                mock.patch.object(host_ipc.windows_api, 'close_handle'):
+            writer = host_ipc._PipeStreams(host_ipc.PipeEndpoint(write=1))
+            writer.write(b'data')
             try:
-                writer.write(b"data")
                 with self.assertRaises(OSError):
                     await writer.drain()
             finally:
-                writer.stop_and_join()
+                with contextlib.suppress(OSError):
+                    await writer.wait_closed()
 
     async def test_drain_of_an_empty_queue_returns(self):
-        with mock.patch.object(host_ipc.windows_api, "write_file") as write:
-            writer = host_ipc._HandleWriter(1, asyncio.get_running_loop())
-            writer.start()
+        with mock.patch.object(host_ipc.windows_api, 'write_pipe', new=mock.AsyncMock()) as write, \
+                mock.patch.object(host_ipc.windows_api, 'close_handle'):
+            writer = host_ipc._PipeStreams(host_ipc.PipeEndpoint(write=1))
+            await writer.drain()
+            await writer.wait_closed()
+        write.assert_not_called()
+
+    async def test_drain_waits_for_the_actual_inflight_write(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def write(handle, data):
+            started.set()
+            await release.wait()
+
+        with mock.patch.object(host_ipc.windows_api, 'write_pipe', new=write), \
+                mock.patch.object(host_ipc.windows_api, 'close_handle'):
+            writer = host_ipc._PipeStreams(host_ipc.PipeEndpoint(write=1))
+            writer.write(b'data')
+            task = asyncio.create_task(writer.drain())
             try:
+                await started.wait()
+                self.assertFalse(task.done())
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                release.set()
                 await writer.drain()
             finally:
-                writer.stop_and_join()
-        write.assert_not_called()
+                release.set()
+                await writer.wait_closed()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":

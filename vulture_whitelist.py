@@ -135,3 +135,9 @@ cflag
 lflag
 ispeed
 ospeed
+
+# Consumed by tests outside the vulture paths: the reader's EOF check
+# mirrors the asyncio StreamReader API, and the vendored Windows transport
+# implements the asyncio get_extra_info contract the fixtures read through.
+_.at_eof
+_.get_extra_info
