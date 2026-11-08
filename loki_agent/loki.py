@@ -68,7 +68,8 @@ def current_session() -> Session:
     return _DEFAULT_SESSION
 
 
-def current_cwd() -> str:
+def current_shell_cwd() -> str:
+    """Return the session's default shell cwd, not Loki's fixed process cwd."""
     return current_session().shell_cwd
 
 
@@ -683,35 +684,18 @@ class LruCache(object):
         while len(self.items) > self.max_size:
             self.items.popitem(last=False)
 
-    def __hasitem__(self, key):
-        return key in self.items
-
-    def __contains__(self, key):
-        return key in self.items
-
     def get(self, key, default=None):
         if key not in self.items:
             return default
         self.items.move_to_end(key)
         return self.items[key]
 
-    def __getitem__(self, key):
-        self.items.move_to_end(key)
-        return self.items[key]
 
-    def clear(self):
-        self.items.clear()
-
-    def pop(self, key, default=None):
-        return self.items.pop(key, default)
-
-
-file_state = LruCache(files.READ_PATHS_LIMIT)
 _webfetch_cache = LruCache(web_tools.WEBFETCH_CACHE_MAX_ENTRIES)  # url -> (fetched_at_epoch, content_text, content_type, final_url, status)
 
 
 def _resolve_path(path: str, base_dir: str | None = None) -> str:
-    return files.resolve_path(path, base_dir if base_dir is not None else current_cwd())
+    return files.resolve_path(path, base_dir if base_dir is not None else current_shell_cwd())
 
 
 def display_path(path: str) -> str:
@@ -720,16 +704,16 @@ def display_path(path: str) -> str:
 
 def change_shell_cwd(path: str | None = None) -> str:
     session = current_session()
-    target = (path or "").strip()
+    target = path or ""
     if not target:
-        target = "~"
+        target = paths.home_directory()
     elif target == "-":
         target = session.previous_shell_cwd
-    resolved = _resolve_path(os.path.expanduser(target))
+    resolved = _resolve_path(target)
     observed = os.stat(resolved)
     if not stat.S_ISDIR(observed.st_mode):
         raise FileNotFoundError(resolved)
-    resolved = files.existing_target(resolved, observed)
+    resolved = files._follow_final_link(resolved)
     old_cwd = session.shell_cwd
     session.shell_cwd = resolved
     session.previous_shell_cwd = old_cwd
@@ -838,7 +822,7 @@ async def run_bash_async(command: str,
         command, timeout=timeout, description=description,
         run_in_background=run_in_background,
         cancel_event=cancel_event,
-        cwd=cwd if cwd is not None else current_cwd(), structured=structured)
+        cwd=cwd if cwd is not None else current_shell_cwd(), structured=structured)
 
 
 def run_jobs() -> str:
@@ -885,18 +869,18 @@ def run_job_stop(job_id: str, force: bool = False) -> str:
 def run_read(file_path: str, offset: int | None = None, limit: int | None = None,
              *, structured=False, cwd=None):
     return files.run_read(file_path, offset, limit, structured=structured,
-                          cwd=cwd if cwd is not None else current_cwd(), observations=file_state)
+                          cwd=cwd if cwd is not None else current_shell_cwd(), observations=current_session().file_observations)
 
 
 def run_write(file_path: str, content: str, *, cwd=None) -> str:
     return files.run_write(file_path, content,
-                           cwd=cwd if cwd is not None else current_cwd(), observations=file_state)
+                           cwd=cwd if cwd is not None else current_shell_cwd(), observations=current_session().file_observations)
 
 
 def run_edit(file_path: str, old_string: str, new_string: str,
              replace_all: bool = False, *, cwd=None) -> str:
     return files.run_edit(file_path, old_string, new_string, replace_all,
-                          cwd=cwd if cwd is not None else current_cwd(), observations=file_state)
+                          cwd=cwd if cwd is not None else current_shell_cwd(), observations=current_session().file_observations)
 
 
 def run_glob(pattern: str, path: str | None = None, *,
@@ -908,7 +892,7 @@ def run_glob(pattern: str, path: str | None = None, *,
 async def run_glob_async(pattern: str, path: str | None = None,
                          cancel_event: asyncio.Event | None = None, *,
                          hidden: bool = False, no_ignore: bool = False, cwd=None) -> str:
-    cwd = cwd if cwd is not None else current_cwd()
+    cwd = cwd if cwd is not None else current_shell_cwd()
     return await files.run_glob_async(
         pattern, path, cancel_event, hidden=hidden, no_ignore=no_ignore, cwd=cwd,
         run_exec=partial(current_job_manager().run_exec, cwd=cwd))
@@ -922,7 +906,7 @@ def run_grep(pattern: str, path: str | None = None, glob: str | None = None,
 async def run_grep_async(pattern: str, path: str | None = None, glob: str | None = None,
                          output_mode: str = "files_with_matches",
                          cancel_event: asyncio.Event | None = None, *, cwd=None, **kwargs) -> str:
-    cwd = cwd if cwd is not None else current_cwd()
+    cwd = cwd if cwd is not None else current_shell_cwd()
     return await files.run_grep_async(
         pattern, path, glob, output_mode, cancel_event, cwd=cwd,
         run_exec=partial(current_job_manager().run_exec, cwd=cwd), **kwargs)
@@ -1305,11 +1289,12 @@ def _execution_metadata(invocation, outcome, defaults):
 
 
 def _invalidate_hook_file_state(invocation):
+    observations = current_session().file_observations
     if invocation.invalidate_all_files:
-        file_state.clear()
+        observations.clear()
         return
     for path in invocation.changed_paths:
-        file_state.pop(files.observation_key(_resolve_path(path, invocation.cwd)), None)
+        observations.pop(_resolve_path(path, invocation.cwd), None)
 
 
 def _read_default_notes(invocation):
@@ -1358,7 +1343,7 @@ async def execute_tool_call_async(
             "name": fn_name,
             "call_id": call_id,
             "args": _raw_tool_arguments(call),
-            "cwd": current_cwd(),
+            "cwd": current_shell_cwd(),
         })
         return result, None
     call_kind = call.get("tool_kind", "function")
@@ -1373,7 +1358,7 @@ async def execute_tool_call_async(
             "name": fn_name,
             "call_id": call_id,
             "args": _raw_tool_arguments(call),
-            "cwd": current_cwd(),
+            "cwd": current_shell_cwd(),
         })
         return result, None
 
@@ -1392,7 +1377,7 @@ async def execute_tool_call_async(
         effective_arguments=copy.deepcopy(original_args),
         schema=spec["schema"],
         semantics=spec.get("semantics", {}),
-        cwd=current_cwd(),
+        cwd=current_shell_cwd(),
         model=current_model() or None,
         provider=_runtime_provider_label(),
         parse_error=parse_error,
@@ -2268,7 +2253,7 @@ def _subagent_argv(agent_type: str, prompt: str) -> list[str]:
         '--prompt',
         prompt,
         '--shell-cwd',
-        current_cwd(),
+        current_shell_cwd(),
     ]
 
 
@@ -2446,7 +2431,7 @@ def make_turn_recovery(cancel_event):
 
     async def policy(payload, *, cancel_event):
         return await pipeline.recover_turn(
-            {**payload, "cwd": current_cwd()}, cancel_event=cancel_event)
+            {**payload, "cwd": current_shell_cwd()}, cancel_event=cancel_event)
 
     return recoveries.TurnRecovery(policy, cancel_event)
 
@@ -2471,7 +2456,7 @@ async def run_turn_end_hooks_async(events, text="", *, error=None):
     payload = {
         "event": "turn_end",
         "reason": reason,
-        "cwd": current_cwd(),
+        "cwd": current_shell_cwd(),
         "text": text,
     }
     if error is not None:
@@ -2652,7 +2637,9 @@ def initial_transcript_items():
     items = [formats.instruction_item(instructions)] if instructions else []
     items.append(formats.instruction_item(
         f"Current date: {time.strftime('%Y-%m-%d')}. "
-        f"Current Loki cwd: {current_cwd()}. Relative tool paths and Bash commands run from this directory. "
+        f"Current shell cwd: {current_shell_cwd()}. "
+        "Relative tool paths resolve against this directory; Bash commands start here. "
+        "Loki's process cwd is fixed and does not change."
     ))
     return items
 
@@ -2671,8 +2658,9 @@ def user_prompt_history(items):
 
 def record_shell_cwd_instruction():
     current_transcript().append(formats.instruction_item(
-        f"Current Loki cwd changed to: {current_cwd()}. "
-        "Relative tool paths and Bash commands now run from this directory."
+        f"Current shell cwd changed to: {current_shell_cwd()}. "
+        "Relative tool paths now resolve against this directory; Bash commands now start here. "
+        "Loki's process cwd is unchanged."
     ))
     mark_chat_log_dirty()
 
@@ -2689,7 +2677,7 @@ def _print_display_line(prefix, text, *, text_writer=None, file=None):
 def print_shell_cwd(text_writer=None):
     sys.stdout.flush()
     _print_display_line(
-        "cwd: ", current_cwd(),
+        "cwd: ", current_shell_cwd(),
         text_writer=text_writer, file=sys.stderr)
     sys.stderr.flush()
 
@@ -2739,10 +2727,6 @@ def chat_log_filename(chat_id: str) -> str:
     return savefiles.chat_log_filename(chat_id)
 
 
-def ensure_chat_log_dir():
-    savefiles.ensure_chat_log_dir(CHAT_LOG_DIR)
-
-
 def new_chat_log_path() -> str:
     return savefiles.new_chat_log_path(CHAT_LOG_DIR)
 
@@ -2753,11 +2737,12 @@ def resolve_chat_log_path(resume_arg: str) -> str:
 
 
 def new_chat_log(filename):
-    # ``filename`` is composed from the runtime's own chat-log root and is used
-    # as given: Loki never normalises or resolves a filesystem operand, on any
-    # platform, for any reason.
+    # Selecting a conversation changes memory, not the filesystem. Publication
+    # creates storage when a save is actually requested; the selected operation
+    # pathname remains unchanged, independently of its provider partition label.
     session = current_session()
     session.conversation_id = conversation_id_for_path(filename)
+    session.file_observations.clear()
     session.transcript_items = initial_transcript_items()
     session.session_todos = []
     session.session_toolsets = []
@@ -2767,9 +2752,6 @@ def new_chat_log(filename):
     session.thinking_budget = None
     session.reasoning_retention = "default"
     session.reasoning_traces = "off"
-    dirname = os.path.dirname(filename)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
     session.chat_log_path = filename
     session.session_state = {"shell_cwd": session.shell_cwd}
     descriptor = active_connection_descriptor()
@@ -2832,8 +2814,8 @@ def mark_chat_log_dirty():
 def load_chat_log(filename, loaded=None, *, apply_shell_cwd=True):
     """Load a saved conversation's state; rendering is the caller's job."""
     if loaded is None:
-        with open(filename, 'r', encoding="utf-8") as f:
-            loaded = savefiles.read_chat_log(f)
+        with savefiles.open_chat_log(filename) as (stream, _facts):
+            loaded = savefiles.read_chat_log(stream)
     transcript, todos, state, toolsets = loaded
     current_session().replace_transcript(
         transcript, todos, toolsets, state, filename)

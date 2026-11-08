@@ -20,6 +20,24 @@ CREDENTIAL_FILE_NAME = "tokens.json"
 CREDENTIAL_LOCK_FILE_NAME = "tokens.lock"
 
 
+def home_directory(environ=None) -> str:
+    """Select an omitted home default; never expand a caller's filename.
+
+    Windows keeps the previous environment-based selection, including an
+    unchanged tilde when no profile variables exist. Switching to a known
+    folder or introducing a Windows failure policy would be a separate change.
+    POSIX uses HOME or the standard account-home fallback for this default.
+    """
+    values = os.environ if environ is None else environ
+    if sys.platform == 'win32':
+        if 'USERPROFILE' in values:
+            return values['USERPROFILE']
+        if 'HOMEPATH' in values:
+            return values.get('HOMEDRIVE', '') + values['HOMEPATH']
+        return '~'
+    return values.get('HOME') or os.path.expanduser('~')
+
+
 def private_directory_support_error() -> str | None:
     """Return why private directory creation is unsupported here, else None.
 
@@ -57,8 +75,9 @@ def config_base_directory(environ=None) -> str:
 
     ``XDG_CONFIG_HOME`` wins when it is explicitly set, on every platform: it
     is the documented override, and it is how callers and tests inject a
-    location.  Otherwise POSIX falls back to ``~/.config`` and Windows asks for
-    the LocalAppData known folder.
+    location. Otherwise POSIX uses the home default's ``.config`` directory;
+    Windows asks for the LocalAppData known folder. Supplied directory values
+    are not expanded or normalized.
 
     Windows uses *local* rather than roaming app data because this tree holds
     credentials: a roaming profile is copied to a server, and secrets must not
@@ -67,10 +86,10 @@ def config_base_directory(environ=None) -> str:
     values = os.environ if environ is None else environ
     configured = values.get("XDG_CONFIG_HOME")
     if configured:
-        return os.path.expanduser(configured)
+        return configured
     if sys.platform == "win32":
         return _windows_local_app_data()
-    return os.path.expanduser("~/.config")
+    return os.path.join(home_directory(values), ".config")
 
 
 def _windows_local_app_data() -> str:
@@ -98,17 +117,17 @@ def loki_config_dir(environ=None) -> str:
 def state_base_directory(environ=None) -> str:
     """Return the directory that holds Loki's per-user state.
 
-    ``XDG_STATE_HOME`` wins when explicitly set. POSIX defaults to
-    ``~/.local/state``. Windows uses LocalAppData as the base, but
-    loki_state_dir() chooses a separate directory from configuration.
+    ``XDG_STATE_HOME`` wins when explicitly set. POSIX defaults to the home
+    default's ``.local/state`` directory. Windows uses LocalAppData as the base,
+    but loki_state_dir() chooses a separate directory from configuration.
     """
     values = os.environ if environ is None else environ
     configured = values.get("XDG_STATE_HOME")
     if configured:
-        return os.path.expanduser(configured)
+        return configured
     if sys.platform == "win32":
         return _windows_local_app_data()
-    return os.path.expanduser("~/.local/state")
+    return os.path.join(home_directory(values), ".local/state")
 
 
 def loki_state_dir(environ=None) -> str:
@@ -119,7 +138,7 @@ def loki_state_dir(environ=None) -> str:
 
 
 def credential_directory(environ=None) -> str:
-    """Return the directory hidden from credential-consuming runtimes."""
+    """Return the configured credential-storage directory."""
     return os.path.join(loki_config_dir(environ), "credentials")
 
 

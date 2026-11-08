@@ -19,17 +19,30 @@ def write_user_settings(config_home, text):
     the actual user file, not a patched loader. Retain the supplied directory
     and create literal children through native primitives, without assembling
     another pathname from the caller's VFS key. The fixture owns the temporary
-    config home; the exit stack closes these borrowed directory acquisitions.
+    config home; each acquired directory closes before that home is removed.
     """
-    with contextlib.ExitStack() as stack:
-        root = private_files.open_directory(config_home)
-        stack.callback(private_files.close, root)
-        private_files.create_directory_at(root, "loki")
-        directory = private_files.open_directory_at(root, "loki")
-        stack.callback(private_files.close, directory)
+    root = private_files.open_directory(config_home)
+    try:
+        write_user_settings_at(root, text)
+    finally:
+        private_files.close(root)
+
+
+def write_user_settings_at(root, text):
+    """Seed the same file through a borrowed root, including literal-~ tests.
+
+    The filename-lookup journey has already selected its directory natively;
+    reopening a constructed pathname would defeat the operand under test.
+    Only the acquired child directory/file belong to this helper.
+    """
+    private_files.create_directory_at(root, "loki")
+    directory = private_files.open_directory_at(root, "loki")
+    try:
         file = private_files.create_exclusive_at(directory, "settings.ini", 0o600)
         with private_files.binary_file(file, "wb") as target:
             target.write(text.encode("utf-8"))
+    finally:
+        private_files.close(directory)
 
 
 @contextlib.contextmanager
@@ -43,6 +56,4 @@ def default_settings():
 
 
 def setUpModule():
-    fixture = default_settings()
-    fixture.__enter__()
-    unittest.addModuleCleanup(fixture.__exit__, None, None, None)
+    unittest.enterModuleContext(default_settings())

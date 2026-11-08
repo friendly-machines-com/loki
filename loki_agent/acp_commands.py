@@ -166,7 +166,7 @@ async def _trace(argument: str, session) -> Outcome:
 
 
 async def _pwd(argument: str, session) -> Outcome:
-    return Outcome(text=f"cwd: {loki.current_cwd()}")
+    return Outcome(text=f"cwd: {loki.current_shell_cwd()}")
 
 
 async def _cd(argument: str, session) -> Outcome:
@@ -176,7 +176,7 @@ async def _cd(argument: str, session) -> Outcome:
         captured.append(str(text))
 
     if loki.change_shell_cwd_from_text(argument, text_writer=writer):
-        return Outcome(text=f"cwd: {loki.current_cwd()}")
+        return Outcome(text=f"cwd: {loki.current_shell_cwd()}")
     return Outcome(text="cd: " + ("\n".join(captured) or "failed"))
 
 

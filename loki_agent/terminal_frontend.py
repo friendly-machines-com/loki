@@ -61,7 +61,7 @@ from .loki import (
     current_agent_mode,
     current_chat_log_path,
     current_config,
-    current_cwd,
+    current_shell_cwd,
     current_model,
     current_session,
     current_transcript,
@@ -820,7 +820,7 @@ def _status_fields(activity):
         "queued_prompts": activity.queued_prompts,
         "queued_images": activity.queued_images,
         "mode": current_agent_mode(),
-        "cwd": display_path(current_cwd()),
+        "cwd": display_path(current_shell_cwd()),
     }
 
 
@@ -1737,7 +1737,7 @@ async def async_main(args, configuration: settings.Settings) -> int:
                                and command_text[len('/image')].isspace())):
                     try:
                         image_path = _image_command_path(command_text)
-                        image = load_image_attachment(image_path, base_dir=current_cwd())
+                        image = load_image_attachment(image_path, base_dir=current_shell_cwd())
                     except ImageAttachmentError as error:
                         sys.stdout.flush()
                         print("image: ", end="", file=sys.stderr)

@@ -14,6 +14,9 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from loki_agent import private_files
+from loki_entrypoints import loki_command
+from settings_fixtures import write_user_settings, write_user_settings_at
 from loki_entrypoints import child_environment, configure_container, entrypoint
 from job_fixtures import job_manager, managed_jobs
 from process_lifecycle_fixtures import observe_fixture
@@ -1538,7 +1541,7 @@ class ModelLoadingTests(unittest.TestCase):
             blob = formats.new_log_blob(
                 events, [])
             blob["session_state"] = {
-                "shell_cwd": loki.current_cwd(),
+                "shell_cwd": loki.current_shell_cwd(),
                 "connection": descriptor.to_dict(),
             }
             pathlib.Path(path).write_text(
@@ -2049,6 +2052,45 @@ class TerminalReasoningEffortTests(unittest.TestCase):
                 ("high", "high"),
             ],
         )
+
+
+class SettingsFilenameTests(unittest.TestCase):
+    def test_explicit_settings_filename_is_forwarded_without_rewriting(self):
+        # The former hook-file selector is gone. The one configuration reader
+        # now owns this same raw-operand guarantee for preferences and hooks.
+        for raw in ['settings.ini', '~/settings.ini', 'link/../settings.ini', 'settings.ini/']:
+            with self.subTest(raw=raw), mock.patch(
+                    'builtins.open', mock.mock_open(read_data=b'[terminal]\n')) as opened:
+                configuration = settings.from_parser(settings.read_ini(raw))
+                self.assertEqual(configuration.hooks, [])
+                opened.assert_called_once_with(raw, 'rb')
+
+    def test_real_entrypoint_reads_literal_tilde_config_not_home_decoy(self):
+        with tempfile.TemporaryDirectory() as workspace, \
+                tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as state:
+            # XDG_CONFIG_HOME is a supplied directory key, not a tilde template.
+            # Create its literal child natively, independently of HOME's decoy.
+            with contextlib.ExitStack() as cleanup:
+                root = private_files.open_directory(workspace)
+                cleanup.callback(private_files.close, root)
+                private_files.create_directory_at(root, '~')
+                literal = private_files.open_directory_at(root, '~')
+                cleanup.callback(private_files.close, literal)
+                write_user_settings_at(literal, '[terminal]\n')
+            write_user_settings(home, 'not the requested configuration')
+            environment = child_environment(
+                PATH=os.environ.get('PATH', ''), HOME=home, USERPROFILE=home,
+                XDG_CONFIG_HOME='~', XDG_STATE_HOME=state,
+                LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1', LOKI_MODEL='dummy',
+                LOKI_DUMMY_REPLY='literal user configuration read')
+            configure_container(environment, workspace)
+            process = subprocess.run(
+                [*loki_command(), '--headless', '--prompt', 'configuration check'],
+                cwd=workspace, env=environment, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertIn('literal user configuration read', process.stdout)
 
 
 class SelectionConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -2963,7 +3005,7 @@ class StatusTextTests(unittest.TestCase):
 
     def test_local_status_groups_queue_counts_with_the_queue_command(self):
         activity = terminal_frontend.TerminalActivityStatus()
-        with mock.patch.object(terminal_frontend, "current_cwd",
+        with mock.patch.object(terminal_frontend, "current_shell_cwd",
                                return_value="/home/dannym/src/loki"), \
                 mock.patch.object(terminal_frontend, "current_agent_mode",
                                   return_value="normal"):
@@ -3028,7 +3070,7 @@ class StatusTextTests(unittest.TestCase):
                 activity = terminal_frontend.TerminalActivityStatus(
                     turn_running=running, queued_prompts=messages, queued_images=images)
                 with mock.patch.object(terminal_frontend, "_terminal_activity", activity), \
-                        mock.patch.object(terminal_frontend, "current_cwd",
+                        mock.patch.object(terminal_frontend, "current_shell_cwd",
                                           return_value="/status/cwd"), \
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     terminal_frontend._write_status_text()
@@ -3584,7 +3626,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(invocation.effective_arguments, {
                     'query': 'loki external custom', 'allowed_domains': ['example.com']})
                 if invocation.call_id == 'chat-search':
-                    self.assertIn(source_key, loki.file_state)
+                    self.assertIn(source_key, loki.current_session().file_observations)
                 return tool_runtime.PreHookDecision()
 
             def post(invocation, outcome):
@@ -3775,7 +3817,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     ('a-search', 'WebSearch', {'query': 'loki', 'allowed_domains': '["example.com"]', 'blocked_domains': None}),
                 ], 'read and search', private=True)
                 self.assertEqual(dispatched[0], ('Read', {'file_path': str(source)}))
-                self.assertIn(source_key, loki.file_state)
+                self.assertIn(source_key, loki.current_session().file_observations)
                 configuration = settings.from_parser(settings.read_ini(hook_config))
                 loki.configure_tool_hook_pipeline(configuration)
                 pipeline = loki.TOOL_HOOK_PIPELINE
@@ -3811,7 +3853,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         ('b-resumed-grep', 'Grep', {'pattern': 'notes', 'path': str(notes), 'output_mode': 'content'})], 'resume B', restored=True)
                     await turn('CHAT', protocols.OPENAI_CHAT, [
                         ('chat-search', 'WebSearch', {'query': 'loki', 'allowed_domains': '["example.com"]', 'blocked_domains': None})], 'chat exact')
-                    self.assertNotIn(source_key, loki.file_state)
+                    self.assertNotIn(source_key, loki.current_session().file_observations)
                     self.assertEqual(source.read_text(), 'marker post\n')
                     chat_followup = captured[-1][1]
                     native = next(m for m in chat_followup['messages'] if m.get('tool_calls', [{}])[0].get('id') == 'chat-search')
@@ -4578,7 +4620,7 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result['type'], 'tool_result')
                     self.assertEqual(result['call_id'], f'read-{label}')
                     self.assertEqual(formats.item_text(result), f'1\tevidence {label}')
-                    self.assertIn(str(root / f'{label}.txt'), loki.file_state)
+                    self.assertIn(str(root / f'{label}.txt'), loki.current_session().file_observations)
                     return formats.DecodedTurn([
                         formats.message_item('assistant', f'answer {label}')])
 
@@ -4626,6 +4668,8 @@ class SavedChatPickerJourneyTests(unittest.IsolatedAsyncioTestCase):
                             if not paths:
                                 self.assertFalse(chat_dir.exists())
                             loki.new_chat_log(path)
+                            if not paths:
+                                self.assertFalse(chat_dir.exists())
                             self.assertEqual(loki.current_chat_log_path(), path)
                             self.assertTrue(session.chat_log_dirty)
                             self.assertFalse(pathlib.Path(path).exists())
@@ -4877,7 +4921,7 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             loki.change_shell_cwd(tmpdir)
 
-            self.assertEqual(loki.current_cwd(), tmpdir)
+            self.assertEqual(loki.current_shell_cwd(), tmpdir)
             self.assertEqual(os.getcwd(), process_cwd)
             self.assertEqual(
                 loki._resolve_path("file.txt"),
@@ -5130,7 +5174,7 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             loki.load_session_state({"shell_cwd": tmpdir})
 
-            self.assertEqual(loki.current_cwd(), tmpdir)
+            self.assertEqual(loki.current_shell_cwd(), tmpdir)
 
     def test_explicit_apply_shell_cwd_false_keeps_the_launch_directory(self):
 
@@ -5141,7 +5185,7 @@ class ShellCwdTests(unittest.IsolatedAsyncioTestCase):
                     {"shell_cwd": saved_dir}, apply_shell_cwd=False)
 
                 self.assertEqual(
-                    loki.current_cwd(), selected)
+                    loki.current_shell_cwd(), selected)
 
     def test_saved_connection_confirmation_is_explicit(self):
         descriptor = ConnectionDescriptor(
@@ -5326,7 +5370,7 @@ class SubagentLaunchTests(unittest.TestCase):
                     self.assertEqual(result, [
                         *prefix, '--subagent', 'Explore', '--subagent-depth', str(depth + 1),
                         '--root-conversation-id', loki.current_session().root_conversation_id,
-                        '--prompt', 'inspect this', '--shell-cwd', loki.current_cwd(),
+                        '--prompt', 'inspect this', '--shell-cwd', loki.current_shell_cwd(),
                     ])
 
     def test_both_entrypoints_can_run_real_subagent(self):
@@ -5838,7 +5882,7 @@ class SubagentLaunchTests(unittest.TestCase):
                 ]))
 
             self.assertEqual(status, 0)
-            self.assertEqual(loki.current_cwd(), tmpdir)
+            self.assertEqual(loki.current_shell_cwd(), tmpdir)
             self.assertEqual(os.getcwd(), loki.STARTUP_CWD)
 
     def test_subagent_environment_contains_no_request_secret(self):

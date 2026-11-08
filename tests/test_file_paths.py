@@ -2,13 +2,13 @@
 
 import asyncio
 import base64
+import errno
 import hashlib
-import io
+import json
 import os
 from pathlib import Path
 import stat
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 from config_fixtures import setUpModule as set_up_config
@@ -23,56 +23,69 @@ def setUpModule():
     set_up_response_headers()
 
 
-class StatIdentityTests(unittest.TestCase):
+class FileObservationTests(unittest.TestCase):
 
-    def test_read_history_key_keeps_case_separators_and_raw_components(self):
-        # Model a platform helper that rewrites names, without using that
-        # helper as the oracle or pretending to model filesystem identity.
-        platform = SimpleNamespace(path=SimpleNamespace(normcase=lambda value: 'folded'))
-        with mock.patch.object(file_operations, 'os', platform):
-            for name in ['C:\\Work\\File', 'c:/work/file', 'dir/./file',
-                         'dir//file/', 'link/../file', '~/file']:
-                with self.subTest(name=name):
-                    self.assertEqual(file_operations.observation_key(name), name)
-
-    def test_observation_handles_ctime_changes_by_platform(self):
+    def test_read_preserves_bounded_utf8_newlines_and_full_observation(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'observed'
-            payload = b'known independently hashed content'
-            path.write_bytes(payload)
-            original = path.stat()
-            for platform in ['posix', 'nt']:
-                for expected in [None, original]:
-                    with self.subTest(platform=platform,
-                                      expected_stat=expected is not None):
-                        calls = 0
+            for name, payload, expected in [
+                    ['text', b'known\r\ncontent', '1\tknown\n2\tcontent'],
+                    ['binary', b'\xff\x00binary', 'binary (8 bytes)'],
+                    ['incomplete', b'\xc3', 'binary (1 bytes)'],
+                    ['empty', b'', 'is empty'],
+                    ['image.png', b'\xffimage', 'is an image (6 bytes)'],
+                    ['capped', b'visible\r\n' + b'x' * 65526 + b'\xff', '1\tvisible']]:
+                path = os.path.join(directory, name)
+                with open(path, 'wb') as stream:
+                    stream.write(payload)
+                observations = {}
+                with self.subTest(name=name), \
+                        mock.patch.object(file_operations, 'READ_CHAR_CAP',
+                                          8 if name == 'capped' else file_operations.READ_CHAR_CAP):
+                    result = file_operations.run_read(path, cwd=directory, observations=observations)
+                    self.assertIn(expected, result)
+                    observed = observations[path]
+                    self.assertEqual(observed.digest, hashlib.sha256(payload).hexdigest())
+                    self.assertEqual(observed.size, len(payload))
 
-                        def changing_metadata(fd):
-                            nonlocal calls
-                            calls += 1
-                            return SimpleNamespace(
-                                st_mode=original.st_mode,
-                                st_dev=original.st_dev,
-                                st_ino=original.st_ino,
-                                st_size=original.st_size,
-                                st_mtime_ns=original.st_mtime_ns,
-                                st_ctime_ns=original.st_ctime_ns + calls)
+    def test_regular_reader_keeps_one_descriptor_owner_on_every_exit(self):
+        """The wrapper borrows the descriptor; this scope closes it even if wrapping fails."""
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, 'owned-reader')
+            with open(target, 'wb') as stream:
+                stream.write(b'known\r\ncontent')
+            native_open, native_close = os.open, os.close
+            for phase in ['success', 'blocking', 'wrapper', 'body']:
+                if phase == 'blocking' and os.name != 'posix':
+                    continue  # Windows uses binary descriptors, not this mode switch.
+                opened = []
 
-                        # Real bytes/open, substituted metadata: test the
-                        # observation consumer, not a private tuple layout.
-                        with mock.patch.object(loki.os, 'name', platform), \
-                                mock.patch.object(loki.os, 'fstat',
-                                                  side_effect=changing_metadata):
-                            if platform == 'posix':
-                                with self.assertRaisesRegex(
-                                        OSError, 'changed while it was being read'):
-                                    file_operations._file_observation(str(path), expected)
-                            else:
-                                observed = file_operations._file_observation(str(path), expected)
-                                self.assertEqual(observed.digest,
-                                                 hashlib.sha256(payload).hexdigest())
-                                self.assertEqual(observed.size, len(payload))
-                                self.assertEqual(calls, 2)
+                def opening(*args, **kwargs):
+                    descriptor = native_open(*args, **kwargs)
+                    opened.append(descriptor)
+                    return descriptor
+
+                def wrapping(*args, **kwargs):
+                    if os.name == 'posix':
+                        self.assertTrue(os.get_blocking(args[0]))
+                    if phase == 'wrapper':
+                        raise OSError('wrapper failed')
+                    return open(*args, **kwargs)
+
+                with self.subTest(phase=phase), \
+                        mock.patch.object(file_operations.os, 'open', side_effect=opening), \
+                        mock.patch.object(file_operations.os, 'close', wraps=native_close) as closing, \
+                        mock.patch.object(file_operations.os, 'set_blocking', wraps=os.set_blocking,
+                                          side_effect=OSError('blocking failed') if phase == 'blocking' else None), \
+                        mock.patch.object(file_operations, 'open', side_effect=wrapping, create=True):
+                    if phase == 'success':
+                        with file_operations._open_regular_file(target) as source:
+                            self.assertEqual(source.read(), 'known\ncontent')
+                    else:
+                        with self.assertRaisesRegex(OSError, phase):
+                            with file_operations._open_regular_file(target):
+                                raise OSError('body failed')
+                    self.assertEqual(len(opened), 1)
+                    closing.assert_called_once_with(opened[0])
 
 
 class FilePathTests(unittest.TestCase):
@@ -85,16 +98,98 @@ class FilePathTests(unittest.TestCase):
         self.project.mkdir()
         self.elsewhere = self.root / 'elsewhere'
         (self.elsewhere / 'child').mkdir(parents=True)
-        (self.project / 'link').symlink_to(
-            self.elsewhere / 'child', target_is_directory=True)
         self.session = sessions.Session(shell_cwd=str(self.project))
         self.addCleanup(self.session.response_headers.close)
         session_patch = mock.patch.object(loki, '_DEFAULT_SESSION', self.session)
         session_patch.start()
         self.addCleanup(session_patch.stop)
-        state_patch = mock.patch.object(loki, 'file_state', {})
-        state_patch.start()
-        self.addCleanup(state_patch.stop)
+
+    def directory_link(self):
+        # Only link-specific invariants need this fixture. Requiring symlink
+        # creation in setUp prevented unrelated file tests from running on a
+        # standard Windows account without that privilege.
+        (self.project / 'link').symlink_to(self.elsewhere / 'child', target_is_directory=True)
+
+    def assert_refused(self, tool, arguments, diagnostic=None):
+        # Exercise the real result boundary rather than treating error-looking
+        # prose from a text helper as evidence that the tool failed.
+        result = asyncio.run(loki.dispatch_tool_async(tool, arguments))
+        self.assertFalse(result['ok'], result)
+        if diagnostic is not None:
+            self.assertIn(diagnostic, result['content'])
+        return result
+
+    def test_read_history_belongs_to_each_conversation(self):
+        """One conversation's Read must not satisfy another conversation's guard."""
+        target = os.path.join(self.project, 'conversation-file')
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write('reviewed')
+        self.assertIn('reviewed', loki.run_read(target))
+        other = sessions.Session(shell_cwd=str(self.project))
+        self.addCleanup(other.response_headers.close)
+        with mock.patch.object(loki, '_DEFAULT_SESSION', other):
+            for tool, arguments in [
+                    ['Write', {'file_path': target, 'content': 'wrong'}],
+                    ['Edit', {'file_path': target, 'old_string': 'reviewed', 'new_string': 'wrong'}]]:
+                with self.subTest(tool=tool):
+                    result = asyncio.run(loki.dispatch_tool_async(tool, arguments))
+                    self.assertFalse(result['ok'], result)
+                    self.assertIn('You must Read', result['content'])
+        with open(target, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), 'reviewed')
+        self.assertIn('Successfully', loki.run_edit(target, 'reviewed', 'updated'))
+
+    def test_new_and_loaded_conversations_discard_live_read_history(self):
+        """Replacing a transcript discards live records; saved JSON cannot restore them."""
+        target = os.path.join(self.project, 'conversation-file')
+        saved = os.path.join(self.project, 'saved-conversation.json')
+        forged = {'shell_cwd': str(self.project), 'file_observations': {
+            target: {'digest': hashlib.sha256(b'reviewed').hexdigest(), 'size': 8}}}
+        with open(saved, 'w', encoding='utf-8') as stream:
+            stream.write(savefiles.serialize_chat_log([], [], forged))
+        for transition in ['new', 'load']:
+            with self.subTest(transition=transition):
+                with open(target, 'w', encoding='utf-8') as stream:
+                    stream.write('reviewed')
+                self.assertIn('reviewed', loki.run_read(target))
+                if transition == 'new':
+                    loki.new_chat_log(os.path.join(self.project, 'new-conversation.json'))
+                else:
+                    loki.load_chat_log(saved)
+                result = asyncio.run(loki.dispatch_tool_async(
+                    'Write', {'file_path': target, 'content': 'wrong'}))
+                self.assertFalse(result['ok'], result)
+                self.assertIn('You must Read', result['content'])
+                self.assertIn('reviewed', loki.run_read(target))
+                self.assertIn('Successfully', loki.run_edit(target, 'reviewed', 'updated'))
+
+    def test_read_history_remains_bounded_and_eviction_requires_read_again(self):
+        """A conversation's bookkeeping must not grow with every filename ever touched."""
+        targets = [os.path.join(self.project, f'bounded-{number}') for number in range(3)]
+        with mock.patch.object(file_operations, 'READ_PATHS_LIMIT', 2):
+            for target in targets:
+                self.assertIn('Successfully', loki.run_write(target, 'contents'))
+            self.assertEqual(len(self.session.file_observations), 2)
+            self.assert_refused('Write', {'file_path': targets[0], 'content': 'wrong'}, 'You must Read')
+            self.assertIn('contents', loki.run_read(targets[0]))
+            self.assertIn('Successfully', loki.run_edit(targets[0], 'contents', 'updated'))
+            self.assertEqual(len(self.session.file_observations), 2)
+
+    def test_failed_reads_do_not_record_observations_but_empty_regular_files_do(self):
+        """Only a successful opened-file read can satisfy the later overwrite guard."""
+        missing = os.path.join(self.project, 'absent-read')
+        for target in [missing, str(self.project)]:
+            with self.subTest(target=target):
+                result = asyncio.run(loki.dispatch_tool_async('Read', {'file_path': target}))
+                self.assertFalse(result['ok'], result)
+                self.assertNotIn(target, self.session.file_observations)
+        empty = os.path.join(self.project, 'empty-read')
+        with open(empty, 'wb'):
+            pass
+        result = asyncio.run(loki.dispatch_tool_async('Read', {'file_path': empty}))
+        self.assertTrue(result['ok'], result)
+        self.assertIn('empty', result['content'])
+        self.assertIn('Successfully', loki.run_write(empty, 'now populated'))
 
     def test_write_and_edit_keep_target_selected_before_validation(self):
         original = self.project / 'original'
@@ -125,37 +220,82 @@ class FilePathTests(unittest.TestCase):
                 self.assertEqual(original.read_text(), 'updated')
                 self.assertEqual(other.read_text(), 'unrelated')
 
-    @unittest.skipUnless(os.name == 'posix', 'controlled same-inode write with restored timestamps')
-    def test_read_snapshot_covers_displayed_bytes_not_a_later_path_read(self):
+    def test_change_between_steps_is_detected_beyond_the_display_cap(self):
+        """Capped Unicode display must not discard the later full-file change warning."""
         target = os.path.join(self.project, 'read-selection')
         with open(target, 'w', encoding='utf-8') as stream:
-            stream.write('value-a')
+            stream.write('\u00e9\u732b value-a')
         original = os.stat(target)
-        fstat = os.fstat
-        calls = 0
+        with mock.patch.object(file_operations, 'READ_CHAR_CAP', 2):
+            result = loki.run_read(target)
+        self.assertIn('\u00e9\u732b', result)
+        self.assertIn('truncated at 2 characters', result)
+        self.assertNotIn('value-a', result)
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write('\u00e9\u732b value-b')
+        os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+        self.assert_refused('Write', {'file_path': target, 'content': 'wrong'}, 'changed on disk')
+        self.assert_refused('Edit', {'file_path': target, 'old_string': 'value-b',
+                                     'new_string': 'updated'}, 'changed on disk')
+        with open(target, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), '\u00e9\u732b value-b')
+        self.assertIn('value-b', loki.run_read(target))
+        self.assertIn('Successfully', loki.run_edit(target, 'value-b', 'updated'))
+
+    def test_read_rejects_a_file_changed_during_its_content_check(self):
+        target = self.project / 'changing-read'
+        target.write_text('reviewed')
+        real_open = open
         changed = False
 
-        def replace_after_text_read(descriptor):
-            nonlocal calls, changed
-            calls += 1
-            if calls == 2:
-                with open(target, 'w', encoding='utf-8') as stream:
-                    stream.write('value-b')
-                os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
-                changed = True
-            return fstat(descriptor)
+        def opening(*args, **kwargs):
+            stream = real_open(*args, **kwargs)
+            if len(args) > 1 and args[1] == 'rb':
+                read = stream.read
 
-        # Real bytes and timestamps, with the existing Windows comparison
-        # policy: ctime is not treated as a stable change indicator there.
-        with mock.patch.object(file_operations.os, 'name', 'nt'), \
-                mock.patch.object(file_operations.os, 'fstat', side_effect=replace_after_text_read):
-            result = loki.run_read(target)
+                def changing_read(*arguments):
+                    nonlocal changed
+                    content = read(*arguments)
+                    if content and not changed:
+                        changed = True
+                        with real_open(target, 'ab') as writer:
+                            writer.write(b' appended')
+                    return content
+
+                stream.read = changing_read
+            return stream
+
+        with mock.patch.object(file_operations, 'open', side_effect=opening, create=True):
+            result = asyncio.run(loki.dispatch_tool_async('Read', {'file_path': str(target)}))
         self.assertTrue(changed)
-        self.assertIn('value-a', result)
-        self.assertNotIn('value-b', result)
-        self.assertIn('changed on disk', loki.run_write(target, 'not authorized'))
-        with open(target, encoding='utf-8') as stream:
-            self.assertEqual(stream.read(), 'value-b')
+        self.assertFalse(result['ok'], result)
+        self.assertIn('changed while it was being read', result['content'])
+        self.assertNotIn(str(target), self.session.file_observations)
+
+    def test_write_rejects_replacement_during_target_selection(self):
+        target = self.project / 'selected-write'
+        replacement = self.project / 'replacement'
+        target.write_text('reviewed')
+        replacement.write_text('reviewed')
+        loki.run_read(str(target))
+        follow = file_operations._follow_final_link
+        changed = False
+
+        def replacing_selection(path):
+            nonlocal changed
+            selected = follow(path)
+            if not changed:
+                changed = True
+                os.replace(replacement, target)
+            return selected
+
+        with mock.patch.object(file_operations, '_follow_final_link', side_effect=replacing_selection):
+            result = asyncio.run(loki.dispatch_tool_async(
+                'Write', {'file_path': str(target), 'content': 'must not publish'}))
+        self.assertTrue(changed)
+        self.assertFalse(result['ok'], result)
+        self.assertIn('path changed during target selection', result['content'])
+        self.assertEqual(target.read_text(), 'reviewed')
 
     def test_edit_validates_the_buffer_it_will_change(self):
         target = os.path.join(self.project, 'edit-selection')
@@ -167,49 +307,28 @@ class FilePathTests(unittest.TestCase):
         with open(target, 'w', encoding='utf-8') as stream:
             stream.write(unread)
         real_open = open
-        real_text_wrapper = io.TextIOWrapper
         interleaved = False
-
-        class InterleavedRead:
-            def __init__(self, stream):
-                self.stream = stream
-
-            def __enter__(self):
-                self.stream.__enter__()
-                return self
-
-            def __exit__(self, *arguments):
-                return self.stream.__exit__(*arguments)
-
-            def fileno(self):
-                return self.stream.fileno()
-
-            def detach(self):
-                return self.stream.detach()
-
-            def read(self, *arguments):
-                nonlocal interleaved
-                data = self.stream.read(*arguments)
-                interleaved = True
-                with real_open(target, 'w', encoding='utf-8') as replacement:
-                    replacement.write(reviewed)
-                return data
 
         def opening(path, mode='r', **kwargs):
             stream = real_open(path, mode, **kwargs)
-            if path == target and mode in ['r', 'rb'] and not interleaved:
-                return InterleavedRead(stream)
+            if mode == 'r' and not interleaved:
+                read = stream.read
+
+                def replacing_read(*arguments):
+                    nonlocal interleaved
+                    data = read(*arguments)
+                    interleaved = True
+                    with real_open(target, 'w', encoding='utf-8') as replacement:
+                        replacement.write(reviewed)
+                    return data
+
+                stream.read = replacing_read
             return stream
 
-        def decoding(buffer, **kwargs):
-            stream = real_text_wrapper(buffer, **kwargs)
-            return stream if interleaved else InterleavedRead(stream)
-
-        with mock.patch.object(file_operations, 'open', side_effect=opening, create=True), \
-                mock.patch.object(io, 'TextIOWrapper', side_effect=decoding):
-            result = loki.run_edit(target, 'old', 'new')
+        with mock.patch.object(file_operations, 'open', side_effect=opening, create=True):
+            self.assert_refused('Edit', {'file_path': target, 'old_string': 'old',
+                                         'new_string': 'new'}, 'changed on disk')
         self.assertTrue(interleaved)
-        self.assertTrue(result.startswith('Error:'), result)
         with open(target, encoding='utf-8') as stream:
             self.assertEqual(stream.read(), reviewed)
 
@@ -221,11 +340,13 @@ class FilePathTests(unittest.TestCase):
         self.assertIn('reviewed', loki.run_read(target))
         os.unlink(target)
         os.mkfifo(target)
-        for operation in [lambda: loki.run_read(target),
-                          lambda: loki.run_write(target, 'wrong'),
-                          lambda: loki.run_edit(target, 'reviewed', 'wrong')]:
-            result = operation()
-            self.assertIn('file is not a regular file', result)
+        for failure, operation in [
+                [OSError, lambda: loki.run_read(target)],
+                [ValueError, lambda: loki.run_write(target, 'wrong')],
+                [OSError, lambda: loki.run_edit(target, 'reviewed', 'wrong')]]:
+            with self.subTest(direct_operation=operation), \
+                    self.assertRaisesRegex(failure, 'file is not a regular file'):
+                operation()
             self.assertTrue(stat.S_ISFIFO(os.stat(target).st_mode))
         calls = [
             ['Read', {'file_path': target}],
@@ -248,47 +369,34 @@ class FilePathTests(unittest.TestCase):
         self.assertIn('binary', loki.run_read(target))
         self.assertEqual(len(os.listdir('/proc/self/fd')), before)
         with mock.patch.object(file_operations.os, 'fstat', side_effect=OSError('metadata unavailable')):
-            self.assertIn('metadata unavailable', loki.run_read(target))
+            self.assert_refused('Read', {'file_path': target}, 'metadata unavailable')
         self.assertEqual(len(os.listdir('/proc/self/fd')), before)
 
     def test_edit_keeps_existing_universal_newline_behavior(self):
         target = os.path.join(self.project, 'edit-newlines')
         for newline in ['\r\n', '\r', '\n']:
-            for legacy_text_snapshot in [False, True]:
-                with self.subTest(newline=newline, legacy_text_snapshot=legacy_text_snapshot):
-                    with open(target, 'wb') as stream:
-                        stream.write(f'old{newline}reviewed{newline}'.encode('utf-8'))
-                    self.assertIn('old', loki.run_read(target))
-                    if legacy_text_snapshot:
-                        loki.file_state[target] = 'old\nreviewed\n'
-                    self.assertIn('Successfully', loki.run_edit(target, 'old', 'new'))
-                    with open(target, 'rb') as stream:
-                        self.assertEqual(stream.read(), b'new\nreviewed\n')
+            with self.subTest(newline=newline):
+                with open(target, 'wb') as stream:
+                    stream.write(f'old{newline}reviewed{newline}'.encode('utf-8'))
+                self.assertIn('old', loki.run_read(target))
+                self.assertIn('Successfully', loki.run_edit(target, 'old', 'new'))
+                with open(target, 'rb') as stream:
+                    self.assertEqual(stream.read(), b'new\nreviewed\n')
 
-    def test_alias_retarget_during_read_does_not_authorize_other_name(self):
+    def test_alias_retarget_after_read_does_not_record_other_name(self):
         original = self.project / 'original'
         other = self.project / 'other'
         original.write_text('same contents')
         other.write_text('same contents')
         alias = self.project / 'alias'
         alias.symlink_to('original')
-        observe = file_operations._read_observed_file
-
-        def redirect_after_observation(path, expected_stat=None, **options):
-            result = observe(path, expected_stat=expected_stat, **options)
-            alias.unlink()
-            alias.symlink_to('other')
-            return result
-
-        with mock.patch.object(file_operations, '_read_observed_file',
-                               side_effect=redirect_after_observation):
-            self.assertIn('same contents', loki.run_read(str(alias)))
-        self.assertEqual(os.readlink(alias), 'other')
-        # Authorization is per spelling: the record names the alias the caller
-        # read, and nothing recorded a read of the other name.
-        self.assertIn(file_operations.observation_key(str(alias)), loki.file_state)
-        self.assertNotIn(file_operations.observation_key(str(other)), loki.file_state)
-        self.assertIn('You must Read', loki.run_write(str(other), 'wrong'))
+        self.assertIn('same contents', loki.run_read(str(alias)))
+        alias.unlink()
+        alias.symlink_to('other')
+        # The record names the alias the caller read, not the other name.
+        self.assertIn(str(alias), self.session.file_observations)
+        self.assertNotIn(str(other), self.session.file_observations)
+        self.assert_refused('Write', {'file_path': str(other), 'content': 'wrong'}, 'You must Read')
         self.assertEqual(other.read_text(), 'same contents')
 
     def test_a_replaced_alias_is_caught_by_what_was_read(self):
@@ -303,7 +411,7 @@ class FilePathTests(unittest.TestCase):
         self.assertIn('same contents', loki.run_read(str(alias)))
         alias.unlink()
         alias.write_text('different contents')
-        self.assertIn('changed on disk', loki.run_write(str(alias), 'wrong'))
+        self.assert_refused('Write', {'file_path': str(alias), 'content': 'wrong'}, 'changed on disk')
         self.assertEqual(alias.read_text(), 'different contents')
         alias.write_text('same contents')
         self.assertIn('Successfully', loki.run_write(str(alias), 'updated'))
@@ -323,18 +431,32 @@ class FilePathTests(unittest.TestCase):
         self.assertEqual((first / 'new-file').read_text(), 'contents')
         self.assertFalse((second / 'new-file').exists())
 
+    def test_editor_publication_follows_a_native_parent_directory_link(self):
+        """An ordinary filename's parent follows native lookup, unlike a protected state root."""
+        self.directory_link()
+        target = os.path.join(self.elsewhere, 'child', 'parent-link-file')
+        operand = os.path.join(self.project, 'link', 'parent-link-file')
+        with open(target, 'w', encoding='utf-8') as stream:
+            stream.write('reviewed')
+        self.assertIn('reviewed', loki.run_read(operand))
+        self.assertIn('Successfully', loki.run_edit(operand, 'reviewed', 'updated'))
+        with open(target, encoding='utf-8') as stream:
+            self.assertEqual(stream.read(), 'updated')
+        self.assertTrue(os.path.islink(os.path.join(self.project, 'link')))
+        with self.assertRaises(OSError):
+            private_files.open_directory_tree(os.path.join(self.project, 'link'))
+
     def test_dangling_parent_link_retains_directory_creation_policy(self):
         alias = self.project / 'alias'
         alias.symlink_to('../elsewhere/new-directory')
-        result = loki.run_write(str(alias / 'new-file'), 'contents')
         if os.name != 'posix':
             # Windows refuses to open a dangling symlink for writing; the link
             # and the absent target are left untouched.
-            self.assertTrue(result.startswith('Error:'), result)
+            self.assert_refused('Write', {'file_path': str(alias / 'new-file'), 'content': 'contents'})
             self.assertTrue(alias.is_symlink())
             self.assertFalse((self.elsewhere / 'new-directory').exists())
             return
-        self.assertIn('Successfully', result)
+        self.assertIn('Successfully', loki.run_write(str(alias / 'new-file'), 'contents'))
         self.assertTrue(alias.is_symlink())
         self.assertEqual(
             (self.elsewhere / 'new-directory' / 'new-file').read_text(),
@@ -343,12 +465,12 @@ class FilePathTests(unittest.TestCase):
     def test_failed_dotdot_lookup_in_link_target_creates_nothing(self):
         alias = self.project / 'alias'
         alias.symlink_to('missing/child/../../missing/new-file')
-        result = loki.run_write(str(alias), 'contents')
-        self.assertTrue(result.startswith('Error:'), result)
+        self.assert_refused('Write', {'file_path': str(alias), 'content': 'contents'})
         self.assertFalse((self.project / 'missing').exists())
         self.assertTrue(alias.is_symlink())
 
     def test_cwd_read_edit_write_publish_atomically_through_aliases(self):
+        self.directory_link()
         process_cwd = os.getcwd()
         for chained in [False, True]:
             with self.subTest(chained=chained):
@@ -388,8 +510,8 @@ class FilePathTests(unittest.TestCase):
 
                 # Reading the terminus does not authorize another spelling.
                 loki.run_read(str(target))
-                self.assertIn('You must Read',
-                              loki.run_edit(operand, 'old', 'edited'))
+                self.assert_refused('Edit', {'file_path': operand, 'old_string': 'old',
+                                             'new_string': 'edited'}, 'You must Read')
                 self.assertEqual(target.read_text(), 'old')
                 self.assertIn('old', loki.run_read(operand))
                 self.assertIn('old', loki.run_read('alias'))
@@ -397,14 +519,14 @@ class FilePathTests(unittest.TestCase):
                 real_create = private_files.create_exclusive_at
                 opened, created = [], []
 
-                def observe_open(name):
-                    handle = real_open(name)
+                def observe_open(name, **options):
+                    handle = real_open(name, **options)
                     opened.append(handle)
                     return handle
 
-                def observe_create(handle, name, mode):
+                def observe_create(handle, name, mode, **options):
                     created.append(handle)
-                    return real_create(handle, name, mode)
+                    return real_create(handle, name, mode, **options)
 
                 with mock.patch.object(private_files, 'open_directory',
                                        side_effect=observe_open), \
@@ -440,25 +562,25 @@ class FilePathTests(unittest.TestCase):
                 else:
                     self.assertTrue(os.path.samefile(
                         loki.change_shell_cwd(invalid), directory))
-                self.assertTrue(os.path.samefile(loki.current_cwd(), directory))
+                self.assertTrue(os.path.samefile(loki.current_shell_cwd(), directory))
                 self.assertFalse((directory / 'missing').exists())
 
     def test_dangling_final_symlink_creates_target_and_preserves_link(self):
         alias = self.project / 'alias'
         alias.symlink_to('../elsewhere/new/subdir/target')
-        result = loki.run_write(str(alias), 'created')
         if os.name != 'posix':
             # As above: a dangling symlink cannot be opened for writing here.
-            self.assertTrue(result.startswith('Error:'), result)
+            self.assert_refused('Write', {'file_path': str(alias), 'content': 'created'})
             self.assertTrue(alias.is_symlink())
             self.assertFalse((self.elsewhere / 'new').exists())
             return
-        self.assertIn('Successfully', result)
+        self.assertIn('Successfully', loki.run_write(str(alias), 'created'))
         self.assertTrue(alias.is_symlink())
         self.assertEqual(
             (self.elsewhere / 'new/subdir/target').read_text(), 'created')
 
     def test_final_symlink_target_dotdot_uses_kernel_traversal(self):
+        self.directory_link()
         right = self.elsewhere / 'target'
         wrong = self.project / 'target'
         right.write_text('right')
@@ -469,8 +591,7 @@ class FilePathTests(unittest.TestCase):
         if os.name != 'posix':
             # Windows refuses a symlink whose target contains `..` (WinError
             # 123), so the write is refused and both files stay untouched.
-            self.assertTrue(
-                loki.run_write(str(alias), 'updated').startswith('Error:'))
+            self.assert_refused('Write', {'file_path': str(alias), 'content': 'updated'})
             self.assertEqual(right.read_text(), 'right')
         else:
             # POSIX applies `..` in the link target through the kernel.
@@ -493,22 +614,20 @@ class FilePathTests(unittest.TestCase):
             # invalid outright.
             for relative in ['missing/../target', 'plain/../target']:
                 self.assertIn('must not read', loki.run_read(relative))
-            self.assertTrue(loki.run_read('target/').startswith('Error:'))
+            self.assert_refused('Read', {'file_path': 'target/'})
             return
         for relative in ['missing/../target', 'plain/../target', 'target/']:
             with self.subTest(path=relative):
                 with self.assertRaises(OSError):
                     with open(str(self.project) + '/' + relative):
                         pass
-                result = loki.run_read(relative)
-                self.assertTrue(result.startswith('Error:'), result)
-                self.assertNotIn('must not read', result)
+                result = self.assert_refused('Read', {'file_path': relative})
+                self.assertNotIn('must not read', result['content'])
 
     def test_parent_creation_cannot_bypass_read_before_overwrite(self):
         target = self.project / 'target'
         target.write_text('must preserve')
-        result = loki.run_write('missing/../target', 'overwrite')
-        self.assertTrue(result.startswith('Error:'), result)
+        self.assert_refused('Write', {'file_path': 'missing/../target', 'content': 'overwrite'})
         self.assertEqual(target.read_text(), 'must preserve')
         self.assertFalse((self.project / 'missing').exists())
 
@@ -520,8 +639,10 @@ class FilePathTests(unittest.TestCase):
         loki.run_read(str(target))
         target.unlink()
         parent.rmdir()
-        self.assertIn('Error checking current file contents',
-                      loki.run_write(str(target), 'wrong'))
+        result = asyncio.run(loki.dispatch_tool_async(
+            'Write', {'file_path': str(target), 'content': 'wrong'}))
+        self.assertFalse(result['ok'], result)
+        self.assertIn('checking current file contents', result['content'])
         self.assertFalse(parent.exists())
 
     def test_non_directory_and_trailing_slash_writes_fail(self):
@@ -529,6 +650,23 @@ class FilePathTests(unittest.TestCase):
         target.write_text('original')
         (self.project / 'plain').write_text('not a directory')
         loki.run_read(str(target))
+        previous_cwd = self.session.shell_cwd
+        for number in [errno.EACCES, errno.EIO, errno.ELOOP]:
+            failure = OSError(number, 'link lookup refused')
+            with self.subTest(errno=number), mock.patch.object(
+                    file_operations.os, 'readlink', side_effect=failure):
+                self.assert_refused('Write', {'file_path': str(target), 'content': 'wrong'}, 'link lookup refused')
+                self.assert_refused('Edit', {'file_path': str(target), 'old_string': 'original',
+                                             'new_string': 'wrong'}, 'link lookup refused')
+                with self.assertRaises(OSError) as refused:
+                    file_operations.atomic_write_text(str(target), 'wrong')
+                self.assertIs(refused.exception, failure)
+                with self.assertRaises(OSError) as refused:
+                    loki.change_shell_cwd(str(self.project))
+                self.assertIs(refused.exception, failure)
+            self.assertEqual(target.read_text(), 'original')
+            self.assertEqual(self.session.shell_cwd, previous_cwd)
+            self.assertFalse(list(self.project.glob('.*.tmp')))
         if os.name != 'posix':
             # `plain/..` cancels lexically here, so the target is written; only
             # the trailing slash on a file is invalid.  Read-before-write keys
@@ -538,12 +676,11 @@ class FilePathTests(unittest.TestCase):
             self.assertIn('Successfully',
                           loki.run_write('plain/../target', 'wrong'))
             self.assertEqual(target.read_text(), 'wrong')
-            self.assertTrue(
-                loki.run_write('target/', 'wrong').startswith('Error:'))
+            self.assert_refused('Write', {'file_path': 'target/', 'content': 'wrong'})
             return
         for relative in ['plain/../target', 'target/']:
             with self.subTest(path=relative):
-                self.assertTrue(loki.run_write(relative, 'wrong').startswith('Error:'))
+                self.assert_refused('Write', {'file_path': relative, 'content': 'wrong'})
         self.assertEqual(target.read_text(), 'original')
 
     def test_symlink_loops_fail_without_replacing_links(self):
@@ -553,7 +690,7 @@ class FilePathTests(unittest.TestCase):
         b.symlink_to('a')
         original_links = {a: os.readlink(a), b: os.readlink(b)}
         original_names = set(self.project.iterdir())
-        self.assertTrue(loki.run_write(str(a), 'wrong').startswith('Error:'))
+        self.assert_refused('Write', {'file_path': str(a), 'content': 'wrong'})
         for link, operand in original_links.items():
             self.assertTrue(link.is_symlink())
             self.assertEqual(os.readlink(link), operand)
@@ -586,7 +723,7 @@ class FilePathTests(unittest.TestCase):
         os.mkdir(target)
         operand = f'"{target}"'
         self.assertTrue(loki.change_shell_cwd_from_text(operand))
-        self.assertTrue(os.path.samefile(loki.current_cwd(), target))
+        self.assertTrue(os.path.samefile(loki.current_shell_cwd(), target))
 
     def test_unlinked_fd_read_does_not_authorize_a_different_named_file(self):
         if os.name != 'posix':
@@ -594,8 +731,7 @@ class FilePathTests(unittest.TestCase):
             # never read cannot authorize a write -- is asserted directly.
             other = self.project / 'unlinked (deleted)'
             other.write_text('same bytes')
-            result = loki.run_write(str(other), 'unreviewed replacement')
-            self.assertTrue(result.startswith('Error:'), result)
+            self.assert_refused('Write', {'file_path': str(other), 'content': 'unreviewed replacement'})
             self.assertEqual(other.read_text(), 'same bytes')
             return
         original = self.project / 'unlinked'
@@ -606,11 +742,11 @@ class FilePathTests(unittest.TestCase):
             self.assertIn('same bytes', loki.run_read(fd_path))
             other = self.project / 'unlinked (deleted)'
             other.write_text('same bytes')
-            result = loki.run_write(str(other), 'unreviewed replacement')
-            self.assertTrue(result.startswith('Error:'), result)
+            self.assert_refused('Write', {'file_path': str(other), 'content': 'unreviewed replacement'})
             self.assertEqual(other.read_text(), 'same bytes')
 
     def test_image_lookup_and_invalid_traversals(self):
+        self.directory_link()
         correct = b'\x89PNG\r\n\x1a\ncorrect'
         (self.elsewhere / 'image.png').write_bytes(correct)
         (self.project / 'image.png').write_bytes(b'not an image')
@@ -664,6 +800,44 @@ class FilePathTests(unittest.TestCase):
             loki.load_chat_log(alias)
         self.assertEqual(savefiles.text_for(alias), '')
 
+    def test_preparsed_saved_log_keeps_the_admitted_snapshot(self):
+        filename = os.path.join(str(self.project), 'prepared.json')
+        admitted = savefiles.serialize_chat_log([], [], {
+            'shell_cwd': str(self.project), 'reasoning_effort': 'high'})
+        with open(filename, 'w', encoding='utf-8') as stream:
+            stream.write(admitted)
+        with savefiles.open_chat_log(filename) as (stream, _facts):
+            loaded = savefiles.read_chat_log(stream)
+        with open(filename, 'w', encoding='utf-8') as stream:
+            stream.write(savefiles.serialize_chat_log([], [], {
+                'shell_cwd': str(self.project), 'reasoning_effort': 'low'}))
+
+        loki.load_chat_log(filename, loaded)
+
+        self.assertEqual(self.session.reasoning_effort_preference, 'high')
+        self.assertEqual(self.session.session_state['reasoning_effort'], 'high')
+        self.assertEqual(self.session.chat_log_path, filename)
+
+    def test_malformed_saved_log_closes_reader_and_preserves_session(self):
+        filename = os.path.join(str(self.project), 'malformed.json')
+        with open(filename, 'w', encoding='utf-8') as stream:
+            stream.write('{invalid')
+        previous = os.path.join(str(self.project), 'previous.json')
+        self.session.chat_log_path = previous
+        self.session.reasoning_effort_preference = 'high'
+        self.session.session_state = {'reasoning_effort': 'high'}
+        with mock.patch.object(savefiles, 'read_chat_log', wraps=savefiles.read_chat_log) as parse, \
+                self.assertRaises(json.JSONDecodeError):
+            loki.load_chat_log(filename)
+
+        parse.assert_called_once()
+        self.assertTrue(parse.call_args.args[0].closed)
+        self.assertEqual(self.session.chat_log_path, previous)
+        self.assertEqual(self.session.reasoning_effort_preference, 'high')
+        self.assertEqual(self.session.session_state, {'reasoning_effort': 'high'})
+        self.assertEqual(self.session.transcript_items, [])
+        self.assertEqual(self.session.shell_cwd, str(self.project))
+
     def test_new_chat_name_selection_does_not_create_directories_before_save(self):
         parent = os.path.join(self.project, 'new-parent')
         filename = os.path.join(parent, 'session.json')
@@ -675,6 +849,7 @@ class FilePathTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(filename))
 
     def test_new_chat_uses_the_path_it_was_given(self):
+        self.directory_link()
         # The path handed to a new chat is composed by the runtime, not taken
         # from a model operand, so it is used as given.  A name that goes
         # through a link is therefore followed again when the log is written --
@@ -687,6 +862,7 @@ class FilePathTests(unittest.TestCase):
         self.assertEqual((base / 'new-session.json').read_text(), 'snapshot')
 
     def test_resume_writes_through_the_path_it_was_given(self):
+        self.directory_link()
         # A resumed session stores the path it was handed and writes through
         # that name.  Whatever the name denotes at write time is what is
         # written: a link redirected after load is followed, and the write is

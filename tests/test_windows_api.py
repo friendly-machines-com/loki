@@ -555,8 +555,8 @@ class StateBaseDirectoryTests(unittest.TestCase):
     def test_posix_default_is_local_state(self):
         with mock.patch.object(sys, "platform", "linux"):
             self.assertEqual(
-                paths.state_base_directory({}),
-                os.path.expanduser("~/.local/state"))
+                paths.state_base_directory({'HOME': 'selected-home'}),
+                'selected-home' + os.sep + '.local/state')
 
     def test_windows_state_is_separate_from_readable_configuration(self):
         base = os.path.join(tempfile.gettempdir(), "Local")
@@ -571,6 +571,71 @@ class StateBaseDirectoryTests(unittest.TestCase):
         self.assertEqual(
             paths.loki_state_dir({"XDG_STATE_HOME": "/state"}),
             os.path.join("/state", "loki"))
+
+
+class HomeDirectoryTests(unittest.TestCase):
+    def test_omitted_home_defaults_keep_platform_selection_without_interpreting_names(self):
+        """Removing generic expansion must not silently replace Windows' default policy."""
+        cases = [
+            ['linux', {'HOME': 'base/link/../home'}, 'base/link/../home'],
+            ['win32', {'USERPROFILE': r'C:\chosen\profile', 'HOMEDRIVE': 'D:',
+                       'HOMEPATH': r'\fallback'}, r'C:\chosen\profile'],
+            ['win32', {'HOMEDRIVE': 'D:', 'HOMEPATH': r'\fallback'}, r'D:\fallback'],
+            ['win32', {'HOMEPATH': r'\fallback'}, r'\fallback'],
+            ['win32', {'USERPROFILE': ''}, ''],
+            ['win32', {}, '~'],
+        ]
+        with mock.patch.dict(os.environ, {'HOME': '/ambient'}, clear=True):
+            for platform, values, expected in cases:
+                with self.subTest(platform=platform, values=values), \
+                        mock.patch.object(sys, 'platform', platform):
+                    self.assertEqual(paths.home_directory(values), expected)
+
+
+class PosixDefaultDirectoryTests(unittest.TestCase):
+    def test_missing_mapping_home_uses_the_normal_default(self):
+        with mock.patch.object(sys, 'platform', 'linux'), \
+                mock.patch.dict(os.environ, {'HOME': '/ambient-home'}, clear=True):
+            home = os.path.expanduser('~')
+            for choose, suffix in [[paths.config_base_directory, '.config'],
+                                   [paths.state_base_directory, '.local/state']]:
+                for values in [{}, {'HOME': ''},
+                               {'HOME': '', 'XDG_CONFIG_HOME': '', 'XDG_STATE_HOME': ''}]:
+                    with self.subTest(chooser=choose.__name__, values=values):
+                        self.assertEqual(choose(values), os.path.join(home, suffix))
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX account-home fallback')
+    def test_unset_home_uses_the_account_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(paths.home_directory(), os.path.expanduser('~'))
+            self.assertEqual(paths.config_base_directory(), os.path.expanduser('~/.config'))
+            self.assertEqual(paths.state_base_directory(), os.path.expanduser('~/.local/state'))
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX empty-HOME default')
+    def test_empty_home_keeps_the_standard_default(self):
+        with mock.patch.dict(os.environ, {'HOME': ''}, clear=True):
+            self.assertEqual(paths.home_directory(), os.path.expanduser('~'))
+            self.assertEqual(paths.config_base_directory(), os.path.expanduser('~/.config'))
+            self.assertEqual(paths.state_base_directory(), os.path.expanduser('~/.local/state'))
+
+    def test_supplied_home_components_are_not_rewritten(self):
+        home = 'base/link/../home'
+        with mock.patch.object(sys, 'platform', 'linux'), \
+                mock.patch.dict(os.environ, {'HOME': '/different-home'}, clear=True):
+            self.assertEqual(paths.config_base_directory({'HOME': home}),
+                             home + os.sep + '.config')
+            self.assertEqual(paths.state_base_directory({'HOME': home}),
+                             home + os.sep + '.local/state')
+
+    def test_xdg_override_is_exact_and_does_not_need_home(self):
+        for choose, key in [[paths.config_base_directory, 'XDG_CONFIG_HOME'],
+                            [paths.state_base_directory, 'XDG_STATE_HOME']]:
+            for raw in ['config', '~/config', './config/', 'base/link/../config//']:
+                with self.subTest(chooser=choose.__name__, raw=raw):
+                    values = {key: raw}
+                    self.assertEqual(choose(values), raw)
+                    values['HOME'] = ''
+                    self.assertEqual(choose(values), raw)
 
 
 class ContainerDeclarationTests(unittest.TestCase):

@@ -814,7 +814,7 @@ class ExternalHookTests(unittest.TestCase):
 
 class LokiToolRuntimeIntegrationTests(unittest.TestCase):
     def setUp(self):
-        loki.file_state.clear()
+        loki.current_session().file_observations.clear()
 
     def execute_with_fake_dispatch(self, call, pipeline=None):
         dispatched = []
@@ -894,7 +894,7 @@ class LokiToolRuntimeIntegrationTests(unittest.TestCase):
 
     def test_bash_uses_the_cwd_shown_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
-            initial = loki.current_cwd()
+            initial = loki.current_shell_cwd()
             pipeline = tool_runtime.ToolHookPipeline()
 
             def change_session_cwd(invocation):
@@ -1128,7 +1128,7 @@ class TurnEndHookTests(unittest.TestCase):
             pipeline = load_hooks(config_path)
             self.assertIsNone(pipeline.turn_end_hooks[0].config.timeout_ms)
             with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline):
-                with mock.patch.object(loki, "current_cwd", return_value=directory):
+                with mock.patch.object(loki, "current_shell_cwd", return_value=directory):
                     asyncio.run(loki.run_turn_end_hooks_async(
                         [{"type": "max_loops"}], "last text"))
             with open(output, encoding="utf-8") as stream:

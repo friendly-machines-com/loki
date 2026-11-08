@@ -10,7 +10,7 @@ import json
 import os
 import re
 import stat
-# import sys
+import sys
 import time
 import uuid
 from pprint import pformat
@@ -64,13 +64,15 @@ def open_chat_log(path: str, *, errors='strict'):
     a frontend before its regular-file check can run.
     """
     flags = os.O_RDONLY
-    if os.name == 'posix':
+    if sys.platform != 'win32':
         flags |= os.O_NONBLOCK
     descriptor = os.open(path, flags)
     try:
         facts = os.fstat(descriptor)
         if not stat.S_ISREG(facts.st_mode):
             raise OSError('saved conversation is not a regular file')
+        if sys.platform != 'win32':
+            os.set_blocking(descriptor, True)
         stream = os.fdopen(descriptor, 'r', encoding='utf-8', errors=errors)
         descriptor = None
         with stream:
@@ -176,7 +178,12 @@ async def run_session_picker_async(
 
 
 def read_chat_log(file_obj) -> tuple[list, list, dict, list]:
-    blob = json.load(file_obj)
+    try:
+        blob = json.load(file_obj)
+    except RecursionError as error:
+        # Frontends handle invalid saved data as ValueError. The decoder's own
+        # nesting limit must not turn such a file into an uncaught startup error.
+        raise ValueError('saved conversation JSON nesting is too deep') from error
     events, todos = formats.load_log_blob(blob)
     state = blob.get("session_state", {}) if isinstance(blob, dict) else {}
     if not isinstance(state, dict):

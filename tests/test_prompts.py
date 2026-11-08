@@ -129,7 +129,11 @@ class SystemPromptTests(unittest.TestCase):
                          "My instructions with {date} and {cwd} left literal.")
         runtime = "\n".join(formats.item_text(item) for item in items[1:])
         self.assertIn("Current date: 2030-01-02", runtime)
-        self.assertIn(f"Current Loki cwd: {self.root}", runtime)
+        self.assertIn(f"Current shell cwd: {self.root}", runtime)
+        self.assertIn("Relative tool paths resolve against this directory", runtime)
+        self.assertIn("Bash commands start here", runtime)
+        self.assertIn("Loki's process cwd is fixed and does not change.", runtime)
+        self.assertNotIn("Current Loki cwd", runtime)
         self.assertNotIn("You have these tools", runtime)
         self.assertNotIn("Read, Write, Edit", runtime)
         self.assertNotIn("Current date:", self.file.read_text(encoding="utf-8"))
@@ -138,8 +142,22 @@ class SystemPromptTests(unittest.TestCase):
         self.write_prompt("")
         self.install_session()
         items = loki.initial_transcript_items()
-        self.assertIn("Current Loki cwd:", "\n".join(formats.item_text(item) for item in items))
+        self.assertIn("Current shell cwd:", "\n".join(formats.item_text(item) for item in items))
         self.assertNotIn(prompts.DEFAULT_SYSTEM_PROMPT, str(items))
+
+    def test_cd_instruction_distinguishes_shell_and_process_cwd(self):
+        process_cwd = os.getcwd()
+        session = self.install_session()
+        self.addCleanup(session.response_headers.close)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(loki.change_shell_cwd_from_text(str(self.root)))
+        instruction = formats.item_text(session.transcript_items[-1])
+        self.assertIn(f"Current shell cwd changed to: {self.root}.", instruction)
+        self.assertIn("Relative tool paths now resolve against this directory", instruction)
+        self.assertIn("Bash commands now start here", instruction)
+        self.assertIn("Loki's process cwd is unchanged.", instruction)
+        self.assertNotIn("Current Loki cwd", instruction)
+        self.assertEqual(os.getcwd(), process_cwd)
 
     def test_new_chats_reread_but_current_and_resumed_chats_retain_snapshot(self):
         self.write_prompt("Original instructions")

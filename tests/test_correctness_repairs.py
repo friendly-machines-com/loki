@@ -101,7 +101,7 @@ class ProviderResponseContractTests(unittest.TestCase):
 
 class FileObservationContractTests(unittest.TestCase):
     def setUp(self):
-        loki.file_state.clear()
+        loki.current_session().file_observations.clear()
 
     def test_binary_change_after_read_blocks_overwrite(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -110,9 +110,10 @@ class FileObservationContractTests(unittest.TestCase):
             self.assertIn("binary", loki.run_read(path))
 
             pathlib.Path(path).write_bytes(b"\x00new")
-            result = loki.run_write(path, "replacement")
+            result = asyncio.run(loki.dispatch_tool_async('Write', {'file_path': path, 'content': 'replacement'}))
 
-            self.assertIn("changed on disk", result)
+            self.assertFalse(result['ok'], result)
+            self.assertIn('changed on disk', result['content'])
             self.assertEqual(pathlib.Path(path).read_bytes(), b"\x00new")
 
     def test_deletion_after_read_blocks_recreation(self):
@@ -122,9 +123,10 @@ class FileObservationContractTests(unittest.TestCase):
             loki.run_read(path)
             os.unlink(path)
 
-            result = loki.run_write(path, "replacement")
+            result = asyncio.run(loki.dispatch_tool_async('Write', {'file_path': path, 'content': 'replacement'}))
 
-            self.assertIn("checking current file contents", result)
+            self.assertFalse(result['ok'], result)
+            self.assertIn('checking current file contents', result['content'])
             self.assertFalse(os.path.exists(path))
 
     def test_empty_string_is_a_valid_write(self):

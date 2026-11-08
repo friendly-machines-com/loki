@@ -1,11 +1,16 @@
 """Guarded file operations and searches, independent of application state.
 
-The runtime supplies its single observation history, invocation cwd, and
-search executor. Path spelling and editor publication policy stay here.
+The runtime supplies the conversation's live read history, invocation cwd,
+and search executor. Path spelling and editor publication policy stay here.
+
+Operation failures raise: the existing tool exception boundary can then report
+failure without guessing from returned prose. Text-only callers use successful
+text directly; tool handlers return the existing explicit result envelope.
 """
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import os
 import stat
@@ -58,6 +63,15 @@ class FileObservation:
     size: int
 
 
+def _remember_observation(observations, key, observation):
+    # Bound the conversation's live history. Successful Read/Write/Edit refresh
+    # a name; eviction asks for another Read rather than retaining unbounded state.
+    observations.pop(key, None)
+    observations[key] = observation
+    if len(observations) > READ_PATHS_LIMIT:
+        observations.pop(next(iter(observations)))
+
+
 def resolve_path(path: str, base_dir: str | None = None) -> str:
     if not path:
         return path
@@ -68,27 +82,6 @@ def resolve_path(path: str, base_dir: str | None = None) -> str:
     if base_dir is None:
         raise ValueError("relative paths require a working directory")
     return os.path.join(base_dir, path)
-
-
-def observation_key(file_path: str) -> str:
-    """The name a read-before-write record is kept under.
-
-    Loki never normalises or resolves a filesystem operand -- never, for any
-    purpose, including this one.  A name is what the caller wrote, anchored by
-    the caller to the fixed logical cwd; rewriting it substitutes a different
-    name for a possibly different object, which is not what any caller asked
-    for.  ``realpath``, ``abspath`` and ``normpath`` all do that rewriting.
-    Case and separators are folded so one name has one key, and nothing else is
-    done to it.
-
-    Identity by ``(st_dev, st_ino)`` is not used either: on volumes that report
-    no file index (fat, exFAT, some shares and filters) two unrelated files
-    share ``st_ino`` 0 and would share a key.
-
-    What detects a replaced file is the observation recorded under this key,
-    compared in ``_stale_file_error``.
-    """
-    return os.path.normcase(file_path)
 
 
 def _follow_final_link(file_path: str) -> str:
@@ -104,29 +97,41 @@ def _follow_final_link(file_path: str) -> str:
     """
     target = file_path
     for _ in range(_MAX_LINK_DEPTH):
-        if not os.path.islink(target):
+        try:
+            link = os.readlink(target)
+        except FileNotFoundError:
             return target
-        link = os.readlink(target)
-        target = (link if os.path.isabs(link)
-                  else os.path.join(os.path.dirname(target), link))
+        except OSError as error:
+            if error.errno == errno.EINVAL:
+                return target  # The selected entry is not a symbolic link.
+            raise
+        if os.path.isabs(link):
+            target = link
+        else:
+            # readlink's relative operand starts at this link's directory,
+            # not the process cwd. Keep its dotdot components for the kernel.
+            directory, _name = os.path.split(target)
+            target = os.path.join(directory, link)
     raise OSError(f"too many levels of symbolic links: {file_path}")
 
 
 def existing_target(file_path: str, observed_stat) -> str:
-    """The name to replace, verified against the object the caller observed."""
+    """Reject an object replaced while this operation selects its destination.
+
+    This is a best-effort check inside one selection, not a lock or an identity
+    requirement between separate Read and Write/Edit calls.
+    """
     target = _follow_final_link(file_path)
     if not os.path.samestat(observed_stat, os.stat(target)):
-        raise OSError("path changed during target selection")
+        raise OSError('path changed during target selection')
     return target
 
 
 def _write_destination(file_path: str) -> str:
-    """Select once, without mutation, before the Read-before-overwrite checks.
+    """Follow final links without discarding native dot-component traversal.
 
-    Existing operands must pass kernel lookup before target selection. Missing
-    parents may be created later, but a failed traversal of '.' or '..' is not
-    permission to discard components. A dangling link is expanded only so its
-    missing target, including missing parent directories, can be selected.
+    Missing parents may be created later. Existing targets are rechecked so a
+    replacement during selection is refused; names remain unlocked afterward.
     """
     try:
         observed = os.stat(file_path)
@@ -145,14 +150,14 @@ def _write_destination(file_path: str) -> str:
             parent = existing_target(parent, parent_stat)
         target = os.path.join(parent, name)
         try:
-            entry = os.lstat(target)
+            link = os.readlink(target)
         except FileNotFoundError:
             return target
-        if stat.S_ISLNK(entry.st_mode):
-            return _write_destination(os.path.join(parent, os.readlink(target)))
-        # An entry appeared during selection. Recheck it rather than assume
-        # this is still a new-file write. The caller checks the selected name.
-        return _write_destination(target)
+        except OSError as error:
+            if error.errno == errno.EINVAL:
+                return target
+            raise
+        return _write_destination(os.path.join(parent, link))
     return existing_target(file_path, observed)
 
 
@@ -252,71 +257,74 @@ def atomic_write_text_at(directory_fd, name: str, content: str):
 
 
 def _stale_file_error(file_path: str, action: str,
-                      file_key=None, *, observations) -> str | None:
-    if file_key is None:
-        file_key = observation_key(file_path)
-    observed = observations.get(file_key)
+                      file_key, *, observations, current=None) -> str | None:
     if file_key not in observations:
         return (
             f"Error: {file_path} has not been read. Read it before "
             f"{action}.")
-    if observed is None:
-        # Older callers used None for a binary observation. It conveys no
-        # identity and therefore cannot safely authorize an overwrite.
-        return (
-            f"Error: {file_path} has no verifiable read snapshot. "
-            f"Read it again before {action}.")
+    observed = observations[file_key]
     try:
-        if isinstance(observed, FileObservation):
+        if current is None:
             current = _file_observation(file_path)
-        else:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                current = f.read()
     except Exception as e:
-        return f"Error checking current file contents before {action}: {e}"
+        return f"Error: checking current file contents before {action}: {e}"
     if observed != current:
         return (f"Error: {file_path} changed on disk since you last read it. "
                 f"Read it again before {action}.")
     return None
 
 
-def _stat_identity(stat_result) -> tuple:
-    identity = (
-        stat_result.st_dev,
-        stat_result.st_ino,
-        stat_result.st_size,
-        stat_result.st_mtime_ns,
-    )
-    if os.name == "posix":
-        # POSIX ctime is the kernel-maintained metadata-change time: it moves on
-        # changes mtime misses (mode, owner, link count) and cannot be set by
-        # the process, so it is tamper evidence.  On Windows the field is
-        # deprecated and moving from creation time to metadata-change time (or
-        # zero), which makes it unstable rather than evidential, so it is left
-        # out there; st_birthtime is creation time and constant, so it is not a
-        # substitute.  The stored SHA-256 digest remains the content proof.
-        identity = identity + (stat_result.st_ctime_ns,)
+@contextlib.contextmanager
+def _open_regular_file(file_path, mode='r', *, newline=None):
+    # POSIX nonblocking open lets us refuse a FIFO without waiting for a writer.
+    # Windows descriptors use binary mode; the text wrapper owns translation.
+    flags = os.O_RDONLY
+    if sys.platform == 'win32':
+        flags |= os.O_BINARY
+    else:
+        flags |= os.O_NONBLOCK
+    descriptor = os.open(file_path, flags)
+    try:
+        file_mode = os.fstat(descriptor).st_mode
+        if stat.S_ISDIR(file_mode):
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), file_path)
+        if not stat.S_ISREG(file_mode):
+            raise OSError('file is not a regular file')
+        if sys.platform != 'win32':
+            os.set_blocking(descriptor, True)
+        # This scope always owns the descriptor. The standard wrapper borrows
+        # it, so wrapping failure and read failure have the same close owner.
+        with open(descriptor, mode, encoding=None if 'b' in mode else 'utf-8',
+                  newline=newline, closefd=False) as source:
+            yield source
+    finally:
+        os.close(descriptor)
+
+
+def _stat_identity(facts):
+    identity = [facts.st_dev, facts.st_ino, facts.st_size, facts.st_mtime_ns]
+    if sys.platform != 'win32':
+        # POSIX ctime detects changes that a restored mtime misses. Windows'
+        # creation/metadata-time meanings differ across supported interpreters.
+        identity.append(facts.st_ctime_ns)
     return identity
 
 
-def _file_observation(
-        file_path: str, expected_stat=None) -> FileObservation:
+def _file_observation(file_path: str, expected_stat=None) -> FileObservation:
+    # Hash the complete file, including bytes beyond Read's display cap. The
+    # metadata checks reject detected changes during this read; they do not
+    # make Read/Edit/Write a transaction or authorize filesystem access.
     digest = hashlib.sha256()
     size = 0
-    with open(file_path, "rb") as file_obj:
-        before = os.fstat(file_obj.fileno())
-        if (expected_stat is not None
-                and _stat_identity(before) != _stat_identity(expected_stat)):
-            raise OSError("file changed while it was being read")
-        while True:
-            chunk = file_obj.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
+    with _open_regular_file(file_path, 'rb') as source:
+        before = os.fstat(source.fileno())
+        if expected_stat is not None and _stat_identity(before) != _stat_identity(expected_stat):
+            raise OSError('file changed while it was being read')
+        while chunk := source.read(1024 * 1024):
             digest.update(chunk)
-        after = os.fstat(file_obj.fileno())
-        if _stat_identity(after) != _stat_identity(before):
-            raise OSError("file changed while it was being read")
+            size += len(chunk)
+        if _stat_identity(os.fstat(source.fileno())) != _stat_identity(before):
+            raise OSError('file changed while it was being read')
     return FileObservation(digest.hexdigest(), size)
 
 
@@ -331,157 +339,120 @@ def _format_numbered_lines(lines: list[str], first_line_number: int = 1) -> str:
 
 def run_read(file_path: str, offset: int | None = None, limit: int | None = None, *, structured=False, cwd, observations):
     if not file_path:
-        return "Error: file_path is required"
+        raise ValueError('file_path is required')
     file_path = resolve_path(file_path, cwd)
-    if os.path.isdir(file_path):
-        return f"Error: {file_path} is a directory, not a file"
-    try:
-        st = os.stat(file_path)
-        file_key = observation_key(file_path)
-    except FileNotFoundError:
-        return f"Error: File not found: {file_path}"
-    except IsADirectoryError:
-        return f"Error: {file_path} is a directory"
-    except Exception as e:
-        return f"Error: {e}"
+    file_key = file_path
 
-    def remember(observation):
-        observations[file_key] = observation
+    def remember(observation, text, process_output=None):
+        _remember_observation(observations, file_key, observation)
+        # Empty/binary/image notices are successful observations too. Their
+        # wording must never be asked to supply the tool's success flag.
+        if structured:
+            return tool_runtime.tool_result(True, text, process_output=process_output)
+        return text
 
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
+    image = ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']
+    facts = os.stat(file_path)
+    content = None
+    if not image:
         try:
-            remember(_file_observation(
-                file_path, expected_stat=st))
-        except OSError as error:
-            return f"Error reading file: {error}"
-        return f"File {file_path} is an image ({st.st_size} bytes). Visual content rendering not supported in this environment; reading the file is acknowledged."
-
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            if _stat_identity(os.fstat(f.fileno())) != _stat_identity(st):
-                raise OSError("file changed while it was being read")
-            # Read one character past the cap so the response can say whether
-            # the file was actually truncated.
-            content = f.read(READ_CHAR_CAP + 1)
-            if _stat_identity(os.fstat(f.fileno())) != _stat_identity(st):
-                raise OSError("file changed while it was being read")
-        truncated_chars = len(content) > READ_CHAR_CAP
-        if truncated_chars:
-            content = content[:READ_CHAR_CAP]
-    except UnicodeDecodeError:
-        try:
-            remember(_file_observation(
-                file_path, expected_stat=st))
-        except OSError as error:
-            return f"Error reading file: {error}"
-        return f"File {file_path} is binary ({st.st_size} bytes); cannot display as text."
-    except Exception as e:
-        return f"Error reading file: {e}"
-
-    if "\x00" in content:
-        try:
-            remember(_file_observation(
-                file_path, expected_stat=st))
-        except OSError as error:
-            return f"Error reading file: {error}"
-        return (
-            f"File {file_path} is binary ({st.st_size} bytes); "
-            "cannot display as text.")
-
+            # The standard text reader owns UTF-8 and universal-newline
+            # decoding. There is no need for a second decoder coordinator
+            # merely to record a model's bounded view of the file.
+            with _open_regular_file(file_path) as source:
+                if _stat_identity(os.fstat(source.fileno())) != _stat_identity(facts):
+                    raise OSError('file changed while it was being read')
+                content = source.read(READ_CHAR_CAP + 1)
+                if _stat_identity(os.fstat(source.fileno())) != _stat_identity(facts):
+                    raise OSError('file changed while it was being read')
+        except UnicodeDecodeError:
+            pass  # Binary files are still observed before Write may replace them.
+    observation = _file_observation(file_path, expected_stat=facts)
+    if image:
+        return remember(observation, f"File {file_path} is an image ({observation.size} bytes). Visual content rendering not supported in this environment; reading the file is acknowledged.")
+    if content is None or "\x00" in content:
+        return remember(observation, f"File {file_path} is binary ({observation.size} bytes); cannot display as text.")
     if not content:
-        remember(_content_observation(""))
-        return f"File {file_path} is empty."
-
+        return remember(observation, f"File {file_path} is empty.")
+    truncated_chars = len(content) > READ_CHAR_CAP
     if truncated_chars:
-        content += f"\n\n[... file truncated at {READ_CHAR_CAP} characters; file is {st.st_size} bytes on disk -- pass offset/limit to read further]"
+        content = content[:READ_CHAR_CAP]
+        content += f"\n\n[... file truncated at {READ_CHAR_CAP} characters; file is {observation.size} bytes on disk -- pass offset/limit to read further]"
 
     lines = content.splitlines()
     total_lines = len(lines)
     start = int(offset) if offset is not None else 0
     if start < 0 or start >= total_lines:
-        return f"Error: offset {offset} out of range (file has {total_lines} lines)"
+        raise ValueError(f'offset {offset} out of range (file has {total_lines} lines)')
     if limit is not None:
         lim = int(limit)
         if lim <= 0:
-            return "Error: limit must be positive"
+            raise ValueError('limit must be positive')
     else:
         lim = tool_contracts.READ_DEFAULT_LINES
     sliced = lines[start:start + lim]
     rendered = _format_numbered_lines(sliced, first_line_number=start + 1)
     if start + lim < total_lines:
         rendered += f"\n... ({total_lines - start - lim} more lines not shown)"
-    try:
-        remember(_file_observation(
-            file_path, expected_stat=st))
-    except OSError as error:
-        return f"Error reading file snapshot: {error}"
-    if structured:
-        output = process_outputs.ProcessOutput("", rendered, "", shell=False, read=True)
-        return tool_runtime.tool_result(True, rendered, process_output=output.to_dict())
-    return rendered
+    output = process_outputs.ProcessOutput('', rendered, '', shell=False, read=True)
+    return remember(observation, rendered, output.to_dict())
 
 
 def run_write(file_path: str, content: str, *, cwd, observations) -> str:
     if not file_path:
-        return "Error: file_path is required"
+        raise ValueError('file_path is required')
     if content is None:
-        return "Error: content is required"
+        raise ValueError('content is required')
     operand = resolve_path(file_path, cwd)
-    # Authorization is per spelling: the record is looked up under the name the
-    # caller wrote, not under the target an existing final symlink resolves to.
-    file_key = observation_key(operand)
-    try:
-        file_path = _write_destination(operand)
-    except Exception as error:
-        return f"Error: {error}"
+    # The overwrite guard records the caller's spelling, not a final symlink's
+    # target name. Reading that target separately does not satisfy this guard.
+    file_key = operand
+    file_path = _write_destination(operand)
     if os.path.exists(operand) and file_key not in observations:
-        return (f"Error: You must Read {file_path} before overwriting it. "
-                "Read it first, then retry the Write.")
+        raise ValueError(f'You must Read {file_path} before overwriting it. '
+                         'Read it first, then retry the Write.')
     if file_key in observations:
-        stale_error = _stale_file_error(file_path, "overwriting it", file_key, observations=observations)
+        stale_error = _stale_file_error(file_path, 'overwriting it', file_key, observations=observations)
         if stale_error:
-            return stale_error
-    try:
-        atomic_write_text(file_path, content)
-        observations[file_key] = _content_observation(content)
-        return f"Successfully wrote to {file_path}"
-    except Exception as e:
-        return f"Error: {e}"
+            raise ValueError(stale_error)
+    atomic_write_text(file_path, content)
+    _remember_observation(observations, file_key, _content_observation(content))
+    return f'Successfully wrote to {file_path}'
 
 
 def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool = False, *, cwd, observations) -> str:
     if not file_path:
-        return "Error: file_path is required"
+        raise ValueError('file_path is required')
     if old_string == new_string:
-        return "Error: new_string must be different from old_string"
+        raise ValueError('new_string must be different from old_string')
     operand = resolve_path(file_path, cwd)
-    # Authorization is per spelling: looked up under the name the caller wrote.
-    file_key = observation_key(operand)
-    try:
-        file_path = _write_destination(operand)
-    except Exception as error:
-        return f"Error: {error}"
+    # The read-before-edit guard is per spelling, as for Write.
+    file_key = operand
+    file_path = _write_destination(operand)
     if file_key not in observations:
-        return f"Error: You must Read {file_path} before editing it."
+        raise ValueError(f'You must Read {file_path} before editing it.')
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = f.read()
-    except FileNotFoundError:
-        return f"Error: File not found: {file_path}"
-    except Exception as e:
-        return f"Error: {e}"
+        with _open_regular_file(file_path, newline='') as source:
+            data = source.read()
+    except UnicodeDecodeError as error:
+        raise ValueError(f'{file_path} is not UTF-8 text.') from error
 
-    stale_error = _stale_file_error(file_path, "editing it", file_key, observations=observations)
+    stale_error = _stale_file_error(
+        file_path, 'editing it', file_key, observations=observations,
+        current=_content_observation(data))
     if stale_error:
-        return stale_error
+        raise ValueError(stale_error)
 
+    # Compare the raw newlines first, then retain the editor's existing
+    # universal-newline behavior.
+    data = data.replace('\r\n', '\n').replace('\r', '\n')
     occurrences = data.count(old_string)
     if occurrences == 0:
-        return f"Error: old_string not found in {file_path}."
+        raise ValueError(f'old_string not found in {file_path}.')
     if occurrences > 1 and not replace_all:
-        return (f"Error: old_string is not unique ({occurrences} occurrences) in {file_path}. "
-                "Provide more context to make it unique, or pass replace_all=true.")
+        raise ValueError(f'old_string is not unique ({occurrences} occurrences) in {file_path}. '
+                         'Provide more context to make it unique, or pass replace_all=true.')
 
     if replace_all:
         new_data = data.replace(old_string, new_string)
@@ -490,12 +461,9 @@ def run_edit(file_path: str, old_string: str, new_string: str, replace_all: bool
         new_data = data.replace(old_string, new_string, 1)
         count = 1
 
-    try:
-        atomic_write_text(file_path, new_data)
-        observations[file_key] = _content_observation(new_data)
-        return f"Successfully edited {file_path} ({count} replacement{'s' if count != 1 else ''})."
-    except Exception as e:
-        return f"Error: {e}"
+    atomic_write_text(file_path, new_data)
+    _remember_observation(observations, file_key, _content_observation(new_data))
+    return f"Successfully edited {file_path} ({count} replacement{'s' if count != 1 else ''})."
 
 
 async def run_glob_async(

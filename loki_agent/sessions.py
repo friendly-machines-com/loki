@@ -20,8 +20,15 @@ from .usages import ContextTracker
 
 
 def conversation_id_for_path(path: str) -> str:
-    """Return a stable, non-secret identity for one persistent conversation."""
-    name = os.path.basename(path)
+    """Recover the provider's persistent conversation partition, not file authority.
+
+    This boundary receives the selected pathname, including arbitrary explicit
+    filenames. The native leaf view is needed only to recover the UUID carried
+    by Loki's generated log-name grammar after a restart; a saved identity field
+    cannot select this partition. Other filenames retain the existing UUID5 of
+    their exact spelling. Neither branch changes the filesystem operand.
+    """
+    _directory, name = os.path.split(path)
     if name.startswith("chat-") and name.endswith(".json"):
         chat_id = name[len("chat-"):-len(".json")]
         # Terminal chats use a bare UUID; ACP-created chats use "loki-UUID".
@@ -67,6 +74,9 @@ class Session:
     # local broker; workers and subagents install a delegated client.
     credential_authority: Any = None
 
+    # Read-before-write records belong to this live conversation, not saved
+    # JSON or the process. Replacing its transcript invalidates them.
+    file_observations: dict = field(default_factory=dict)
     transcript_items: list = field(default_factory=list)
     context_usage: ContextTracker = field(default_factory=ContextTracker)
     session_todos: list = field(default_factory=list)
@@ -175,6 +185,7 @@ class Session:
             self.transcript_items, identity, capacity, live=live)
 
     def replace_transcript(self, transcript, todos, toolsets, state, path):
+        self.file_observations.clear()
         self.transcript_items = transcript
         self.session_todos = todos
         self.session_toolsets = toolsets
