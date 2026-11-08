@@ -209,6 +209,7 @@ class CatalogFetchTests(unittest.TestCase):
                     self.assertEqual(transport.await_args.kwargs, {
                         "headers_in": {"Accept": "application/json"},
                         "timeout": models.MODELS_DEV_TIMEOUT_S,
+                        "response_timeout": models.MODELS_DEV_TIMEOUT_S,
                         "max_bytes": models.MODELS_DEV_MAX_BYTES,
                         "retry_max_attempts": models.MODELS_DEV_RETRY_MAX_ATTEMPTS,
                     })

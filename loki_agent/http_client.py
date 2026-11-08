@@ -63,8 +63,20 @@ class HttpRequestDeliveryError(OSError):
 
 
 async def _wait_with_cancel(awaitable, timeout, cancel_check):
+    """Await one operation, honoring cooperative cancellation throughout.
+
+    A numeric ``timeout`` is a caller-chosen abandonment budget for this one
+    phase: expiry stops waiting here, it is not evidence about the peer.
+    ``timeout=None`` deliberately waits without a duration, for peers that
+    legitimately compute silently before answering (model inference,
+    server-side compaction, one-time credential exchange); elapsed time is
+    not evidence of failure there. Either way ``cancel_check`` is consulted
+    promptly and cancellation outranks a simultaneous completion.
+    """
     task = asyncio.create_task(awaitable)
-    deadline = asyncio.get_running_loop().time() + timeout
+    deadline = (
+        None if timeout is None
+        else asyncio.get_running_loop().time() + timeout)
     try:
         while True:
             if cancel_check():
@@ -74,11 +86,14 @@ async def _wait_with_cancel(awaitable, timeout, cancel_check):
                     except BaseException:
                         pass
                 raise HttpRequestCancelled()
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError()
-            done, _ = await asyncio.wait(
-                {task}, timeout=min(0.05, remaining))
+            if deadline is None:
+                done, _ = await asyncio.wait({task}, timeout=0.05)
+            else:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                done, _ = await asyncio.wait(
+                    {task}, timeout=min(0.05, remaining))
             if done:
                 # Cancellation is an instruction, not a race for whichever
                 # future happens to be inspected first.  If both completed in
@@ -143,7 +158,12 @@ class HttpStreamResponse:
 
 
 class HttpBodyStream:
-    """Incrementally expose one HTTP response body without buffering it."""
+    """Incrementally expose one HTTP response body without buffering it.
+
+    ``timeout=None`` gives body reads no duration (cancellation still
+    applies): deliberate for model streams whose server computes silently
+    between tokens.
+    """
 
     def __init__(self, reader, headers, *, timeout, max_bytes,
                  cancel_check=None):
@@ -396,6 +416,7 @@ def _build_raw_request(method: str, request_url: str, headers_in: dict | None = 
 
 async def _async_http_request_once(method: str, request_url: str, *, headers_in: dict | None = None,
                                    body: bytes = b'', timeout: int = HTTP_DEFAULT_TIMEOUT_S,
+                                   response_timeout: float | None = None,
                                    max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                    cancel_check=None,
                                    on_response_headers=None) -> HttpResponse:
@@ -405,16 +426,27 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
     parsed, raw_request = _build_raw_request(
         method, request_url, headers_in, body)
     delivery = {"request_may_have_been_sent": False}
+    cancel = cancel_check or (lambda: False)
 
     async def request_once() -> HttpResponse:
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
         ssl_context = ssl.create_default_context() if parsed.scheme == 'https' else None
-        reader, writer = await asyncio.open_connection(
-            parsed.hostname,
-            port,
-            ssl=ssl_context,
-            server_hostname=parsed.hostname if ssl_context else None,
-        )
+        # Connection setup and request delivery each get the caller's
+        # transport budget. Waiting for the response gets ``response_timeout``
+        # instead: peers that compute before answering (model inference,
+        # server-side compaction, one-time credential exchange) are silent
+        # for arbitrarily long while healthy, so the response wait has no
+        # duration unless the caller passes one. Connection teardown below
+        # sits outside both budgets: a slow close must not discard an
+        # already-read response.
+        reader, writer = await _wait_with_cancel(
+            asyncio.open_connection(
+                parsed.hostname,
+                port,
+                ssl=ssl_context,
+                server_hostname=parsed.hostname if ssl_context else None,
+            ),
+            timeout, cancel)
         try:
             # Mark first, because an arbitrary transport's write() contract
             # does not prove that an exception means zero bytes were queued.
@@ -422,29 +454,32 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
             # rotating refresh token and destroy the newer credential state.
             delivery["request_may_have_been_sent"] = True
             writer.write(raw_request)
-            await writer.drain()
+            await _wait_with_cancel(writer.drain(), timeout, cancel)
 
-            status_line, response_headers = await _read_headers(reader)
-            parts = status_line.split(' ', 2)
-            if len(parts) < 2 or not parts[1].isdigit():
-                raise OSError(f"invalid HTTP status line: {status_line!r}")
-            status = int(parts[1])
-            reason = parts[2] if len(parts) > 2 else ''
-            if on_response_headers is not None:
-                # Some protocols mint routing state in response headers that
-                # must be used if reading this response fails and the request
-                # is retried. Report headers before consuming the body so the
-                # caller can update its per-attempt state in time.
-                on_response_headers(status, response_headers)
-            transfer_encoding = response_headers.get('transfer-encoding', '').lower()
-            if 'chunked' in transfer_encoding:
-                response_body, truncated = await _read_chunked_body(reader, max_bytes)
-            elif response_headers.get('content-length', '').isdigit():
-                response_body, truncated = await _read_content_length(
-                    reader, int(response_headers['content-length']), max_bytes)
-            else:
-                response_body, truncated = await _read_until_eof(reader, max_bytes)
-            return HttpResponse(request_url, status, reason, response_headers, response_body, truncated)
+            async def response() -> HttpResponse:
+                status_line, response_headers = await _read_headers(reader)
+                parts = status_line.split(' ', 2)
+                if len(parts) < 2 or not parts[1].isdigit():
+                    raise OSError(f"invalid HTTP status line: {status_line!r}")
+                status = int(parts[1])
+                reason = parts[2] if len(parts) > 2 else ''
+                if on_response_headers is not None:
+                    # Some protocols mint routing state in response headers that
+                    # must be used if reading this response fails and the request
+                    # is retried. Report headers before consuming the body so the
+                    # caller can update its per-attempt state in time.
+                    on_response_headers(status, response_headers)
+                transfer_encoding = response_headers.get('transfer-encoding', '').lower()
+                if 'chunked' in transfer_encoding:
+                    response_body, truncated = await _read_chunked_body(reader, max_bytes)
+                elif response_headers.get('content-length', '').isdigit():
+                    response_body, truncated = await _read_content_length(
+                        reader, int(response_headers['content-length']), max_bytes)
+                else:
+                    response_body, truncated = await _read_until_eof(reader, max_bytes)
+                return HttpResponse(request_url, status, reason, response_headers, response_body, truncated)
+
+            return await _wait_with_cancel(response(), response_timeout, cancel)
         finally:
             writer.close()
             try:
@@ -455,8 +490,7 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
                 pass
 
     try:
-        return await _wait_with_cancel(
-            request_once(), timeout, cancel_check or (lambda: False))
+        return await request_once()
     except asyncio.CancelledError as error:
         # Task cancellation is control flow, so preserve its type. Rotating
         # credential callers still need the delivery fact to decide whether
@@ -480,13 +514,16 @@ async def _async_http_request_once(method: str, request_url: str, *, headers_in:
 async def async_http_stream(method: str, request_url: str, *,
                             headers_in: dict | None = None, body: bytes = b"",
                             timeout: int = HTTP_DEFAULT_TIMEOUT_S,
+                            response_timeout: float | None = None,
                             max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                             cancel_check=None):
     """Open an HTTP request and expose its response body as an async iterator.
 
-    ``timeout`` is applied to connection setup, response headers, and each
-    individual body read. It is therefore an idle timeout, not a cap on the
-    total duration of an active stream.
+    ``timeout`` bounds connection setup and request delivery. Waiting for
+    response headers and for each body read uses ``response_timeout``
+    instead: a model stream's server may compute silently before the first
+    token or between tokens, so that wait has no duration unless the caller
+    passes one -- cancellation still applies at once.
     """
     parsed, raw_request = _build_raw_request(
         method, request_url, headers_in, body)
@@ -509,14 +546,14 @@ async def async_http_stream(method: str, request_url: str, *,
         writer.write(raw_request)
         await _wait_with_cancel(writer.drain(), timeout, cancel)
         status_line, response_headers = await _wait_with_cancel(
-            _read_headers(reader), timeout, cancel)
+            _read_headers(reader), response_timeout, cancel)
         parts = status_line.split(" ", 2)
         if len(parts) < 2 or not parts[1].isdigit():
             raise OSError(f"invalid HTTP status line: {status_line!r}")
         status = int(parts[1])
         reason = parts[2] if len(parts) > 2 else ""
         response_body = HttpBodyStream(
-            reader, response_headers, timeout=timeout, max_bytes=max_bytes,
+            reader, response_headers, timeout=response_timeout, max_bytes=max_bytes,
             cancel_check=cancel)
         yield HttpStreamResponse(
             request_url, status, reason, response_headers, response_body)
@@ -531,6 +568,7 @@ async def async_http_stream(method: str, request_url: str, *,
 
 async def async_http_request(method: str, request_url: str, *, headers_in: dict | None = None,
                              body: bytes = b'', timeout: int = HTTP_DEFAULT_TIMEOUT_S,
+                             response_timeout: float | None = None,
                              max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                              retry_max_attempts: int = 1,
                              retry_base_delay_s: float = HTTP_RETRY_BASE_DELAY_S,
@@ -539,6 +577,17 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
                              cancel_check=None,
                              prepare_attempt_headers=None,
                              on_response_headers=None) -> HttpResponse:
+    """Deliver one request through fresh connections.
+
+    ``timeout`` bounds connection setup and request delivery per attempt.
+    ``response_timeout`` bounds waiting for the complete response (headers
+    and body); None deliberately waits without a duration -- for peers that
+    compute silently before answering -- and cancellation still applies.
+    Retrieval callers pass a number when they want a bounded exchange.
+    Retries apply only to transient transport failures of the delivery
+    phases; a timeout there means this attempt stopped waiting, not that the
+    peer failed.
+    """
     cancel = cancel_check or (lambda: False)
     attempt = 0
     while True:
@@ -555,7 +604,8 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
             return await _async_http_request_once(
                 method, request_url,
                 headers_in=attempt_headers, body=body,
-                timeout=timeout, max_bytes=max_bytes,
+                timeout=timeout, response_timeout=response_timeout,
+                max_bytes=max_bytes,
                 cancel_check=cancel,
                 on_response_headers=on_response_headers,
             )
@@ -564,7 +614,9 @@ async def async_http_request(method: str, request_url: str, *, headers_in: dict 
                 raise
             delay = retry_base_delay_s * (retry_backoff_factor ** (attempt - 1))
             delay += random.uniform(0, retry_max_jitter_s)
-            await _wait_with_cancel(asyncio.sleep(delay), delay + 0.1, cancel)
+            # The backoff wait itself has no duration beyond the delay:
+            # waking late from scheduling is fine, and cancellation ends it.
+            await _wait_with_cancel(asyncio.sleep(delay), None, cancel)
 
 
 def _redirect_location(response: HttpResponse) -> str | None:
@@ -577,6 +629,7 @@ def _redirect_location(response: HttpResponse) -> str | None:
 async def async_http_request_follow_same_host(method: str, request_url: str, *,
                                               headers_in: dict | None = None, body: bytes = b'',
                                               timeout: int = HTTP_DEFAULT_TIMEOUT_S,
+                                              response_timeout: float | None = None,
                                               max_bytes: int = HTTP_MAX_RESPONSE_BYTES,
                                               max_redirects: int = 5,
                                               retry_max_attempts: int = 1,
@@ -588,7 +641,9 @@ async def async_http_request_follow_same_host(method: str, request_url: str, *,
     original_host = urllib.parse.urlparse(request_url).netloc
     for _ in range(max_redirects + 1):
         response = await async_http_request(method, current_url, headers_in=headers_in,
-                                            body=body, timeout=timeout, max_bytes=max_bytes,
+                                            body=body, timeout=timeout,
+                                            response_timeout=response_timeout,
+                                            max_bytes=max_bytes,
                                             retry_max_attempts=retry_max_attempts,
                                             retry_base_delay_s=retry_base_delay_s,
                                             retry_max_jitter_s=retry_max_jitter_s,

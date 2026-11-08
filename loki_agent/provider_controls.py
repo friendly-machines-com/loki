@@ -169,6 +169,11 @@ async def authorized_request(context: ControlContext, spec, method, url, *,
         kwargs = {
             "headers_in": headers,
             "timeout": _REQUEST_TIMEOUT_S,
+            # Bounded retrieval: these are account/status queries. Mutations
+            # keep the single attempt and report ambiguity on failure, so a
+            # timeout here means Loki stopped waiting -- never that the
+            # reset or redemption did not happen.
+            "response_timeout": _REQUEST_TIMEOUT_S,
             "max_bytes": _REQUEST_MAX_BYTES,
             "retry_max_attempts": retry_max_attempts,
         }

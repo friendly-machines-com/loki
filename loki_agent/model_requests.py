@@ -47,9 +47,6 @@ class RequestContext:
     response_headers: header_observations.Store
 
 
-LLM_REQUEST_TIMEOUT_S = 300
-LLM_STREAM_IDLE_TIMEOUT_S = 300
-
 HTTP_RETRY_MAX_ATTEMPTS_LLM = 3     # for chat-completion POSTs (with idempotency key)
 # Idempotency-key header injected on every chat-completion POST so the provider
 # can dedup a retry. Anthropic honors this server-side; OpenAI-compat servers
@@ -451,6 +448,7 @@ async def async_provider_request(
 
     retry_attempts = http_client.HTTP_RETRY_MAX_ATTEMPTS
     request_timeout = http_client.HTTP_DEFAULT_TIMEOUT_S
+    response_timeout = http_client.HTTP_DEFAULT_TIMEOUT_S
     if method == 'POST':
         # Best-effort server-side dedup; Anthropic honors this header on
         # /v1/messages. OpenAI-compat servers may ignore it.
@@ -463,7 +461,12 @@ async def async_provider_request(
         # rather than stacking another budget outside HTTP's automatic retries.
         # This function still owns body/key replay and its bounded 401 refresh.
         retry_attempts = 1 if recovery is not None else HTTP_RETRY_MAX_ATTEMPTS_LLM
-        request_timeout = LLM_REQUEST_TIMEOUT_S
+        # Waiting for the response deliberately has no duration: a model may
+        # compute silently for a long time (local inference, server-side
+        # compaction), and elapsed silence is not evidence of failure.
+        # Connection setup and request delivery stay bounded; user
+        # cancellation remains the stop mechanism.
+        response_timeout = None
 
     rejected_generation = None
     recovered = False
@@ -482,6 +485,7 @@ async def async_provider_request(
             "body": body,
             "headers_in": headers_to_use,
             "timeout": request_timeout,
+            "response_timeout": response_timeout,
             "max_bytes": http_client.HTTP_MAX_RESPONSE_BYTES,
             "retry_max_attempts": retry_attempts,
             "retry_base_delay_s": http_client.HTTP_RETRY_BASE_DELAY_S,
@@ -650,12 +654,18 @@ async def _async_chat_stream_request_once(
         codex_turn_state=None, observe=None, on_reasoning_delta=None,
         *, config) -> protocols.ProviderResponse:
     body = json.dumps(payload).encode("utf-8")
+    # Connection setup and delivery keep the transport budget; waiting for
+    # the stream -- before the first token and between tokens -- deliberately
+    # has no duration: a model may compute silently for a long time (local
+    # inference, server-side compaction), and elapsed silence is not evidence
+    # of failure. User cancellation remains the stop mechanism.
     async with http_client.async_http_stream(
             "POST",
             request_url,
             body=body,
             headers_in=request_headers,
-            timeout=LLM_STREAM_IDLE_TIMEOUT_S,
+            timeout=http_client.HTTP_DEFAULT_TIMEOUT_S,
+            response_timeout=None,
             max_bytes=http_client.HTTP_MAX_RESPONSE_BYTES,
             cancel_check=cancel_check) as response:
         if observe is not None:
@@ -895,8 +905,10 @@ async def async_chat_stream_request(
                         and exc.retry_after is not None)):
                 delay += random.uniform(0, http_client.HTTP_RETRY_MAX_JITTER_S)
             try:
+                # The backoff wait itself has no duration beyond the delay:
+                # waking late from scheduling is fine, and cancellation ends it.
                 await http_client._wait_with_cancel(
-                    asyncio.sleep(delay), delay + 0.1, cancel)
+                    asyncio.sleep(delay), None, cancel)
             except http_client.HttpRequestCancelled:
                 raise recoveries.Cancelled()
 

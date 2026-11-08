@@ -170,7 +170,12 @@ async def _fetch_url_async(url: str, cancel_check=None) -> dict:
     try:
         response = await http_client.async_http_request_follow_same_host(
             'GET', url, headers_in=request_headers,
-            timeout=WEBFETCH_TIMEOUT_S, max_bytes=WEBFETCH_MAX_BYTES,
+            timeout=WEBFETCH_TIMEOUT_S,
+            # Bounded retrieval: a page fetch is not model computation, so
+            # this budget means Loki stopped waiting, not that the peer
+            # failed. The subsequent model processing waits without one.
+            response_timeout=WEBFETCH_TIMEOUT_S,
+            max_bytes=WEBFETCH_MAX_BYTES,
             retry_max_attempts=http_client.HTTP_RETRY_MAX_ATTEMPTS,
             retry_base_delay_s=http_client.HTTP_RETRY_BASE_DELAY_S,
             retry_max_jitter_s=http_client.HTTP_RETRY_MAX_JITTER_S,
@@ -274,6 +279,7 @@ async def run_websearch_async(query: str, allowed_domains: list | None = None,
             headers_in={'Content-Type': 'application/x-www-form-urlencoded',
                         'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'},
             timeout=WEBSEARCH_TIMEOUT_S,
+            response_timeout=WEBSEARCH_TIMEOUT_S,
             max_bytes=WEBSEARCH_MAX_RESPONSE_BYTES,
             retry_max_attempts=http_client.HTTP_RETRY_MAX_ATTEMPTS,
             retry_base_delay_s=http_client.HTTP_RETRY_BASE_DELAY_S,

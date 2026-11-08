@@ -462,6 +462,65 @@ class HttpClientRequestTests(unittest.TestCase):
                     max_bytes=100,
                 ))
 
+    def test_unbounded_response_wait_still_honors_cancellation(self):
+        # A peer that computes before answering stays silent while healthy,
+        # so the response wait has no duration; cancellation still ends it.
+        connector = FakeConnector([])
+        entered = []
+
+        async def open_connection(host, port, ssl=None, server_hostname=None):
+            entered.append((host, port))
+            reader = asyncio.StreamReader()
+            writer = FakeWriter()
+            connector.writers.append(writer)
+            return reader, writer
+
+        connector.open_connection = open_connection
+        state = {"cancelled": False}
+
+        async def request():
+            return await http_client.async_http_request(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                body=b"{}",
+                timeout=5,
+                cancel_check=lambda: state["cancelled"])
+
+        async def scenario():
+            async with running_fixture_task(request()) as task:
+                while not connector.writers:
+                    await asyncio.sleep(0)
+                while not bytes(connector.writers[0].data):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                state["cancelled"] = True
+                with self.assertRaises(http_client.HttpRequestCancelled):
+                    await task
+                self.assertTrue(connector.writers[0].closed)
+
+        with PatchedOpenConnection(connector):
+            asyncio.run(scenario())
+
+    def test_bounded_response_wait_raises_when_the_budget_is_exhausted(self):
+        connector = FakeConnector([])
+
+        async def open_connection(host, port, ssl=None, server_hostname=None):
+            reader = asyncio.StreamReader()
+            writer = FakeWriter()
+            connector.writers.append(writer)
+            return reader, writer
+
+        connector.open_connection = open_connection
+
+        with PatchedOpenConnection(connector):
+            with self.assertRaises(http_client.HttpRequestDeliveryError):
+                asyncio.run(http_client.async_http_request(
+                    "GET",
+                    "https://example.test/",
+                    timeout=5,
+                    response_timeout=0.01,
+                ))
+
 
 class HttpClientRedirectTests(unittest.TestCase):
     def test_same_host_redirect_is_followed(self):

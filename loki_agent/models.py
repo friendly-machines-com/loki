@@ -43,7 +43,6 @@ MODELS_DEV_URL = "https://models.dev/api.json"
 MODELS_DEV_TIMEOUT_S = 30
 MODELS_DEV_MAX_BYTES = 20 * 1024 * 1024
 MODELS_DEV_RETRY_MAX_ATTEMPTS = 3
-OPENAI_MODELS_TIMEOUT_S = 5
 OPENAI_MODELS_MAX_BYTES = 20 * 1024 * 1024
 OPENAI_MODELS_RETRY_MAX_ATTEMPTS = 3
 
@@ -668,6 +667,7 @@ async def fetch_models_dev(cache_path=None, url=MODELS_DEV_URL):
             "Accept": "application/json",
         },
         timeout=MODELS_DEV_TIMEOUT_S,
+        response_timeout=MODELS_DEV_TIMEOUT_S,
         max_bytes=MODELS_DEV_MAX_BYTES,
         retry_max_attempts=MODELS_DEV_RETRY_MAX_ATTEMPTS,
     )
@@ -715,7 +715,12 @@ async def fetch_openai_subscription_models(
             "GET",
             request_url,
             headers_in=headers,
-            timeout=OPENAI_MODELS_TIMEOUT_S,
+            # Bounded discovery with the ordinary retrieval budget: the
+            # former five-second allowance was aggressive for a catalog the
+            # provider may assemble on demand, and its failure only means
+            # the fallback picker loses one source.
+            timeout=http_client.HTTP_DEFAULT_TIMEOUT_S,
+            response_timeout=http_client.HTTP_DEFAULT_TIMEOUT_S,
             max_bytes=OPENAI_MODELS_MAX_BYTES,
             retry_max_attempts=OPENAI_MODELS_RETRY_MAX_ATTEMPTS,
         )

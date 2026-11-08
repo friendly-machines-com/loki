@@ -27,7 +27,6 @@ from loki_agent import (
 from loki_agent import __main__ as terminal_entrypoint
 from loki_agent.credentials import CredentialStore
 from loki_agent import jobs as job_runtime, tool_contracts
-from loki_agent import model_requests
 
 
 class ProviderResponseContractTests(unittest.TestCase):
@@ -51,7 +50,7 @@ class ProviderResponseContractTests(unittest.TestCase):
                     request_headers={},
                 ))
 
-    def test_chat_posts_and_model_gets_use_separate_timeouts(self):
+    def test_chat_post_waits_for_computation_and_model_gets_stay_bounded(self):
         response = http_client.HttpResponse(
             "https://example.test/v1/chat/completions",
             200,
@@ -60,9 +59,12 @@ class ProviderResponseContractTests(unittest.TestCase):
             b"{}",
         )
 
-        for method, payload, expected_timeout in [
-                ("POST", {"model": "x"}, model_requests.LLM_REQUEST_TIMEOUT_S),
-                ("GET", None, http_client.HTTP_DEFAULT_TIMEOUT_S)]:
+        for method, payload, expected in [
+                ("POST", {"model": "x"},
+                 (http_client.HTTP_DEFAULT_TIMEOUT_S, None)),
+                ("GET", None,
+                 (http_client.HTTP_DEFAULT_TIMEOUT_S,
+                  http_client.HTTP_DEFAULT_TIMEOUT_S))]:
             transport = mock.AsyncMock(return_value=response)
             with self.subTest(method=method), mock.patch.object(
                     http_client, "async_http_request", new=transport):
@@ -77,10 +79,12 @@ class ProviderResponseContractTests(unittest.TestCase):
                 provider_response, protocols.ProviderResponse)
             self.assertEqual(provider_response.payload, {})
             self.assertEqual(transport.await_args.args[0], method)
+            # A model may compute silently for a long time, so the POST's
+            # response wait has no duration; retrieval stays bounded.
             self.assertEqual(
-                transport.await_args.kwargs["timeout"],
-                expected_timeout,
-            )
+                transport.await_args.kwargs["timeout"], expected[0])
+            self.assertEqual(
+                transport.await_args.kwargs["response_timeout"], expected[1])
 
     def test_tool_loop_reports_provider_protocol_error_without_appending(self):
         events = []
