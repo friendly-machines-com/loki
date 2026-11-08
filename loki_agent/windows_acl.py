@@ -1,4 +1,4 @@
-"""Pure reading of a Windows DACL in SDDL form.
+"""Pure Windows DACL reading and shared private-object templates in SDDL form.
 
 A DACL reaches this module as SDDL text: ``windows_api.dacl_sddl`` converts a
 path's descriptor, and a handle's descriptor is converted the same way.  This
@@ -8,7 +8,7 @@ platform.
 
 It is deliberately separate from ``windows_state``: that module owns the grant
 *policy* (the read/read-write levels, appending and removing Loki's own ACE, the
-ledger), while this one only parses.  The credential layer reads a DACL to
+ledger), while this one handles shared ACL data. The credential layer reads a DACL to
 decide whether a directory or file is private, and must not pull in the
 workspace/AppContainer policy to do it; the workspace side must not grow a
 second parser that could disagree about what a string means.
@@ -46,6 +46,16 @@ _RIGHTS = {
     "SY": windows_api.AccessMask.SYNCHRONIZE,
     "AS": windows_api.AccessMask.ACCESS_SYSTEM_SECURITY,
 }
+
+
+def private_dacl_sddl(user: str) -> str:
+    """Private-object access for the user, SYSTEM, and trusted Administrators.
+
+    Callers choose this only for Loki-managed private objects, never as an
+    automatic permission repair for a user-owned project directory.
+    """
+    return (f"D:P(A;OICI;FA;;;{user})"
+            "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
 
 
 def rights_mask(rights: str) -> int:

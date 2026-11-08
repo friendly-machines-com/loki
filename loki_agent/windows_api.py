@@ -875,6 +875,20 @@ def _converted_dacl(sddl):
         yield dacl
 
 
+def create_directory(path, *, security_descriptor):
+    """Create with explicit security at creation; never change an existing object."""
+    create = bind('kernel32', 'CreateDirectoryW', wintypes.BOOL,
+                  wintypes.LPCWSTR, ctypes.POINTER(SecurityAttributes))
+    with _converted_security_descriptor(security_descriptor) as descriptor:
+        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        if not create(path, ctypes.byref(attributes)):
+            status = ctypes.get_last_error()
+            if status == 183:  # ERROR_ALREADY_EXISTS: caller validates the existing object.
+                return False
+            raise WindowsApiError(f'Could not create {path!r}', status=status)
+    return True
+
+
 def open_with_access(path, desired_access,
                      creation=FileCreateDisposition.OPEN_EXISTING,
                      flags=FileFlags.FILE_FLAG_BACKUP_SEMANTICS,
@@ -1630,7 +1644,7 @@ def file_identity(handle) -> str:
 
 
 def nt_create_file(directory, name, desired_access, disposition, options,
-                   attributes=0):
+                   attributes=0, *, security_descriptor=None):
     """Open or create ``name`` relative to the directory handle ``directory``.
 
     ``name`` is one path component; the caller checks that.  ``attributes`` is
@@ -1648,20 +1662,26 @@ def nt_create_file(directory, name, desired_access, disposition, options,
     text = ctypes.create_string_buffer(encoded + b"\0\0")
     string = UnicodeString(len(encoded), len(encoded) + 2,
                            ctypes.cast(text, ctypes.c_void_p))
-    attributes_block = ObjectAttributes(
-        ctypes.sizeof(ObjectAttributes), directory, ctypes.pointer(string),
-        NtObjectAttributes.OBJ_CASE_INSENSITIVE, None, None)
-    io = IoStatusBlock()
-    handle = ctypes.c_void_p()
-    status = create(ctypes.byref(handle), desired_access,
-                    ctypes.byref(attributes_block), ctypes.byref(io),
-                    None, attributes, FileShareMode.FILE_SHARE_ALL,
-                    disposition, options, None, 0)
-    if status < 0:
-        raise WindowsApiError(
-            f"NtCreateFile({name!r}) failed: 0x{status & 0xffffffff:08x}",
-            status=status & 0xffffffff)
-    return handle.value
+    with ExitStack() as cleanup:
+        with _converted_security_descriptor(security_descriptor) as descriptor:
+            attributes_block = ObjectAttributes(
+                ctypes.sizeof(ObjectAttributes), directory, ctypes.pointer(string),
+                NtObjectAttributes.OBJ_CASE_INSENSITIVE, descriptor, None)
+            io = IoStatusBlock()
+            handle = ctypes.c_void_p()
+            status = create(ctypes.byref(handle), desired_access,
+                            ctypes.byref(attributes_block), ctypes.byref(io),
+                            None, attributes, FileShareMode.FILE_SHARE_ALL,
+                            disposition, options, None, 0)
+            if status < 0:
+                raise WindowsApiError(
+                    f"NtCreateFile({name!r}) failed: 0x{status & 0xffffffff:08x}",
+                    status=status & 0xffffffff)
+            cleanup.callback(close_handle, handle.value)
+        # Descriptor release must settle before the new handle is handed out.
+        # If it fails, this creation still owns and closes that handle.
+        cleanup.pop_all()
+        return handle.value
 
 
 def nt_rename(source, directory, name):

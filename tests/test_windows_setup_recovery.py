@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import os
+import sys
 import tempfile
 import types
 import unittest
@@ -33,10 +34,13 @@ class RecoveryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = temporary.name
+        # Ledger publication reaches the native private-file creator on win32;
+        # its DACL must name the real owner, not the unit model's old 'user' label.
+        self.user = (api.current_user_sid() if sys.platform == 'win32'
+                     else 'S-1-5-21-1-2-3-1001')
         self.workspace = os.path.join(self.root, 'work')
         self.removed = os.path.join(self.root, 'removed')
         self.new = os.path.join(self.root, 'new')
-        self.location = os.path.join(self.root, 'ledger.json')
         self.config = os.path.join(self.root, 'config')
         self.state = os.path.join(self.root, 'state')
         self.key = state.workspace_key(self.workspace)
@@ -45,16 +49,26 @@ class RecoveryTests(unittest.TestCase):
                     state.Grant(self.removed, state.Access.READ_WRITE, 'user')]
         self.ledger = {'version': 1, 'workspaces': {
             self.key: state.ledger_entry(self.workspace, self.profile, self.old)}}
-        self.backend = setup.WindowsBackend(self.ledger, self.location)
+        self.backend = setup.WindowsBackend(self.ledger)
         self.descriptors = {g.path: state.add_package_ace('D:AI(A;OICI;FA;;;SY)', SID, g.access)
                             for g in self.old}
         self.descriptors[self.new] = 'D:AI(A;OICI;FA;;;SY)'
+        native_close = api.close_handle
+
+        def close_model_or_native(handle):
+            # ACL calls below use authored path labels as model handles. Real
+            # publication handles must still be closed by the actual backend.
+            if not isinstance(handle, str):
+                native_close(handle)
+
         patches = [
+            # This decision fixture owns an authored ledger and substituted ACLs;
+            # acquisition/reload and native contention have separate controls.
             mock.patch.object(setup.paths, 'loki_config_dir', return_value=self.config),
             mock.patch.object(setup.paths, 'loki_state_dir', return_value=self.state),
             mock.patch.object(setup.paths, 'credential_directory',
                               return_value=os.path.join(self.config, 'credentials')),
-            mock.patch.object(api, 'current_user_sid', return_value='user'),
+            mock.patch.object(api, 'current_user_sid', return_value=self.user),
             mock.patch.object(self.backend, '_private_directory'),
             mock.patch.object(self.backend, '_ensure_profile', return_value=SID),
             mock.patch.object(api, 'dacl_sddl', side_effect=self.descriptors.__getitem__),
@@ -62,7 +76,7 @@ class RecoveryTests(unittest.TestCase):
             # The grant is checked, read and written through one handle; this
             # host has no handles, so the path itself stands in for it.
             mock.patch.object(api, 'open_directory_for_acl', side_effect=lambda path: path),
-            mock.patch.object(api, 'close_handle'),
+            mock.patch.object(api, 'close_handle', side_effect=close_model_or_native),
             mock.patch.object(api, 'handle_dacl_sddl', side_effect=self.descriptors.__getitem__),
             mock.patch.object(containers, 'set_handle_dacl_sddl', side_effect=lambda handle, sddl: self.descriptors.__setitem__(handle, sddl)),
         ]
@@ -93,8 +107,8 @@ class RecoveryTests(unittest.TestCase):
     def test_shared_config_reads_survive_another_workspace_reapply_and_removal(self):
         other_workspace = os.path.join(self.root, 'other-workspace')
         other_sid = 'S-1-15-2-9-8-7'
-        self.descriptors[self.config] = setup.private_dacl_sddl('user')
-        self.descriptors[other_workspace] = setup.private_dacl_sddl('user')
+        self.descriptors[self.config] = setup.private_dacl_sddl(self.user)
+        self.descriptors[other_workspace] = setup.private_dacl_sddl(self.user)
         first = state.Definition(self.workspace, [
             state.Grant(self.workspace, state.Access.READ_WRITE, 'workspace'),
             state.Grant(self.config, state.Access.READ, 'config')])
@@ -115,8 +129,8 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(state.grants_access(
             self.descriptors[self.config], other_sid, state.Access.READ))
         self.backend._private_directory.assert_any_call(
-            os.path.join(self.config, 'credentials'), 'user')
-        self.assertNotIn(mock.call(self.config, 'user'),
+            os.path.join(self.config, 'credentials'), self.user)
+        self.assertNotIn(mock.call(self.config, self.user),
                          self.backend._private_directory.call_args_list)
         with mock.patch.object(api, 'derive_app_container_sid', return_value=SID), \
                 mock.patch.object(containers, 'delete_app_container_profile'):
@@ -132,7 +146,7 @@ class RecoveryTests(unittest.TestCase):
         with mock.patch.object(self.backend, '_grant_path', side_effect=api.WindowsApiError('grant failed')):
             checks = self.apply()
         self.assertTrue(any(c.status == 'fail' for c in checks))
-        persisted = state.load_ledger(self.location)
+        persisted = state.load_ledger()
         entry = persisted['workspaces'][self.key]
         self.assertTrue(entry['pending'])
         self.assertEqual({g.path for g in state.entry_grants(entry)},
@@ -146,17 +160,17 @@ class RecoveryTests(unittest.TestCase):
         real_save = state.save_ledger
         calls = 0
 
-        def save(blob, path):
+        def save(blob):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise OSError('disk full')
-            real_save(blob, path)
+            real_save(blob)
         with mock.patch.object(setup, 'save_ledger', side_effect=save):
             checks = self.apply()
         self.assertTrue(any(c.status == 'fail' for c in checks))
         self.assertTrue(self.ledger['workspaces'][self.key]['pending'])
-        self.assertTrue(state.load_ledger(self.location)['workspaces'][self.key]['pending'])
+        self.assertTrue(state.load_ledger()['workspaces'][self.key]['pending'])
 
     def test_uninstall_keeps_failed_entry_and_does_not_delete_profile(self):
         with mock.patch.object(self.backend, '_ungrant_path', side_effect=OSError('denied')), \

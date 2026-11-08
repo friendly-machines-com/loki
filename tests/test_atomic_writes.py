@@ -6,6 +6,7 @@ import stat
 import tempfile
 import unittest
 from unittest import mock
+from loki_agent import private_files
 
 from loki_agent import files as file_operations
 
@@ -203,3 +204,29 @@ class AtomicWritePermissionTests(unittest.TestCase):
                 file_operations.atomic_write_text(str(self.target), 'new')
         self.assertEqual(self.target.read_text(), 'old')
         self.assertEqual(set(self.root.iterdir()), {self.target})
+
+    def test_ledger_name_failure_closes_the_acquired_directory(self):
+        from loki_agent import windows_state
+
+        opened = []
+        open_tree, close = private_files.open_directory_tree, private_files.close
+
+        def opening(*args, **kwargs):
+            handle = open_tree(*args, **kwargs)
+            opened.append(handle)
+            return handle
+
+        with mock.patch.object(windows_state.paths, 'loki_state_dir', return_value=str(self.root)), \
+                mock.patch.object(private_files, 'open_directory_tree', side_effect=opening), \
+                mock.patch.object(private_files, 'close', wraps=close) as closing, \
+                mock.patch.object(windows_state.secrets, 'token_hex', side_effect=OSError('name failed')):
+            try:
+                with self.assertRaisesRegex(OSError, 'name failed'):
+                    windows_state.save_ledger({'version': 1, 'workspaces': {}})
+                self.assertEqual(len(opened), 1)
+                closing.assert_called_once_with(opened[0])
+            finally:
+                for handle in opened:
+                    if mock.call(handle) not in closing.call_args_list:
+                        close(handle)
+        self.assertEqual(os.listdir(self.root), ['target'])

@@ -217,6 +217,85 @@ class ParentDirectoryTests(unittest.TestCase):
             self.assertEqual(windows_api.file_identity(handle), identity)
 
 
+class CreationSecurityTests(unittest.TestCase):
+    def test_relative_creation_owns_descriptor_until_creation_and_closes_unpublished_results(self):
+        for outcome in ['success', 'native-error', 'conversion-error', 'null-descriptor', 'free-error']:
+            with self.subTest(outcome=outcome):
+                events = []
+
+                def convert(text, revision, output, size):
+                    self.assertEqual(text, 'O:creator')
+                    if outcome == 'conversion-error':
+                        return 0
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0 if outcome == 'null-descriptor' else 88
+                    events.append('converted')
+                    return 1
+
+                def create(output, access, attributes, io, allocation, flags, share, disposition, options, extra, count):
+                    self.assertEqual(events, ['converted'])
+                    metadata = ctypes.cast(attributes, ctypes.POINTER(windows_api.ObjectAttributes)).contents
+                    self.assertEqual(metadata.SecurityDescriptor, 88)
+                    self.assertEqual(metadata.RootDirectory, 17)
+                    events.append('create')
+                    if outcome == 'native-error':
+                        return ctypes.c_int32(0xc0000022).value
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 31
+                    return 0
+
+                def free(descriptor):
+                    self.assertEqual(descriptor.value, 88)
+                    events.append('free')
+                    if outcome == 'free-error':
+                        raise OSError('descriptor release failed')
+
+                functions = {'NtCreateFile': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
+                             'LocalFree': free}
+                with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
+                        mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True), \
+                        mock.patch.object(windows_api, 'close_handle') as close:
+                    if outcome == 'success':
+                        self.assertEqual(windows_api.nt_create_file(
+                            17, 'new', 2, 2, 0, security_descriptor='O:creator'), 31)
+                    else:
+                        expected = OSError if outcome == 'free-error' else windows_api.WindowsApiError
+                        with self.assertRaises(expected):
+                            windows_api.nt_create_file(17, 'new', 2, 2, 0, security_descriptor='O:creator')
+                    self.assertEqual(close.call_args_list, [mock.call(31)] if outcome == 'free-error' else [])
+                    events_by_failure = {'conversion-error': [], 'null-descriptor': ['converted']}
+                    self.assertEqual(events, events_by_failure.get(outcome, ['converted', 'create', 'free']))
+
+    def test_directory_creation_applies_security_at_creation_and_does_not_repair_existing_objects(self):
+        for result, error in [[1, 0], [0, 183], [0, 5]]:
+            with self.subTest(result=result, error=error):
+                freed = []
+
+                def convert(text, revision, output, size):
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 88
+                    return 1
+
+                def create(path, attributes):
+                    self.assertEqual(path, 'raw/../selected')
+                    security = ctypes.cast(attributes, ctypes.POINTER(windows_api.SecurityAttributes)).contents
+                    self.assertEqual(security.lpSecurityDescriptor, 88)
+                    self.assertEqual(security.bInheritHandle, 0)
+                    return result
+
+                functions = {'CreateDirectoryW': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
+                             'LocalFree': lambda descriptor: freed.append(descriptor.value)}
+                with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
+                        mock.patch.object(ctypes, 'get_last_error', return_value=error, create=True), \
+                        mock.patch.object(windows_api, 'set_handle_dacl') as repair:
+                    if error == 5:
+                        with self.assertRaises(windows_api.WindowsApiError) as raised:
+                            windows_api.create_directory('raw/../selected', security_descriptor='O:creator')
+                        self.assertEqual(raised.exception.status, 5)
+                    else:
+                        self.assertEqual(windows_api.create_directory(
+                            'raw/../selected', security_descriptor='O:creator'), bool(result))
+                    repair.assert_not_called()
+                self.assertEqual(freed, [88])
+
+
 class GuidTests(unittest.TestCase):
     def test_documented_guid_parses_to_its_documented_fields(self):
         guid = windows_api.guid_from_text(windows_api.FOLDERID_LOCAL_APP_DATA)

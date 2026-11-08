@@ -26,6 +26,7 @@ What the privacy check does and does not cover is stated at
 from __future__ import annotations
 
 import os
+import ntpath
 
 from . import windows_acl, windows_api
 from .credential_errors import CredentialStorageError
@@ -166,10 +167,19 @@ def _facts_from_handle(handle) -> FileFacts:
 
 
 def _open_relative(directory, name, desired_access, disposition, options,
-                   attributes=0):
+                   attributes=0, *, user_owned=False, private=False):
+    creation = {}
     try:
+        if user_owned or private:
+            user = windows_api.current_user_sid()
+            creation['security_descriptor'] = 'O:' + user
+            if private:
+                # Setup authority files must not inherit runtime grants from
+                # their shared state parent. Setting just ownership retains its
+                # DACL; FILE_OPEN_IF never repairs existing permissions.
+                creation['security_descriptor'] += windows_acl.private_dacl_sddl(user)
         return windows_api.nt_create_file(
-            directory, name, desired_access, disposition, options, attributes)
+            directory, name, desired_access, disposition, options, attributes, **creation)
     except windows_api.WindowsApiError as error:
         _raise_oserror(error)
 
@@ -258,6 +268,37 @@ def close(handle) -> None:
 
 # -- opens ----------------------------------------------------------------
 
+def make_private_directory(path: str) -> None:
+    """Create missing private user-owned objects; leave existing ones unchanged.
+
+    Try the exact native operand first. Only a missing parent requires splitting
+    it for recursive creation; the final CreateDirectoryW operand is unchanged.
+    """
+    try:
+        user = windows_api.current_user_sid()
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+    descriptor = 'O:' + user + windows_acl.private_dacl_sddl(user)
+
+    def create(name):
+        try:
+            windows_api.create_directory(name, security_descriptor=descriptor)
+        except windows_api.WindowsApiError as error:
+            if (isinstance(error, windows_api.WindowsResourceError)
+                    or error.status != windows_api.ERROR_PATH_NOT_FOUND):
+                raise
+            parent, _leaf = ntpath.split(name)
+            if not parent or parent == name:
+                raise
+            create(parent)
+            windows_api.create_directory(name, security_descriptor=descriptor)
+
+    try:
+        create(path)
+    except windows_api.WindowsApiError as error:
+        _raise_oserror(error)
+
+
 def open_directory(path: str):
     try:
         handle = windows_api.open_with_access(
@@ -289,7 +330,7 @@ def open_read_at(directory, name: str):
         windows_api.NtCreateDisposition.FILE_OPEN, _NON_DIRECTORY)
 
 
-def create_exclusive_at(directory, name: str, mode: int, *, append=False):
+def create_exclusive_at(directory, name: str, mode: int, *, append=False, user_owned=False):
     _check_name(name)
     # ``mode`` is a POSIX concept.  On POSIX the mode makes the new file
     # private regardless of the directory; here the file's access comes from the
@@ -311,10 +352,19 @@ def create_exclusive_at(directory, name: str, mode: int, *, append=False):
         access | windows_api.AccessMask.FILE_READ_ATTRIBUTES
         | windows_api.AccessMask.SYNCHRONIZE,
         windows_api.NtCreateDisposition.FILE_CREATE, _NON_DIRECTORY,
-        windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL)
+        windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL, user_owned=user_owned)
 
 
-def open_lock_file_at(directory, name: str, mode: int):
+def create_private_at(directory, name: str):
+    """Exclusively create a private user-owned file, even in a shared parent."""
+    _check_name(name)
+    return _open_relative(
+        directory, name, windows_api.AccessMask.GENERIC_WRITE | windows_api.AccessMask.SYNCHRONIZE,
+        windows_api.NtCreateDisposition.FILE_CREATE, _NON_DIRECTORY,
+        windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL, private=True)
+
+
+def open_lock_file_at(directory, name: str, mode: int, *, user_owned=False):
     _check_name(name)
     return _open_relative(
         directory, name,
@@ -322,7 +372,7 @@ def open_lock_file_at(directory, name: str, mode: int):
         | windows_api.AccessMask.GENERIC_WRITE
         | windows_api.AccessMask.FILE_READ_ATTRIBUTES
         | windows_api.AccessMask.SYNCHRONIZE,
-        windows_api.NtCreateDisposition.FILE_OPEN_IF, _NON_DIRECTORY)
+        windows_api.NtCreateDisposition.FILE_OPEN_IF, _NON_DIRECTORY, user_owned=user_owned)
 
 
 def _directory_result(handle):

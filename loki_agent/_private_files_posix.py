@@ -49,6 +49,11 @@ def _no_follow(flags: int) -> int:
     return flags | getattr(os, "O_NOFOLLOW", 0)
 
 
+def make_private_directory(path: str) -> None:
+    """Create private missing directories without repairing existing objects."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+
+
 def open_directory(path: str) -> int:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     return os.open(path, _no_follow(flags))
@@ -86,14 +91,19 @@ def open_read_at(directory_fd: int, name: str) -> int:
     return os.open(name, _no_follow(flags), dir_fd=directory_fd)
 
 
-def create_exclusive_at(directory_fd: int, name: str, mode: int, *, append=False) -> int:
+def create_exclusive_at(directory_fd: int, name: str, mode: int, *, append=False, user_owned=False) -> int:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if append:
         flags |= os.O_APPEND
     return os.open(name, _no_follow(flags), mode, dir_fd=directory_fd)
 
 
-def open_lock_file_at(directory_fd: int, name: str, mode: int) -> int:
+def create_private_at(directory_fd: int, name: str) -> int:
+    _check_name(name)
+    return create_exclusive_at(directory_fd, name, 0o600)
+
+
+def open_lock_file_at(directory_fd: int, name: str, mode: int, *, user_owned=False) -> int:
     flags = os.O_RDWR | os.O_CREAT
     return os.open(name, _no_follow(flags), mode, dir_fd=directory_fd)
 

@@ -18,11 +18,11 @@ import os
 import secrets
 import stat
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from . import paths
+from . import private_files
 from . import windows_api
 from .windows_acl import (
     dacl_parts,
@@ -30,6 +30,9 @@ from .windows_acl import (
     rights_mask,
 )
 LEDGER_VERSION = 1
+LEDGER_NAME = 'windows-setup.json'
+_SETUP_TEMP_PREFIX = '.setup-'
+_SETUP_TEMP_BYTES = 12
 PROFILE_NAME_PREFIX = "Loki.Workspace."
 # These are compatibility alternatives in the second (write) access check, not
 # an additional private-role conjunct. Managed state must grant none of them
@@ -355,12 +358,12 @@ class Definition:
 
 
 def ledger_path() -> str:
-    return os.path.join(paths.loki_state_dir(), "windows-setup.json")
+    return os.path.join(paths.loki_state_dir(), LEDGER_NAME)
 
 
-def load_ledger(path: str | None = None) -> dict:
-    """Load the ledger, returning an empty one when absent or unreadable."""
-    location = ledger_path() if path is None else path
+def load_ledger() -> dict:
+    """Load the configured setup ledger, empty when absent or unreadable."""
+    location = ledger_path()
     try:
         with open(location, "r", encoding="utf-8") as stream:
             blob = json.load(stream)
@@ -373,55 +376,36 @@ def load_ledger(path: str | None = None) -> dict:
     return blob
 
 
-def save_ledger(blob: dict, path: str | None = None) -> None:
-    """Atomically replace the ledger.
+def save_ledger(blob: dict) -> None:
+    """Publish the fixed metadata name through one retained state-directory object.
 
-    The write is local rather than reusing the agent core's helper because this
-    module must stay importable before anything decides about the runtime.
+    Setup metadata is private at creation, even while its parent permits owning
+    runtimes to maintain other state. The caller never supplies another ledger
+    pathname; XDG/configured state selection already has one owner in paths.
     """
-    location = ledger_path() if path is None else path
-    directory = os.path.dirname(location) or "."
-    os.makedirs(directory, exist_ok=True)
+    data = (json.dumps(blob, indent=2, sort_keys=True) + '\n').encode('utf-8')
+    directory = private_files.open_directory_tree(paths.loki_state_dir())
     temporary = None
-    created = False
     try:
-        if sys.platform == 'win32':
-            import msvcrt
-            temporary = os.path.join(directory, '.setup-' + secrets.token_hex(12))
-            user = windows_api.current_user_sid()
-            raw = windows_api.open_with_access(
-                temporary, windows_api.AccessMask.GENERIC_WRITE,
-                creation=windows_api.FileCreateDisposition.CREATE_NEW,
-                flags=windows_api.FileAttribute.FILE_ATTRIBUTE_NORMAL,
-                security_descriptor=f'D:P(A;;FA;;;{user})(A;;FA;;;SY)(A;;FA;;;BA)')
-            created = True
-            try:
-                handle = msvcrt.open_osfhandle(raw, os.O_WRONLY | os.O_BINARY | os.O_NOINHERIT)
-            except BaseException:
-                windows_api.close_handle(raw)
-                raise
-        else:
-            handle, temporary = tempfile.mkstemp(dir=directory, prefix=".setup-")
-            created = True
-        # The replacement inherits the temporary object's private descriptor,
-        # not the state directory's package access. There is no public interval
-        # in which an owning runtime or a tool can acquire a ledger-write handle.
-        try:
-            stream = os.fdopen(handle, "w", encoding="utf-8")
-        except BaseException:
-            os.close(handle)
-            raise
-        with stream:
-            json.dump(blob, stream, indent=2, sort_keys=True)
-            stream.write("\n")
+        # The acquired directory must also close if temporary naming fails.
+        candidate = _SETUP_TEMP_PREFIX + secrets.token_hex(_SETUP_TEMP_BYTES)
+        handle = private_files.create_private_at(directory, candidate)
+        # A failed exclusive create never makes another publication ours to delete.
+        temporary = candidate
+        with private_files.binary_file(handle, 'wb') as stream:
+            stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, location)
-    except BaseException:
-        if created:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary)
-        raise
+        private_files.replace_at(directory, candidate, LEDGER_NAME)
+        temporary = None
+        private_files.fsync(directory)
+    finally:
+        try:
+            if temporary is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    private_files.unlink_at(directory, temporary)
+        finally:
+            private_files.close(directory)
 
 
 def workspace_key(workspace: str) -> str:
@@ -453,10 +437,14 @@ def entry_grants(entry: dict) -> list[Grant]:
     return grants
 
 
-def setup_asset(path: str, root=None) -> bool:
-    """The ledger and its adjacent publication files keep a private contract."""
-    return (os.path.dirname(path) == (paths.loki_state_dir() if root is None else root) and
-            (os.path.basename(path) == 'windows-setup.json' or os.path.basename(path).startswith('.setup-')))
+def setup_asset_name(name: str) -> bool:
+    """Classify only the setup publisher's positive leaf-name namespace."""
+    if name == LEDGER_NAME:
+        return True
+    if not name.startswith(_SETUP_TEMP_PREFIX):
+        return False
+    suffix = name[len(_SETUP_TEMP_PREFIX):]
+    return len(suffix) == _SETUP_TEMP_BYTES * 2 and all(character in '0123456789abcdef' for character in suffix)
 
 
 def state_objects(root=None):
@@ -467,7 +455,7 @@ def state_objects(root=None):
     """
     root = paths.loki_state_dir() if root is None else root
 
-    def walk(directory):
+    def walk(directory, *, setup_root=False):
         yield directory
         with os.scandir(directory) as entries:
             children = sorted(entries, key=lambda entry: entry.name)
@@ -476,7 +464,7 @@ def state_objects(root=None):
             if (stat.S_ISLNK(facts.st_mode) or
                     getattr(facts, 'st_file_attributes', 0) & windows_api.FileAttribute.FILE_ATTRIBUTE_REPARSE_POINT):
                 raise windows_api.WindowsApiError('managed state contains a reparse entry: ' + entry.path)
-            if setup_asset(entry.path, root):
+            if setup_root and setup_asset_name(entry.name):
                 if not stat.S_ISREG(facts.st_mode):
                     raise windows_api.WindowsApiError('setup metadata is not a regular file: ' + entry.path)
                 continue
@@ -486,14 +474,14 @@ def state_objects(root=None):
                 yield entry.path
             else:
                 raise windows_api.WindowsApiError('managed state contains a non-regular entry: ' + entry.path)
-    yield from walk(root)
+    yield from walk(root, setup_root=True)
 
 
 def setup_files():
     """Existing authority files that must not inherit runtime state access."""
     with os.scandir(paths.loki_state_dir()) as entries:
         for entry in entries:
-            if not setup_asset(entry.path):
+            if not setup_asset_name(entry.name):
                 continue
             facts = entry.stat(follow_symlinks=False)
             if (not stat.S_ISREG(facts.st_mode) or

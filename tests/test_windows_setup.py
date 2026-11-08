@@ -21,6 +21,7 @@ from windows_state_fixtures import directory_identity_patch, directory_handle, r
 
 from loki_agent import windows_acl
 from loki_agent import windows_api
+from loki_agent import private_files
 from loki_agent import windows_containers
 from loki_agent import windows_setup
 from loki_agent import windows_state
@@ -532,33 +533,61 @@ class NamingTests(unittest.TestCase):
 
 
 class LedgerTests(unittest.TestCase):
-    def test_round_trip(self):
-        with tempfile.TemporaryDirectory() as root:
-            location = os.path.join(root, "nested", "ledger.json")
-            blob = {"version": windows_state.LEDGER_VERSION,
-                    "workspaces": {"k": {"workspace": "/p",
-                                         "profile": "Loki.Workspace.x",
-                                         "grants": []}}}
-
-            windows_setup.save_ledger(blob, location)
-
-            self.assertEqual(windows_setup.load_ledger(location), blob)
-
-    def test_missing_or_corrupt_ledger_is_empty(self):
-        with tempfile.TemporaryDirectory() as root:
-            missing = os.path.join(root, "absent.json")
-            self.assertEqual(
-                windows_setup.load_ledger(missing)["workspaces"], {})
-            corrupt = os.path.join(root, "corrupt.json")
-            with open(corrupt, "w", encoding="utf-8") as stream:
-                json.dump({"workspaces": "not a mapping"}, stream)
-            self.assertEqual(
-                windows_setup.load_ledger(corrupt)["workspaces"], {})
-
     def test_recorded_workspace_label_preserves_the_callers_operand(self):
         raw = 'relative/link/../workspace//'
         entry = windows_state.ledger_entry(raw, 'profile', [])
         self.assertEqual(entry['workspace'], raw)
+
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                windows_state.paths, 'loki_state_dir', return_value=root + os.sep + 'nested'):
+            directory = windows_state.paths.loki_state_dir()
+            os.mkdir(directory)
+            if sys.platform == 'win32':
+                dacl = windows_state.add_package_ace(
+                    windows_acl.private_dacl_sddl(windows_api.current_user_sid()),
+                    'S-1-15-2-1-2-3', windows_state.Access.READ_WRITE)
+                windows_api.set_named_dacl(directory, dacl)
+            else:
+                os.chmod(directory, 0o755)
+            self.assertTrue(private_files.describe_path(directory).group_or_other_access)
+            blob = {'version': windows_state.LEDGER_VERSION,
+                    'workspaces': {'k': {'workspace': '/p', 'profile': 'Loki.Workspace.x', 'grants': []}}}
+            windows_setup.save_ledger(blob)
+            self.assertEqual(windows_setup.load_ledger(), blob)
+            facts = private_files.describe_path(windows_state.ledger_path())
+            self.assertTrue(facts.owned_by_current_user)
+            self.assertFalse(facts.group_or_other_access)
+
+    def test_missing_or_corrupt_ledger_is_empty(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                windows_state.paths, 'loki_state_dir', return_value=root):
+            self.assertEqual(windows_setup.load_ledger()['workspaces'], {})
+            windows_setup.save_ledger({'workspaces': 'not a mapping'})
+            self.assertEqual(windows_setup.load_ledger()['workspaces'], {})
+            with open(windows_state.ledger_path(), 'w', encoding='utf-8') as stream:
+                stream.write('{invalid')
+            self.assertEqual(windows_setup.load_ledger()['workspaces'], {})
+
+    def test_publication_keeps_the_selected_directory_after_rename_and_replacement(self):
+        with tempfile.TemporaryDirectory() as root:
+            selected, moved = root + os.sep + 'state', root + os.sep + 'moved'
+            os.mkdir(selected)
+            replace = private_files.replace_at
+            blob = {'version': windows_state.LEDGER_VERSION, 'workspaces': {}}
+
+            def replace_after_move(directory, source, name):
+                os.rename(selected, moved)
+                os.mkdir(selected)
+                return replace(directory, source, name)
+
+            with mock.patch.object(windows_state.paths, 'loki_state_dir', return_value=selected), \
+                    mock.patch.object(private_files, 'replace_at', side_effect=replace_after_move):
+                windows_state.save_ledger(blob)
+            self.assertEqual(os.listdir(selected), [])
+            with open(moved + os.sep + windows_state.LEDGER_NAME, encoding='utf-8') as stream:
+                self.assertEqual(json.load(stream), blob)
+            self.assertEqual(os.listdir(moved), [windows_state.LEDGER_NAME])
 
 
 class PlanTests(unittest.TestCase):
@@ -662,19 +691,28 @@ class ManagedStatePolicyTests(unittest.TestCase):
                         self.assertTrue(self.errors(f'(A;{flags};{rights};;;{sid})'))
             self.assertEqual(self.errors(f'(A;OICI;FRFX;;;{sid})'), [])
 
+    def test_setup_names_follow_the_actual_publisher_namespace(self):
+        self.assertTrue(windows_state.setup_asset_name('windows-setup.json'))
+        self.assertTrue(windows_state.setup_asset_name('.setup-' + 'a' * 24))
+        for name in ['.setup-', '.setup-pending', '.setup-' + 'a' * 23, '.setup-' + 'A' * 24,
+                     'other/windows-setup.json', 'windows-setup.json/']:
+            with self.subTest(name=name):
+                self.assertFalse(windows_state.setup_asset_name(name))
+
     def test_inventory_excludes_only_root_setup_publication_files(self):
         with tempfile.TemporaryDirectory() as root:
-            job = os.path.join(root, 'job')
+            job = root + os.sep + 'job'
             os.mkdir(job)
-            for path in [os.path.join(root, 'windows-setup.json'),
-                         os.path.join(root, '.setup-pending'),
-                         os.path.join(job, 'windows-setup.json'),
-                         os.path.join(job, 'stdout.log')]:
+            publication = '.setup-' + 'a' * 24
+            ordinary = root + os.sep + '.setup-pending'
+            nested = job + os.sep + publication
+            for path in [root + os.sep + windows_state.LEDGER_NAME, root + os.sep + publication,
+                         ordinary, nested, job + os.sep + windows_state.LEDGER_NAME, job + os.sep + 'stdout.log']:
                 with open(path, 'w'):
                     pass
             self.assertEqual(set(windows_state.state_objects(root)),
-                             {root, job, os.path.join(job, 'windows-setup.json'),
-                              os.path.join(job, 'stdout.log')})
+                             {root, job, ordinary, nested, job + os.sep + windows_state.LEDGER_NAME,
+                              job + os.sep + 'stdout.log'})
 
     def test_inventory_refuses_a_setup_directory(self):
         with tempfile.TemporaryDirectory() as root:

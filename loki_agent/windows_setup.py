@@ -51,7 +51,7 @@ from . import windows_api
 from . import windows_state
 from . import windows_containers
 from . import windows_verify
-from .windows_acl import names_package, dacl_parts
+from .windows_acl import names_package, dacl_parts, private_dacl_sddl
 from .windows_state import (
     Access,
     Backend,
@@ -82,9 +82,8 @@ from .windows_state import (
 class WindowsBackend:
     """Applies the plan through the shared Windows declarations."""
 
-    def __init__(self, ledger: dict, ledger_location: str | None = None):
+    def __init__(self, ledger: dict):
         self.ledger = ledger
-        self.ledger_location = ledger_location
 
     # -- helpers --
     def _ensure_profile(self, name: str) -> str:
@@ -218,7 +217,7 @@ class WindowsBackend:
         else:
             workspaces[key] = entry
         updated = {**self.ledger, "workspaces": workspaces}
-        save_ledger(updated, self.ledger_location)
+        save_ledger(updated)
         self.ledger.clear()
         self.ledger.update(updated)
 
@@ -316,16 +315,6 @@ class WindowsBackend:
             except (windows_api.WindowsApiError, OSError, ValueError) as error:
                 checks.append(Check(f"uninstall {key}", "fail", str(error)))
         return checks
-
-
-def private_dacl_sddl(user: str) -> str:
-    """A protected DACL granting only the owner, SYSTEM and Administrators.
-
-    Used for the directories Loki creates and owns.  User directories are never
-    rewritten to this: their existing DACLs are preserved and our ACE appended.
-    """
-    return (f"D:P(A;OICI;FA;;;{user})"
-            "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
 
 
 class UnavailableBackend:

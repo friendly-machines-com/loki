@@ -260,17 +260,18 @@ class JsonCredentialStorage:
                 "retrying (Loki will not change them)")
 
     def _acquire_directory(self):
-        # Refuse before creating anything on Windows versions without private
-        # mkdir support. Only construction resolves this configured pathname.
+        # Check the declared private-filesystem support floor before creation.
+        # Only construction resolves this configured pathname.
         unsupported = paths.private_directory_support_error()
         if unsupported is not None:
             raise CredentialStorageError(unsupported)
-        os.makedirs(os.path.dirname(self.directory), exist_ok=True)
         try:
-            os.mkdir(self.directory, 0o700)
-        except FileExistsError:
-            pass
-        try:
+            try:
+                private_files.make_private_directory(self.directory)
+            except FileExistsError:
+                # The open below must distinguish a non-directory or reparse
+                # entry from an existing private directory, on that object.
+                pass
             directory_fd = private_files.open_directory(self.directory)
         except NotADirectoryError as error:
             raise CredentialStorageError(
@@ -358,13 +359,15 @@ class JsonCredentialStorage:
         if len(data) > MAX_CREDENTIAL_FILE_BYTES:
             raise CredentialStorageError(
                 "credential JSON exceeds its size limit")
-        temporary_name = (
+        candidate = (
             f".{paths.CREDENTIAL_FILE_NAME}."
             f"{os.getpid()}.{secrets.token_hex(12)}")
+        temporary_name = None
         fd = None
         try:
-            fd = private_files.create_exclusive_at(
-                directory_fd, temporary_name, 0o600)
+            fd = private_files.create_exclusive_at(directory_fd, candidate, 0o600, user_owned=True)
+            # A collision is another publication's entry, not our cleanup work.
+            temporary_name = candidate
             # Describe the file this call just created, before a byte is
             # written: it takes its access from the directory's DACL, and a
             # directory widened between ensure_directory's check and this create
@@ -375,32 +378,32 @@ class JsonCredentialStorage:
                     and not facts.group_or_other_access):
                 raise CredentialStorageError(
                     f"new credential file is not private: {temporary_name}")
-            view = memoryview(data)
-            while view:
-                written = private_files.write(fd, view)
-                if written <= 0:
-                    raise OSError("short credential JSON write")
-                view = view[written:]
+            private_files.write_all(fd, data)
             private_files.fsync(fd)
-            private_files.close(fd)
-            fd = None
+            # Close once before Windows replacement; a failed close must not
+            # cause cleanup to retry a potentially released/reused descriptor.
+            closing, fd = fd, None
+            private_files.close(closing)
             private_files.replace_at(
                 directory_fd, temporary_name, paths.CREDENTIAL_FILE_NAME)
+            temporary_name = None
             private_files.fsync(directory_fd)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not persist credential JSON: {error}") from error
         finally:
-            if fd is not None:
-                private_files.close(fd)
-            with contextlib.suppress(
-                    FileNotFoundError, CredentialStorageError):
-                private_files.unlink_at(directory_fd, temporary_name)
+            try:
+                if fd is not None:
+                    private_files.close(fd)
+            finally:
+                if temporary_name is not None:
+                    with contextlib.suppress(FileNotFoundError, CredentialStorageError):
+                        private_files.unlink_at(directory_fd, temporary_name)
 
     def _open_lock_at(self, directory_fd):
         try:
             fd = private_files.open_lock_file_at(
-                directory_fd, paths.CREDENTIAL_LOCK_FILE_NAME, 0o600)
+                directory_fd, paths.CREDENTIAL_LOCK_FILE_NAME, 0o600, user_owned=True)
         except OSError as error:
             raise CredentialStorageError(
                 f"could not open credential lock: {error}") from error

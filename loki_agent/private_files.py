@@ -37,10 +37,12 @@ if sys.platform == "win32":
         close,
         create_directory_at,
         create_exclusive_at,
+        create_private_at,
         describe,
         describe_path,
         fsync,
         information,
+        make_private_directory,
         open_append_at,
         open_directory,
         open_directory_at,
@@ -58,10 +60,12 @@ else:
         close,
         create_directory_at,
         create_exclusive_at,
+        create_private_at,
         describe,
         describe_path,
         fsync,
         information,
+        make_private_directory,
         open_append_at,
         open_directory,
         open_directory_at,
@@ -73,6 +77,22 @@ else:
         unlink_at,
         write,
     )
+
+
+def write_all(handle, data):
+    """Complete delivery on a borrowed native token, without taking ownership.
+
+    Credential/state publication and job diagnostics still use that token for
+    their native validation, synchronization or close protocol. binary_file
+    consumes ownership instead, so it is not a drop-in write on these borrowed
+    tokens. Permission, durability and cleanup policy remain with the caller.
+    """
+    view = memoryview(data)
+    while view:
+        written = write(handle, view)
+        if written <= 0:
+            raise OSError('could not write complete file contents')
+        view = view[written:]
 
 
 def open_directory_tree(path, mode=0o700):
@@ -114,10 +134,12 @@ __all__ = [
     "close",
     "create_directory_at",
     "create_exclusive_at",
+    "create_private_at",
     "describe",
     "describe_path",
     "fsync",
     "information",
+    "make_private_directory",
     "open_append_at",
     "open_directory",
     "open_directory_at",
@@ -129,4 +151,5 @@ __all__ = [
     "seek",
     "unlink_at",
     "write",
+    "write_all",
 ]
