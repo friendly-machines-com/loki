@@ -22,7 +22,7 @@ Two rules keep this module safe to share rather than copied around:
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import ctypes
 import enum
 import subprocess
@@ -41,6 +41,15 @@ class WindowsApiError(RuntimeError):
     def __init__(self, message, status=None):
         super().__init__(message)
         self.status = status
+
+
+class WindowsResourceError(WindowsApiError):
+    """Native retirement failed, possibly after creation or mutation succeeded.
+
+    Callers must not classify its status as an open/create refusal, retry a
+    mutation, or count it as successful access denial. It remains a
+    WindowsApiError for fatal reporting.
+    """
 
 
 class WindowsUnavailableError(WindowsApiError):
@@ -212,43 +221,18 @@ def current_user_sid() -> str:
     The SID is what the SDDL grants name, so it has to come from the token
     rather than from anything the environment claims.
     """
-    open_token = bind("advapi32", "OpenProcessToken", wintypes.BOOL,
-                      ctypes.c_void_p, wintypes.DWORD,
-                      ctypes.POINTER(ctypes.c_void_p))
-    get_current_process = bind("kernel32", "GetCurrentProcess",
-                               ctypes.c_void_p)
-    get_token_information = bind(
-        "advapi32", "GetTokenInformation", wintypes.BOOL, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD))
-    convert_sid = bind("advapi32", "ConvertSidToStringSidW", wintypes.BOOL,
-                       ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
-    close = bind("kernel32", "CloseHandle", wintypes.BOOL, ctypes.c_void_p)
-
-    token = ctypes.c_void_p()
-    if not open_token(get_current_process(), TokenAccess.TOKEN_QUERY,
-                      ctypes.byref(token)):
-        raise WindowsApiError("OpenProcessToken failed")
+    token = open_process_token(current_process_handle(), TokenAccess.TOKEN_QUERY)
     try:
+        query = _get_token_information()
         size = wintypes.DWORD()
-        get_token_information(token, TOKEN_USER_CLASS, None, 0,
-                              ctypes.byref(size))
+        query(token, TOKEN_USER_CLASS, None, 0, ctypes.byref(size))
         buffer = ctypes.create_string_buffer(size.value)
-        if not get_token_information(token, TOKEN_USER_CLASS, buffer,
-                                     len(buffer), ctypes.byref(size)):
-            raise WindowsApiError("GetTokenInformation(TokenUser) failed")
-        sid = ctypes.c_void_p.from_buffer(buffer).value  # SID_AND_ATTRIBUTES
-        text = ctypes.c_void_p()
-        if not convert_sid(sid, ctypes.byref(text)):
-            raise WindowsApiError("ConvertSidToStringSidW failed")
-        try:
-            return ctypes.wstring_at(text)
-        finally:
-            local_free(text)
+        if not query(token, TOKEN_USER_CLASS, buffer, len(buffer), ctypes.byref(size)):
+            raise WindowsApiError("GetTokenInformation(TokenUser) failed", status=ctypes.get_last_error())
+        # The SID pointer is borrowed from this live TokenUser buffer.
+        return sid_text(ctypes.c_void_p.from_buffer(buffer).value)
     finally:
-        close(token)
+        close_handle(token)
 
 
 def _sddl_from_descriptor(descriptor, information) -> str:
@@ -257,8 +241,6 @@ def _sddl_from_descriptor(descriptor, information) -> str:
         "advapi32", "ConvertSecurityDescriptorToStringSecurityDescriptorW",
         wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
         ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
     text = ctypes.c_void_p()
     if not convert(descriptor, SDDL_REVISION_1, information,
                    ctypes.byref(text), None):
@@ -286,8 +268,6 @@ def dacl_sddl(path: str) -> str:
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p))
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
 
     descriptor = ctypes.c_void_p()
     status = get_named(path, SE_FILE_OBJECT, SecurityInformation.DACL_SECURITY_INFORMATION,
@@ -318,18 +298,11 @@ def open_directory_handle(path: str):
     this is still not a lock.  ``FILE_FLAG_BACKUP_SEMANTICS`` is what opens a
     directory at all.
     """
-    create_file = bind("kernel32", "CreateFileW", ctypes.c_void_p,
-                       wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
-                       ctypes.c_void_p)
-    handle = create_file(path, AccessMask.FILE_READ_ATTRIBUTES,
-                         FileShareMode.FILE_SHARE_ALL, None,
-                         FileCreateDisposition.OPEN_EXISTING,
-                         FileFlags.FILE_FLAG_BACKUP_SEMANTICS, None)
-    if handle is None or handle == INVALID_HANDLE_VALUE:
-        raise WindowsApiError(f"CreateFileW({path!r}) failed",
-                              status=ctypes.get_last_error())
-    return handle
+    return open_with_access(
+        path, AccessMask.FILE_READ_ATTRIBUTES,
+        creation=FileCreateDisposition.OPEN_EXISTING,
+        flags=FileFlags.FILE_FLAG_BACKUP_SEMANTICS,
+        share_mode=FileShareMode.FILE_SHARE_ALL)
 
 
 def open_directory_for_acl(path: str):
@@ -345,20 +318,11 @@ def open_directory_for_acl(path: str):
     junction swapped into ``path`` afterwards cannot move the operation to a
     different object.
     """
-    create_file = bind("kernel32", "CreateFileW", ctypes.c_void_p,
-                       wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
-                       ctypes.c_void_p)
-    handle = create_file(
-        path, (AccessMask.WRITE_DAC | AccessMask.READ_CONTROL
-               | AccessMask.FILE_READ_ATTRIBUTES),
-        FileShareMode.FILE_SHARE_READ | FileShareMode.FILE_SHARE_WRITE,
-        None, FileCreateDisposition.OPEN_EXISTING,
-        FileFlags.FILE_FLAG_BACKUP_SEMANTICS, None)
-    if handle is None or handle == INVALID_HANDLE_VALUE:
-        raise WindowsApiError(f"CreateFileW({path!r}) for ACL failed",
-                              status=ctypes.get_last_error())
-    return handle
+    return open_with_access(
+        path, AccessMask.WRITE_DAC | AccessMask.READ_CONTROL | AccessMask.FILE_READ_ATTRIBUTES,
+        creation=FileCreateDisposition.OPEN_EXISTING,
+        flags=FileFlags.FILE_FLAG_BACKUP_SEMANTICS,
+        share_mode=FileShareMode.FILE_SHARE_READ | FileShareMode.FILE_SHARE_WRITE)
 
 
 def final_path_from_handle(handle) -> str:
@@ -420,8 +384,6 @@ def label_sddl(path: str) -> str:
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p))
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
 
     descriptor = ctypes.c_void_p()
     status = get_named(path, SE_FILE_OBJECT, SecurityInformation.LABEL_SECURITY_INFORMATION,
@@ -442,8 +404,6 @@ def handle_owner_sid(handle) -> str:
     open cannot redirect the owner query to a different object.
     """
     get = _get_security_info()
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
     owner = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
     status = get(handle, SE_FILE_OBJECT, SecurityInformation.OWNER_SECURITY_INFORMATION,
@@ -467,8 +427,6 @@ def handle_dacl_sddl(handle, object_type: int = SE_FILE_OBJECT):
     ``SE_KERNEL_OBJECT`` for a process.
     """
     get = _get_security_info()
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
     dacl = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
     status = get(handle, object_type, SecurityInformation.DACL_SECURITY_INFORMATION,
@@ -493,89 +451,41 @@ def set_handle_dacl(handle, sddl: str, object_type: int = SE_FILE_OBJECT) -> Non
     which is what the POSIX code achieves by setting the mode through the open
     descriptor rather than by pathname.  ``object_type`` selects the kind of
     object -- a file by default, or ``SE_KERNEL_OBJECT`` for a process or
-    thread.
+    thread. Setup grants and editor publication share the same file-DACL and
+    protection-flag operation; their policy and borrowed-handle lifetime remain
+    with the caller. This scope owns only the converted descriptor allocation.
     """
-    convert = bind(
-        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-    get_dacl = bind(
-        "advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
-        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
-        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
     set_info = bind(
         "advapi32", "SetSecurityInfo", wintypes.DWORD, ctypes.c_void_p,
         ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p)
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
-
-    descriptor = ctypes.c_void_p()
-    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
-        raise WindowsApiError(
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
-    try:
-        present = wintypes.BOOL()
-        dacl = ctypes.c_void_p()
-        defaulted = wintypes.BOOL()
-        if not get_dacl(descriptor, ctypes.byref(present),
-                        ctypes.byref(dacl), ctypes.byref(defaulted)):
-            raise WindowsApiError("GetSecurityDescriptorDacl failed")
-        if not present.value or not dacl.value:
-            raise WindowsApiError("the descriptor has no DACL to apply")
-        status = set_info(handle, object_type, SecurityInformation.DACL_SECURITY_INFORMATION,
-                          None, None, dacl, None)
+    with _converted_dacl(sddl) as dacl:
+        flags = SecurityInformation.DACL_SECURITY_INFORMATION
+        status = set_info(handle, object_type, flags, None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(f"SetSecurityInfo(dacl) failed: {status}",
                                   status=status)
-    finally:
-        local_free(descriptor)
 
 
 def set_named_dacl(path: str, sddl: str) -> None:
     """Replace ``path``'s DACL from SDDL.
 
-    A pathname fallback for handles that were opened without ``WRITE_DAC``
-    (``SetSecurityInfo`` on such a handle is refused).  Like the POSIX
-    ``os.chmod`` fallback, it lacks the descriptor branch's protection against a
-    replaced temporary entry, so the caller must name that gap.
+    Native filesystem/setup fixtures use this DACL-only pathname operation;
+    setup's protected-path setter and editor publication deliberately retain
+    their different policies. A pathname does not bind a replaced temporary
+    entry like an opened handle, so callers must account for that lookup gap.
     """
-    convert = bind(
-        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-    get_dacl = bind(
-        "advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
-        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
-        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
     set_named = bind(
         "advapi32", "SetNamedSecurityInfoW", wintypes.DWORD, wintypes.LPWSTR,
         ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p)
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
-
-    descriptor = ctypes.c_void_p()
-    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
-        raise WindowsApiError(
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
-    try:
-        present = wintypes.BOOL()
-        dacl = ctypes.c_void_p()
-        defaulted = wintypes.BOOL()
-        if not get_dacl(descriptor, ctypes.byref(present),
-                        ctypes.byref(dacl), ctypes.byref(defaulted)):
-            raise WindowsApiError("GetSecurityDescriptorDacl failed")
-        if not present.value or not dacl.value:
-            raise WindowsApiError("the descriptor has no DACL to apply")
+    with _converted_dacl(sddl) as dacl:
         status = set_named(path, SE_FILE_OBJECT, SecurityInformation.DACL_SECURITY_INFORMATION,
                            None, None, dacl, None)
         if status != ERROR_SUCCESS:
             raise WindowsApiError(
                 f"SetNamedSecurityInfoW({path!r}) failed: {status}",
                 status=status)
-    finally:
-        local_free(descriptor)
 
 
 def app_container_profile_name_is_usable(name: str) -> bool:
@@ -602,15 +512,14 @@ def derive_app_container_sid(name: str) -> str:
     try:
         return sid_text(sid)
     finally:
-        free_sid(sid)
+        if free_sid(sid):
+            raise WindowsResourceError('FreeSid failed')
 
 
 def sid_text(sid) -> str:
     """Convert a SID pointer to its string form."""
     convert = bind("advapi32", "ConvertSidToStringSidW", wintypes.BOOL,
                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
 
     text = ctypes.c_void_p()
     if not convert(sid, ctypes.byref(text)):
@@ -659,8 +568,6 @@ def canonical_sid(text: str) -> str:
         return known
     convert = bind("advapi32", "ConvertStringSidToSidW", wintypes.BOOL,
                    wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
     sid = ctypes.c_void_p()
     if not convert(text, ctypes.byref(sid)):
         raise WindowsApiError(f"ConvertStringSidToSidW({text!r}) failed",
@@ -880,13 +787,73 @@ def _get_token_information():
 
 
 def close_handle(handle) -> None:
-    """Release a kernel handle."""
-    bind("kernel32", "CloseHandle", wintypes.BOOL, ctypes.c_void_p)(handle)
+    """Attempt release once; failure is not proof of physical retirement.
+
+    Owners consume their slot before calling and still attempt sibling cleanup.
+    A failed numeric handle is not safe to retry: it may already be invalid.
+    """
+    if not bind("kernel32", "CloseHandle", wintypes.BOOL, ctypes.c_void_p)(handle):
+        raise WindowsResourceError('CloseHandle failed', status=ctypes.get_last_error())
+
+
+def local_free(pointer) -> None:
+    """Release LocalAlloc-backed descriptors/SID text, reporting native failure.
+
+    All conversion owners use this one return convention: NULL means success.
+    A failed release does not authorize replaying a creation or ACL mutation.
+    """
+    if bind('kernel32', 'LocalFree', ctypes.c_void_p, ctypes.c_void_p)(pointer):
+        raise WindowsResourceError('LocalFree failed', status=ctypes.get_last_error())
 
 
 def current_process_handle():
     """The pseudo-handle for the calling process; it need not be closed."""
     return bind("kernel32", "GetCurrentProcess", ctypes.c_void_p)()
+
+
+@contextmanager
+def _converted_security_descriptor(sddl):
+    """Own an optional explicit descriptor through its consuming native call."""
+    if sddl is None:
+        yield None
+        return
+    convert = bind('advapi32', 'ConvertStringSecurityDescriptorToSecurityDescriptorW',
+                   wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
+                   ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+    descriptor = ctypes.c_void_p()
+    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
+        raise WindowsApiError('Could not prepare object permissions', status=ctypes.get_last_error())
+    try:
+        if not descriptor.value:
+            raise WindowsApiError('The explicit security descriptor is null')
+        yield descriptor
+    finally:
+        if descriptor.value:
+            local_free(descriptor)
+
+
+@contextmanager
+def _converted_dacl(sddl):
+    """Loan a required DACL while its descriptor stays owned by this scope.
+
+    File, setup and token mutators all require the same explicit DACL view;
+    the optional creation-descriptor scope alone does not enforce that rule.
+    Callers retain object/protection policy and copy any returned ACL bytes
+    before leaving: this c_void_p is borrowed, not an independent allocation.
+    """
+    if sddl is None:
+        raise WindowsApiError('an explicit DACL descriptor is required')
+    with _converted_security_descriptor(sddl) as descriptor:
+        get_dacl = bind(
+            'advapi32', 'GetSecurityDescriptorDacl', wintypes.BOOL,
+            ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
+        present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not get_dacl(descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise WindowsApiError('GetSecurityDescriptorDacl failed', status=ctypes.get_last_error())
+        if not present.value or not dacl.value:
+            raise WindowsApiError('the descriptor has no DACL to apply')
+        yield dacl
 
 
 def open_with_access(path, desired_access,
@@ -905,38 +872,22 @@ def open_with_access(path, desired_access,
                        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                        ctypes.c_void_p)
-    descriptor = ctypes.c_void_p()
-    attributes = None
-    free = None
-    if security_descriptor is not None:
-        convert = bind('advapi32', 'ConvertStringSecurityDescriptorToSecurityDescriptorW',
-                       wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
-                       ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-        free = bind('kernel32', 'LocalFree', ctypes.c_void_p, ctypes.c_void_p)
-        if not convert(security_descriptor, SDDL_REVISION_1, ctypes.byref(descriptor), None):
-            raise WindowsApiError('ConvertStringSecurityDescriptorToSecurityDescriptorW failed', status=ctypes.get_last_error())
-        if not descriptor.value:
-            raise WindowsApiError('the explicit file descriptor is null')
-        security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
-        attributes = ctypes.byref(security)
-    handle = None
-    acquired = False
-    try:
-        handle = create_file(path, desired_access, share_mode, attributes, creation, flags, None)
-        if handle is None or handle == INVALID_HANDLE_VALUE:
-            raise WindowsApiError(f"CreateFileW({path!r}) failed", status=ctypes.get_last_error())
-        acquired = True
-        return handle
-    finally:
-        if free is not None and descriptor.value:
-            try:
+    with ExitStack() as rollback:
+        with _converted_security_descriptor(security_descriptor) as descriptor:
+            attributes = None
+            if descriptor is not None:
                 # Setup metadata must be private from its first instant, even
                 # when its parent grants owning runtimes state-writing access.
-                free(descriptor)
-            except BaseException:
-                if acquired:
-                    close_handle(handle)
-                raise
+                security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+                attributes = ctypes.byref(security)
+            handle = create_file(path, desired_access, share_mode, attributes, creation, flags, None)
+            if handle is None or handle == INVALID_HANDLE_VALUE:
+                raise WindowsApiError(f"CreateFileW({path!r}) failed", status=ctypes.get_last_error())
+            rollback.callback(close_handle, handle)
+        # Temporary descriptor cleanup can fail after acquisition but before
+        # publication. The existing rollback owns that handle until this point.
+        rollback.pop_all()
+        return handle
 
 
 def open_process_token(process, rights: int = TokenAccess.TOKEN_QUERY):
@@ -1076,7 +1027,6 @@ def create_write_restricted_token(source, restricting_sids):
         raise ValueError('write restriction requires restricting identities')
     convert = bind('advapi32', 'ConvertStringSidToSidW', wintypes.BOOL,
                    wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
-    free = bind('kernel32', 'LocalFree', ctypes.c_void_p, ctypes.c_void_p)
     restrict = bind('advapi32', 'CreateRestrictedToken', wintypes.BOOL,
                     ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
                     wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
@@ -1090,7 +1040,7 @@ def create_write_restricted_token(source, restricting_sids):
                 pointer = ctypes.c_void_p()
                 if not convert(sid, ctypes.byref(pointer)):
                     raise WindowsApiError('ConvertStringSidToSidW failed', status=ctypes.get_last_error())
-                cleanup.callback(free, pointer)
+                cleanup.callback(local_free, pointer)
                 pointers.append(pointer)
             entries = (_SidAttributes * len(pointers))(*[_SidAttributes(pointer, 0) for pointer in pointers])
             if not restrict(source, WRITE_RESTRICTED, 0, None, 0, None, len(entries), entries, ctypes.byref(result)):
@@ -1120,35 +1070,12 @@ def set_token_default_dacl(token, sddl: str | bytes) -> None:
         if not set_info(token, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(acl), ctypes.sizeof(acl)):
             raise WindowsApiError('SetTokenInformation(TokenDefaultDacl) failed', status=ctypes.get_last_error())
         return
-    convert = bind(
-        "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-        wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-    get_dacl = bind(
-        "advapi32", "GetSecurityDescriptorDacl", wintypes.BOOL,
-        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
-        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
-    descriptor = ctypes.c_void_p()
-    if not convert(sddl, SDDL_REVISION_1, ctypes.byref(descriptor), None):
-        raise WindowsApiError("ConvertStringSecurityDescriptorToSecurityDescriptorW failed",
-                              status=ctypes.get_last_error())
-    try:
-        present, defaulted, acl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
-        if not get_dacl(descriptor, ctypes.byref(present), ctypes.byref(acl),
-                        ctypes.byref(defaulted)):
-            raise WindowsApiError("GetSecurityDescriptorDacl failed",
-                                  status=ctypes.get_last_error())
-        if not present.value or not acl.value:
-            raise WindowsApiError("the descriptor has no DACL to apply")
+    with _converted_dacl(sddl) as acl:
         # TOKEN_DEFAULT_DACL is one pointer into descriptor. SetTokenInformation
         # copies the ACL; freeing descriptor sooner would leave a dangling ACL.
         if not set_info(token, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(acl), ctypes.sizeof(acl)):
             raise WindowsApiError("SetTokenInformation(TokenDefaultDacl) failed",
                                   status=ctypes.get_last_error())
-    finally:
-        local_free(descriptor)
 
 
 def token_is_app_container(token) -> bool:
@@ -1317,82 +1244,6 @@ def get_exit_code_process(handle) -> int:
     return code.value
 
 
-def create_process_with_pseudoconsole(executable, arguments, hpc, *,
-                                      environment=None,
-                                      current_directory=None):
-    """Create ``executable`` attached to the pseudoconsole ``hpc``.
-
-    A plain console child (no AppContainer): the pseudoconsole supplies the
-    child's standard handles.  ``STARTF_USESTDHANDLES`` with null handles is
-    set so ``CreateProcessW`` does not duplicate this process's redirected
-    handles into the child (microsoft/terminal discussion 15814).
-    """
-    initialize = bind("kernel32", "InitializeProcThreadAttributeList",
-                      wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD,
-                      wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t))
-    update = bind("kernel32", "UpdateProcThreadAttribute", wintypes.BOOL,
-                  ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t,
-                  ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
-                  ctypes.c_void_p)
-    delete = bind("kernel32", "DeleteProcThreadAttributeList", None,
-                  ctypes.c_void_p)
-    create = bind("kernel32", "CreateProcessW", wintypes.BOOL,
-                  wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
-                  ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
-                  ctypes.c_void_p, wintypes.LPCWSTR,
-                  ctypes.POINTER(StartupInfoEx),
-                  ctypes.POINTER(ProcessInformation))
-
-    size = ctypes.c_size_t()
-    # The sizing call is documented to fail with ERROR_INSUFFICIENT_BUFFER
-    # while filling in the required size; only a wrong error is a defect.
-    initialize(None, 1, 0, ctypes.byref(size))
-    if ctypes.get_last_error() != 122 or not size.value:
-        raise WindowsApiError("InitializeProcThreadAttributeList sizing failed")
-    storage = ctypes.create_string_buffer(size.value)
-    attributes = ctypes.cast(storage, ctypes.c_void_p)
-    initialized = False
-    try:
-        if not initialize(attributes, 1, 0, ctypes.byref(size)):
-            raise WindowsApiError("InitializeProcThreadAttributeList failed")
-        initialized = True
-        # The value is the HPCON itself, not its address (the documented call
-        # passes the handle, not a pointer to it).  hpc is already a c_void_p
-        # holding that handle, so it is passed as-is; re-wrapping it in
-        # c_void_p would try to convert a c_void_p into a pointer and fail.
-        if not update(attributes, 0,
-                      ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                      hpc, ctypes.sizeof(ctypes.c_void_p),
-                      None, None):
-            raise WindowsApiError(
-                "UpdateProcThreadAttribute(PSEUDOCONSOLE) failed")
-
-        startup = StartupInfoEx()
-        startup.StartupInfo.cb = ctypes.sizeof(StartupInfoEx)
-        startup.lpAttributeList = attributes
-        startup.StartupInfo.dwFlags = StartupInfoFlags.STARTF_USESTDHANDLES
-        # hStdInput/hStdOutput/hStdError stay NULL; the pseudoconsole supplies
-        # them, and null handles keep the compatibility path from duplicating
-        # the parent's redirected handles into the child.
-        information = ProcessInformation()
-        command_line = ctypes.create_unicode_buffer(
-            subprocess.list2cmdline([executable, *arguments]))
-        flags = CreateProcessFlags.EXTENDED_STARTUPINFO_PRESENT
-        block = environment_block(environment, current_directory)
-        if block is not None:
-            flags |= CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT
-        if not create(executable, command_line, None, None, False, flags,
-                      block, current_directory, ctypes.byref(startup),
-                      ctypes.byref(information)):
-            raise WindowsApiError(
-                "CreateProcessW failed: "
-                f"{ctypes.get_last_error()}")
-        return information
-    finally:
-        if initialized:
-            delete(attributes)
-
-
 def environment_block(environment: dict, current_directory=None):
     """Encode ``environment`` as the Unicode block ``CreateProcessW`` accepts.
 
@@ -1418,7 +1269,7 @@ def create_process_in_app_container(executable, arguments, package_sid,
                                     current_directory=None,
                                     inherited_handles=None, environment=None,
                                     standard_handles=None, pseudoconsole=None, *,
-                                    primary_token=None, object_security=None):
+                                    information, primary_token=None, object_security=None):
     """Create ``executable`` suspended inside the AppContainer ``package_sid``.
 
     When supplied, ``package_sid`` is the package SID in string form, as
@@ -1441,8 +1292,9 @@ def create_process_in_app_container(executable, arguments, package_sid,
     resume or terminate it. Its token object's DACL and future-object default
     are separate: a launch copy can have a compatible creation default while
     the actual child's default is made private and checked before resume.
-    The returned :class:`ProcessInformation` owns the process and thread handles;
-    the caller must terminate/reap on setup failure and close both handles.
+    The supplied empty ProcessInformation owns successful native output at once,
+    including an exception during later buffer cleanup. Its caller must retire
+    an unpublished child, observe exit, and only then close its handles.
     """
     if package_sid is None:
         if primary_token is None:
@@ -1454,26 +1306,29 @@ def create_process_in_app_container(executable, arguments, package_sid,
     return create_process_suspended(
         executable, arguments, package_sid, current_directory, inherited_handles,
         environment, standard_handles, pseudoconsole,
-        primary_token=primary_token, object_security=object_security)
+        information=information, primary_token=primary_token, object_security=object_security)
 
 
 def create_process_suspended(executable, arguments, package_sid=None,
                              current_directory=None, inherited_handles=None,
                              environment=None, standard_handles=None, pseudoconsole=None, *,
-                             primary_token=None, object_security=None, creationflags=0,
+                             information, primary_token=None, object_security=None, creationflags=0,
                              search_path=False):
-    """One native creation path, retaining ownership until it returns.
+    """One native creation path, writing into its caller's existing owner.
 
     No new lowbox attributes means retaining the supplied token/caller context,
     not retrying a failed contained launch outside containment. ``search_path``
     uses Windows' command-line image lookup for a caller-selected bare command;
     sanctioned Loki images are supplied explicitly and do not use that lookup.
     Every variant stays suspended until its local owner verifies and resumes it.
+    Buffer cleanup never waits for or releases the child: its output record is
+    already owned even if cleanup fails, so asynchronous callers can retire it
+    through the same process owner instead of blocking their event loop here.
     """
+    if information.hProcess or information.hThread:
+        raise ValueError('process output still owns native handles')
     convert_sid = bind("advapi32", "ConvertStringSidToSidW", wintypes.BOOL,
                        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
-    local_free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                      ctypes.c_void_p)
     initialize = bind("kernel32", "InitializeProcThreadAttributeList",
                       wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD,
                       wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t))
@@ -1495,8 +1350,7 @@ def create_process_suspended(executable, arguments, package_sid=None,
                       ctypes.c_void_p, *parameters)
 
     sid = ctypes.c_void_p()
-    if package_sid is not None and not convert_sid(package_sid, ctypes.byref(sid)):
-        raise WindowsApiError(f"ConvertStringSidToSidW({package_sid!r}) failed")
+    sid_acquired = False
     # The list must be sized for every attribute it will receive: one when a
     # package SID is supplied, one when handles are inherited, and one when the
     # child is attached to a pseudoconsole. Sizing it for fewer and adding more
@@ -1507,14 +1361,18 @@ def create_process_suspended(executable, arguments, package_sid=None,
     attribute_list = None
     initialized = False
     handle_array = None
-    descriptor = ctypes.c_void_p()
-    created = False
     try:
+        if package_sid is not None:
+            if not convert_sid(package_sid, ctypes.byref(sid)):
+                raise WindowsApiError(f"ConvertStringSidToSidW({package_sid!r}) failed")
+            sid_acquired = True
         if attribute_count:
+            # Sizing is documented to fail with ERROR_INSUFFICIENT_BUFFER
+            # while filling the size; another failure leaves no usable size.
             initialize(None, attribute_count, 0, ctypes.byref(size))
             if not size.value:
                 raise WindowsApiError(
-                    "InitializeProcThreadAttributeList reported no size")
+                    "InitializeProcThreadAttributeList sizing failed")
             attribute_storage = ctypes.create_string_buffer(size.value)
             attribute_list = ctypes.cast(attribute_storage, ctypes.c_void_p)
             if not initialize(attribute_list, attribute_count, 0,
@@ -1523,6 +1381,8 @@ def create_process_suspended(executable, arguments, package_sid=None,
                     "InitializeProcThreadAttributeList failed")
             initialized = True
         if package_sid is not None:
+            # Both the entry array and its owned SID allocations remain live
+            # through CreateProcess, not merely UpdateProcThreadAttribute.
             capabilities = SecurityCapabilities(sid, None, 0, 0)
             if not update(attribute_list, 0,
                           ProcThreadAttribute.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
@@ -1565,7 +1425,6 @@ def create_process_suspended(executable, arguments, package_sid=None,
             startup.StartupInfo.dwFlags = StartupInfoFlags.STARTF_USESTDHANDLES
             (startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput,
              startup.StartupInfo.hStdError) = standard_handles
-        information = ProcessInformation()
         command_line = ctypes.create_unicode_buffer(
             subprocess.list2cmdline([executable, *arguments]))
         flags = (CreateProcessFlags.CREATE_SUSPENDED
@@ -1573,58 +1432,34 @@ def create_process_suspended(executable, arguments, package_sid=None,
         block = environment_block(environment, current_directory)
         if block is not None:
             flags |= CreateProcessFlags.CREATE_UNICODE_ENVIRONMENT
-        security = None
-        if object_security is not None:
-            convert = bind(
-                "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-                wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
-                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-            converted = ctypes.c_void_p()
-            if not convert(object_security, SDDL_REVISION_1,
-                           ctypes.byref(converted), None):
-                raise WindowsApiError("ConvertStringSecurityDescriptorToSecurityDescriptorW failed",
-                                      status=ctypes.get_last_error())
-            if not converted.value:
-                raise WindowsApiError("the explicit process descriptor is null")
-            descriptor = converted
-            attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
-            security = ctypes.byref(attributes)
-        creation = [None if search_path else executable, command_line, security, security,
-                    bool(inherited_handles), flags, block,
-                    current_directory, ctypes.byref(startup),
-                    ctypes.byref(information)]
-        if primary_token is not None:
-            creation.insert(0, primary_token)
-        if not create(*creation):
-            operation = "CreateProcessW" if primary_token is None else "CreateProcessAsUserW"
-            status = ctypes.get_last_error()
-            raise WindowsApiError(f"{operation} failed: {status}", status=status)
-        created = True
-        return information
+        with _converted_security_descriptor(object_security) as descriptor:
+            security = None
+            if descriptor is not None:
+                attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+                security = ctypes.byref(attributes)
+            creation = [None if search_path else executable, command_line, security, security,
+                        bool(inherited_handles), flags, block,
+                        current_directory, ctypes.byref(startup),
+                        ctypes.byref(information)]
+            if primary_token is not None:
+                creation.insert(0, primary_token)
+            if not create(*creation):
+                operation = "CreateProcessW" if primary_token is None else "CreateProcessAsUserW"
+                status = ctypes.get_last_error()
+                # Failed native output is unspecified, not an acquired child.
+                ctypes.memset(ctypes.byref(information), 0, ctypes.sizeof(information))
+                raise WindowsApiError(f"{operation} failed: {status}", status=status)
+            return information
     finally:
-        try:
-            with ExitStack() as cleanup:
-                if sid.value:
-                    cleanup.callback(local_free, sid)
-                # Both initial objects consume this descriptor synchronously.
-                # It must outlive creation; the child never owns its buffer.
-                if descriptor.value:
-                    cleanup.callback(local_free, descriptor)
-                if initialized:
-                    cleanup.callback(delete, attribute_list)
-        except BaseException:
-            if created:
-                # Ownership transfers only when this function returns. If
-                # native-buffer cleanup is interrupted, the caller has no
-                # handles yet: retire the suspended child here, not an orphan.
-                with ExitStack() as cleanup:
-                    cleanup.callback(close_handle, information.hProcess)
-                    cleanup.callback(close_handle, information.hThread)
-                    if wait_for_single_object(information.hProcess, 0) == WAIT_TIMEOUT:
-                        terminate_process(information.hProcess)
-                    if wait_for_single_object(information.hProcess, INFINITE) != WAIT_OBJECT_0:
-                        raise WindowsApiError("suspended child cleanup wait failed")
-            raise
+        with ExitStack() as cleanup:
+            if sid_acquired:
+                cleanup.callback(local_free, sid)
+            # Only temporary native buffers belong here. Child handles are
+            # already held by the caller, including cleanup interruption.
+            # Object security is independent of the attribute list and has
+            # already retired; attributes still precede their borrowed SID data.
+            if initialized:
+                cleanup.callback(delete, attribute_list)
 
 
 # -- handle-relative file operations -------------------------------------
@@ -1841,6 +1676,92 @@ def by_handle_file_information(handle):
     return information
 
 
+async def _pipe_io(handle, buffer, size, operation):
+    """Retain one exact I/O record and buffer through kernel completion.
+
+    Inherited pipe streams need asynchronous write-only I/O; asyncio's public
+    Windows writer probes read access, and its private proactor is not an API.
+    GetOverlappedResult(False) observes this record directly, without an extra
+    event handle, a worker thread or an elapsed execution limit. Each stream
+    serializes its operations. The caller still owns the borrowed pipe handle.
+    """
+    import asyncio
+
+    submit = bind('kernel32', operation, wintypes.BOOL, ctypes.c_void_p,
+                  ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
+    result = bind('kernel32', 'GetOverlappedResult', wintypes.BOOL, ctypes.c_void_p,
+                  ctypes.POINTER(Overlapped), ctypes.POINTER(wintypes.DWORD), wintypes.BOOL)
+    cancel = bind('kernel32', 'CancelIoEx', wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p)
+    record = Overlapped()
+    count = wintypes.DWORD()
+    if not submit(handle, buffer, size, ctypes.byref(count), ctypes.byref(record)):
+        error = ctypes.get_last_error()
+        if error != 997:  # ERROR_IO_PENDING
+            raise WindowsApiError(operation + ' failed', status=error)
+
+    async def completed():
+        while not result(handle, ctypes.byref(record), ctypes.byref(count), False):
+            error = ctypes.get_last_error()
+            if error != 996:  # ERROR_IO_INCOMPLETE; every other result is terminal.
+                return error
+            await asyncio.sleep(.01)
+        return 0
+
+    try:
+        error = await completed()
+    except BaseException:
+        cancel_error = 0
+        try:
+            if not cancel(handle, ctypes.byref(record)):
+                cancel_error = ctypes.get_last_error()
+                if cancel_error == 1168:  # ERROR_NOT_FOUND: completion won cancellation.
+                    cancel_error = 0
+        finally:
+            # This task itself owns the native record. Resume its terminal
+            # observation after cancellation; do not create another I/O/waiter
+            # or free storage merely because cancellation was requested.
+            while True:
+                try:
+                    await completed()
+                    break
+                except asyncio.CancelledError:
+                    continue
+        if cancel_error:
+            raise WindowsApiError('CancelIoEx failed', status=cancel_error)
+        raise
+    if error:
+        raise WindowsApiError(operation + ' failed', status=error)
+    return count.value
+
+
+async def read_pipe(handle, size=65536):
+    """Read an overlapped byte pipe; a closed peer is EOF, not a retry."""
+    buffer = ctypes.create_string_buffer(size)
+    try:
+        count = await _pipe_io(handle, buffer, size, 'ReadFile')
+    except WindowsApiError as error:
+        if error.status in PIPE_CLOSED_ERRORS:
+            return b''
+        raise
+    return buffer.raw[:count]
+
+
+async def write_pipe(handle, data):
+    """Complete all bytes while retaining every submitted buffer through exit."""
+    payload = bytes(data)
+    offset = 0
+    while offset < len(payload):
+        chunk = payload[offset:]
+        buffer = ctypes.create_string_buffer(chunk)
+        count = await _pipe_io(handle, buffer, len(chunk), 'WriteFile')
+        if not count:
+            raise WindowsApiError('WriteFile made no progress')
+        offset += count
+
+
+PIPE_CLOSED_ERRORS = frozenset([109, 232, 233])  # broken/closing/disconnected byte pipe
+
+
 def read_file(handle, size):
     """Read up to ``size`` bytes; returns what was read (may be short)."""
     read = bind("kernel32", "ReadFile", wintypes.BOOL, ctypes.c_void_p,
@@ -1908,7 +1829,7 @@ ERROR_LOCK_VIOLATION = 33
 
 
 class Overlapped(ctypes.Structure):
-    """OVERLAPPED: the offset a locked range starts at, and an event slot."""
+    """One native overlapped operation, including its byte offset/event slot."""
 
     # Fixed-width ``c_uint32`` for the offset fields: ``wintypes.DWORD`` is
     # ``c_ulong`` (8 bytes on LP64) and would give this the wrong layout.
@@ -1985,39 +1906,26 @@ def create_pipe(inherit: bool = True, size: int = 0, *,
                   ctypes.POINTER(ctypes.c_void_p),
                   ctypes.POINTER(ctypes.c_void_p),
                   ctypes.POINTER(SecurityAttributes), ctypes.c_uint32)
-    descriptor = ctypes.c_void_p()
-    if security_descriptor is not None:
-        convert = bind(
-            "advapi32", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-            wintypes.BOOL, wintypes.LPCWSTR, wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
-        free = bind("kernel32", "LocalFree", ctypes.c_void_p,
-                    ctypes.c_void_p)
-        if not convert(security_descriptor, SDDL_REVISION_1,
-                       ctypes.byref(descriptor), None):
-            raise WindowsApiError("Cannot build the pipe security descriptor",
-                                  status=ctypes.get_last_error())
-        if not descriptor.value:
-            raise WindowsApiError("Pipe security descriptor is missing")
-    try:
-        # Conversion uses the Windows local heap, not Python-owned storage.
-        # Keep it until the whole endpoint setup returns: lpSecurityDescriptor
-        # is a borrowed pointer while CreatePipe reads these attributes.
-        attributes = SecurityAttributes(
-            ctypes.sizeof(SecurityAttributes), descriptor.value,
-            1 if inherit else 0)
-        read_handle = ctypes.c_void_p()
-        write_handle = ctypes.c_void_p()
-        if not create(ctypes.byref(read_handle), ctypes.byref(write_handle),
-                      ctypes.byref(attributes), size):
-            # The output values are indeterminate on failure, not handles we
-            # own. Capture the error before LocalFree can change last-error.
-            raise WindowsApiError("CreatePipe failed",
-                                  status=ctypes.get_last_error())
+    with ExitStack() as rollback:
+        with _converted_security_descriptor(security_descriptor) as descriptor:
+            # Conversion uses the Windows local heap, not Python-owned storage.
+            # Keep it until the whole endpoint setup returns: lpSecurityDescriptor
+            # is a borrowed pointer while CreatePipe reads these attributes.
+            attributes = SecurityAttributes(
+                ctypes.sizeof(SecurityAttributes), descriptor,
+                1 if inherit else 0)
+            read_handle = ctypes.c_void_p()
+            write_handle = ctypes.c_void_p()
+            if not create(ctypes.byref(read_handle), ctypes.byref(write_handle),
+                          ctypes.byref(attributes), size):
+                # The output values are indeterminate on failure, not handles we
+                # own. Capture the error before LocalFree can change last-error.
+                raise WindowsApiError("CreatePipe failed", status=ctypes.get_last_error())
+            rollback.callback(close_handle, read_handle.value)
+            rollback.callback(close_handle, write_handle.value)
+        # Successful endpoints remain unpublished until descriptor cleanup ends.
+        rollback.pop_all()
         return read_handle.value, write_handle.value
-    finally:
-        if descriptor.value:
-            free(descriptor)
 
 
 def set_handle_information(handle, mask: int, flags: int) -> None:
