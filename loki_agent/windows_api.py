@@ -1090,12 +1090,14 @@ def create_write_restricted_token(source, restricting_sids):
     return result
 
 
-def set_token_default_dacl(token, sddl: str | bytes) -> None:
+def set_token_default_dacl(token, sddl: str | bytes) -> bytes:
     """Set future-object security on the supplied token, not its object DACL.
 
     The caller owns token selection and must verify the result before a child
     runs. TOKEN_ADJUST_DEFAULT suffices here; readback separately needs QUERY.
     Bytes restore an earlier ACL exactly, without rebuilding its permissions.
+    Return an owned copy of the requested ACL for exact readback comparison;
+    callers must not compare rendered SDDL aliases or retain descriptor pointers.
     """
     set_info = bind('advapi32', 'SetTokenInformation', wintypes.BOOL,
                     ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
@@ -1106,13 +1108,18 @@ def set_token_default_dacl(token, sddl: str | bytes) -> None:
         acl = ctypes.c_void_p(ctypes.addressof(storage))
         if not set_info(token, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(acl), ctypes.sizeof(acl)):
             raise WindowsApiError('SetTokenInformation(TokenDefaultDacl) failed', status=ctypes.get_last_error())
-        return
+        return sddl
     with _converted_dacl(sddl) as acl:
+        length = ctypes.c_uint16.from_address(acl.value + 2).value
+        if length < 8:
+            raise WindowsApiError('the descriptor contains a short ACL')
+        expected = ctypes.string_at(acl, length)
         # TOKEN_DEFAULT_DACL is one pointer into descriptor. SetTokenInformation
         # copies the ACL; freeing descriptor sooner would leave a dangling ACL.
         if not set_info(token, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(acl), ctypes.sizeof(acl)):
             raise WindowsApiError("SetTokenInformation(TokenDefaultDacl) failed",
                                   status=ctypes.get_last_error())
+        return expected
 
 
 def token_is_app_container(token) -> bool:

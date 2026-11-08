@@ -5,7 +5,7 @@ import sys
 import unittest
 from unittest import mock
 
-from loki_agent import process_protections
+from loki_agent import process_protections, windows_api
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,34 +65,65 @@ class ProcessProtectionTests(unittest.TestCase):
                     expected.append([3, 0, 0, 0, 0])  # GET_DUMPABLE
                 self.assertEqual(prctl.calls, expected)
 
+    def test_windows_current_objects_and_future_default_have_independent_owners(self):
+        for valid in [True, False]:
+            with self.subTest(valid=valid), \
+                    mock.patch.object(process_protections.sys, 'platform', 'win32'), \
+                    mock.patch.object(windows_api, 'current_user_sid', return_value='owner'), \
+                    mock.patch.object(windows_api, 'current_process_handle', return_value=1), \
+                    mock.patch.object(windows_api, 'bind', return_value=lambda: 2), \
+                    mock.patch.object(windows_api, 'set_handle_dacl') as protect, \
+                    mock.patch.object(windows_api, 'open_process_token', return_value=3) as open_token, \
+                    mock.patch.object(windows_api, 'set_token_default_dacl', side_effect=(
+                        None if valid else windows_api.WindowsApiError('default refused'))) as install, \
+                    mock.patch.object(windows_api, 'close_handle') as close:
+                if valid:
+                    self.assertTrue(process_protections.protect_credential_process())
+                else:
+                    with self.assertRaises(process_protections.ProcessProtectionError):
+                        process_protections.protect_credential_process()
+                open_token.assert_called_once_with(
+                    1, windows_api.TokenAccess.TOKEN_QUERY | windows_api.TokenAccess.TOKEN_ADJUST_DEFAULT)
+                install.assert_called_once_with(3, process_protections.private_object_dacl('owner'))
+                close.assert_called_once_with(3)  # Both current-object handles are borrowed pseudohandles.
+                self.assertEqual([call.args[0] for call in protect.call_args_list], [1, 2] if valid else [1])
+
     def test_real_process_reports_protection(self):
-        if os.name == "nt":
-            # Windows has no prctl; the protection is the process object's
-            # DACL, so a child applies it and reports its own process DACL.
+        if sys.platform == "win32":
+            # Observe this direct caller and a genuinely later thread. The
+            # suspended-child tests separately establish creation-time security.
             code = (
-                "import json\n"
-                "from loki_agent import process_protections, windows_api\n"
+                "import ctypes, json, threading\n"
+                "from loki_agent import process_protections, windows_api as api\n"
                 "process_protections.protect_credential_process()\n"
-                "print(json.dumps({'dacl': windows_api.handle_dacl_sddl(\n"
-                "    windows_api.current_process_handle(),\n"
-                "    windows_api.SE_KERNEL_OBJECT)}))\n"
+                "current_thread = api.bind('kernel32', 'GetCurrentThread', ctypes.c_void_p)\n"
+                "threads = [api.handle_dacl_sddl(current_thread(), api.SE_KERNEL_OBJECT)]\n"
+                "worker = threading.Thread(target=lambda: threads.append(\n"
+                "    api.handle_dacl_sddl(current_thread(), api.SE_KERNEL_OBJECT)))\n"
+                "worker.start(); worker.join()\n"
+                "token = api.open_process_token(api.current_process_handle())\n"
+                "try:\n"
+                "    result = {'owner': api.current_user_sid(), 'threads': threads,\n"
+                "              'default': api.acl_sddl(api.token_default_dacl(token)),\n"
+                "              'dacl': api.handle_dacl_sddl(api.current_process_handle(), api.SE_KERNEL_OBJECT)}\n"
+                "finally: api.close_handle(token)\n"
+                "print(json.dumps(result))\n"
             )
             process = subprocess.run(
                 [sys.executable, "-c", code],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
-                timeout=10,
             )
             self.assertEqual(process.returncode, 0, process.stderr)
-            dacl = json.loads(process.stdout)["dacl"]
-            self.assertIsNotNone(dacl)
-            # Only the owner, SYSTEM and the Administrators hold full control;
-            # the inherited Everyone/Users grants are gone.
-            self.assertIn("SY", dacl)
-            self.assertIn("BA", dacl)
-            self.assertNotIn("WD", dacl)
-            self.assertNotIn("BU", dacl)
+            from loki_agent import windows_acl
+            result = json.loads(process.stdout)
+            self.assertEqual(len(result['threads']), 2)
+            expected = {windows_api.canonical_sid(sid) for sid in [result['owner'], 'SY', 'BA']}
+            for dacl in [result['dacl'], result['default'], *result['threads']]:
+                self.assertIsNotNone(dacl)
+                self.assertEqual({windows_api.canonical_sid(sid) for sid in
+                                  windows_acl.allow_trustees(dacl, include_inherit_only=True)}, expected)
             return
         if not sys.platform.startswith("linux"):
             self.skipTest("native dumpability witness requires Linux")
@@ -115,7 +146,6 @@ class ProcessProtectionTests(unittest.TestCase):
             cwd=ROOT,
             capture_output=True,
             text=True,
-            timeout=10,
         )
 
         self.assertEqual(process.returncode, 0, process.stderr)

@@ -17,7 +17,7 @@ from ctypes import wintypes
 
 from . import windows_api as api
 from . import windows_state as state
-from . import windows_verify
+from . import windows_verify, process_protections
 from .lifetimes import finish_cleanup
 from .runtime_isolations import RuntimeIsolationError
 
@@ -385,8 +385,8 @@ def prepare_local(process, command, environment, current_directory, handles, sta
                   owning, creationflags=0):
     """Prepare an existing local child owner; never infer cwd or role from argv.
 
-    Owning children retain the parent's future-object policy exactly. Ordinary
-    children need a compatible creation default for their own libraries' pipes.
+    Owning children get private future-object creation before first execution.
+    Ordinary children need a compatible creation default for their own libraries' pipes.
     Tools get a write-restricted token whose role is derived from the actual
     package. Owning launches never remove an inherited restriction. Neither
     path changes the live parent's default; only preopened output handles grant
@@ -406,7 +406,7 @@ def prepare_local(process, command, environment, current_directory, handles, sta
         expected_restricting = restricting
         expected_default = original
         owner = api.current_user_sid()
-        security = f'D:P(A;;GA;;;{owner})(A;;GA;;;SY)(A;;GA;;;BA)'
+        security = process_protections.private_object_dacl(owner)
         if contained:
             if original is None:
                 raise api.WindowsApiError('the parent token has no creation ACL')
@@ -433,20 +433,16 @@ def prepare_local(process, command, environment, current_directory, handles, sta
             compatible = api.acl_sddl(original) + f'(A;;GA;;;{package})'
             if not owning:
                 compatible += f'(A;;GA;;;{role})'
-            api.set_token_default_dacl(primary, compatible)
-            if not owning:
-                expected_default = api.token_default_dacl(primary)
+            expected_default = api.set_token_default_dacl(primary, compatible)
         process.information = api.ProcessInformation()
         process.information = api.create_process_suspended(
             command[0], command[1:], information=process.information, current_directory=current_directory,
             inherited_handles=handles, environment=environment, standard_handles=standard_handles,
             primary_token=primary, object_security=security, creationflags=creationflags,
-            # This is ordinary external-command lookup, from the creator's
-            # actual cwd. Loki entrypoints must keep their selected image.
             search_path=not owning and not os.path.dirname(command[0]))
         process.pid = process.information.dwProcessId
         rights = api.TokenAccess.TOKEN_QUERY
-        if contained and owning:
+        if owning:
             rights |= api.TokenAccess.TOKEN_ADJUST_DEFAULT
         child = api.open_process_token(process.information.hProcess, rights)
         cleanup.callback(api.close_handle, child)
@@ -455,9 +451,13 @@ def prepare_local(process, command, environment, current_directory, handles, sta
                 api.token_integrity_level(child) != integrity or
                 api.token_restricting_sids(child) != expected_restricting):
             raise api.WindowsApiError('suspended child identity mismatch')
-        if contained and owning:
-            api.set_token_default_dacl(child, original)
-        if api.token_default_dacl(child) != expected_default or api.token_default_dacl(source) != original:
+        if owning:
+            # Preserving an arbitrary parent's default is not a privacy policy.
+            # Initial objects are already private; install the owning child's
+            # future default now, without changing the live parent's token.
+            process_protections.install_private_default(child, owner)
+        elif api.token_default_dacl(child) != expected_default:
+            # This checks the child construction, not readback of a token we set.
             raise api.WindowsApiError('suspended child creation ACL mismatch')
 
 
@@ -539,6 +539,8 @@ def prepare_contained(process, executable, arguments, environment, workspace, in
                        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
     assign = api.bind("kernel32", "AssignProcessToJobObject", wintypes.BOOL,
                       ctypes.c_void_p, ctypes.c_void_p)
+    owner = api.current_user_sid()
+    private = process_protections.private_object_dacl(owner)
     with ExitStack() as pending_job, ExitStack() as duplicated_stdio:
         job = _checked(create_job(None, None), "CreateJobObjectW")
         pending_job.callback(api.close_handle, job)
@@ -557,14 +559,16 @@ def prepare_contained(process, executable, arguments, environment, workspace, in
             executable, arguments, package, information=process.information,
             current_directory=current_directory,
             inherited_handles=[*inherited_handles, *duplicates, *(stdio if stdio is not None else [])],
-            environment=child_environment, standard_handles=standard_handles)
+            environment=child_environment, standard_handles=standard_handles,
+            object_security=private)
         process.pid = process.information.dwProcessId
         token = api.open_process_token(
-            process.information.hProcess, api.TokenAccess.TOKEN_QUERY)
+            process.information.hProcess, api.TokenAccess.TOKEN_QUERY | api.TokenAccess.TOKEN_ADJUST_DEFAULT)
         try:
             if (not api.token_is_app_container(token)
                     or api.token_app_container_sid(token) != package):
                 raise RuntimeIsolationError("Suspended runtime token mismatch")
+            process_protections.install_private_default(token, owner)
         finally:
             api.close_handle(token)
         _checked(assign(job, process.information.hProcess), "AssignProcessToJobObject")

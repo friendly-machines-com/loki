@@ -740,8 +740,12 @@ class TokenCreationTests(unittest.TestCase):
                 self.assertEqual(raised.exception.status, 5)
 
     @contextlib.contextmanager
-    def default_calls(self, *, fail=None, present=True, acl=0xa00):
+    def default_calls(self, *, fail=None, present=True, acl=True):
         events = []
+        # The setter now returns copied ACL bytes for pre-resume verification.
+        # Supply real backing storage rather than a fictitious readable pointer.
+        storage = ctypes.create_string_buffer(b'\x02\x00\x08\x00\x00\x00\x00\x00', 8)
+        selected = ctypes.addressof(storage) if acl is True else acl
 
         def convert(sddl, revision, output, size):
             ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0xd00
@@ -750,7 +754,7 @@ class TokenCreationTests(unittest.TestCase):
 
         def get(descriptor, present_out, acl_out, defaulted):
             ctypes.cast(present_out, ctypes.POINTER(wintypes.BOOL))[0] = present
-            ctypes.cast(acl_out, ctypes.POINTER(ctypes.c_void_p))[0] = acl
+            ctypes.cast(acl_out, ctypes.POINTER(ctypes.c_void_p))[0] = selected
             events.append('get')
             return fail != 'get'
 
@@ -758,7 +762,7 @@ class TokenCreationTests(unittest.TestCase):
             self.assertEqual(token, 42)
             self.assertEqual(kind, windows_api.TOKEN_DEFAULT_DACL_CLASS)
             self.assertEqual(size, ctypes.sizeof(ctypes.c_void_p))
-            self.assertEqual(ctypes.cast(value, ctypes.POINTER(ctypes.c_void_p))[0], acl)
+            self.assertEqual(ctypes.cast(value, ctypes.POINTER(ctypes.c_void_p))[0], selected)
             self.assertNotIn('free', events)
             events.append('set')
             if fail == 'interrupt':
@@ -778,8 +782,9 @@ class TokenCreationTests(unittest.TestCase):
 
     def test_default_setter_keeps_the_acl_alive_through_the_copy(self):
         with self.default_calls() as events:
-            windows_api.set_token_default_dacl(42, 'D:(A;;GA;;;SY)')
+            expected = windows_api.set_token_default_dacl(42, 'D:(A;;GA;;;SY)')
         self.assertEqual(events, ['convert', 'get', 'set', 'free'])
+        self.assertEqual(expected, b'\x02\x00\x08\x00\x00\x00\x00\x00')
 
     def test_default_setter_refuses_absent_or_null_acls(self):
         for present, acl in [[False, 0xa00], [True, None]]:

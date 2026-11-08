@@ -385,6 +385,8 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(create.call_args.kwargs['environment'], expected)
             self.assertEqual(create.call_args.kwargs['current_directory'],
                              '/work')
+            self.assertEqual(create.call_args.kwargs['object_security'],
+                             'D:P(A;;GA;;;S-1-5-21-1)(A;;GA;;;SY)(A;;GA;;;BA)')
             self.assertEqual(create.call_args.kwargs['inherited_handles'],
                              [40, 41, 130, 131, 132] if stdio is None else [40, 41, 132, *stdio])
             self.assertEqual(create.call_args.kwargs['standard_handles'],
@@ -400,11 +402,17 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_verified_child_is_assigned_before_resume(self):
         events = await self.exercise(True)
+        self.assertLess(events.index('private-default'), events.index('AssignProcessToJobObject'))
         self.assertLess(events.index('AssignProcessToJobObject'), events.index('resume'))
         self.assertNotIn('terminate', events)
 
     async def test_wrong_token_is_terminated_without_resume(self):
         events = await self.exercise(False)
+        self.assertIn('terminate', events)
+        self.assertNotIn('resume', events)
+
+    async def test_private_default_failure_terminates_without_resume(self):
+        events = await self.exercise(True, default_installed=False)
         self.assertIn('terminate', events)
         self.assertNotIn('resume', events)
 
@@ -435,10 +443,11 @@ class LaunchTests(unittest.IsolatedAsyncioTestCase):
 
 class LocalLaunchTests(unittest.TestCase):
     @contextmanager
-    def calls(self, owning, mismatch=False):
-        original, compatible = b'original-acl', b'compatible-acl'
+    def calls(self, owning, mismatch=None):
+        original, compatible, private = b'original-acl', b'compatible-acl', b'private-acl'
         info = api.ProcessInformation(101, 102, 103, 104)
-        seen = {'sets': [], 'closed': []}
+        seen = {'sets': [], 'closed': [], 'job_events': [], 'ui_flags': 0}
+
         role = runtime.state.tool_role_sid('S-1-15-2-1')
         original_sids = [['S-1-5-21-2', 0]]
         filtered_sids = [*original_sids, [role, 7]]
@@ -446,16 +455,16 @@ class LocalLaunchTests(unittest.TestCase):
             'current_process_handle': lambda: 99,
             'open_process_token': mock.Mock(side_effect=[44, 55, 66]),
             'current_user_sid': lambda: 'S-1-5-21-1',
-            'token_is_app_container': lambda token: not (mismatch and token == 66),
-            'token_app_container_sid': lambda token: 'S-1-15-2-1',
+            'token_is_app_container': lambda token: not (mismatch == 'container' and token == 66),
+            'token_app_container_sid': lambda token: 'S-1-15-2-9' if mismatch == 'package' and token == 66 else 'S-1-15-2-1',
             'token_integrity_level': lambda token: 'S-1-16-4096',
             'token_restricting_sids': lambda token: original_sids if owning or token == 44 else filtered_sids,
             'token_logon_sid': lambda token: 'S-1-5-5-0-99',
             'create_write_restricted_token': mock.Mock(return_value=77),
-            'token_default_dacl': lambda token: original if token == 44 or (token == 66 and owning) else compatible,
+            'token_default_dacl': lambda token: original if token == 44 else private if token == 66 and owning else compatible,
             'duplicate_primary_token': lambda *args: 77,
             'acl_sddl': lambda acl: 'D:existing-grants',
-            'set_token_default_dacl': lambda *args: seen['sets'].append(list(args)),
+            'set_token_default_dacl': lambda *args: seen['sets'].append(list(args)) or (private if args[0] == 66 else compatible),
             'close_handle': seen['closed'].append,
             'create_process_suspended': mock.Mock(return_value=info),
             'resume_thread': mock.Mock(),
@@ -493,7 +502,8 @@ class LocalLaunchTests(unittest.TestCase):
                 else:
                     seen['filter'].assert_not_called()
                 self.assertEqual(seen['sets'][0], [77, compatible])
-                self.assertEqual(seen['sets'][1:], [[66, b'original-acl']] if owning else [])
+                private = 'D:P(A;;GA;;;S-1-5-21-1)(A;;GA;;;SY)(A;;GA;;;BA)'
+                self.assertEqual(seen['sets'][1:], [[66, private]] if owning else [])
                 self.assertNotIn(44, [entry[0] for entry in seen['sets']])
                 self.assertCountEqual(seen['closed'], [44, 55, 66, 77])
                 seen['resume'].assert_not_called()
@@ -507,7 +517,7 @@ class LocalLaunchTests(unittest.TestCase):
             self.assertEqual(seen['create'].call_args.kwargs['current_directory'], '/explicit-trusted-directory')
 
     def test_identity_failure_retains_the_suspended_child_for_async_retirement(self):
-        with self.calls(True, mismatch=True) as seen:
+        with self.calls(True, mismatch='package') as seen:
             process = runtime.ContainedProcess(None)
             with self.assertRaises(api.WindowsApiError):
                 runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], [1, 2, 3], owning=True)
