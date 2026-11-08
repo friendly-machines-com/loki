@@ -6,6 +6,7 @@ over pipes with the dummy provider (no network): initialize, session/new
 """
 
 import asyncio
+import io
 import errno
 import json
 import os
@@ -927,12 +928,17 @@ class QuarantineTests(unittest.TestCase):
 class EntrypointTests(unittest.TestCase):
 
     def test_subagent_uses_inherited_worker_authority(self):
-        with mock.patch.object(
+        from loki_agent import runtime_isolation
+
+        order = []
+        with mock.patch.object(runtime_isolation, 'verify_contained_runtime',
+                               side_effect=lambda: order.append('verify')) as verify, \
+                mock.patch.object(
                 acp_main,
                 "capture_process_credentials") as capture, \
                 mock.patch.object(
                     acp_main,
-                    "protect_credential_process") as protect, \
+                    "protect_credential_process", side_effect=lambda: order.append('protect')) as protect, \
                 mock.patch(
                     "loki_agent.subagents.main",
                     return_value=31) as subagent_main, \
@@ -946,6 +952,8 @@ class EntrypointTests(unittest.TestCase):
             status = acp_main.main()
 
         self.assertEqual(status, 31)
+        self.assertEqual(order, ['verify', 'protect'])
+        verify.assert_called_once_with()
         capture.assert_not_called()
         protect.assert_called_once_with()
         subagent_main.assert_called_once_with([
@@ -953,6 +961,25 @@ class EntrypointTests(unittest.TestCase):
             "--session-owner-fd", "7",
             "--credential-capability-fd", "8",
         ])
+
+    def test_subagent_gate_failure_refuses_dispatch_and_root_capture(self):
+        from loki_agent import runtime_isolation, windows_api
+
+        for failure in [runtime_isolation.RuntimeIsolationError('gate refused'),
+                        windows_api.WindowsApiError('native verification failed')]:
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(runtime_isolation, 'verify_contained_runtime', side_effect=failure), \
+                    mock.patch.object(acp_main, 'protect_credential_process') as protect, \
+                    mock.patch.object(acp_main, 'capture_process_credentials') as capture, \
+                    mock.patch.object(acp_main, 'configure_logging') as logging, \
+                    mock.patch('loki_agent.subagents.main', return_value=31) as dispatch, \
+                    mock.patch.object(sys, 'argv', ['loki-acp', '--subagent', 'Explore']), \
+                    mock.patch.object(sys, 'stderr', io.StringIO()):
+                self.assertEqual(acp_main.main(), 2)
+                protect.assert_not_called()
+                capture.assert_not_called()
+                logging.assert_not_called()
+                dispatch.assert_not_called()
 
 
 class WorkerStartupCleanupTests(unittest.IsolatedAsyncioTestCase):

@@ -10,7 +10,10 @@ import asyncio
 import os
 import sys
 
+from . import runtime_isolation
 from .credentials import CredentialStore, capture_process_credentials
+from .runtime_isolation import RuntimeIsolationError
+from .windows_api import WindowsApiError
 from .diagnostics import configure_logging
 from .lifetimes import finish_cleanup
 from .process_protections import (
@@ -71,11 +74,12 @@ def main() -> int:
 
     if sys.argv[1:2] == ["--subagent"]:
         try:
-            # ACP subagents inherit the worker's already-covered mount
-            # namespace. Re-unsharing would add a namespace level for no
-            # security gain and can hit kernel nesting or policy limits.
+            # Process hardening alone does not prove AppContainer containment.
+            # The central re-check is a POSIX no-op: Linux inherits the worker's
+            # credential cover and must not create another namespace level.
+            runtime_isolation.verify_contained_runtime()
             protect_credential_process()
-        except ProcessProtectionError as error:
+        except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError) as error:
             print(
                 f"Security initialization error: {error}",
                 file=sys.stderr,

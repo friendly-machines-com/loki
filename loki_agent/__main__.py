@@ -81,11 +81,10 @@ def main() -> int:
 
     if sys.argv[1:2] == ["--subagent"]:
         try:
-            # A subagent can only be delegated by the already-isolated
-            # terminal runtime, so it inherits the credential cover mount.
-            # Re-unsharing would add a namespace level for no security gain,
-            # can hit nesting/policy limits, and would undermine the simple
-            # invariant that only the first runtime establishes this view.
+            # A subagent is delegated by the terminal runtime. On Linux it
+            # inherits that runtime's credential cover; re-unsharing would
+            # add a namespace level for no security gain and can hit nesting
+            # or policy limits. Only the first Linux runtime installs the cover.
             runtime_isolation.verify_contained_runtime()
             protect_credential_process()
         except (ProcessProtectionError, RuntimeIsolationError, WindowsApiError) as error:
