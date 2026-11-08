@@ -166,7 +166,9 @@ try {
         $gate = Join-Path $root 'loki_agent'
         New-Item -ItemType Directory -Path $gate | Out-Null
         foreach ($module in @('__init__.py', 'windows_api.py', 'windows_acl.py',
-                              'paths.py', 'windows_state.py',
+                              'paths.py', 'windows_state.py', 'private_files.py',
+                              '_private_files_posix.py', '_private_files_windows.py',
+                              'credential_errors.py', 'file_facts.py',
                               'windows_verify.py', 'process_protections.py', 'host_ipc.py',
                               'handle_reader.py', 'lifetimes.py', 'streams.py')) {
             $copy = Join-Path $gate $module
