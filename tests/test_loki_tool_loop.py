@@ -112,6 +112,100 @@ class ScriptedInputSession:
         raise AssertionError(f"unexpected real modal prompt: {prompt!r}")
 
 
+class TerminalBangFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def _bang_with_failed_inference(self, *, context_exhausted):
+        from test_http_client import FakeConnector
+
+        # ERROR records this native Responses failure. Decode the server event;
+        # replacing the turn runner would miss output lost on its error path.
+        message = ('Your input exceeds the context window of this model. '
+                   'Please adjust your input and try again.')
+        body = ('event: response.failed\ndata: ' + json.dumps({
+            'type': 'response.failed', 'response': {
+                'id': 'bang-failed', 'status': 'failed', 'output': [],
+                'error': {'code': 'context_length_exceeded', 'message': message},
+            }}) + '\n\n').encode()
+        connector = FakeConnector([
+            b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n'
+            + f'Content-Length: {len(body)}\r\n\r\n'.encode() + body])
+        async with contextlib.AsyncExitStack() as resources:
+            root = resources.enter_context(tempfile.TemporaryDirectory())
+            state = resources.enter_context(tempfile.TemporaryDirectory())
+            resources.enter_context(isolated_response_headers())
+            session = loki.current_session()
+            session.shell_cwd = root
+            with tempfile.NamedTemporaryFile(dir=root, delete=False) as witness:
+                witness_path = witness.name
+            with tempfile.NamedTemporaryFile(dir=root, delete=False) as log:
+                log_path = log.name
+            command = shlex.join([sys.executable, '-c',
+                                  "import sys\n"
+                                  "with open(sys.argv[1], 'ab') as target:\n"
+                                  "    target.write(b'executed\\n')\n"
+                                  "print('BANG_LOCAL_STDOUT')\n"
+                                  "print('BANG_LOCAL_STDERR', file=sys.stderr)\n",
+                                  witness_path])
+            stdout, stderr = io.StringIO(), io.StringIO()
+            attempts = []
+            original_connect = asyncio.open_connection
+
+            async def connect(*args, **kwargs):
+                if 'sock' in kwargs:
+                    return await original_connect(*args, **kwargs)
+                attempts.append(args)
+                self.assertEqual(args[0], 'provider.example.test')
+                # Both execution and display must precede even the attempt to
+                # contact the model, not merely survive successful inference.
+                with open(witness_path, 'rb') as result:
+                    self.assertEqual(result.read(), b'executed\n')
+                self.assertIn('[stdout]\nBANG_LOCAL_STDOUT', stdout.getvalue())
+                self.assertIn('[stderr]\nBANG_LOCAL_STDERR', stdout.getvalue())
+                if not context_exhausted:
+                    raise socket.gaierror(socket.EAI_AGAIN, 'Temporary failure in name resolution')
+                return await connector.open_connection(*args, **kwargs)
+
+            resources.enter_context(mock.patch.object(loki, 'LOKI_JOB_STATE_DIR', state))
+            resources.enter_context(mock.patch.object(loki, 'CREDENTIALS', CredentialStore({
+                'LOKI_API_BASE': 'https://provider.example.test/v1/responses',
+                'LOKI_PROVIDER': protocols.OPENAI_RESPONSES,
+                'LOKI_MODEL': 'bang-model', 'LOKI_STREAM': '1'})))
+            resources.enter_context(mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()))
+            resources.enter_context(mock.patch.object(asyncio, 'open_connection', side_effect=connect))
+            resources.enter_context(mock.patch.object(terminal_frontend, 'input_session',
+                                                      return_value=ScriptedInputSession(['!' + command, None])))
+            resources.enter_context(mock.patch.object(terminal_frontend, 'new_chat_log_path', return_value=log_path))
+            resources.enter_context(mock.patch.object(terminal_frontend, 'restore_output_area_after_input'))
+            resources.enter_context(contextlib.redirect_stdout(stdout))
+            resources.enter_context(contextlib.redirect_stderr(stderr))
+            resources.push_async_callback(session.close_state)
+            await terminal_frontend.async_main([], settings.Settings())
+            self.assertTrue(attempts)
+            with open(witness_path, 'rb') as result:
+                self.assertEqual(result.read(), b'executed\n')
+            self.assertIn('[stdout]\nBANG_LOCAL_STDOUT', stdout.getvalue())
+            self.assertIn('[stderr]\nBANG_LOCAL_STDERR', stdout.getvalue())
+            diagnostics = stdout.getvalue() + stderr.getvalue()
+            self.assertIn('context_length_exceeded' if context_exhausted
+                          else 'Temporary failure in name resolution', diagnostics)
+            if context_exhausted:
+                self.assertIn(message, diagnostics)
+                request = json.loads(bytes(connector.writers[0].data).partition(b'\r\n\r\n')[2])
+                user, = [part['text'] for item in request['input'] if item.get('role') == 'user'
+                         for part in item['content']]
+                self.assertIn(f'I ran the local command `{command}`.', user)
+                self.assertIn('[stdout]\nBANG_LOCAL_STDOUT', user)
+                self.assertIn('[stderr]\nBANG_LOCAL_STDERR', user)
+            for writer in connector.writers:
+                self.assertTrue(writer.closed)
+                self.assertTrue(writer.wait_closed_called)
+
+    async def test_bang_executes_and_displays_output_when_context_is_exhausted(self):
+        await self._bang_with_failed_inference(context_exhausted=True)
+
+    async def test_bang_executes_and_displays_output_when_network_is_unavailable(self):
+        await self._bang_with_failed_inference(context_exhausted=False)
+
+
 # A fresh fixture-owned Session replaces field-by-field snapshot/restore.
 # CREDENTIALS is a separate module global; tests that assign it retain its own
 # patch. Live jobs still need their manager/Runner cleanup before Store release.

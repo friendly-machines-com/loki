@@ -3751,8 +3751,9 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
             stack.push_async_callback(session.close_state)
             stack.enter_context(mock.patch.object(loki, "_DEFAULT_SESSION", session))
             stack.enter_context(mock.patch.object(loki, "CREDENTIALS", CredentialStore({})))
-            stack.enter_context(mock.patch.object(loki, "current_model", return_value="model"))
-            stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
+            if completion is not None:
+                stack.enter_context(mock.patch.object(loki, "current_model", return_value="model"))
+                stack.enter_context(mock.patch.object(loki, "async_chat_completion", new=completion))
             stack.enter_context(mock.patch.object(loki, "LOKI_JOB_STATE_DIR", os.path.join(state_root, "jobs")))
             # The process seam owns byte transport, not an OS process.
             stack.enter_context(mock.patch.object(
@@ -4236,6 +4237,92 @@ class WorkerPromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         release.set()
                         owners = [active] if close is None else [active, close]
                         await asyncio.gather(*owners, return_exceptions=True)
+
+    async def _bang_with_failed_inference(self, *, context_exhausted):
+        import socket
+        from test_http_client import FakeConnector
+        from loki_agent import http_client, loki, tool_runtime
+
+        # Match ERROR's server-side Responses error through real HTTP/SSE
+        # decoding; the normal model and tool loop must not be stubbed out.
+        message = ('Your input exceeds the context window of this model. '
+                   'Please adjust your input and try again.')
+        body = ('event: response.failed\ndata: ' + json.dumps({
+            'type': 'response.failed', 'response': {
+                'id': 'bang-failed', 'status': 'failed', 'output': [],
+                'error': {'code': 'context_length_exceeded', 'message': message},
+            }}) + '\n\n').encode()
+        connector = FakeConnector([
+            b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n'
+            + f'Content-Length: {len(body)}\r\n\r\n'.encode() + body])
+        with tempfile.TemporaryDirectory() as root:
+            with tempfile.NamedTemporaryFile(dir=root, delete=False) as witness:
+                witness_path = witness.name
+            command = shlex.join([sys.executable, '-c',
+                                  "import sys\n"
+                                  "with open(sys.argv[1], 'ab') as target:\n"
+                                  "    target.write(b'executed\\n')\n"
+                                  "print('BANG_LOCAL_STDOUT')\n"
+                                  "print('BANG_LOCAL_STDERR', file=sys.stderr)\n",
+                                  witness_path])
+            messages, attempts = [], []
+            async with self._channel(root, messages, None) as channel:
+                loki.apply_runtime_config(connections.make_runtime_config(
+                    'https://provider.example.test/v1/responses', protocols.OPENAI_RESPONSES,
+                    model='bang-model', stream=True))
+                worker = channel.process.worker
+                emitted = mock.Mock(wraps=worker.write)
+                original_connect = asyncio.open_connection
+
+                def text(updates):
+                    return ''.join(update['content']['text'] for update in _tool_updates(updates, 'prompt-owner')
+                                   if update['sessionUpdate'] == 'agent_message_chunk')
+
+                async def connect(*args, **kwargs):
+                    if 'sock' in kwargs:
+                        return await original_connect(*args, **kwargs)
+                    attempts.append(args)
+                    self.assertEqual(args[0], 'provider.example.test')
+                    with open(witness_path, 'rb') as result:
+                        self.assertEqual(result.read(), b'executed\n')
+                    # Publication must precede inference. The separate channel
+                    # reader may legitimately forward these bytes on its next step.
+                    published = text([call.args[0] for call in emitted.call_args_list])
+                    self.assertIn('[stdout]\nBANG_LOCAL_STDOUT', published)
+                    self.assertIn('[stderr]\nBANG_LOCAL_STDERR', published)
+                    if not context_exhausted:
+                        raise socket.gaierror(socket.EAI_AGAIN, 'Temporary failure in name resolution')
+                    return await connector.open_connection(*args, **kwargs)
+
+                with mock.patch.object(worker, 'write', new=emitted), \
+                        mock.patch.object(http_client.asyncio, 'open_connection', side_effect=connect), \
+                        mock.patch.object(loki, 'TOOL_HOOK_PIPELINE', tool_runtime.ToolHookPipeline()):
+                    with self.assertRaises(acps.TransportError) as failed:
+                        await channel.request('session/prompt', self._params('!' + command))
+                self.assertTrue(attempts)
+                with open(witness_path, 'rb') as result:
+                    self.assertEqual(result.read(), b'executed\n')
+                self.assertIn('[stdout]\nBANG_LOCAL_STDOUT', text(messages))
+                self.assertIn('[stderr]\nBANG_LOCAL_STDERR', text(messages))
+                self.assertIn('context_length_exceeded' if context_exhausted
+                              else 'Temporary failure in name resolution', str(failed.exception))
+                if context_exhausted:
+                    self.assertIn(message, str(failed.exception))
+                    request = json.loads(bytes(connector.writers[0].data).partition(b'\r\n\r\n')[2])
+                    user, = [part['text'] for item in request['input'] if item.get('role') == 'user'
+                             for part in item['content']]
+                    self.assertIn(f'I ran the local command `{command}`.', user)
+                    self.assertIn('[stdout]\nBANG_LOCAL_STDOUT', user)
+                    self.assertIn('[stderr]\nBANG_LOCAL_STDERR', user)
+                for writer in connector.writers:
+                    self.assertTrue(writer.closed)
+                    self.assertTrue(writer.wait_closed_called)
+
+    async def test_bang_executes_and_displays_output_when_context_is_exhausted(self):
+        await self._bang_with_failed_inference(context_exhausted=True)
+
+    async def test_bang_executes_and_displays_output_when_network_is_unavailable(self):
+        await self._bang_with_failed_inference(context_exhausted=False)
 
     async def test_bang_cancellation_reaps_command_without_requesting_inference(self):
         import shlex
