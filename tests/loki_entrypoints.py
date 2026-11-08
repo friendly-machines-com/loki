@@ -103,11 +103,18 @@ def _powershell_sddl(path: str) -> str:
     second opinion, because a single reader that mis-parses would otherwise be
     its own evidence for what the label says.
     """
+    # Windows environment names are case-insensitive; dict(os.environ) uses
+    # uppercase keys on win32. Drop only this diagnostic's foreign module path.
+    environment = {name: value for name, value in os.environ.items()
+                   if name.upper() != 'PSMODULEPATH'}
+    # Encode a PowerShell literal, not a different filesystem operand: a quote
+    # in an actual filename must not become executable diagnostic source.
+    quoted = path.replace("'", "''")
     try:
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-             f"(Get-Acl -LiteralPath '{path}').Sddl"],
-            capture_output=True, text=True, timeout=60)
+             f"(Get-Acl -LiteralPath '{quoted}').Sddl"],
+            env=environment, capture_output=True, text=True)
     except OSError as error:
         return f"<{type(error).__name__}: {error}>"
     if result.returncode != 0:

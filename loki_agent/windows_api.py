@@ -1279,8 +1279,8 @@ def pseudoconsole_release(hpc) -> None:
 
 
 WAIT_OBJECT_0 = 0
-WAIT_TIMEOUT = 258
 WAIT_ABANDONED = 0x80
+WAIT_TIMEOUT = 258
 INFINITE = 0xffffffff
 
 
@@ -1812,6 +1812,119 @@ def by_handle_file_information(handle):
     return information
 
 
+class ConsoleInputRecord(ctypes.Structure):
+    # INPUT_RECORD: aligned native storage; keyboard/VT translation stays in
+    # ReadFile rather than being reimplemented from the opaque event payload.
+    _fields_ = [('event_type', ctypes.c_uint16), ('event_data', ctypes.c_uint32 * 4)]
+
+
+KEY_EVENT = 0x0001
+
+
+def discard_console_notification(handle):
+    """Consume one non-key notification on the caller's borrowed input stream."""
+    mode = wintypes.DWORD()
+    query = bind('kernel32', 'GetConsoleMode', wintypes.BOOL,
+                 ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
+    if not query(handle, ctypes.byref(mode)):
+        return False  # Ordinary synchronous files keep their existing byte path.
+    record, count = ConsoleInputRecord(), wintypes.DWORD()
+    peek = bind('kernel32', 'PeekConsoleInputW', wintypes.BOOL,
+                ctypes.c_void_p, ctypes.POINTER(ConsoleInputRecord), wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD))
+    if not peek(handle, ctypes.byref(record), 1, ctypes.byref(count)):
+        raise WindowsApiError('Could not inspect console input', status=ctypes.get_last_error())
+    if not count.value or record.event_type == KEY_EVENT:
+        return False
+    consume = bind('kernel32', 'ReadConsoleInputW', wintypes.BOOL,
+                   ctypes.c_void_p, ctypes.POINTER(ConsoleInputRecord), wintypes.DWORD,
+                   ctypes.POINTER(wintypes.DWORD))
+    if not consume(handle, ctypes.byref(record), 1, ctypes.byref(count)):
+        raise WindowsApiError('Could not consume console notification', status=ctypes.get_last_error())
+    return True
+
+
+def read_file(handle, size):
+    """Read up to ``size`` bytes; returns what was read (may be short)."""
+    read = bind("kernel32", "ReadFile", wintypes.BOOL, ctypes.c_void_p,
+                ctypes.c_void_p, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
+    buffer = ctypes.create_string_buffer(size)
+    count = wintypes.DWORD()
+    if not read(handle, ctypes.cast(buffer, ctypes.c_void_p), size,
+                ctypes.byref(count), None):
+        raise WindowsApiError("ReadFile failed", status=ctypes.get_last_error())
+    return buffer.raw[:count.value]
+
+
+def write_file(handle, data):
+    """Write ``data``; returns the number of bytes written."""
+    write = bind("kernel32", "WriteFile", wintypes.BOOL, ctypes.c_void_p,
+                 ctypes.c_void_p, wintypes.DWORD,
+                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
+    payload = bytes(data)
+    buffer = ctypes.create_string_buffer(payload)
+    count = wintypes.DWORD()
+    if not write(handle, ctypes.cast(buffer, ctypes.c_void_p), len(payload),
+                 ctypes.byref(count), None):
+        raise WindowsApiError("WriteFile failed", status=ctypes.get_last_error())
+    return count.value
+
+
+def set_file_pointer(handle, offset, whence) -> int:
+    """Move a synchronous file handle's pointer; returns the new position.
+
+    ``whence`` uses the portable ``os.SEEK_*`` numbering, which matches the
+    Win32 FILE_BEGIN/FILE_CURRENT/FILE_END values.
+    """
+    move = bind("kernel32", "SetFilePointerEx", wintypes.BOOL, ctypes.c_void_p,
+                ctypes.c_int64, ctypes.POINTER(ctypes.c_int64), wintypes.DWORD)
+    position = ctypes.c_int64()
+    if not move(handle, ctypes.c_int64(offset), ctypes.byref(position), whence):
+        raise WindowsApiError("SetFilePointerEx failed",
+                              status=ctypes.get_last_error())
+    return position.value
+
+
+def flush_file(handle) -> None:
+    """Flush a file handle's buffered data to the volume."""
+    flush = bind("kernel32", "FlushFileBuffers", wintypes.BOOL,
+                 ctypes.c_void_p)
+    if not flush(handle):
+        raise WindowsApiError("FlushFileBuffers failed",
+                              status=ctypes.get_last_error())
+
+
+# -- range locks ---------------------------------------------------------
+# ``LockFileEx`` is the Windows equivalent of ``flock``: an advisory lock on a
+# byte range of an open handle.  It locks from the OVERLAPPED offset, so the
+# one-byte range at zero has to be stated explicitly.  Contention is reported
+# as ERROR_LOCK_VIOLATION, not as a blocking wait.
+
+# LOCKFILE_* (winnt.h): how LockFileEx is to behave while another holds a range.
+class LockFlags(enum.IntFlag):
+    LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+    LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+
+
+ERROR_LOCK_VIOLATION = 33
+
+
+class Overlapped(ctypes.Structure):
+    """One native overlapped operation, including its byte offset/event slot."""
+
+    # Fixed-width ``c_uint32`` for the offset fields: ``wintypes.DWORD`` is
+    # ``c_ulong`` (8 bytes on LP64) and would give this the wrong layout.
+    _fields_ = [("Internal", ctypes.c_size_t),
+                ("InternalHigh", ctypes.c_size_t),
+                ("Offset", ctypes.c_uint32),
+                ("OffsetHigh", ctypes.c_uint32),
+                ("hEvent", ctypes.c_void_p)]
+
+
+PIPE_CLOSED_ERRORS = frozenset([109, 232, 233])  # broken/closing/disconnected byte pipe
+
+
 async def _pipe_io(handle, buffer, size, operation):
     """Retain one exact I/O record and buffer through kernel completion.
 
@@ -1893,119 +2006,6 @@ async def write_pipe(handle, data):
         if not count:
             raise WindowsApiError('WriteFile made no progress')
         offset += count
-
-
-PIPE_CLOSED_ERRORS = frozenset([109, 232, 233])  # broken/closing/disconnected byte pipe
-
-
-def read_file(handle, size):
-    """Read up to ``size`` bytes; returns what was read (may be short)."""
-    read = bind("kernel32", "ReadFile", wintypes.BOOL, ctypes.c_void_p,
-                ctypes.c_void_p, wintypes.DWORD,
-                ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
-    buffer = ctypes.create_string_buffer(size)
-    count = wintypes.DWORD()
-    if not read(handle, ctypes.cast(buffer, ctypes.c_void_p), size,
-                ctypes.byref(count), None):
-        raise WindowsApiError("ReadFile failed", status=ctypes.get_last_error())
-    return buffer.raw[:count.value]
-
-
-def write_file(handle, data):
-    """Write ``data``; returns the number of bytes written."""
-    write = bind("kernel32", "WriteFile", wintypes.BOOL, ctypes.c_void_p,
-                 ctypes.c_void_p, wintypes.DWORD,
-                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
-    payload = bytes(data)
-    buffer = ctypes.create_string_buffer(payload)
-    count = wintypes.DWORD()
-    if not write(handle, ctypes.cast(buffer, ctypes.c_void_p), len(payload),
-                 ctypes.byref(count), None):
-        raise WindowsApiError("WriteFile failed", status=ctypes.get_last_error())
-    return count.value
-
-
-def set_file_pointer(handle, offset, whence) -> int:
-    """Move a synchronous file handle's pointer; returns the new position.
-
-    ``whence`` uses the portable ``os.SEEK_*`` numbering, which matches the
-    Win32 FILE_BEGIN/FILE_CURRENT/FILE_END values.
-    """
-    move = bind("kernel32", "SetFilePointerEx", wintypes.BOOL, ctypes.c_void_p,
-                ctypes.c_int64, ctypes.POINTER(ctypes.c_int64), wintypes.DWORD)
-    position = ctypes.c_int64()
-    if not move(handle, ctypes.c_int64(offset), ctypes.byref(position), whence):
-        raise WindowsApiError("SetFilePointerEx failed",
-                              status=ctypes.get_last_error())
-    return position.value
-
-
-def flush_file(handle) -> None:
-    """Flush a file handle's buffered data to the volume."""
-    flush = bind("kernel32", "FlushFileBuffers", wintypes.BOOL,
-                 ctypes.c_void_p)
-    if not flush(handle):
-        raise WindowsApiError("FlushFileBuffers failed",
-                              status=ctypes.get_last_error())
-
-
-# -- range locks ---------------------------------------------------------
-# ``LockFileEx`` is the Windows equivalent of ``flock``: an advisory lock on a
-# byte range of an open handle.  It locks from the OVERLAPPED offset, so the
-# one-byte range at zero has to be stated explicitly.  Contention is reported
-# as ERROR_LOCK_VIOLATION, not as a blocking wait.
-
-# LOCKFILE_* (winnt.h): how LockFileEx is to behave while another holds a range.
-class LockFlags(enum.IntFlag):
-    LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
-    LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
-
-
-ERROR_LOCK_VIOLATION = 33
-
-
-class ConsoleInputRecord(ctypes.Structure):
-    # INPUT_RECORD: aligned native storage; keyboard/VT translation stays in
-    # ReadFile rather than being reimplemented from the opaque event payload.
-    _fields_ = [('event_type', ctypes.c_uint16), ('event_data', ctypes.c_uint32 * 4)]
-
-
-def discard_console_notification(handle):
-    """Consume one non-key notification on the caller's borrowed input stream."""
-    mode = wintypes.DWORD()
-    query = bind('kernel32', 'GetConsoleMode', wintypes.BOOL,
-                 ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
-    if not query(handle, ctypes.byref(mode)):
-        return False  # Ordinary synchronous files keep their existing byte path.
-    record, count = ConsoleInputRecord(), wintypes.DWORD()
-    peek = bind('kernel32', 'PeekConsoleInputW', wintypes.BOOL,
-                ctypes.c_void_p, ctypes.POINTER(ConsoleInputRecord), wintypes.DWORD,
-                ctypes.POINTER(wintypes.DWORD))
-    if not peek(handle, ctypes.byref(record), 1, ctypes.byref(count)):
-        raise WindowsApiError('Could not inspect console input', status=ctypes.get_last_error())
-    if not count.value or record.event_type == KEY_EVENT:
-        return False
-    consume = bind('kernel32', 'ReadConsoleInputW', wintypes.BOOL,
-                   ctypes.c_void_p, ctypes.POINTER(ConsoleInputRecord), wintypes.DWORD,
-                   ctypes.POINTER(wintypes.DWORD))
-    if not consume(handle, ctypes.byref(record), 1, ctypes.byref(count)):
-        raise WindowsApiError('Could not consume console notification', status=ctypes.get_last_error())
-    return True
-
-
-KEY_EVENT = 0x0001
-
-
-class Overlapped(ctypes.Structure):
-    """One native overlapped operation, including its byte offset/event slot."""
-
-    # Fixed-width ``c_uint32`` for the offset fields: ``wintypes.DWORD`` is
-    # ``c_ulong`` (8 bytes on LP64) and would give this the wrong layout.
-    _fields_ = [("Internal", ctypes.c_size_t),
-                ("InternalHigh", ctypes.c_size_t),
-                ("Offset", ctypes.c_uint32),
-                ("OffsetHigh", ctypes.c_uint32),
-                ("hEvent", ctypes.c_void_p)]
 
 
 def lock_file(handle, flags) -> None:

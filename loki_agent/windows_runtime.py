@@ -19,8 +19,8 @@ from ctypes import wintypes
 from . import windows_api as api
 from . import windows_state as state
 from . import windows_verify, process_protections
-from .lifetimes import finish_cleanup
 from .runtime_isolations import RuntimeIsolationError
+from .lifetimes import finish_cleanup
 
 WORKSPACE_ENV = "LOKI_CONTAINER_WORKSPACE"
 # The package SID the launcher verified the child's token against, for the
@@ -184,89 +184,6 @@ def report_runtime_access(workspace, directory, error):
     except Exception as problem:  # noqa: BLE001 - recording only
         report["integrity"] = f"<{type(problem).__name__}: {problem}>"
     print(json.dumps(report), file=sys.stderr, flush=True)
-
-
-def report_write_failure(operation, path, error, traceback_text=None):
-    # The error text names a path, not the call that used it.
-    if traceback_text:
-        print(traceback_text, file=sys.stderr, flush=True)
-    """Report a refused write from inside the container, beside the paths.
-
-    A refusal is the one moment the descriptor, this process's integrity level
-    and the failing call are visible together.  The descriptor is objective,
-    but whether this process can read it and what it is granted are not, so the
-    report records the exception's own winerror and path, the descriptors it
-    could read, its integrity level, and whether a fresh child of that parent
-    can be created at all -- which separates "this parent refuses creation"
-    from "something else about this call was refused".
-    """
-    import json
-
-    report = {
-        "runtime-access": operation,
-        "path": path,
-        "winerror": getattr(error, "winerror", None),
-        "errno": getattr(error, "errno", None),
-        "error": f"{type(error).__name__}: {error}",
-    }
-    parent = os.path.dirname(path or "")
-    for name, candidate in (("target", path), ("parent", parent),
-                            ("grandparent", os.path.dirname(parent))):
-        if candidate is None:
-            continue
-        entry = {"path": candidate, "exists": os.path.exists(candidate)}
-        for key, call in (("dacl", api.dacl_sddl), ("label", api.label_sddl)):
-            try:
-                entry[key] = call(candidate)
-            except Exception as problem:  # noqa: BLE001 - recording only
-                entry[key] = f"<{type(problem).__name__}: {problem}>"
-        report[name] = entry
-    report["can_create_child"] = _try_create_child(parent)
-    if path:
-        # The directory the runtime must create inside is the one whose label
-        # differs from the workspace's, so ask about it separately.
-        report["can_create_child_in_target"] = _try_create_child(path)
-        report["makedirs_child"] = _attempt(lambda: os.makedirs(
-            os.path.join(path, "chats"), exist_ok=True))
-        report["stat"] = _attempt(lambda: os.stat(path))
-        report["isdir"] = os.path.isdir(path)
-        report["mkdir"] = _attempt(lambda: os.mkdir(path))
-        report["makedirs_exist_ok"] = _attempt(
-            lambda: os.makedirs(path, exist_ok=True))
-    try:
-        token = api.open_process_token(api.current_process_handle())
-        try:
-            report["integrity"] = api.token_integrity_level(token)
-        finally:
-            api.close_handle(token)
-    except Exception as problem:  # noqa: BLE001 - recording only
-        report["integrity"] = f"<{type(problem).__name__}: {problem}>"
-    print(json.dumps(report), file=sys.stderr, flush=True)
-
-
-def _attempt(operation):
-    """Run ``operation`` and describe the outcome, for the failure report."""
-    try:
-        operation()
-    except OSError as error:
-        return f"{type(error).__name__}: {error}"
-    return "ok"
-
-
-def _try_create_child(parent):
-    """Whether this process can create a fresh child of ``parent`` right now."""
-    if not parent or not os.path.isdir(parent):
-        return "no-parent"
-    probe = os.path.join(parent, f"loki-write-probe-{os.getpid()}")
-    try:
-        os.mkdir(probe)
-    except OSError as error:
-        return f"refused: {type(error).__name__}: {error}"
-    try:
-        os.rmdir(probe)
-    except OSError:
-        pass
-    return "created"
 
 
 def ensure_runtime_temp():
@@ -467,6 +384,9 @@ def _prepare_local_job(process, *, restrict_ui):
         # the child directly: terminating an empty, unassigned job cannot do it.
         process.job = job
         cleanup.pop_all()
+        # Do not set KILL_ON_JOB_CLOSE here. The outer runtime job already owns
+        # root shutdown; closing a completed leader's transport must not kill its
+        # otherwise-live ordinary descendants. Their inherited UI limits remain.
 
 
 def prepare_local(process, command, environment, current_directory, handles, standard_handles, *,

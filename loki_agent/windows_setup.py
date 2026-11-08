@@ -24,7 +24,8 @@ What the split does *not* do:
   accidental and indirect calls; it does not remove the capability.
 
 The shared data, rules and read-only verification live in ``windows_state`` and
-``windows_verify``; the OS mutation lives in ``windows_containers``.
+``windows_verify``. Setup uses shared ``windows_api`` handle primitives;
+``windows_containers`` supplies profile lifecycle and setup's pathname ACL edits.
 
 Nothing security-relevant crosses the process boundary: the editor writes the
 ledger and exits, and the caller re-derives the package SID and re-verifies

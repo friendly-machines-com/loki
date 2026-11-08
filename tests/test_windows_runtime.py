@@ -29,6 +29,24 @@ def setUpModule():
     unittest.enterModuleContext(directory_identity_patch())
 
 
+class NativeDiagnosticTests(unittest.TestCase):
+    def test_independent_acl_diagnostic_uses_native_modules_and_literal_filenames(self):
+        from loki_entrypoints import _powershell_sddl
+        result = types.SimpleNamespace(returncode=0, stdout='D:PAI\n', stderr='')
+        path = r"C:\users\O'Hara\project"
+        caller_environment = {'SystemRoot': r'C:\Windows', 'PSModulePath': r'C:\PowerShell7\Modules'}
+        with mock.patch.dict(os.environ, caller_environment, clear=True), \
+                mock.patch('loki_entrypoints.subprocess.run', return_value=result) as run:
+            self.assertEqual(_powershell_sddl(path), 'D:PAI')
+        self.assertEqual(run.call_args.args[0][-1],
+                         "(Get-Acl -LiteralPath 'C:\\users\\O''Hara\\project').Sddl")
+        environment = run.call_args.kwargs['env']
+        self.assertNotIn('PSMODULEPATH', [name.upper() for name in environment])
+        self.assertEqual([value for name, value in environment.items() if name.upper() == 'SYSTEMROOT'],
+                         [r'C:\Windows'])
+        self.assertNotIn('timeout', run.call_args.kwargs)
+
+
 class GateTests(unittest.TestCase):
     def test_empty_or_unfinished_checks_refuse(self):
         for checks in [[], [Check('probe', 'untested')], [Check('probe', 'fail')]]:
