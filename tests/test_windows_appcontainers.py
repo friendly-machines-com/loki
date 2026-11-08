@@ -519,8 +519,9 @@ class AppContainers(NativeCalls):
                 if process.process:
                     if self.wait(process.process, 0) == 258:
                         self.check(self.terminate(process.process, 1))
-                        if self.wait(process.process, 10000) != 0:
-                            raise TimeoutError('AppContainer process did not exit')
+                        state = self.wait(process.process, 0xffffffff)
+                        if state != 0:
+                            raise RuntimeError('AppContainer exit observation failed: 0x%x' % state)
             finally:
                 # Closing the job kills associated descendants even if the root
                 # has already exited. This is not proof against broker escapes.
@@ -895,17 +896,19 @@ class StateTokenProbe:
         native = self.n
         arguments = [sys.executable, '-I', '-u', __file__,
                      '--state-access', str(manifest_path), role]
+        if suspended_only:
+            # Publish this non-executing control only after native cleanup.
+            # PyPy misreports cleanup errors on conditional returns inside "with".
+            with self.created_process(token, arguments, Path(manifest_path).parent, streams, role) as info:
+                if info['created']:
+                    result = {key: info[key] for key in ['created', 'winerror', 'kernel_token', 'in_job']}
+                else:
+                    error = info['exception']
+                    result = {'created': False, 'winerror': getattr(error, 'winerror', None), 'error': str(error)}
+            return result
         with self.created_process(token, arguments, Path(manifest_path).parent, streams, role) as info:
             if not info['created']:
-                error = info['exception']
-                if not suspended_only:
-                    raise error
-                return {'created': False, 'winerror': getattr(error, 'winerror', None),
-                        'error': str(error)}
-            if suspended_only:
-                # This control is inspected and retired without running code;
-                # unlike the owning scenario, the ordinary broker may lack a job.
-                return {key: info[key] for key in ['created', 'winerror', 'kernel_token', 'in_job']}
+                raise info['exception']
             child = info['process']
             snapshot = info['kernel_token']
             if not info['in_job']:
@@ -1271,6 +1274,7 @@ def cleanup_tree(directory, depth):
     witness cannot open the NUL device (native errno 13 at cea20fa), so the
     devnull constant is not an option inside the sandbox.
     """
+    child = None
     if depth < 2:
         child_stdin = open(directory / ('stdio-%d.in' % depth), 'wb')
         child_stdin.close()
@@ -1279,20 +1283,23 @@ def cleanup_tree(directory, depth):
                 open(directory / ('stdio-%d.in' % depth), 'rb'))
             stdout = files.enter_context(
                 open(directory / ('stdio-%d.out' % depth), 'wb'))
-            subprocess.Popen([sys.executable, '-I', '-u', __file__,
-                              '--cleanup-tree', str(directory), str(depth + 1)],
-                             close_fds=True, stdin=stdin, stdout=stdout,
-                             stderr=subprocess.STDOUT)
+            child = subprocess.Popen([sys.executable, '-I', '-u', __file__,
+                                      '--cleanup-tree', str(directory), str(depth + 1)],
+                                     close_fds=True, stdin=stdin, stdout=stdout,
+                                     stderr=subprocess.STDOUT)
     report = directory / ('ready-%d' % depth)
     temporary = report.with_suffix('.tmp')
     temporary.write_text(str(os.getpid()))
     os.replace(temporary, report)
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
+    # Only root release or the controller's actual Job Object retirement may
+    # finish this fixture. Forward a failed descendant instead of waiting on a
+    # readiness file its producer can no longer publish.
+    while True:
         if depth == 0 and (directory / 'release').exists():
             return
+        if child is not None and child.poll() is not None:
+            raise RuntimeError('cleanup descendant exited before root release: %s' % child.returncode)
         time.sleep(0.02)
-    raise TimeoutError('cleanup witness exceeded its safety deadline')
 
 
 def broker_death(directory, package, report):
@@ -1307,65 +1314,81 @@ def broker_death(directory, package, report):
     native.check(api.parse_sid(package, C.byref(sid)))
     try:
         def observe(root_process, job):
-            deadline = time.monotonic() + 20
             reports = [directory / ('ready-%d' % i) for i in range(3)]
             while not all(path.exists() for path in reports):
                 if native.wait(root_process, 0) != 258:
                     raise RuntimeError('broker-death root exited before readiness')
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('broker-death tree readiness timed out')
                 time.sleep(0.02)
             payload = {'broker_pid': os.getpid(),
                        'tree_pids': [int(path.read_text()) for path in reports]}
             temporary = report.with_suffix('.tmp')
             temporary.write_text(json.dumps(payload))
             os.replace(temporary, report)
-            # Stay alive holding the job until the parent kills this broker.
-            deadline = time.monotonic() + 60
-            while not (directory / 'release').exists():
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('broker-death witness exceeded deadline')
-                time.sleep(0.05)
+            # The normal test kills this broker without running cleanup. EOF
+            # is solely the failing/dead controller's backstop: unwind launch
+            # ownership immediately so its retained job closes, not after a
+            # second execution/readiness budget.
+            sys.stdin.buffer.read()
+            raise RuntimeError('broker-death controller ended before termination')
         native.launch([sys.executable, '-I', '-u', __file__, '--cleanup-tree',
                        str(directory), '0'], sid, directory,
-                      directory / 'broker-death.log', observe=observe)
+                      directory / 'broker-death.log', observe=observe, deadline=float('inf'))
     finally:
         native.free_sid(sid)
 
 
 def race_tree(directory, depth):
-    """Spawn bounded short-lived children continuously until stopped.
+    """Publish stable live identities while creation races owned job retirement.
 
-    Every child appends its own pid to the shared track file and then sleeps,
-    so the parent can enumerate the exact set of processes that existed while
-    shutdown raced creation. Child stdio uses workspace files (the contained
-    witness cannot open the NUL device)."""
-    report = directory / ('ready-%d' % depth)
-    temporary = report.with_suffix('.tmp')
-    temporary.write_text(str(os.getpid()))
+    Workload count/pacing bounds how many children are created, not how long
+    they survive. Child-mode reports are atomic and include kernel creation
+    identity: a later PID reuse cannot become a claimed survivor or a target
+    of fallback termination. No actor self-exits on a clock.
+    """
+    if depth:
+        native = AppContainers()
+        api = escape_helpers['Escapes'](native, primitives, ExtendedStartups, ProcessInfos)
+        report = os.path.join(directory, 'race-child-%d.json' % os.getpid())
+        temporary = report + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as stream:
+            json.dump({'pid': os.getpid(),
+                       'creation': api.creation_time(native.current_process())}, stream)
+        os.replace(temporary, report)
+        threading.Event().wait()
+        return
+    report = os.path.join(directory, 'ready-0')
+    temporary = report + '.tmp'
+    with open(temporary, 'w', encoding='utf-8') as stream:
+        stream.write(str(os.getpid()))
     os.replace(temporary, report)
-    track = directory / 'race-pids'
-    marker = ('import os, sys, time;'
-              ' stream = open(sys.argv[1], "a");'
-              ' stream.write(str(os.getpid()) + chr(10)); stream.close();'
-              ' time.sleep(30)')
+    children = []
+
+    def observe_children():
+        for index, child in enumerate(children):
+            code = child.poll()
+            if code is not None:
+                with open(os.path.join(directory, 'race-stdio-%d.out' % index),
+                          encoding='utf-8', errors='replace') as stream:
+                    detail = stream.read()
+                raise RuntimeError('race descendant exited before controller retirement: %s; %s'
+                                   % (code, detail))
+
     for index in range(40):
         with ExitStack() as files:
             stdin = files.enter_context(
-                open(directory / ('race-stdio-%d.in' % index), 'wb'))
+                open(os.path.join(directory, 'race-stdio-%d.in' % index), 'wb'))
             stdin.close()
             stdin = files.enter_context(
-                open(directory / ('race-stdio-%d.in' % index), 'rb'))
+                open(os.path.join(directory, 'race-stdio-%d.in' % index), 'rb'))
             stdout = files.enter_context(
-                open(directory / ('race-stdio-%d.out' % index), 'wb'))
-            subprocess.Popen([sys.executable, '-I', '-c', marker, str(track)],
-                             close_fds=True, stdin=stdin, stdout=stdout,
-                             stderr=subprocess.STDOUT)
+                open(os.path.join(directory, 'race-stdio-%d.out' % index), 'wb'))
+            children.append(subprocess.Popen(
+                [sys.executable, '-I', '-u', __file__, '--race-tree', str(directory), '1'],
+                close_fds=True, stdin=stdin, stdout=stdout, stderr=subprocess.STDOUT))
+        observe_children()
         time.sleep(0.05)
-    deadline = time.monotonic() + 20
-    while not (directory / 'stop').exists():
-        if time.monotonic() >= deadline:
-            raise TimeoutError('race witness exceeded its safety deadline')
+    while True:
+        observe_children()
         time.sleep(0.02)
 
 
@@ -1852,39 +1875,45 @@ def scratch_probe(native, sid, workspace, report_path):
 
 
 def peer_readiness_failure(peer, log):
-    wait_error = None
+    # The caller still owns retirement. Diagnostics must not wait for a peer
+    # deliberately held alive, nor substitute another readiness deadline.
+    observation_error = None
     try:
-        code = peer.wait(timeout=5)
-        detail = 'exit code %s' % code
+        code = peer.poll()
+        detail = 'still running' if code is None else 'exit code %s' % code
     except (OSError, subprocess.SubprocessError) as error:
-        wait_error = error
+        observation_error = error
         detail = '%s: %s' % (type(error).__name__, error)
     log.flush()
     log.seek(0)
     output = log.read().decode(errors='replace')
-    raise RuntimeError('unrestricted peer did not become ready; wait: %s; log: %s'
-                       % (detail, output)) from wait_error
+    raise RuntimeError('unrestricted peer did not become ready; process: %s; log: %s'
+                       % (detail, output)) from observation_error
 
 
 def task_witness(request_path):
-    """Read the supervisor-registered task's request: manifest and report.
+    """Read the supervisor-registered task's manifest, report and lifetime lease.
 
     The task action is fixed at registration (S4U self-registration by the
     standard-user broker is denied on this Server image; native run
     1670996), so the broker selects the witness target via this file.
     """
     request = json.loads(request_path.read_text())
-    return json.loads(Path(request['manifest']).read_text()), Path(request['report'])
+    return [json.loads(Path(request['manifest']).read_text()),
+            Path(request['report']), request['lease']]
 
 
-def verify_task_route(report_path, owner, native=None, api=None):
+def verify_task_route(report_path, owner, native=None, api=None, *, cleanup):
     """The control must prove the route live, dangerous, and honestly reported.
 
     With kernel access provided, the witness process is independently
     inspected: its token must match both the owner and its own report, so a
     forged or mismatched self-report fails the control. The credential read
     must be 'allowed'; any other outcome (denial or error) means the route is
-    not proven dangerous and the control fails.
+    not proven dangerous and the control fails. The caller's retirement
+    registrar is outside its lease scope: retain the creation-checked kernel
+    identity through lease release and actual exit, rather than close/reopen a
+    reported PID. Inspection failure must unwind that same owner.
     """
     payload = json.loads(report_path.read_text())
     if payload['token']['user'] != owner or payload['token']['app'] != 0:
@@ -1895,16 +1924,21 @@ def verify_task_route(report_path, owner, native=None, api=None):
                            % payload['credential_access'])
     if native is not None and api is not None:
         handle = native.check(native.open_process(
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
-            | PROCESS_TERMINATE, False, payload['pid']))
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, payload['pid']))
         try:
-            token = api.token(handle, TOKEN_QUERY)
-            try:
-                snapshot = api.snapshot(token)
-            finally:
-                api.close(token)
-        finally:
+            if native.wait(handle, 0) != 258:
+                raise RuntimeError('control witness exited before kernel inspection')
+            if payload.get('creation') != api.creation_time(handle):
+                raise RuntimeError('control witness creation identity disagrees with report')
+            cleanup(api.reap_witness, handle)
+        except BaseException:
             api.close(handle)
+            raise
+        token = api.token(handle, TOKEN_QUERY)
+        try:
+            snapshot = api.snapshot(token)
+        finally:
+            api.close(token)
         if snapshot != payload['token']:
             raise RuntimeError('kernel token disagrees with witness report: '
                                '%r vs %r' % (snapshot, payload['token']))
@@ -1965,13 +1999,21 @@ def reap_activation_wrapper(process):
     returning or propagating.
     """
     failure = None
+    result = None
     try:
         if process.poll() is None:
             process.kill()
     except Exception as error:
         failure = error
     try:
-        process.communicate(timeout=5)
+        result = process.communicate()
+    except Exception as error:
+        if failure is None:
+            failure = error
+    try:
+        # A pipe-read error is not evidence that the killed wrapper exited.
+        # Join the retained process even when draining its output failed.
+        process.wait()
     except Exception as error:
         if failure is None:
             failure = error
@@ -1984,9 +2026,10 @@ def reap_activation_wrapper(process):
                     failure = error
     if failure is not None:
         raise failure
+    return result
 
 
-def activate_and_observe(command, report_path, owner, native, api):
+def activate_and_observe(command, report_path, owner, native, api, *, cleanup):
     """Run one activation while inspecting its witness live.
 
     Polling continues for the full bounded deadline even after the wrapper
@@ -1999,28 +2042,25 @@ def activate_and_observe(command, report_path, owner, native, api):
     process = subprocess.Popen(command, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True)
     payload = None
-    output = error = ''
     try:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if report_path.exists():
-                payload = verify_task_route(report_path, owner, native, api)
+                payload = verify_task_route(report_path, owner, native, api, cleanup=cleanup)
                 break
             time.sleep(0.05)
-        try:
-            output, error = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            output, error = process.communicate(timeout=5)
     except BaseException:
         # The primary error wins; a failing cleanup is reported, not hidden.
         try:
             reap_activation_wrapper(process)
-        except Exception as cleanup:
+        except Exception as cleanup_error:
             print(json.dumps({'probe': 'com-control',
-                              'cleanup_error': repr(cleanup)}), flush=True)
+                              'cleanup_error': repr(cleanup_error)}), flush=True)
         raise
-    reap_activation_wrapper(process)
+    # Once observation finishes this wrapper has no remaining fixture purpose.
+    # Retire it explicitly, not after another grace period. The separately
+    # launched witness is not owned by this wrapper.
+    output, error = reap_activation_wrapper(process)
     return payload, {'exit': process.returncode, 'stdout': output,
                      'stderr': error}
 
@@ -2368,6 +2408,415 @@ def contained(manifest_path, descendant=False):
 
 
 class EscapeResultTests(unittest.TestCase):
+    def lease_native(self):
+        native = mock.Mock()
+        native.open.return_value = 701
+        native.close.return_value = True
+        native.lock_file.return_value = True
+        native.unlock_file.return_value = True
+
+        def checked(value):
+            if not value:
+                raise OSError('native call failed')
+            return value
+
+        native.check.side_effect = checked
+        return native
+
+    def test_controller_lease_owns_lock_handle_and_generated_path(self):
+        native = self.lease_native()
+        with tempfile.TemporaryDirectory() as directory:
+            with escape_helpers['witness_lease'](native, primitives['Overlapped'], directory) as lease:
+                self.assertTrue(os.path.isfile(lease))
+                self.assertTrue(os.path.isabs(lease))
+                native.close.assert_not_called()
+                arguments = native.lock_file.call_args.args
+                self.assertEqual([arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]],
+                                 [701, 3, 0, 1, 0])
+            native.close.assert_called_once_with(701)
+            self.assertFalse(os.path.exists(lease))
+
+    def test_controller_lease_releases_after_body_failure(self):
+        native = self.lease_native()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, 'inspection failed'):
+                with escape_helpers['witness_lease'](native, primitives['Overlapped'], directory) as lease:
+                    raise RuntimeError('inspection failed')
+            native.close.assert_called_once_with(701)
+            self.assertFalse(os.path.exists(lease))
+
+    def test_controller_lease_closes_handle_after_lock_failure(self):
+        native = self.lease_native()
+        native.lock_file.return_value = False
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(OSError, 'native call failed'):
+                with escape_helpers['witness_lease'](native, primitives['Overlapped'], directory):
+                    self.fail('failed lock was published')
+            native.close.assert_called_once_with(701)
+            self.assertFalse(os.path.exists(native.open.call_args.args[0]))
+
+    def test_controller_lease_removes_file_after_open_failure(self):
+        native = self.lease_native()
+        native.open.side_effect = OSError('lease open failed')
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(OSError, 'lease open failed'):
+                with escape_helpers['witness_lease'](native, primitives['Overlapped'], directory):
+                    self.fail('failed acquisition was published')
+            native.close.assert_not_called()
+            self.assertFalse(os.path.exists(native.open.call_args.args[0]))
+
+    def witness_api(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = self.lease_native()
+        api.primitives = primitives
+        api.token = mock.Mock(return_value=702)
+        api.snapshot = mock.Mock(return_value={'user': 'u', 'app': 1, 'package': 'p'})
+        api.creation_time = mock.Mock(return_value=[11, 22])
+        api.close = mock.Mock(wraps=api.close)
+        return api
+
+    def test_witness_does_not_probe_after_controller_already_ended(self):
+        api = self.witness_api()
+        classify, report = mock.Mock(), mock.Mock()
+        with mock.patch.object(C, 'set_last_error', create=True):
+            escape_helpers['witness'](api, {'secret': 'unused'}, report, classify, 'lease')
+        classify.assert_not_called()
+        api.token.assert_not_called()
+        report.with_suffix.assert_not_called()
+        api.n.open.assert_called_once_with('lease')
+        api.close.assert_called_once_with(701)
+        self.assertEqual(api.n.lock_file.call_args.args[1], 1)
+
+    def test_live_witness_publishes_identity_then_waits_for_controller_release(self):
+        api = self.witness_api()
+        report = mock.Mock()
+        classify = mock.Mock(return_value={'outcome': 'access-denied'})
+
+        def lock(handle, flags, reserved, low, high, overlapped):
+            if flags == 1:
+                return False
+            self.assertEqual(flags, 0)
+            report.with_suffix.return_value.write_text.assert_called_once()
+            replace.assert_called_once_with(report.with_suffix.return_value, report)
+            return True
+
+        api.n.lock_file.side_effect = lock
+        with mock.patch.object(C, 'set_last_error', create=True), \
+                mock.patch.object(C, 'get_last_error', return_value=33, create=True), \
+                mock.patch.object(os, 'replace') as replace:
+            escape_helpers['witness'](api, {'secret': 'unused'}, report, classify, 'lease')
+        payload = json.loads(report.with_suffix.return_value.write_text.call_args.args[0])
+        self.assertEqual(payload['creation'], [11, 22])
+        self.assertEqual(payload['token'], api.snapshot.return_value)
+        self.assertEqual(payload['credential_access'], {'outcome': 'access-denied'})
+        self.assertEqual([call.args[1] for call in api.n.lock_file.call_args_list], [1, 0])
+        replace.assert_called_once_with(report.with_suffix.return_value, report)
+        self.assertEqual(api.close.call_args_list, [mock.call(702), mock.call(701)])
+
+    def test_witness_closes_lease_after_probe_failure(self):
+        api = self.witness_api()
+        api.n.lock_file.return_value = False
+        classify = mock.Mock(side_effect=OSError('credential observation failed'))
+        with mock.patch.object(C, 'set_last_error', create=True), \
+                mock.patch.object(C, 'get_last_error', return_value=33, create=True):
+            with self.assertRaisesRegex(OSError, 'credential observation failed'):
+                escape_helpers['witness'](api, {'secret': 'unused'}, mock.Mock(), classify, 'lease')
+        self.assertEqual(api.close.call_args_list, [mock.call(702), mock.call(701)])
+        self.assertEqual(api.n.lock_file.call_count, 1)
+
+    def test_witness_refuses_unexpected_lease_lock_error(self):
+        api = self.witness_api()
+        api.n.lock_file.return_value = False
+        classify = mock.Mock()
+        with mock.patch.object(C, 'set_last_error', create=True), \
+                mock.patch.object(C, 'get_last_error', return_value=5, create=True), \
+                mock.patch.object(C, 'WinError', side_effect=lambda code: OSError(code, 'lease denied'), create=True):
+            with self.assertRaisesRegex(OSError, 'lease denied'):
+                escape_helpers['witness'](api, {'secret': 'unused'}, mock.Mock(), classify, 'lease')
+        classify.assert_not_called()
+        api.close.assert_called_once_with(701)
+
+    def test_creation_identity_uses_exact_filetime_words_and_borrows_handle(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = self.lease_native()
+        kind = escape_helpers['FileTimes']
+        self.assertEqual(C.sizeof(kind), 8)
+        self.assertEqual(kind.low.offset, 0)
+        self.assertEqual(kind.high.offset, 4)
+
+        def times(process, created, ended, kernel, user):
+            self.assertEqual(process, 77)
+            value = C.cast(created, C.POINTER(kind)).contents
+            value.low, value.high = 0x89abcdef, 0x01234567
+            return True
+
+        api.process_times = times
+        self.assertEqual(api.creation_time(77), [0x89abcdef, 0x01234567])
+        api.n.close.assert_not_called()
+
+    def test_creation_observation_failure_does_not_publish_a_zero_identity(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = self.lease_native()
+        api.process_times = mock.Mock(return_value=False)
+        with self.assertRaisesRegex(OSError, 'native call failed'):
+            api.creation_time(77)
+        api.n.close.assert_not_called()
+
+    def test_witness_reap_observes_actual_native_exit_without_extra_budget(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = self.lease_native()
+        api.n.wait.return_value = 0
+        api.reap_witness(77)
+        api.n.wait.assert_called_once_with(77, 0xffffffff)
+        api.n.close.assert_called_once_with(77)
+        api.n.terminate.assert_not_called()
+
+    def test_witness_reap_reports_failed_exit_observation(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.n = self.lease_native()
+        api.n.wait.return_value = 0xffffffff
+        with self.assertRaisesRegex(RuntimeError, 'exit observation failed'):
+            api.reap_witness(77)
+        api.n.wait.assert_called_once_with(77, 0xffffffff)
+        api.n.close.assert_called_once_with(77)
+
+    def test_task_control_refuses_reused_pid_before_adopting_retirement(self):
+        report = mock.Mock()
+        report.read_text.return_value = json.dumps(
+            {'pid': 42, 'creation': [11, 22], 'token': {'user': 'u', 'app': 0},
+             'credential_access': {'outcome': 'allowed'}})
+        native, api, cleanup = self.lease_native(), mock.Mock(), mock.Mock()
+        native.open_process.return_value = 7
+        native.wait.return_value = 258
+        api.creation_time.return_value = [99, 22]
+        with self.assertRaisesRegex(RuntimeError, 'creation identity'):
+            verify_task_route(report, 'u', native, api, cleanup=cleanup)
+        cleanup.assert_not_called()
+        api.token.assert_not_called()
+        api.close.assert_called_once_with(7)
+
+    def test_task_request_requires_an_explicit_controller_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = os.path.join(directory, 'manifest.json')
+            with open(manifest, 'w', encoding='utf-8') as stream:
+                json.dump({'workspace': directory}, stream)
+            request = mock.Mock()
+            request.read_text.return_value = json.dumps(
+                {'manifest': manifest, 'report': os.path.join(directory, 'report.json')})
+            with self.assertRaisesRegex(KeyError, 'lease'):
+                task_witness(request)
+
+    def fake_witness_api(self):
+        # Argument/launch-result units replace the kernel lease but retain its
+        # real scope ordering. Separate portable units exercise the native
+        # lock/close contract without assuming these operands name real files.
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        api.created = 0
+        api.n = self.lease_native()
+        api.primitives = primitives
+        api.lease_path = "controller lease's path"
+        api.events = []
+        api.reap_witness = mock.Mock(side_effect=lambda process: api.events.append('reap-%s' % process))
+
+        @contextmanager
+        def lease(native, overlapped_type, directory):
+            api.events.append('lease-open')
+            try:
+                yield api.lease_path
+            finally:
+                api.events.append('lease-close')
+
+        self.enterContext(mock.patch.dict(api.wmi_launch.__globals__, {'witness_lease': lease}))
+        return api
+
+    def shell_witness_api(self):
+        api = self.fake_witness_api()
+        api.co_initialize = mock.Mock(return_value=0)
+        api.co_uninitialize = mock.Mock()
+
+        def create(pointer):
+            info = C.cast(pointer, C.POINTER(escape_helpers['ShellInfos'])).contents
+            info.process = 801
+            api.parameters = info.parameters
+            api.events.append('create')
+            return True
+
+        api.shell_execute = mock.Mock(side_effect=create)
+        return api
+
+    def test_shell_witness_releases_controller_before_native_reap(self):
+        api = self.shell_witness_api()
+        report = mock.Mock()
+        report.parent = 'directory'
+        expected = {'outcome': 'contained'}
+
+        def inspect(*arguments):
+            api.events.append('inspect')
+            return expected
+
+        api.inspect_witness = mock.Mock(side_effect=inspect)
+        self.assertEqual(api.shell_launch('python.exe', 'probe.py', 'manifest', report, 'u', 'p'), expected)
+        self.assertEqual(api.events, ['lease-open', 'create', 'inspect', 'lease-close', 'reap-801'])
+        self.assertEqual(api.parameters, subprocess.list2cmdline(
+            ['-I', '-u', 'probe.py', '--launch-witness', 'manifest', str(report), api.lease_path]))
+        api.co_uninitialize.assert_called_once_with()
+
+    def test_shell_inspection_failure_still_releases_then_joins(self):
+        api = self.shell_witness_api()
+        api.inspect_witness = mock.Mock(side_effect=OSError('inspection failed'))
+        report = mock.Mock()
+        report.parent = 'directory'
+        with self.assertRaisesRegex(OSError, 'inspection failed'):
+            api.shell_launch('python.exe', 'probe.py', 'manifest', report, 'u', 'p')
+        self.assertEqual(api.events, ['lease-open', 'create', 'lease-close', 'reap-801'])
+        self.assertEqual(api.created, 1)
+        api.co_uninitialize.assert_called_once_with()
+
+    def test_shell_creation_failure_does_not_reap_an_uncreated_child(self):
+        api = self.shell_witness_api()
+        api.shell_execute.side_effect = None
+        api.shell_execute.return_value = False
+        report = mock.Mock()
+        report.parent = 'directory'
+        with self.assertRaisesRegex(OSError, 'native call failed'):
+            api.shell_launch('python.exe', 'probe.py', 'manifest', report, 'u', 'p')
+        self.assertEqual(api.events, ['lease-open', 'lease-close'])
+        self.assertEqual(api.created, 0)
+        api.reap_witness.assert_not_called()
+
+    def test_wmi_witness_releases_controller_before_native_reap(self):
+        api = self.fake_witness_api()
+        api.n.open_process.return_value = 801
+        expected = {'outcome': 'contained'}
+
+        def inspect(*arguments):
+            api.events.append('inspect')
+            return expected
+
+        api.inspect_witness = mock.Mock(side_effect=inspect)
+        report = mock.Mock()
+        report.parent = 'directory'
+        with mock.patch.dict(api.wmi_launch.__globals__, {'run_powershell': mock.Mock(
+                return_value='{"kind":"return","code":0,"pid":42}')}):
+            self.assertEqual(api.wmi_launch(
+                'python.exe', 'probe.py', 'manifest', report, 'u', 'p'), expected)
+        self.assertEqual(api.events, ['lease-open', 'inspect', 'lease-close', 'reap-801'])
+        api.n.open_process.assert_called_once_with(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, 42)
+        self.assertEqual(api.created, 1)
+
+    def test_task_slot_readiness_observes_scheduler_not_elapsed_sleep(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        query = mock.Mock(side_effect=['4\n', '2\n', '3\n'])
+        with mock.patch.dict(api.wait_task_idle.__globals__, {'run_powershell': query}), \
+                mock.patch.object(time, 'sleep'):
+            api.wait_task_idle("task's name")
+        self.assertEqual(query.call_count, 3)
+        self.assertIn("task''s name", query.call_args.args[0])
+
+    def test_task_slot_refuses_disabled_state(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        with mock.patch.dict(api.wait_task_idle.__globals__, {'run_powershell': mock.Mock(return_value='1')}):
+            with self.assertRaisesRegex(RuntimeError, 'not runnable'):
+                api.wait_task_idle('task')
+
+    def test_task_slot_refuses_unknown_state(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        with mock.patch.dict(api.wait_task_idle.__globals__, {'run_powershell': mock.Mock(return_value='0')}):
+            with self.assertRaisesRegex(RuntimeError, 'not runnable'):
+                api.wait_task_idle('task')
+
+    def test_task_slot_propagates_query_failure(self):
+        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
+        with mock.patch.dict(api.wait_task_idle.__globals__, {'run_powershell': mock.Mock(
+                side_effect=OSError('scheduler query failed'))}):
+            with self.assertRaisesRegex(OSError, 'scheduler query failed'):
+                api.wait_task_idle('task')
+
+    def test_peer_releases_marker_handle_only_after_controller_eof(self):
+        native, report, control = self.lease_native(), mock.Mock(), mock.Mock()
+
+        def eof():
+            report.with_suffix.return_value.write_text.assert_called_once()
+            native.close.assert_not_called()
+            return b''
+
+        control.buffer.read.side_effect = eof
+        with mock.patch.object(sys, 'stdin', control), mock.patch.object(os, 'replace'):
+            escape_helpers['peer'](native, 'fake-target', report)
+        native.close.assert_called_once_with(701)
+        control.buffer.read.assert_called_once_with()
+
+    def test_peer_input_failure_still_closes_its_target_handle(self):
+        native, report, control = self.lease_native(), mock.Mock(), mock.Mock()
+        control.buffer.read.side_effect = OSError('controller read failed')
+        with mock.patch.object(sys, 'stdin', control), mock.patch.object(os, 'replace'):
+            with self.assertRaisesRegex(OSError, 'controller read failed'):
+                escape_helpers['peer'](native, 'fake-target', report)
+        native.close.assert_called_once_with(701)
+
+    def test_peer_publication_failure_still_closes_its_target_handle(self):
+        native, report, control = self.lease_native(), mock.Mock(), mock.Mock()
+        report.with_suffix.return_value.write_text.side_effect = OSError('publication failed')
+        with mock.patch.object(sys, 'stdin', control):
+            with self.assertRaisesRegex(OSError, 'publication failed'):
+                escape_helpers['peer'](native, 'fake-target', report)
+        native.close.assert_called_once_with(701)
+        control.buffer.read.assert_not_called()
+
+    def test_race_marker_publishes_creation_identity_before_owned_wait(self):
+        native, api, waiting = self.lease_native(), mock.Mock(), mock.Mock()
+        native.current_process.return_value = 77
+        api.creation_time.return_value = [11, 22]
+        with tempfile.TemporaryDirectory() as directory:
+            report = os.path.join(directory, 'race-child-%d.json' % os.getpid())
+
+            def held():
+                with open(report, encoding='utf-8') as stream:
+                    self.assertEqual(json.load(stream), {'pid': os.getpid(), 'creation': [11, 22]})
+                raise RuntimeError('controlled actor termination')
+
+            waiting.wait.side_effect = held
+            with mock.patch.object(sys.modules[__name__], 'AppContainers', return_value=native), \
+                    mock.patch.dict(escape_helpers, {'Escapes': mock.Mock(return_value=api)}), \
+                    mock.patch.object(threading, 'Event', return_value=waiting):
+                with self.assertRaisesRegex(RuntimeError, 'controlled actor termination'):
+                    race_tree(directory, 1)
+            api.creation_time.assert_called_once_with(77)
+            waiting.wait.assert_called_once_with()
+            self.assertFalse(os.path.exists(report + '.tmp'))
+
+    def test_broker_controller_eof_unwinds_held_job_without_sleep_budget(self):
+        native, api, directory, report, control = self.lease_native(), mock.Mock(), mock.MagicMock(), mock.Mock(), mock.Mock()
+        events = []
+        paths = {name: mock.Mock() for name in ['ready-0', 'ready-1', 'ready-2', 'broker-death.log']}
+        for index, name in enumerate(['ready-0', 'ready-1', 'ready-2']):
+            paths[name].exists.return_value = True
+            paths[name].read_text.return_value = str(100 + index)
+        directory.__truediv__.side_effect = paths.__getitem__
+
+        def parse(package, pointer):
+            C.cast(pointer, C.POINTER(HANDLE)).contents.value = 901
+            return True
+
+        def launch(*arguments, **options):
+            try:
+                options['observe'](77, 88)
+            finally:
+                events.append('job-closed')
+
+        api.parse_sid.side_effect = parse
+        native.launch.side_effect = launch
+        native.free_sid.side_effect = lambda sid: events.append('sid-freed')
+        control.buffer.read.side_effect = lambda: events.append('controller-eof') or b''
+        with mock.patch.object(sys.modules[__name__], 'AppContainers', return_value=native), \
+                mock.patch.dict(escape_helpers, {'Escapes': mock.Mock(return_value=api)}), \
+                mock.patch.object(sys, 'stdin', control), mock.patch.object(os, 'replace'):
+            with self.assertRaisesRegex(RuntimeError, 'controller ended'):
+                broker_death(directory, 'package', report)
+        self.assertEqual(events, ['controller-eof', 'job-closed', 'sid-freed'])
+        self.assertEqual(native.launch.call_args.kwargs['deadline'], float('inf'))
+
     def test_inherited_nul_probe_requires_a_confirmed_write(self):
         expected = {'identity': [1, 'package'], 'native_write': True,
                     'crt_bytes': len(b'inherited-nul-write\n')}
@@ -2518,8 +2967,7 @@ class EscapeResultTests(unittest.TestCase):
         self.assertEqual(result['delete_status'], 0)
 
     def test_wmi_wrapper_failures_are_not_wmi_denial(self):
-        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
-        api.created = 0
+        api = self.fake_witness_api()
         arguments = ('python.exe', 'probe.py', Path('manifest.json'),
                      Path('report.json'), 'user', 'package')
         with mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
@@ -2657,13 +3105,10 @@ class EscapeResultTests(unittest.TestCase):
         # stdio; the devnull constant would fail them (it is an int sentinel).
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            clock = iter([0, 10, 200])  # readiness wait expires immediately
-            with mock.patch.object(time, 'monotonic',
-                                   side_effect=lambda: next(clock)), \
-                    mock.patch.object(time, 'sleep'), \
-                    mock.patch.object(subprocess, 'Popen') as popen:
-                with self.assertRaises(TimeoutError):
-                    cleanup_tree(directory, 0)
+            with open(directory / 'release', 'w'):
+                pass
+            with mock.patch.object(subprocess, 'Popen') as popen:
+                self.assertIsNone(cleanup_tree(directory, 0))
             self.assertEqual(popen.call_count, 1)
             kwargs = popen.call_args.kwargs
             self.assertTrue(kwargs['close_fds'])
@@ -2930,18 +3375,26 @@ print('RETURNED', flush=True)
         self.assertEqual(events, ['open', 'revert', 'close-13', 'residual',
                                   'close-9', 'close-7'])
 
-    def test_peer_readiness_failure_preserves_log_and_wait_error(self):
-        for failure in (None, subprocess.TimeoutExpired(['peer'], 5), OSError('wait failed')):
-            with self.subTest(failure=failure), tempfile.TemporaryFile('w+b') as log:
-                log.write(b'peer startup diagnostics')
-                peer = mock.Mock()
-                peer.wait.return_value = 9
-                peer.wait.side_effect = failure
-                with self.assertRaisesRegex(RuntimeError, 'peer startup diagnostics') as caught:
-                    peer_readiness_failure(peer, log)
-                self.assertIs(caught.exception.__cause__, failure)
-                detail = 'exit code 9' if failure is None else type(failure).__name__
-                self.assertIn(detail, str(caught.exception))
+    def _peer_diagnostic(self, peer, detail, cause=None):
+        with tempfile.TemporaryFile('w+b') as log:
+            log.write(b'peer startup diagnostics')
+            with self.assertRaisesRegex(RuntimeError, 'peer startup diagnostics') as caught:
+                peer_readiness_failure(peer, log)
+        self.assertIs(caught.exception.__cause__, cause)
+        self.assertIn(detail, str(caught.exception))
+        peer.wait.assert_not_called()
+        peer.kill.assert_not_called()
+        peer.terminate.assert_not_called()
+
+    def test_peer_readiness_failure_preserves_exited_peer_log(self):
+        self._peer_diagnostic(mock.Mock(poll=mock.Mock(return_value=9)), 'exit code 9')
+
+    def test_peer_readiness_failure_does_not_join_a_live_borrowed_peer(self):
+        self._peer_diagnostic(mock.Mock(poll=mock.Mock(return_value=None)), 'still running')
+
+    def test_peer_readiness_failure_preserves_poll_error(self):
+        failure = OSError('poll failed')
+        self._peer_diagnostic(mock.Mock(poll=mock.Mock(side_effect=failure)), 'OSError', failure)
 
     def test_impersonation_launch_relays_child_report(self):
         api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
@@ -2992,7 +3445,7 @@ print('RETURNED', flush=True)
             live = {'pid': 42, 'token': {'user': 'u', 'app': 0},
                     'credential_access': {'outcome': 'allowed'}}
             report.write_text(json.dumps(live))
-            self.assertEqual(verify_task_route(report, 'u'), live)
+            self.assertEqual(verify_task_route(report, 'u', cleanup=mock.Mock()), live)
             for token, access in [
                     ({'user': 'u', 'app': 1}, 'allowed'),
                     ({'user': 'other', 'app': 0}, 'allowed'),
@@ -3003,17 +3456,19 @@ print('RETURNED', flush=True)
                      'credential_access': {'outcome': access}}))
                 with self.subTest(token=token, access=access):
                     with self.assertRaisesRegex(RuntimeError, 'control witness'):
-                        verify_task_route(report, 'u')
+                        verify_task_route(report, 'u', cleanup=mock.Mock())
 
     def test_task_control_kernel_token_must_match_witness(self):
         with tempfile.TemporaryDirectory() as name:
             report = Path(name) / 'r.json'
             report.write_text(json.dumps(
-                {'pid': 42, 'token': {'user': 'u', 'app': 0},
+                {'pid': 42, 'creation': [11, 22], 'token': {'user': 'u', 'app': 0},
                  'credential_access': {'outcome': 'allowed'}}))
             native, api = mock.Mock(), mock.Mock()
             native.check.side_effect = lambda value: value
             native.open_process.return_value = 7
+            native.wait.return_value = 258
+            api.creation_time.return_value = [11, 22]
             api.token.return_value = 8
             api.close.return_value = True
 
@@ -3025,12 +3480,17 @@ print('RETURNED', flush=True)
                                     (lambda token: {'user': 'u', 'app': 1},
                                      False)]:
                 api.snapshot.side_effect = kernel
-                with self.subTest(matches=matches):
+                api.close.reset_mock()
+                api.reap_witness.reset_mock()
+                with self.subTest(matches=matches), ExitStack() as retirement:
                     if matches:
-                        verify_task_route(report, 'u', native, api)
+                        verify_task_route(report, 'u', native, api, cleanup=retirement.callback)
                     else:
                         with self.assertRaisesRegex(RuntimeError, 'kernel'):
-                            verify_task_route(report, 'u', native, api)
+                            verify_task_route(report, 'u', native, api, cleanup=retirement.callback)
+                    api.close.assert_called_once_with(8)
+                    api.reap_witness.assert_not_called()
+                api.reap_witness.assert_called_once_with(7)
 
     def test_witness_verdict_only_accepts_denied_contained_witnesses(self):
         verdict = witness_verdict
@@ -3053,7 +3513,7 @@ print('RETURNED', flush=True)
     def fake_activation_process(self, alive=True):
         process = mock.Mock()
         process.poll.return_value = None if alive else 0
-        process.communicate.side_effect = lambda timeout=5: ('out', 'err')
+        process.communicate.side_effect = lambda: ('out', 'err')
         process.returncode = 0
         return process
 
@@ -3062,18 +3522,22 @@ print('RETURNED', flush=True)
         report = mock.Mock()
         report.exists.side_effect = [False, False, True]
         payload = {'pid': 1}
+        cleanup = mock.Mock()
+        process = self.fake_activation_process(False)
         clock = iter(range(0, 100))
-        with mock.patch.object(subprocess, 'Popen',
-                               return_value=self.fake_activation_process(False)), \
+        with mock.patch.object(subprocess, 'Popen', return_value=process), \
                 mock.patch.object(module, 'verify_task_route',
                                   return_value=payload) as verify, \
                 mock.patch.object(time, 'monotonic',
                                   side_effect=lambda: next(clock)), \
                 mock.patch.object(time, 'sleep'):
-            result = activate_and_observe(['x'], report, 'u', None, None)
+            result = activate_and_observe(['x'], report, 'u', None, None, cleanup=cleanup)
         # The wrapper exited immediately; polling still caught the report.
         self.assertEqual(result[0], payload)
-        verify.assert_called_once_with(report, 'u', None, None)
+        verify.assert_called_once_with(report, 'u', None, None, cleanup=cleanup)
+        process.communicate.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        process.kill.assert_not_called()
 
     def test_activation_observation_kills_wrapper_on_error(self):
         module = sys.modules[__name__]
@@ -3088,7 +3552,7 @@ print('RETURNED', flush=True)
                                   side_effect=lambda: next(clock)), \
                 mock.patch.object(time, 'sleep'):
             with self.assertRaisesRegex(RuntimeError, 'bad report'):
-                activate_and_observe(['x'], report, 'u', None, None)
+                activate_and_observe(['x'], report, 'u', None, None, cleanup=mock.Mock())
         # A live wrapper is killed and reaped even when verification raised.
         process.kill.assert_called_once()
         self.assertGreaterEqual(process.communicate.call_count, 1)
@@ -3104,7 +3568,7 @@ print('RETURNED', flush=True)
                 mock.patch.object(time, 'monotonic',
                                   side_effect=lambda: next(clock)), \
                 mock.patch.object(time, 'sleep'):
-            result = activate_and_observe(['x'], report, 'u', None, None)
+            result = activate_and_observe(['x'], report, 'u', None, None, cleanup=mock.Mock())
         self.assertIsNone(result[0])
         verify.assert_not_called()
         process.kill.assert_called_once()
@@ -3115,15 +3579,14 @@ print('RETURNED', flush=True)
         report.exists.return_value = False
         clock = iter([0, 30] + [31] * 50)
         process = self.fake_activation_process(alive=True)
-        process.communicate.side_effect = [('out', 'err'),
-                                           RuntimeError('reap failed')]
+        process.communicate.side_effect = RuntimeError('reap failed')
         with mock.patch.object(subprocess, 'Popen', return_value=process), \
                 mock.patch.object(module, 'verify_task_route') as verify, \
                 mock.patch.object(time, 'monotonic',
                                   side_effect=lambda: next(clock)), \
                 mock.patch.object(time, 'sleep'):
             with self.assertRaisesRegex(RuntimeError, 'reap failed'):
-                activate_and_observe(['x'], report, 'u', None, None)
+                activate_and_observe(['x'], report, 'u', None, None, cleanup=mock.Mock())
         verify.assert_not_called()
 
     def test_activation_cleanup_failure_is_reported_not_hidden(self):
@@ -3141,7 +3604,7 @@ print('RETURNED', flush=True)
                 mock.patch.object(time, 'sleep'), \
                 mock.patch('builtins.print') as printed:
             with self.assertRaisesRegex(RuntimeError, 'bad report'):
-                activate_and_observe(['x'], report, 'u', None, None)
+                activate_and_observe(['x'], report, 'u', None, None, cleanup=mock.Mock())
         diagnostic = json.loads(printed.call_args.args[0])
         self.assertEqual(diagnostic['probe'], 'com-control')
         self.assertIn('cleanup broke', diagnostic['cleanup_error'])
@@ -3260,6 +3723,7 @@ print('RETURNED', flush=True)
         process.stdout.close.assert_called_once()
         process.stderr.close.assert_called_once()
         process.kill.assert_called_once()
+        process.wait.assert_called_once_with()
 
     def test_scenario_deadline_defaults_before_observation(self):
         self.assertEqual(_scenario_deadline(123.0), 123.0)
@@ -3315,15 +3779,15 @@ print('RETURNED', flush=True)
             (directory / 'm.json').write_text(json.dumps(manifest))
             (directory / 'request.json').write_text(json.dumps(
                 {'manifest': str(directory / 'm.json'),
-                 'report': str(directory / 'r.json')}))
-            loaded, report = task_witness(directory / 'request.json')
+                 'report': str(directory / 'r.json'), 'lease': 'controller-lease'}))
+            loaded, report, lease = task_witness(directory / 'request.json')
             self.assertEqual(loaded, manifest)
             self.assertEqual(report, directory / 'r.json')
+            self.assertEqual(lease, 'controller-lease')
 
     def test_wmi_operands_are_quoted_without_json_cmdlets(self):
         import base64
-        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
-        api.created = 0
+        api = self.fake_witness_api()
         report = Path("work's $name `tick __REQUEST__") / 'report.json'
         arguments = ('python.exe', "probe's.py", Path('manifest.json'),
                      report, 'user', 'package')
@@ -3336,7 +3800,7 @@ print('RETURNED', flush=True)
         script = base64.b64decode(launch.call_args.args[0][-1]).decode('utf-16-le')
         command = subprocess.list2cmdline(
             ['python.exe', '-I', '-u', "probe's.py", '--launch-witness',
-             'manifest.json', str(report)])
+             'manifest.json', str(report), api.lease_path])
         assignments = ("$command = ('" + command.replace("'", "''") + "')\n" +
                        "$directory = ('" + str(report.parent).replace("'", "''") +
                        "')\n")
@@ -3345,8 +3809,7 @@ print('RETURNED', flush=True)
         self.assertNotIn('ConvertTo-Json', script)
 
     def test_wmi_numeric_exception_reply_preserves_denial_classification(self):
-        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
-        api.created = 0
+        api = self.fake_witness_api()
         arguments = ('python.exe', 'probe.py', Path('manifest.json'),
                      Path('report.json'), 'user', 'package')
         for hresult, denied in [(-2147024891, True), (-2147217405, True),
@@ -3408,8 +3871,7 @@ print('RETURNED', flush=True)
                 self.assertNotIn('env', launch.call_args.kwargs)
 
     def test_wmi_wrapper_protocol_failures_remain_errors(self):
-        api = escape_helpers['Escapes'].__new__(escape_helpers['Escapes'])
-        api.created = 0
+        api = self.fake_witness_api()
         arguments = ('python.exe', 'probe.py', Path('manifest.json'),
                      Path('report.json'), 'user', 'package')
         for code, output in [(0, ''), (0, 'not json'),
@@ -4307,20 +4769,22 @@ class StateTokenProbeTests(unittest.TestCase):
                         failure if index in rejected else handle
                         for index, handle in enumerate(handles)])
                     role = HANDLE(23)
-                    parsed = []
-                    probe.api.parse_sid.side_effect = (
-                        lambda value, pointer: parsed.append(pointer._obj) or True)
+
+                    def parse_sid(value, pointer):
+                        pointer._obj.value = 91 if value == 'S-1-1-0' else 92
+                        return True
+
+                    probe.api.parse_sid.side_effect = parse_sid
                     probe.n.sid.side_effect = (
-                        lambda handle: 'tool-role' if handle is role else
-                        ('everyone' if handle is parsed[0] else 'foreign'))
+                        lambda handle: 'tool-role' if handle.value == role.value else
+                        ('everyone' if handle.value == 91 else 'foreign'))
                     with mock.patch('builtins.print') as output:
                         probe.compare_filters(17, role, context)
-                    everyone, foreign = parsed
                     self.assertEqual(probe.api.parse_sid.call_args_list, [
                         mock.call('S-1-1-0', mock.ANY),
                         mock.call('S-1-5-32-547', mock.ANY)])
-                    self.assertEqual(probe.n.local_free.call_args_list,
-                                     [mock.call(everyone), mock.call(foreign)])
+                    self.assertEqual([call.args[0].value for call in probe.n.local_free.call_args_list],
+                                     [91, 92])
                     records = [json.loads(call.args[0]) for call in output.call_args_list]
                     self.assertEqual(records[0], {
                         'probe': 'state-token-filter', 'phase': 'source',
@@ -4342,11 +4806,11 @@ class StateTokenProbeTests(unittest.TestCase):
                             self.assertIn('CreateRestrictedToken', row['error'])
                         else:
                             self.assertEqual(row['token'], source)
-                    self.assertEqual(probe.filtered.call_args_list, [
-                        mock.call(17, None, flags=0),
-                        mock.call(17, everyone, flags=0),
-                        mock.call(17, foreign, flags=0),
-                        mock.call(17, role, flags=0x8)])
+                    self.assertEqual([
+                        [[getattr(argument, 'value', argument) for argument in call.args], call.kwargs]
+                        for call in probe.filtered.call_args_list], [
+                            [[17, None], {'flags': 0}], [[17, 91], {'flags': 0}],
+                            [[17, 92], {'flags': 0}], [[17, 23], {'flags': 0x8}]])
                     successful = [handle for index, handle in enumerate(handles)
                                   if index not in rejected]
                     self.assertEqual(probe.api.snapshot.call_args_list,
@@ -4875,22 +5339,27 @@ class AppContainerTests(unittest.TestCase):
         self.addCleanup(peer_log.close)
         peer = subprocess.Popen(
             [sys.executable, '-I', '-u', __file__, '--peer', str(secret / 'read'),
-             str(peer_report)], stdin=subprocess.DEVNULL, stdout=peer_log,
+             str(peer_report)], stdin=subprocess.PIPE, stdout=peer_log,
             stderr=subprocess.STDOUT, close_fds=True)
 
         def retire_peer():
-            if peer.poll() is None:
-                peer.terminate()
-            peer.wait(timeout=10)
+            # A close-only parent lease also ends the actor if this controller
+            # dies. Join before releasing its diagnostics and fake target files.
+            try:
+                peer.stdin.close()
+            finally:
+                peer.wait()
         self.addCleanup(retire_peer)
-        deadline = time.monotonic() + 15
         while not peer_report.exists():
-            if peer.poll() is not None or time.monotonic() >= deadline:
+            if peer.poll() is not None:
                 peer_readiness_failure(peer, peer_log)
             time.sleep(0.02)
         target = json.loads(peer_report.read_text())
         self.assertEqual(target['pid'], peer.pid)
         api = escape_helpers['Escapes'](native, primitives, ExtendedStartups, ProcessInfos)
+        # Enter retirement before any worker lease: TestCase cleanup then
+        # releases those leases before joining their retained native identities.
+        worker_retirement = self.enterContext(ExitStack())
         # Kernel identity plus real memory/handle controls prove the target and
         # helpers work for the unrestricted same-user broker before denial tests.
         process = native.check(native.open_process(
@@ -4943,27 +5412,31 @@ class AppContainerTests(unittest.TestCase):
 
             def run_schtasks(*arguments):
                 result = subprocess.run([schtasks, *arguments], capture_output=True,
-                                        text=True, timeout=30)
+                                        text=True)
                 self.assertEqual(result.returncode, 0, '%s: %s%s' % (
                     ' '.join(arguments), result.stdout, result.stderr))
                 return result
 
+            with ExitStack() as retirement, escape_helpers['witness_lease'](
+                    native, primitives['Overlapped'], workspace) as lease:
+                request_path.write_text(json.dumps({'manifest': str(manifest),
+                                                    'report': str(control_report), 'lease': lease}))
+                run_schtasks('/Run', '/TN', task_name)
+                deadline = time.monotonic() + 20
+                while not control_report.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('scheduled-task control witness did not report')
+                    time.sleep(0.05)
+                control = verify_task_route(
+                    control_report, owner, native, api, cleanup=retirement.callback)
+                print(json.dumps({'scheduled_task_control': control}), flush=True)
+            # Reaping the action does not itself acknowledge the scheduler's
+            # IgnoreNew slot. Observe that slot before retargeting the request.
+            api.wait_task_idle(task_name)
+            task_lease = self.enterContext(escape_helpers['witness_lease'](
+                native, primitives['Overlapped'], workspace))
             request_path.write_text(json.dumps({'manifest': str(manifest),
-                                                'report': str(control_report)}))
-            run_schtasks('/Run', '/TN', task_name)
-            deadline = time.monotonic() + 20
-            while not control_report.exists():
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('scheduled-task control witness did not report')
-                time.sleep(0.05)
-            control = verify_task_route(control_report, owner, native, api)
-            print(json.dumps({'scheduled_task_control': control}), flush=True)
-            # The witness self-exits ten seconds after publishing; wait it out
-            # so a still-running instance cannot mask the worker attempt.
-            time.sleep(12)
-            # Retarget the fixed bootstrap at the worker-attempt report.
-            request_path.write_text(json.dumps({'manifest': str(manifest),
-                                                'report': str(task_report)}))
+                                                'report': str(task_report), 'lease': task_lease}))
         # Per-user local COM server (arm 1, no admin): register, prove the
         # route is live and dangerous via an unrestricted control activation,
         # then retarget the registration at the worker-attempt report. If the
@@ -4972,27 +5445,28 @@ class AppContainerTests(unittest.TestCase):
         com_report = root / ('com-report-' + uuid.uuid4().hex + '.json')
         clsid = '{%s}' % uuid.uuid4()
 
-        def com_witness(report):
+        def com_witness(report, lease):
             return subprocess.list2cmdline(
                 [sys.executable, '-I', '-u', __file__, '--launch-witness',
-                 str(manifest), str(report)])
+                 str(manifest), str(report), lease])
 
-        register_user_com_server(clsid, com_witness(com_control_report))
-        self.addCleanup(unregister_user_com_server, clsid)
         escapes = Path(__file__).with_name('windows_escapes.py')
         # Each live route arms one independent worker attempt with its own
         # per-arm report; no arm substitutes for another.
         com_targets = []
-        payload, detail = activate_and_observe(
-            [sys.executable, '-I', '-u', str(escapes), '--com-activate', clsid],
-            com_control_report, owner, native, api)
+        with ExitStack() as retirement, escape_helpers['witness_lease'](
+                native, primitives['Overlapped'], workspace) as lease:
+            register_user_com_server(clsid, com_witness(com_control_report, lease))
+            self.addCleanup(unregister_user_com_server, clsid)
+            payload, detail = activate_and_observe(
+                [sys.executable, '-I', '-u', str(escapes), '--com-activate', clsid],
+                com_control_report, owner, native, api, cleanup=retirement.callback)
         if payload is not None:
             print(json.dumps({'com_control': payload, 'scope': 'user'}),
                   flush=True)
-            # Wait out the control witness so a live instance cannot mask the
-            # worker attempt, then retarget the registration.
-            time.sleep(12)
-            register_user_com_server(clsid, com_witness(com_report))
+            com_lease = self.enterContext(escape_helpers['witness_lease'](
+                native, primitives['Overlapped'], workspace))
+            register_user_com_server(clsid, com_witness(com_report, com_lease))
             com_targets.append({'name': 'user', 'clsid': clsid,
                                 'report': str(com_report)})
         else:
@@ -5027,12 +5501,15 @@ class AppContainerTests(unittest.TestCase):
                     com_request = Path(machine[request_field])
                     control_report_path = root / (
                         'com-' + scope + '-control-' + uuid.uuid4().hex + '.json')
-                    com_request.write_text(json.dumps(
-                        {'manifest': str(manifest),
-                         'report': str(control_report_path)}))
-                    payload, detail = activate_and_observe(
-                        [sys.executable, '-I', '-u', str(escapes), '--com-activate',
-                         machine_cls], control_report_path, owner, native, api)
+                    with ExitStack() as retirement, escape_helpers['witness_lease'](
+                            native, primitives['Overlapped'], workspace) as lease:
+                        com_request.write_text(json.dumps(
+                            {'manifest': str(manifest),
+                             'report': str(control_report_path), 'lease': lease}))
+                        payload, detail = activate_and_observe(
+                            [sys.executable, '-I', '-u', str(escapes), '--com-activate',
+                             machine_cls], control_report_path, owner, native, api,
+                            cleanup=retirement.callback)
                     if payload is None:
                         print(json.dumps({'com_setup': 'control-failed',
                                           'scope': scope,
@@ -5040,15 +5517,17 @@ class AppContainerTests(unittest.TestCase):
                         continue
                     print(json.dumps({'com_control': payload, 'scope': scope}),
                           flush=True)
-                    time.sleep(12)
-                    # The comparison arms are control-only; only the full
+                    # Release/join the control before reusing this registration.
+                    # Comparison arms remain control-only; only the full
                     # AppID+LaunchPermission arm arms a worker attempt.
                     if scope == 'machine':
                         machine_report = root / (
                             'com-machine-report-' + uuid.uuid4().hex + '.json')
+                        machine_lease = self.enterContext(escape_helpers['witness_lease'](
+                            native, primitives['Overlapped'], workspace))
                         com_request.write_text(json.dumps(
                             {'manifest': str(manifest),
-                             'report': str(machine_report)}))
+                             'report': str(machine_report), 'lease': machine_lease}))
                         com_targets.append({'name': scope, 'clsid': machine_cls,
                                             'report': str(machine_report)})
         manifest.write_text(json.dumps({'secret': str(secret),
@@ -5064,13 +5543,10 @@ class AppContainerTests(unittest.TestCase):
                 retained = []
 
                 def observe(root_process, job):
-                    deadline = time.monotonic() + 20
                     reports = [directory / ('ready-%d' % i) for i in range(3)]
                     while not all(path.exists() for path in reports):
                         if native.wait(root_process, 0) != 258:
                             raise RuntimeError('cleanup root exited before readiness')
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError('cleanup tree readiness timed out')
                         time.sleep(0.02)
                     for path in reports[1:]:
                         pid = int(path.read_text())
@@ -5096,11 +5572,11 @@ class AppContainerTests(unittest.TestCase):
                     code = native.launch(
                         [sys.executable, '-I', '-u', __file__, '--cleanup-tree',
                          str(directory), '0'], sid, directory, root / (mode + '.log'),
-                        observe=observe)
+                        observe=observe, deadline=float('inf'))
                     self.assertEqual(code, 1 if mode == 'terminated-root' else 0)
                     # launch() has closed its job. Observe death before fallback
                     # retirement or the administrative account-wide sweep.
-                    states = [native.wait(handle, 5000) for handle in retained]
+                    states = [native.wait(handle, 0xffffffff) for handle in retained]
                     print(json.dumps({'cleanup': mode, 'descendant_waits': states}),
                           flush=True)
                     self.assertEqual(states, [0, 0])
@@ -5118,16 +5594,16 @@ class AppContainerTests(unittest.TestCase):
             directory.mkdir()
             report = root / 'broker-death.json'
             broker_log = open(root / 'broker-death-broker.log', 'w+b')
+            self.addCleanup(broker_log.close)
             sub_broker = subprocess.Popen(
                 [sys.executable, '-I', '-u', __file__, '--broker-death',
                  str(directory), package, str(report)],
-                stdin=subprocess.DEVNULL, stdout=broker_log,
+                stdin=subprocess.PIPE, stdout=broker_log,
                 stderr=subprocess.STDOUT, close_fds=True)
             retained = []
             try:
-                deadline = time.monotonic() + 30
                 while not report.exists():
-                    if sub_broker.poll() is not None or time.monotonic() >= deadline:
+                    if sub_broker.poll() is not None:
                         broker_log.flush()
                         broker_log.seek(0)
                         self.fail('broker-death sub-broker did not report; log: %s'
@@ -5155,19 +5631,20 @@ class AppContainerTests(unittest.TestCase):
                     PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, sub_broker.pid))
                 try:
                     native.check(native.terminate(broker_handle, 1))
-                    sub_broker.wait(timeout=10)
+                    sub_broker.wait()
                 finally:
                     api.close(broker_handle)
                 # Every broker handle, including its job, is gone now: the tree
                 # must die with no finally path and before any fallback sweep.
-                states = [native.wait(handle, 10000) for handle in retained]
+                states = [native.wait(handle, 0xffffffff) for handle in retained]
                 print(json.dumps({'cleanup': 'broker-death',
                                   'descendant_waits': states}), flush=True)
                 self.assertEqual(states, [0, 0, 0])
             finally:
+                sub_broker.stdin.close()
                 if sub_broker.poll() is None:
                     sub_broker.terminate()
-                sub_broker.wait(timeout=10)
+                sub_broker.wait()
                 broker_log.close()
                 with ExitStack() as cleanup:
                     for handle in retained:
@@ -5180,15 +5657,11 @@ class AppContainerTests(unittest.TestCase):
             def observe(root_process, job):
                 # Let creation and shutdown genuinely overlap: only require the
                 # root plus a handful of recorded children before terminating.
-                deadline = time.monotonic() + 20
                 ready = directory / 'ready-0'
-                track = directory / 'race-pids'
-                while (not ready.exists() or not track.exists() or
-                       len(track.read_text().splitlines()) < 5):
+                while (not ready.exists() or
+                       len(list(directory.glob('race-child-*.json'))) < 5):
                     if native.wait(root_process, 0) != 258:
                         raise RuntimeError('race root exited before children')
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError('race tree readiness timed out')
                     time.sleep(0.01)
                 native.check(native.terminate(root_process, 1))
 
@@ -5196,26 +5669,44 @@ class AppContainerTests(unittest.TestCase):
                 code = native.launch(
                     [sys.executable, '-I', '-u', __file__, '--race-tree',
                      str(directory), '0'], sid, directory,
-                    root / 'shutdown-race.log', observe=observe)
+                    root / 'shutdown-race.log', observe=observe, deadline=float('inf'))
                 self.assertEqual(code, 1)
-                # launch() has returned, so its job is closed. Any recorded
-                # child that is still alive survived creation racing shutdown.
-                pids = [int(value) for value in
-                        (directory / 'race-pids').read_text().split()]
-                survivors = []
-                for pid in pids:
-                    handle = native.open_process(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, pid)
+                # Job closure must finish the indefinitely held actors. A PID
+                # opened after the race may have been reused: only the recorded
+                # creation identity and package may enter fallback retirement.
+                identities = [json.loads(path.read_text())
+                              for path in directory.glob('race-child-*.json')]
+                states = []
+                already_gone = []
+                for identity in identities:
+                    pid = identity['pid']
+                    handle = native.open_process(
+                        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, pid)
                     if not handle:
+                        error = C.get_last_error()
+                        if error != 87:  # Invalid PID proves absence; access denial does not.
+                            raise C.WinError(error)
+                        already_gone.append(pid)
                         continue
+                    transferred = False
                     try:
-                        if native.wait(handle, 3000) != 0:
-                            survivors.append(pid)
+                        if api.creation_time(handle) != identity['creation']:
+                            already_gone.append(pid)
+                            continue
+                        self.assertEqual(native.app_identity(handle), (1, package))
+                        retained.append(handle)
+                        transferred = True
+                        states.append([pid, native.wait(handle, 0xffffffff)])
                     finally:
-                        api.close(handle)
+                        if not transferred:
+                            api.close(handle)
+                survivors = [pid for pid, state in states if state == 258]
                 print(json.dumps({'cleanup': 'shutdown-race',
-                                  'children': len(pids),
-                                  'survivors': survivors}), flush=True)
+                                  'children': len(identities), 'already_gone': already_gone,
+                                  'descendant_waits': states, 'survivors': survivors}), flush=True)
                 self.assertEqual(survivors, [])
+                self.assertEqual([state for _pid, state in states], [0] * len(retained))
+                self.assertEqual(len(already_gone) + len(retained), len(identities))
             finally:
                 try:
                     diagnostic = root / 'shutdown-race.log'
@@ -5229,16 +5720,19 @@ class AppContainerTests(unittest.TestCase):
         self.assertIsNone(peer.poll(), 'unrestricted target exited before attacks')
 
         def witness_kernel_token(payload):
-            """Inspect a witness process only while verifiably still running."""
+            """Retain a creation-checked live witness through controller release."""
             try:
                 handle = native.check(native.open_process(
-                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, False, payload['pid']))
+                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, payload['pid']))
             except OSError:
                 return None
+            transferred = False
             try:
-                if native.wait(handle, 0) != 258:
-                    # Already exited: this would not be a live inspection.
+                if (native.wait(handle, 0) != 258 or
+                        payload.get('creation') != api.creation_time(handle)):
                     return None
+                worker_retirement.callback(api.reap_witness, handle)
+                transferred = True
                 token = api.token(handle, 8)
                 try:
                     return api.snapshot(token)
@@ -5247,12 +5741,13 @@ class AppContainerTests(unittest.TestCase):
             except OSError:
                 return None
             finally:
-                api.close(handle)
+                if not transferred:
+                    api.close(handle)
 
-        # Live observation during the scenario: witnesses self-exit ten
-        # seconds after publishing, so kernel inspection must happen while
-        # the root process still runs. The observer and the final wait share
-        # one deadline, so observation never extends the launch budget.
+        # Controller leases keep witnesses live for kernel inspection instead
+        # of requiring it before a self-expiry. The existing experiment budget
+        # still governs observation; lease release and native reaping are owned
+        # separately and do not use that budget.
         live_witnesses = {}
         scenario_deadline = time.monotonic() + 90
 
@@ -5363,12 +5858,12 @@ if __name__ == '__main__':
     if len(sys.argv) == 4 and sys.argv[1] == '--peer':
         escape_helpers['peer'](AppContainers(), sys.argv[2], Path(sys.argv[3]))
         sys.exit(0)
-    if len(sys.argv) == 4 and sys.argv[1] == '--launch-witness':
+    if len(sys.argv) == 5 and sys.argv[1] == '--launch-witness':
         native = AppContainers()
         api = escape_helpers['Escapes'](
             native, primitives, ExtendedStartups, ProcessInfos)
         escape_helpers['witness'](api, json.loads(Path(sys.argv[2]).read_text()),
-                                  Path(sys.argv[3]), access_outcome)
+                                  Path(sys.argv[3]), access_outcome, sys.argv[4])
         sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] == '--token-impersonation':
         native = AppContainers()
@@ -5380,11 +5875,11 @@ if __name__ == '__main__':
         sys.exit(0 if report['outcome'] in ['impersonated-contained',
                                             'access-denied'] else 1)
     if len(sys.argv) == 3 and sys.argv[1] in ['--task-witness', '--com-witness']:
-        manifest, report = task_witness(Path(sys.argv[2]))
+        manifest, report, lease = task_witness(Path(sys.argv[2]))
         native = AppContainers()
         api = escape_helpers['Escapes'](
             native, primitives, ExtendedStartups, ProcessInfos)
-        escape_helpers['witness'](api, manifest, report, access_outcome)
+        escape_helpers['witness'](api, manifest, report, access_outcome, lease)
         sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] == '--runtime-gate':
         sys.exit(runtime_gate(sys.argv[2]))

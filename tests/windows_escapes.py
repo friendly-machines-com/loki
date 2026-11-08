@@ -19,14 +19,15 @@ https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/create-method-in-cl
 https://learn.microsoft.com/en-us/windows/win32/wmisdk/wmi-error-constants
   WBEM_E_ACCESS_DENIED is 0x80041003, not a generic WMI failure.
 
-Shell/WMI witnesses only query their own token and attempt a fake-file read.
-They self-exit after ten seconds even if the launching probe loses its handle.
-The administrative CI fixture additionally cleans up this unique user's
-processes; this is cleanup, not part of the confinement claim.
+Shell/WMI/task/COM witnesses only query their own token and attempt a fake-file
+read. A close-only controller lease releases them even if their launcher dies;
+normal controllers separately join the actual native process before cleanup.
+The administrative CI fixture's account sweep is still only a failure backstop,
+never part of the confinement claim.
 """
 
 import base64
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import ctypes as C
 from ctypes import wintypes as W
 import json
@@ -41,6 +42,39 @@ import uuid
 HANDLE = C.c_void_p
 ULONG = C.c_uint32
 LONG = C.c_int32
+
+
+class FileTimes(C.Structure):
+    # The report-based task/COM route must pin a PID to the observed process's
+    # birth, not reopen a possibly reused PID for retirement. Keep native
+    # FILETIME words exact on every host used by the portable ABI tests.
+    _fields_ = [('low', ULONG), ('high', ULONG)]
+
+
+@contextmanager
+def witness_lease(native, overlapped_type, directory):
+    """Own a close-only lifetime for OS-launched diagnostic witnesses.
+
+    Shell/WMI/task/COM cannot all inherit the controller's stdin or root job.
+    A wrapper exit is not witness exit, and a finite self-expiry races kernel
+    inspection. Reuse the probes' byte-range locks: this non-inherited handle
+    holds an exclusive lock until scope exit or controller death. The actor
+    only reads this fresh, non-secret workspace input; no new grant or service
+    is needed. Callers keep process reaping OUTSIDE this lease scope so release
+    always precedes the actual exit join, including inspection failures.
+    """
+    # This is a generated fixture input, not a rewritten manifest operand.
+    # Anchor it because OS-mediated children can start in another directory.
+    path = os.path.join(os.getcwd(), directory, 'witness-lease-' + uuid.uuid4().hex)
+    with open(path, 'xb'):
+        pass
+    with ExitStack() as cleanup:
+        cleanup.callback(os.unlink, path)
+        handle = native.open(path, access=0xC0000000)  # GENERIC_READ | WRITE
+        cleanup.callback(lambda: native.check(native.close(handle)))
+        overlapped = overlapped_type()
+        native.check(native.lock_file(handle, 3, 0, 1, 0, C.byref(overlapped)))
+        yield path
 
 
 class Luids(C.Structure):
@@ -219,6 +253,18 @@ def run_powershell(script, probe, *, timeout=None):
     return result.stdout
 
 
+def powershell_literal(value):
+    """Quote WMI operands and the task-state query without interpolation.
+
+    Windows command-line quoting does not quote a PowerShell source token;
+    preserve the existing typographic-quote handling for both real callers.
+    """
+    value = value.replace("'", "''")
+    for quote in '\u2018\u2019\u201a\u201b':
+        value = value.replace(quote, "' + [char]%d + '" % ord(quote))
+    return "('" + value + "')"
+
+
 class Escapes:
     def __init__(self, native, primitives, startup_type, process_type):
         self.n = native
@@ -247,6 +293,9 @@ class Escapes:
                                   C.POINTER(ShellInfos))
         self.co_initialize = bind(self.ole, 'CoInitializeEx', LONG, HANDLE, ULONG)
         self.co_uninitialize = bind(self.ole, 'CoUninitialize', None)
+        self.process_times = bind(
+            native.kernel, 'GetProcessTimes', W.BOOL, HANDLE,
+            *[C.POINTER(FileTimes) for _ in range(4)])
         self.read_memory = bind(native.kernel, 'ReadProcessMemory', W.BOOL,
                                 HANDLE, HANDLE, HANDLE, C.c_size_t,
                                 C.POINTER(C.c_size_t))
@@ -350,14 +399,31 @@ class Escapes:
         if not self.n.close(handle):
             raise RuntimeError('escape probe CloseHandle failed: %s' % C.get_last_error())
 
+    def creation_time(self, process):
+        values = [FileTimes() for _ in range(4)]
+        self.n.check(self.process_times(process, *[C.byref(value) for value in values]))
+        # Two JSON integers preserve all FILETIME bits without float rounding.
+        return [values[0].low, values[0].high]
+
+    def reap_witness(self, process):
+        # The launcher's inner lease scope has already ended. This is a native
+        # exit observation, not a grace period or evidence from a closed pipe.
+        try:
+            state = self.n.wait(process, 0xffffffff)
+            if state != 0:
+                raise RuntimeError('witness exit observation failed: %s' % state)
+        finally:
+            self.close(process)
+
     def retire(self, process):
-        # For Shell/WMI, token inspection may itself be denied. Still attempt
-        # cleanup; witnesses also have a bounded lifetime independent of us.
+        # Non-witness launch probes still require explicit termination. Their
+        # own native process handle, not an arbitrary join budget, owns reaping.
         try:
             if self.n.wait(process, 0) == 258:
                 self.n.check(self.n.terminate(process, 1))
-                if self.n.wait(process, 10000) != 0:
-                    raise TimeoutError('escape-probe child did not exit')
+                state = self.n.wait(process, 0xffffffff)
+                if state != 0:
+                    raise RuntimeError('escape-probe exit observation failed: %s' % state)
         finally:
             self.close(process)
 
@@ -434,46 +500,68 @@ class Escapes:
                 'pid': child.pid, 'executed': False}
 
     def inspect_witness(self, process, report, owner, package):
+        # The launcher retains this borrowed process outside its lease scope:
+        # inspection/token cleanup finishes, then lease release, then exit join.
         with ExitStack() as cleanup:
-            cleanup.callback(self.retire, process)
             token = self.token(process, TOKEN_QUERY)
             cleanup.callback(self.close, token)
-            # Kernel-query result, not just a witness assertion of identity.
             snapshot = self.snapshot(token)
-            deadline = time.monotonic() + 5
             while not report.exists():
                 if self.n.wait(process, 0) != 258:
                     raise RuntimeError('launch witness exited without a report')
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('launch witness report timed out')
                 time.sleep(0.02)
             payload = json.loads(report.read_text())
+            if (self.n.wait(process, 0) != 258 or
+                    payload['creation'] != self.creation_time(process)):
+                raise RuntimeError('launch witness lifetime/creation identity changed')
             safe = (identity_matches(snapshot, owner, package) and
                     payload['token'] == snapshot and
                     payload['credential_access']['outcome'] == 'access-denied')
             return {'outcome': 'contained' if safe else 'escaped',
                     'token': snapshot, 'witness': payload}
 
+    # Shell/WMI already use the report directory as their child working
+    # directory. Keep the generated controller lease there too, rather than
+    # deriving another directory from the caller's unchanged manifest operand.
     def shell_launch(self, executable, script, manifest, report, owner, package):
         self.n.hresult(self.co_initialize(None, 2 | 4))
         try:
-            info = ShellInfos()
-            info.size = C.sizeof(info)
-            info.mask = (SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
-                         | SEE_MASK_FLAG_NO_UI)
-            info.verb = 'open'
-            info.file = executable
-            info.parameters = subprocess.list2cmdline(
-                ['-I', '-u', script, '--launch-witness', str(manifest), str(report)])
-            info.directory = str(report.parent)
-            info.show = 0
-            self.n.check(self.shell_execute(C.byref(info)))
-            self.created += 1  # Conservatively treat Shell success as launch.
-            if not info.process:
-                raise RuntimeError('ShellExecute succeeded without inspectable handle')
-            return self.inspect_witness(info.process, report, owner, package)
+            with ExitStack() as retirement:
+                with witness_lease(self.n, self.primitives['Overlapped'],
+                                   report.parent) as lease:
+                    info = ShellInfos()
+                    info.size = C.sizeof(info)
+                    info.mask = (SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+                                 | SEE_MASK_FLAG_NO_UI)
+                    info.verb = 'open'
+                    info.file = executable
+                    info.parameters = subprocess.list2cmdline(
+                        ['-I', '-u', script, '--launch-witness', str(manifest), str(report), lease])
+                    info.directory = str(report.parent)
+                    info.show = 0
+                    self.n.check(self.shell_execute(C.byref(info)))
+                    self.created += 1  # Conservatively treat Shell success as launch.
+                    if not info.process:
+                        raise RuntimeError('ShellExecute succeeded without inspectable handle')
+                    retirement.callback(self.reap_witness, info.process)
+                    return self.inspect_witness(info.process, report, owner, package)
         finally:
             self.co_uninitialize()
+
+    def wait_task_idle(self, name):
+        # IgnoreNew is a scheduler-instance policy, not just a process lifetime.
+        # After reaping the control witness, observe the actual task slot before
+        # retargeting its request; another settling sleep would prove nothing.
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  '$task = Get-ScheduledTask -TaskName ' + powershell_literal(name) + '\n'
+                  '[Console]::Out.WriteLine([int]$task.State)\n')
+        while True:
+            state = int(run_powershell(script, 'task-state').strip())
+            if state == 3:  # TASK_STATE_READY
+                return
+            if state not in [2, 4]:  # Queued/running may still finish normally.
+                raise RuntimeError('task is not runnable: state %s' % state)
+            time.sleep(0.02)
 
     def powershell_startup(self):
         # Same direct-descendant launch, environment and deadline as WMI; no
@@ -489,22 +577,19 @@ class Escapes:
         return {'outcome': 'ready'}
 
     def wmi_launch(self, executable, script, manifest, report, owner, package):
-        command = subprocess.list2cmdline(
-            [executable, '-I', '-u', script, '--launch-witness', str(manifest),
-             str(report)])
-        # The PowerShell process is itself a direct sandbox descendant. Failure
-        # to start PowerShell or produce this protocol is NOT WMI denial evidence.
-        # Single-quoted literals prevent interpolation of paths/arguments. Build
-        # assignments separately so operand text is never a template placeholder.
+        with ExitStack() as retirement:
+            with witness_lease(self.n, self.primitives['Overlapped'],
+                               report.parent) as lease:
+                command = subprocess.list2cmdline(
+                    [executable, '-I', '-u', script, '--launch-witness', str(manifest),
+                     str(report), lease])
+                # The PowerShell process is itself a direct sandbox descendant. Failure
+                # to start PowerShell or produce this protocol is NOT WMI denial evidence.
+                # Single-quoted literals prevent interpolation of paths/arguments. Build
+                # assignments separately so operand text is never a template placeholder.
 
-        def literal(value):
-            value = value.replace("'", "''")
-            # Keep typographic quotes out of PowerShell's string tokenizer.
-            for quote in '\u2018\u2019\u201a\u201b':
-                value = value.replace(quote, "' + [char]%d + '" % ord(quote))
-            return "('" + value + "')"
-        ps = ('$command = ' + literal(command) + '\n$directory = ' +
-              literal(str(report.parent)) + '\n') + r"""
+                ps = ('$command = ' + powershell_literal(command) + '\n$directory = ' +
+                      powershell_literal(str(report.parent)) + '\n') + r"""
 $ErrorActionPreference = 'Stop'
 function Mark-Phase($phase) {
     [Console]::Error.WriteLine($phase)
@@ -527,31 +612,32 @@ try {
     [Console]::Out.Flush()
 }
 """
-        reply = json.loads(run_powershell(ps, 'wmi'))
-        if reply['kind'] == 'exception':
-            status = reply['hresult'] & 0xffffffff
-            if status not in [0x80070005, 0x80041003]:
-                raise RuntimeError('unexpected WMI exception: %r' % reply)
-            return {'outcome': 'access-denied', 'phase': 'wmi-exception',
-                    'reply': reply}
-        if reply['kind'] != 'return':
-            raise RuntimeError('unexpected WMI reply: %r' % reply)
-        if reply['code'] in [2, 3]:
-            return {'outcome': 'access-denied', 'phase': 'wmi-create', 'reply': reply}
-        if reply['code'] == 0:
-            self.created += 1
-        if reply['code'] != 0 or reply['pid'] <= 0:
-            raise RuntimeError('unexpected WMI creation result: %r' % reply)
-        # QUERY_LIMITED_INFORMATION | SYNCHRONIZE | TERMINATE. Failure here is
-        # an uninspectable successful launch, NOT evidence WMI denied creation.
-        process = self.n.open_process(
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
-            | PROCESS_TERMINATE, False, reply['pid'])
-        if not process:
-            error = C.get_last_error()
-            raise RuntimeError('WMI created pid %s; inspection failed: %s' %
-                               (reply['pid'], error))
-        return self.inspect_witness(process, report, owner, package)
+                reply = json.loads(run_powershell(ps, 'wmi'))
+                if reply['kind'] == 'exception':
+                    status = reply['hresult'] & 0xffffffff
+                    if status not in [0x80070005, 0x80041003]:
+                        raise RuntimeError('unexpected WMI exception: %r' % reply)
+                    return {'outcome': 'access-denied', 'phase': 'wmi-exception',
+                            'reply': reply}
+                if reply['kind'] != 'return':
+                    raise RuntimeError('unexpected WMI reply: %r' % reply)
+                if reply['code'] in [2, 3]:
+                    return {'outcome': 'access-denied', 'phase': 'wmi-create', 'reply': reply}
+                if reply['code'] == 0:
+                    self.created += 1
+                if reply['code'] != 0 or reply['pid'] <= 0:
+                    raise RuntimeError('unexpected WMI creation result: %r' % reply)
+                # Query and synchronize only: lease release retires the actor, so no
+                # termination right is needed. Failure after WMI success remains an
+                # uninspectable launch, never evidence that creation was denied.
+                process = self.n.open_process(
+                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, reply['pid'])
+                if not process:
+                    error = C.get_last_error()
+                    raise RuntimeError('WMI created pid %s; inspection failed: %s' %
+                                       (reply['pid'], error))
+                retirement.callback(self.reap_witness, process)
+                return self.inspect_witness(process, report, owner, package)
 
     def launch_as_user(self, primary, executable, command, startup, child,
                        flags):
@@ -824,9 +910,10 @@ def peer(native, secret, report):
         temporary = report.with_suffix('.tmp')
         temporary.write_text(json.dumps(payload))
         os.replace(temporary, report)
-        # The owning fixture also retains the process and terminates it in
-        # finally; this lifetime bound is not the observer's cleanup evidence.
-        time.sleep(180)
+        # This unrestricted actor already has controller-owned stdin. EOF,
+        # including controller death, releases its marker/handle without a
+        # finite keepalive or an unowned indefinitely parked process.
+        sys.stdin.buffer.read()
     finally:
         native.check(native.close(handle))
 
@@ -906,22 +993,36 @@ def impersonation(api, manifest, classify):
         api.close(source)
 
 
-def witness(api, manifest, report, classify):
-    import os
-    token = api.token(api.n.current_process(), TOKEN_QUERY)
-    try:
-        snapshot = api.snapshot(token)
-    finally:
-        api.close(token)
-    outcome = classify('witness-credential-read',
-                       lambda: (Path(manifest['secret']) / 'read').read_bytes())
-    payload = {'pid': os.getpid(), 'token': snapshot, 'credential_access': outcome}
-    temporary = report.with_suffix('.tmp')
-    temporary.write_text(json.dumps(payload))
-    os.replace(temporary, report)
-    # Bound even a successfully escaped process; no broker/parent survival or
-    # successful TerminateProcess call is required for this payload to exit.
-    time.sleep(10)
+def witness(api, manifest, report, classify, lease):
+    # OS-mediated launches cannot borrow a reliable parent PID or stdin. A
+    # nonblocking shared-lock probe rejects an already-ended controller lease;
+    # after publication, the blocking shared lock ends on controller close/death.
+    # No command channel, new permission, or elapsed self-expiry is involved.
+    with ExitStack() as cleanup:
+        handle = api.n.open(lease)  # Existing input, read-only.
+        cleanup.callback(api.close, handle)
+        overlapped = api.primitives['Overlapped']()
+        C.set_last_error(0)
+        if api.n.lock_file(handle, 1, 0, 1, 0, C.byref(overlapped)):
+            api.n.check(api.n.unlock_file(handle, 0, 1, 0, C.byref(overlapped)))
+            return  # Controller has already ended; do not run a late probe.
+        error = C.get_last_error()
+        if error != 33:  # ERROR_LOCK_VIOLATION is the only live-lease witness.
+            raise C.WinError(error)
+        token = api.token(api.n.current_process(), TOKEN_QUERY)
+        try:
+            snapshot = api.snapshot(token)
+        finally:
+            api.close(token)
+        outcome = classify('witness-credential-read',
+                           lambda: (Path(manifest['secret']) / 'read').read_bytes())
+        payload = {'pid': os.getpid(), 'creation': api.creation_time(api.n.current_process()),
+                   'token': snapshot, 'credential_access': outcome}
+        temporary = report.with_suffix('.tmp')
+        temporary.write_text(json.dumps(payload))
+        os.replace(temporary, report)
+        api.n.check(api.n.lock_file(handle, 0, 0, 1, 0, C.byref(overlapped)))
+        api.n.check(api.n.unlock_file(handle, 0, 1, 0, C.byref(overlapped)))
 
 
 def probe(api, manifest, script, manifest_path, classify):
