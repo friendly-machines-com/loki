@@ -739,7 +739,12 @@ ERROR_PATH_NOT_FOUND = 3
 ERROR_ACCESS_DENIED = 5
 ERROR_SHARING_VIOLATION = 32
 ERROR_BROKEN_PIPE = 109
+ERROR_INSUFFICIENT_BUFFER = 122
+ERROR_ALREADY_EXISTS = 183
 ERROR_NO_DATA = 232
+ERROR_PIPE_NOT_CONNECTED = 233
+ERROR_IO_INCOMPLETE = 996
+ERROR_IO_PENDING = 997
 ERROR_NOT_FOUND = 1168
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 FILE_TYPE_PIPE = 3
@@ -894,7 +899,7 @@ def create_directory(path, *, security_descriptor):
         attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
         if not create(path, ctypes.byref(attributes)):
             status = ctypes.get_last_error()
-            if status == 183:  # ERROR_ALREADY_EXISTS: caller validates the existing object.
+            if status == ERROR_ALREADY_EXISTS:  # caller validates the existing object.
                 return False
             raise WindowsApiError(f'Could not create {path!r}', status=status)
     return True
@@ -1473,7 +1478,7 @@ def create_process_suspended(executable, arguments, package_sid=None,
             # Sizing is documented to fail with ERROR_INSUFFICIENT_BUFFER
             # while filling the size; another failure leaves no usable size.
             initialize(None, attribute_count, 0, ctypes.byref(size))
-            if ctypes.get_last_error() != 122 or not size.value:
+            if ctypes.get_last_error() != ERROR_INSUFFICIENT_BUFFER or not size.value:
                 raise WindowsApiError(
                     "InitializeProcThreadAttributeList sizing failed")
             attribute_storage = ctypes.create_string_buffer(size.value)
@@ -1922,7 +1927,7 @@ class Overlapped(ctypes.Structure):
                 ("hEvent", ctypes.c_void_p)]
 
 
-PIPE_CLOSED_ERRORS = frozenset([109, 232, 233])  # broken/closing/disconnected byte pipe
+PIPE_CLOSED_ERRORS = frozenset([ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED])  # broken/closing/disconnected byte pipe
 
 
 async def _pipe_io(handle, buffer, size, operation):
@@ -1945,13 +1950,13 @@ async def _pipe_io(handle, buffer, size, operation):
     count = wintypes.DWORD()
     if not submit(handle, buffer, size, ctypes.byref(count), ctypes.byref(record)):
         error = ctypes.get_last_error()
-        if error != 997:  # ERROR_IO_PENDING
+        if error != ERROR_IO_PENDING:
             raise WindowsApiError(operation + ' failed', status=error)
 
     async def completed():
         while not result(handle, ctypes.byref(record), ctypes.byref(count), False):
             error = ctypes.get_last_error()
-            if error != 996:  # ERROR_IO_INCOMPLETE; every other result is terminal.
+            if error != ERROR_IO_INCOMPLETE:  # every other result is terminal.
                 return error
             await asyncio.sleep(.01)
         return 0
@@ -1963,7 +1968,7 @@ async def _pipe_io(handle, buffer, size, operation):
         try:
             if not cancel(handle, ctypes.byref(record)):
                 cancel_error = ctypes.get_last_error()
-                if cancel_error == 1168:  # ERROR_NOT_FOUND: completion won cancellation.
+                if cancel_error == ERROR_NOT_FOUND:  # completion won cancellation.
                     cancel_error = 0
         finally:
             # This task itself owns the native record. Resume its terminal

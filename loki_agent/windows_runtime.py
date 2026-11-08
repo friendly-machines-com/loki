@@ -272,7 +272,7 @@ class ContainedProcess:
             result = api.wait_for_single_object(self.information.hProcess, 0)
             if result == api.WAIT_OBJECT_0:
                 self.returncode = api.get_exit_code_process(self.information.hProcess)
-            elif result == 258:  # WAIT_TIMEOUT; do not block the broker loop.
+            elif result == api.WAIT_TIMEOUT:  # do not block the broker loop.
                 await asyncio.sleep(0.02)
             else:
                 raise api.WindowsApiError(f"WaitForSingleObject: {result}")
