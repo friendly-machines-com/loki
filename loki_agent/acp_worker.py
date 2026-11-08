@@ -9,7 +9,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from . import connections, model_requests, paths, savefiles, tool_contracts
+from . import connections, model_requests, paths, savefiles
 from . import (
     acp_commands,
     acps,
@@ -21,8 +21,8 @@ from . import (
     replays,
 )
 from .connections import ConnectionDescriptor, ConnectionDescriptorError
-from .sessions import Session
 from .lifetimes import finish_cleanup
+from .sessions import Session
 
 
 _DISCONNECTED = object()
@@ -74,6 +74,9 @@ class Worker:
         self._option_leaves: dict[str, object] = {}
         self._current_option_value: str | None = None
         self._configuration_error: str | None = None
+        # An uncommitted open is inert, not merely model-less: local commands
+        # and option changes can execute/write logs without leasing credentials.
+        # Prompt/config admission therefore checks this existing approval owner.
         self._pending_open: PendingSessionOpen | None = None
         # Images staged by /image, attached to the next real-turn prompt.
         self._pending_images: list = []
@@ -87,10 +90,8 @@ class Worker:
             try:
                 thinking = self._prepare_prompt(message.get("params") or {})
             except acps.TransportError as error:
-                self.write(acps.response(
-                    request_id,
-                    error={"code": error.code, "message": str(error)},
-                ))
+                self.write(acps.error_response(
+                    request_id, {"code": error.code, "message": str(error)}))
                 return
             self._prompt_task = asyncio.create_task(
                 self._answer(
@@ -138,18 +139,20 @@ class Worker:
                 thinking=thinking,
             )
         except acps.TransportError as error:
-            self.write(acps.response(
-                request_id,
-                error={"code": error.code, "message": str(error)},
-            ))
+            self.write(acps.error_response(
+                request_id, {"code": error.code, "message": str(error)}))
             return
         except Exception as error:
-            self.write(acps.response(
-                request_id,
-                error={"code": acps.INTERNAL_ERROR, "message": str(error)},
-            ))
+            self.write(acps.error_response(
+                request_id, {"code": acps.INTERNAL_ERROR, "message": str(error)}))
             return
-        self.write(acps.response(request_id, result=result))
+        try:
+            self.write(acps.response(request_id, result=result))
+        except acps.TransportError as error:
+            # Encoding failed before any frame byte. The caller receives an
+            # explicit error, not a partial result or a stranded request.
+            self.write(acps.error_response(
+                request_id, {"code": error.code, "message": str(error)}))
 
     async def dispatch(
             self, method: str, params: dict,
@@ -169,6 +172,9 @@ class Worker:
             return await self.prepare_open(params)
         if method == "session/commit_open":
             return self.commit_open()
+        if (self._pending_open is not None
+                and method in ['session/set_config_option', 'session/describe_config_selection']):
+            raise acps.TransportError('session open is awaiting approval', code=acps.INVALID_PARAMS)
         # Describe is the front's first step toward a configuration change.
         # Apply the same active-turn guard there, before the front can ask for
         # approval or persist a pin for a change we would subsequently refuse.
@@ -744,17 +750,6 @@ class Worker:
         finally:
             self._reverse_requests.pop(request_id, None)
 
-    def _ask_advertised_tools(self) -> tuple[list, str | None]:
-        """Tool definitions offered to the model and the withheld name.
-
-        The Ask tool exists for the model exactly when the client can
-        answer it; otherwise it is not advertised at all, so the model is
-        never told about a question tool that would always fail.
-        """
-        if self.can_ask_user:
-            return loki.TOOLS, None
-        return tool_contracts.without_ask_tool(loki.TOOLS), tool_contracts.ASK_TOOL_NAME
-
     async def _ask_user(self, question: str, options: list, *,
                         multi_select: bool = False) -> dict:
         outcome = await self.request_input(
@@ -834,6 +829,8 @@ class Worker:
         if not self.session.active:
             raise acps.TransportError(
                 "This conversation has closed", code=acps.INVALID_PARAMS)
+        if self._pending_open is not None:
+            raise acps.TransportError('session open is awaiting approval', code=acps.INVALID_PARAMS)
         if self._prompt_task is not None and not self._prompt_task.done():
             raise acps.TransportError(
                 "a prompt is already running for this session",

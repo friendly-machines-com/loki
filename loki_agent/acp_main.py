@@ -32,6 +32,7 @@ async def amain(credentials: CredentialStore) -> int:
         acps.quarantine_stdout()
         write = acps.make_writer(saved_stdout)
     finally:
+        # make_writer owns its own copy, not this temporary quarantine loan.
         os.close(saved_stdout)
     reader = acps.AsyncFdLineReader(0)
 
@@ -41,17 +42,9 @@ async def amain(credentials: CredentialStore) -> int:
             if not line:
                 continue
             try:
-                import json
-                message = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                write(acps.response(
-                    None, error={"code": acps.PARSE_ERROR,
-                                 "message": str(error)}))
-                continue
-            if not isinstance(message, dict):
-                write(acps.response(
-                    None, error={"code": acps.PARSE_ERROR,
-                                 "message": "not a JSON object"}))
+                message = acps.decode_message(raw_line)
+            except acps.TransportError as error:
+                write(acps.error_response(None, {'code': error.code, 'message': str(error)}))
                 continue
             yield message
 
@@ -60,8 +53,13 @@ async def amain(credentials: CredentialStore) -> int:
         front = Front(read, write, credentials, storage)
         await front.run()
         return 0
+    except acps.MessageTooLarge as error:
+        write(acps.error_response(None, {'code': acps.INVALID_REQUEST, 'message': str(error)}))
+        return 2
     finally:
         try:
+            # The generator can be suspended at yield when routing/write fails.
+            # Its outer owner must join input retirement before returning.
             await finish_cleanup(reader.aclose(), preserve_failure=sys.exc_info()[0] is not None)
         finally:
             storage.close()

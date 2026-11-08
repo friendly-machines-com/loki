@@ -25,6 +25,7 @@ from . import (
     runtime_isolation,
     savefiles,
     paths,
+    streams,
 )
 from .connections import (
     ConnectionDescriptor,
@@ -32,7 +33,6 @@ from .connections import (
     connection_display_fields,
 )
 from .credentials import CredentialStore
-from . import streams
 from .lifetimes import finish_cleanup
 # The Ask bounds are the tool's public contract and live with the tool
 # definition; the front validates against the same values instead of
@@ -105,9 +105,7 @@ class WorkerChannel:
         self._pending[request_id] = future
         try:
             message = acps.request(request_id, method, params)
-            encoded = (
-                json.dumps(message, ensure_ascii=False) + "\n"
-            ).encode("utf-8")
+            encoded = acps.encode_message(message)
             async with self._write_lock:
                 if self._closed or self.process.stdin is None:
                     raise acps.TransportError(
@@ -127,9 +125,11 @@ class WorkerChannel:
         receive the answer, and its pending request future dies with the
         reader's failure fanout.
         """
-        encoded = (
-            json.dumps(acps.response(request_id, result=result, error=error),
-                       ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            encoded = acps.encode_message(acps.response(request_id, result=result, error=error))
+        except acps.TransportError as failure:
+            encoded = acps.encode_message(acps.error_response(
+                request_id, {'code': failure.code, 'message': str(failure)}))
         try:
             async with self._write_lock:
                 if self._closed or self.process.stdin is None:
@@ -207,6 +207,10 @@ class WorkerChannel:
         except (BrokenPipeError, ConnectionError, OSError) as error:
             failure = acps.TransportError(
                 f"worker channel for {self.session_id} failed: {error}")
+        except ValueError as error:
+            # A retained over-limit line cannot be retried. Retire this channel
+            # and fail its requests through the normal owner, not a reader crash.
+            failure = acps.TransportError(f'worker emitted an invalid ACP frame: {error}')
         finally:
             self._closed = True
             try:
@@ -368,7 +372,7 @@ class Front:
             print(f"ACP notification {message.get('method')!r} failed: "
                   f"{error!r}", file=sys.stderr)
         else:
-            self.write(acps.response(message["id"], error={
+            self.write(acps.error_response(message["id"], {
                 "code": getattr(error, "code", acps.INTERNAL_ERROR),
                 "message": str(error),
             }))
@@ -578,7 +582,7 @@ class Front:
         updates = None
         if isinstance(result, dict):
             updates = result.pop("lokiUpdates", None)
-        self.write(acps.response(request_id, result=result))
+        outgoing = [acps.response(request_id, result=result)]
         if updates:
             # The client learns the session before commands and current plan.
             # These are fresh state, not conversation replay on resume.
@@ -588,10 +592,26 @@ class Front:
                 session_id = (message.get("params") or {}).get("sessionId")
             if isinstance(session_id, str) and session_id:
                 for update in updates:
-                    self.write(acps.notification("session/update", {
+                    outgoing.append(acps.notification("session/update", {
                         "sessionId": session_id,
                         "update": update,
                     }))
+        try:
+            # Check the whole publication before acknowledging success. The
+            # client's id/envelope can make a worker-sized result too large.
+            for packet in outgoing:
+                for _encoded in acps.encoded_messages(packet):
+                    del _encoded
+        except acps.TransportError as error:
+            if owner is not None and (method == 'session/new' or method in RESTORE_METHODS):
+                owner.state = 'closing'
+                # This open operation is itself owned by owner.tasks; do not
+                # join it through _begin_close while retiring failed publication.
+                await finish_cleanup(self._finish_close(owner, []), preserve_failure=True)
+            self._error(message, error)
+            return
+        for packet in outgoing:
+            self.write(packet)
 
     async def dispatch(
             self, method: str, params: dict, request_id=None,

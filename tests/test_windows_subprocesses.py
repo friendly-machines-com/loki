@@ -400,6 +400,9 @@ class WorkerCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_normal_exit_releases_handles_once(self):
         await self.exercise()
 
+    async def test_worker_pipe_accepts_frames_larger_than_the_stdio_default(self):
+        await self.exercise(large_output=True)
+
     async def test_local_roles_keep_cwd_and_capture_three_streams(self):
         for owning in [True, False]:
             with self.subTest(owning=owning):

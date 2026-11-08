@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 
-from . import host_ipc, host_process, streams
+from . import acps, host_ipc, host_process, streams
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +217,7 @@ else:
                        "--credential-directory-fd", str(directory_fd)]
             logger.debug("worker command: %r", command)
             return await _create_posix_process(
-                delegation, *command,
+                delegation, *command, limit=acps.MAX_MESSAGE_BYTES,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=None,

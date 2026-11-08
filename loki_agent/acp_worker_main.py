@@ -72,7 +72,6 @@ async def _serve_connected_runtime(runtime, write):
             )
             return 2
 
-        import json
         reader = acps.AsyncFdLineReader(0)
         try:
             async for raw_line in reader:
@@ -80,20 +79,9 @@ async def _serve_connected_runtime(runtime, write):
                 if not line:
                     continue
                 try:
-                    message = json.loads(line)
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    write(acps.response(
-                        None,
-                        error={
-                            "code": acps.PARSE_ERROR,
-                            "message": str(error),
-                        }))
-                    continue
-                if not isinstance(message, dict):
-                    write(acps.response(
-                        None,
-                        error={"code": acps.PARSE_ERROR,
-                               "message": "not a JSON object"}))
+                    message = acps.decode_message(raw_line)
+                except acps.TransportError as error:
+                    write(acps.error_response(None, {'code': error.code, 'message': str(error)}))
                     continue
                 # Keep reading while a prompt task runs so cancellation does
                 # not queue behind the operation it is meant to interrupt.
@@ -105,6 +93,9 @@ async def _serve_connected_runtime(runtime, write):
                     worker.resolve_reverse(message["id"], message)
                     continue
                 await worker.handle(message, concurrent=True)
+        except acps.MessageTooLarge as error:
+            write(acps.error_response(None, {'code': acps.INVALID_REQUEST, 'message': str(error)}))
+            return 2
         finally:
             try:
                 # Handler/write failure happens outside readline's own cleanup.

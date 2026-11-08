@@ -33,7 +33,7 @@ import sys
 import warnings
 
 from . import windows_api as api
-from . import windows_runtime, host_ipc, streams
+from . import windows_runtime, host_ipc, streams, acps
 from .lifetimes import finish_cleanup
 
 PIPE = subprocess.PIPE
@@ -540,7 +540,7 @@ async def create_worker_process(*, workspace, environment, arguments,
     transport = None
     try:
         loop = asyncio.get_running_loop()
-        protocol = streams.ProcessProtocol(limit=64 * 1024)
+        protocol = streams.ProcessProtocol(limit=acps.MAX_MESSAGE_BYTES)
         waiter = loop.create_future()
         transport = ContainedWorkerTransport(
             loop, protocol, native=native, workspace=workspace, environment=environment,

@@ -24,6 +24,109 @@ class TransportError(Exception):
         self.code = code
 
 
+# ACP carries prompts/catalogs, unlike small credential RPC. The public budget
+# counts UTF-8 JSON bytes before LF; both subprocess backends use this same bound.
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+
+
+class MessageTooLarge(TransportError):
+    def __init__(self):
+        super().__init__(f'ACP message exceeds the {MAX_MESSAGE_BYTES}-byte limit')
+
+
+def encode_message(message: dict) -> bytes:
+    """Encode one bounded frame before writing any part of it."""
+    data = bytearray()
+    try:
+        for piece in json.JSONEncoder(ensure_ascii=False).iterencode(message):
+            remaining = MAX_MESSAGE_BYTES - len(data)
+            if len(piece) > remaining:
+                raise MessageTooLarge()
+            encoded = piece.encode('utf-8')
+            if len(encoded) > remaining:
+                raise MessageTooLarge()
+            data.extend(encoded)
+    except (ValueError, TypeError, RecursionError) as error:
+        raise TransportError('ACP message cannot be encoded as UTF-8 JSON') from error
+    data.append(10)
+    return bytes(data)
+
+
+def error_response(request_id, error: dict) -> dict:
+    """An error must fit too, even when its original diagnostic/id cannot."""
+    message = response(request_id, error=error)
+    try:
+        encode_message(message)
+        return message
+    except TransportError as failure:
+        bounded = {'code': INTERNAL_ERROR, 'message': str(failure)}
+    message = response(request_id, error=bounded)
+    try:
+        encode_message(message)
+    except TransportError:
+        message = response(None, error={
+            'code': INVALID_REQUEST,
+            'message': 'ACP request identifier cannot fit a bounded response'})
+    return message
+
+
+def decode_message(raw: bytes) -> dict:
+    """Decode a frame and reject unanswerable requests before admission.
+
+    An id must leave room for an error reply, not only an unusually compact
+    input. Otherwise a valid-sized request could execute yet be unreportable.
+    """
+    if len(raw) - int(raw.endswith(b'\n')) > MAX_MESSAGE_BYTES:
+        raise MessageTooLarge()
+    try:
+        message = json.loads(raw.decode('utf-8'))
+    except (ValueError, RecursionError) as error:
+        raise TransportError(str(error), code=PARSE_ERROR) from error
+    if not isinstance(message, dict):
+        raise TransportError('not a JSON object', code=PARSE_ERROR)
+    request_id = message.get('id')
+    if message.get('method') is not None and request_id is not None:
+        probe = error_response(request_id, {
+            'code': INTERNAL_ERROR, 'message': str(MessageTooLarge())})
+        if probe['id'] is None:
+            raise TransportError(
+                'ACP request identifier cannot fit a bounded response', code=INVALID_REQUEST)
+    return message
+
+
+def encoded_messages(message: dict):
+    """Split only append-defined text updates; never split structured snapshots.
+
+    Replay, live events and local-command output share this wire policy. Six
+    bytes per character bounds JSON escapes as well as four-byte UTF-8, leaving
+    the measured envelope intact. Callers' dictionaries/text remain unchanged.
+    """
+    params = message.get('params')
+    update = params.get('update') if isinstance(params, dict) else None
+    content = update.get('content') if isinstance(update, dict) else None
+    text = content.get('text') if isinstance(content, dict) else None
+    if (message.get('method') != 'session/update' or 'id' in message
+            or not isinstance(params, dict) or not isinstance(update, dict)
+            or not isinstance(content, dict) or not isinstance(text, str) or content.get('type') != 'text'
+            or update.get('sessionUpdate') not in [
+                'user_message_chunk', 'agent_message_chunk', 'agent_thought_chunk']):
+        yield encode_message(message)
+        return
+    packet, params, update, content = dict(message), dict(params), dict(update), dict(content)
+    packet['params'], params['update'], update['content'] = params, update, content
+    content['text'] = ''
+    envelope = len(encode_message(packet)) - 1
+    room = MAX_MESSAGE_BYTES - envelope
+    if text and room == 0:
+        raise MessageTooLarge()
+    count = max(1, room // 6)
+    if not text:
+        yield encode_message(packet)
+    for start in range(0, len(text), count):
+        content['text'] = text[start:start + count]
+        yield encode_message(packet)
+
+
 class AsyncFdLineReader:
     """Read lines from a Unix fd through event-loop readiness notifications.
 
@@ -46,7 +149,7 @@ class AsyncFdLineReader:
         # Accepted raw bytes outlive a cancelled wakeup or reader-thread join.
         # Framing, including partial prefixes and EOF, has one shared owner.
         self._chunks = asyncio.Queue(maxsize=1)
-        self._reader = BufferedReader(self._receive, limit=None)
+        self._reader = BufferedReader(self._receive, limit=MAX_MESSAGE_BYTES)
 
     async def readline(self) -> bytes:
         if self._reading:
@@ -54,6 +157,11 @@ class AsyncFdLineReader:
         self._reading = True
         try:
             return await self._reader.readline()
+        except ValueError as error:
+            # A limit failure is terminal: retrying the same retained buffer
+            # cannot make progress, and a native producer may be backpressured.
+            await finish_cleanup(self.aclose(), preserve_failure=True)
+            raise MessageTooLarge() from error
         finally:
             self._reading = False
 
@@ -138,18 +246,17 @@ class AsyncFdLineReader:
 
 
 def make_writer(fd: int):
-    """Line-buffered writer for one JSON-RPC message per line.
+    """Write checked JSON frames; only append-defined text can span messages.
 
-    Payload and delimiter are separate writes: no concatenation means no
-    second copy of a potentially large message, and the newline doubles
-    as the flush marker.
+    A frame is fully size-checked before its first byte, so callers can report
+    an oversized structured result without leaving a partial JSON line behind.
     """
     stream = os.fdopen(os.dup(fd), "w", encoding="utf-8", buffering=1)
 
     def write(message: dict) -> None:
-        stream.write(json.dumps(message, ensure_ascii=False))
-        stream.write("\n")
-        stream.flush()
+        for encoded in encoded_messages(message):
+            stream.write(encoded.decode('utf-8'))
+            stream.flush()
 
     return write
 
@@ -177,6 +284,7 @@ def request(request_id, method: str, params: dict) -> dict:
 
 
 PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603

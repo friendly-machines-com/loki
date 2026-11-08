@@ -424,6 +424,20 @@ exists. A broken hook stops recovery rather than retrying itself.
 To disable retries, remove the `[hook.turn_error.retry]` section and restart
 Loki or your ACP agent.
 
+## ACP message limits
+
+ACP messages are limited to **16 MiB of UTF-8 JSON before the newline**, on
+both the client/front and front/worker channels. Clients must support this
+budget; it is not the subprocess library's usual 64 KiB line limit.
+Loki divides user, assistant and thought text updates into complete messages
+without dropping text. Structured results such as model-option lists are not
+silently truncated: an oversized result produces an explicit RPC error.
+A result-size failure does not promise that an operation's effects were rolled
+back, so do not automatically replay a mutating request. Oversized input lines
+produce a protocol error and close their channel; identifiers that cannot leave
+room for an error response are rejected before dispatch with a null-id error.
+The limit bounds individual wire frames, not an entire conversation's memory.
+
 ## Saved sessions
 
 Chat logs save the conversation, selected model, connection settings, and other
