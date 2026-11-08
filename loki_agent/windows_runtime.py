@@ -333,10 +333,10 @@ def terminate_job(job):
 
 
 class ContainedProcess:
-    """Own a child and its runtime-lifetime or ordinary-tool family job.
+    """Own a child and its runtime-lifetime or ordinary-tool UI job.
 
-    A tool's family job has no kill-on-close limit; the enclosing runtime job
-    still owns root shutdown. Runtime owners
+    A tool's leaf job has no kill-on-close limit: it separates window handles,
+    while the enclosing runtime job still owns root shutdown. Runtime owners
     keep their existing kill-on-close lifetime. No job handle crosses to tools.
     """
 
@@ -385,9 +385,9 @@ class ContainedProcess:
             self.release_leader()
 
     def close_family(self):
-        # Ordinary family jobs deliberately lack kill-on-close. Only the
-        # runtime's enclosing job supplies root-shutdown lifetime; releasing
-        # this control reference must not terminate surviving descendants.
+        # Tool UI jobs deliberately lack kill-on-close. Their limits remain on
+        # associated descendants after this handle closes; only the runtime's
+        # enclosing job supplies the existing root-shutdown lifetime.
         job, self.job = self.job, None
         if job is not None:
             api.close_handle(job)
@@ -423,12 +423,19 @@ def duplicate_handle(handle, *, inheritable):
     return result.value
 
 
-def _prepare_local_job(process):
-    """Own this launch's family without changing its UI restrictions."""
+def _prepare_local_job(process, *, restrict_ui):
+    """Own this launch's family; separate ordinary contained tools' UI too."""
+    # File/token write restrictions do not prevent window messaging on a shared
+    # desktop. Native controls demonstrated a filtered tool invoking a synthetic
+    # writer's window handler, which then wrote state with the writer's authority.
+    # Keep tools and their descendants in a different UI job from owning runtimes;
+    # restrict it before resume so DLL initializers cannot use that route either.
     create = api.bind('kernel32', 'CreateJobObjectW', ctypes.c_void_p,
                       ctypes.c_void_p, wintypes.LPCWSTR)
     assign = api.bind('kernel32', 'AssignProcessToJobObject', wintypes.BOOL,
                       ctypes.c_void_p, ctypes.c_void_p)
+    restrict = api.bind('kernel32', 'SetInformationJobObject', wintypes.BOOL,
+                        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
     query = api.bind('kernel32', 'QueryInformationJobObject', wintypes.BOOL,
                      ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
                      ctypes.POINTER(wintypes.DWORD))
@@ -438,10 +445,13 @@ def _prepare_local_job(process):
         job = _checked(create(None, None), 'CreateJobObjectW')
         cleanup.callback(api.close_handle, job)
         # Assignment to an additional job requires no UI limits on that destination.
-        # The child remains suspended throughout assignment and checks;
+        # The child remains suspended throughout assignment, restriction and checks;
         # this is not the obsolete run-then-restrict readiness-file construction.
         _checked(assign(job, process.information.hProcess), 'AssignProcessToJobObject')
-        limits = ctypes.c_uint32(0)
+        limits = ctypes.c_uint32(1 if restrict_ui else 0)  # JOB_OBJECT_UILIMIT_HANDLES
+        if restrict_ui:
+            _checked(restrict(job, 4, ctypes.byref(limits), ctypes.sizeof(limits)),
+                     'SetInformationJobObject(UI)')
         actual = ctypes.c_uint32()
         _checked(query(job, 4, ctypes.byref(actual), ctypes.sizeof(actual), None),
                  'QueryInformationJobObject(UI)')
@@ -451,7 +461,7 @@ def _prepare_local_job(process):
         _checked(member(api.current_process_handle(), job, ctypes.byref(owner)),
                  'IsProcessInJob(owner)')
         if actual.value != limits.value or not child.value or owner.value:
-            raise api.WindowsApiError('suspended child family boundary mismatch')
+            raise api.WindowsApiError('suspended tool UI boundary mismatch')
         # Transfer only a verified assignment. Otherwise retirement must kill
         # the child directly: terminating an empty, unassigned job cannot do it.
         process.job = job
@@ -538,7 +548,7 @@ def prepare_local(process, command, environment, current_directory, handles, sta
         elif api.token_default_dacl(child) != expected_default:
             # This checks the child construction, not readback of a token we set.
             raise api.WindowsApiError('suspended child creation ACL mismatch')
-        _prepare_local_job(process)
+        _prepare_local_job(process, restrict_ui=contained and not owning)
 
 
 async def retire_local(process, *, preserve_failure=False):

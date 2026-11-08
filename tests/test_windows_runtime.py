@@ -606,6 +606,60 @@ class LocalLaunchTests(unittest.TestCase):
     def test_owning_child_losing_appcontainer_identity_retains_the_suspended_child(self):
         self._identity_failure(True, 'container')
 
+    def test_only_ordinary_children_receive_verified_ui_limits_before_execution(self):
+        # Local creation must keep the writer out of the child's UI domain.
+        # This portable contract checks ordering; the native fixture separately
+        # checks exact enclosing-job membership and actual window operations.
+        for owning in [True, False]:
+            with self.subTest(owning=owning), self.calls(owning) as seen:
+                process = runtime.ContainedProcess(None)
+                try:
+                    runtime.prepare_local(
+                        process, ['/chosen/image.exe'], {}, '/workspace', [], [1, 2, 3],
+                        owning=owning)
+                    self.assertEqual(seen['job_events'], [['assign', 88, 101]] if owning else [
+                        ['assign', 88, 101], ['restrict', 88, 4, 1]])
+                    seen['resume'].assert_not_called()
+                finally:
+                    process.close()
+
+    def test_ui_assignment_failure_keeps_the_child_available_for_retirement(self):
+        with self.calls(False) as seen:
+            seen['fail_assignment'] = True
+            process = runtime.ContainedProcess(None)
+            try:
+                with self.assertRaisesRegex(OSError, 'assignment refused'):
+                    runtime.prepare_local(
+                        process, ['/chosen/image.exe'], {}, '/workspace', [], [1, 2, 3],
+                        owning=False)
+                # An empty leaf job cannot terminate the suspended child.
+                # Close it locally; the factory must still retire the child.
+                self.assertIsNone(process.job)
+                self.assertEqual(seen['closed'].count(88), 1)
+                self.assertEqual(process.information.hProcess, 101)
+                self.assertNotIn(101, seen['closed'])
+                seen['resume'].assert_not_called()
+            finally:
+                process.close()
+
+    def test_ui_readback_or_writer_membership_mismatch_never_publishes_the_job(self):
+        for failure in [{'reported_ui_flags': 0}, {'writer_in_leaf': True}]:
+            with self.subTest(failure=failure), self.calls(False) as seen:
+                seen.update(failure)
+                process = runtime.ContainedProcess(None)
+                try:
+                    with self.assertRaisesRegex(api.WindowsApiError, 'UI boundary mismatch'):
+                        runtime.prepare_local(
+                            process, ['/chosen/image.exe'], {}, '/workspace', [], [1, 2, 3],
+                            owning=False)
+                    self.assertIsNone(process.job)
+                    self.assertEqual(seen['closed'].count(88), 1)
+                    self.assertEqual(process.information.hProcess, 101)
+                    self.assertNotIn(101, seen['closed'])
+                    seen['resume'].assert_not_called()
+                finally:
+                    process.close()
+
 
 class FamilyAccountingTests(unittest.TestCase):
     def _close_failure(self, failed_handle):
