@@ -422,7 +422,10 @@ class OpenAIChatGPTCredential:
                     self._permanent_failure = (
                         self._generation, permanent)
                     raise permanent from error
-                if rejected_generation is not None or self._expired(now):
+                if rejected_generation is not None or self._expired(self._clock()):
+                    # The clock is reobserved here: the earlier sample was
+                    # taken before the awaited refresh, and elapsed real time
+                    # during that await is not captured by it.
                     raise
                 # A proactive refresh is best-effort while the current token
                 # is still valid.  A later request can try again.
@@ -805,6 +808,12 @@ async def request_openai_token_refresh(
         "refresh_token": refresh_token,
     }, separators=(",", ":")).encode("utf-8")
     try:
+        # Waiting for the token endpoint deliberately has no duration: the
+        # response may involve server-side processing, and abandoning a sent
+        # rotation on a guessed budget would manufacture the very
+        # indeterminate outcome this caller must then refuse to replay.
+        # Connection setup and delivery stay bounded; cancellation still
+        # applies and is treated as possibly-sent by the broker.
         response = await http_client.async_http_request(
             "POST",
             OPENAI_REFRESH_URL,
@@ -815,6 +824,7 @@ async def request_openai_token_refresh(
                 "originator": OPENAI_ORIGINATOR,
             },
             timeout=OPENAI_REFRESH_TIMEOUT_S,
+            response_timeout=None,
             max_bytes=OPENAI_REFRESH_MAX_BYTES,
             retry_max_attempts=1,
         )

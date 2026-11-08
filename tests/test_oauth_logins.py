@@ -3,7 +3,6 @@ import base64
 import json
 import urllib.parse
 import unittest
-from unittest import mock
 
 from process_lifecycle_fixtures import observe_fixture
 from loki_agent import http_client
@@ -107,16 +106,22 @@ class OpenAIBrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         login.close()
         await login._server.wait_closed()
 
-    async def test_browser_login_timeout_closes_callback_server(self):
+    async def test_browser_login_waits_without_a_duration(self):
+        # A callback that has not arrived yet is not an error: the login
+        # waits for the result without a local duration, and cancellation
+        # remains the stop mechanism.
         login = await oauth_logins.start_openai_browser_login(
             ports=(0,))
+        task = asyncio.create_task(login.complete())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
-        with mock.patch.object(
-                oauth_logins, "OPENAI_LOGIN_TIMEOUT_S", 0):
-            with self.assertRaisesRegex(
-                    oauth_logins.OAuthLoginError, "timed out"):
-                await login.complete()
+        self.assertFalse(task.done())
+        self.assertTrue(login._server.is_serving())
 
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
         self.assertFalse(login._server.is_serving())
         self.assertTrue(login._result.cancelled())
 
@@ -164,25 +169,35 @@ class OpenAIDeviceLoginTests(unittest.IsolatedAsyncioTestCase):
             await oauth_logins.complete_openai_device_login(
                 authorization, request=request)
 
-    async def test_device_poll_has_overall_timeout(self):
+    async def test_device_poll_keeps_polling_without_an_overall_duration(self):
         authorization = oauth_logins.DeviceAuthorization(
             verification_url="https://auth.example/device",
             user_code="ABCD-EFGH",
             device_auth_id="device",
             interval=1,
         )
-        times = iter([0, oauth_logins.OPENAI_LOGIN_TIMEOUT_S + 1])
+        polls = []
 
         async def request(_method, url, **_kwargs):
+            polls.append(url)
             return response(url, 403, {})
 
-        with self.assertRaisesRegex(
-                oauth_logins.OAuthLoginError, "timed out"):
-            await oauth_logins.complete_openai_device_login(
-                authorization,
-                request=request,
-                clock=lambda: next(times),
-            )
+        async def sleep(_delay):
+            # Provider pacing without wall-clock: one scheduling turn each.
+            await asyncio.sleep(0)
+
+        task = asyncio.create_task(oauth_logins.complete_openai_device_login(
+            authorization, request=request, sleep=sleep))
+        try:
+            for _ in range(8):
+                await asyncio.sleep(0)
+            # Pending authorization keeps polling; there is no local overall
+            # duration that would abandon it.
+            self.assertGreaterEqual(len(polls), 3)
+            self.assertFalse(task.done())
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_device_poll_cancellation_propagates(self):
         authorization = oauth_logins.DeviceAuthorization(

@@ -45,7 +45,6 @@ OPENAI_OAUTH_SCOPE = (
     "api.connectors.read api.connectors.invoke"
 )
 OPENAI_CALLBACK_PORTS = (1455, 1457)
-OPENAI_LOGIN_TIMEOUT_S = 15 * 60
 OPENAI_LOGIN_REQUEST_TIMEOUT_S = 30
 OPENAI_LOGIN_MAX_BYTES = 256 * 1024
 CALLBACK_HEADER_MAX_BYTES = 16 * 1024
@@ -105,12 +104,18 @@ async def _request(
         method, url, *, body=b"", headers=None, request=None):
     request_function = request or http_client.async_http_request
     try:
+        # Waiting for these responses deliberately has no duration: they
+        # mint or consume one-time authorization material and may involve
+        # server-side processing, so abandoning one on a guessed budget
+        # could report a failure that never happened. Connection setup and
+        # delivery stay bounded; cancellation still applies.
         return await request_function(
             method,
             url,
             body=body,
             headers_in=headers or {},
             timeout=OPENAI_LOGIN_REQUEST_TIMEOUT_S,
+            response_timeout=None,
             max_bytes=OPENAI_LOGIN_MAX_BYTES,
             retry_max_attempts=1,
         )
@@ -307,18 +312,21 @@ class OpenAIBrowserLogin:
             redirect_uri, pkce, state)
 
     async def complete(self):
+        """Wait for the browser callback, then exchange its authorization code.
+
+        There is no local overall login duration: a callback that has not
+        arrived yet is not an error, and a guessed bound would abandon valid
+        logins. User cancellation and ``close()`` stop the wait; the
+        callback server closes in ``finally`` either way.
+        """
         try:
-            code = await asyncio.wait_for(
-                self._result, OPENAI_LOGIN_TIMEOUT_S)
+            code = await self._result
             return await exchange_openai_authorization_code(
                 code,
                 self._redirect_uri,
                 self._pkce,
                 request=self._request,
             )
-        except asyncio.TimeoutError as error:
-            raise OAuthLoginError(
-                "OpenAI browser login timed out") from error
         finally:
             self.close()
             await self._server.wait_closed()
@@ -416,10 +424,14 @@ async def request_openai_device_authorization(*, request=None):
 async def complete_openai_device_login(
         authorization: DeviceAuthorization, *,
         request=None,
-        sleep=asyncio.sleep,
-        clock=None):
-    clock_function = clock or asyncio.get_running_loop().time
-    deadline = clock_function() + OPENAI_LOGIN_TIMEOUT_S
+        sleep=asyncio.sleep):
+    """Poll until the authorization completes, is declined, or is cancelled.
+
+    There is no local overall duration: the authorization response carries
+    no provider expiry to honor, and a guessed completion bound would
+    abandon valid logins. Pacing follows the provider interval; user
+    cancellation remains the stop mechanism.
+    """
     while True:
         body = json.dumps({
             "device_auth_id": authorization.device_auth_id,
@@ -466,8 +478,4 @@ async def complete_openai_device_login(
             raise OAuthLoginError(
                 f"OpenAI device-code poll returned HTTP "
                 f"{response.status}")
-        remaining = deadline - clock_function()
-        if remaining <= 0:
-            raise OAuthLoginError(
-                "OpenAI device login timed out")
-        await sleep(min(authorization.interval, remaining))
+        await sleep(authorization.interval)
