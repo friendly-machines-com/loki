@@ -4192,7 +4192,7 @@ class ProviderToolReplayWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual([row[:2] for row in hook_records()], [
                         [event, cid] for cid in ['chat-search', 'anthropic-search', 'c-search']
                         for event in ['pre_tool_call', 'post_tool_call']])
-                    self.assertEqual(replays.classify_transcript(persisted), expected_replay)
+                    self.assertEqual([block for event in persisted for block in replays.classify_event(event)], expected_replay)
                     presentation = savefiles.ResumeTranscriptRenderer('current').presentation(persisted)
                     self.assertEqual([(kind, ''.join(text for _, text in segments))
                                       for kind, segments in presentation], expected_terminal)

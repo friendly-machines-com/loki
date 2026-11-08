@@ -61,12 +61,12 @@ class ReasoningProjectionTests(unittest.TestCase):
         self.assertFalse(any(kind == "reasoning" for kind, block in hidden))
         text = [value for kind, block in visible if kind == "reasoning"
                 for name, value in block if name == "text"]
-        replay = replays.classify_transcript(events, show_reasoning=True)
+        replay = [block for event in events for block in replays.classify_event(event, show_reasoning=True)]
         self.assertEqual(text, [value for kind, value, key in replay if kind == "thought"])
         self.assertEqual(text, ["plain summary", "thought"])
         self.assertNotIn("SECRET", str(visible))
         self.assertIn("SECRET", str(events))
-        self.assertFalse(any(kind == "thought" for kind, value, key in replays.classify_transcript(events)))
+        self.assertFalse(any(kind == "thought" for kind, value, key in [block for event in events for block in replays.classify_event(event)]))
 
 
 class ReasoningAccumulatorTests(unittest.TestCase):
@@ -254,7 +254,7 @@ class ReasoningLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await loki.run_tool_loop_async(self.session.transcript_items, stream_chat=True, on_event=events.append)
         self.assertEqual("".join(event["text"] for event in events if event["type"] == "reasoning_delta"), "visible")
         self.assertEqual(formats.reasoning_field(self.session.transcript_items[0]), "reasoning")
-        replay = replays.classify_transcript(self.session.transcript_items, show_reasoning=True)
+        replay = [block for event in self.session.transcript_items for block in replays.classify_event(event, show_reasoning=True)]
         self.assertEqual([text for kind, text, key in replay if kind == "thought"], ["visible"])
         native = formats.items_to_openai_chat_messages(self.session.transcript_items)[0]
         self.assertEqual(native["reasoning"], "visible")

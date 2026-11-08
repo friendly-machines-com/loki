@@ -113,10 +113,3 @@ def classify_event(event: dict, *, show_reasoning=False):
              f"{pformat(event, width=100)}",
              ("session_event", str(event_type)))]
 
-
-def classify_transcript(events: list, *, show_reasoning=False):
-    """Classify a full transcript into a flat list of replay tuples."""
-    blocks = []
-    for event in events:
-        blocks.extend(classify_event(event, show_reasoning=show_reasoning))
-    return blocks

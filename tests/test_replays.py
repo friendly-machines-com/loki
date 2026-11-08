@@ -1,6 +1,6 @@
 """Replay-fidelity tests: exotic transcript items must never vanish.
 
-The contract under test: `replays.classify_transcript` consumes the same
+The contract under test: the replay classifier consumes the same
 canonical transcript list that ResumeTranscriptRenderer renders for the
 terminal, so every user-visible thing the terminal resume shows must appear
 in the replay classification -- possibly as degraded text, never as
@@ -14,6 +14,12 @@ import unittest
 from loki_agent import formats, replays
 
 
+def classify(events):
+    return [block for event in events
+            for block in replays.classify_event(event)]
+
+
+
 def user_message(text):
     return formats.message_item("user", text)
 
@@ -24,7 +30,7 @@ class ReplayFidelityTests(unittest.TestCase):
             formats.instruction_item("You are a helpful system agent."),
             user_message("hello"),
         ]
-        classified = replays.classify_transcript(events)
+        classified = classify(events)
         self.assertEqual([b[1] for b in classified], ["hello"])
 
     def test_unknown_session_events_have_exact_terminal_and_replay_fallback(self):
@@ -39,7 +45,7 @@ class ReplayFidelityTests(unittest.TestCase):
             with self.subTest(event=event['type']):
                 events = [formats.instruction_item('system preamble'), event,
                           user_message('hi')]
-                self.assertEqual(replays.classify_transcript(events), [
+                self.assertEqual(classify(events), [
                     ('agent', text, ('session_event', event['type'])),
                     ('user', 'hi', ('message', 'user'))])
                 presentation = ResumeTranscriptRenderer('Assistant').presentation(events)
@@ -56,7 +62,7 @@ class ReplayFidelityTests(unittest.TestCase):
                 {"type": "image", "source": {"data": "..."}},
             ],
         }]
-        classified = replays.classify_transcript(events)
+        classified = classify(events)
         texts = [b[1] for b in classified]
         self.assertIn("what is this", texts)
         self.assertIn("[Image content]", texts)
@@ -74,7 +80,7 @@ class ReplayFidelityTests(unittest.TestCase):
                  "content": [{"type": "text", "text": "answer"}]},
             ],
         }]
-        classified = replays.classify_transcript(events)
+        classified = classify(events)
         self.assertEqual([b[1] for b in classified], ["answer"])
 
     def test_provider_notice_is_not_fabricated_as_acp_agent_text(self):
@@ -90,7 +96,7 @@ class ReplayFidelityTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(replays.classify_transcript([event]), [])
+        self.assertEqual(classify([event]), [])
 
     def test_incomplete_response_status_is_visible(self):
         events = [{
@@ -102,7 +108,7 @@ class ReplayFidelityTests(unittest.TestCase):
                  "content": [{"type": "text", "text": "partial"}]},
             ],
         }]
-        classified = replays.classify_transcript(events)
+        classified = classify(events)
         texts = [b[1] for b in classified]
         self.assertIn("[Model response incomplete]", texts)
         self.assertIn("partial", texts)
@@ -115,7 +121,7 @@ class ReplayFidelityTests(unittest.TestCase):
             "is_error": True,
             "content": [{"type": "text", "text": "boom"}],
         }]
-        classified = replays.classify_transcript(events)
+        classified = classify(events)
         self.assertEqual(classified[0][0], "tool")
         self.assertIn("Tool error", classified[0][1])
         self.assertIn("boom", classified[0][1])
@@ -150,7 +156,7 @@ class ReplayFidelityTests(unittest.TestCase):
                  "execution": "provider"},
             ],
         }]
-        classified = replays.classify_transcript(events)
+        classified = classify(events)
         self.assertEqual(classified[0][0], "tool")
         self.assertEqual(classified[0][1], "web_search")
 
