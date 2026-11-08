@@ -1983,6 +1983,16 @@ class PromptRenderer:
 
 
 class PromptController:
+    """One logical edit, including navigation and initial-text semantics.
+
+    InputSession retains its normal controller across producer cancellation
+    for a modal. Coroutine-local edit state would die with that producer;
+    keeping only its text would lose the caret, history draft and seed edits.
+    get_input_async instead creates a separate, one-shot controller for each
+    modal prompt. A cancelled read can resume; a completed edit is discarded
+    by its caller rather than reused for another submission.
+    """
+
     def __init__(self, terminal, prompt: str = 'User: ', history=None, session=None,
                  on_mode_cycle=None, history_provider=None, *, initial_text: str = '',
                  ignore_unchanged_initial_text=False):
@@ -1994,24 +2004,22 @@ class PromptController:
         self.history_provider = history_provider
         self.session = session  # AsyncKeyReader held for the whole session
         self.on_mode_cycle = on_mode_cycle or (lambda: None)
+        self.buffer = InputBuffer()
+        self.buffer.insert(initial_text)
+        self.history_index = len(self.history)
+        self.saved_input = ''
+        self.initial_text_untouched = True
 
     async def read_text(self) -> str:
-        """Read editable input, starting with initial_text and the cursor at its end."""
+        """Read or resume this edit; only a new controller applies initial_text."""
         fd = new_stdin
         interactive = os.isatty(fd) and os.isatty(sys.stdout.fileno())
-        buffer = InputBuffer()
-        buffer.insert(self.initial_text)
         renderer = PromptRenderer(self.terminal, self.prompt)
-
-        output_row, output_col = 1, 1
-        history_index = len(self.history)
-        saved_input = ""
 
         if self.session is not None:
             # Session owns raw mode + the reader for the whole session; the
             # prompt just consumes keys from it.
-            return await self._read_text_from_reader(self.session, interactive, buffer, renderer,
-                                                     output_row, output_col, history_index, saved_input)
+            return await self._read_text_from_reader(self.session, interactive, renderer)
         # No session: manage our own raw mode + reader for this one call.
         reader = AsyncKeyReader(
             fd,
@@ -2021,79 +2029,78 @@ class PromptController:
         )
         with TerminalMode(fd, interactive):
             async with reader:
-                return await self._read_text_from_reader(reader, interactive, buffer, renderer,
-                                                         output_row, output_col, history_index, saved_input)
+                return await self._read_text_from_reader(reader, interactive, renderer)
 
-    async def _read_text_from_reader(self, reader, interactive, buffer, renderer,
-                                     output_row, output_col, history_index, saved_input):
+    async def _read_text_from_reader(self, reader, interactive, renderer):
         if interactive:
-            renderer.render(buffer)
+            renderer.render(self.buffer)
 
+        # Display batching belongs to this read, not the retained edit: a
+        # modal may have consumed PASTE_END while normal input was paused.
         paste_active = False
-        initial_text_untouched = True
         while True:
             event = await reader.read_key()
             unchanged_seed = (
-                self.ignore_unchanged_initial_text and initial_text_untouched
-                and buffer.text() == self.initial_text)
+                self.ignore_unchanged_initial_text and self.initial_text_untouched
+                and self.buffer.text() == self.initial_text)
             if event.kind == "EOF":
-                if buffer.text() and not unchanged_seed:
-                    return buffer.text()
+                if self.buffer.text() and not unchanged_seed:
+                    return self.buffer.text()
                 raise EOFError
             if event.kind == "CTRL_C":
                 raise KeyboardInterrupt
             if event.kind == "CTRL_D":
-                if buffer.text() and not unchanged_seed:
-                    return buffer.text()
+                if self.buffer.text() and not unchanged_seed:
+                    return self.buffer.text()
                 raise EOFError
             if event.kind == "ENTER":
                 if interactive:
                     # print() This would unnecessarily scroll
                     self.terminal.flush()
-                return '' if unchanged_seed else buffer.text()
+                return '' if unchanged_seed else self.buffer.text()
             if event.kind not in ["RESIZE", "MODE_CYCLE", "PASTE_START", "PASTE_END"]:
-                initial_text_untouched = False
+                self.initial_text_untouched = False
             if event.kind == "TEXT":
-                buffer.insert(event.text)
+                self.buffer.insert(event.text)
             elif event.kind == "BACKSPACE":
-                buffer.backspace()
+                self.buffer.backspace()
             elif event.kind == "BACKSPACE_WORD":
-                buffer.backspace_word()
+                self.buffer.backspace_word()
             elif event.kind == "DELETE":
-                buffer.delete()
+                self.buffer.delete()
             elif event.kind == "CURSOR_LEFT":
-                buffer.left()
+                self.buffer.left()
             elif event.kind == "CURSOR_RIGHT":
-                buffer.right()
+                self.buffer.right()
             elif event.kind == "CURSOR_WORD_LEFT":
-                buffer.word_left()
+                self.buffer.word_left()
             elif event.kind == "CURSOR_WORD_RIGHT":
-                buffer.word_right()
+                self.buffer.word_right()
             elif event.kind == "HOME":
-                buffer.home()
+                self.buffer.home()
             elif event.kind == "END":
-                buffer.end()
+                self.buffer.end()
             elif event.kind in ["CURSOR_UP", "PAGE_UP"]:
-                if history_index == len(self.history) and self.history_provider:
+                if self.history_index == len(self.history) and self.history_provider:
                     # The producer opens this prompt before the consumer adds
                     # the submitted message to the transcript. Refresh on entry
                     # to history, but keep a stable list while browsing it.
                     self.history = list(self.history_provider() or [])
-                    history_index = len(self.history)
-                if self.history and history_index > 0:
-                    if history_index == len(self.history):
-                        saved_input = buffer.text()
-                    history_index -= 1
-                    buffer = InputBuffer()
-                    buffer.insert(self.history[history_index])
+                    self.history_index = len(self.history)
+                if self.history and self.history_index > 0:
+                    if self.history_index == len(self.history):
+                        self.saved_input = self.buffer.text()
+                    self.history_index -= 1
+                    self.buffer = InputBuffer()
+                    self.buffer.insert(self.history[self.history_index])
             elif event.kind in ["CURSOR_DOWN", "PAGE_DOWN"]:
-                if history_index < len(self.history):
-                    history_index += 1
-                    buffer = InputBuffer()
-                    if history_index == len(self.history):
-                        buffer.insert(saved_input)
+                if self.history_index < len(self.history):
+                    self.history_index += 1
+                    self.buffer = InputBuffer()
+                    if self.history_index == len(self.history):
+                        self.buffer.insert(self.saved_input)
                     else:
-                        buffer.insert(self.history[history_index])
+                        self.buffer.insert(self.history[self.history_index])
             elif event.kind == "PASTE_START":
                 paste_active = True
             elif event.kind == "PASTE_END":
@@ -2107,7 +2114,7 @@ class PromptController:
                 # the buffer.
                 self.on_mode_cycle()
             if interactive and not paste_active:
-                renderer.render(buffer)
+                renderer.render(self.buffer)
 
 
 async def get_input_async(prompt=None, history=None, session=None, on_mode_cycle=None,
@@ -2125,7 +2132,7 @@ class InputModal:
 
     Entering suspends the normal user-message producer. While active, prompt()
     is the only supported consumer of the session's reader. Exiting restores
-    the normal producer.
+    the normal producer with its unfinished edit, not the modal's answer.
     """
 
     def __init__(self, session):
@@ -2310,6 +2317,11 @@ class InputSession:
         )
         self.user_messages = UserMessageQueue(on_queue_size_change)
         self._producer = None
+        # The normal edit outlives temporary producer tasks. get_input_async
+        # makes fresh editors for modal answers and cannot preserve this edit.
+        # Keep one authoritative controller until normal submission/cancel/EOF
+        # or session shutdown; modal pause/resume never copies or clears it.
+        self._normal_prompt = None
         self._mode = None
         self._modal = None
         self._reader_entered = False
@@ -2351,6 +2363,8 @@ class InputSession:
                         if self._producer.done():
                             self._producer = None
             finally:
+                if self._producer is None:
+                    self._normal_prompt = None
                 self.user_messages.discard_pending_messages()
         finally:
             try:
@@ -2370,26 +2384,37 @@ class InputSession:
                 initial_text = (
                     self.initial_text_provider()
                     if self.interactive and self.initial_text_provider else '')
-                text = await get_input_async(
-                    session=self.reader,
-                    history_provider=self.history_provider,
-                    on_mode_cycle=self.on_mode_cycle,
-                    initial_text=initial_text,
-                    ignore_unchanged_initial_text=bool(initial_text))
+                if self._normal_prompt is None or (
+                        self._normal_prompt.initial_text_untouched
+                        and self._normal_prompt.initial_text != initial_text):
+                    # /model can change the automatic dummy-provider prefix.
+                    # Refresh an untouched default only, never a user's edit,
+                    # even if that edit is empty or equals the old default.
+                    self._normal_prompt = PromptController(
+                        terminal, session=self.reader,
+                        history_provider=self.history_provider,
+                        on_mode_cycle=self.on_mode_cycle,
+                        initial_text=initial_text,
+                        ignore_unchanged_initial_text=bool(initial_text))
+                text = await self._normal_prompt.read_text()
+                self._normal_prompt = None
                 # Immediate commands (command_deliveries) are deliberately
                 # allowed during a busy turn and must bypass the FIFO,
                 # including past ordinary prompts already queued.
                 if self.on_submit(text):
                     continue
             except EOFError:
+                self._normal_prompt = None
                 self.user_messages.put_nowait(None)  # sentinel: end of session
                 return
             except KeyboardInterrupt:
+                self._normal_prompt = None
                 # Ctrl+C at the prompt cancels the current prompt; keep looping
                 # so the user can keep typing. cancel_event is set by the
                 # reader.
                 continue
             except Exception as e:
+                self._normal_prompt = None
                 # An unexpected exception (e.g. render failing on a tiny
                 # resize, or a write I/O error) would otherwise kill the
                 # producer task silently and leave the main loop blocked on

@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from process_lifecycle_fixtures import observe_fixture
+from terminal_input_fixtures import PromptKeyboard
 from loki_agent import terminals
 
 
@@ -1215,16 +1216,7 @@ class PromptControllerTests(unittest.TestCase):
         async def scenario():
             controller = terminals.PromptController(RecordingTerminal())
             renderer = RecordingRenderer()
-            result = await controller._read_text_from_reader(
-                FakeReader(),
-                True,
-                terminals.InputBuffer(),
-                renderer,
-                1,
-                1,
-                0,
-                "",
-            )
+            result = await controller._read_text_from_reader(FakeReader(), True, renderer)
             return result, renderer.rendered
 
         result, rendered = asyncio.run(scenario())
@@ -1362,51 +1354,180 @@ class InputHistoryTests(unittest.TestCase):
 class NormalInputSeedTests(unittest.IsolatedAsyncioTestCase):
     async def test_seed_refreshes_without_reinterpreting_queued_submissions(self):
         seed = '!'
-        observed = []
-        session = terminals.InputSession(
-            fd=0, initial_text_provider=lambda: seed)
-        session.interactive = True
-
-        async def read(**kwargs):
-            nonlocal seed
-            observed.append(kwargs['initial_text'])
-            if len(observed) == 1:
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0, initial_text_provider=lambda: seed) as session:
+                self.assertEqual((await keyboard.next_read(session._producer))[1:], ['!', 1])
+                await keyboard.press(session._producer, 'TEXT', 'first')
                 seed = ''
-                return '!first'
-            if len(observed) == 2:
+                self.assertEqual((await keyboard.press(session._producer, 'ENTER'))[1:], ['', 0])
+                await keyboard.press(session._producer, 'TEXT', 'queued prose')
                 seed = '!'
-                return 'queued prose'
-            raise EOFError
-
-        with mock.patch.object(terminals, 'get_input_async', new=read):
-            await session._produce()
-        self.assertEqual(observed, ['!', '', '!'])
-        self.assertEqual(await session.user_messages.get(), '!first')
-        self.assertEqual(await session.user_messages.get(), 'queued prose')
-        self.assertIsNone(await session.user_messages.get())
+                self.assertEqual((await keyboard.press(session._producer, 'ENTER'))[1:], ['!', 1])
+                keyboard.feed('EOF')
+                await session._producer
+                self.assertEqual(session.user_messages.get_nowait(), '!first')
+                self.assertEqual(session.user_messages.get_nowait(), 'queued prose')
+                self.assertIsNone(session.user_messages.get_nowait())
 
     async def test_noninteractive_input_is_not_seeded(self):
         provider = mock.Mock(return_value='!')
-        session = terminals.InputSession(fd=0, initial_text_provider=provider)
-        session.interactive = False
-        reader = mock.AsyncMock(side_effect=['plain text', EOFError()])
-        with mock.patch.object(terminals, 'get_input_async', new=reader):
-            await session._produce()
-        provider.assert_not_called()
-        self.assertEqual(await session.user_messages.get(), 'plain text')
-        self.assertTrue(all(
-            call.kwargs['initial_text'] == '' for call in reader.await_args_list))
+        with PromptKeyboard().installed(interactive=False) as keyboard:
+            async with terminals.InputSession(fd=0, initial_text_provider=provider) as session:
+                await keyboard.next_read(session._producer)
+                await keyboard.press(session._producer, 'TEXT', 'plain text')
+                await keyboard.press(session._producer, 'ENTER')
+                keyboard.feed('EOF')
+                await session._producer
+                provider.assert_not_called()
+                self.assertEqual(session.user_messages.get_nowait(), 'plain text')
+                self.assertIsNone(session.user_messages.get_nowait())
 
     async def test_ctrl_c_opens_a_fresh_seeded_prompt(self):
-        session = terminals.InputSession(fd=0, initial_text_provider=lambda: '!')
-        session.interactive = True
-        reader = mock.AsyncMock(side_effect=[KeyboardInterrupt(), '!pwd', EOFError()])
-        with mock.patch.object(terminals, 'get_input_async', new=reader):
-            await session._produce()
-        self.assertEqual(await session.user_messages.get(), '!pwd')
-        self.assertIsNone(await session.user_messages.get())
-        self.assertTrue(all(
-            call.kwargs['initial_text'] == '!' for call in reader.await_args_list))
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0, initial_text_provider=lambda: '!') as session:
+                self.assertEqual((await keyboard.next_read(session._producer))[1:], ['!', 1])
+                await keyboard.press(session._producer, 'TEXT', 'discard this')
+                self.assertEqual((await keyboard.press(session._producer, 'CTRL_C'))[1:], ['!', 1])
+                self.assertTrue(keyboard.cancel_event.is_set())
+                await keyboard.press(session._producer, 'TEXT', 'pwd')
+                await keyboard.press(session._producer, 'ENTER')
+                keyboard.feed('EOF')
+                await session._producer
+                self.assertEqual(session.user_messages.get_nowait(), '!pwd')
+                self.assertIsNone(session.user_messages.get_nowait())
+
+    async def test_modal_refreshes_only_untouched_defaults(self):
+        cases = [
+            ['!', '', [], '', ''],
+            ['', '!', [], '!', ''],
+            ['!', '!', [], '!', ''],
+            ['!', '', [terminals.KeyEvent('BACKSPACE'), terminals.KeyEvent('TEXT', '!')], '!', '!'],
+            ['!', '!', [terminals.KeyEvent('BACKSPACE')], '', ''],
+            ['', '!', [terminals.KeyEvent('TEXT', 'x'), terminals.KeyEvent('BACKSPACE')], '', ''],
+            ['!', '', [terminals.KeyEvent('TEXT', 'pwd')], '!pwd', '!pwd'],
+        ]
+        for seed, next_seed, edits, rendered, submitted in cases:
+            with self.subTest(seed=seed, next_seed=next_seed, edits=edits), \
+                    PromptKeyboard().installed() as keyboard:
+                async with terminals.InputSession(fd=0, initial_text_provider=lambda: seed) as session:
+                    await keyboard.next_read(session._producer)
+                    for event in edits:
+                        await keyboard.press(session._producer, event.kind, event.text)
+                    async with session.modal():
+                        seed = next_seed
+                    self.assertEqual(
+                        (await keyboard.next_read(session._producer))[1:], [rendered, len(rendered)])
+                    await keyboard.press(session._producer, 'ENTER')
+                    self.assertEqual(session.user_messages.get_nowait(), submitted)
+
+
+class InputDraftTests(unittest.IsolatedAsyncioTestCase):
+    async def test_modal_preserves_history_position_and_saved_draft(self):
+        history = ['older', 'newer']
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0, history_provider=lambda: history) as session:
+                await keyboard.next_read(session._producer)
+                await keyboard.press(session._producer, 'TEXT', 'my draft')
+                await keyboard.press(session._producer, 'CURSOR_UP')
+                before = await keyboard.press(session._producer, 'CURSOR_LEFT')
+                async with session.modal():
+                    history.append('arrived during modal')
+                self.assertEqual(await keyboard.next_read(session._producer), before)
+                self.assertEqual(
+                    (await keyboard.press(session._producer, 'CURSOR_DOWN'))[1:], ['my draft', 8])
+                self.assertEqual(
+                    (await keyboard.press(session._producer, 'CURSOR_UP'))[1], 'arrived during modal')
+                await keyboard.press(session._producer, 'CURSOR_DOWN')
+                await keyboard.press(session._producer, 'ENTER')
+                self.assertEqual(session.user_messages.get_nowait(), 'my draft')
+
+    async def test_modal_exception_restores_draft_before_another_key(self):
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0) as session:
+                await keyboard.next_read(session._producer)
+                await keyboard.press(session._producer, 'TEXT', 'draft')
+                before = await keyboard.press(session._producer, 'CURSOR_LEFT')
+                with self.assertRaisesRegex(ValueError, 'dialog failed'):
+                    async with session.modal():
+                        raise ValueError('dialog failed')
+                self.assertEqual(await keyboard.next_read(session._producer), before)
+                await keyboard.press(session._producer, 'TEXT', '!')
+                await keyboard.press(session._producer, 'ENTER')
+                self.assertEqual(session.user_messages.get_nowait(), 'draf!t')
+
+    async def test_paste_batching_does_not_suppress_redraw_after_a_modal(self):
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0) as session:
+                await keyboard.next_read(session._producer)
+                await keyboard.press(session._producer, 'PASTE_START')
+                await keyboard.press(session._producer, 'TEXT', 'pasted\n\u96ea')
+                async with session.modal():
+                    pass
+                self.assertEqual(
+                    (await keyboard.next_read(session._producer))[1:], ['pasted\n\u96ea', 8])
+                self.assertEqual(
+                    (await keyboard.press(session._producer, 'TEXT', '!'))[1:], ['pasted\n\u96ea!', 9])
+
+    async def test_submitted_and_immediate_commands_do_not_return_as_drafts(self):
+        commands = []
+
+        def submit(text):
+            if text == '/ps':
+                commands.append(text)
+                return True
+            return False
+
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0, on_submit=submit) as session:
+                await keyboard.next_read(session._producer)
+                for text in ['sent message', '/ps']:
+                    await keyboard.press(session._producer, 'TEXT', text)
+                    self.assertEqual((await keyboard.press(session._producer, 'ENTER'))[1:], ['', 0])
+                    async with session.modal():
+                        pass
+                    self.assertEqual((await keyboard.next_read(session._producer))[1:], ['', 0])
+                self.assertEqual(commands, ['/ps'])
+                self.assertEqual(session.user_messages.get_nowait(), 'sent message')
+                self.assertTrue(session.user_messages.empty())
+
+    async def test_shutdown_discards_draft_even_when_reader_cleanup_needs_retry(self):
+        for fails in [False, True]:
+            with self.subTest(cleanup_fails=fails), PromptKeyboard().installed() as keyboard:
+                session = terminals.InputSession(fd=0)
+                await session.__aenter__()
+                try:
+                    await keyboard.next_read(session._producer)
+                    await keyboard.press(session._producer, 'TEXT', 'private unfinished draft')
+                    session.user_messages.put_nowait('pending message')
+                    if fails:
+                        with mock.patch.object(keyboard, '__aexit__', side_effect=RuntimeError('cleanup failed')):
+                            with self.assertRaisesRegex(RuntimeError, 'cleanup failed'):
+                                await session.__aexit__(None, None, None)
+                finally:
+                    await session.__aexit__(None, None, None)
+                self.assertFalse(keyboard.reading)
+                self.assertTrue(session.user_messages.empty())
+                async with session:
+                    self.assertEqual((await keyboard.next_read(session._producer))[1:], ['', 0])
+
+    async def test_failed_resume_ends_input_without_reviving_the_draft(self):
+        with PromptKeyboard().installed() as keyboard:
+            session = terminals.InputSession(fd=0)
+            async with session:
+                await keyboard.next_read(session._producer)
+                await keyboard.press(session._producer, 'TEXT', 'unfinished')
+                errors = io.StringIO()
+                with (
+                    mock.patch.object(terminals, 'PromptRenderer', side_effect=RuntimeError('redraw failed')),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    async with session.modal():
+                        pass
+                    await session._producer
+                self.assertIsNone(session.user_messages.get_nowait())
+                self.assertIn('input session error: redraw failed', errors.getvalue())
+            async with session:
+                self.assertEqual((await keyboard.next_read(session._producer))[1:], ['', 0])
 
 
 class InputModalTests(unittest.TestCase):

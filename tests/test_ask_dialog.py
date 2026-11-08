@@ -12,7 +12,9 @@ import types
 import unittest
 from unittest import mock
 
-from loki_agent import formats, loki, protocols, terminal_frontend
+from process_lifecycle_fixtures import running_fixture_task
+from terminal_input_fixtures import PromptKeyboard
+from loki_agent import formats, loki, protocols, terminal_frontend, terminals
 from loki_agent.sessions import Session
 from loki_agent import connections, tool_contracts
 
@@ -189,6 +191,96 @@ class AskDialogTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(error=type(error).__name__):
                 outcome, _, _ = await self._run(DialogSession([error]))
                 self.assertEqual(outcome, {"action": "cancelled"})
+
+
+class AskDraftTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ask_preserves_the_separate_normal_draft_and_cursor(self):
+        cases = [
+            ['2', {'action': 'answered', 'answer': 'Remote'}, False],
+            ['via VPN', {'action': 'answered', 'answer': 'via VPN'}, False],
+            ['d', {'action': 'declined'}, False],
+            ['', {'action': 'cancelled'}, False],
+            [None, {'action': 'cancelled'}, False],
+            ['1,2', {'action': 'answered', 'answer': ['Local', 'Remote']}, True],
+        ]
+        draft = 'Keep this\n\u96ea draft'
+        for reply, expected, multi_select in cases:
+            with self.subTest(reply=reply), PromptKeyboard().installed() as keyboard:
+                async with terminals.InputSession(fd=0) as session:
+                    await keyboard.next_read(session._producer)
+                    await keyboard.press(session._producer, 'PASTE_START')
+                    await keyboard.press(session._producer, 'TEXT', draft)
+                    await keyboard.press(session._producer, 'PASTE_END')
+                    before = await keyboard.press(session._producer, 'CURSOR_LEFT')
+                    session.user_messages.put_nowait('already queued')
+                    async with running_fixture_task(terminal_frontend.run_ask_dialog_async(
+                            session, keyboard.cancel_event, 'Which storage?', options(),
+                            multi_select=multi_select)) as question:
+                        answer_frame = await keyboard.next_read(question)
+                        self.assertEqual(answer_frame[1:], ['', 0])
+                        if reply is None:
+                            keyboard.feed('CTRL_C')
+                        else:
+                            await keyboard.press(question, 'TEXT', reply)
+                            keyboard.feed('ENTER')
+                        self.assertEqual(await question, expected)
+                    restored = await keyboard.next_read(session._producer)
+                    self.assertEqual(restored, before)
+                    self.assertEqual(keyboard.cancel_event.is_set(), reply is None)
+                    self.assertEqual(session.user_messages.get_nowait(), 'already queued')
+                    self.assertTrue(session.user_messages.empty())
+                    await keyboard.press(session._producer, 'TEXT', '!')
+                    keyboard.feed('ENTER')
+                    await keyboard.next_read(session._producer)
+                    self.assertEqual(
+                        session.user_messages.get_nowait(), draft[:-1] + '!' + draft[-1:])
+
+    async def test_retries_and_consecutive_questions_keep_the_normal_draft(self):
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0) as session:
+                await keyboard.next_read(session._producer)
+                before = await keyboard.press(session._producer, 'TEXT', 'unfinished')
+                for _ in range(2):
+                    async with running_fixture_task(terminal_frontend.run_ask_dialog_async(
+                            session, keyboard.cancel_event, 'Which storage?', options())) as question:
+                        self.assertEqual((await keyboard.next_read(question))[1:], ['', 0])
+                        await keyboard.press(question, 'TEXT', '99')
+                        self.assertEqual(
+                            (await keyboard.press(question, 'ENTER'))[1:], ['', 0])
+                        await keyboard.press(question, 'TEXT', '1')
+                        keyboard.feed('ENTER')
+                        self.assertEqual(await question, {'action': 'answered', 'answer': 'Local'})
+                    self.assertEqual(await keyboard.next_read(session._producer), before)
+                    self.assertTrue(session.user_messages.empty())
+
+    async def test_cancelling_the_question_task_restores_the_normal_draft(self):
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0) as session:
+                await keyboard.next_read(session._producer)
+                before = await keyboard.press(session._producer, 'TEXT', 'unfinished')
+                async with running_fixture_task(terminal_frontend.run_ask_dialog_async(
+                        session, keyboard.cancel_event, 'Which storage?', options())) as question:
+                    await keyboard.next_read(question)
+                    question.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await question
+                self.assertEqual(await keyboard.next_read(session._producer), before)
+                self.assertTrue(session.user_messages.empty())
+
+    async def test_eof_dismisses_ask_and_preserves_normal_partial_input_semantics(self):
+        with PromptKeyboard().installed() as keyboard:
+            async with terminals.InputSession(fd=0) as session:
+                await keyboard.next_read(session._producer)
+                await keyboard.press(session._producer, 'TEXT', 'unfinished')
+                async with running_fixture_task(terminal_frontend.run_ask_dialog_async(
+                        session, keyboard.cancel_event, 'Which storage?', options())) as question:
+                    await keyboard.next_read(question)
+                    keyboard.feed('EOF')
+                    self.assertEqual(await question, {'action': 'cancelled'})
+                await session._producer
+                self.assertEqual(session.user_messages.get_nowait(), 'unfinished')
+                self.assertIsNone(session.user_messages.get_nowait())
+                self.assertTrue(session.user_messages.empty())
 
 
 class TerminalAskUserTests(unittest.IsolatedAsyncioTestCase):

@@ -17,7 +17,8 @@ from unittest import mock
 from loki_entrypoints import (
     child_environment, configure_container, entrypoint, loki_command)
 from job_fixtures import job_manager, managed_jobs
-from process_lifecycle_fixtures import observe_fixture
+from process_lifecycle_fixtures import observe_fixture, running_fixture_task
+from terminal_input_fixtures import PromptKeyboard
 from response_header_fixtures import isolated_response_headers, setUpModule as set_up_response_headers
 from settings_fixtures import (
     setUpModule as set_up_default_settings, write_user_settings, write_user_settings_at)
@@ -1340,22 +1341,10 @@ class ModelLoadingTests(unittest.TestCase):
             'http://dummy.invalid/v1', protocols.DUMMY, model='custom-dummy')
 
         async def scenario(path):
-            submissions = asyncio.Queue()
-            prompts = asyncio.Queue()
-            session = terminals.InputSession(
-                fd=0, autostart=False,
-                initial_text_provider=terminal_frontend._normal_input_initial_text)
-            session.interactive = True
-            session.reader = mock.MagicMock()
-
-            async def read(**kwargs):
-                self.assertIsNone(session._modal)
-                prompts.put_nowait(kwargs['initial_text'])
-                return await submissions.get()
-
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch.object(terminals, 'TerminalMode'))
-                stack.enter_context(mock.patch.object(terminals, 'get_input_async', new=read))
+            with PromptKeyboard().installed() as keyboard, contextlib.ExitStack() as stack:
+                session = terminals.InputSession(
+                    fd=0, autostart=False,
+                    initial_text_provider=terminal_frontend._normal_input_initial_text)
                 stack.enter_context(mock.patch.object(
                     terminal_frontend, 'input_session', return_value=session))
                 stack.enter_context(mock.patch.object(
@@ -1368,22 +1357,23 @@ class ModelLoadingTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(
                     terminal_frontend, 'config_from_modelsdev_selection',
                     side_effect=[real_config, dummy_config]))
-                task = asyncio.create_task(terminal_frontend.async_main([], settings.Settings()))
-                try:
-                    self.assertEqual(await prompts.get(), '!')
+                async with running_fixture_task(
+                        terminal_frontend.async_main([], settings.Settings())) as task:
+                    self.assertEqual((await keyboard.next_read(task))[1], '!')
                     for old_seed, new_seed in [['!', ''], ['', '!']]:
-                        submissions.put_nowait('/model')
+                        if old_seed:
+                            await keyboard.press(task, 'BACKSPACE')
+                        await keyboard.press(task, 'TEXT', '/model')
+                        keyboard.feed('ENTER')
                         # The producer opens another prompt before the consumer
-                        # takes modal ownership; that prompt is then cancelled.
-                        self.assertEqual(await prompts.get(), old_seed)
-                        self.assertEqual(await prompts.get(), new_seed)
-                    submissions.put_nowait('/quit')
+                        # takes modal ownership. Only its untouched default may
+                        # refresh when the selected provider changes.
+                        self.assertEqual((await keyboard.next_read(task))[1], old_seed)
+                        self.assertEqual((await keyboard.next_read(task))[1], new_seed)
+                    await keyboard.press(task, 'BACKSPACE')
+                    await keyboard.press(task, 'TEXT', '/quit')
+                    keyboard.feed('ENTER')
                     self.assertEqual(await task, 0)
-                finally:
-                    if not task.done():
-                        task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await task
 
         with tempfile.TemporaryDirectory() as tmpdir:
             asyncio.run(scenario(os.path.join(tmpdir, 'chat.json')))
