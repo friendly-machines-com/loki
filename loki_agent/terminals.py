@@ -2186,11 +2186,14 @@ class UserMessageQueue(asyncio.Queue):
 
     def __init__(self, on_size_change=None):
         super().__init__()
-        # asyncio.Queue's public API is FIFO-only (put/get), but the editor
-        # must enumerate, index, delete-from-middle and reorder entries, so
-        # these methods reach into ``_queue`` -- the deque asyncio.Queue keeps
-        # its items in. It is a private attribute (type stubs omit it), so we
-        # name and type it here to keep the class self-describing.
+        # Accepted monitor-plane exception: asyncio.Queue's public API is
+        # FIFO-only, but /queue must inspect/edit/delete/reorder pending user
+        # submissions. Reusing its deque avoids a second queue and copied
+        # getter wakeup/cancellation machinery. These mutations are synchronous
+        # on the input owner's loop; they neither replace the active turn nor
+        # turn monitor output into conversation. This narrow dependency does
+        # not authorize private subprocess/lifetime APIs elsewhere.
+        # Type stubs omit _queue, so declare the owned deque explicitly.
         self._queue: collections.deque = collections.deque()
         self._next_id = 1
         self._message_count = 0

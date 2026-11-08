@@ -30,7 +30,7 @@ class Outcome:
     for the next prompt.
     """
 
-    __slots__ = ("text", "model_text", "image")
+    __slots__ = ["text", "model_text", "image"]
 
     def __init__(self, text=None, model_text=None, image=None):
         self.text = text
