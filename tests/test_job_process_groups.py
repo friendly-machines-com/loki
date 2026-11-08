@@ -9,13 +9,13 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from loki_entrypoints import configure_container
-from test_acps import _ACPFrontFixture, _tool_updates
 from types import SimpleNamespace
 
 from job_fixtures import job_manager
 from loki_agent import host_process, private_files, jobs as job_runtime
 from process_lifecycle_fixtures import ProcessResources, observe_fixture
+from loki_entrypoints import configure_container
+from test_acps import _ACPFrontFixture, _tool_updates
 
 
 _DESCENDANT = """
@@ -188,125 +188,6 @@ class _Group:
                                      return_exceptions=True)
             finally:
                 await self.job_scope.aclose()
-
-
-@unittest.skipUnless(sys.platform == 'win32' or sys.platform.startswith('linux'),
-                     'root retirement needs Windows jobs or Linux PID namespaces')
-class JobLifetimeTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
-    async def test_frontend_stop_cancel_and_root_retirement(self):
-        root = self.enterContext(tempfile.TemporaryDirectory(prefix='acp-descendant-workflow-'))
-        workspace = os.path.join(root, 'workspace')
-        private_files.make_private_directory(workspace)
-        witnesses, parents, children = {}, {}, {}
-        for label in ['A', 'B', 'C', 'D']:
-            witnesses[label] = os.path.join(workspace, label)
-            os.mkdir(witnesses[label])
-            env = self._controlled_search(root, witnesses[label], label, cwd=workspace)
-            if label == 'A':
-                environment = env
-        stop_allowed, both_completed = asyncio.Event(), asyncio.Event()
-        actions = ['A', 'B', 'stop-A', 'C', 'stop-B', 'D', None]
-
-        async def respond(request):
-            action = actions.pop(0)
-            if action in ['C', 'D']:
-                self.assertIn('Sent ', request['messages'][-1]['content'])
-            if action is None:
-                return {'role': 'assistant', 'content': 'Lifetime and isolation complete.'}
-            if action.startswith('stop-'):
-                if action == 'stop-A':
-                    both_completed.set()
-                    await stop_allowed.wait()
-                with open(parents[action[-1]]['metadata'], encoding='utf-8') as stream:
-                    record = json.load(stream)
-                name, args = 'JobStop', {'job_id': record['id'], 'force': True}
-            else:
-                name, args = 'Grep', {'pattern': 'CONTROLLED_SEARCH_OUTPUT_' + action,
-                                      'path': os.path.join(witnesses[action], 'controlled-search.py'),
-                                      'output_mode': 'content'}
-            return {'role': 'assistant', 'content': '', 'tool_calls': [{
-                'id': action, 'type': 'function',
-                'function': {'name': name, 'arguments': json.dumps(args)}}]}
-
-        url, requests, _authorization = await self._provider(respond)
-        environment.update(LOKI_PROVIDER='openai_chat', LOKI_API_BASE=url,
-                           LOKI_MODEL='workflow-model', LOKI_STREAM='0',
-                           LOKI_API_KEY='family-synthetic-key')
-        configure_container(environment, workspace)
-        front, diagnostics = await self._front(environment, workspace, lifetime_boundary=True, cleanup=self.addAsyncCleanup)
-        await self._request(front, 1, 'initialize', {'protocolVersion': 1})
-        opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
-        session_id = opened['sessionId']
-        pending = None
-
-        async def release_reader():
-            if pending is not None:
-                pending.cancel()
-                await asyncio.gather(pending, return_exceptions=True)
-
-        self.addAsyncCleanup(release_reader)
-
-        async def start_turn(identifier):
-            return await self._request(front, identifier, 'session/prompt', {
-                'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'Continue the lifetime journey'}]})
-
-        async def ready(label, *, complete):
-            directory = witnesses[label]
-            parents[label] = await self._search_file(directory, 'parent-ready', pending)
-            child = await self._search_file(directory, 'child-ready', pending)
-            children[label] = self._observe_process_exit(child['host_pid'])
-            parent_exited = self._observe_process_exit(parents[label]['host_pid'])
-            await self._ping_search(directory, 'parent', 'before-completion', label,
-                                    exited=parent_exited)
-            await self._ping_search(directory, 'child', 'before-completion', label,
-                                    exited=children[label])
-            if complete:
-                with open(os.path.join(directory, 'parent-finish'), 'x'):
-                    pass
-
-        async def dead(label):
-            while not children[label]():
-                if pending.done():
-                    pending.result()  # Surface a frontend failure instead of hiding it.
-                await asyncio.sleep(0.01)
-
-        pending = asyncio.create_task(start_turn(3))
-        for label in ['A', 'B']:
-            await ready(label, complete=True)
-        await observe_fixture(both_completed.wait(), pending)
-        for label in ['A', 'B']:
-            with open(parents[label]['metadata'], encoding='utf-8') as stream:
-                record = json.load(stream)
-            self.assertEqual(record['exit_code'], 0)
-            self.assertIsNone(record['finished_at'])
-            await self._ping_search(witnesses[label], 'child', 'after-normal-resource-close', label,
-                                    exited=children[label])
-        # Both families belong to this one pending ACP prompt/session.
-        stop_allowed.set()
-        await ready('C', complete=False)
-        await dead('A')
-        await self._ping_search(witnesses['B'], 'child', 'after-A-stop', 'B', exited=children['B'])
-        front.stdin.write((json.dumps({'jsonrpc': '2.0', 'method': 'session/cancel',
-                                      'params': {'sessionId': session_id}}) + '\n').encode())
-        await front.stdin.drain()
-        reply, messages = await pending
-        self.assertEqual(reply, {'stopReason': 'cancelled'})
-        await dead('C')
-        await self._ping_search(witnesses['B'], 'child', 'after-C-cancel', 'B', exited=children['B'])
-        updates = json.dumps(_tool_updates(messages, session_id))
-        for label in ['A', 'B']:
-            self.assertIn('CONTROLLED_SEARCH_OUTPUT_' + label, updates)
-        pending = asyncio.create_task(start_turn(4))
-        await ready('D', complete=True)
-        reply, _messages = await pending
-        self.assertEqual(reply, {'stopReason': 'end_turn'})
-        await dead('B')
-        self.assertEqual(actions, [])
-        self.assertEqual(len(requests), 7)
-        # D still runs after normal completion; only closing this root retires it.
-        await self._ping_search(witnesses['D'], 'child', 'before-root-retirement', 'D', exited=children['D'])
-        await self._finish(front, diagnostics, session_id)
-        await dead('D')
 
 
 @unittest.skipUnless(os.name == 'posix', 'POSIX process-group contract')
@@ -534,6 +415,125 @@ class JobProcessGroupTests(unittest.IsolatedAsyncioTestCase):
                 await manager._terminate_process_group(job, signal.SIGTERM, 0)
                 exists.assert_not_called()
                 send.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == 'win32' or sys.platform.startswith('linux'),
+                     'root retirement needs Windows jobs or Linux PID namespaces')
+class JobLifetimeTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_frontend_stop_cancel_and_root_retirement(self):
+        root = self.enterContext(tempfile.TemporaryDirectory(prefix='acp-descendant-workflow-'))
+        workspace = os.path.join(root, 'workspace')
+        private_files.make_private_directory(workspace)
+        witnesses, parents, children = {}, {}, {}
+        for label in ['A', 'B', 'C', 'D']:
+            witnesses[label] = os.path.join(workspace, label)
+            os.mkdir(witnesses[label])
+            env = self._controlled_search(root, witnesses[label], label, cwd=workspace)
+            if label == 'A':
+                environment = env
+        stop_allowed, both_completed = asyncio.Event(), asyncio.Event()
+        actions = ['A', 'B', 'stop-A', 'C', 'stop-B', 'D', None]
+
+        async def respond(request):
+            action = actions.pop(0)
+            if action in ['C', 'D']:
+                self.assertIn('Sent ', request['messages'][-1]['content'])
+            if action is None:
+                return {'role': 'assistant', 'content': 'Lifetime and isolation complete.'}
+            if action.startswith('stop-'):
+                if action == 'stop-A':
+                    both_completed.set()
+                    await stop_allowed.wait()
+                with open(parents[action[-1]]['metadata'], encoding='utf-8') as stream:
+                    record = json.load(stream)
+                name, args = 'JobStop', {'job_id': record['id'], 'force': True}
+            else:
+                name, args = 'Grep', {'pattern': 'CONTROLLED_SEARCH_OUTPUT_' + action,
+                                      'path': os.path.join(witnesses[action], 'controlled-search.py'),
+                                      'output_mode': 'content'}
+            return {'role': 'assistant', 'content': '', 'tool_calls': [{
+                'id': action, 'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(args)}}]}
+
+        url, requests, _authorization = await self._provider(respond)
+        environment.update(LOKI_PROVIDER='openai_chat', LOKI_API_BASE=url,
+                           LOKI_MODEL='workflow-model', LOKI_STREAM='0',
+                           LOKI_API_KEY='family-synthetic-key')
+        configure_container(environment, workspace)
+        front, diagnostics = await self._front(environment, workspace, lifetime_boundary=True, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+        opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+        session_id = opened['sessionId']
+        pending = None
+
+        async def release_reader():
+            if pending is not None:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+        self.addAsyncCleanup(release_reader)
+
+        async def start_turn(identifier):
+            return await self._request(front, identifier, 'session/prompt', {
+                'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'Continue the lifetime journey'}]})
+
+        async def ready(label, *, complete):
+            directory = witnesses[label]
+            parents[label] = await self._search_file(directory, 'parent-ready', pending)
+            child = await self._search_file(directory, 'child-ready', pending)
+            children[label] = self._observe_process_exit(child['host_pid'])
+            parent_exited = self._observe_process_exit(parents[label]['host_pid'])
+            await self._ping_search(directory, 'parent', 'before-completion', label,
+                                    exited=parent_exited)
+            await self._ping_search(directory, 'child', 'before-completion', label,
+                                    exited=children[label])
+            if complete:
+                with open(os.path.join(directory, 'parent-finish'), 'x'):
+                    pass
+
+        async def dead(label):
+            while not children[label]():
+                if pending.done():
+                    pending.result()  # Surface a frontend failure instead of hiding it.
+                await asyncio.sleep(0.01)
+
+        pending = asyncio.create_task(start_turn(3))
+        for label in ['A', 'B']:
+            await ready(label, complete=True)
+        await observe_fixture(both_completed.wait(), pending)
+        for label in ['A', 'B']:
+            with open(parents[label]['metadata'], encoding='utf-8') as stream:
+                record = json.load(stream)
+            self.assertEqual(record['exit_code'], 0)
+            self.assertIsNone(record['finished_at'])
+            await self._ping_search(witnesses[label], 'child', 'after-normal-resource-close', label,
+                                    exited=children[label])
+        # Both families belong to this one pending ACP prompt/session.
+        stop_allowed.set()
+        await ready('C', complete=False)
+        await dead('A')
+        await self._ping_search(witnesses['B'], 'child', 'after-A-stop', 'B', exited=children['B'])
+        front.stdin.write((json.dumps({'jsonrpc': '2.0', 'method': 'session/cancel',
+                                      'params': {'sessionId': session_id}}) + '\n').encode())
+        await front.stdin.drain()
+        reply, messages = await pending
+        self.assertEqual(reply, {'stopReason': 'cancelled'})
+        await dead('C')
+        await self._ping_search(witnesses['B'], 'child', 'after-C-cancel', 'B', exited=children['B'])
+        updates = json.dumps(_tool_updates(messages, session_id))
+        for label in ['A', 'B']:
+            self.assertIn('CONTROLLED_SEARCH_OUTPUT_' + label, updates)
+        pending = asyncio.create_task(start_turn(4))
+        await ready('D', complete=True)
+        reply, _messages = await pending
+        self.assertEqual(reply, {'stopReason': 'end_turn'})
+        await dead('B')
+        self.assertEqual(actions, [])
+        self.assertEqual(len(requests), 7)
+        # D still runs after normal completion; only closing this root retires it.
+        await self._ping_search(witnesses['D'], 'child', 'before-root-retirement', 'D', exited=children['D'])
+        await self._finish(front, diagnostics, session_id)
+        await dead('D')
 
 
 if __name__ == '__main__':

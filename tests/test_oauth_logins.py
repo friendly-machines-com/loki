@@ -5,6 +5,7 @@ import urllib.parse
 import unittest
 from unittest import mock
 
+from process_lifecycle_fixtures import observe_fixture
 from loki_agent import http_client
 from loki_agent import oauth_logins
 
@@ -205,11 +206,17 @@ class OpenAIDeviceLoginTests(unittest.IsolatedAsyncioTestCase):
                 request=request,
                 sleep=sleep,
             ))
-        await sleeping.wait()
-        task.cancel()
+        try:
+            # The poll can fail before reaching the held sleep. Borrow its
+            # actual task for readiness; this fixture still owns retirement.
+            await observe_fixture(sleeping.wait(), task)
+            task.cancel()
 
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_token_error_does_not_include_response_body(self):
         secret_body = b"refresh_token=must-not-appear"

@@ -3,6 +3,8 @@ import os
 import tempfile
 import unittest
 from unittest import mock
+from config_fixtures import setUpModule as set_up_config
+from response_header_fixtures import setUpModule as set_up_response_headers
 
 from loki_agent import acp_commands
 from loki_agent import authentications, connections, models, openai_models, protocols
@@ -11,8 +13,9 @@ from loki_agent import provider_controls, skills
 from loki_agent.sessions import Session
 
 
-def session(shell_cwd):
-    return Session(shell_cwd=shell_cwd)
+def setUpModule():
+    set_up_config()
+    set_up_response_headers()
 
 
 class ParseTests(unittest.TestCase):
@@ -108,20 +111,12 @@ class AdvertisementTests(unittest.TestCase):
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self._saved = loki._DEFAULT_SESSION
-        self.addCleanup(self._restore)
-
-    def _restore(self):
-        loki._DEFAULT_SESSION = self._saved
-
-    def _install(self, shell_cwd):
-        loki._DEFAULT_SESSION = session(shell_cwd)
-        return loki._DEFAULT_SESSION
+        self.session = Session(shell_cwd="/tmp")
+        self.addCleanup(self.session.response_headers.close)
+        self.enterContext(mock.patch.object(loki, '_DEFAULT_SESSION', self.session))
 
     async def test_cd_failure_is_reported_not_raised(self):
-        _session = self._install("/tmp")
-
-        outcome = await acp_commands.run("/cd /no/such/place", _session)
+        outcome = await acp_commands.run("/cd /no/such/place", self.session)
 
         self.assertTrue(outcome.text.startswith("cd: "))
         self.assertIn("/no/such/place", outcome.text)
@@ -135,22 +130,17 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         # One layer of matching quotes is still removed, and nothing else.
         self.assertEqual(loki._parse_cd_arg_text('"a b"'), "a b")
 
-        _session = self._install("/tmp")
-
-        outcome = await acp_commands.run(r"/cd C:\work\sub", _session)
+        outcome = await acp_commands.run(r"/cd C:\work\sub", self.session)
 
         self.assertNotIn("C:worksub", outcome.text)
 
     async def test_status_without_a_connection_says_so(self):
-        _session = self._install("/tmp")
-
-        outcome = await acp_commands.run("/status", _session)
+        outcome = await acp_commands.run("/status", self.session)
 
         self.assertIn("No active HTTP chat connection", outcome.text)
 
     async def test_status_json_is_json_when_account_controls_are_available(self):
-        current = self._install("/tmp")
-        self.addCleanup(current.response_headers.close)
+        current = self.session
         current.runtime_config = connections.make_runtime_config(
             authentications.OPENAI_CHATGPT_RESPONSES_URL, protocols.OPENAI_RESPONSES,
             model="model", credential_ref=authentications.CredentialRef.openai_subscription(),
@@ -162,43 +152,32 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Live account data: /account usage, /account resets", outcome.text)
 
     async def test_account_without_controls_is_explicit(self):
-        _session = self._install("/tmp")
-
-        outcome = await acp_commands.run("/account", _session)
+        outcome = await acp_commands.run("/account", self.session)
 
         self.assertIn("No live account controls", outcome.text)
 
     async def test_unknown_account_control_is_reported(self):
-        _session = self._install("/tmp")
-
-        outcome = await acp_commands.run("/account nope", _session)
+        outcome = await acp_commands.run("/account nope", self.session)
 
         self.assertEqual(outcome.text, "No such account control: nope")
 
     async def test_image_failure_is_reported_not_raised(self):
-        _session = self._install("/tmp")
-
-        outcome = await acp_commands.run("/image nope.png", _session)
+        outcome = await acp_commands.run("/image nope.png", self.session)
 
         self.assertTrue(outcome.text.startswith("image: "))
 
     async def test_non_command_returns_none(self):
-        _session = self._install("/tmp")
-
-        self.assertIsNone(await acp_commands.run("hello", _session))
+        self.assertIsNone(await acp_commands.run("hello", self.session))
 
 
 class FakeControlTests(unittest.IsolatedAsyncioTestCase):
     """The ACP /account path against a stub control, provider-independent."""
 
     def setUp(self):
-        self._saved = loki._DEFAULT_SESSION
-        self.addCleanup(self._restore)
-        loki._DEFAULT_SESSION = session("/tmp")
+        self.session = Session(shell_cwd="/tmp")
+        self.addCleanup(self.session.response_headers.close)
+        self.enterContext(mock.patch.object(loki, '_DEFAULT_SESSION', self.session))
         self._actions = ()
-
-    def _restore(self):
-        loki._DEFAULT_SESSION = self._saved
 
     async def _read(self, context):
         return provider_controls.ControlResult(
@@ -216,11 +195,9 @@ class FakeControlTests(unittest.IsolatedAsyncioTestCase):
             read=self._read,
         )
         for name in ["available_controls", "find_control"]:
-            patch = mock.patch.object(
+            self.enterContext(mock.patch.object(
                 provider_controls, name, return_value=[spec]
-                if name == "available_controls" else spec)
-            patch.start()
-            self.addCleanup(patch.stop)
+                if name == "available_controls" else spec))
 
     async def test_lists_controls_when_called_without_argument(self):
         self._patch()

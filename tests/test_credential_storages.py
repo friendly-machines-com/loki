@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import closing
+from contextlib import AsyncExitStack, closing
 import json
 import os
 import stat
@@ -10,6 +10,7 @@ import time
 import unittest
 from unittest import mock
 
+from process_lifecycle_fixtures import observe_fixture, running_fixture_task
 from loki_agent import authentications
 from loki_agent import private_files
 from loki_agent import credential_storages
@@ -284,11 +285,9 @@ print('relative private store validated')
                                return_value=lock_fd), \
                 mock.patch.object(file_locks, 'try_lock_exclusive',
                                   side_effect=BlockingIOError):
-            task = asyncio.create_task(self.storage.store_openai_login(tokens()))
-            try:
+            async with running_fixture_task(self.storage.store_openai_login(tokens())) as task:
                 await asyncio.sleep(0)
                 self.assertFalse(task.done())
-            finally:
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
@@ -550,13 +549,24 @@ print('relative private store validated')
     async def test_two_instances_send_only_one_rotation(self):
         first = credential_storages.JsonCredentialStorage(
             self.directory)
+        self.addCleanup(first.close)
         second = credential_storages.JsonCredentialStorage(
             self.directory)
+        self.addCleanup(second.close)
         current = tokens().normalized()
         await first.store_openai_login(current)
         calls = []
         started = asyncio.Event()
         release = asyncio.Event()
+        contended = asyncio.Event()
+        real_lock = file_locks.try_lock_exclusive
+
+        def observe(token):
+            try:
+                return real_lock(token)
+            except BlockingIOError:
+                contended.set()
+                raise
 
         async def refresh(value):
             calls.append(value)
@@ -567,22 +577,27 @@ print('relative private store validated')
                 refresh_token="refresh-b",
             )
 
-        first_task = asyncio.create_task(
-            first.rotate_openai_subscription(
-                current, refresh=refresh))
-        await started.wait()
-        second_task = asyncio.create_task(
-            second.rotate_openai_subscription(
-                current, refresh=refresh))
-        await asyncio.sleep(0.1)
-        release.set()
-        results = await asyncio.gather(first_task, second_task)
+        async with AsyncExitStack() as actors:
+            first_task = await actors.enter_async_context(running_fixture_task(
+                first.rotate_openai_subscription(current, refresh=refresh)))
+            try:
+                await observe_fixture(started.wait(), first_task)
+                with mock.patch.object(file_locks, 'try_lock_exclusive', new=observe):
+                    second_task = await actors.enter_async_context(running_fixture_task(
+                        second.rotate_openai_subscription(current, refresh=refresh)))
+                    # Only a REAL rejected lock attempt proves the second actor
+                    # overlaps the held rotation. A settling sleep proves nothing.
+                    await observe_fixture(contended.wait(), second_task, first_task)
+                    release.set()
+                    results = await asyncio.gather(first_task, second_task)
 
-        self.assertEqual(calls, ["refresh-a"])
-        self.assertEqual(
-            {result.refresh_token for result in results},
-            {"refresh-b"},
-        )
+                self.assertEqual(calls, ["refresh-a"])
+                self.assertEqual(
+                    {result.refresh_token for result in results},
+                    {"refresh-b"},
+                )
+            finally:
+                release.set()
 
 
 class CredentialDocumentTests(unittest.TestCase):
@@ -590,99 +605,92 @@ class CredentialDocumentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = os.path.join(
                 temporary, "loki", "credentials")
-            storage = credential_storages.JsonCredentialStorage(
-                directory)
-            asyncio.run(storage.store_openai_login(tokens()))
-            calls_path = os.path.join(temporary, "calls")
-            release_path = os.path.join(temporary, "release")
-            loaded_path = os.path.join(temporary, "loaded")
-            command = [
-                sys.executable,
-                "-m",
-                "tests.credential_rotation_processes",
-                directory,
-                calls_path,
-                release_path,
-                loaded_path,
-            ]
-            processes = []
-            try:
-                first = subprocess.Popen(
-                    command,
-                    cwd=ROOT,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                processes.append(first)
-                deadline = time.monotonic() + 5
-                while not os.path.exists(calls_path):
-                    if first.poll() is not None:
-                        break
-                    if time.monotonic() >= deadline:
-                        self.fail("first refresh process did not start")
-                    time.sleep(0.01)
-                if first.poll() is not None:
-                    stdout, stderr = first.communicate()
-                    self.fail(
-                        "first refresh process failed: "
-                        f"{stdout!r} {stderr!r}")
-
-                second = subprocess.Popen(
-                    command,
-                    cwd=ROOT,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                processes.append(second)
-                # Wait until the second process has read the credential
-                # document, rather than guessing with a sleep.  It reads the
-                # document outside the lock, so it must read while the first
-                # still holds it; if it reads after publication it sees the
-                # refreshed tokens and rotates a second time.
-                deadline = time.monotonic() + 5
-                while _marker_lines(loaded_path) < 2:
-                    if second.poll() is not None:
-                        stdout, stderr = second.communicate()
-                        self.fail(
-                            "second refresh process failed: "
-                            f"{stdout!r} {stderr!r}")
-                    if time.monotonic() >= deadline:
-                        self.fail(
-                            "second refresh process did not read the document")
-                    time.sleep(0.01)
-                with open(
-                        calls_path, encoding="ascii") as stream:
-                    self.assertEqual(len(stream.readlines()), 1)
-                with open(
-                        release_path, "w",
-                        encoding="ascii") as stream:
-                    stream.write("release\n")
-
-                results = [
-                    process.communicate(timeout=5)
-                    for process in processes
+            with closing(credential_storages.JsonCredentialStorage(
+                    directory)) as storage:
+                asyncio.run(storage.store_openai_login(tokens()))
+                calls_path = os.path.join(temporary, "calls")
+                release_path = os.path.join(temporary, "release")
+                loaded_path = os.path.join(temporary, "loaded")
+                command = [
+                    sys.executable,
+                    "-c",
+                    "import runpy; runpy.run_path('tests/credential_rotation_processes.py', run_name='__main__')",
+                    directory,
+                    calls_path,
+                    release_path,
+                    loaded_path,
                 ]
-                for process, (stdout, stderr) in zip(
-                        processes, results):
-                    self.assertEqual(
-                        process.returncode, 0, stderr)
-                    self.assertEqual(
-                        stdout.strip(), "refresh-b")
-                with open(
-                        calls_path, encoding="ascii") as stream:
-                    self.assertEqual(len(stream.readlines()), 1)
-            finally:
-                for process in processes:
-                    if process.poll() is None:
-                        process.kill()
+                processes = []
+                try:
+                    first = subprocess.Popen(
+                        command,
+                        cwd=ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    processes.append(first)
+                    while not os.path.exists(calls_path):
+                        if first.poll() is not None:
+                            break
+                        time.sleep(0.01)
+                    if first.poll() is not None:
+                        stdout, stderr = first.communicate()
+                        self.fail(
+                            "first refresh process failed: "
+                            f"{stdout!r} {stderr!r}")
+
+                    second = subprocess.Popen(
+                        command,
+                        cwd=ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    processes.append(second)
+                    # Wait until the second process has read the credential
+                    # document, rather than guessing with a sleep.  It reads the
+                    # document outside the lock, so it must read while the first
+                    # still holds it; if it reads after publication it sees the
+                    # refreshed tokens and rotates a second time.
+                    while _marker_lines(loaded_path) < 2:
+                        if second.poll() is not None:
+                            stdout, stderr = second.communicate()
+                            self.fail(
+                                "second refresh process failed: "
+                                f"{stdout!r} {stderr!r}")
+                        time.sleep(0.01)
+                    with open(
+                            calls_path, encoding="ascii") as stream:
+                        self.assertEqual(len(stream.readlines()), 1)
+                    with open(
+                            release_path, "w",
+                            encoding="ascii") as stream:
+                        stream.write("release\n")
+
+                    results = [
                         process.communicate()
-                    else:
-                        if process.stdout is not None:
-                            process.stdout.close()
-                        if process.stderr is not None:
-                            process.stderr.close()
+                        for process in processes
+                    ]
+                    for process, (stdout, stderr) in zip(
+                            processes, results):
+                        self.assertEqual(
+                            process.returncode, 0, stderr)
+                        self.assertEqual(
+                            stdout.strip(), "refresh-b")
+                    with open(
+                            calls_path, encoding="ascii") as stream:
+                        self.assertEqual(len(stream.readlines()), 1)
+                finally:
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill()
+                            process.communicate()
+                        else:
+                            if process.stdout is not None:
+                                process.stdout.close()
+                            if process.stderr is not None:
+                                process.stderr.close()
 
     def test_unknown_records_are_preserved_by_openai_login(self):
         with tempfile.TemporaryDirectory() as temporary:

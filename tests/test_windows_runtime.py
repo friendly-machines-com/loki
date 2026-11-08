@@ -10,19 +10,20 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+
 from windows_state_fixtures import directory_identity_patch
+from process_lifecycle_fixtures import observe_fixture
 
 from loki_agent import windows_runtime as runtime
 from loki_agent import windows_api as api
+from loki_agent import windows_state
 from loki_agent.windows_state import Check
 from loki_agent.runtime_isolations import RuntimeIsolationError
 
 
-# The canonical path of an object is asked of the kernel about an open handle
-# (windows_state._final_path), which only exists on Windows.  These modules test
-# the ledger, plan and gate logic on every host, so they substitute the
-# platform's canonicalisation with its Python equivalent; the real call is
-# exercised by the Windows legs.
+# Gate/ledger decision tests use opaque model objects, not pathname oracles.
+# The actual frontend/environment class below restores native identity lookup.
+_native_directory_identity = windows_state._directory_identity
 
 
 def setUpModule():
@@ -578,66 +579,6 @@ class LocalLaunchTests(unittest.TestCase):
                 self.assertCountEqual(seen['closed'], [44, 55, 66, 77])
                 seen['resume'].assert_not_called()
 
-    def test_generic_role_policy_does_not_replace_the_callers_explicit_directory(self):
-        # Loki's trusted call site supplies its process cwd. This generic layer
-        # must forward that value, not derive another directory from the role.
-        with self.calls(True) as seen:
-            runtime.prepare_local(runtime.ContainedProcess(None), ['/chosen/loki.exe'], {},
-                                  '/explicit-trusted-directory', [], [1, 2, 3], owning=True)
-            self.assertEqual(seen['create'].call_args.kwargs['current_directory'], '/explicit-trusted-directory')
-
-    def test_identity_failure_retains_the_suspended_child_for_async_retirement(self):
-        self._identity_failure(False, 'package')
-
-    def test_only_bare_external_commands_use_windows_command_lookup(self):
-        """Qualification chooses a native launch parameter; it must never rewrite the image."""
-        cases = [
-            ['cmd.exe', True],
-            [r'.\cmd.exe', False],
-            ['tools/cmd.exe', False],
-            [r'C:cmd.exe', False],
-            [r'C:\tools\cmd.exe', False],
-            [r'\tools\cmd.exe', False],
-            [r'\\server\share\cmd.exe', False],
-        ]
-        for image, search in cases:
-            for owning in [False, True]:
-                with self.subTest(image=image, owning=owning), self.calls(owning) as seen:
-                    runtime.prepare_local(runtime.ContainedProcess(None), [image, '/c', 'exit'], {},
-                                          '/workspace', [], [1, 2, 3], owning=owning)
-                    self.assertEqual(seen['create'].call_args.args[0], image)
-                    self.assertEqual(seen['create'].call_args.kwargs['search_path'],
-                                     search and not owning)
-
-    def _identity_failure(self, owning, mismatch):
-        with self.calls(owning, mismatch=mismatch) as seen:
-            process = runtime.ContainedProcess(None)
-            with self.assertRaises(api.WindowsApiError):
-                runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], [1, 2, 3],
-                                      owning=owning)
-            self.assertEqual(process.information.hProcess, 101)
-            self.assertNotIn(101, seen['closed'])
-            self.assertNotIn(102, seen['closed'])
-            seen['resume'].assert_not_called()
-            if mismatch == 'package':
-                self.assertTrue(api.token_is_app_container(66))
-                self.assertNotEqual(api.token_app_container_sid(66), api.token_app_container_sid(44))
-
-    def test_owning_child_package_mismatch_retains_the_suspended_child(self):
-        self._identity_failure(True, 'package')
-
-    def test_tool_child_capability_mismatch_retains_the_suspended_child(self):
-        self._identity_failure(False, 'capabilities')
-
-    def test_owning_child_capability_mismatch_retains_the_suspended_child(self):
-        self._identity_failure(True, 'capabilities')
-
-    def test_tool_child_losing_appcontainer_identity_retains_the_suspended_child(self):
-        self._identity_failure(False, 'container')
-
-    def test_owning_child_losing_appcontainer_identity_retains_the_suspended_child(self):
-        self._identity_failure(True, 'container')
-
     def test_only_ordinary_children_receive_verified_ui_limits_before_execution(self):
         # Local creation must keep the writer out of the child's UI domain.
         # This portable contract checks ordering; the native fixture separately
@@ -691,6 +632,66 @@ class LocalLaunchTests(unittest.TestCase):
                     seen['resume'].assert_not_called()
                 finally:
                     process.close()
+
+    def test_generic_role_policy_does_not_replace_the_callers_explicit_directory(self):
+        # Loki's trusted call site supplies its process cwd. This generic layer
+        # must forward that value, not derive another directory from the role.
+        with self.calls(True) as seen:
+            runtime.prepare_local(runtime.ContainedProcess(None), ['/chosen/loki.exe'], {},
+                                  '/explicit-trusted-directory', [], [1, 2, 3], owning=True)
+            self.assertEqual(seen['create'].call_args.kwargs['current_directory'], '/explicit-trusted-directory')
+
+    def _identity_failure(self, owning, mismatch):
+        with self.calls(owning, mismatch=mismatch) as seen:
+            process = runtime.ContainedProcess(None)
+            with self.assertRaises(api.WindowsApiError):
+                runtime.prepare_local(process, ['/chosen/loki.exe'], {}, '/trusted', [], [1, 2, 3],
+                                      owning=owning)
+            self.assertEqual(process.information.hProcess, 101)
+            self.assertNotIn(101, seen['closed'])
+            self.assertNotIn(102, seen['closed'])
+            seen['resume'].assert_not_called()
+            if mismatch == 'package':
+                self.assertTrue(api.token_is_app_container(66))
+                self.assertNotEqual(api.token_app_container_sid(66), api.token_app_container_sid(44))
+
+    def test_identity_failure_retains_the_suspended_child_for_async_retirement(self):
+        self._identity_failure(False, 'package')
+
+    def test_owning_child_package_mismatch_retains_the_suspended_child(self):
+        self._identity_failure(True, 'package')
+
+    def test_tool_child_capability_mismatch_retains_the_suspended_child(self):
+        self._identity_failure(False, 'capabilities')
+
+    def test_owning_child_capability_mismatch_retains_the_suspended_child(self):
+        self._identity_failure(True, 'capabilities')
+
+    def test_tool_child_losing_appcontainer_identity_retains_the_suspended_child(self):
+        self._identity_failure(False, 'container')
+
+    def test_owning_child_losing_appcontainer_identity_retains_the_suspended_child(self):
+        self._identity_failure(True, 'container')
+
+    def test_only_bare_external_commands_use_windows_command_lookup(self):
+        """Qualification chooses a native launch parameter; it must never rewrite the image."""
+        cases = [
+            ['cmd.exe', True],
+            [r'.\cmd.exe', False],
+            ['tools/cmd.exe', False],
+            [r'C:cmd.exe', False],
+            [r'C:\tools\cmd.exe', False],
+            [r'\tools\cmd.exe', False],
+            [r'\\server\share\cmd.exe', False],
+        ]
+        for image, search in cases:
+            for owning in [False, True]:
+                with self.subTest(image=image, owning=owning), self.calls(owning) as seen:
+                    runtime.prepare_local(runtime.ContainedProcess(None), [image, '/c', 'exit'], {},
+                                          '/workspace', [], [1, 2, 3], owning=owning)
+                    self.assertEqual(seen['create'].call_args.args[0], image)
+                    self.assertEqual(seen['create'].call_args.kwargs['search_path'],
+                                     search and not owning)
 
 
 class FamilyAccountingTests(unittest.TestCase):
@@ -759,7 +760,46 @@ class FamilyAccountingTests(unittest.TestCase):
 
 
 class LocalRetirementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_termination_keeps_control_until_observed_exit(self):
+        owner = runtime.ContainedProcess(api.ProcessInformation(71, 72, 73, 0), job=88)
+        entered, exited = asyncio.Event(), asyncio.Event()
+        failure = api.WindowsApiError('termination failed', status=5)
+
+        async def wait():
+            entered.set()
+            await exited.wait()
+            owner.returncode = 1
+            return 1
+
+        with mock.patch.object(runtime, 'terminate_job', side_effect=failure), \
+                mock.patch.object(owner, 'wait', side_effect=wait), \
+                mock.patch.object(api, 'close_handle') as close:
+            task = asyncio.create_task(runtime.retire_local(owner))
+            try:
+                await observe_fixture(entered.wait(), task)
+                self.assertFalse(task.done())
+                self.assertEqual(owner.job, 88)
+                self.assertEqual(owner.information.hProcess, 71)
+                close.assert_not_called()
+                exited.set()
+                with self.assertRaises(api.WindowsApiError) as caught:
+                    await task
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(close.call_args_list, [mock.call(88), mock.call(72), mock.call(71)])
+            finally:
+                exited.set()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def test_repeated_cancellation_joins_exit_before_closing_handles(self):
+        await self._retirement_fixture()
+
+    async def test_readiness_observes_retirement_failure_before_native_wait(self):
+        failure = mock.AsyncMock(side_effect=RuntimeError('retirement failed before wait'))
+        with mock.patch.object(runtime, 'retire_local', new=failure):
+            with self.assertRaisesRegex(RuntimeError, 'retirement failed before wait'):
+                await self._retirement_fixture()
+
+    async def _retirement_fixture(self):
         entered, exited = asyncio.Event(), asyncio.Event()
         events = []
         process = mock.Mock(information=api.ProcessInformation(71, 72, 73, 0))
@@ -774,64 +814,61 @@ class LocalRetirementTests(unittest.IsolatedAsyncioTestCase):
         process.terminate.side_effect = lambda: events.append('terminate')
         process.close.side_effect = lambda: events.append('close')
         task = asyncio.create_task(runtime.retire_local(process))
-        await entered.wait()
-        task.cancel()
-        await asyncio.sleep(0)
-        task.cancel()
-        await asyncio.sleep(0)
-        self.assertEqual(events, ['terminate'])
-        exited.set()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        self.assertEqual(events, ['terminate', 'exit', 'close'])
+        try:
+            # Retirement can fail before entering wait(). On any fixture exit,
+            # release its fake native witness before joining the real owner;
+            # otherwise an assertion failure strands cancellation-resistant work.
+            await observe_fixture(entered.wait(), task)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertEqual(events, ['terminate'])
+            exited.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(events, ['terminate', 'exit', 'close'])
+        finally:
+            exited.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @unittest.skipUnless(sys.platform == "win32",
                      "the contained launch is Windows-only")
 class LaunchEnvironmentTests(unittest.TestCase):
-    """Reproduce the contained launch with controlled environments.
+    """Qualify real frontend/runtime startup with reduced and full environments."""
 
-    The pty tests fail ``CreateProcessW failed: 203`` when the TUI front starts
-    its runtime, and the environment that launch is given is the suspect.  This
-    runs the real ``windows_runtime.launch`` with the reduced environment those
-    tests use, plus one variant adding each variable the broker restores from
-    its profile, and records start/winerror per variant.  Recorded, not
-    asserted: a failure here is the measurement, and the assertion belongs to
-    whatever fix follows.
-    """
+    def setUp(self):
+        # This class crosses the real setup/entrypoint boundary. Unlike the
+        # decision tests above, it must use actual native workspace identities.
+        patch = mock.patch.object(windows_state, '_directory_identity', new=_native_directory_identity)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_environment_variants(self):
-        import json
-        from loki_entrypoints import child_environment, configure_container
-        record = {"probe": "launch-environment-203"}
+        import subprocess
+        from loki_entrypoints import child_environment, configure_container, entrypoint
+        from loki_agent.credentials import is_credential_name
+
         with tempfile.TemporaryDirectory(prefix="loki-launch-env-") as root:
-            workspace = os.path.join(root, "workspace")
-            os.makedirs(workspace)
+            workspace = root + os.sep + 'workspace'
+            os.mkdir(workspace)
+            marker = 'native environment launch completed'
             reduced = child_environment(
-                HOME=root,
-                XDG_CONFIG_HOME=os.path.join(root, "config"),
-                XDG_STATE_HOME=os.path.join(root, "state"),
-                PATH=os.environ.get("PATH", ""))
+                HOME=root, XDG_CONFIG_HOME=root + os.sep + 'config',
+                XDG_STATE_HOME=root + os.sep + 'state', PATH=os.environ.get('PATH', ''),
+                LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                LOKI_MODEL='dummy', LOKI_DUMMY_REPLY=marker)
             configure_container(reduced, workspace)
-            variants = {"reduced": dict(reduced)}
-            for name in ["USERPROFILE", "LOCALAPPDATA", "APPDATA",
-                         "PROGRAMDATA", "PROGRAMFILES"]:
-                if os.environ.get(name):
-                    variants["with_" + name] = {**reduced, name: os.environ[name]}
-            variants["full_process"] = dict(os.environ)
-            for label, environment in variants.items():
-                try:
-                    process = runtime.launch(
-                        sys.executable, ["-c", "pass"], environment,
-                        workspace, [], current_directory=os.getcwd())
-                except Exception as error:
-                    record[label] = {
-                        "started": False,
-                        "winerror": getattr(error, "winerror", None),
-                        "error": type(error).__name__,
-                        "message": str(error)}
-                else:
-                    record[label] = {"started": True}
-                    process.close()
-        print(json.dumps(record), flush=True)
-        self.assertTrue(record)
+            full = {name: value for name, value in os.environ.items()
+                    if not is_credential_name(name) and not name.startswith('LOKI_')}
+            full.update(reduced)
+            for label, environment in [['reduced', reduced], ['full', full]]:
+                with self.subTest(environment=label):
+                    process = subprocess.run(
+                        [entrypoint('loki'), '--headless', '--prompt', 'environment check'],
+                        cwd=workspace, env=environment, stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True)
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    self.assertIn(marker, process.stdout)

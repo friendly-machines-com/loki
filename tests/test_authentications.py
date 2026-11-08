@@ -225,13 +225,19 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_ambiguous_refresh_is_never_replayed(self):
         now = 10_000.0
         calls = 0
-        started = asyncio.Event()
+        consumer = asyncio.current_task()
+        cancelling = consumer.cancelling()
+        requested = []
+        cancel_handle = None
 
         async def refresh(_refresh_token):
-            nonlocal calls
+            nonlocal calls, cancel_handle
             calls += 1
-            started.set()
-            await asyncio.Event().wait()
+            # Refresh runs inline in this consumer: cancel it at the real hold,
+            # without another operation Task or readiness-observer protocol.
+            cancel_handle = asyncio.get_running_loop().call_soon(
+                lambda: requested.append(consumer.cancel()))
+            await asyncio.Future()
 
         record = auth.OpenAIChatGPTCredential(
             auth.OpenAITokenSet(
@@ -241,15 +247,21 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             rotate=rotation(refresh, now),
             clock=lambda: now,
         )
-        pending = asyncio.create_task(record.lease())
-        await started.wait()
-        pending.cancel()
-
-        with self.assertRaises(asyncio.CancelledError):
-            await pending
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await record.lease()
+            self.assertEqual(requested, [True])
+            self.assertEqual(consumer.cancelling(), cancelling + 1)
+        finally:
+            if cancel_handle is not None:
+                cancel_handle.cancel()
+            # Remove exactly our delivered requests, never unrelated cancellation.
+            for accepted in requested:
+                if accepted and consumer.cancelling() > cancelling:
+                    consumer.uncancel()
+        self.assertEqual(consumer.cancelling(), cancelling)
         with self.assertRaises(auth.RefreshIndeterminateError):
             await record.lease()
-
         self.assertEqual(calls, 1)
 
     async def test_refresh_cannot_switch_account(self):
@@ -281,12 +293,13 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_replacement_wins_over_in_flight_refresh(self):
         now = 10_000.0
-        started = asyncio.Event()
-        release = asyncio.Event()
 
         async def refresh(_refresh_token):
-            started.set()
-            await release.wait()
+            # Replace during the actual refresh, before its stale result returns.
+            record.replace(auth.OpenAITokenSet(
+                access_token=jwt({"exp": now + 7200}),
+                refresh_token="replacement-refresh",
+            ))
             return auth.RefreshResult(
                 access_token=jwt({"exp": now + 3600}),
                 refresh_token="stale-refresh-result",
@@ -300,16 +313,8 @@ class CredentialBrokerTests(unittest.IsolatedAsyncioTestCase):
             rotate=rotation(refresh, now),
             clock=lambda: now,
         )
-        pending = asyncio.create_task(record.lease())
-        await started.wait()
-        record.replace(auth.OpenAITokenSet(
-            access_token=jwt({"exp": now + 7200}),
-            refresh_token="replacement-refresh",
-        ))
-        release.set()
-
-        lease = await pending
-
+        lease = await record.lease()
+        # Outside the callback: a later stale overwrite must still fail here.
         self.assertEqual(record.tokens.refresh_token, "replacement-refresh")
         self.assertEqual(lease.value, record.tokens.access_token)
 

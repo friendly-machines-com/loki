@@ -156,6 +156,76 @@ def observe_process_exit(case, pid):
     return exited
 
 
+def windows_process_environment(pid, parent_pid):
+    """Observe a live same-user test child through a held read-only handle.
+
+    The test owns and keeps both processes alive; verified PID/parent fields
+    reject an unrelated selection. This uses no debug privilege or target code.
+    The PEB prefix follows winternl.h; Environment follows CommandLine in the
+    native parameters ABI (phnt/ntrtl.h). An unsanitized owning-worker control
+    must independently detect its injected value before absence is meaningful.
+    """
+    import ctypes
+    from ctypes import wintypes
+    from loki_agent import windows_api as api
+
+    pointer = ctypes.c_void_p
+
+    class Basic(ctypes.Structure):
+        _fields_ = [('status', ctypes.c_int32), ('peb', pointer),
+                    ('affinity', ctypes.c_size_t), ('priority', ctypes.c_int32),
+                    ('pid', ctypes.c_size_t), ('parent', ctypes.c_size_t)]
+
+    class Peb(ctypes.Structure):
+        _fields_ = [('flags', ctypes.c_ubyte * 4), ('reserved', pointer * 2),
+                    ('loader', pointer), ('parameters', pointer)]
+
+    class String(ctypes.Structure):
+        _fields_ = [('length', ctypes.c_uint16), ('maximum', ctypes.c_uint16), ('buffer', pointer)]
+
+    class Parameters(ctypes.Structure):
+        _fields_ = [('reserved', ctypes.c_ubyte * 16), ('pointers', pointer * 10),
+                    ('image', String), ('command', String), ('environment', pointer)]
+
+    opening = api.bind('kernel32', 'OpenProcess', pointer, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    query = api.bind('ntdll', 'NtQueryInformationProcess', ctypes.c_int32,
+                     pointer, ctypes.c_int, pointer, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG))
+    reading = api.bind('kernel32', 'ReadProcessMemory', wintypes.BOOL,
+                       pointer, pointer, pointer, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t))
+    handle = opening(0x0400 | 0x0010, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        basic, returned = Basic(), wintypes.ULONG()
+        status = query(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic), ctypes.byref(returned))
+        if status < 0:
+            raise OSError('NtQueryInformationProcess: 0x%x' % (status & 0xffffffff))
+        if returned.value != ctypes.sizeof(basic) or basic.pid != pid or basic.parent != parent_pid:
+            raise AssertionError('process observation identity/ABI mismatch')
+
+        def read(address, size):
+            data, count = ctypes.create_string_buffer(size), ctypes.c_size_t()
+            if not reading(handle, address, data, size, ctypes.byref(count)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if count.value != size:
+                raise AssertionError('short native environment observation')
+            return data.raw
+
+        peb = Peb.from_buffer_copy(read(basic.peb, ctypes.sizeof(Peb)))
+        parameters = Parameters.from_buffer_copy(read(peb.parameters, ctypes.sizeof(Parameters)))
+        if not parameters.environment:
+            raise AssertionError('missing native environment pointer')
+        data = bytearray()
+        # A malformed native view must fail, never manufacture an empty report.
+        for offset in range(0, 131072, 2):
+            data.extend(read(parameters.environment + offset, 2))
+            if data.endswith(b'\0\0\0\0'):
+                return data.decode('utf-16-le').encode('utf-8')
+        raise AssertionError('unterminated controlled environment')
+    finally:
+        api.close_handle(handle)
+
+
 class ProcessResources:
     """Observe production launch ownership; public fixture drivers use cleanup only."""
 

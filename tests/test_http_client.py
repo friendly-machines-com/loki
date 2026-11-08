@@ -1,23 +1,11 @@
 import asyncio
-import contextlib
 import sys
 import time
 import unittest
 from unittest import mock
 
+from process_lifecycle_fixtures import observe_fixture, running_fixture_task
 from loki_agent import http_client
-
-
-@contextlib.asynccontextmanager
-async def _running_request(awaitable):
-    task = asyncio.create_task(awaitable)
-    try:
-        yield task
-    finally:
-        if not task.done():
-            task.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(task, return_exceptions=True), 1)
 
 
 class FakeWriter:
@@ -202,8 +190,8 @@ class HttpClientRequestTests(unittest.TestCase):
             connector.open_connection = open_connection
             tls_context = object()
             with PatchedOpenConnection(connector, tls_context):
-                async with _running_request(request()) as task:
-                    await asyncio.wait_for(entered.wait(), 1)
+                async with running_fixture_task(request()) as task:
+                    await observe_fixture(entered.wait(), task)
                     self.assertFalse(task.done())
                     self.assertFalse(interrupted.is_set())
                     self.assertEqual(len(connector.writers), phase == "drain")
@@ -215,7 +203,7 @@ class HttpClientRequestTests(unittest.TestCase):
                         self.assertFalse(connector.writers[0].closed)
                     task.cancel()
                     with self.assertRaises(asyncio.CancelledError) as raised:
-                        await asyncio.wait_for(task, 1)
+                        await task
                     expected = phase == "drain"
                     self.assertEqual(delivery_states, [expected])
                     legacy_loss = (
@@ -262,11 +250,11 @@ class HttpClientRequestTests(unittest.TestCase):
                     "POST", "https://example.test/v1/chat/completions",
                     body=b"{}", timeout=30, cancel_check=cancel_check)
 
-            task = asyncio.create_task(request())
-            await entered.wait()
-            cancelled = True
-            with self.assertRaises(http_client.HttpRequestCancelled):
-                await asyncio.wait_for(task, timeout=1)
+            async with running_fixture_task(request()) as task:
+                await observe_fixture(entered.wait(), task)
+                cancelled = True
+                with self.assertRaises(http_client.HttpRequestCancelled):
+                    await task
 
         with PatchedOpenConnection(connector):
             asyncio.run(scenario())
@@ -296,19 +284,19 @@ class HttpClientRequestTests(unittest.TestCase):
             tls_context = object()
             with PatchedOpenConnection(connector, tls_context), mock.patch.object(
                     asyncio, "sleep", new=observed_sleep):
-                async with _running_request(http_client.async_http_request(
+                async with running_fixture_task(http_client.async_http_request(
                         "POST", "https://example.test/v1/chat/completions",
                         body=b"{}", timeout=20, retry_max_attempts=3,
                         retry_base_delay_s=10, retry_max_jitter_s=0,
                         cancel_check=lambda: cancelled)) as task:
-                    await asyncio.wait_for(sleeping.wait(), 1)
+                    await observe_fixture(sleeping.wait(), task)
                     self.assertFalse(cancelled)
                     self.assertFalse(task.done())
                     self.assertFalse(interrupted.is_set())
                     self.assertEqual(len(connector.calls), 1)
                     cancelled = True
                     with self.assertRaises(http_client.HttpRequestCancelled):
-                        await asyncio.wait_for(task, 1)
+                        await task
                     self.assertTrue(task.done())
                     self.assertTrue(interrupted.is_set())
                     self.assertEqual(len(sleep_tasks), 1)
@@ -494,9 +482,9 @@ class HttpClientRedirectTests(unittest.TestCase):
         connector.open_connection = open_connection
 
         async def scenario():
-            return await asyncio.wait_for(http_client.async_http_request_follow_same_host(
+            return await http_client.async_http_request_follow_same_host(
                 "GET", "https://example.test/start", headers_in=headers,
-                timeout=5, max_bytes=10), 3)
+                timeout=5, max_bytes=10)
 
         with PatchedOpenConnection(connector, tls_context):
             response = asyncio.run(scenario())
@@ -656,11 +644,11 @@ class HttpClientRetryTests(unittest.TestCase):
             connector.open_connection = open_connection
             tls_context = object()
             with PatchedOpenConnection(connector, tls_context):
-                response = await asyncio.wait_for(http_client.async_http_request(
+                response = await http_client.async_http_request(
                     "POST", "https://example.test/responses", headers_in=headers, body=body,
                     timeout=5, retry_max_attempts=2, retry_base_delay_s=0,
                     retry_max_jitter_s=0, prepare_attempt_headers=prepare,
-                    on_response_headers=capture), 3)
+                    on_response_headers=capture)
                 self.assertEqual(response.url, "https://example.test/responses")
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.reason, "OK")
@@ -808,15 +796,15 @@ class HttpClientStreamingTests(unittest.TestCase):
 
             connector.open_connection = open_connection
             with PatchedOpenConnection(connector):
-                async with _running_request(request()) as task:
+                async with running_fixture_task(request()) as task:
                     if active:
-                        await asyncio.wait_for(entered.wait(), 1)
+                        await observe_fixture(entered.wait(), task)
                         self.assertFalse(cancelled)
                         self.assertFalse(task.done())
                         self.assertFalse(interrupted.is_set())
                         cancelled = True
                     with self.assertRaises(http_client.HttpRequestCancelled):
-                        await asyncio.wait_for(task, 1)
+                        await task
                     self.assertTrue(task.done())
                     self.assertEqual(contexts, [])
                     self.assertEqual(connector.writers, [])
@@ -868,9 +856,9 @@ class HttpClientStreamingTests(unittest.TestCase):
 
             connector.open_connection = open_connection
             with PatchedOpenConnection(connector):
-                async with _running_request(consume()) as task:
-                    await asyncio.wait_for(first_observed.wait(), 1)
-                    await asyncio.wait_for(second_read.wait(), 1)
+                async with running_fixture_task(consume()) as task:
+                    await observe_fixture(first_observed.wait(), task)
+                    await observe_fixture(second_read.wait(), task)
                     self.assertEqual(chunks, [b"abc"])
                     self.assertFalse(task.done())
                     self.assertFalse(released)
@@ -883,7 +871,7 @@ class HttpClientStreamingTests(unittest.TestCase):
                     released = True
                     reader.feed_data(b"4\r\ndefg\r\n0\r\nX-Trailer: ignored\r\n\r\n")
                     reader.feed_eof()
-                    await asyncio.wait_for(task, 1)
+                    await task
                     self.assertTrue(task.done())
                     self.assertFalse(task.cancelled())
                     self.assertEqual(chunks, [b"abc", b"defg"])

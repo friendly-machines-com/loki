@@ -10,6 +10,7 @@ denials look successful by making them vacuous.
 import os
 import unittest
 from unittest import mock
+
 from windows_state_fixtures import directory_identity_patch
 
 from loki_agent import paths
@@ -63,6 +64,15 @@ class ProbeContainmentTests(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
+
+    def test_close_failure_is_not_classified_as_an_access_denial(self):
+        access = windows_api.AccessMask.GENERIC_READ
+        self.allow(WORKSPACE, access)
+        failure = windows_api.WindowsApiError('CloseHandle failed', status=5)
+        with mock.patch.object(windows_api, 'close_handle', side_effect=failure):
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                windows_verify._denied('probe', WORKSPACE, access, 'read')
+        self.assertIs(caught.exception, failure)
 
     def _open(self, path, desired_access):
         self.attempts.append((path, desired_access))
@@ -455,15 +465,6 @@ class ProbeContainmentTests(unittest.TestCase):
             checks = self.checks()
 
         self.assertEqual(checks["process token"].status, "fail")
-
-    def test_close_failure_is_not_classified_as_an_access_denial(self):
-        access = windows_api.AccessMask.GENERIC_READ
-        self.allow(WORKSPACE, access)
-        failure = windows_api.WindowsApiError('CloseHandle failed', status=5)
-        with mock.patch.object(windows_api, 'close_handle', side_effect=failure):
-            with self.assertRaises(windows_api.WindowsApiError) as caught:
-                windows_verify._denied('probe', WORKSPACE, access, 'read')
-        self.assertIs(caught.exception, failure)
 
 
 class VerifyContainerTests(unittest.TestCase):

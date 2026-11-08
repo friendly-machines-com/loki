@@ -8,9 +8,9 @@ locations are checked here too, for the same reason: which platform-specific
 location they resolve to is decided by branches that never run on this host.
 """
 
+import asyncio
 import contextlib
 import ctypes
-import asyncio
 import os
 import sys
 import tempfile
@@ -217,83 +217,45 @@ class ParentDirectoryTests(unittest.TestCase):
             self.assertEqual(windows_api.file_identity(handle), identity)
 
 
-class CreationSecurityTests(unittest.TestCase):
-    def test_relative_creation_owns_descriptor_until_creation_and_closes_unpublished_results(self):
-        for outcome in ['success', 'native-error', 'conversion-error', 'null-descriptor', 'free-error']:
+class ConsoleInputTests(unittest.TestCase):
+    def test_input_record_has_the_native_size_and_payload_alignment(self):
+        self.assertEqual(ctypes.sizeof(windows_api.ConsoleInputRecord), 20)
+        self.assertEqual(windows_api.ConsoleInputRecord.event_data.offset, 4)
+
+    def test_only_non_key_console_notifications_are_consumed(self):
+        for outcome in ['file', 'empty', 'key', 'notification', 'peek-error', 'consume-error']:
             with self.subTest(outcome=outcome):
                 events = []
 
-                def convert(text, revision, output, size):
-                    self.assertEqual(text, 'O:creator')
-                    if outcome == 'conversion-error':
-                        return 0
-                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0 if outcome == 'null-descriptor' else 88
-                    events.append('converted')
-                    return 1
+                def mode(handle, output):
+                    self.assertEqual(handle, 17)
+                    events.append('mode')
+                    return outcome != 'file'
 
-                def create(output, access, attributes, io, allocation, flags, share, disposition, options, extra, count):
-                    self.assertEqual(events, ['converted'])
-                    metadata = ctypes.cast(attributes, ctypes.POINTER(windows_api.ObjectAttributes)).contents
-                    self.assertEqual(metadata.SecurityDescriptor, 88)
-                    self.assertEqual(metadata.RootDirectory, 17)
-                    events.append('create')
-                    if outcome == 'native-error':
-                        return ctypes.c_int32(0xc0000022).value
-                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 31
-                    return 0
+                def peek(handle, record, length, count):
+                    self.assertEqual([handle, length], [17, 1])
+                    record._obj.event_type = windows_api.KEY_EVENT if outcome == 'key' else 4
+                    count._obj.value = 0 if outcome == 'empty' else 1
+                    events.append('peek')
+                    return outcome != 'peek-error'
 
-                def free(descriptor):
-                    self.assertEqual(descriptor.value, 88)
-                    events.append('free')
-                    if outcome == 'free-error':
-                        raise OSError('descriptor release failed')
+                def consume(handle, record, length, count):
+                    self.assertEqual([handle, length, record._obj.event_type], [17, 1, 4])
+                    events.append('consume')
+                    return outcome != 'consume-error'
 
-                functions = {'NtCreateFile': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
-                             'LocalFree': free}
+                functions = {'GetConsoleMode': mode, 'PeekConsoleInputW': peek, 'ReadConsoleInputW': consume}
                 with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
-                        mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True), \
-                        mock.patch.object(windows_api, 'close_handle') as close:
-                    if outcome == 'success':
-                        self.assertEqual(windows_api.nt_create_file(
-                            17, 'new', 2, 2, 0, security_descriptor='O:creator'), 31)
+                        mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+                    if outcome in ['peek-error', 'consume-error']:
+                        with self.assertRaises(windows_api.WindowsApiError) as caught:
+                            windows_api.discard_console_notification(17)
+                        self.assertEqual(caught.exception.status, 5)
                     else:
-                        expected = OSError if outcome == 'free-error' else windows_api.WindowsApiError
-                        with self.assertRaises(expected):
-                            windows_api.nt_create_file(17, 'new', 2, 2, 0, security_descriptor='O:creator')
-                    self.assertEqual(close.call_args_list, [mock.call(31)] if outcome == 'free-error' else [])
-                    events_by_failure = {'conversion-error': [], 'null-descriptor': ['converted']}
-                    self.assertEqual(events, events_by_failure.get(outcome, ['converted', 'create', 'free']))
-
-    def test_directory_creation_applies_security_at_creation_and_does_not_repair_existing_objects(self):
-        for result, error in [[1, 0], [0, 183], [0, 5]]:
-            with self.subTest(result=result, error=error):
-                freed = []
-
-                def convert(text, revision, output, size):
-                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 88
-                    return 1
-
-                def create(path, attributes):
-                    self.assertEqual(path, 'raw/../selected')
-                    security = ctypes.cast(attributes, ctypes.POINTER(windows_api.SecurityAttributes)).contents
-                    self.assertEqual(security.lpSecurityDescriptor, 88)
-                    self.assertEqual(security.bInheritHandle, 0)
-                    return result
-
-                functions = {'CreateDirectoryW': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
-                             'LocalFree': lambda descriptor: freed.append(descriptor.value)}
-                with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
-                        mock.patch.object(ctypes, 'get_last_error', return_value=error, create=True), \
-                        mock.patch.object(windows_api, 'set_handle_dacl') as repair:
-                    if error == 5:
-                        with self.assertRaises(windows_api.WindowsApiError) as raised:
-                            windows_api.create_directory('raw/../selected', security_descriptor='O:creator')
-                        self.assertEqual(raised.exception.status, 5)
-                    else:
-                        self.assertEqual(windows_api.create_directory(
-                            'raw/../selected', security_descriptor='O:creator'), bool(result))
-                    repair.assert_not_called()
-                self.assertEqual(freed, [88])
+                        self.assertEqual(windows_api.discard_console_notification(17), outcome == 'notification')
+                expected = (['mode'] if outcome == 'file' else ['mode', 'peek']
+                            if outcome in ['empty', 'key', 'peek-error'] else ['mode', 'peek', 'consume'])
+                self.assertEqual(events, expected)
 
 
 class NamedMutexTests(unittest.TestCase):
@@ -398,45 +360,83 @@ class NamedMutexTests(unittest.TestCase):
         self.assertEqual(statuses, [windows_api.WAIT_TIMEOUT, windows_api.WAIT_OBJECT_0])
 
 
-class ConsoleInputTests(unittest.TestCase):
-    def test_input_record_has_the_native_size_and_payload_alignment(self):
-        self.assertEqual(ctypes.sizeof(windows_api.ConsoleInputRecord), 20)
-        self.assertEqual(windows_api.ConsoleInputRecord.event_data.offset, 4)
-
-    def test_only_non_key_console_notifications_are_consumed(self):
-        for outcome in ['file', 'empty', 'key', 'notification', 'peek-error', 'consume-error']:
+class CreationSecurityTests(unittest.TestCase):
+    def test_relative_creation_owns_descriptor_until_creation_and_closes_unpublished_results(self):
+        for outcome in ['success', 'native-error', 'conversion-error', 'null-descriptor', 'free-error']:
             with self.subTest(outcome=outcome):
                 events = []
 
-                def mode(handle, output):
-                    self.assertEqual(handle, 17)
-                    events.append('mode')
-                    return outcome != 'file'
+                def convert(text, revision, output, size):
+                    self.assertEqual(text, 'O:creator')
+                    if outcome == 'conversion-error':
+                        return 0
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0 if outcome == 'null-descriptor' else 88
+                    events.append('converted')
+                    return 1
 
-                def peek(handle, record, length, count):
-                    self.assertEqual([handle, length], [17, 1])
-                    record._obj.event_type = windows_api.KEY_EVENT if outcome == 'key' else 4
-                    count._obj.value = 0 if outcome == 'empty' else 1
-                    events.append('peek')
-                    return outcome != 'peek-error'
+                def create(output, access, attributes, io, allocation, flags, share, disposition, options, extra, count):
+                    self.assertEqual(events, ['converted'])
+                    metadata = ctypes.cast(attributes, ctypes.POINTER(windows_api.ObjectAttributes)).contents
+                    self.assertEqual(metadata.SecurityDescriptor, 88)
+                    self.assertEqual(metadata.RootDirectory, 17)
+                    events.append('create')
+                    if outcome == 'native-error':
+                        return ctypes.c_int32(0xc0000022).value
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 31
+                    return 0
 
-                def consume(handle, record, length, count):
-                    self.assertEqual([handle, length, record._obj.event_type], [17, 1, 4])
-                    events.append('consume')
-                    return outcome != 'consume-error'
+                def free(descriptor):
+                    self.assertEqual(descriptor.value, 88)
+                    events.append('free')
+                    if outcome == 'free-error':
+                        raise OSError('descriptor release failed')
 
-                functions = {'GetConsoleMode': mode, 'PeekConsoleInputW': peek, 'ReadConsoleInputW': consume}
+                functions = {'NtCreateFile': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
+                             'LocalFree': free}
                 with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
-                        mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True):
-                    if outcome in ['peek-error', 'consume-error']:
-                        with self.assertRaises(windows_api.WindowsApiError) as caught:
-                            windows_api.discard_console_notification(17)
-                        self.assertEqual(caught.exception.status, 5)
+                        mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True), \
+                        mock.patch.object(windows_api, 'close_handle') as close:
+                    if outcome == 'success':
+                        self.assertEqual(windows_api.nt_create_file(
+                            17, 'new', 2, 2, 0, security_descriptor='O:creator'), 31)
                     else:
-                        self.assertEqual(windows_api.discard_console_notification(17), outcome == 'notification')
-                expected = (['mode'] if outcome == 'file' else ['mode', 'peek']
-                            if outcome in ['empty', 'key', 'peek-error'] else ['mode', 'peek', 'consume'])
-                self.assertEqual(events, expected)
+                        expected = OSError if outcome == 'free-error' else windows_api.WindowsApiError
+                        with self.assertRaises(expected):
+                            windows_api.nt_create_file(17, 'new', 2, 2, 0, security_descriptor='O:creator')
+                    self.assertEqual(close.call_args_list, [mock.call(31)] if outcome == 'free-error' else [])
+                    events_by_failure = {'conversion-error': [], 'null-descriptor': ['converted']}
+                    self.assertEqual(events, events_by_failure.get(outcome, ['converted', 'create', 'free']))
+
+    def test_directory_creation_applies_security_at_creation_and_does_not_repair_existing_objects(self):
+        for result, error in [[1, 0], [0, 183], [0, 5]]:
+            with self.subTest(result=result, error=error):
+                freed = []
+
+                def convert(text, revision, output, size):
+                    ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 88
+                    return 1
+
+                def create(path, attributes):
+                    self.assertEqual(path, 'raw/../selected')
+                    security = ctypes.cast(attributes, ctypes.POINTER(windows_api.SecurityAttributes)).contents
+                    self.assertEqual(security.lpSecurityDescriptor, 88)
+                    self.assertEqual(security.bInheritHandle, 0)
+                    return result
+
+                functions = {'CreateDirectoryW': create, 'ConvertStringSecurityDescriptorToSecurityDescriptorW': convert,
+                             'LocalFree': lambda descriptor: freed.append(descriptor.value)}
+                with mock.patch.object(windows_api, 'bind', side_effect=lambda library, symbol, *args: functions[symbol]), \
+                        mock.patch.object(ctypes, 'get_last_error', return_value=error, create=True), \
+                        mock.patch.object(windows_api, 'set_handle_dacl') as repair:
+                    if error == 5:
+                        with self.assertRaises(windows_api.WindowsApiError) as raised:
+                            windows_api.create_directory('raw/../selected', security_descriptor='O:creator')
+                        self.assertEqual(raised.exception.status, 5)
+                    else:
+                        self.assertEqual(windows_api.create_directory(
+                            'raw/../selected', security_descriptor='O:creator'), bool(result))
+                    repair.assert_not_called()
+                self.assertEqual(freed, [88])
 
 
 class GuidTests(unittest.TestCase):
@@ -639,6 +639,21 @@ class PosixDefaultDirectoryTests(unittest.TestCase):
 
 
 class ContainerDeclarationTests(unittest.TestCase):
+    def test_derived_sid_release_failure_is_reported_without_retry(self):
+        def derive(name, output):
+            output._obj.value = 99
+            return 0
+
+        free = mock.Mock(return_value=99)
+        calls = {'DeriveAppContainerSidFromAppContainerName': derive, 'FreeSid': free}
+        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: calls[symbol]), \
+                mock.patch.object(windows_api, 'sid_text', return_value='package-sid'):
+            with self.assertRaisesRegex(windows_api.WindowsApiError, 'FreeSid failed') as caught:
+                windows_api.derive_app_container_sid('profile')
+        self.assertIsNone(caught.exception.status)  # FreeSid documents no last-error contract.
+        self.assertEqual(free.call_count, 1)
+        self.assertEqual(free.call_args.args[0].value, 99)
+
     def test_security_capabilities_layout_is_two_pointers_and_two_dwords(self):
         pointer = ctypes.sizeof(ctypes.c_void_p)
         capabilities = windows_api.SecurityCapabilities
@@ -671,21 +686,6 @@ class ContainerDeclarationTests(unittest.TestCase):
         # catches a member added or dropped in the middle.
         self.assertEqual(ctypes.sizeof(windows_api.StartupInfo),
                          9 * pointer + 32)
-
-    def test_derived_sid_release_failure_is_reported_without_retry(self):
-        def derive(name, output):
-            output._obj.value = 99
-            return 0
-
-        free = mock.Mock(return_value=99)
-        calls = {'DeriveAppContainerSidFromAppContainerName': derive, 'FreeSid': free}
-        with mock.patch.object(windows_api, 'bind', side_effect=lambda lib, symbol, *args: calls[symbol]), \
-                mock.patch.object(windows_api, 'sid_text', return_value='package-sid'):
-            with self.assertRaisesRegex(windows_api.WindowsApiError, 'FreeSid failed') as caught:
-                windows_api.derive_app_container_sid('profile')
-        self.assertIsNone(caught.exception.status)  # FreeSid documents no last-error contract.
-        self.assertEqual(free.call_count, 1)
-        self.assertEqual(free.call_args.args[0].value, 99)
 
 
 class TokenInspectionTests(unittest.TestCase):
@@ -1666,6 +1666,15 @@ class PipeDeclarationTests(unittest.TestCase):
                 windows_api.create_pipe()
         self.assertEqual(caught.exception.status, 6)
 
+    def test_close_handle_failure_reports_status_without_retry(self):
+        native = mock.Mock(return_value=False)
+        with mock.patch.object(windows_api, 'bind', return_value=native), \
+                mock.patch.object(ctypes, 'get_last_error', return_value=6, create=True):
+            with self.assertRaises(windows_api.WindowsApiError) as caught:
+                windows_api.close_handle(17)
+        self.assertEqual(caught.exception.status, 6)
+        native.assert_called_once_with(17)
+
     def test_clear_handle_inheritance_clears_only_that_flag(self):
         seen = []
 
@@ -1689,15 +1698,6 @@ class PipeDeclarationTests(unittest.TestCase):
                 windows_api.set_handle_information(
                     1, windows_api.HandleFlags.HANDLE_FLAG_INHERIT, 0)
         self.assertEqual(caught.exception.status, 6)
-
-    def test_close_handle_failure_reports_status_without_retry(self):
-        native = mock.Mock(return_value=False)
-        with mock.patch.object(windows_api, 'bind', return_value=native), \
-                mock.patch.object(ctypes, 'get_last_error', return_value=6, create=True):
-            with self.assertRaises(windows_api.WindowsApiError) as caught:
-                windows_api.close_handle(17)
-        self.assertEqual(caught.exception.status, 6)
-        native.assert_called_once_with(17)
 
 
 class PipeSecurityTests(unittest.TestCase):

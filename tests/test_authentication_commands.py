@@ -18,8 +18,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from loki_entrypoints import child_environment, configure_container, entrypoint
-from process_lifecycle_fixtures import ProcessResources
+from loki_entrypoints import ROOT, child_environment, configure_container, entrypoint
+from process_lifecycle_fixtures import ProcessResources, observe_fixture, running_fixture_task
 
 from loki_agent import authentication_commands
 from loki_agent import authentications
@@ -27,7 +27,7 @@ from loki_agent import credential_storages
 from loki_agent import formats, paths, savefiles
 from loki_agent import credential_supervisors, http_client, oauth_logins
 from loki_agent.credentials import CredentialStore
-from tests.test_oauth_logins import jwt, response
+from test_oauth_logins import jwt, response
 
 
 @contextlib.contextmanager
@@ -65,6 +65,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temporary.cleanup)
         self.storage = credential_storages.JsonCredentialStorage(
             os.path.join(self.temporary.name, "credentials"))
+        self.addCleanup(self.storage.close)
 
     async def test_reactor_diagnostics_stay_visible_outside_command_stderr(self):
         runner, command = io.StringIO(), io.StringIO()
@@ -112,7 +113,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(self.storage.load_openai_subscription())
             target = query["redirect_uri"][0] + "?" + urllib.parse.urlencode({
                 "code": "authorization-secret", "state": query["state"][0]})
-            with urllib.request.urlopen(target, timeout=5) as answer:
+            with urllib.request.urlopen(target) as answer:
                 callback_answers.append((answer.status, answer.read()))
             return True
 
@@ -174,8 +175,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
                 separate_asyncio_diagnostics(), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             args = ["login", "openai"] + (["--device-code"] if device else [])
-            self.assertEqual(await asyncio.wait_for(authentication_commands.run(
-                args, storage=self.storage), 10), 0)
+            self.assertEqual(await authentication_commands.run(args, storage=self.storage), 0)
             if device:
                 launcher.assert_not_called()
                 self.assertEqual(len(poll_times), 2)
@@ -205,7 +205,8 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(name.startswith(".tokens.json.")
                                  for name in os.listdir(self.storage.directory)))
             self.assertNotIn(access, repr(stored.tokens))
-            reopened = credential_storages.JsonCredentialStorage(self.storage.directory)
+            reopened = self.enterContext(contextlib.closing(
+                credential_storages.JsonCredentialStorage(self.storage.directory)))
             supervisor = credential_supervisors.CredentialSupervisor(CredentialStore({}), reopened)
             ref = authentications.CredentialRef.openai_subscription()
             spec = authentications.AuthSpec(
@@ -217,35 +218,44 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(authentications.CredentialUnavailable):
                 await authentications.authorized_request_headers(supervisor.broker, spec,
                                                                  "https://evil.invalid/")
-            tasks = [asyncio.create_task(authentications.authorized_request_headers(
-                supervisor.broker, spec, url, rejected_generation=lease.generation))
-                for _ in range(2)]
-            try:
-                await asyncio.wait_for(refresh_started.wait(), 5)
-            finally:
-                release_refresh.set()
-            rotated = await asyncio.wait_for(asyncio.gather(*tasks), 5)
-            self.assertEqual([h["Authorization"] for h, _ in rotated],
-                             ["Bearer access-rotated-secret"] * 2)
-            self.assertEqual(requests.count(authentications.OPENAI_REFRESH_URL), 2)
-            durable = credential_storages.JsonCredentialStorage(self.storage.directory)
-            self.assertEqual(durable.load_openai_subscription().tokens.refresh_token,
-                             "refresh-rotated-secret")
-            restarted = credential_supervisors.CredentialSupervisor(CredentialStore({}), durable)
-            self.assertEqual((await restarted.broker.lease(ref, destination=url)).value, "access-rotated-secret")
-            revision = durable.load_document()["revision"]
-            self.assertEqual(await authentication_commands.run(["status", "openai"], storage=durable), 0)
-            self.assertEqual(await authentication_commands.run(["logout", "openai"], storage=durable), 0)
-            self.assertEqual(await authentication_commands.run(["logout", "openai"], storage=durable), 0)
-            self.assertEqual(await authentication_commands.run(["status", "openai"], storage=durable), 1)
-            self.assertGreater(durable.load_document()["revision"], revision)
-            self.assertEqual(durable.load_document()["credentials"], {})
-            logged_out = credential_supervisors.CredentialSupervisor(
-                CredentialStore({}),
-                credential_storages.JsonCredentialStorage(self.storage.directory))
-            self.assertFalse(logged_out.inventory.has_ref(ref))
-            with self.assertRaises(authentications.CredentialUnavailable):
-                await logged_out.broker.lease(ref, destination=url)
+            async with contextlib.AsyncExitStack() as actors:
+                tasks = [await actors.enter_async_context(running_fixture_task(authentications.authorized_request_headers(
+                    supervisor.broker, spec, url, rejected_generation=lease.generation)))]
+                try:
+                    await observe_fixture(refresh_started.wait(), tasks[0])
+                    tasks.append(await actors.enter_async_context(running_fixture_task(authentications.authorized_request_headers(
+                        supervisor.broker, spec, url, rejected_generation=lease.generation))))
+                    try:
+                        # Start actor two only after real refresh readiness, then
+                        # observe both owners while the refresh remains held.
+                        await observe_fixture(refresh_started.wait(), *tasks)
+                    finally:
+                        release_refresh.set()
+                    rotated = await asyncio.gather(*tasks)
+                    self.assertEqual([h["Authorization"] for h, _ in rotated],
+                                     ["Bearer access-rotated-secret"] * 2)
+                    self.assertEqual(requests.count(authentications.OPENAI_REFRESH_URL), 2)
+                    durable = self.enterContext(contextlib.closing(
+                        credential_storages.JsonCredentialStorage(self.storage.directory)))
+                    self.assertEqual(durable.load_openai_subscription().tokens.refresh_token,
+                                     "refresh-rotated-secret")
+                    restarted = credential_supervisors.CredentialSupervisor(CredentialStore({}), durable)
+                    self.assertEqual((await restarted.broker.lease(ref, destination=url)).value, "access-rotated-secret")
+                    revision = durable.load_document()["revision"]
+                    self.assertEqual(await authentication_commands.run(["status", "openai"], storage=durable), 0)
+                    self.assertEqual(await authentication_commands.run(["logout", "openai"], storage=durable), 0)
+                    self.assertEqual(await authentication_commands.run(["logout", "openai"], storage=durable), 0)
+                    self.assertEqual(await authentication_commands.run(["status", "openai"], storage=durable), 1)
+                    self.assertGreater(durable.load_document()["revision"], revision)
+                    self.assertEqual(durable.load_document()["credentials"], {})
+                    logged_out = credential_supervisors.CredentialSupervisor(
+                        CredentialStore({}), self.enterContext(contextlib.closing(
+                            credential_storages.JsonCredentialStorage(self.storage.directory))))
+                    self.assertFalse(logged_out.inventory.has_ref(ref))
+                    with self.assertRaises(authentications.CredentialUnavailable):
+                        await logged_out.broker.lease(ref, destination=url)
+                finally:
+                    release_refresh.set()
         self.assertEqual(errors.getvalue(), "")
         self.assertIn("Logged in: OpenAI ChatGPT subscription", output.getvalue())
         for secret in [access, identity, "refresh-secret", "access-rotated-secret",
@@ -257,6 +267,12 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_login_preserves_previous_credential(self):
         await self._interrupted_browser(cancel=True)
+
+    async def test_browser_readiness_observes_login_startup_failure(self):
+        failure = mock.AsyncMock(side_effect=RuntimeError('login failed before URL publication'))
+        with mock.patch.object(authentication_commands, 'run', new=failure):
+            with self.assertRaisesRegex(RuntimeError, 'login failed before URL publication'):
+                await self._interrupted_browser(cancel=True)
 
     async def _interrupted_browser(self, *, cancel):
         previous = tokens()
@@ -275,7 +291,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(authentication_commands.run(
                 ["login", "openai", "--no-browser"], storage=self.storage))
             try:
-                await asyncio.wait_for(ready.wait(), 5)
+                await observe_fixture(ready.wait(), task)
                 url = next(line for line in output.getvalue().splitlines()
                            if line.startswith(oauth_logins.OPENAI_AUTHORIZE_URL))
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
@@ -296,7 +312,7 @@ class AuthenticationCommandTests(unittest.IsolatedAsyncioTestCase):
                         writer.close()
                         await writer.wait_closed()
                     with self.assertRaisesRegex(oauth_logins.OAuthLoginError, "declined"):
-                        await asyncio.wait_for(task, 5)
+                        await task
                 with self.assertRaises(OSError):
                     await asyncio.open_connection("127.0.0.1", redirect.port)
             finally:
@@ -362,6 +378,31 @@ class AuthenticationEntrypointTests(unittest.TestCase):
                 process.stderr)
             self.assertFalse(os.path.exists(os.path.join(directory, '.loki')))
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX home-based locations')
+    def test_missing_or_empty_home_accepts_explicit_locations(self):
+        for home in [None, '']:
+            for frontend in ['loki', 'loki-acp']:
+                with self.subTest(home=home, frontend=frontend), \
+                        tempfile.TemporaryDirectory() as directory:
+                    environment = child_environment(
+                        PATH=os.environ.get('PATH', ''),
+                        XDG_CONFIG_HOME=os.path.join(directory, 'config'),
+                        XDG_STATE_HOME=os.path.join(directory, 'state'),
+                        LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                        LOKI_MODEL='dummy')
+                    if home is not None:
+                        environment['HOME'] = home
+                    command = [entrypoint(frontend)]
+                    if frontend == 'loki':
+                        command.extend(['--headless', '--prompt', 'home check'])
+                    process = subprocess.run(
+                        command, cwd=directory, env=environment,
+                        input='', capture_output=True, text=True)
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    if frontend == 'loki-acp':
+                        self.assertEqual(process.stdout, '')
+                    self.assertNotIn('Traceback', process.stderr)
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
     def test_invalid_startup_authority_refuses_both_real_entrypoints(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as regular:
@@ -413,7 +454,7 @@ class AuthenticationEntrypointTests(unittest.TestCase):
                 os.close(owner_write)
                 child.close()
 
-    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
+    @unittest.skipUnless(os.name == 'posix', 'POSIX standard-stream inheritance')
     def test_headless_startup_preserves_closed_output_streams(self):
         wrapper = r'''
 import json,os,sys
@@ -448,6 +489,68 @@ os.execve(sys.argv[1], [sys.argv[1], '--headless', '--prompt', 'startup check'],
                 finally:
                     storage.close()
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX standard-stream inheritance')
+    def test_runtime_does_not_inherit_resources_reusing_absent_output_streams(self):
+        # A trusted import can open an inheritable resource in a closed stdio
+        # slot. Simulate that independently of interpreter-specific importers,
+        # then use the real supervisor and sanctioned runtime executable.
+        probe = r'''
+import asyncio, json, os, sys
+from loki_agent.credential_storages import JsonCredentialStorage
+from loki_agent.credential_supervisors import CredentialSupervisor
+from loki_agent.credentials import CredentialStore
+launcher, workspace, resource_path, report_path = sys.argv[1:5]
+closed = json.loads(sys.argv[5])
+resource = os.open(resource_path, os.O_RDONLY)
+original = os.fstat(resource)
+for fd in closed:
+    setattr(sys, {1: 'stdout', 2: 'stderr'}[fd], None)
+    os.dup2(resource, fd, inheritable=True)
+os.chdir(workspace)
+storage = JsonCredentialStorage()
+try:
+    supervisor = CredentialSupervisor(CredentialStore(dict(os.environ)), storage)
+    status = asyncio.run(supervisor.run_terminal_runtime(
+        launcher, ['--headless', '--prompt', 'startup check']))
+    retained = []
+    for fd in closed:
+        current = os.fstat(fd)
+        retained.append(current.st_dev == original.st_dev
+                        and current.st_ino == original.st_ino)
+    with open(report_path, 'w', encoding='utf-8') as stream:
+        json.dump({'retained': retained}, stream)
+finally:
+    storage.close()
+    os.close(resource)
+raise SystemExit(status)
+'''
+        for closed in [[], [1], [2], [1, 2]]:
+            with self.subTest(closed=closed), tempfile.TemporaryDirectory() as directory:
+                workspace = directory + '/workspace'
+                os.mkdir(workspace)
+                resource = directory + '/import-resource'
+                report = directory + '/report.json'
+                with open(resource, 'w', encoding='utf-8') as stream:
+                    stream.write('not a child output stream')
+                process = subprocess.run(
+                    [sys.executable, '-c', probe, entrypoint('loki'), workspace,
+                     resource, report, json.dumps(closed)],
+                    cwd=ROOT,
+                    env=child_environment(
+                        PATH=os.environ.get('PATH', ''), HOME=directory,
+                        XDG_CONFIG_HOME=directory + '/config',
+                        XDG_STATE_HOME=directory + '/state',
+                        LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                        LOKI_MODEL='dummy', LOKI_DUMMY_REPLY='reused-stream startup completed'),
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                if 1 not in closed:
+                    self.assertIn('reused-stream startup completed', process.stdout)
+                with open(report, encoding='utf-8') as stream:
+                    self.assertEqual(json.load(stream)['retained'], [True for _ in closed])
+                with open(resource, encoding='utf-8') as stream:
+                    self.assertEqual(stream.read(), 'not a child output stream')
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux mount isolation')
     def test_late_login_stays_hidden_from_live_runtime_and_tool(self):
         async def exercise(directory):
@@ -463,7 +566,6 @@ os.execve(sys.argv[1], [sys.argv[1], '--headless', '--prompt', 'startup check'],
                 connected.set_result([reader, writer])
 
             address = os.path.join(workspace, 'control.sock')
-            server = await asyncio.start_unix_server(accept, path=address)
             # The Bash child cannot proceed until the outside process has
             # published credentials, so denial cannot pass merely because the
             # token file did not exist when the tool tried to read it.
@@ -497,6 +599,7 @@ connection.close()
             status_resources = None
             output = None
             writer = None
+            server = await asyncio.start_unix_server(accept, path=address)
             try:
                 process = await asyncio.create_subprocess_exec(
                     entrypoint('loki'), '--dangerously-skip-permissions',
@@ -556,20 +659,28 @@ connection.close()
                 self.assertRegex(formats.item_text(results[0]), r'Permission denied|not found')
                 self.assertNotIn(late_tokens.access_token, json.dumps(transcript))
             finally:
-                if writer is not None:
-                    writer.close()
+                async def peer_closed():
                     with contextlib.suppress(ConnectionError):
                         await writer.wait_closed()
-                server.close()
-                await server.wait_closed()
-                if status_resources is not None:
-                    await status_resources.cleanup()
-                if resources is not None:
-                    await resources.cleanup()
-                if output is not None:
-                    await output
-                if storage is not None:
-                    storage.close()
+
+                # Revoke admission/peer input, retire both real producers, then
+                # join output and streams. One failed release cannot skip any
+                # other owner; storage outlives every asynchronous backstop.
+                async with contextlib.AsyncExitStack() as cleanup:
+                    if storage is not None:
+                        cleanup.callback(storage.close)
+                    cleanup.push_async_callback(server.wait_closed)
+                    if writer is not None:
+                        cleanup.push_async_callback(peer_closed)
+                    if output is not None:
+                        cleanup.push_async_callback(lambda: output)
+                    if resources is not None:
+                        cleanup.push_async_callback(resources.cleanup)
+                    if status_resources is not None:
+                        cleanup.push_async_callback(status_resources.cleanup)
+                    if writer is not None:
+                        cleanup.callback(writer.close)
+                    cleanup.callback(server.close)
 
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(exercise(directory))
@@ -577,48 +688,46 @@ connection.close()
     def test_dummy_frontend_startup_compatibility_not_subscription_consumption(self):
         with tempfile.TemporaryDirectory() as temporary:
             config_home = os.path.join(temporary, "config")
-            storage = credential_storages.JsonCredentialStorage(
+            with contextlib.closing(credential_storages.JsonCredentialStorage(
                 os.path.join(
-                    config_home, "loki", "credentials"))
-            asyncio.run(storage.store_openai_login(tokens()))
-            environment = dict(os.environ)
-            environment.update({
-                "HOME": temporary,
-                "XDG_CONFIG_HOME": config_home,
-                "XDG_STATE_HOME": os.path.join(temporary, "state"),
-                "LOKI_API_BASE": "http://dummy.invalid/v1",
-                "LOKI_PROVIDER": "dummy",
-                "LOKI_MODEL": "dummy-model",
-            })
+                    config_home, "loki", "credentials"))) as storage:
+                asyncio.run(storage.store_openai_login(tokens()))
+                environment = dict(os.environ)
+                environment.update({
+                    "HOME": temporary,
+                    "XDG_CONFIG_HOME": config_home,
+                    "XDG_STATE_HOME": os.path.join(temporary, "state"),
+                    "LOKI_API_BASE": "http://dummy.invalid/v1",
+                    "LOKI_PROVIDER": "dummy",
+                    "LOKI_MODEL": "dummy-model",
+                })
 
-            workspace = os.path.join(temporary, "workspace")
-            os.makedirs(workspace)
-            configure_container(environment, workspace)
-            terminal = subprocess.run(
-                [
-                    entrypoint("loki"),
-                    "--headless",
-                ],
-                input="",
-                env=environment,
-                cwd=workspace,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=10,
-                check=False,
-            )
-            acp = subprocess.run(
-                [entrypoint("loki-acp")],
-                input="",
-                env=environment,
-                cwd=workspace,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=10,
-                check=False,
-            )
+                workspace = os.path.join(temporary, "workspace")
+                os.makedirs(workspace)
+                configure_container(environment, workspace)
+                terminal = subprocess.run(
+                    [
+                        entrypoint("loki"),
+                        "--headless",
+                    ],
+                    input="",
+                    env=environment,
+                    cwd=workspace,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                acp = subprocess.run(
+                    [entrypoint("loki-acp")],
+                    input="",
+                    env=environment,
+                    cwd=workspace,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
 
         self.assertEqual(terminal.returncode, 0, terminal.stderr)
         self.assertEqual(acp.returncode, 0, acp.stderr)
@@ -626,38 +735,38 @@ connection.close()
     def test_real_loki_status_and_logout_use_xdg_store(self):
         with tempfile.TemporaryDirectory() as temporary:
             config_home = os.path.join(temporary, "config")
-            storage = credential_storages.JsonCredentialStorage(
-                os.path.join(config_home, "loki", "credentials"))
-            asyncio.run(
-                storage.store_openai_login(tokens()))
-            environment = dict(os.environ)
-            environment.update({
-                "HOME": temporary,
-                "XDG_CONFIG_HOME": config_home,
-            })
-            command = [
-                entrypoint("loki"),
-                "auth",
-            ]
+            with contextlib.closing(credential_storages.JsonCredentialStorage(
+                    os.path.join(config_home, "loki", "credentials"))) as storage:
+                asyncio.run(
+                    storage.store_openai_login(tokens()))
+                environment = dict(os.environ)
+                environment.update({
+                    "HOME": temporary,
+                    "XDG_CONFIG_HOME": config_home,
+                })
+                command = [
+                    entrypoint("loki"),
+                    "auth",
+                ]
 
-            status = subprocess.run(
-                command + ["status", "openai"],
-                env=environment,
-                cwd=temporary,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            logout = subprocess.run(
-                command + ["logout", "openai"],
-                env=environment,
-                cwd=temporary,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
+                status = subprocess.run(
+                    command + ["status", "openai"],
+                    env=environment,
+                    cwd=temporary,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                logout = subprocess.run(
+                    command + ["logout", "openai"],
+                    env=environment,
+                    cwd=temporary,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
 
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertEqual(logout.returncode, 0, logout.stderr)

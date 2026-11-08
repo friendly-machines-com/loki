@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from process_lifecycle_fixtures import observe_fixture_state
 from loki_agent import (
     authentications,
     http_client,
@@ -122,7 +123,22 @@ def _subscription_catalog(*slugs):
 
 class CatalogFetchTests(unittest.TestCase):
     def test_catalog_fetch_cache_reopen_normalize_and_filter(self):
+        self._catalog_journey()
 
+    def test_catalog_handler_close_failure_reaches_the_request_owner(self):
+        wait_closed = asyncio.StreamWriter.wait_closed
+
+        async def failed_close(writer):
+            await wait_closed(writer)
+            raise OSError("catalog handler close failed")
+
+        # Exercise the same real listener/request owner after bytes arrive.
+        # The HTTP client suppresses its own close errors, not server failures.
+        with mock.patch.object(asyncio.StreamWriter, "wait_closed", new=failed_close):
+            with self.assertRaisesRegex(OSError, "catalog handler close failed"):
+                self._catalog_journey()
+
+    def _catalog_journey(self):
         async def lifecycle():
             raw = dict(DATA, openai={
                 "id": "openai", "name": "OpenAI", "npm": "@ai-sdk/openai",
@@ -131,21 +147,25 @@ class CatalogFetchTests(unittest.TestCase):
             })
             body = json.dumps(raw).encode()
             received = []
-            settled = asyncio.Event()
+            handlers = []
 
             async def serve(reader, writer):
                 try:
-                    received.append(await asyncio.wait_for(
-                        reader.readuntil(b"\r\n\r\n"), 5))
+                    received.append(await reader.readuntil(b"\r\n\r\n"))
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                                  + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
-                    await asyncio.wait_for(writer.drain(), 5)
+                    await writer.drain()
                 finally:
                     writer.close()
-                    await asyncio.wait_for(writer.wait_closed(), 5)
-                    settled.set()
+                    await writer.wait_closed()
 
-            server = await asyncio.start_server(serve, "127.0.0.1", 0)
+            def accepted(reader, writer):
+                # Listener closure does not join accepted connections, and a
+                # settled event cannot forward a callback failure. Retain the
+                # actual handlers through request observation and final cleanup.
+                handlers.append(asyncio.create_task(serve(reader, writer)))
+
+            server = await asyncio.start_server(accepted, "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             real_connect = asyncio.open_connection
             real_request = http_client.async_http_request
@@ -172,8 +192,18 @@ class CatalogFetchTests(unittest.TestCase):
                          mock.patch.object(http_client, "async_http_request", wraps=real_request) as transport, \
                          mock.patch.object(models, "fetch_models_dev", side_effect=fetch), \
                          mock.patch.object(asyncio, "to_thread", side_effect=AssertionError("executor used")):
-                        data, groups = await asyncio.wait_for(models.ensure_index(cache_path=str(cache)), 10)
-                    await asyncio.wait_for(settled.wait(), 5)
+                        request = asyncio.create_task(models.ensure_index(cache_path=str(cache)))
+                        try:
+                            await observe_fixture_state(lambda: bool(handlers), request)
+                            await asyncio.wait([request, handlers[0]], return_when=asyncio.FIRST_COMPLETED)
+                            if handlers[0].done():
+                                handlers[0].result()
+                            data, groups = await request
+                            await asyncio.gather(*handlers)
+                        finally:
+                            if not request.done():
+                                request.cancel()
+                            await asyncio.gather(request, return_exceptions=True)
                     self.assertEqual(transport.await_count, 1)
                     self.assertEqual(transport.await_args.args, ("GET", models.MODELS_DEV_URL))
                     self.assertEqual(transport.await_args.kwargs, {
@@ -219,7 +249,11 @@ class CatalogFetchTests(unittest.TestCase):
                 finally:
                     models._index_cache = saved
                     server.close()
-                    await asyncio.wait_for(server.wait_closed(), 5)
+                    await server.wait_closed()
+                    for handler in handlers:
+                        if not handler.done():
+                            handler.cancel()
+                    await asyncio.gather(*handlers, return_exceptions=True)
 
         asyncio.run(lifecycle())
 

@@ -7,7 +7,8 @@ import sys
 import tempfile
 import unittest
 
-from loki_entrypoints import configure_container, entrypoint
+from directory_fixtures import directory_alias
+from loki_entrypoints import configure_container, loki_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,7 +65,7 @@ class DiagnosticsTests(unittest.TestCase):
         environment.update(env)
         return subprocess.run(
             [sys.executable, '-c', code], cwd=ROOT, env=environment,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True)
 
     def test_default_silence_and_visible_warning(self):
         result = self.run_code()
@@ -187,9 +188,9 @@ with patch('loki_agent.diagnostics.json.dumps', side_effect=AssertionError):
             })
             configure_container(environment, workspace)
             result = subprocess.run(
-                [entrypoint('loki'), '--headless', '--prompt', 'hello'],
+                [*loki_command(), '--headless', '--prompt', 'hello'],
                 cwd=workspace, env=environment, capture_output=True,
-                text=True, timeout=20)
+                text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Logging configuration ignored", result.stderr)
             self.assertEqual(
@@ -230,13 +231,12 @@ assert os.environ['LOKI_LOG_CONFIG'] == original
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Unknown test fields', log.read_text())
 
-    def test_dotdot_after_symlink_uses_platform_traversal(self):
+    def test_dotdot_after_directory_alias_uses_platform_traversal(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             (base / 'project').mkdir()
             (base / 'elsewhere' / 'child').mkdir(parents=True)
-            (base / 'project' / 'link').symlink_to(
-                base / 'elsewhere' / 'child', target_is_directory=True)
+            directory_alias(base / 'elsewhere' / 'child', base / 'project' / 'link')
             log = base / 'literal.log'
             # POSIX follows the link and applies `..` in its target, so the
             # elsewhere copy is the one selected; Windows resolves `..`

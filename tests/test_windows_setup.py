@@ -16,24 +16,20 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from directory_fixtures import directory_alias
-from windows_state_fixtures import directory_identity_patch, directory_handle, real_directory_locations
 
+from directory_fixtures import directory_alias
+from windows_state_fixtures import directory_handle, directory_identity_patch, real_directory_locations
+
+from loki_agent import private_files
 from loki_agent import windows_acl
 from loki_agent import windows_api
-from loki_agent import private_files
 from loki_agent import windows_containers
 from loki_agent import windows_setup
 from loki_agent import windows_state
 
 
-# The canonical path of an object is asked of the kernel about an open handle
-# (windows_state._final_path), which only exists on Windows.  These modules test
-# the ledger, plan and gate logic on every host, so they substitute the
-# platform's canonicalisation with its Python equivalent; the real call is
-# exercised by the Windows legs.
-
-
+# Pure decision tests use authored model objects. Actual alias/ancestry tests
+# explicitly switch to real-directory controls; the native classes use Windows.
 def setUpModule():
     unittest.enterModuleContext(directory_identity_patch())
 
@@ -801,6 +797,43 @@ class ManagedStatePolicyTests(unittest.TestCase):
             sddl, windows_state.tool_role_sid(PACKAGE_SID), windows_state.Access.READ_WRITE))
 
 
+class NativeCleanupClassificationTests(unittest.TestCase):
+    def test_optional_root_cannot_disappear_after_cleanup_failure(self):
+        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_FILE_NOT_FOUND)
+        with mock.patch.object(windows_state, '_directory_location', side_effect=failure):
+            with self.assertRaises(windows_api.WindowsResourceError) as caught:
+                windows_state._optional_location('configured-operand')
+        self.assertIs(caught.exception, failure)
+
+    def test_automatic_preflight_cannot_accept_cleanup_failure_as_missing(self):
+        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_PATH_NOT_FOUND)
+        with mock.patch.object(windows_state.paths, 'loki_config_dir', return_value='configured-operand'), \
+                mock.patch.object(windows_state, '_directory_location', side_effect=failure):
+            errors = windows_state.protected_path_errors(
+                'configured-operand', windows_state.Access.READ, origin='config')
+        self.assertTrue(errors)
+        self.assertIn('CloseHandle failed', errors[0])
+
+    def test_cleanup_failure_cannot_create_a_pending_default_identity(self):
+        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_PATH_NOT_FOUND)
+        grant = windows_state.Grant('configured-operand', windows_state.Access.READ, 'config')
+        with mock.patch.object(windows_state.paths, 'loki_config_dir', return_value=grant.path), \
+                mock.patch.object(windows_state, '_directory_identity', side_effect=failure):
+            with self.assertRaises(windows_api.WindowsResourceError) as caught:
+                windows_state._grant_identity(grant)
+        self.assertIs(caught.exception, failure)
+
+    def test_profile_cleanup_failure_cannot_trigger_an_already_exists_fallback(self):
+        failure = windows_api.WindowsResourceError(
+            'LocalFree failed', status=windows_containers.PROFILE_ALREADY_EXISTS)
+        with mock.patch.object(windows_containers, 'create_app_container_profile', side_effect=failure), \
+                mock.patch.object(windows_api, 'derive_app_container_sid') as derive:
+            with self.assertRaises(windows_api.WindowsResourceError) as caught:
+                windows_setup.WindowsBackend({})._ensure_profile('profile')
+        self.assertIs(caught.exception, failure)
+        derive.assert_not_called()
+
+
 class AutomaticGrantTests(unittest.TestCase):
     def test_automatic_grants_include_read_only_configuration(self):
         grants = windows_setup.automatic_grants("/work")
@@ -879,43 +912,6 @@ class FakeBackend:
         self.uninstalled.append(blob)
         blob["workspaces"] = {}
         return [windows_setup.Check("ledger", "pass", "cleared")]
-
-
-class NativeCleanupClassificationTests(unittest.TestCase):
-    def test_optional_root_cannot_disappear_after_cleanup_failure(self):
-        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_FILE_NOT_FOUND)
-        with mock.patch.object(windows_state, '_directory_location', side_effect=failure):
-            with self.assertRaises(windows_api.WindowsResourceError) as caught:
-                windows_state._optional_location('configured-operand')
-        self.assertIs(caught.exception, failure)
-
-    def test_automatic_preflight_cannot_accept_cleanup_failure_as_missing(self):
-        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_PATH_NOT_FOUND)
-        with mock.patch.object(windows_state.paths, 'loki_config_dir', return_value='configured-operand'), \
-                mock.patch.object(windows_state, '_directory_location', side_effect=failure):
-            errors = windows_state.protected_path_errors(
-                'configured-operand', windows_state.Access.READ, origin='config')
-        self.assertTrue(errors)
-        self.assertIn('CloseHandle failed', errors[0])
-
-    def test_cleanup_failure_cannot_create_a_pending_default_identity(self):
-        failure = windows_api.WindowsResourceError('CloseHandle failed', status=windows_api.ERROR_PATH_NOT_FOUND)
-        grant = windows_state.Grant('configured-operand', windows_state.Access.READ, 'config')
-        with mock.patch.object(windows_state.paths, 'loki_config_dir', return_value=grant.path), \
-                mock.patch.object(windows_state, '_directory_identity', side_effect=failure):
-            with self.assertRaises(windows_api.WindowsResourceError) as caught:
-                windows_state._grant_identity(grant)
-        self.assertIs(caught.exception, failure)
-
-    def test_profile_cleanup_failure_cannot_trigger_an_already_exists_fallback(self):
-        failure = windows_api.WindowsResourceError(
-            'LocalFree failed', status=windows_containers.PROFILE_ALREADY_EXISTS)
-        with mock.patch.object(windows_containers, 'create_app_container_profile', side_effect=failure), \
-                mock.patch.object(windows_api, 'derive_app_container_sid') as derive:
-            with self.assertRaises(windows_api.WindowsResourceError) as caught:
-                windows_setup.WindowsBackend({})._ensure_profile('profile')
-        self.assertIs(caught.exception, failure)
-        derive.assert_not_called()
 
 
 class ConfigureCommandTests(unittest.TestCase):
@@ -1199,8 +1195,9 @@ class EditorWidgetTests(unittest.TestCase):
         self.assertEqual(len(self.backend.applied), 1)
 
     def test_apply_refuses_a_protected_path_without_calling_the_backend(self):
-        with mock.patch.object(windows_state, "_runtime_trees",
-                               return_value=["/protected"]):
+        selected = windows_state._directory_location('/protected')
+        roots = {'configuration': None, 'state': None, 'credentials': selected}
+        with mock.patch.object(windows_state, '_root_locations', return_value=roots):
             editor = self.editor()
             editor.model.add("/protected", windows_setup.Access.READ)
 

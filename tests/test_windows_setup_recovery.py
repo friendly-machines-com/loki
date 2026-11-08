@@ -3,12 +3,13 @@
 from contextlib import contextmanager, nullcontext
 import os
 import subprocess
-import time
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
+
 from windows_state_fixtures import directory_identity_patch, real_directory_locations
 
 from loki_agent import windows_api as api
@@ -18,12 +19,8 @@ from loki_agent import windows_state as state
 from loki_agent import windows_verify as verify
 
 
-# windows_state._final_path asks the kernel about an open handle, which only
-# exists on Windows; this module tests the ledger and recovery logic on every
-# host, so it substitutes the platform's canonicalisation.  The real call is
-# exercised by the Windows legs.
-
-
+# Recovery decisions use authored model objects and substituted ACL calls.
+# The explicit alias control below switches to real directory objects.
 def setUpModule():
     unittest.enterModuleContext(directory_identity_patch())
 

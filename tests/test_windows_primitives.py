@@ -1309,6 +1309,51 @@ def child(mode, root, stage=None):
 class WindowsProbeMarshallingTests(unittest.TestCase):
     """Portable boundary regressions; mocks are not native Windows evidence."""
 
+    def test_retry_fixture_observes_crt_failure_before_contention_marker(self):
+        # Exercise the actual standalone fixture controller on every platform.
+        # Only its native setup/CRT operation/peer are faked; the file context,
+        # task failure, completion wakeup and cancellation/join remain real.
+        probe = WindowsPrimitiveTests('test_cancelled_nonblocking_retry_closes_descriptor')
+        with mock.patch.dict(probe.setUp.__globals__, {'NativeCalls': mock.Mock()}):
+            probe.setUp()
+        try:
+            crt = mock.Mock(LK_NBLCK=1, LK_UNLCK=2)
+            crt.locking.side_effect = OSError(errno.EIO, 'CRT failed before contention')
+            with mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                    mock.patch.object(probe, 'stop_at', return_value=mock.Mock()), \
+                    mock.patch.object(probe, 'run_child'):
+                with self.assertRaisesRegex(OSError, 'CRT failed before contention'):
+                    probe.test_cancelled_nonblocking_retry_closes_descriptor()
+                crt.locking.assert_called_once()
+        finally:
+            probe.doCleanups()
+
+    def test_retry_fixture_cancellation_closes_its_real_file_context(self):
+        probe = WindowsPrimitiveTests('test_cancelled_nonblocking_retry_closes_descriptor')
+        with mock.patch.dict(probe.setUp.__globals__, {'NativeCalls': mock.Mock()}):
+            probe.setUp()
+        streams = []
+        acquire = open
+
+        def opened(*arguments, **keywords):
+            stream = acquire(*arguments, **keywords)
+            streams.append(stream)
+            return stream
+
+        try:
+            crt = mock.Mock(LK_NBLCK=1, LK_UNLCK=2)
+            crt.locking.side_effect = OSError(errno.EACCES, 'contended fixture lock')
+            with mock.patch.dict(sys.modules, {'msvcrt': crt}), \
+                    mock.patch.object(probe, 'stop_at', return_value=mock.Mock()), \
+                    mock.patch.object(probe, 'run_child'), \
+                    mock.patch.dict(probe.test_cancelled_nonblocking_retry_closes_descriptor.__globals__,
+                                    {'open': opened}):
+                probe.test_cancelled_nonblocking_retry_closes_descriptor()
+            self.assertEqual(len(streams), 1)
+            self.assertTrue(streams[0].closed)
+        finally:
+            probe.doCleanups()
+
     def test_rename_buffer_has_utf16_terminator_outside_counted_name(self):
         for name in ['published', 'long-name-\U0001f600', 'C:\\dir\\published']:
             with self.subTest(name=name):
@@ -1672,12 +1717,21 @@ class WindowsPrimitiveTests(unittest.TestCase):
                             self.fail('acquired lock while child owns it')
 
             task = asyncio.create_task(waiter())
+            # This standalone CI copy cannot import the shared project fixture.
+            # Reuse its existing marker to wake on either contention or owner
+            # completion, then inspect the owner before asserting cancellation.
+            task.add_done_callback(lambda _task: attempted.set())
             try:
                 await attempted.wait()
-            finally:
+                if task.done():
+                    await task
+                    self.fail('retry ended before the contended lock was observed')
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
         asyncio.run(exercise())
         self.assertEqual(len(descriptors), 1)

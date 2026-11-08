@@ -1,11 +1,13 @@
 """Exact request permissions across the real authority, channel and store."""
 
 import asyncio
+from contextlib import AsyncExitStack
 import os
 import tempfile
 import unittest
 from unittest import mock
 
+from process_lifecycle_fixtures import observe_fixture, running_fixture_task
 from loki_agent import authentications as auth
 from loki_agent import credential_capabilities as capabilities
 from loki_agent import credential_storages, file_locks, private_files
@@ -62,7 +64,9 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 await self.broker.lease(self.reference, URL)
 
     async def test_other_supervisor_changes_are_visible_without_a_cache(self):
-        other = auth.CredentialBroker(storage=credential_storages.JsonCredentialStorage(self.directory.name))
+        storage = credential_storages.JsonCredentialStorage(self.directory.name)
+        self.addCleanup(storage.close)
+        other = auth.CredentialBroker(storage=storage)
         other.install_static(self.reference, "other-owner-value")
         await self.broker.approve_destinations(self.reference, [URL])
         self.assertEqual((await other.lease(self.reference, URL)).value, "other-owner-value")
@@ -74,24 +78,23 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             await other.lease(self.reference, URL)
 
     async def test_permission_is_rechecked_after_waiting_for_a_value(self):
-        started = asyncio.Event()
-        released = asyncio.Event()
-
         async def delayed(rejected_generation=None):
-            started.set()
-            await released.wait()
-            return auth.CredentialLease(self.reference, "sample-value")
-        await self.broker.approve_destinations(self.reference, [URL])
-        with mock.patch.object(self.broker._records[self.reference], "lease", delayed):
-            pending = asyncio.create_task(self.broker.lease(self.reference, URL))
-            await started.wait()
+            # Revoke in the actual value lookup, between the two public checks.
             async with self.storage._locked_document() as [directory_fd, document]:
                 document["endpoint_approvals"][self.reference.encode()] = []
                 self.storage._next_revision(document)
                 self.storage._write_document_at(directory_fd, document)
-            released.set()
+            return auth.CredentialLease(self.reference, "sample-value")
+
+        await self.broker.approve_destinations(self.reference, [URL])
+        self.assertEqual(self.storage.approved_destinations(self.reference), frozenset({URL}))
+        with mock.patch.object(self.broker._records[self.reference], "lease",
+                               new=mock.AsyncMock(side_effect=delayed)) as lookup:
             with self.assertRaises(auth.CredentialUnavailable):
-                await pending
+                await self.broker.lease(self.reference, URL)
+        # Denial must follow the real lookup/revocation, not fail at admission.
+        lookup.assert_awaited_once()
+        self.assertEqual(self.storage.approved_destinations(self.reference), frozenset())
 
     async def test_subscription_limit_cannot_be_overridden_by_disk_or_confirmation(self):
         reference = auth.CredentialRef.openai_subscription()
@@ -157,8 +160,6 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         def check_owner():
             if not live:
                 raise RuntimeError("closed owner")
-        lock_holder = asyncio.create_task(holder())
-        await held.wait()
         real_lock = file_locks.try_lock_exclusive
 
         def observe(token):
@@ -167,20 +168,24 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             except BlockingIOError:
                 waiting.set()
                 raise
-        try:
-            with mock.patch.object(file_locks, "try_lock_exclusive", observe):
-                pending = asyncio.create_task(self.broker.approve_destinations(
-                    self.reference, [URL], before_commit=check_owner))
-                await waiting.wait()
-                live = False
+        async with AsyncExitStack() as actors:
+            lock_holder = await actors.enter_async_context(running_fixture_task(holder()))
+            try:
+                await observe_fixture(held.wait(), lock_holder)
+                with mock.patch.object(file_locks, "try_lock_exclusive", observe):
+                    pending = await actors.enter_async_context(running_fixture_task(self.broker.approve_destinations(
+                        self.reference, [URL], before_commit=check_owner)))
+                    # Both the approval and the held lock can invalidate this
+                    # real-contention observation; neither is an event-only owner.
+                    await observe_fixture(waiting.wait(), pending, lock_holder)
+                    live = False
+                    release.set()
+                    await lock_holder
+                    with self.assertRaisesRegex(RuntimeError, "closed owner"):
+                        await pending
+                self.assertEqual(self.storage.approved_destinations(self.reference), frozenset())
+            finally:
                 release.set()
-                await lock_holder
-                with self.assertRaisesRegex(RuntimeError, "closed owner"):
-                    await pending
-            self.assertEqual(self.storage.approved_destinations(self.reference), frozenset())
-        finally:
-            release.set()
-            await lock_holder
 
     async def test_real_channel_record_then_lease_and_relay_limits(self):
         server, endpoint = await capabilities.CredentialCapabilityServer.create(
@@ -239,11 +244,6 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             async with self.storage._locked_document():
                 held.set()
                 await release.wait()
-        task = asyncio.create_task(holder())
-        await held.wait()
-        server, endpoint = await capabilities.CredentialCapabilityServer.create(
-            self.broker, {self.reference}, manage_approvals=True)
-        client = await capabilities.CredentialClient.from_fd(endpoint)
         real_lock = file_locks.try_lock_exclusive
 
         def observe(token):
@@ -252,21 +252,27 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             except BlockingIOError:
                 waiting.set()
                 raise
-        try:
-            with mock.patch.object(file_locks, "try_lock_exclusive", observe):
-                pending = asyncio.create_task(client.approve_destinations(self.reference, [URL]))
-                await waiting.wait()
-                await server.close()
-                with self.assertRaises(capabilities.CapabilityError):
-                    await pending
-            release.set()
-            await task
-            self.assertEqual(self.storage.approved_destinations(self.reference), frozenset())
-        finally:
-            release.set()
-            await task
-            await client.close()
-            await server.close()
+        async with AsyncExitStack() as channels, AsyncExitStack() as actors:
+            task = await actors.enter_async_context(running_fixture_task(holder()))
+            try:
+                await observe_fixture(held.wait(), task)
+                server, endpoint = await capabilities.CredentialCapabilityServer.create(
+                    self.broker, {self.reference}, manage_approvals=True)
+                channels.push_async_callback(server.close)
+                client = await capabilities.CredentialClient.from_fd(endpoint)
+                channels.push_async_callback(client.close)
+                with mock.patch.object(file_locks, "try_lock_exclusive", observe):
+                    pending = await actors.enter_async_context(running_fixture_task(
+                        client.approve_destinations(self.reference, [URL])))
+                    await observe_fixture(waiting.wait(), pending, task)
+                    await server.close()
+                    with self.assertRaises(capabilities.CapabilityError):
+                        await pending
+                release.set()
+                await task
+                self.assertEqual(self.storage.approved_destinations(self.reference), frozenset())
+            finally:
+                release.set()
 
     @unittest.skipUnless(os.name == "posix", "POSIX file types")
     async def test_special_document_is_rejected_before_blocking(self):
@@ -333,9 +339,6 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return auth.RefreshResult("next-access", "next-refresh")
 
-        rotation = asyncio.create_task(self.storage.rotate_openai_subscription(
-            tokens.normalized(), refresh=refresh))
-        await entered.wait()
         real_lock = file_locks.try_lock_exclusive
 
         def observe(token):
@@ -345,19 +348,22 @@ class EndpointAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 waiting.set()
                 raise
 
-        try:
-            with mock.patch.object(file_locks, "try_lock_exclusive", observe):
-                saving = asyncio.create_task(self.broker.approve_destinations(
-                    self.reference, [URL]))
-                await waiting.wait()
+        async with AsyncExitStack() as actors:
+            rotation = await actors.enter_async_context(running_fixture_task(self.storage.rotate_openai_subscription(
+                tokens.normalized(), refresh=refresh)))
+            try:
+                await observe_fixture(entered.wait(), rotation)
+                with mock.patch.object(file_locks, "try_lock_exclusive", observe):
+                    saving = await actors.enter_async_context(running_fixture_task(self.broker.approve_destinations(
+                        self.reference, [URL])))
+                    await observe_fixture(waiting.wait(), saving, rotation)
+                    release.set()
+                    await asyncio.gather(rotation, saving)
+                self.assertEqual(self.storage.load_openai_subscription().tokens.refresh_token,
+                                 "next-refresh")
+                self.assertEqual(self.storage.approved_destinations(self.reference), frozenset({URL}))
+            finally:
                 release.set()
-                await asyncio.gather(rotation, saving)
-            self.assertEqual(self.storage.load_openai_subscription().tokens.refresh_token,
-                             "next-refresh")
-            self.assertEqual(self.storage.approved_destinations(self.reference), frozenset({URL}))
-        finally:
-            release.set()
-            await rotation
 
     async def test_controller_without_approval_permission_cannot_change_the_store(self):
         server, endpoint = await capabilities.CredentialCapabilityServer.create(

@@ -1,10 +1,10 @@
-"""End-to-end UI test: run the real loki_agent TUI under a pty with the
-dummy provider (no network) and assert on what the terminal actually shows.
+"""Real TTY workflow/lifecycle checks and transparent-PTY rendering journeys.
 
-The assertions parse the byte stream and check what the escapes *mean* --
-which text was emitted bold, which was emitted cyan, whether any OSC-777
-control sequence was emitted -- rather than matching exact escape bytes,
-because a ConPTY pipe rewrites SGR spellings while preserving their meaning.
+ConPTY cases check native input, turn persistence and process cleanup, not
+conhost repaint serialization. Application styling/control escaping is tested
+before ConPTY in the platform-independent terminal and presentation suites.
+The POSIX rendering journeys additionally inspect the application's unchanged
+byte stream; the SGR tracker is deliberately not a terminal emulator.
 """
 
 import json
@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from loki_agent import pty_backend  # noqa: E402
 from loki_entrypoints import (child_environment, configure_container,  # noqa: E402
-                              entrypoint)
+                              loki_command)
 
 REPLY = "**boldword** and `codeword` done"
 
@@ -262,7 +262,7 @@ def run_loki_pty_reply(stream: bool, stream_chunks=None,
     try:
         configure_container(env, tmpdir)
         handle = pty_backend.spawn_pty(
-            [entrypoint("loki")], env=env, cwd=tmpdir)
+            loki_command(), env=env, cwd=tmpdir)
         _read_until(handle, collected, 'User: !')
         turn_start = len(collected)
         # These journeys exercise model turns, not the dummy shell default.
@@ -395,7 +395,7 @@ class PtyFixtureTests(unittest.TestCase):
 
                 with (
                     mock.patch.object(module, 'configure_container', side_effect=configure),
-                    mock.patch.object(module, 'entrypoint', return_value='/installed/loki'),
+                    mock.patch.object(module, 'loki_command', return_value=['/installed/loki']),
                     mock.patch.object(module, '_read_until'),
                     mock.patch.object(module, '_read_to_exit', return_value=(0, b'')),
                     mock.patch.object(pty_backend, 'spawn_pty', side_effect=spawn),
@@ -408,6 +408,45 @@ class PtyFixtureTests(unittest.TestCase):
                 self.assertFalse(os.path.exists(configured[0]))
 
 
+class PtyWorkflowTests(unittest.TestCase):
+    def test_real_tty_turn_and_fifo_quit_preserve_the_saved_conversation(self):
+        for streaming in [False, True]:
+            with self.subTest(streaming=streaming), tempfile.TemporaryDirectory(prefix='loki-tty-workflow-') as root:
+                workspace = os.path.join(root, 'workspace')
+                os.mkdir(workspace)
+                environment = child_environment(
+                    HOME=root, XDG_CONFIG_HOME=os.path.join(root, 'config'),
+                    XDG_STATE_HOME=os.path.join(root, 'state'), PATH=os.environ.get('PATH', ''),
+                    TERM='xterm', LOKI_PROVIDER='dummy', LOKI_API_BASE='http://dummy.invalid/v1',
+                    LOKI_MODEL='dummy', LOKI_DUMMY_REPLY='native workflow reply',
+                    LOKI_STREAM='1' if streaming else '0')
+                if streaming:
+                    environment['LOKI_DUMMY_STREAM_CHUNKS'] = json.dumps(['native ', 'workflow reply'])
+                configure_container(environment, workspace)
+                handle = pty_backend.spawn_pty(loki_command(), env=environment, cwd=workspace)
+                captured = bytearray()
+                try:
+                    _read_until(handle, captured, 'User: !')
+                    handle.write(b'\x7fnative workflow prompt\r')
+                    handle.write(b'\x7f/quit\r')
+                    code, output = _read_to_exit(handle, captured)
+                    self.assertEqual(code, 0, output)
+                    with os.scandir(os.path.join(workspace, '.loki', 'chats')) as entries:
+                        logs = [entry.path for entry in entries if entry.name.endswith('.json')]
+                    self.assertEqual(len(logs), 1, logs)
+                    with open(logs[0], encoding='utf-8') as stream:
+                        conversation = json.dumps(json.load(stream))
+                    self.assertIn('native workflow prompt', conversation)
+                    self.assertIn('native workflow reply', conversation)
+                finally:
+                    try:
+                        handle.terminate()
+                    finally:
+                        handle.close()
+
+
+@unittest.skipIf(sys.platform == 'win32',
+                 'Transparent PTY emission capture; ConPTY workflow/lifecycle and pre-ConPTY emission run separately')
 class PtyUiTests(unittest.TestCase):
 
     def _assert_styled_output(self, output):
@@ -577,7 +616,7 @@ class PtyUiTests(unittest.TestCase):
                 LOKI_DUMMY_STREAM_GATE=gate)
             configure_container(env, workspace)
             handle = pty_backend.spawn_pty(
-                [entrypoint("loki")], cols=240, rows=24, env=env, cwd=workspace)
+                loki_command(), cols=240, rows=24, env=env, cwd=workspace)
             output = bytearray()
             try:
                 _read_until(handle, output, "User: !")
@@ -724,7 +763,7 @@ class PtyCliUsageTests(unittest.TestCase):
         os.makedirs(workspace, exist_ok=True)
         configure_container(env, workspace)
         handle = pty_backend.spawn_pty(
-            [entrypoint("loki"), *cli_args], env=env, cwd=workspace)
+            [*loki_command(), *cli_args], env=env, cwd=workspace)
         try:
             return _read_to_exit(handle)
         finally:
@@ -847,6 +886,8 @@ def _pty_child(argv):
                 pipeline = tool_runtime.ToolHookPipeline()
                 pipeline.turn_error_hooks.append(object())
                 events = []
+                # The core owns completion and its advertised tool snapshot;
+                # inject failure there, not through a frontend-owned wrapper.
                 with mock.patch.object(loki, "TOOL_HOOK_PIPELINE", pipeline), \
                         mock.patch.object(pipeline, "recover_turn", new=wait_policy), \
                         mock.patch.object(loki, "async_chat_completion", new=fail), \
