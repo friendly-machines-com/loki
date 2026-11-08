@@ -15,14 +15,15 @@ runtime itself even if it is not currently requesting a credential.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
+import sys
 from dataclasses import dataclass
 
 from . import connections, credential_capabilities, host_ipc, protocols
 from . import runtime_isolation
 from .authentications import CredentialBroker
 from .credentials import CredentialInventory, CredentialStore
+from .lifetimes import finish_cleanup
 
 
 class CredentialSupervisor:
@@ -93,35 +94,26 @@ class CredentialSupervisor:
             delegation.child_spawned()
             return await process.wait()
         finally:
-            # Revoke the runtime before waiting for it. In particular, the
-            # terminal child observes owner EOF and gets a chance to restore
-            # raw tty state itself. Sending SIGTERM immediately would race
-            # that cleanup and could leave the caller's terminal damaged.
-            try:
-                delegation.revoke_now()
-                if process is not None and process.returncode is None:
-                    wait_task = asyncio.create_task(
-                        process.wait(), name="loki-runtime-shutdown")
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(wait_task), timeout=2)
-                    except asyncio.TimeoutError:
-                        with contextlib.suppress(ProcessLookupError):
-                            process.terminate()
-                        try:
-                            await asyncio.wait_for(
-                                asyncio.shield(wait_task), timeout=2)
-                        except asyncio.TimeoutError:
-                            with contextlib.suppress(ProcessLookupError):
-                                process.kill()
-                            await wait_task
-            finally:
-                # Cleanup must also run when waiting or termination fails.
+            async def retire():
                 try:
-                    await delegation.close()
-                finally:
                     if process is not None:
-                        runtime_isolation.close_runtime_process(process)
+                        await process.wait()
+                finally:
+                    try:
+                        await delegation.close()
+                    finally:
+                        # A failed waiter is not exit. Keep native control
+                        # intact on that error path; delegation still retires.
+                        if process is not None and process.returncode is not None:
+                            runtime_isolation.close_runtime_process(process)
+
+            try:
+                # Owner EOF cancels the actual runtime and lets it restore tty
+                # state and join jobs. Only the job owner applies signal grace;
+                # another supervisor deadline can cut that retirement short.
+                delegation.revoke_now()
+            finally:
+                await finish_cleanup(retire(), preserve_failure=sys.exc_info()[0] is not None)
 
 
 @dataclass
@@ -149,12 +141,12 @@ class RuntimeDelegation:
                 credential_child,
             )
         except BaseException:
-            for end in [owner_parent, owner_child, credential_child]:
-                if end is not None:
-                    with contextlib.suppress(OSError):
-                        host_ipc.close_end(end)
-            if credential_server is not None:
-                await credential_server.close()
+            async with contextlib.AsyncExitStack() as cleanup:
+                if credential_server is not None:
+                    cleanup.push_async_callback(credential_server.close)
+                for end in [credential_child, owner_child, owner_parent]:
+                    if end is not None:
+                        cleanup.callback(host_ipc.close_end, end)
             raise
 
     def child_arguments(self) -> list[str]:
@@ -178,21 +170,22 @@ class RuntimeDelegation:
 
     def child_spawned(self) -> None:
         """Close the supervisor's copies of the ends the child owns."""
-        for attribute in ["owner_child", "credential_child"]:
-            end = getattr(self, attribute)
-            setattr(self, attribute, None)
-            if end is not None:
-                with contextlib.suppress(OSError):
-                    host_ipc.close_end(end)
+        with contextlib.ExitStack() as cleanup:
+            for attribute in ['credential_child', 'owner_child']:
+                end = getattr(self, attribute)
+                setattr(self, attribute, None)
+                if end is not None:
+                    cleanup.callback(host_ipc.close_end, end)
 
     def revoke_now(self) -> None:
         """Synchronously revoke runtime lifetime and credential authority."""
         owner_parent = self.owner_parent
         self.owner_parent = None
-        if owner_parent is not None:
-            with contextlib.suppress(OSError):
+        try:
+            if owner_parent is not None:
                 host_ipc.close_end(owner_parent)
-        self.credential_server.close_now()
+        finally:
+            self.credential_server.close_now()
 
     async def close(self) -> None:
         # Each cleanup action is independently necessary. A transport error
@@ -200,5 +193,7 @@ class RuntimeDelegation:
         try:
             self.revoke_now()
         finally:
-            self.child_spawned()
-            await self.credential_server.close()
+            try:
+                self.child_spawned()
+            finally:
+                await self.credential_server.close()

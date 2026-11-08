@@ -1,6 +1,5 @@
 """One computation snapshot crosses helper/process boundaries without authority."""
 
-import asyncio
 import json
 import os
 import sys
@@ -8,22 +7,22 @@ import tempfile
 import unittest
 from unittest import mock
 
+from loki_entrypoints import child_environment, configure_container, loki_command
+from test_acps import _ACPFrontFixture
 from loki_agent import formats, loki, models, protocols, subagents
 from loki_agent.credentials import CredentialStore
 from loki_agent.sessions import Session
 from loki_agent import connections
-from loki_agent import jobs as job_runtime
 from loki_agent import model_requests
 
 
-class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
+class ThinkingDelegationTests(_ACPFrontFixture, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES, model="claude-opus-4-5",
             reasoning_capabilities=models.ReasoningCapabilities(True, ["budget_tokens"], 1024, 6000)))
-        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.addCleanup(self.session.response_headers.close)
+        self.enterContext(mock.patch.object(loki, "_DEFAULT_SESSION", self.session))
 
     async def test_envelope_round_trip_preserves_computation_not_presentation(self):
         loki.thinking_command("mode manual budget 2048")
@@ -68,6 +67,7 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("LOKI_REASONING_EFFORT", env)
         self.assertEqual(json.loads(env["LOKI_TURN_THINKING"])["settings"]["effort"], "high")
         self.assertEqual(json.loads(env["LOKI_REASONING_EFFORT_PROFILE"]), profile.to_dict())
+        env["LOKI_REASONING_EFFORT"] = "not-a-supported-effort"
         restored = loki.delegated_turn_settings(CredentialStore.capture(env))
         self.assertEqual(restored.effort, "high")
         self.assertIsNone(self.session.reasoning_effort_preference)
@@ -97,16 +97,16 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         loki.thinking_command("mode manual budget 2048")
         snapshot = loki.capture_turn_settings()
         self.session.thinking_mode = "off"
-        executable = os.path.abspath("loki.py")
+        command = loki_command()
         job = mock.Mock(id="j", cwd="cwd", pid=1, pgid=1, status="running", exit_code=0,
                         stdout_path="out", stderr_path="err")
         manager = mock.Mock(run_exec=mock.AsyncMock(return_value=[job, "completed", "answer", ""]),
                             run_background_exec=mock.AsyncMock(return_value=job))
-        with mock.patch.object(loki, "current_job_manager", return_value=manager), mock.patch.object(sys, "argv", [executable]):
+        with mock.patch.object(loki, "current_job_manager", return_value=manager), mock.patch.object(sys, "argv", [command[-1]]):
             await loki.run_agent_async("task", "prompt", thinking=snapshot)
             await loki.run_agent_async("task", "prompt", run_in_background=True, thinking=snapshot)
         for call in [manager.run_exec.await_args, manager.run_background_exec.await_args]:
-            self.assertEqual(call.args[0][0], executable)
+            self.assertEqual(call.args[0][:len(command)], command)
             data = json.loads(call.kwargs["env"]["LOKI_TURN_THINKING"])
             self.assertEqual(data["settings"]["mode"], "manual")
             self.assertEqual(data["settings"]["budget"], 2048)
@@ -140,58 +140,54 @@ class ThinkingDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "answer")
 
     async def test_real_sanctioned_child_receives_one_turn_computation(self):
-        requests = []
+        async def respond(request):
+            self.assertLessEqual(len(requests), 3)
+            if len(requests) == 1:
+                return [{"type": "tool_use", "id": "delegate", "name": "Agent", "input": {
+                    "description": "task", "prompt": "answer briefly", "subagent_type": "Explore"}}]
+            return [{"type": "text", "text": "child answer"}]
 
-        async def server_request(reader, writer):
-            try:
-                header = await reader.readuntil(b"\r\n\r\n")
-                length = next(int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
-                              if line.lower().startswith(b"content-length:"))
-                requests.append(json.loads(await reader.readexactly(length)))
-                response = json.dumps({
-                    "type": "message", "role": "assistant", "model": "custom",
-                    "content": [{"type": "text", "text": "child answer"}], "stop_reason": "end_turn"}).encode()
-                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-                             + str(len(response)).encode() + b"\r\nConnection: close\r\n\r\n" + response)
-                await writer.drain()
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        server = await asyncio.start_server(server_request, "127.0.0.1", 0)
-        try:
-            port = server.sockets[0].getsockname()[1]
-            self.session.runtime_config = connections.make_runtime_config(
-                f"http://127.0.0.1:{port}/v1/messages", protocols.ANTHROPIC_MESSAGES, model="custom",
-                reasoning_effort_profile=models.ReasoningEffortProfile(["low", "high"]))
-            loki.thinking_command("effort high mode adaptive")
-            self.session.reasoning_traces = "on"
-            snapshot = loki.capture_turn_settings()
-            self.session.credential_authority = loki.authentications.CredentialBroker()
-            with tempfile.TemporaryDirectory() as directory:
-                manager = job_runtime.JobManager(directory)
-                self.session.job_manager = manager
-                try:
-                    export_environment = loki._subagent_env
-
-                    def conflicting_ambient_preference(*args, **kwargs):
-                        env = export_environment(*args, **kwargs)
-                        env["LOKI_REASONING_EFFORT"] = "not-a-supported-effort"
-                        return env
-
-                    with mock.patch.object(sys, "argv", [os.path.abspath("loki.py")]), mock.patch.object(
-                            loki, "_subagent_env", conflicting_ambient_preference):
-                        result = await loki.run_agent_async("task", "answer briefly", thinking=snapshot)
-                    self.assertIn("child answer", result)
-                finally:
-                    await manager.close_session_owned()
-            self.assertEqual(len(requests), 1)
-            self.assertEqual(requests[0]["thinking"], {"type": "adaptive"})
-            self.assertEqual(requests[0]["output_config"], {"effort": "high"})
-            self.assertNotIn("display", requests[0]["thinking"])
-        finally:
-            server.close()
-            await server.wait_closed()
+        endpoint, requests, _authorizations = await self._provider(
+            respond, protocol=protocols.ANTHROPIC_MESSAGES)
+        temporary = tempfile.TemporaryDirectory(prefix='loki-thinking-delegation-')
+        self.addCleanup(temporary.cleanup)
+        workspace = os.path.join(temporary.name, 'workspace')
+        os.mkdir(workspace)
+        environment = child_environment(
+            PATH=os.environ.get('PATH', ''), HOME=temporary.name, TERM='dumb',
+            XDG_CONFIG_HOME=os.path.join(temporary.name, 'config'),
+            XDG_STATE_HOME=os.path.join(temporary.name, 'state'),
+            LOKI_PROVIDER='anthropic', LOKI_API_BASE=endpoint, LOKI_MODEL='custom', LOKI_STREAM='0',
+            LOKI_REASONING_EFFORT='low',
+            LOKI_REASONING_EFFORT_PROFILE=json.dumps(models.ReasoningEffortProfile(['low', 'high']).to_dict()))
+        configure_container(environment, workspace)
+        # A unittest dispatcher is not an owning AppContainer runtime. The real
+        # front must create its worker before that worker delegates to Explore.
+        front, diagnostics = await self._front(environment, workspace, cleanup=self.addAsyncCleanup)
+        await self._request(front, 1, 'initialize', {'protocolVersion': 1})
+        opened, _ = await self._request(front, 2, 'session/new', {'cwd': workspace})
+        session_id = opened['sessionId']
+        for request_id, config_id, value in [
+                [3, 'reasoning_effort', 'effort:high'], [4, 'reasoning_traces', 'on']]:
+            configured, _ = await self._request(front, request_id, 'session/set_config_option', {
+                'sessionId': session_id, 'configId': config_id, 'value': value})
+            self.assertEqual(next(option['currentValue'] for option in configured['configOptions']
+                                  if option['id'] == config_id), value)
+        # A custom model has no advertised native mode menu. Its explicit
+        # /thinking command is the supported input, not an invented menu choice.
+        local, _ = await self._request(front, 5, 'session/prompt', {
+            'sessionId': session_id, 'prompt': [{'type': 'text', 'text': '/thinking mode adaptive'}]})
+        self.assertEqual(local, {'stopReason': 'end_turn'})
+        self.assertEqual(requests, [])
+        result, messages = await self._request(front, 6, 'session/prompt', {
+            'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'delegate once'}]})
+        self.assertEqual(result, {'stopReason': 'end_turn'})
+        self.assertIn('child answer', json.dumps(messages))
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(requests[1]['thinking'], {'type': 'adaptive'})
+        self.assertEqual(requests[1]['output_config'], {'effort': 'high'})
+        self.assertNotIn('display', requests[1]['thinking'])
+        await self._finish(front, diagnostics, session_id)
 
     async def test_answer_only_explore_captures_once_then_reuses_explicit_settings(self):
         snapshot = model_requests.TurnThinkingSettings(mode="manual", budget=2048, traces="on")

@@ -14,9 +14,8 @@ class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.session = Session(runtime_config=connections.make_runtime_config(
             "https://api.anthropic.com/v1", protocols.ANTHROPIC_MESSAGES, model="claude-opus-4-5"))
-        patch = mock.patch.object(loki, "_DEFAULT_SESSION", self.session)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.addCleanup(self.session.response_headers.close)
+        self.enterContext(mock.patch.object(loki, "_DEFAULT_SESSION", self.session))
 
     def worker(self, write=None):
         worker = acp_worker.Worker(self.session, write or (lambda message: None))
@@ -92,7 +91,7 @@ class ThinkingSurfaceTests(unittest.IsolatedAsyncioTestCase):
             return formats.DecodedTurn([formats.message_item("assistant", "answer")])
 
         execute = mock.AsyncMock(return_value=({"ok": True, "content": "ok"}, {}))
-        with mock.patch.object(terminal_frontend, "async_chat_completion", completion), mock.patch.object(
+        with mock.patch.object(loki, "async_chat_completion", completion), mock.patch.object(
                 loki, "execute_tool_call_async", execute), mock.patch.object(
                 terminal_frontend.terminals, "redraw_status_bar"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(await terminal_frontend.run_terminal_turn_async([]), "answer")

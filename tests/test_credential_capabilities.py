@@ -1,12 +1,15 @@
 import asyncio
 import os
+import socket
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
+from process_lifecycle_fixtures import observe_fixture
 from loki_agent import authentications
 from loki_agent import credential_capabilities
+from loki_agent import credential_runtimes
 from loki_agent import credential_supervisors
 from loki_agent import host_ipc
 
@@ -235,19 +238,19 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             await credential_capabilities.CredentialClient.from_fd(child_fd))
         pending = asyncio.create_task(self.client.lease(self.first, destination=DESTINATION))
         try:
-            await asyncio.wait_for(started.wait(), 2)
+            await observe_fixture(started.wait(), pending, self.server._reader_task)
             self.assertFalse(pending.done())
-            await asyncio.wait_for(self.server.close(), 2)
+            await self.server.close()
             with self.assertRaisesRegex(
                     credential_capabilities.CapabilityError, "closed"):
-                await asyncio.wait_for(pending, 2)
+                await pending
             self.assertTrue(cancelled.is_set())
             self.assertTrue(self.server._reader_task.done())
             # Client is still present; denial cannot be supplied by voluntarily
             # shutting it down as the cooperative owner-lifetime child does.
             with self.assertRaisesRegex(
                     credential_capabilities.CapabilityError, "closed"):
-                await asyncio.wait_for(self.client.lease(self.first, destination=DESTINATION), 2)
+                await self.client.lease(self.first, destination=DESTINATION)
             self.assertEqual(requests, [self.first])
             self.assertEqual(self.client._pending, {})
         finally:
@@ -266,6 +269,36 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             await self.server.close()
 
         wait_closed.assert_awaited()
+
+    async def test_cancelled_runtime_connection_closes_a_completed_client(self):
+        self.server, capability = await credential_capabilities.CredentialCapabilityServer.create(
+            self.broker, {self.first})
+        parent, child = host_ipc.owner_channel()
+        owner = credential_runtimes.SessionOwner(child)
+        from_streams = credential_capabilities.CredentialClient._from_streams
+
+        async def connected(reader, writer):
+            self.client = await from_streams(reader, writer)
+            # The real handshake completes, but cancellation wins before its
+            # result is transferred to the runtime caller.
+            asyncio.current_task().add_done_callback(lambda _task: pending.cancel())
+            return self.client
+
+        with mock.patch.object(credential_capabilities.CredentialClient, '_from_streams', new=connected):
+            pending = asyncio.create_task(credential_runtimes._connect_while_owned(capability, owner))
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending
+                self.assertIsNotNone(self.client)
+                with self.assertRaises(credential_capabilities.CapabilityError):
+                    await self.client.lease(self.first, destination=DESTINATION)
+                self.assertTrue(self.client.closed)
+                self.assertTrue(self.client._reader_task.done())
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+                await owner.close()
+                host_ipc.close_end(parent)
 
     def test_wire_messages_are_bounded_and_must_be_objects(self):
         with self.assertRaises(
@@ -323,6 +356,112 @@ class CredentialCapabilityTests(unittest.IsolatedAsyncioTestCase):
             await server.close()
 
 
+class SessionOwnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unstarted_owner_close_reports_native_failure_without_retry(self):
+        endpoint = host_ipc.PipeEndpoint(read=101)
+        failure = host_ipc.windows_api.WindowsApiError('CloseHandle failed', status=6)
+        with mock.patch.object(host_ipc.windows_api, 'read_pipe', new=mock.AsyncMock()) as read, \
+                mock.patch.object(host_ipc.windows_api, 'close_handle', side_effect=failure) as close:
+            owner = credential_runtimes.SessionOwner(endpoint)
+            with self.assertRaises(host_ipc.windows_api.WindowsApiError) as caught:
+                await owner.close()
+            self.assertIs(caught.exception, failure)
+            self.assertTrue(owner.closed_task.cancelled())
+            read.assert_not_awaited()
+            close.assert_called_once_with(101)
+            self.assertEqual(endpoint.handles(), [])
+            await owner.close()
+            close.assert_called_once_with(101)
+
+    async def test_owner_channel_and_socket_share_close_only_observation(self):
+        for create in [host_ipc.owner_channel, socket.socketpair]:
+            with self.subTest(create=create.__name__):
+                parent, child = create()
+                if isinstance(child, int):
+                    os.set_inheritable(child, True)
+                owner = credential_runtimes.SessionOwner(child)
+                try:
+                    if isinstance(child, int):
+                        # Inheritance is cleared before the watcher gets a step.
+                        self.assertFalse(os.get_inheritable(child))
+                    host_ipc.close_end(parent)
+                    parent = None
+                    await owner.closed_task
+                    if isinstance(child, int):
+                        os.fstat(child)  # The fd watch borrows, rather than consumes, its end.
+                finally:
+                    await owner.close()
+                    if parent is not None:
+                        host_ipc.close_end(parent)
+
+    async def test_native_end_release_follows_joined_read_retirement(self):
+        entered, retiring, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        closed = []
+
+        async def read_pipe(handle):
+            self.assertEqual(handle, 23)
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                retiring.set()
+                await release.wait()
+
+        endpoint = host_ipc.PipeEndpoint(read=23)
+        with mock.patch.object(host_ipc.windows_api, 'read_pipe', new=read_pipe), \
+                mock.patch.object(host_ipc.windows_api, 'close_handle', side_effect=closed.append):
+            owner = credential_runtimes.SessionOwner(endpoint)
+            closing = None
+            try:
+                await observe_fixture(entered.wait(), owner.closed_task)
+                closing = asyncio.create_task(owner.close())
+                await observe_fixture(retiring.wait(), closing)
+                self.assertFalse(closing.done())
+                self.assertEqual(closed, [])
+                release.set()
+                await closing
+                self.assertEqual(closed, [23])
+                self.assertEqual(endpoint.handles(), [])
+            finally:
+                release.set()
+                if closing is not None:
+                    await asyncio.gather(closing, return_exceptions=True)
+                await owner.close()
+
+    async def test_cancelled_close_releases_the_inherited_endpoint(self):
+        parent, child = host_ipc.owner_channel()
+        owner = credential_runtimes.SessionOwner(child)
+        native = host_ipc.is_endpoint(child)
+        release = (mock.patch.object(child, 'close', wraps=child.close) if native
+                   else mock.patch.object(os, 'close', wraps=os.close))
+        with release as released:
+            closing = asyncio.create_task(owner.close())
+            # Cancel after watcher retirement, before the join resumes its
+            # caller. The real endpoint must close before cancellation escapes.
+            owner.closed_task.add_done_callback(lambda _task: closing.cancel())
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await closing
+                self.assertTrue(owner.closed_task.done())
+                if native:
+                    from loki_agent import windows_api
+                    with self.assertRaises(windows_api.WindowsApiError) as raised:
+                        await windows_api.write_pipe(parent.write, b'closed')
+                    self.assertIn(raised.exception.status, windows_api.PIPE_CLOSED_ERRORS)
+                    released.assert_called_once_with()
+                else:
+                    with self.assertRaises(BrokenPipeError):
+                        os.write(parent, b'closed')
+                    released.assert_called_once_with(child)
+            finally:
+                if not closing.done():
+                    closing.cancel()
+                await asyncio.gather(closing, return_exceptions=True)
+                if not released.called:
+                    host_ipc.close_end(child)
+                host_ipc.close_end(parent)
+
+
 class DelegatedRuntimeProcessTests(unittest.IsolatedAsyncioTestCase):
     """A real child receives both ends and the delegation contract holds.
 
@@ -373,11 +512,11 @@ class DelegatedRuntimeProcessTests(unittest.IsolatedAsyncioTestCase):
                     host_ipc.close_end(self.delegation.owner_parent)
                     self.delegation.owner_parent = None
                     self.assertEqual(
-                        await asyncio.wait_for(process.wait(), 5), 0)
+                        await process.wait(), 0)
                 finally:
                     if process.returncode is None:
                         process.kill()
-                    await asyncio.wait_for(process.wait(), 5)
+                    await process.wait()
             with open(out_path, encoding="utf-8") as stream:
                 stdout = stream.read()
             with open(err_path, encoding="utf-8") as stream:
@@ -387,10 +526,10 @@ class DelegatedRuntimeProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stderr, "")
 
     @staticmethod
-    async def _await_marker(path, marker, process, timeout=30):
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while loop.time() < deadline:
+    async def _await_marker(path, marker, process):
+        # The delegated actor remains live until owner EOF. Its actual exit,
+        # not startup speed, invalidates this file observation.
+        while True:
             with open(path, "rb") as stream:
                 if marker in stream.read():
                     return
@@ -398,7 +537,6 @@ class DelegatedRuntimeProcessTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError(
                     "delegated child exited before writing %r" % marker)
             await asyncio.sleep(0.05)
-        raise AssertionError("delegated child never wrote %r" % marker)
 
 
 if __name__ == "__main__":

@@ -10,55 +10,25 @@ runtimes cannot accidentally acquire different lifetime semantics.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
-import socket
 
-from . import acps, credential_capabilities, host_ipc
+from . import credential_capabilities, host_ipc
 from .credentials import CredentialInventory
+from .lifetimes import finish_cleanup
 
 
 class SessionOwner:
-    """One inherited session-lifetime channel end.
+    """Capture one inherited end before its canonical watcher can first run.
 
-    POSIX watches a descriptor with ``add_reader``.  Windows cannot (the
-    proactor loop takes sockets only), so there the end is a socket and the
-    loop watches it as a stream instead.
+    host_ipc owns endpoint dispatch and close-only observation. This runtime
+    owner retains the original end and releases it only after watcher retirement.
     """
 
     def __init__(self, owner):
-        self.fd = None
-        self.socket = None
-        self.endpoint = None
-        if isinstance(owner, socket.socket):
-            self.socket = owner
-            self.closed_task = asyncio.create_task(
-                self._read_until_closed(owner),
-                name="loki-session-owner",
-            )
-        elif host_ipc.is_endpoint(owner):
-            # Windows anonymous-pipe read end; EOF is the owner's close.
-            self.endpoint = owner
-            self.closed_task = asyncio.create_task(
-                host_ipc.watch_closed(owner),
-                name="loki-session-owner",
-            )
-        else:
-            os.set_inheritable(owner, False)
-            self.fd = owner
-            self.closed_task = asyncio.create_task(
-                acps.AsyncFdLineReader(owner).readline(),
-                name="loki-session-owner",
-            )
+        self.endpoint = owner
+        self.closed_task = asyncio.create_task(
+            host_ipc.watch_closed(owner), name="loki-session-owner")
         self._closed = False
-
-    @staticmethod
-    async def _read_until_closed(endpoint: socket.socket) -> bytes:
-        reader, writer = await asyncio.open_connection(sock=endpoint)
-        try:
-            return await reader.read()
-        finally:
-            writer.close()
 
     async def close(self):
         if self._closed:
@@ -66,15 +36,14 @@ class SessionOwner:
         self._closed = True
         if not self.closed_task.done():
             self.closed_task.cancel()
-        await asyncio.gather(
-            self.closed_task, return_exceptions=True)
-        with contextlib.suppress(OSError):
-            if self.socket is not None:
-                self.socket.close()
-            elif self.endpoint is not None:
-                host_ipc.close_end(self.endpoint)
-            elif self.fd is not None:
-                os.close(self.fd)
+        try:
+            await asyncio.gather(
+                self.closed_task, return_exceptions=True)
+        finally:
+            # gather joins the watcher even when this closer is cancelled.
+            # Cancellation must not skip physical closure: _closed has already
+            # disabled a later retry of this inherited endpoint's cleanup.
+            host_ipc.close_end(self.endpoint)
 
 
 async def _connect_while_owned(capability_fd: int, owner: SessionOwner):
@@ -88,30 +57,35 @@ async def _connect_while_owned(capability_fd: int, owner: SessionOwner):
         initializer.connect(),
         name="loki-credential-initialization",
     )
+
+    async def retire_client():
+        # A completed initialization can own a live client, not just an endpoint.
+        # Until publication this scope must retire either result; joining the
+        # initialization task alone does not revoke the returned capability.
+        try:
+            result = (await asyncio.gather(
+                client_task, return_exceptions=True))[0]
+        finally:
+            initializer.close_now()
+        if isinstance(result, credential_capabilities.CredentialClient):
+            await result.close()
+
     try:
         done, _pending = await asyncio.wait(
             {owner.closed_task, client_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
     except BaseException:
-        if not client_task.done():
-            client_task.cancel()
-        await asyncio.gather(client_task, return_exceptions=True)
-        initializer.close_now()
+        client_task.cancel()
+        await finish_cleanup(retire_client(), preserve_failure=True)
         raise
     if owner.closed_task not in done:
         return await client_task
 
     # Owner closure wins a simultaneous handshake completion. The credential
     # channel has no independent lifetime outside the delegating supervisor.
-    if not client_task.done():
-        client_task.cancel()
-    result = (await asyncio.gather(
-        client_task, return_exceptions=True))[0]
-    initializer.close_now()
-    if isinstance(
-            result, credential_capabilities.CredentialClient):
-        await result.close()
+    client_task.cancel()
+    await finish_cleanup(retire_client())
     return None
 
 
@@ -144,7 +118,7 @@ class CredentialRuntime:
 
     async def run(self, coroutine):
         """Return ``(completed, result)`` while enforcing both lifetimes."""
-        if self.owner.closed_task.done():
+        if self.owner.closed_task.done() or self.credential_client.closed:
             # Do not start user/model work after an already-observed
             # revocation. Native coroutine objects must be closed explicitly
             # because they will never be wrapped in a task and awaited.
@@ -158,6 +132,7 @@ class CredentialRuntime:
             self.credential_client.wait_closed(),
             name="loki-credential-owner",
         )
+        completed = False
         try:
             done, _pending = await asyncio.wait(
                 {
@@ -174,24 +149,31 @@ class CredentialRuntime:
                 # Revocation wins if it lands in the same event-loop turn as
                 # normal completion. Authority has no useful "last instant"
                 # after its owner is already known to be gone.
-                if not operation_task.done():
-                    operation_task.cancel()
-                await asyncio.gather(
-                    operation_task, return_exceptions=True)
+                self.credential_client.close_now()
                 return False, None
-            return True, await operation_task
+            result = await operation_task
+            completed = True
+            return completed, result
         finally:
-            # Cancellation of run() itself must not detach the operation from
-            # the lifetime monitor. This matters during local shutdown even
-            # when neither inherited channel has reached EOF yet.
-            if not operation_task.done():
-                operation_task.cancel()
-            await asyncio.gather(
-                operation_task, return_exceptions=True)
-            if not capability_task.done():
-                capability_task.cancel()
-            await asyncio.gather(
-                capability_task, return_exceptions=True)
+            async def retired():
+                try:
+                    await asyncio.gather(operation_task, return_exceptions=True)
+                finally:
+                    if not capability_task.done():
+                        capability_task.cancel()
+                    await asyncio.gather(capability_task, return_exceptions=True)
+
+            try:
+                # Revoke before cancellation can be consumed by a lower loop's
+                # finally block. Closing hooks cannot start fresh work afterward.
+                if not operation_task.done():
+                    try:
+                        if not self.credential_client.closed:
+                            self.credential_client.close_now()
+                    finally:
+                        operation_task.cancel()
+            finally:
+                await finish_cleanup(retired(), preserve_failure=not completed)
 
     async def close(self):
         # Owner closure is mandatory even if transport shutdown reports an

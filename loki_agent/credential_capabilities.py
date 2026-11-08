@@ -8,6 +8,7 @@ requiring nonportable descriptor passing or a pathname-addressed service.
 
 from __future__ import annotations
 
+import abc
 import asyncio
 import contextlib
 import json
@@ -15,6 +16,7 @@ import os
 import socket
 
 from . import host_ipc
+from .lifetimes import finish_cleanup
 from .authentications import (
     CredentialAuthority,
     CredentialBroker,
@@ -140,20 +142,80 @@ class _CredentialClientInitializer:
             endpoint.close()
 
 
-class CredentialClient:
+class _CapabilityConnection(abc.ABC):
+    """One physical channel lifetime, not shared RPC/authority policy.
+
+    Both peers revoke synchronously and retain one closer through cancellation.
+    Reader completion signals logical owner loss; transport retirement must not
+    recursively wait from that reader or discard pending native I/O ownership.
+    Public socket transports and inherited pipe streams expose the same abort
+    seam. Each peer implements the abstract reader loop; this owner schedules
+    and retires it. No extra close lock or independent writer lifecycle is necessary.
+    """
+
+    def __init__(self, reader, writer, name):
+        self._reader = reader
+        self._writer = writer
+        self._closed = False
+        self._close_task = None
+        self._reader_task = asyncio.create_task(self._read_messages(), name=name)
+
+    @abc.abstractmethod
+    async def _read_messages(self) -> None:
+        raise NotImplementedError
+
+    @property
+    def closed(self):
+        """Logical revocation, independent of pending physical retirement."""
+        return self._closed
+
+    def close_now(self):
+        self._closed = True
+        try:
+            if not self._writer.transport.is_closing():
+                self._writer.transport.abort()
+        finally:
+            if (not self._reader_task.done()
+                    and self._reader_task is not asyncio.current_task(loop=self._reader_task.get_loop())):
+                self._reader_task.cancel()
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(
+                    self._retire(), name=self._reader_task.get_name() + '-close')
+
+    async def _retire(self):
+        try:
+            try:
+                if not self._writer.transport.is_closing():
+                    self._writer.transport.abort()
+            finally:
+                with contextlib.suppress(ConnectionError):
+                    await self._writer.wait_closed()
+        finally:
+            await asyncio.gather(self._reader_task, return_exceptions=True)
+
+    async def close(self):
+        failed = True
+        try:
+            self.close_now()
+            failed = False
+        finally:
+            await finish_cleanup(self._close_task, preserve_failure=failed)
+
+    async def wait_closed(self):
+        """Observe broker loss without cancelling its shared reader/closer."""
+        await asyncio.shield(self._reader_task)
+
+
+class CredentialClient(_CapabilityConnection):
     """Multiplex async credential requests over one delegated capability."""
 
     def __init__(self, reader: asyncio.StreamReader,
                  writer: asyncio.StreamWriter):
-        self._reader = reader
-        self._writer = writer
         self._write_lock = asyncio.Lock()
         self._pending: dict[int, asyncio.Future] = {}
         self._next_id = 0
-        self._closed = False
         self._available: frozenset[CredentialRef] = frozenset()
-        self._reader_task = asyncio.create_task(
-            self._read_messages(), name="credential-capability-client")
+        super().__init__(reader, writer, 'credential-capability-client')
 
     @classmethod
     def from_fd(cls, fd: int):
@@ -295,33 +357,15 @@ class CredentialClient:
                 else CapabilityError(
                     f"credential capability failed: {error}"))
         finally:
-            self._closed = True
             failure = failure or CapabilityError(
                 "credential capability closed")
             for future in list(self._pending.values()):
                 if not future.done():
                     future.set_exception(failure)
-
-    async def close(self):
-        self.close_now()
-        with contextlib.suppress(
-                BrokenPipeError, ConnectionError, OSError):
-            await self._writer.wait_closed()
-        await asyncio.gather(self._reader_task, return_exceptions=True)
-
-    async def wait_closed(self):
-        """Wait for owner revocation without canceling the shared reader."""
-        await asyncio.shield(self._reader_task)
-
-    def close_now(self):
-        """Revoke the capability synchronously during process state changes."""
-        self._closed = True
-        self._writer.close()
-        if not self._reader_task.done():
-            self._reader_task.cancel()
+            self.close_now()
 
 
-class CredentialCapabilityServer:
+class CredentialCapabilityServer(_CapabilityConnection):
     """Serve a fixed subset of an authority through one socket endpoint."""
 
     def __init__(
@@ -340,13 +384,7 @@ class CredentialCapabilityServer:
         self.destinations = (
             frozenset(destinations) if destinations is not None else None)
         self.manage_approvals = manage_approvals
-        self._reader = reader
-        self._writer = writer
-        self._close_lock = asyncio.Lock()
-        self._writer_close_task = None
-        self._closed = False
-        self._reader_task = asyncio.create_task(
-            self._read_messages(), name="credential-capability-server")
+        super().__init__(reader, writer, 'credential-capability-server')
 
     @classmethod
     async def create(
@@ -382,19 +420,13 @@ class CredentialCapabilityServer:
                     # The transport, not the borrowed socket/endpoint, owns
                     # this side after stream adoption. Join its real closer
                     # even if acquisition is cancelled a second time.
-                    writer.close()
+                    writer.transport.abort()
 
                     async def wait_closed():
-                        with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+                        with contextlib.suppress(ConnectionError):
                             await writer.wait_closed()
 
-                    cleanup = asyncio.create_task(wait_closed())
-                    while not cleanup.done():
-                        try:
-                            await asyncio.shield(cleanup)
-                        except asyncio.CancelledError:
-                            continue
-                    cleanup.result()
+                    await finish_cleanup(wait_closed(), preserve_failure=True)
             raise
 
     async def _read_messages(self):
@@ -413,7 +445,7 @@ class CredentialCapabilityServer:
         except (CapabilityError, ConnectionError, OSError, ValueError):
             pass
         finally:
-            await self._close_writer()
+            self.close_now()
 
     async def _answer(self, message: dict):
         request_id = message.get("id")
@@ -493,39 +525,3 @@ class CredentialCapabilityServer:
     def _check_live(self):
         if self._closed:
             raise CapabilityError("approval was cancelled")
-
-    async def _close_writer(self):
-        async with self._close_lock:
-            self._closed = True
-            self._writer.close()
-            if self._writer_close_task is None:
-                # On Python 3.10, cancelling one task directly awaiting
-                # StreamWriter.wait_closed() can cancel the transport's
-                # shared close waiter. The reader task is deliberately
-                # cancelled during revocation, so keep the actual transport
-                # wait in a separately shielded task which close() can still
-                # join afterward.
-                async def wait_closed():
-                    with contextlib.suppress(
-                            BrokenPipeError, ConnectionError, OSError):
-                        await self._writer.wait_closed()
-
-                self._writer_close_task = asyncio.create_task(
-                    wait_closed(),
-                    name="credential-capability-writer-close",
-                )
-            close_task = self._writer_close_task
-        await asyncio.shield(close_task)
-
-    async def close(self):
-        self.close_now()
-        await asyncio.gather(self._reader_task, return_exceptions=True)
-        await self._close_writer()
-
-    def close_now(self):
-        """Revoke a child capability without awaiting task cleanup."""
-        if not self._closed:
-            self._closed = True
-            self._writer.close()
-        if not self._reader_task.done():
-            self._reader_task.cancel()
