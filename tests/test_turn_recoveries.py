@@ -9,13 +9,15 @@ import socket
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import test_acps as acp_fixtures
 from loki_entrypoints import child_environment, configure_container
+from process_lifecycle_fixtures import observe_fixture
 from response_header_fixtures import setUpModule  # noqa: F401 - unittest hook
 from settings_fixtures import write_user_settings
-from loki_agent import acps, connections, formats, http_client, loki, model_requests
+from loki_agent import acps, connections, credential_runtimes, formats, http_client, loki, model_requests
 from loki_agent import protocols, recoveries, settings, sse, terminal_frontend, tool_runtime
 from loki_agent.acp_worker import Worker
 from loki_agent.sessions import Session
@@ -74,7 +76,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
 
     def config(self, value):
         # Fixtures stay dict-shaped for readability; this helper emits the
-        # settings-file INI: one section per hook named <phase>.<id>, with
+        # settings-file INI: one section per hook named hook.<phase>.<id>, with
         # indexed options for lists. Hook configuration entries carry a
         # mandatory cwd; tests that do not care about location run in the
         # session directory, and the per-phase location test supplies a
@@ -103,7 +105,8 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                 lines.append("")
         configuration = settings.from_parser(
             settings.read_ini(self.make_file("\n".join(lines))))
-        return tool_runtime.build_hook_pipeline(configuration.hooks)
+        return tool_runtime.build_hook_pipeline(
+            configuration.hooks, create_exec=loki._tool_process_creator())
 
     def policy(self, arguments: list):
         command = [sys.executable, self.script]
@@ -760,6 +763,60 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             chat.assert_awaited_once()
             self.assertEqual([entry["type"] for entry in events], ["response_cancelled"])
 
+    async def test_runtime_revocation_cancels_backoff_without_another_attempt(self):
+        # The restored runtime revokes the operation when its owner or broker
+        # disappears; this is not the turn's keyboard-cancel event. Backoff is
+        # borrowed work, not cleanup to shield from that revocation. Drive the
+        # real CredentialRuntime and wait, faking only external lifetime signals,
+        # provider failure and policy. No elapsed quiet period proves readiness.
+        for lost in ["owner", "broker"]:
+            with self.subTest(lost=lost):
+                owner_closed = asyncio.get_running_loop().create_future()
+                client_closed = asyncio.Event()
+                parked = asyncio.Event()
+                cancel_event = asyncio.Event()
+                client = SimpleNamespace(closed=False, wait_closed=client_closed.wait)
+
+                def close_client():
+                    client.closed = True
+                    client_closed.set()
+
+                client.close_now = close_client
+                runtime = credential_runtimes.CredentialRuntime(
+                    SimpleNamespace(closed_task=owner_closed), client)
+                original_wait = asyncio.wait_for
+
+                async def observe_wait(operation, timeout):
+                    if timeout == 3600:
+                        parked.set()
+                    return await original_wait(operation, timeout)
+
+                policy = mock.AsyncMock(return_value=recoveries.RetryDecision(3600))
+                chat = mock.AsyncMock(side_effect=OSError("network unavailable"))
+                with mock.patch.object(self.pipeline, "recover_turn", new=policy), \
+                        mock.patch.object(recoveries.asyncio, "wait_for", new=observe_wait):
+                    operation = asyncio.create_task(runtime.run(
+                        self.run_loop(chat, cancel_event=cancel_event)))
+                    try:
+                        await observe_fixture(parked.wait(), operation)
+                        if lost == "owner":
+                            owner_closed.set_result(None)
+                        else:
+                            close_client()
+                        completed, result = await operation
+                        self.assertFalse(completed)
+                        self.assertIsNone(result)
+                        self.assertFalse(cancel_event.is_set())
+                        self.assertTrue(client.closed)
+                        chat.assert_awaited_once()
+                        policy.assert_awaited_once()
+                    finally:
+                        if not operation.done():
+                            operation.cancel()
+                        await asyncio.gather(operation, return_exceptions=True)
+                        if not owner_closed.done():
+                            owner_closed.set_result(None)
+
     def test_decoded_failure_reuses_the_stream_classifier_and_wait_hint(self):
         turn = formats.openai_responses_response_to_items({
             "object": "response", "id": "failed", "status": "failed", "output": [], "error": {
@@ -902,7 +959,10 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
         diagnostic_bytes = bytearray()
 
         def on_diagnostics(data):
-            diagnostic_bytes.extend(data)
+            # The restored front fixture supplies a cumulative buffer, not a
+            # new chunk. Replace our observation snapshot rather than counting
+            # every previously received byte again on each callback.
+            diagnostic_bytes[:] = data
             start = diagnostic_bytes.find(b"Retrying in 1800 seconds.")
             # Wait for the complete diagnostic, not one conveniently unsplit
             # read chunk, so assertions cover what the client has received.
@@ -910,7 +970,8 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                 backoff.set()
 
         front, diagnostics = await self._front(
-            environment, workspace, on_diagnostics=on_diagnostics)
+            environment, workspace, cleanup=self.addAsyncCleanup,
+            on_diagnostics=on_diagnostics)
         await self._request(front, 1, "initialize", {"protocolVersion": 1})
         opened, _ = await self._request(front, 2, "session/new", {"cwd": workspace})
         session_id = opened["sessionId"]
@@ -976,6 +1037,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
             await reader
             await front.wait()
             errors = await diagnostics
+            self.assertEqual(bytes(diagnostic_bytes), errors)
             self.assertEqual(front.returncode, 0, errors.decode(errors="replace"))
             self.assertIn(b"temporarily unavailable", errors)
             self.assertIn(b"api_error", errors)
@@ -1018,13 +1080,14 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
     async def test_terminal_and_acp_use_same_owner_and_notify_final_outcome_once(self):
         end = self.observe_end()
         events = []
-        with mock.patch.object(terminal_frontend, "async_chat_completion", new=mock.AsyncMock(
-                side_effect=[OSError("DNS"), answer()])), \
+        with mock.patch.object(loki, "async_chat_completion", new=mock.AsyncMock(
+                side_effect=[OSError("DNS"), answer()])) as completion, \
                 mock.patch.object(terminal_frontend, "_redraw_status"), \
                 mock.patch.object(terminal_frontend, "_terminal_agent_event"):
             text = await terminal_frontend.run_terminal_turn_async(
                 self.items, cancel_event=asyncio.Event(), turn_events=events)
         await loki.run_turn_end_hooks_async(events, text)
+        self.assertEqual(completion.await_count, 2)
         end.assert_awaited_once()
         self.assertEqual(end.await_args.args[0]["reason"], "completed")
         for cancel in [False, True]:
@@ -1041,8 +1104,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                 with mock.patch.object(self.pipeline, "recover_turn", new=policy), \
                         mock.patch.object(loki, "current_model", return_value="test"), \
                         mock.patch.object(loki, "async_chat_completion", new=mock.AsyncMock(
-                            side_effect=[OSError("DNS"), answer()])), \
-                        mock.patch.object(worker, "_ask_advertised_tools", return_value=[[], None]), \
+                            side_effect=[OSError("DNS"), answer()])) as completion, \
                         mock.patch.object(worker, "_publish_context_usage"), mock.patch.object(loki, "save_chat_log"):
                     params = {"sessionId": "s", "prompt": [{"type": "text", "text": "work"}]}
                     task = asyncio.create_task(worker._answer({"id": 7, "method": "session/prompt", "params": params}))
@@ -1053,6 +1115,7 @@ class TurnRecoveryTests(acp_fixtures._ACPFrontFixture, unittest.IsolatedAsyncioT
                             await worker.prompt(params)
                         await worker.dispatch("session/cancel", {"sessionId": "s"})
                     await task
+                self.assertEqual(completion.await_count, 1 if cancel else 2)
                 replies = [message for message in messages if message.get("id") == 7]
                 self.assertEqual(len(replies), 1)
                 self.assertEqual(replies[0]["result"]["stopReason"], "cancelled" if cancel else "end_turn")

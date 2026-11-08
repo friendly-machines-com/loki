@@ -141,3 +141,7 @@ ospeed
 # implements the asyncio get_extra_info contract the fixtures read through.
 _.at_eof
 _.get_extra_info
+
+# The ACP delegation test asserts this winerror alongside ERROR_BROKEN_PIPE
+# for writes into a closed anonymous pipe: either code means the peer is gone.
+ERROR_NO_DATA
